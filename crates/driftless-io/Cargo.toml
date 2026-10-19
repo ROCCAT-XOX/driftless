@@ -15,6 +15,9 @@ test-util = []
 
 [dependencies]
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 
 [dev-dependencies]
