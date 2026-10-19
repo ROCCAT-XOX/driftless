@@ -16,5 +16,8 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "MPL-2.0",
+    # Both come in through the debug viewer `rerun`:
+    "BSL-1.0",              # xxhash-rust via re_log_encoding
+    "CDLA-Permissive-2.0",  # webpki-roots (CA data) via ureq/ehttp
 ]
 confidence-threshold = 0.9

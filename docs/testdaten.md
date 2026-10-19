@@ -35,3 +35,9 @@ $DRIFTLESS_TESTDATA/
 Die Dateien stammen aus einem Testscan mit dem 3DMakerPro-Scanner. Die
 Referenzdateien (`trj.txt`, `smooth.las`) dienen nur zum Vergleich; Software
 des Scanner-Herstellers wird nicht ins Repository uebernommen.
+
+## Fehlersuche-Viewer
+
+`driftless view <ordner>` braucht den rerun-Viewer in passender Version:
+`cargo install rerun-cli --version 0.38.1 --locked`.
+Ohne Fenster: `--dry-run datei.rrd` schreibt nur die Aufzeichnung.

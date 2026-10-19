@@ -2,6 +2,7 @@
 
 mod compare;
 mod inspect;
+mod view;
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
@@ -19,6 +20,8 @@ enum Command {
     Inspect(inspect::Args),
     /// Vergleicht zwei Trajektorien (TUM): Abweichung, Start↔Ende, Länge
     Compare(compare::Args),
+    /// Fehlersuche-Viewer (rerun): Punkte, IMU, Bilder, Trajektorie
+    View(view::Args),
 }
 
 fn main() -> ExitCode {
@@ -26,6 +29,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Inspect(args) => inspect::run(&args),
         Command::Compare(args) => compare::run(&args),
+        Command::View(args) => view::run(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
