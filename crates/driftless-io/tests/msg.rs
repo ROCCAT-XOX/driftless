@@ -221,9 +221,8 @@ fn pointcloud2_rejects_row_step_too_small() {
 fn pointcloud2_huge_height_zero_width_is_fast_or_error() {
     let start = std::time::Instant::now();
     let b = shaped_cloud(u32::MAX, 0, 12, 12, 0, &[]);
-    match decode_pointcloud2(&b) {
-        Ok(f) => assert!(f.points.is_empty() && f.dropped == 0),
-        Err(_) => {}
+    if let Ok(f) = decode_pointcloud2(&b) {
+        assert!(f.points.is_empty() && f.dropped == 0);
     }
     assert!(start.elapsed() < std::time::Duration::from_millis(500));
 }
