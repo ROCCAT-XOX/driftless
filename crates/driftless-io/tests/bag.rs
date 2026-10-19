@@ -159,3 +159,41 @@ fn real_lidar_bag_summary() {
     }
     assert_eq!((lidar, imu), (2663, 53264));
 }
+
+/// End offsets of all top-level chunk records (op 0x05).
+fn chunk_ends(bytes: &[u8]) -> Vec<usize> {
+    let rd = |p: usize| u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+    let (mut pos, mut ends) = (13usize, Vec::new());
+    while pos < bytes.len() {
+        let hlen = rd(pos);
+        let op = bytes[pos + 4 + 4 + 3]; // first header field is `op=<byte>`
+        let end = pos + 4 + hlen + 4 + rd(pos + 4 + hlen);
+        if op == 0x05 {
+            ends.push(end);
+        }
+        pos = end;
+    }
+    ends
+}
+
+#[test]
+fn cut_at_chunk_boundary_before_index_is_truncated() {
+    for comp in [Compression::None, Compression::Lz4] {
+        let (mut bytes, expected) = build(comp, true, 1);
+        let ends = chunk_ends(&bytes);
+        assert_eq!(ends.len(), 6);
+        bytes.truncate(ends[2]);
+        let cut = bytes.len() as u64;
+        let got = read_all(bytes, &[]);
+        assert_eq!(got.len(), 4, "{comp:?}");
+        for (m, (t, d)) in got[..3].iter().zip(expected) {
+            let (gt, _, gd) = m.as_ref().unwrap();
+            assert_eq!((gt, gd), (&t, &d));
+        }
+        assert!(
+            matches!(got[3], Err(BagError::Truncated { offset }) if offset == cut),
+            "{comp:?}: {:?}",
+            got[3]
+        );
+    }
+}

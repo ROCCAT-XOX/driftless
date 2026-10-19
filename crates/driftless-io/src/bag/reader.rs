@@ -32,6 +32,8 @@ pub struct BagReader<R: Read + Seek> {
     /// First byte after the bag header record.
     data_start: u64,
     file_len: u64,
+    /// Offset of the index section from the bag header (0 = unindexed).
+    index_pos: u64,
 }
 
 impl BagReader<BufReader<File>> {
@@ -202,6 +204,7 @@ impl<R: Read + Seek> BagReader<R> {
             by_id: HashMap::new(),
             data_start,
             file_len,
+            index_pos,
         };
         if index_pos > 0 && index_pos < file_len {
             // Errors here (damaged index) fall through to the sequential scan below.
@@ -337,6 +340,12 @@ impl<'a, R: Read + Seek> Messages<'a, R> {
                     None => self.chunk = None,
                 }
             } else if !self.advance()? {
+                // Clean end of walk: a header pointing past the file end means the
+                // copy/recording was cut before the index section.
+                let r = &self.reader;
+                if r.index_pos > 0 && r.index_pos >= r.file_len {
+                    return Err(BagError::Truncated { offset: r.file_len });
+                }
                 return Ok(None);
             }
         }
