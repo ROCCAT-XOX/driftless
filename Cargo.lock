@@ -167,6 +167,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "driftless-io",
+ "driftless-traj",
  "predicates",
  "serde",
  "serde_json",
@@ -191,6 +192,10 @@ version = "0.1.0"
 [[package]]
 name = "driftless-traj"
 version = "0.1.0"
+dependencies = [
+ "nalgebra",
+ "thiserror",
+]
 
 [[package]]
 name = "float-cmp"

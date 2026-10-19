@@ -8,3 +8,7 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+thiserror = "2"
