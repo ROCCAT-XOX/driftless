@@ -1,0 +1,1 @@
+//! Trajectory types and utilities.

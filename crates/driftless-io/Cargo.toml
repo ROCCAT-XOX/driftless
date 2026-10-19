@@ -1,0 +1,10 @@
+[package]
+name = "driftless-io"
+description = "Driftless: Datei-Ein- und Ausgabe (Bags, Trajektorien, Punktwolken)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

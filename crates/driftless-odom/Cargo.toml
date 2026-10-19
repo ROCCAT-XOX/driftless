@@ -1,0 +1,10 @@
+[package]
+name = "driftless-odom"
+description = "Driftless: Odometrie und SLAM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

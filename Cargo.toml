@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/driftless-io",
+    "crates/driftless-traj",
+    "crates/driftless-odom",
+    "crates/driftless-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/ROCCAT-XOX/driftless"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
