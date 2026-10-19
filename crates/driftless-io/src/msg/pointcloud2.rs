@@ -109,31 +109,40 @@ pub fn decode_pointcloud2(data: &[u8]) -> Result<LidarFrame, MsgError> {
         }
     }
 
-    let total = height
-        .checked_mul(width)
-        .ok_or_else(|| MsgError::Malformed("height*width overflows".into()))?;
-    let row_step = if row_step == 0 && height <= 1 {
-        point_step.saturating_mul(width)
-    } else {
-        row_step
-    };
-    // Last byte needed: start of the final row plus width points.
-    let needed = if total == 0 {
-        0
-    } else {
-        (height - 1)
-            .checked_mul(row_step)
-            .and_then(|r| r.checked_add(width.checked_mul(point_step)?))
-            .ok_or_else(|| MsgError::Malformed("PointCloud2 size overflows".into()))?
-    };
-    if needed > cloud.len() {
+    if point_step == 0 {
+        return Err(MsgError::Malformed("PointCloud2 point_step is 0".into()));
+    }
+    let overflow = || MsgError::Malformed("PointCloud2 size overflows".into());
+    let total = height.checked_mul(width).ok_or_else(overflow)?;
+    let row_bytes = width.checked_mul(point_step).ok_or_else(overflow)?;
+    let row_step = if height <= 1 { row_bytes } else { row_step };
+    if height > 1 && row_step < row_bytes {
         return Err(MsgError::Malformed(format!(
-            "PointCloud2 declares {needed} data bytes but holds {}",
+            "PointCloud2 row_step {row_step} is smaller than width*point_step {row_bytes}"
+        )));
+    }
+    if total == 0 {
+        return Ok(LidarFrame {
+            stamp,
+            points: Vec::new(),
+            dropped: 0,
+        });
+    }
+    let payload = total.checked_mul(point_step).ok_or_else(overflow)?;
+    // Last byte needed: start of the final row plus one row of points.
+    let needed = (height - 1)
+        .checked_mul(row_step)
+        .and_then(|r| r.checked_add(row_bytes))
+        .ok_or_else(overflow)?;
+    if payload > cloud.len() || needed > cloud.len() {
+        return Err(MsgError::Malformed(format!(
+            "PointCloud2 declares {} data bytes but holds {}",
+            payload.max(needed),
             cloud.len()
         )));
     }
 
-    let mut points = Vec::with_capacity(total);
+    let mut points = Vec::with_capacity(total.min(cloud.len() / point_step));
     let mut dropped = 0u32;
     for row in 0..height {
         for col in 0..width {
@@ -141,7 +150,7 @@ pub fn decode_pointcloud2(data: &[u8]) -> Result<LidarFrame, MsgError> {
             let p = &cloud[start..start + point_step];
             let xyz = [x.read(p) as f32, y.read(p) as f32, z.read(p) as f32];
             if !xyz.iter().all(|v| v.is_finite()) || xyz == [0.0; 3] {
-                dropped += 1;
+                dropped = dropped.saturating_add(1);
                 continue;
             }
             points.push(LidarPoint {

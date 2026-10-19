@@ -157,6 +157,128 @@ fn pointcloud2_rejects_bad_input() {
     ));
 }
 
+/// Cloud with explicit height/width/row_step and raw data, one x,y,z f32 point = 12 bytes.
+fn shaped_cloud(
+    height: u32,
+    width: u32,
+    step: u32,
+    row_step: u32,
+    data_len: u32,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&[0u8; 12]);
+    string(&mut b, "l");
+    b.extend_from_slice(&height.to_le_bytes());
+    b.extend_from_slice(&width.to_le_bytes());
+    b.extend_from_slice(&3u32.to_le_bytes());
+    for (name, off) in [("x", 0u32), ("y", 4), ("z", 8)] {
+        string(&mut b, name);
+        b.extend_from_slice(&off.to_le_bytes());
+        b.push(7);
+        b.extend_from_slice(&1u32.to_le_bytes());
+    }
+    b.push(0);
+    b.extend_from_slice(&step.to_le_bytes());
+    b.extend_from_slice(&row_step.to_le_bytes());
+    b.extend_from_slice(&data_len.to_le_bytes());
+    b.extend_from_slice(data);
+    b.push(1);
+    b
+}
+
+fn xyz_bytes(n: usize) -> Vec<u8> {
+    (0..n * 3)
+        .flat_map(|i| (i as f32 + 1.0).to_le_bytes())
+        .collect()
+}
+
+#[test]
+fn pointcloud2_rejects_zero_point_step() {
+    let b = shaped_cloud(1, 2, 0, 0, 24, &xyz_bytes(2));
+    assert!(matches!(
+        decode_pointcloud2(&b),
+        Err(MsgError::Malformed(_))
+    ));
+}
+
+#[test]
+fn pointcloud2_rejects_row_step_too_small() {
+    let d = xyz_bytes(4);
+    for rs in [0u32, 12] {
+        let b = shaped_cloud(2, 2, 12, rs, 48, &d);
+        assert!(
+            matches!(decode_pointcloud2(&b), Err(MsgError::Malformed(_))),
+            "row_step {rs}"
+        );
+    }
+    // Sufficient row_step works.
+    let ok = decode_pointcloud2(&shaped_cloud(2, 2, 12, 24, 48, &d)).unwrap();
+    assert_eq!(ok.points.len(), 4);
+}
+
+#[test]
+fn pointcloud2_huge_height_zero_width_is_fast_or_error() {
+    let start = std::time::Instant::now();
+    let b = shaped_cloud(u32::MAX, 0, 12, 12, 0, &[]);
+    match decode_pointcloud2(&b) {
+        Ok(f) => assert!(f.points.is_empty() && f.dropped == 0),
+        Err(_) => {}
+    }
+    assert!(start.elapsed() < std::time::Duration::from_millis(500));
+}
+
+#[test]
+fn pointcloud2_rejects_count_exceeding_data() {
+    let b = shaped_cloud(1, 1_000_000, 12, 12_000_000, 24, &xyz_bytes(2));
+    assert!(matches!(
+        decode_pointcloud2(&b),
+        Err(MsgError::Malformed(_))
+    ));
+    let b = shaped_cloud(u32::MAX, u32::MAX, 12, 0, 24, &xyz_bytes(2));
+    assert!(decode_pointcloud2(&b).is_err());
+}
+
+#[test]
+fn imu_hand_built_layout() {
+    let mut b = Vec::new();
+    b.extend_from_slice(&1u32.to_le_bytes());
+    b.extend_from_slice(&50u32.to_le_bytes());
+    b.extend_from_slice(&250_000_000u32.to_le_bytes());
+    string(&mut b, "imu");
+    let f64s =
+        |b: &mut Vec<u8>, v: &[f64]| v.iter().for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+    f64s(&mut b, &[9.0, 9.0, 9.0, 9.0]); // orientation
+    f64s(&mut b, &[8.0; 9]);
+    f64s(&mut b, &[0.5, -0.25, 2.0]); // angular velocity
+    f64s(&mut b, &[7.0; 9]);
+    f64s(&mut b, &[1.0, 2.0, 3.0]); // linear acceleration
+    f64s(&mut b, &[6.0; 9]);
+    let s = decode_imu(&b).unwrap();
+    assert_eq!(s.stamp, 50.25);
+    assert_eq!(s.gyro, [0.5, -0.25, 2.0]);
+    assert_eq!(s.accel, [1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn compressed_image_truncated() {
+    let img = CompressedImage {
+        stamp: 1.0,
+        format: "jpeg".into(),
+        data: vec![1, 2, 3, 4],
+    };
+    let b = encode_compressed_image(&img);
+    for cut in [1, 3, b.len() - 1] {
+        assert!(
+            matches!(
+                decode_compressed_image(&b[..b.len() - cut]),
+                Err(MsgError::Truncated { .. })
+            ),
+            "cut {cut}"
+        );
+    }
+}
+
 #[test]
 fn imu_roundtrip() {
     let s = ImuSample {
