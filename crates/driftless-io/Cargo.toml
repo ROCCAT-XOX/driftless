@@ -8,3 +8,15 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# Exposes `bag::writer::BagWriter` (test helper) to other crates' tests.
+test-util = []
+
+[dependencies]
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
+thiserror = "2"
+
+[dev-dependencies]
+# Self dev-dependency: enables `test-util` for the integration tests in tests/.
+driftless-io = { path = ".", features = ["test-util"] }
