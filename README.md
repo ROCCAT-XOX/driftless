@@ -3,7 +3,9 @@
 Open-source desktop software for processing handheld LiDAR scans — drift-corrected, cleanly colourised,
 correctable by hand. Runs natively on **macOS (Apple Silicon)** and **Windows**.
 
-> Status: early development. Nothing usable yet.
+> Status: early development, command line only. Milestone 2 done: LiDAR-IMU odometry, SLAM with automatic
+> loop closure and manual corrections (`slam`, `correct`), debug viewer. Results on real scans:
+> [docs/ergebnisse/2026-10-20-meilenstein-2.md](docs/ergebnisse/2026-10-20-meilenstein-2.md) (German).
 
 ## Why
 
@@ -39,6 +41,15 @@ Build with `cargo build --release`; the binary is `driftless`. Folder arguments 
 | `driftless correct <dir> list` · `loop <a_s> <b_s> [--note TEXT]` · `disable <nr>` · `enable <nr>` | Manual corrections in `<dir>/corrections.toml`: list them, add a loop (the places at two times, seconds since scan start as in `slam.json`, are the same), switch entries off and on; entries are never removed |
 | `driftless export-glim <folder> -o <dir>` | Writes `imu.bin` and `lidar.bin` for the GLIM spike (`spikes/glim/`) |
 | `driftless compare <a.tum> <b.tum> [--json]` | Trajectory yardstick: ATE after alignment, path length, start-to-end gap |
+
+Typical correction loop:
+
+```sh
+driftless slam <scan> -o out                 # full run, minutes at most
+driftless view <scan> --slam out             # check quality, loops, start-to-end gap
+driftless correct out loop 3.5 250.0         # the places at 3.5 s and 250.0 s are the same
+driftless slam <scan> -o out --reuse         # recompute from submaps.bin in seconds
+```
 
 ## Legal
 

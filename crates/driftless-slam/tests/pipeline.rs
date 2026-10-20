@@ -209,8 +209,8 @@ fn with_injected_drift(r: &SlamResult) -> (Vec<Submap>, Vec<Isometry3<f64>>) {
 
 /// With the automatic search switched off (search radius 0) the drifted room loop keeps its
 /// start-end gap; one manual loop between the still phases at start and end closes it. The
-/// first and the last submap share only part of the room (inlier ratio 0.34, below the
-/// automatic 0.5), which `manual_min_inlier_ratio` (0.25) allows for.
+/// first and the last submap share only part of the room (inlier ratio 0.34), which
+/// `manual_min_inlier_ratio` (0.25) allows for.
 #[test]
 fn manual_loop_fixes_missed_loop() {
     let r = room_loop();

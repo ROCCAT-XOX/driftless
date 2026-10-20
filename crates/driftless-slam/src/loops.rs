@@ -25,10 +25,12 @@ pub struct LoopConfig {
     pub max_candidates: usize,
     /// Voxel size the source points are thinned to before ICP (m).
     pub icp_voxel: f64,
-    /// Smallest share of source points with a correspondence at the final pose.
+    /// Smallest share of source points with a correspondence at the final pose. Two submaps
+    /// of a revisit usually cover the place from different stretches of the walk, so true
+    /// loops on real scans reach only 0.09–0.56; ICP that slid into a wrong pose stayed
+    /// below 0.18 (measurements: `docs/ergebnisse/2026-10-20-meilenstein-2.md`).
     pub min_inlier_ratio: f64,
-    /// The same for a manual loop: the user vouches for the place, and the two submaps
-    /// usually cover it from different stretches of the walk.
+    /// The same for a manual loop: the user vouches for the place.
     pub manual_min_inlier_ratio: f64,
     /// Largest point-to-plane RMS at the final pose (m).
     pub max_rms: f64,
@@ -44,7 +46,7 @@ impl Default for LoopConfig {
             radius_per_m: 0.05,
             max_candidates: 3,
             icp_voxel: 0.25,
-            min_inlier_ratio: 0.5,
+            min_inlier_ratio: 0.25,
             manual_min_inlier_ratio: 0.25,
             max_rms: 0.05,
             // The weakest position direction must be at least partly fixed by the geometry.
