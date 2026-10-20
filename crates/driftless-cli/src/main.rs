@@ -1,6 +1,7 @@
 //! `driftless`: command line entry point. Each subcommand lives in its own module.
 
 mod compare;
+mod export_glim;
 mod inspect;
 mod view;
 
@@ -22,6 +23,8 @@ enum Command {
     Compare(compare::Args),
     /// Fehlersuche-Viewer (rerun): Punkte, IMU, Bilder, Trajektorie
     View(view::Args),
+    /// Spike: LiDAR- und IMU-Daten als Binärstrom für den GLIM-Treiber (spikes/glim)
+    ExportGlim(export_glim::Args),
 }
 
 fn main() -> ExitCode {
@@ -30,6 +33,7 @@ fn main() -> ExitCode {
         Command::Inspect(args) => inspect::run(&args),
         Command::Compare(args) => compare::run(&args),
         Command::View(args) => view::run(&args),
+        Command::ExportGlim(args) => export_glim::run(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

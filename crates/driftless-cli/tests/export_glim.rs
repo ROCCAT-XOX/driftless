@@ -1,0 +1,117 @@
+use assert_cmd::Command;
+use driftless_io::bag::writer::{BagWriter, Compression};
+use driftless_io::bag::Time;
+use driftless_io::msg::encode::{encode_imu, encode_pointcloud2};
+use driftless_io::msg::{ImuSample, LidarPoint};
+use predicates::prelude::*;
+use std::fs;
+use std::path::PathBuf;
+
+fn tmp(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "driftless-export-glim-{}-{name}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn time(t: f64) -> Time {
+    let sec = t.floor();
+    Time {
+        sec: sec as u32,
+        nsec: ((t - sec) * 1e9).round() as u32,
+    }
+}
+
+fn point(x: f32, ring: u16, t_rel: f64) -> LidarPoint {
+    LidarPoint {
+        xyz: [x, 1.0, 2.0],
+        intensity: 7.0,
+        ring,
+        t_rel,
+    }
+}
+
+fn f64_at(b: &[u8], off: usize) -> f64 {
+    f64::from_le_bytes(b[off..off + 8].try_into().unwrap())
+}
+fn f32_at(b: &[u8], off: usize) -> f32 {
+    f32::from_le_bytes(b[off..off + 4].try_into().unwrap())
+}
+fn u32_at(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
+}
+
+#[test]
+fn export_glim_writes_imu_and_lidar_streams() {
+    let dir = tmp("basic");
+    let mut w = BagWriter::new(Compression::None);
+    let lc = w.add_connection("/vanjee_722z", "sensor_msgs/PointCloud2");
+    let ic = w.add_connection("/vanjee_imu_packets", "sensor_msgs/Imu");
+    for i in 0..3 {
+        let s = 100.0 + i as f64 * 0.005;
+        let imu = ImuSample {
+            stamp: s,
+            gyro: [0.1, 0.2, 0.3],
+            accel: [0.0, 0.0, 9.81],
+        };
+        w.write_message(ic, time(s), &encode_imu(&imu));
+    }
+    for i in 0..2 {
+        let s = 100.0 + i as f64 * 0.1;
+        let pts = [
+            point(1.0, 3, 0.0),
+            point(f32::NAN, 4, 0.01),
+            point(2.0, 5, 0.05),
+        ];
+        w.write_message(lc, time(s), &encode_pointcloud2(s, "lidar", &pts));
+    }
+    fs::write(dir.join("LIDAR_0.bag"), w.finish()).unwrap();
+    let out = dir.join("out");
+
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .args(["export-glim"])
+        .arg(&dir)
+        .arg("-o")
+        .arg(&out)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 LiDAR-Frames"))
+        .stdout(predicate::str::contains("3 IMU-Messungen"));
+
+    let imu = fs::read(out.join("imu.bin")).unwrap();
+    assert_eq!(&imu[..8], b"DLIMU01\0");
+    assert_eq!(imu.len(), 8 + 3 * 56);
+    assert_eq!(f64_at(&imu, 8), 100.0);
+    assert_eq!(f64_at(&imu, 8 + 3 * 8), 9.81); // az
+    assert_eq!(f64_at(&imu, 8 + 6 * 8), 0.3); // gz
+    assert!((f64_at(&imu, 8 + 2 * 56) - 100.01).abs() < 1e-9);
+
+    let lidar = fs::read(out.join("lidar.bin")).unwrap();
+    assert_eq!(&lidar[..8], b"DLPTS01\0");
+    // Two frames, NaN point dropped: 2 points of 24 bytes each.
+    let frame = 12 + 2 * 24;
+    assert_eq!(lidar.len(), 8 + 2 * frame);
+    assert_eq!(f64_at(&lidar, 8), 100.0);
+    assert_eq!(u32_at(&lidar, 16), 2);
+    let p1 = 8 + 12 + 24;
+    assert_eq!(f32_at(&lidar, p1), 2.0); // x
+    assert_eq!(f32_at(&lidar, p1 + 12), 7.0); // intensity
+    assert!((f32_at(&lidar, p1 + 16) - 0.05).abs() < 1e-7); // t_rel
+    assert_eq!(u32_at(&lidar, p1 + 20), 5); // ring
+    assert!((f64_at(&lidar, 8 + frame) - 100.1).abs() < 1e-9);
+}
+
+#[test]
+fn export_glim_missing_folder_fails() {
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .args(["export-glim", "/nonexistent/driftless", "-o"])
+        .arg(tmp("missing").join("out"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nicht gefunden"));
+}

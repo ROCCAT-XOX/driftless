@@ -12,3 +12,7 @@
 *.amx
 /data/
 /testdata/local/
+
+# GLIM spike: locally built dependencies and run outputs
+spikes/glim/.deps/
+spikes/glim/out/
