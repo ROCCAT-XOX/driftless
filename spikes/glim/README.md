@@ -87,17 +87,41 @@ spikes/glim/.deps/prefix/bin/glim_driftless spikes/glim/out/hilti/config <tmp>/i
 driftless compare <tmp>/dump/traj_imu.txt $DRIFTLESS_TESTDATA/hilti2022/exp14_basement_2_imu.txt --max-dt 0.05
 ```
 
+Standard-Konfiguration (nur Extrinsik geändert), Treiber mit bis zu 10 Frames Rückstand:
+
 | Lauf | ATE | Laufzeit | Spitzen-RAM |
 |---|---|---|---|
 | Standard, 8 Threads (3 Läufe) | 0,62 / 0,79 / 1,18 m | 3,9–4,1 s (+ Export 5,2 s) | 407–427 MB |
-| 1 Thread (Vorverarbeitung + Odometrie) | 0,75 m (reproduzierbar) | 9,5–10,3 s | ≈ 520 MB |
+| 1 Thread (Vorverarbeitung + Odometrie) | 0,75 m | 9,5–10,3 s | ≈ 520 MB |
 | 1 Thread, `initialization_mode` LOOSE | 0,46 m | 9,2 s | 537 MB |
 | 1 Thread, Voxel 0,25 m, 20 000 Punkte | 1,04 m | 14,7 s | 813 MB |
 
-- Mit 8 Threads ist das Ergebnis **nicht reproduzierbar** (auf JMK6 war es das).
-- Der Fehler entsteht in den ersten ≈ 13 s (schnelles Anheben und Loslaufen), danach bleibt er gleich.
-  GLIM meldet laufend „IMU prediction is not good / T_lidar_imu is not accurate“; die Rust-Grundlinie kommt mit
-  derselben Extrinsik auf 0,074 m. Ursache nicht weiter untersucht.
+Befund Initialisierung: Das Gerät steht ≈ 6 s still. `ROBUST` (Standard, 3-s-Fenster) schätzt trotzdem
+`v_world_imu ≈ (0, 0, −0,23) m/s` und Bias 0; die ersten 3 s fehlen in der Ausgabe (Initialisierungsfenster).
+Daher eingerichtet (zusätzlich zur Extrinsik):
+
+- `config_odometry_cpu.json`: `"initialization_mode": "NAIVE"`, `"initialization_window_size": 1.0`
+  (Schwerkraft aus dem Mittel der Beschleunigung, Geschwindigkeit 0).
+- `config_sensors.json`: `"imu_bias": [0.0608, 0.0835, 0.0571, -0.00154, -0.00134, 0.00030]`
+  (`bias_a`, `bias_g` aus `lidar_calibration.yaml`); `imu_acc_noise` 0,01, `imu_gyro_noise` 0,002
+  (geschätzt, die Kalibrierung enthält keine Rauschwerte).
+- Treiber: `DRIFTLESS_GLIM_MAX_LAG=0` (Umgebungsvariable). GLIMs Odometrie-Thread verarbeitet vor jedem Frame alle
+  bis dahin eingespeisten IMU-Daten; mit Rückstand hängt das Ergebnis (z. B. auf welchem Frame die
+  Initialisierung landet) vom Thread-Timing ab. Standard bleibt 10 (JMK6-Ergebnis unverändert, bytegleich).
+
+| Lauf (`MAX_LAG=0`) | ATE | Start↔Ende (21,303) | Laufzeit | Spitzen-RAM |
+|---|---|---|---|---|
+| `ROBUST`, 1 Thread (2 Läufe gleich) | 0,746 m | 18,62 m | 15,6 s | 475 MB |
+| `NAIVE` + Bias, 1 Thread (2 Läufe gleich) | 0,346 m | 21,43 m | 14,9 s | ≈ 450 MB |
+| `NAIVE` + Bias + Rauschwerte, 1 Thread (2 Läufe gleich) | **0,326 m** | 21,48 m | 14,6 s | 462 MB |
+| `NAIVE` + Bias, 8 Threads (3 Läufe) | 0,45 / 0,54 / 0,37 m | 20,6–21,5 m | 6,4–6,7 s | 387–417 MB |
+| `NAIVE` + Bias + Rauschwerte, 8 Threads (2 Läufe) | 0,35 / 0,58 m | 21,38 m | 6,5 s | 387–414 MB |
+| `ROBUST`, 8 Threads (2 Läufe) | 0,43 / 0,64 m | 20,2–21,1 m | 6,8 s | 391–396 MB |
+
+- Mit 8 Threads bleibt das Ergebnis auch Frame für Frame **nicht reproduzierbar** (auf JMK6 war es das).
+- Nach der Einrichtung hat der Start keinen Sprung mehr (0,1–0,4 m); der Restfehler wächst in den letzten ≈ 15 s bis 0,6 m.
+  GLIM meldet weiter zeitweise „IMU prediction is not good“. Ursache offen; die Rust-Grundlinie kommt mit
+  derselben Extrinsik auf 0,074 m.
 
 ## Aufbau
 

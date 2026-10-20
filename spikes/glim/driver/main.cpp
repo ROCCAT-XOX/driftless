@@ -4,6 +4,7 @@
 //
 // Usage: glim_driftless <config_dir> <input_dir> <dump_dir> [module_dir]
 
+#include <cstdlib>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -187,6 +188,13 @@ int main(int argc, char** argv) {
     for (const auto& s : sub_mapping.get_results()) global_mapping.insert_submap(s);
   };
 
+  // Frames the estimator may lag behind. GLIM's odometry thread consumes all IMU data queued so
+  // far before each frame, so with a lag > 0 the result depends on thread timing (e.g. which frame
+  // the IMU initialisation lands on). DRIFTLESS_GLIM_MAX_LAG=0 feeds strictly in step (reproducible).
+  const char* lag_env = std::getenv("DRIFTLESS_GLIM_MAX_LAG");
+  const int max_lag = lag_env ? std::atoi(lag_env) : 10;
+  spdlog::info("max_lag={}", max_lag);
+
   size_t next_imu = 0, frames = 0, skipped = 0;
   while (auto raw = read_frame(lidar)) {
     // IMU must cover the whole scan (relative point times up to ~0.1 s).
@@ -204,7 +212,7 @@ int main(int argc, char** argv) {
     odometry.insert_frame(preprocessor.preprocess(raw));
     frames++;
     // Offline playback: do not run ahead of the estimator.
-    while (odometry.workload() > 10) {
+    while (odometry.workload() > max_lag) {
       forward_results();
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
