@@ -1,0 +1,21 @@
+[package]
+name = "driftless-odom"
+description = "Driftless: Odometrie und SLAM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+driftless-io = { path = "../driftless-io" }
+driftless-traj = { path = "../driftless-traj" }
+kiddo = { version = "6", default-features = false }
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+rayon = "1"
+
+[dev-dependencies]
+driftless-io = { path = "../driftless-io", features = ["test-util"] }

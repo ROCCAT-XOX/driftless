@@ -1,0 +1,26 @@
+[package]
+name = "driftless-io"
+description = "Driftless: Datei-Ein- und Ausgabe (Bags, Trajektorien, Punktwolken)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Exposes `bag::writer::BagWriter` (test helper) to other crates' tests.
+test-util = []
+
+[dependencies]
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+# Self dev-dependency: enables `test-util` for the integration tests in tests/.
+driftless-io = { path = ".", features = ["test-util"] }

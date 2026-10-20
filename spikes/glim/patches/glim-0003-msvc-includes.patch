@@ -1,0 +1,24 @@
+diff --git a/include/glim/util/extension_module.hpp b/include/glim/util/extension_module.hpp
+index 2825ce5..65d0aee 100644
+--- a/include/glim/util/extension_module.hpp
++++ b/include/glim/util/extension_module.hpp
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <string>
++
+ #include <memory>
+ 
+ namespace glim {
+diff --git a/include/glim/util/load_module.hpp b/include/glim/util/load_module.hpp
+index f1a57c5..8353f22 100644
+--- a/include/glim/util/load_module.hpp
++++ b/include/glim/util/load_module.hpp
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <string>
++
+ #include <memory>
+ 
+ namespace glim {

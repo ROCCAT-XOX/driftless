@@ -1,0 +1,36 @@
+{
+  "camera_info": {
+    "left": {
+      "K": [400.5, 0.0, 320.25, 0.0, 401.5, 240.75, 0.0, 0.0, 1.0],
+      "camera_model": "fisheyeKB",
+      "coeff": [0.01, -0.02, 0.003, -0.0004],
+      "extrinsics": {"rotation": [0.1, 0.2, 0.3], "translation": [0.01, 0.02, 0.03]},
+      "image_width": 640,
+      "image_height": 480
+    },
+    "right": {
+      "K": [410.0, 0.0, 330.0, 0.0, 411.0, 250.0, 0.0, 0.0, 1.0],
+      "camera_model": "fisheyeKB",
+      "coeff": [0.05, -0.06, 0.007, -0.0008],
+      "extrinsics": {"rotation": [0.4, 0.5, 0.6], "translation": [0.04, 0.05, 0.06]},
+      "image_width": 640,
+      "image_height": 480
+    }
+  },
+  "device": {"SN": "TEST0000001", "model": "TESTMODEL"},
+  "initial_guess": {
+    "left": {"x": 1.0, "y": 2.0, "z": 3.0, "r_deg": 4.0, "p_deg": 5.0, "y_deg": 6.0}
+  },
+  "out_put": {
+    "left": {
+      "EulerFormResult": {"x": 0.1, "y": 0.2, "z": 0.3, "r_deg": 1.0, "p_deg": 2.0, "y_deg": 3.0},
+      "transform_matrix": [
+        [1.0, 2.0, 3.0, 4.0],
+        [5.0, 6.0, 7.0, 8.0],
+        [9.0, 10.0, 11.0, 12.0],
+        [0.0, 0.0, 0.0, 1.0]
+      ]
+    }
+  },
+  "some_future_field": {"ignored": true}
+}
