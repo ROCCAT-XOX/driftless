@@ -34,6 +34,7 @@ Build with `cargo build --release`; the binary is `driftless`. Folder arguments 
 | `driftless inspect <folder> [--json]` | Report on a scan: device, duration, topics with counts and rates, problems |
 | `driftless view <folder> [--traj t.tum] [--lidar-topic T] [--imu-topic T]` | Debug viewer (rerun): point clouds, IMU, camera images, optional trajectory |
 | `driftless odom <folder> -o <dir> [--lidar-to-imu x y z qx qy qz qw]` | LiDAR-IMU odometry (Rust baseline); writes `traj.tum` and `map.las` |
+| `driftless slam <folder> -o <dir> [--lidar-to-imu x y z qx qy qz qw] [--lidar-topic T] [--imu-topic T]` | SLAM with automatic loop closure; writes `traj.tum` (corrected), `traj_odom.tum` (before), `map.las` and `slam.json` (submaps, loop checks, graph) |
 | `driftless export-glim <folder> -o <dir>` | Writes `imu.bin` and `lidar.bin` for the GLIM spike (`spikes/glim/`) |
 | `driftless compare <a.tum> <b.tum> [--json]` | Trajectory yardstick: ATE after alignment, path length, start-to-end gap |
 

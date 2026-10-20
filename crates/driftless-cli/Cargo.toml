@@ -18,6 +18,7 @@ workspace = true
 clap = { version = "4", features = ["derive"] }
 driftless-io = { path = "../driftless-io" }
 driftless-odom = { path = "../driftless-odom" }
+driftless-slam = { path = "../driftless-slam" }
 driftless-traj = { path = "../driftless-traj" }
 las = "0.11"
 serde = { version = "1", features = ["derive"] }

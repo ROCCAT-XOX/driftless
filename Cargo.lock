@@ -1070,6 +1070,7 @@ dependencies = [
  "clap",
  "driftless-io",
  "driftless-odom",
+ "driftless-slam",
  "driftless-traj",
  "las",
  "predicates",
@@ -1114,9 +1115,13 @@ dependencies = [
 name = "driftless-slam"
 version = "0.1.0"
 dependencies = [
+ "driftless-graph",
+ "driftless-io",
  "driftless-odom",
  "driftless-traj",
  "nalgebra",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

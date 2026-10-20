@@ -78,6 +78,14 @@ pub struct LoopCheck {
     pub manual: bool,
 }
 
+/// A loop the user marks by hand: the places at times `a_t` and `b_t` (seconds since the
+/// start of the scan) are the same. Handled by [`crate::solve`] from Task 6 on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManualLoop {
+    pub a_t: f64,
+    pub b_t: f64,
+}
+
 /// Coarse-to-fine correspondence distances of the verification ICP (m).
 const STAGES: [f64; 3] = [1.0, 0.5, 0.25];
 /// Largest difference between the two registration directions (m, rad).

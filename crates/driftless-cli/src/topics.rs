@@ -1,4 +1,4 @@
-//! Topic selection for the commands that read sensor streams (`odom`, `export-glim`).
+//! Topic selection for the commands that read sensor streams (`odom`, `slam`, `export-glim`).
 
 use driftless_io::bag::{BagError, BagReader};
 use std::collections::BTreeSet;
