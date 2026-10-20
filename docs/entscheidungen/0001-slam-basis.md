@@ -1,6 +1,6 @@
 # 0001 – SLAM-Basis: GLIM oder eigener Rust-Kern
 
-Stand: 2026-10-20 · Status: **Vorschlag, Entscheidung durch Yannick offen**
+Stand: 2026-10-20 · Status: **Angenommen** (Yannick, 20.10.2026): eigener Rust-Kern, GLIM nur als Vergleich
 
 ## Frage
 
