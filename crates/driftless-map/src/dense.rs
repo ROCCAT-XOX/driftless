@@ -25,7 +25,10 @@ pub struct DenseConfig {
     pub max_range: f64,
     /// Points closer to the LiDAR are left out (operator, device) (m).
     pub min_range: f64,
-    /// Every `ray_step`-th point in range of each frame goes into the [`RaySource`].
+    /// Every `ray_step`-th point in range of each frame goes into the [`RaySource`], starting
+    /// at point `frame index mod ray_step`: the start rotates from frame to frame so that a
+    /// step sharing a factor with the ring count does not leave out the same rings in every
+    /// frame.
     pub ray_step: usize,
 }
 
@@ -150,7 +153,7 @@ impl VoxelCloud {
 /// `odom_cfg` as the SLAM run) and places every deskewed sweep with its corrected body pose
 /// `corrected[index]` (one per used frame, e.g. the SLAM `traj.tum`). Each point keeps the
 /// intensity of its LiDAR return and the frame's end time. Also returns every
-/// [`DenseConfig::ray_step`]-th point per frame as [`RaySource`].
+/// [`DenseConfig::ray_step`]-th point per frame (rotating start) as [`RaySource`].
 ///
 /// Fails if `corrected` does not belong to these frames (count or times differ).
 pub fn build_dense(
@@ -198,10 +201,11 @@ pub fn build_dense(
             .collect();
         rays.sensor
             .push(to_f32(&(pose * Point3::from(origin)).coords));
+        let first_ray = f.index % cfg.ray_step;
         let mut k = 0usize;
         for (p, &i) in placed.iter().zip(f.intensity) {
             let Some(p) = p else { continue };
-            if k.is_multiple_of(cfg.ray_step) {
+            if k % cfg.ray_step == first_ray {
                 rays.ends.push(to_f32(&p.world));
             }
             k += 1;

@@ -1113,6 +1113,7 @@ dependencies = [
  "driftless-odom",
  "driftless-slam",
  "driftless-traj",
+ "kiddo",
  "las",
  "nalgebra",
  "rayon",

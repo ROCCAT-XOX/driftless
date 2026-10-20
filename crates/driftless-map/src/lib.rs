@@ -3,12 +3,15 @@
 //! [`build_dense`] runs the (deterministic) odometry again over the same frames, so every
 //! deskewed sweep comes back in the body frame, and places it with the SLAM-corrected pose of
 //! that frame. One point is kept per voxel: the one seen from closest, since near points are
-//! the most accurate. [`write_las`] and [`write_ply`] write the [`Cloud`].
+//! the most accurate. [`clean`] removes ghosts (things that moved) and isolated outliers;
+//! [`write_las`] and [`write_ply`] write the [`Cloud`].
 
+mod clean;
 mod cloud;
 mod dense;
 mod export;
 
+pub use clean::{clean, find_ghosts, find_outliers, CleanConfig, CleanStats};
 pub use cloud::Cloud;
 pub use dense::{build_dense, DenseConfig, DenseStats, RaySource};
 pub use export::{write_las, write_ply};

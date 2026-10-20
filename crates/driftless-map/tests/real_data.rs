@@ -1,6 +1,7 @@
 //! Dense cloud of a real JMK6 scan in `$DRIFTLESS_TESTDATA` (see `docs/testdaten.md`): SLAM,
 //! trajectory through a TUM file (as `traj.tum` of `driftless slam`), then the dense cloud
-//! and LAS/PLY. Prints point count and timings; skips when the data is missing.
+//! and LAS/PLY, and its cleaning. Prints point counts and timings; skips when the data is
+//! missing.
 //!
 //! `cargo test --release -p driftless-map --test real_data -- --ignored --nocapture`
 
@@ -8,7 +9,7 @@ use driftless_io::bag::BagReader;
 use driftless_io::msg::{decode_imu, decode_pointcloud2, ImuSample, LidarFrame};
 use driftless_io::project::discover_project;
 use driftless_io::testdata;
-use driftless_map::{build_dense, write_las, write_ply, DenseConfig};
+use driftless_map::{build_dense, clean, write_las, write_ply, CleanConfig, DenseConfig};
 use driftless_slam::{run_slam, SlamConfig};
 use driftless_traj::{read_tum, write_tum};
 use std::path::{Path, PathBuf};
@@ -112,5 +113,52 @@ fn jmk6_scan_143623_dense_cloud() {
     );
     assert_eq!(stats.frames, corrected.len());
     assert!(stats.points > 100_000);
+    std::fs::remove_dir_all(&out).unwrap();
+}
+
+#[test]
+#[ignore = "needs DRIFTLESS_TESTDATA"]
+fn jmk6_scan_143623_clean() {
+    let Some(folder) = testdata::path("jmk6-2026-10-20/20261020143623").filter(|p| p.exists())
+    else {
+        eprintln!("SKIPPED: {} not set or scan missing", testdata::ENV_VAR);
+        return;
+    };
+    let bags = discover_project(&folder).unwrap().lidar_bags;
+    let imu = read_imu(&bags);
+    let cfg = SlamConfig::default();
+    let (slam, _) = with_frames(&bags, |frames| run_slam(frames, &imu, &cfg));
+    let (cloud, rays, _) = with_frames(&bags, |frames| {
+        build_dense(
+            frames,
+            &imu,
+            &cfg.odom,
+            &slam.poses(),
+            &DenseConfig::default(),
+        )
+    })
+    .unwrap();
+    let points = cloud.len();
+
+    let start = Instant::now();
+    let (kept, removed, stats) = clean(cloud, &rays, &CleanConfig::default()).unwrap();
+    let clean_s = start.elapsed().as_secs_f64();
+    println!(
+        "143623: clean {clean_s:.1} s; {points} points, {} rays -> {} kept, {} ghosts, {} \
+         outliers",
+        rays.ends.len(),
+        stats.kept,
+        stats.ghosts,
+        stats.outliers,
+    );
+    let out = std::env::temp_dir().join(format!("driftless-map-clean-{}", std::process::id()));
+    std::fs::create_dir_all(&out).unwrap();
+    write_las(&out.join("clean.las"), &kept).unwrap();
+    write_las(&out.join("removed.las"), &removed).unwrap();
+    assert_eq!(kept.len() + removed.len(), points);
+    assert!(
+        stats.kept > points * 9 / 10,
+        "cleaning removed more than 10 %"
+    );
     std::fs::remove_dir_all(&out).unwrap();
 }

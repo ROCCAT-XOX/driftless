@@ -189,9 +189,55 @@ fn dense_voxel_keeps_nearest() {
     assert_eq!(cloud.frame, vec![1]);
     assert_eq!(cloud.t, vec![1.6]);
     assert!((cloud.xyz[0][0] - 3.013).abs() < 1e-5);
-    // Every frame's single point is a ray (index 0 is always taken).
-    assert_eq!(rays.ends.len(), 4);
-    assert_eq!(rays.frame_start, vec![0, 1, 2, 3, 4]);
+    // Frame f takes points f mod 4, f mod 4 + 4, ...: of these one-point frames only frame 0
+    // gives a ray.
+    assert_eq!(rays.ends.len(), 1);
+    assert_eq!(rays.frame_start, vec![0, 1, 1, 1, 1]);
+}
+
+/// With `ray_step` 4, frame f takes points f mod 4, f mod 4 + 4, ...: a step that shares a
+/// factor with the ring count does not miss the same rings in every frame.
+#[test]
+fn dense_ray_subset_rotates() {
+    let still = Walk {
+        still: 100.0,
+        speed: 0.0,
+    };
+    let imu = imu_samples(&still, 0.0, 3.0, 200.0);
+    let point = |k: usize| [2.0 + 0.5 * k as f32, 0.3, 0.1];
+    let frames: Vec<LidarFrame> = (0..5)
+        .map(|f| LidarFrame {
+            stamp: 1.5 + 0.1 * f as f64,
+            points: (0..4)
+                .map(|k| LidarPoint {
+                    xyz: point(k),
+                    intensity: 1.0,
+                    ring: k as u16,
+                    t_rel: 0.0,
+                })
+                .collect(),
+            dropped: 0,
+        })
+        .collect();
+    let corrected: Vec<Pose> = (0..5)
+        .map(|f| pose(1.5 + 0.1 * f as f64, &Isometry3::identity()))
+        .collect();
+    let (_, rays, _) = build_dense(
+        frames.into_iter(),
+        &imu,
+        &OdomConfig::default(),
+        &corrected,
+        &DenseConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(rays.frame_start, vec![0, 1, 2, 3, 4, 5]);
+    for (f, end) in rays.ends.iter().enumerate() {
+        let want = point(f % 4);
+        assert!(
+            (0..3).all(|a| (end[a] - want[a]).abs() < 1e-4),
+            "frame {f}: {end:?}"
+        );
+    }
 }
 
 /// Every dense point keeps the intensity of its own return, also when the odometry and the
