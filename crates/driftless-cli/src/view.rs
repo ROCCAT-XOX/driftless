@@ -12,6 +12,10 @@ use driftless_traj::read_tum;
 use std::path::PathBuf;
 
 const TIMELINE: &str = "stamp";
+/// With `--slam`: seconds since the start of the scan, the times `driftless correct` expects.
+const SCAN_TIMELINE: &str = "ab_scan_beginn";
+/// Slack when comparing times read from `traj.tum` (9 decimals) with `slam.json`.
+const TIME_TOLERANCE: f64 = 1e-6;
 const CLOUD_TYPE: &str = "sensor_msgs/PointCloud2";
 const IMU_TYPE: &str = "sensor_msgs/Imu";
 const COMPRESSED_IMAGE_TYPE: &str = "sensor_msgs/CompressedImage";
@@ -112,7 +116,7 @@ fn load_slam(dir: &std::path::Path) -> Result<SlamView, BoxError> {
         .map_err(|e| format!("{} nicht lesbar: {e}", json_path.display()))?;
     let report: SlamReport = serde_json::from_str(&text).map_err(|e| {
         format!(
-            "{} ist kein gültiger SLAM-Bericht: {e}",
+            "{} ist kein gültiger SLAM-Bericht: {e}; mit `driftless slam` neu erzeugen",
             json_path.display()
         )
     })?;
@@ -132,18 +136,16 @@ fn xyz64(p: [f64; 3]) -> [f32; 3] {
 }
 
 /// One line strip per submap: a pose belongs to the last submap that started at or before
-/// it (times are seconds since the first pose). Each strip also ends on the first point of
-/// the next one, so the coloured line has no gaps. Submaps without poses are skipped.
+/// it (within [`TIME_TOLERANCE`]). Each strip also ends on the first point of the next one,
+/// so the coloured line has no gaps. Submaps without poses are skipped.
 fn trajectory_strips(view: &SlamView) -> (Vec<Vec<[f32; 3]>>, Vec<[u8; 3]>) {
     let submaps = &view.report.submaps;
-    let Some(t0) = view.corrected.first().map(|p| p.t) else {
-        return (Vec::new(), Vec::new());
-    };
+    let t0 = view.report.scan_start;
     let mut groups: Vec<Vec<[f32; 3]>> = vec![Vec::new(); submaps.len()];
     for pose in &view.corrected {
         let t = pose.t - t0;
         let idx = submaps
-            .partition_point(|m| m.t_start <= t)
+            .partition_point(|m| m.t_start <= t + TIME_TOLERANCE)
             .saturating_sub(1);
         if let Some(g) = groups.get_mut(idx) {
             g.push(xyz(pose));
@@ -232,8 +234,13 @@ fn log_slam(rec: &rerun::RecordingStream, view: &SlamView) -> Result<(), BoxErro
     Ok(())
 }
 
-fn set_stamp(rec: &rerun::RecordingStream, stamp: f64) {
+/// Sets the time of the next log calls: the bag stamp and, with `--slam`, the seconds since
+/// the start of the scan.
+fn set_stamp(rec: &rerun::RecordingStream, stamp: f64, scan_start: Option<f64>) {
     rec.set_duration_secs(TIMELINE, stamp);
+    if let Some(t0) = scan_start {
+        rec.set_duration_secs(SCAN_TIMELINE, stamp - t0);
+    }
 }
 
 /// Topics to show from one bag.
@@ -302,6 +309,7 @@ fn log_bag(
     rec: &rerun::RecordingStream,
     plan: &BagPlan,
     every: u32,
+    scan_start: Option<f64>,
     counts: &mut Counts,
     warnings: &mut Vec<String>,
 ) -> Result<(), BoxError> {
@@ -334,7 +342,7 @@ fn log_bag(
         if topic == plan.lidar.as_ref() {
             match decode_pointcloud2(&msg.data) {
                 Ok(f) => {
-                    set_stamp(rec, f.stamp);
+                    set_stamp(rec, f.stamp, scan_start);
                     rec.log(
                         "lidar/points",
                         &rerun::Points3D::new(f.points.iter().map(|p| p.xyz))
@@ -347,7 +355,7 @@ fn log_bag(
         } else if topic == plan.imu.as_ref() {
             match decode_imu(&msg.data) {
                 Ok(s) => {
-                    set_stamp(rec, s.stamp);
+                    set_stamp(rec, s.stamp, scan_start);
                     for (i, axis) in ["x", "y", "z"].iter().enumerate() {
                         rec.log(
                             format!("imu/gyro/{axis}"),
@@ -371,7 +379,7 @@ fn log_bag(
             }
             match decode_compressed_image(&msg.data) {
                 Ok(img) => {
-                    set_stamp(rec, img.stamp);
+                    set_stamp(rec, img.stamp, scan_start);
                     rec.log(
                         camera_entity(&msg.topic),
                         &rerun::EncodedImage::from_file_contents(img.data),
@@ -432,9 +440,17 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
     if let Some(view) = &slam {
         log_slam(&rec, view)?;
     }
+    let scan_start = slam.as_ref().map(|v| v.report.scan_start);
     let mut counts = Counts::default();
     for plan in &plans {
-        log_bag(&rec, plan, args.every, &mut counts, &mut warnings)?;
+        log_bag(
+            &rec,
+            plan,
+            args.every,
+            scan_start,
+            &mut counts,
+            &mut warnings,
+        )?;
     }
     rec.flush_blocking()?;
     for w in &warnings {
@@ -444,6 +460,11 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
         "{} LiDAR-Frames, {} IMU-Messungen, {} Kamerabilder geloggt",
         counts.lidar, counts.imu, counts.images
     );
+    if slam.is_some() {
+        println!(
+            "Zeitleiste {SCAN_TIMELINE}: Sekunden ab Scan-Beginn, wie `driftless correct loop` sie erwartet"
+        );
+    }
     if let Some(file) = &args.dry_run {
         println!("Aufzeichnung geschrieben: {}", file.display());
     }
@@ -452,7 +473,56 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{camera_entity, quality_color};
+    use super::{camera_entity, quality_color, trajectory_strips, SlamView};
+    use driftless_slam::report::{BeforeAfter, SlamReport, SubmapReport};
+    use driftless_traj::nalgebra::{UnitQuaternion, Vector3};
+    use driftless_traj::Pose;
+
+    /// A pose on a submap start, rounded below it by the 9 decimals of `traj.tum`, belongs
+    /// to that submap.
+    #[test]
+    fn trajectory_strips_tolerate_rounded_times() {
+        let sm = |id: usize, t_start: f64, quality: f32| SubmapReport {
+            id,
+            t_start,
+            t_end: t_start + 0.5,
+            quality,
+            anchor: [0.0; 3],
+            odom_anchor: [0.0; 3],
+        };
+        let none = BeforeAfter {
+            before: 0.0,
+            after: 0.0,
+        };
+        let scan_start = 1000.25;
+        let pose = |t: f64, x: f64| Pose {
+            t,
+            p: Vector3::new(x, 0.0, 0.0),
+            q: UnitQuaternion::identity(),
+        };
+        let view = SlamView {
+            report: SlamReport {
+                scan_start,
+                submaps: vec![sm(0, 0.0, 1.0), sm(1, 0.6, 0.0)],
+                loops: Vec::new(),
+                graph: None,
+                start_end_gap: none.clone(),
+                path_length: none,
+            },
+            // the second pose is the first frame of submap 1, written 0.4 ns early
+            corrected: vec![
+                pose(scan_start, 0.0),
+                pose(scan_start + 0.6 - 4e-10, 1.0),
+                pose(scan_start + 1.0, 2.0),
+            ],
+            odometry: Vec::new(),
+        };
+        let (strips, colors) = trajectory_strips(&view);
+        assert_eq!(colors, [quality_color(1.0), quality_color(0.0)]);
+        assert_eq!(strips[0].len(), 2, "{strips:?}");
+        assert_eq!(strips[1].len(), 2, "{strips:?}");
+        assert_eq!(strips[1][0], [1.0, 0.0, 0.0]);
+    }
 
     #[test]
     fn quality_color_endpoints() {

@@ -41,7 +41,7 @@ fn submaps() -> (Vec<Submap>, Vec<Isometry3<f64>>) {
             id,
             anchor: iso(id as f64 * 5.0, id as f64),
             frames,
-            points: vec![[-0.0, 1.0 / 3.0, 7.5], [1e-30, -2.5, f32::MAX]],
+            points: vec![[-0.0, 1.0 / 3.0, 7.5], [1e-30, -2.5, 1.0e6]],
         });
     }
     let odom = out
@@ -179,4 +179,25 @@ fn cache_rejects_unusable_submaps() {
         load_cache(&path, "x").unwrap_err(),
         CacheError::Invalid(_)
     ));
+}
+
+/// Finite but absurd coordinates (beyond 1000 km) are damage, not data.
+#[test]
+fn cache_rejects_huge_coordinates() {
+    let path = tmp("huge-coord");
+    type Damage = fn(&mut Vec<Submap>, &mut Vec<Isometry3<f64>>);
+    let damage: [Damage; 4] = [
+        |s, _| s[0].anchor.translation.y = 1.0e7,
+        |_, o| o[1].translation.z = -2.0e6,
+        |s, _| s[2].frames[1].offset.translation.x = 1.0e300,
+        |s, _| s[1].points[0][0] = -3.0e6,
+    ];
+    for (k, f) in damage.iter().enumerate() {
+        let (mut s, mut odom) = submaps();
+        f(&mut s, &mut odom);
+        save_cache(&path, &s, &odom, "x").unwrap();
+        let e = load_cache(&path, "x").unwrap_err();
+        assert!(matches!(e, CacheError::Invalid(_)), "{k}: {e:?}");
+        assert!(e.to_string().contains("beschädigt"), "{k}: {e}");
+    }
 }

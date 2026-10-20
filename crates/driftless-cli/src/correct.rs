@@ -20,7 +20,7 @@ enum Action {
     /// Alle Korrekturen nummeriert mit Status
     List,
     /// Manuelle Schleife: die Stellen zu zwei Zeiten (Sekunden ab Scan-Beginn, wie in slam.json
-    /// und im Viewer) sind derselbe Ort
+    /// und im Viewer auf der Zeitleiste ab_scan_beginn) sind derselbe Ort
     #[command(allow_negative_numbers = true)]
     Loop {
         /// Erste Zeit (s ab Scan-Beginn)
@@ -66,6 +66,15 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         Action::Disable { nr } | Action::Enable { nr } => {
             let enable = matches!(args.action, Action::Enable { .. });
             let state = if enable { "aktiv" } else { "deaktiviert" };
+            // Switching an entry back on is checked like a new loop against the active ones.
+            if let Some(l) = c
+                .loops
+                .get(nr.wrapping_sub(1))
+                .filter(|l| enable && !l.enabled)
+            {
+                check_new_loop(&args.target, &c, l.a, l.b)
+                    .map_err(|e| format!("Eintrag {nr} nicht eingeschaltet: {e}"))?;
+            }
             if c.set_enabled(*nr, enable)? {
                 c.save(&path)?;
                 println!("Eintrag {nr} ist jetzt {state}");

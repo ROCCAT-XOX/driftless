@@ -219,7 +219,8 @@ fn loop_sequence_slam_not_worse() {
     assert!(slam <= 0.0553 * 1.2, "ATE SLAM {slam}");
 }
 
-/// JMK6 `Test` (266 s) against RayStudio `trj.txt` (a comparison, not ground truth).
+/// JMK6 `Test` (266 s) against RayStudio `trj.txt` (a comparison, not ground truth); a second
+/// full run gives the same result.
 #[test]
 #[ignore = "needs DRIFTLESS_TESTDATA"]
 fn jmk6_slam_not_worse_than_odom() {
@@ -227,7 +228,14 @@ fn jmk6_slam_not_worse_than_odom() {
         return;
     };
     let run = slam(&folder, Isometry3::identity());
+    let again = slam(&folder, Isometry3::identity());
     summary("Test", &run);
+    assert!(same_poses(&run.result.poses(), &again.result.poses()));
+    assert!(same_poses(
+        &run.result.odom_poses(),
+        &again.result.odom_poses()
+    ));
+    assert_eq!(run.result.loops, again.result.loops);
     let (odom, slam) = ate("Test", &run, &read_tum(&rs).unwrap());
     assert!(slam <= odom * 1.05, "ATE SLAM {slam} vs odometry {odom}");
     assert!(slam <= 0.0183 * 1.2, "ATE SLAM {slam}");
@@ -285,11 +293,12 @@ fn jmk6_scan_143415_deterministic() {
     assert_eq!(a.result.loops, b.result.loops);
 }
 
-/// New JMK6 scan without reference (108 s) that ends where it started: SLAM is deterministic
-/// and keeps the start-end gap at the measured value.
+/// New JMK6 scan without reference (108 s) that ends where it started: SLAM is deterministic,
+/// closes at least one loop and does not widen the start-end gap of the odometry (at most
+/// 2 mm more), which stays near the measured value.
 #[test]
 #[ignore = "needs DRIFTLESS_TESTDATA"]
-fn jmk6_scan_143623_closes() {
+fn jmk6_scan_143623_gap_not_worse() {
     let Some(folder) = data("jmk6-2026-10-20/20261020143623") else {
         return;
     };
@@ -299,6 +308,11 @@ fn jmk6_scan_143623_closes() {
     assert!(same_poses(&a.result.poses(), &b.result.poses()));
     assert_eq!(a.result.loops, b.result.loops);
     assert!(accepted > 0);
+    let gap_odom = start_end_gap(&a.result.odom_poses());
     let gap = start_end_gap(&a.result.poses());
+    assert!(
+        gap <= gap_odom + 0.002,
+        "start-end gap {gap} m vs odometry {gap_odom} m"
+    );
     assert!(gap <= 0.024 * 1.2 + 0.01, "start-end gap {gap} m");
 }

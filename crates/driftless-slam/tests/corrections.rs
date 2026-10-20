@@ -55,6 +55,50 @@ fn corrections_append_and_disable_keep_history() {
     assert!(c.set_enabled(0, false).is_err());
 }
 
+#[test]
+fn corrections_save_replaces_file_without_leftovers() {
+    let dir = std::env::temp_dir().join(format!("driftless-corr-save-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("corrections.toml");
+    let mut c = Corrections::default();
+    c.add_loop(1.0, 2.0, "", "2026-10-20T10:00:00Z");
+    c.save(&path).unwrap();
+    c.add_loop(3.0, 4.0, "", "2026-10-20T10:01:00Z");
+    c.save(&path).unwrap();
+    assert_eq!(Corrections::load(&path).unwrap(), c);
+    let names: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, ["corrections.toml"]);
+
+    // a folder that does not exist: German error naming the file
+    let e = c
+        .save(&dir.join("fehlt").join("corrections.toml"))
+        .unwrap_err();
+    assert!(e.contains("corrections.toml nicht schreibbar"), "{e}");
+}
+
+#[test]
+fn corrections_unknown_keys_are_errors() {
+    let dir = std::env::temp_dir().join(format!("driftless-corr-unknown-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("corrections.toml");
+    for text in [
+        // mistyped key inside an entry
+        "[[loop]]\na = 1.0\nb = 2.0\nenabled = true\nnotiz = \"Treppe\"\n",
+        // mistyped table name
+        "[[schleife]]\na = 1.0\nb = 2.0\nenabled = true\n",
+    ] {
+        fs::write(&path, text).unwrap();
+        let e = Corrections::load(&path).unwrap_err();
+        assert!(e.contains("nicht lesbar"), "{e}");
+        assert!(e.contains("corrections.toml"), "{e}");
+    }
+}
+
 fn planar(x: f64, y: f64, yaw: f64) -> Isometry3<f64> {
     Isometry3::from_parts(
         Translation3::new(x, y, 0.0),

@@ -34,6 +34,9 @@ const POINT_BYTES: usize = 3 * 4;
 const SUBMAP_MIN_BYTES: usize = 8 + 2 * ISO_BYTES + 8 + 8;
 /// Largest deviation of a stored quaternion from unit length.
 const MAX_QUAT_NORM_ERROR: f64 = 1e-6;
+/// Largest absolute coordinate (m) of a position, offset or point. Far beyond any scan; a
+/// larger value is damage and would only produce inf and NaN in the pose graph.
+const MAX_COORD: f64 = 1e6;
 
 const HINT: &str = "`driftless slam` ohne `--reuse` neu laufen lassen";
 
@@ -209,6 +212,16 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// A finite coordinate within [`MAX_COORD`].
+    fn coord(&mut self, what: &'static str) -> Result<f64, CacheError> {
+        let v = self.finite(what)?;
+        if v.abs() <= MAX_COORD {
+            Ok(v)
+        } else {
+            Err(CacheError::Invalid(what))
+        }
+    }
+
     /// A count of records of at least `record` bytes each that must fit into the rest.
     fn count(&mut self, record: usize) -> Result<usize, CacheError> {
         let n = self.u64()?;
@@ -222,8 +235,12 @@ impl<'a> Reader<'a> {
     fn iso(&mut self) -> Result<Isometry3<f64>, CacheError> {
         const WHAT: &str = "ungültige Pose";
         let mut v = [0.0; 7];
-        for x in &mut v {
-            *x = self.finite(WHAT)?;
+        for (i, x) in v.iter_mut().enumerate() {
+            *x = if i < 3 {
+                self.coord(WHAT)?
+            } else {
+                self.finite(WHAT)?
+            };
         }
         let q = Quaternion::new(v[6], v[3], v[4], v[5]);
         if (q.norm() - 1.0).abs() > MAX_QUAT_NORM_ERROR {
@@ -293,7 +310,10 @@ fn parse(bytes: &[u8]) -> Result<CacheContents, CacheError> {
                 f32::from_le_bytes(r.array()?),
                 f32::from_le_bytes(r.array()?),
             ];
-            if !p.iter().all(|v| v.is_finite()) {
+            if !p
+                .iter()
+                .all(|v| v.is_finite() && f64::from(v.abs()) <= MAX_COORD)
+            {
                 return Err(CacheError::Invalid("ungültiger Punkt"));
             }
             points.push(p);

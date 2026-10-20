@@ -46,6 +46,13 @@ fn slam_writes_all_outputs() {
 
     let json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(out.join("slam.json")).unwrap()).unwrap();
+    // absolute start of the scan: the stamp of the first pose (bags start at 1000 s)
+    let scan_start = json["scan_start"].as_f64().unwrap();
+    assert!(
+        (scan_start - traj[0].t).abs() < 1e-6,
+        "scan_start {scan_start}"
+    );
+    assert!(traj[0].t >= 1000.0, "{}", traj[0].t);
     let submaps = json["submaps"].as_array().unwrap();
     assert_eq!(submaps.len(), 1);
     assert_eq!(submaps[0]["t_start"], 0.0);

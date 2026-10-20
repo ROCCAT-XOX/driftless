@@ -23,7 +23,9 @@ use std::path::Path;
 const HEADER: &str = "# Driftless-Korrekturen. Zeiten in Sekunden ab Scan-Beginn.\n\
 # Bearbeiten mit `driftless correct`; Einträge werden nur angehängt oder deaktiviert.\n\n";
 
+/// Unknown keys (e.g. a mistyped hand edit) are an error instead of being dropped silently.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Corrections {
     #[serde(rename = "loop", default)]
     pub loops: Vec<LoopEntry>,
@@ -31,6 +33,7 @@ pub struct Corrections {
 
 /// One manual loop: the places at times `a` and `b` are the same.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoopEntry {
     pub a: f64,
     pub b: f64,
@@ -53,9 +56,14 @@ impl Corrections {
         toml::from_str(&text).map_err(|e| format!("{} nicht lesbar: {e}", path.display()))
     }
 
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        let body = toml::to_string(self).map_err(io::Error::other)?;
-        fs::write(path, format!("{HEADER}{body}"))
+    /// Writes `path`. The file is written next to it first and then renamed, so an
+    /// interrupted write never leaves half a file behind.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let fail = |e: &dyn std::fmt::Display| format!("{} nicht schreibbar: {e}", path.display());
+        let body = toml::to_string(self).map_err(|e| fail(&e))?;
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, format!("{HEADER}{body}")).map_err(|e| fail(&e))?;
+        fs::rename(&tmp, path).map_err(|e| fail(&e))
     }
 
     /// Appends an active loop and returns its number (1-based, as `driftless correct list`

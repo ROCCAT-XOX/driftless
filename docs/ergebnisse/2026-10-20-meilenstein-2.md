@@ -4,13 +4,15 @@ Stand: 2026-10-20 · gemessen auf dem MacBook Pro M4 Pro, Release-Build, Standar
 
 ## Kurzfassung
 
-- `driftless slam` läuft auf allen fünf Aufnahmen durch, bitgleich bei jedem Lauf und mit `--reuse`
-  (gleiche `traj.tum` wie der volle Lauf).
+- `driftless slam` läuft auf allen fünf Aufnahmen durch. Zwei volle Läufe sind bitgleich (geprüft
+  auf den drei JMK6-Aufnahmen; die Hilti-Aufnahmen liefen je einmal), und `--reuse` liefert dieselbe
+  Laufbahn wie der volle Lauf (geprüft auf JMK6 `Test`).
 - **Keine falsche Schleife** wurde übernommen. Alle übernommenen Schleifen verschieben die
   Odometrie um höchstens 1,3 cm und 0,2°.
 - **Die Odometrie ist auf diesen Aufnahmen schon so gut, dass der Schleifenschluss kaum etwas
-  zu korrigieren hat.** ATE bleibt gleich (Hilti exp14, exp04) oder ändert sich um 0,5 mm
-  (JMK6 `Test`, Vergleich mit RayStudio). Eine Verbesserung durch den Schleifenschluss lässt sich mit
+  zu korrigieren hat.** ATE bleibt gleich (Hilti exp14, exp04); bei JMK6 `Test`
+  (Vergleich mit RayStudio) ist sie um 0,5 mm schlechter als die Odometrie (0,0178 → 0,0183 m).
+  Das liegt unter der Aussagegrenze von ≈ 2 mm, ist also nicht messbar verschlechtert. Eine Verbesserung durch den Schleifenschluss lässt sich mit
   diesen Daten **nicht zeigen**; geprüft ist, dass er nichts verschlechtert.
 - Schwellwert `min_inlier_ratio` von 0,5 auf **0,25** gesenkt (Begründung unten): mehr echte
   Schleifen (JMK6 `Test` 1 → 15, `143623` 3 → 10, `143415` 0 → 2), keine falsche dazu.
@@ -116,9 +118,10 @@ Schleifen“ verworfen, und keine übernommene Schleife war falsch.
   (`143415`, 0 ↔ 3; dort zusätzlich von „schlecht bestimmt“ bzw. „nicht konvergiert“ abgefangen),
   bei `Test` 0,065. 0,25 hält diese allein über den Anteil heraus; 0,15 oder weniger verließe sich
   bei `143415` nur noch auf die anderen Prüfungen.
-- **ATE:** exp14 und exp04 unverändert. `Test` 0,0180 → 0,0183 m (+0,3 mm). Das liegt innerhalb der
-  Streuung aller Varianten (0,0172–0,0199 m) und ist ein Vergleich mit RayStudio, keine Wahrheit;
-  als Verschlechterung werten wir es nicht. Werte unter 0,25 bringen auf exp04 (Wahrheit) +0,2 bis
+- **ATE:** exp14 und exp04 unverändert. `Test` gegenüber dem bisherigen Schwellwert 0,50:
+  0,0180 → 0,0183 m (+0,3 mm); gegenüber der Odometrie: 0,0178 → 0,0183 m (+0,5 mm schlechter).
+  Beides liegt unter der Aussagegrenze von ≈ 2 mm (Vergleich mit RayStudio, keine Wahrheit) und
+  innerhalb der Streuung aller Varianten (0,0172–0,0199 m), ist also nicht messbar verschlechtert. Werte unter 0,25 bringen auf exp04 (Wahrheit) +0,2 bis
   +0,6 mm.
 - Manuelle Schleifen haben ihren eigenen Schwellwert `manual_min_inlier_ratio` (0,25, unverändert).
 
@@ -136,16 +139,18 @@ Sonst wurde nichts verstellt.
 ## Tests
 
 `crates/driftless-slam/tests/real_data.rs`, alle `#[ignore]`, überspringen sauber ohne Daten:
-`cargo test --release -p driftless-slam -- --ignored --nocapture` (≈ 70 s).
+`cargo test --release -p driftless-slam -- --ignored --nocapture` (gemessen 37 s nach fertigem
+Build). Die Tests laufen parallel, die Dauer bestimmt exp04; die Laufzeiten, die die Tests ausgeben,
+sind deshalb länger als die Einzelläufe der Tabelle oben. Mit `--test-threads=1` dauert es länger.
 
 | Test | prüft |
 |---|---|
 | `exp14_slam_not_worse` | ATE SLAM ≤ Odometrie × 1,05 und ≤ 0,074 m × 1,2 |
 | `loop_sequence_slam_not_worse` | exp04: ATE an den Kontrollpunkten SLAM ≤ Odometrie × 1,05 und ≤ 0,0553 m × 1,2; gibt Abweichung je Kontrollpunkt aus |
-| `jmk6_slam_not_worse_than_odom` | `Test` gegen `trj.txt`: ATE SLAM ≤ Odometrie × 1,05 und ≤ 0,0183 m × 1,2 |
+| `jmk6_slam_not_worse_than_odom` | `Test` gegen `trj.txt`: ATE SLAM ≤ Odometrie × 1,05 und ≤ 0,0183 m × 1,2; zwei volle Läufe bitgleich (Laufbahn, Odometrie, Schleifenprüfungen) |
 | `jmk6_reuse_under_10_s` | `Test`: Zwischenspeicher lesen, Graph lösen, Ausgaben bilden < 10 s (gemessen 2,8–3,1 s), gleiche Laufbahn wie voller Lauf |
 | `jmk6_scan_143415_deterministic` | zwei Läufe bitgleich (Laufbahn und Schleifenprüfungen) |
-| `jmk6_scan_143623_closes` | zwei Läufe bitgleich, mindestens eine Schleife, Start↔Ende ≤ 0,024 m × 1,2 + 0,01 m |
+| `jmk6_scan_143623_gap_not_worse` | zwei Läufe bitgleich, mindestens eine Schleife, Start↔Ende nach dem Schleifenschluss ≤ Odometrie + 2 mm und ≤ 0,024 m × 1,2 + 0,01 m |
 
 ## Einschränkungen
 

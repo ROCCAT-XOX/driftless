@@ -173,7 +173,68 @@ fn correct_loop_then_reuse() {
         "{toml}"
     );
 
+    // while entry 1 is off, the same pair may be entered again; switching 1 back on would
+    // then join the same submaps twice and is refused like `loop`
+    correct(&out, &["loop", "2.0", "10.5"])
+        .success()
+        .stdout(predicate::str::contains("Eintrag 2 angehängt"));
+    let toml = fs::read_to_string(out.join("corrections.toml")).unwrap();
+    correct(&out, &["enable", "1"])
+        .failure()
+        .stderr(predicate::str::contains("Eintrag 1 nicht eingeschaltet"))
+        .stderr(predicate::str::contains("doppelte Schleife"));
+    assert_eq!(
+        fs::read_to_string(out.join("corrections.toml")).unwrap(),
+        toml
+    );
+    correct(&out, &["disable", "2"]).success();
+
     correct(&out, &["enable", "1"]).success();
     slam(&dir, &out, true).success();
     assert_eq!(slam_json(&out)["loops"].as_array().unwrap().len(), 1);
+}
+
+/// A correction that no longer fits fails the full run only after the cache is written: the
+/// message says how to switch it off and recompute.
+#[test]
+fn full_run_with_bad_correction_hints_disable_and_reuse() {
+    let dir = tmp("bad-correction");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    // the scan is 1.5 s long
+    fs::write(
+        out.join("corrections.toml"),
+        "[[loop]]\na = 0.5\nb = 30.0\nenabled = true\n",
+    )
+    .unwrap();
+    slam(&dir, &out, false)
+        .failure()
+        .stderr(predicate::str::contains("außerhalb des Scans"))
+        .stderr(predicate::str::contains("disable <nr>"))
+        .stderr(predicate::str::contains("--reuse"));
+    assert!(out.join("submaps.bin").exists());
+    correct(&out, &["disable", "1"]).success();
+    slam(&dir, &out, true).success();
+}
+
+/// Write errors name the file.
+#[test]
+fn write_errors_name_the_file() {
+    let dir = tmp("write-errors");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    // a folder in the way of the cache
+    fs::create_dir_all(out.join("submaps.bin").join("x")).unwrap();
+    slam(&dir, &out, false)
+        .failure()
+        .stderr(predicate::str::contains("submaps.bin nicht schreibbar"));
+    fs::remove_dir_all(out.join("submaps.bin")).unwrap();
+
+    slam(&dir, &out, false).success();
+    fs::create_dir_all(out.join("traj.vorher.tum").join("x")).unwrap();
+    slam(&dir, &out, true)
+        .failure()
+        .stderr(predicate::str::contains("traj.tum nicht in"))
+        .stderr(predicate::str::contains("traj.vorher.tum umbenennbar"));
 }

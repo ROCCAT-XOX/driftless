@@ -49,14 +49,17 @@ pub struct Args {
 
 /// What the cache depends on: names and sizes of the LiDAR bags, the chosen topics and the
 /// settings.
-fn input_id(bags: &[PathBuf], args: &Args, cfg: &SlamConfig) -> Result<String, std::io::Error> {
+fn input_id(bags: &[PathBuf], args: &Args, cfg: &SlamConfig) -> Result<String, String> {
     let mut id = String::new();
     for bag in bags {
         let name = bag
             .file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_default();
-        id += &format!("{name} {}\n", fs::metadata(bag)?.len());
+        let len = fs::metadata(bag)
+            .map_err(|e| format!("{} nicht lesbar: {e}", bag.display()))?
+            .len();
+        id += &format!("{name} {len}\n");
     }
     id += &format!(
         "lidar_topic {:?}\nimu_topic {:?}\n{cfg:?}\n",
@@ -79,13 +82,29 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let cache = args.out.join(CACHE_FILE);
     let corrections = Corrections::load(&args.out.join(CORRECTIONS_FILE))?;
     let manual = corrections.manual_loops();
+    // A bad correction fails only in `solve`; the cache is written by then.
+    let solve_hint = |e: driftless_slam::ManualLoopError| {
+        format!(
+            "{e}\nKorrektur mit `driftless correct {out} list` suchen, mit `driftless correct {out} \
+             disable <nr>` abschalten und `driftless slam` mit denselben Angaben und `--reuse` \
+             erneut starten (der Zwischenspeicher ist geschrieben)",
+            out = args.out.display(),
+        )
+    };
 
     let result = if args.reuse {
         let (submaps, odom_anchors) = load_cache(&cache, &input)?;
-        let result = solve(submaps, odom_anchors, &manual, &cfg)?;
+        let result = solve(submaps, odom_anchors, &manual, &cfg).map_err(solve_hint)?;
         let traj = args.out.join("traj.tum");
+        let previous = args.out.join("traj.vorher.tum");
         if traj.exists() {
-            fs::rename(&traj, args.out.join("traj.vorher.tum"))?;
+            fs::rename(&traj, &previous).map_err(|e| {
+                format!(
+                    "{} nicht in {} umbenennbar: {e}",
+                    traj.display(),
+                    previous.display()
+                )
+            })?;
         }
         println!(
             "Zwischenspeicher {CACHE_FILE}: {} Teilkarten, {} manuelle Schleifen",
@@ -102,8 +121,9 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             })?;
         require_frames(&stats)?;
         let odom_anchors: Vec<_> = submaps.iter().map(|m| m.anchor).collect();
-        save_cache(&cache, &submaps, &odom_anchors, &input)?;
-        let result = solve(submaps, odom_anchors, &manual, &cfg)?;
+        save_cache(&cache, &submaps, &odom_anchors, &input)
+            .map_err(|e| format!("Zwischenspeicher {} nicht schreibbar: {e}", cache.display()))?;
+        let result = solve(submaps, odom_anchors, &manual, &cfg).map_err(solve_hint)?;
         warn_if_not_static(&stats);
         println!(
             "{} Posen aus {} LiDAR-Frames ({} übersprungen), {} IMU-Messungen, \

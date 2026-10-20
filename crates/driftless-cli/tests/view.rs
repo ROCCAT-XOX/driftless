@@ -209,6 +209,7 @@ fn slam_output(name: &str) -> PathBuf {
         rms: 0.1,
     };
     let report = SlamReport {
+        scan_start: 100.0,
         submaps: vec![
             sm(0, 0.0, 1.0, 0.0),
             sm(1, 2.0, 0.5, 2.0),
@@ -254,19 +255,30 @@ fn slam_output(name: &str) -> PathBuf {
 fn view_slam_logs_quality_and_loops() {
     let dir = hilti_style_project("slam", true);
     let out = slam_output("slam-out");
-    view(&dir, &["--slam", out.to_str().unwrap()]).success();
+    view(&dir, &["--slam", out.to_str().unwrap()])
+        .success()
+        .stdout(predicate::str::contains("Zeitleiste ab_scan_beginn"));
     let rrd = fs::read(dir.join("out.rrd")).unwrap();
+    let has = |name: &str| rrd.windows(name.len()).any(|w| w == name.as_bytes());
     for entity in [
         "slam/trajectory",
         "slam/odometry",
         "slam/loops",
         "slam/anchors",
+        // the timeline of the correction times
+        "ab_scan_beginn",
     ] {
-        assert!(
-            rrd.windows(entity.len()).any(|w| w == entity.as_bytes()),
-            "{entity} fehlt in der Aufzeichnung"
-        );
+        assert!(has(entity), "{entity} fehlt in der Aufzeichnung");
     }
+
+    // without --slam there is no scan start, so no such timeline
+    view(&dir, &[])
+        .success()
+        .stdout(predicate::str::contains("ab_scan_beginn").not());
+    let rrd = fs::read(dir.join("out.rrd")).unwrap();
+    assert!(!rrd
+        .windows("ab_scan_beginn".len())
+        .any(|w| w == b"ab_scan_beginn"));
 }
 
 #[test]

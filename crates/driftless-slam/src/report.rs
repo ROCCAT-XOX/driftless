@@ -1,5 +1,5 @@
 //! `slam.json`: what the SLAM run did, for the user and the viewer. Times are seconds since
-//! the start of the scan ([`scan_start`]).
+//! the start of the scan ([`scan_start`]), which is stored as an absolute stamp as well.
 
 use crate::loops::{LoopVerdict, POSITION_ONLY};
 use crate::pipeline::SlamResult;
@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlamReport {
+    /// [`scan_start`] as an absolute stamp (s, the clock of the bags): bag time minus this is
+    /// the time `driftless correct` expects.
+    pub scan_start: f64,
     pub submaps: Vec<SubmapReport>,
     /// Every verified loop candidate, sorted by `(b, a)`.
     pub loops: Vec<LoopReport>,
@@ -113,6 +116,7 @@ impl SlamReport {
             .collect();
         let (before, after) = (r.odom_poses(), r.poses());
         SlamReport {
+            scan_start: t0,
             submaps,
             loops,
             graph: r.graph.as_ref().map(|g| GraphReport {
