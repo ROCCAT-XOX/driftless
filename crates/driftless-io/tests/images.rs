@@ -124,3 +124,22 @@ fn image_stream_counts_bad_images() {
     assert_eq!(n, 1);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn oversized_header_is_rejected_without_allocating() {
+    // Take a valid JPEG and patch the SOF0 dimensions to 16000x16000.
+    let mut jpg = solid_jpeg(64, 48, [1, 2, 3]);
+    let sof = jpg
+        .windows(2)
+        .position(|w| w == [0xFF, 0xC0])
+        .expect("SOF0 marker");
+    // marker(2) length(2) precision(1) height(2) width(2)
+    jpg[sof + 5..sof + 7].copy_from_slice(&16000u16.to_be_bytes());
+    jpg[sof + 7..sof + 9].copy_from_slice(&16000u16.to_be_bytes());
+    let start = std::time::Instant::now();
+    assert!(matches!(decode_jpeg(&jpg, 1), Err(ImageError::Jpeg(_))));
+    assert!(start.elapsed().as_millis() < 500);
+    // Zero dimensions are rejected as well.
+    jpg[sof + 5..sof + 9].copy_from_slice(&[0, 0, 0, 0]);
+    assert!(decode_jpeg(&jpg, 1).is_err());
+}

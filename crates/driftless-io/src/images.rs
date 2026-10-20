@@ -11,6 +11,8 @@ use zune_jpeg::JpegDecoder;
 
 /// Maximum number of images decoded concurrently (and therefore held in memory).
 const MAX_WORKERS: usize = 4;
+/// Largest accepted JPEG side length; guards against huge allocations from crafted headers.
+const MAX_DIMENSION: usize = 8192;
 
 /// Errors produced while decoding an image.
 #[derive(Debug, thiserror::Error)]
@@ -55,15 +57,28 @@ pub fn decode_jpeg(bytes: &[u8], downscale: u32) -> Result<RgbImage, ImageError>
     if !matches!(downscale, 1 | 2 | 4) {
         return Err(ImageError::Downscale(downscale));
     }
-    let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+    let options = DecoderOptions::default()
+        .jpeg_set_out_colorspace(ColorSpace::RGB)
+        .set_max_width(MAX_DIMENSION)
+        .set_max_height(MAX_DIMENSION);
     let mut dec = JpegDecoder::new_with_options(ZCursor::new(bytes), options);
-    let pixels = dec
-        .decode()
+    // Read the header first so oversized images are rejected before any pixel allocation.
+    dec.decode_headers()
         .map_err(|e| ImageError::Jpeg(format!("{e:?}")))?;
     let (w, h) = dec
         .dimensions()
         .ok_or_else(|| ImageError::Jpeg("keine Bildgröße".into()))?;
-    if pixels.len() != w * h * 3 {
+    if w == 0 || h == 0 || w > MAX_DIMENSION || h > MAX_DIMENSION {
+        return Err(ImageError::Jpeg(format!("Bildgröße {w}x{h} nicht erlaubt")));
+    }
+    let expected = w
+        .checked_mul(h)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| ImageError::Jpeg("Bild zu groß".into()))?;
+    let pixels = dec
+        .decode()
+        .map_err(|e| ImageError::Jpeg(format!("{e:?}")))?;
+    if pixels.len() != expected {
         return Err(ImageError::Jpeg("unerwartete Pixelanzahl".into()));
     }
     if downscale == 1 {
