@@ -14,9 +14,15 @@
 //!    [`ColorConfig::views_per_point`] best views; its colour is their weighted mean in
 //!    linear RGB, written as sRGB.
 //!
+//! Before the blend, each view's colour is divided by its image's exposure and white-balance
+//! gain (see [`crate::exposure`]), fitted on the kept views.
+//!
 //! Points no image sees get a gray from their intensity and `colored = false`.
 
 use crate::clean::spread_axes;
+use crate::exposure::{
+    apply_gains, estimate_gains, sample_observations, view_spread, ExposureConfig, ImageGain,
+};
 use crate::sharpness::sharpness;
 use crate::visibility::{visible_points, PointGrid, Seen};
 use crate::{Cloud, MapError};
@@ -100,6 +106,8 @@ pub struct ColorConfig {
     pub max_angular_rate: f64,
     /// Views kept and blended per point.
     pub views_per_point: usize,
+    /// Exposure and white balance between the images.
+    pub exposure: ExposureConfig,
 }
 
 impl Default for ColorConfig {
@@ -113,6 +121,7 @@ impl Default for ColorConfig {
             min_sharpness: 0.4,
             max_angular_rate: 1.0,
             views_per_point: 3,
+            exposure: ExposureConfig::default(),
         }
     }
 }
@@ -144,11 +153,11 @@ impl ColorConfig {
         if self.views_per_point == 0 {
             return bad("Ansichten je Punkt müssen mindestens 1 sein");
         }
-        Ok(())
+        self.exposure.check()
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ColorStats {
     /// Images that passed every check and were projected.
     pub images_used: usize,
@@ -160,6 +169,16 @@ pub struct ColorStats {
     pub images_bad: usize,
     pub points_colored: usize,
     pub points_uncolored: usize,
+    /// Gain of every used image, in (capture time, camera name) order.
+    pub gains: Vec<ImageGain>,
+    /// Smallest and largest gain over all used images and channels (1 without images).
+    pub gain_min: f32,
+    pub gain_max: f32,
+    /// Mean colour spread between the views of a point before and after the equalisation:
+    /// standard deviation of the blended views' colours per channel, in sRGB units (0–255),
+    /// averaged over the channels and over the points with at least 2 views.
+    pub spread_before: f64,
+    pub spread_after: f64,
 }
 
 /// What the quality pass found for one image of the stream.
@@ -377,15 +396,20 @@ fn linear_table() -> [f32; 256] {
     })
 }
 
-/// Linear value → sRGB byte.
-fn to_srgb(l: f32) -> u8 {
+/// Linear value → sRGB in 0–255, not rounded.
+pub(crate) fn srgb_value(l: f32) -> f64 {
     let l = f64::from(l.clamp(0.0, 1.0));
     let c = if l <= 0.003_130_8 {
         12.92 * l
     } else {
         1.055 * l.powf(1.0 / 2.4) - 0.055
     };
-    (c * 255.0).round().clamp(0.0, 255.0) as u8
+    c * 255.0
+}
+
+/// Linear value → sRGB byte.
+fn to_srgb(l: f32) -> u8 {
+    srgb_value(l).round().clamp(0.0, 255.0) as u8
 }
 
 /// Bilinear sample of `img` at pixel `uv` (pixel centres at integers), in linear RGB.
@@ -431,10 +455,12 @@ fn view_weight(
 
 /// One kept view of a point; `weight == 0` marks an empty slot.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct View {
-    weight: f32,
-    rank: u32,
-    rgb: [f32; 3],
+pub(crate) struct View {
+    pub(crate) weight: f32,
+    /// The image's position in (capture time, camera name) order.
+    pub(crate) rank: u32,
+    /// Linear RGB.
+    pub(crate) rgb: [f32; 3],
 }
 
 const EMPTY: View = View {
@@ -620,6 +646,38 @@ pub fn colorize(
             return Err(e);
         }
     }
+
+    // Exposure and white balance, fitted on the kept views. Images by rank.
+    let mut used: Vec<&ImageRecord> = records
+        .iter()
+        .filter(|r| matches!(r.status, Status::Used { .. }))
+        .collect();
+    used.sort_by_key(|r| match r.status {
+        Status::Used { rank, .. } => rank,
+        _ => unreachable!("only used images"),
+    });
+    stats.spread_before = view_spread(&slots, k);
+    let gains = if cfg.exposure.samples == 0 {
+        vec![[1.0; 3]; used.len()]
+    } else {
+        let cameras = used.iter().map(|r| r.camera).collect();
+        let obs = sample_observations(&slots, k, cameras, cfg.exposure.samples);
+        estimate_gains(&obs, &cfg.exposure)
+    };
+    apply_gains(&mut slots, &gains);
+    stats.spread_after = view_spread(&slots, k);
+    let all = gains.iter().flatten();
+    stats.gain_min = all.clone().copied().reduce(f32::min).unwrap_or(1.0);
+    stats.gain_max = all.copied().reduce(f32::max).unwrap_or(1.0);
+    stats.gains = used
+        .iter()
+        .zip(&gains)
+        .map(|(r, g)| ImageGain {
+            camera: cams[r.camera].camera.name.clone(),
+            stamp: r.stamp,
+            gain: *g,
+        })
+        .collect();
 
     let grays = intensity_grays(&cloud.intensity);
     let (rgb, colored): (Vec<[u8; 3]>, Vec<bool>) = slots

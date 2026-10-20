@@ -5,13 +5,15 @@
 //! that frame. One point is kept per voxel: the one seen from closest, since near points are
 //! the most accurate. [`clean`] removes ghosts (things that moved) and isolated outliers;
 //! [`colorize`] colours it from the camera images (visibility by depth buffer, image quality,
-//! weighted blend of the best views); [`write_las`] and [`write_ply`] write the [`Cloud`].
+//! exposure and white balance between the images, weighted blend of the best views);
+//! [`write_las`] and [`write_ply`] write the [`Cloud`].
 
 mod clean;
 mod cloud;
 mod color;
 mod dense;
 mod export;
+mod exposure;
 mod sharpness;
 pub mod visibility;
 
@@ -20,6 +22,7 @@ pub use cloud::Cloud;
 pub use color::{colorize, ColorCamera, ColorConfig, ColorStats, ImageSource};
 pub use dense::{build_dense, DenseConfig, DenseStats, RaySource};
 pub use export::{write_las, write_ply};
+pub use exposure::{estimate_gains, ExposureConfig, ImageGain, Observations, DARK, SATURATED};
 pub use sharpness::sharpness;
 
 #[derive(Debug, thiserror::Error)]

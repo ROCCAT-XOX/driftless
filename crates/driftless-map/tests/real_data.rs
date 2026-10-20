@@ -232,6 +232,10 @@ fn jmk6_scan_143623_color() {
         stats.images_outside_trajectory,
         stats.images_bad,
     );
+    println!(
+        "143623: gains {:.3}…{:.3}; view spread {:.2} → {:.2} (sRGB 0–255)",
+        stats.gain_min, stats.gain_max, stats.spread_before, stats.spread_after,
+    );
     match std::env::var_os("DRIFTLESS_COLOR_OUT") {
         Some(dir) => {
             let out = PathBuf::from(dir);
@@ -249,4 +253,5 @@ fn jmk6_scan_143623_color() {
     }
     assert!(stats.images_used > 0);
     assert!(stats.points_colored > cloud.len() / 2);
+    assert!(stats.spread_after < stats.spread_before);
 }
