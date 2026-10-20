@@ -3,6 +3,7 @@ use driftless_io::bag::writer::{BagWriter, Compression};
 use driftless_io::bag::Time;
 use driftless_io::msg::encode::{encode_compressed_image, encode_imu, encode_pointcloud2};
 use driftless_io::msg::{CompressedImage, ImuSample, LidarPoint};
+use predicates::prelude::*;
 use std::fs;
 use std::path::PathBuf;
 
@@ -85,6 +86,104 @@ fn view_dry_run_writes_rrd() {
         .assert()
         .success();
     assert!(fs::metadata(&rrd).unwrap().len() > 0);
+}
+
+/// Hilti-style topic names; raw `sensor_msgs/Image` topic present (not shown, only warned).
+fn hilti_style_project(name: &str, with_lidar: bool) -> PathBuf {
+    let dir = tmp(name);
+    let mut w = BagWriter::new(Compression::None);
+    let lc = w.add_connection("/hesai/pandar", "sensor_msgs/PointCloud2");
+    let ic = w.add_connection("/alphasense/imu", "sensor_msgs/Imu");
+    let cc = w.add_connection(
+        "/alphasense/cam0/image_raw/compressed",
+        "sensor_msgs/CompressedImage",
+    );
+    w.add_connection("/alphasense/cam1/image_raw", "sensor_msgs/Image");
+    for i in 0..4 {
+        let s = 100.0 + i as f64 * 0.1;
+        if with_lidar {
+            let pts = [LidarPoint {
+                xyz: [1.0, 2.0, 3.0],
+                intensity: 1.0,
+                ring: 0,
+                t_rel: 0.0,
+            }];
+            w.write_message(lc, time(s), &encode_pointcloud2(s, "l", &pts));
+        }
+        let m = ImuSample {
+            stamp: s,
+            gyro: [0.0; 3],
+            accel: [0.0, 0.0, 9.81],
+        };
+        w.write_message(ic, time(s), &encode_imu(&m));
+        let img = CompressedImage {
+            stamp: s,
+            format: "jpeg".into(),
+            data: vec![0xff, 0xd8, 0xff, 0xd9],
+        };
+        w.write_message(cc, time(s), &encode_compressed_image(&img));
+    }
+    fs::write(dir.join("LIDAR_0.bag"), w.finish()).unwrap();
+    dir
+}
+
+fn view(dir: &std::path::Path, extra: &[&str]) -> assert_cmd::assert::Assert {
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .arg("view")
+        .arg(dir)
+        .args(extra)
+        .arg("--dry-run")
+        .arg(dir.join("out.rrd"))
+        .assert()
+}
+
+#[test]
+fn view_shows_non_jmk6_topics() {
+    let dir = hilti_style_project("hilti", true);
+    view(&dir, &["--every", "1"])
+        .success()
+        .stdout(predicate::str::contains("4 LiDAR-Frames"))
+        .stdout(predicate::str::contains("4 IMU-Messungen"))
+        .stdout(predicate::str::contains("4 Kamerabilder"))
+        .stderr(predicate::str::contains("sensor_msgs/Image-Topics"))
+        .stderr(predicate::str::contains("/alphasense/cam1/image_raw"));
+}
+
+#[test]
+fn view_without_lidar_topic_is_error_before_opening_output() {
+    let dir = hilti_style_project("no-lidar", false);
+    // The bag still has the PointCloud2 connection but we drop it by asking for a wrong name.
+    view(&dir, &["--lidar-topic", "/nope"])
+        .failure()
+        .stderr(predicate::str::contains("Fehler"))
+        .stderr(predicate::str::contains("/nope"))
+        .stderr(predicate::str::contains("/hesai/pandar"));
+    assert!(!dir.join("out.rrd").exists());
+
+    let mut w = BagWriter::new(Compression::None);
+    let ic = w.add_connection("/imu", "sensor_msgs/Imu");
+    let m = ImuSample {
+        stamp: 1.0,
+        gyro: [0.0; 3],
+        accel: [0.0, 0.0, 9.81],
+    };
+    w.write_message(ic, time(1.0), &encode_imu(&m));
+    let dir = tmp("really-no-lidar");
+    fs::write(dir.join("LIDAR_0.bag"), w.finish()).unwrap();
+    view(&dir, &[])
+        .failure()
+        .stderr(predicate::str::contains("PointCloud2"));
+    assert!(!dir.join("out.rrd").exists());
+}
+
+#[test]
+fn view_bad_trajectory_fails_before_opening_output() {
+    let dir = hilti_style_project("bad-traj", true);
+    let traj = dir.join("traj.txt");
+    fs::write(&traj, "not a trajectory\n").unwrap();
+    view(&dir, &["--traj", traj.to_str().unwrap()]).failure();
+    assert!(!dir.join("out.rrd").exists());
 }
 
 /// Real recording; prints runtime. Run with `cargo test -- --ignored --nocapture`.
