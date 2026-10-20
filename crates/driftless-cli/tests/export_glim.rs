@@ -164,3 +164,94 @@ fn export_glim_normalises_absolute_point_times_and_selects_topic() {
     assert_eq!(f32_at(&lidar, 20 + 16), 0.0);
     assert!((f32_at(&lidar, 20 + 24 + 16) - 0.05).abs() < 1e-6);
 }
+
+/// Small bag: `n` LiDAR frames on `/lidar` (if `lidar`), `n * 5` IMU samples on `/imu`.
+fn small_bag(comp: Compression, per_chunk: usize, lidar: bool, n: usize) -> Vec<u8> {
+    let mut w = BagWriter::new(comp).messages_per_chunk(per_chunk);
+    let lc = w.add_connection("/lidar", "sensor_msgs/PointCloud2");
+    let ic = w.add_connection("/imu", "sensor_msgs/Imu");
+    for i in 0..n * 5 {
+        let s = 100.0 + i as f64 * 0.01;
+        let imu = ImuSample {
+            stamp: s,
+            gyro: [0.0; 3],
+            accel: [0.0, 0.0, 9.81],
+        };
+        w.write_message(ic, time(s), &encode_imu(&imu));
+        if lidar && i % 5 == 0 {
+            let pts = [point(1.0, 0, 0.0), point(2.0, 1, 0.01)];
+            w.write_message(lc, time(s), &encode_pointcloud2(s, "l", &pts));
+        }
+    }
+    w.finish()
+}
+
+fn export(dir: &std::path::Path, extra: &[&str]) -> assert_cmd::assert::Assert {
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .arg("export-glim")
+        .arg(dir)
+        .arg("-o")
+        .arg(dir.join("out"))
+        .args(extra)
+        .assert()
+}
+
+#[test]
+fn export_glim_fails_on_unsupported_compression() {
+    let dir = tmp("bz2");
+    fs::write(
+        dir.join("LIDAR_0.bag"),
+        small_bag(Compression::Labelled("bz2"), 10, true, 4),
+    )
+    .unwrap();
+    export(&dir, &[])
+        .failure()
+        .stderr(predicate::str::contains("Fehler"))
+        .stderr(predicate::str::contains("bz2"));
+}
+
+#[test]
+fn export_glim_truncated_bag_warns_and_keeps_data() {
+    let dir = tmp("truncated");
+    let mut bytes = small_bag(Compression::None, 5, true, 10);
+    bytes.truncate(bytes.len() * 7 / 10);
+    fs::write(dir.join("LIDAR_0.bag"), bytes).unwrap();
+    export(&dir, &[])
+        .success()
+        .stderr(predicate::str::contains("Warnung"))
+        .stderr(predicate::str::contains("truncated"));
+    let lidar = fs::read(dir.join("out/lidar.bin")).unwrap();
+    assert!(lidar.len() > 8);
+}
+
+#[test]
+fn export_glim_unknown_topic_names_are_errors() {
+    let dir = tmp("unknown-topic");
+    fs::write(
+        dir.join("LIDAR_0.bag"),
+        small_bag(Compression::None, 10, true, 2),
+    )
+    .unwrap();
+    export(&dir, &["--lidar-topic", "/nope"])
+        .failure()
+        .stderr(predicate::str::contains("/nope"))
+        .stderr(predicate::str::contains("/lidar"));
+    export(&dir, &["--imu-topic", "/nope"])
+        .failure()
+        .stderr(predicate::str::contains("/nope"))
+        .stderr(predicate::str::contains("/imu"));
+}
+
+#[test]
+fn export_glim_without_lidar_frames_fails() {
+    let dir = tmp("no-lidar");
+    fs::write(
+        dir.join("LIDAR_0.bag"),
+        small_bag(Compression::None, 10, false, 2),
+    )
+    .unwrap();
+    export(&dir, &[])
+        .failure()
+        .stderr(predicate::str::contains("keine LiDAR-Frames"));
+}

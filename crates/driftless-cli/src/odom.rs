@@ -3,7 +3,7 @@
 //!
 //! The IMU is read first (small), the LiDAR frames are then streamed from a reader thread.
 
-use crate::topics::pick_topic;
+use crate::topics::{bag_read_error, file_name, TopicPicker};
 use driftless_io::bag::BagReader;
 use driftless_io::msg::{decode_imu, decode_pointcloud2, ImuSample, LidarFrame};
 use driftless_io::project::discover_project;
@@ -40,8 +40,8 @@ pub struct Args {
 }
 
 /// Calls `f` with every message of `msg_type` in `bags` until it returns `false`, from the
-/// topic chosen by [`pick_topic`]. A read error (truncated copy) ends that bag with a warning;
-/// everything before it is kept. Fails if no bag has a matching topic.
+/// topic chosen by [`TopicPicker`]. A truncated bag ends with a warning (everything before the
+/// cut is kept); any other read error fails. An explicit topic no bag has fails.
 fn for_each_message(
     bags: &[PathBuf],
     msg_type: &str,
@@ -49,13 +49,12 @@ fn for_each_message(
     option: &str,
     mut f: impl FnMut(&[u8]) -> bool,
 ) -> Result<(), String> {
-    let mut found = false;
+    let mut picker = TopicPicker::new(msg_type, wanted, option);
     for bag in bags {
-        let mut reader = BagReader::open(bag).map_err(|e| format!("{}: {e}", bag.display()))?;
-        let Some(topic) = pick_topic(&reader, msg_type, wanted, option)? else {
+        let mut reader = BagReader::open(bag).map_err(|e| format!("{}: {e}", file_name(bag)))?;
+        let Some(topic) = picker.pick(&reader)? else {
             continue;
         };
-        found = true;
         for item in reader.messages(&[topic.as_str()]) {
             match item {
                 Ok(m) => {
@@ -64,16 +63,13 @@ fn for_each_message(
                     }
                 }
                 Err(e) => {
-                    eprintln!("Warnung: {}: {e}", bag.display());
+                    bag_read_error(bag, e)?;
                     break;
                 }
             }
         }
     }
-    match (found, wanted) {
-        (true, _) | (false, None) => Ok(()),
-        (false, Some(w)) => Err(format!("Topic {w} ({msg_type}) in keiner LIDAR-Bag")),
-    }
+    picker.finish()
 }
 
 /// `x y z qx qy qz qw` (LiDAR pose in the IMU frame) → isometry. The quaternion is normalised.
@@ -138,34 +134,48 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
+    if imu.is_empty() {
+        return Err(format!(
+            "keine IMU-Messungen ({IMU_TYPE}) gelesen; die Odometrie braucht eine IMU"
+        )
+        .into());
+    }
+
     let bags = project.lidar_bags.clone();
     let lidar_topic = args.lidar_topic.clone();
     let (tx, rx) = sync_channel::<LidarFrame>(16);
     let reader = std::thread::spawn(move || {
-        let mut bad = 0usize;
+        let (mut bad, mut dropped) = (0usize, 0u64);
         let r = for_each_message(
             &bags,
             CLOUD_TYPE,
             lidar_topic.as_deref(),
             "--lidar-topic",
             |data| match decode_pointcloud2(data) {
-                Ok(f) => tx.send(f).is_ok(),
+                Ok(f) => {
+                    dropped += u64::from(f.dropped);
+                    tx.send(f).is_ok()
+                }
                 Err(_) => {
                     bad += 1;
                     true
                 }
             },
         );
-        r.map(|()| bad)
+        r.map(|()| (bad, dropped))
     });
     let result = run_odometry(rx.into_iter(), &imu, &cfg);
-    bad += reader.join().map_err(|_| "Lesethread abgestürzt")??;
+    let (bad_frames, dropped) = reader.join().map_err(|_| "Lesethread abgestürzt")??;
+    bad += bad_frames;
 
+    if result.stats.frames_in == 0 {
+        return Err(format!("keine LiDAR-Frames ({CLOUD_TYPE}) gelesen").into());
+    }
     write_tum(&args.out.join("traj.tum"), &result.poses)?;
     write_las(&args.out.join("map.las"), &result.map_points)?;
 
     let s = &result.stats;
-    if !s.static_start {
+    if !imu.is_empty() && !s.static_start {
         eprintln!(
             "Warnung: Gerät stand in der ersten Sekunde nicht still; Schwerkraft und Kreisel-Offset \
              sind nur grob geschätzt"
@@ -185,6 +195,18 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         start_end_gap(&result.poses),
         s.icp_failures,
         bad
+    );
+    let c = &s.imu;
+    println!(
+        "IMU bereinigt: {} umsortiert, {} doppelte, {} nicht endliche, {} Lücken; \
+         Punktzeiten: {} Punkte übersprungen, {} auf 0 begrenzt; Decoder verwarf {} Punkte",
+        if c.reordered { "ja" } else { "nein" },
+        c.duplicates,
+        c.non_finite,
+        c.gaps,
+        s.points_time_skipped,
+        s.points_time_clamped,
+        dropped
     );
     println!(
         "Laufzeit {:.1} s{} → {}",

@@ -8,6 +8,9 @@ use std::io::Write;
 pub enum Compression {
     None,
     Lz4,
+    /// Stores the chunk data uncompressed but labels it with this compression name
+    /// (e.g. `"bz2"`), to test how readers handle unsupported compression.
+    Labelled(&'static str),
 }
 
 struct Pending {
@@ -144,6 +147,7 @@ impl BagWriter {
 
         let (name, payload) = match self.compression {
             Compression::None => ("none", raw.clone()),
+            Compression::Labelled(name) => (name, raw.clone()),
             Compression::Lz4 => {
                 let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
                 enc.write_all(&raw).unwrap();

@@ -248,3 +248,111 @@ fn odom_without_deskew_runs() {
         .stdout(predicate::str::contains("15 Posen"))
         .stdout(predicate::str::contains("ohne Deskew"));
 }
+
+/// Small bag: `frames` room scans on `/lidar` (if `lidar`), IMU on `/imu` (if `imu`).
+fn small_bag(comp: Compression, per_chunk: usize, lidar: bool, imu: bool) -> Vec<u8> {
+    let mut w = BagWriter::new(comp).messages_per_chunk(per_chunk);
+    let lc = w.add_connection("/lidar", "sensor_msgs/PointCloud2");
+    let ic = w.add_connection("/imu", "sensor_msgs/Imu");
+    let scan = room_scan();
+    for i in 0..=300 {
+        let s = 1000.0 + i as f64 * 0.005;
+        if imu {
+            let m = ImuSample {
+                stamp: s,
+                gyro: [0.0; 3],
+                accel: [0.0, 0.0, 9.81],
+            };
+            w.write_message(ic, time(s), &encode_imu(&m));
+        }
+        if lidar && i % 20 == 0 && i < 300 {
+            w.write_message(lc, time(s), &encode_pointcloud2(s, "l", &scan));
+        }
+    }
+    w.finish()
+}
+
+fn odom(dir: &std::path::Path, extra: &[&str]) -> assert_cmd::assert::Assert {
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .arg("odom")
+        .arg(dir)
+        .arg("-o")
+        .arg(dir.join("out"))
+        .args(extra)
+        .assert()
+}
+
+#[test]
+fn odom_fails_on_unsupported_compression() {
+    let dir = tmp("bz2");
+    fs::write(
+        dir.join("LIDAR_0.bag"),
+        small_bag(Compression::Labelled("bz2"), 50, true, true),
+    )
+    .unwrap();
+    odom(&dir, &[])
+        .failure()
+        .stderr(predicate::str::contains("Fehler"))
+        .stderr(predicate::str::contains("bz2"));
+    assert!(!dir.join("out/traj.tum").exists());
+}
+
+#[test]
+fn odom_truncated_bag_warns_and_keeps_data() {
+    let dir = tmp("truncated");
+    let mut bytes = small_bag(Compression::None, 40, true, true);
+    bytes.truncate(bytes.len() * 7 / 10);
+    fs::write(dir.join("LIDAR_0.bag"), bytes).unwrap();
+    odom(&dir, &[])
+        .success()
+        .stderr(predicate::str::contains("Warnung"))
+        .stderr(predicate::str::contains("truncated"));
+    let traj = driftless_traj::read_tum(&dir.join("out/traj.tum")).unwrap();
+    assert!(!traj.is_empty() && traj.len() < 15, "{} poses", traj.len());
+}
+
+#[test]
+fn odom_unknown_topic_names_list_available_ones() {
+    let dir = tmp("unknown-topic");
+    fs::write(
+        dir.join("LIDAR_0.bag"),
+        small_bag(Compression::None, 50, true, true),
+    )
+    .unwrap();
+    odom(&dir, &["--imu-topic", "/nope"])
+        .failure()
+        .stderr(predicate::str::contains("/nope"))
+        .stderr(predicate::str::contains("/imu"));
+    odom(&dir, &["--lidar-topic", "/nope"])
+        .failure()
+        .stderr(predicate::str::contains("/nope"))
+        .stderr(predicate::str::contains("/lidar"));
+}
+
+#[test]
+fn odom_without_imu_fails() {
+    let dir = tmp("no-imu");
+    fs::write(
+        dir.join("LIDAR_0.bag"),
+        small_bag(Compression::None, 50, true, false),
+    )
+    .unwrap();
+    odom(&dir, &[])
+        .failure()
+        .stderr(predicate::str::contains("keine IMU-Messungen"));
+}
+
+#[test]
+fn odom_without_lidar_frames_fails() {
+    let dir = tmp("no-lidar");
+    fs::write(
+        dir.join("LIDAR_0.bag"),
+        small_bag(Compression::None, 50, false, true),
+    )
+    .unwrap();
+    odom(&dir, &[])
+        .failure()
+        .stderr(predicate::str::contains("keine LiDAR-Frames"));
+    assert!(!dir.join("out/traj.tum").exists());
+}

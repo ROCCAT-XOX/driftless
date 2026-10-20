@@ -17,7 +17,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
-use crate::topics::pick_topic;
+use crate::topics::{bag_read_error, file_name, TopicPicker};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -45,22 +45,19 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     imu.write_all(IMU_MAGIC)?;
     lidar.write_all(LIDAR_MAGIC)?;
 
+    let mut lidar_picker = TopicPicker::new(
+        "sensor_msgs/PointCloud2",
+        args.lidar_topic.as_deref(),
+        "--lidar-topic",
+    );
+    let mut imu_picker =
+        TopicPicker::new("sensor_msgs/Imu", args.imu_topic.as_deref(), "--imu-topic");
     let (mut frames, mut samples, mut points, mut dropped, mut errors) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
     for bag in &project.lidar_bags {
-        let mut reader = BagReader::open(bag)?;
-        let lidar_topic = pick_topic(
-            &reader,
-            "sensor_msgs/PointCloud2",
-            args.lidar_topic.as_deref(),
-            "--lidar-topic",
-        )?;
-        let imu_topic = pick_topic(
-            &reader,
-            "sensor_msgs/Imu",
-            args.imu_topic.as_deref(),
-            "--imu-topic",
-        )?;
+        let mut reader = BagReader::open(bag).map_err(|e| format!("{}: {e}", file_name(bag)))?;
+        let lidar_topic = lidar_picker.pick(&reader)?;
+        let imu_topic = imu_picker.pick(&reader)?;
         let topics: Vec<&str> = lidar_topic
             .iter()
             .chain(&imu_topic)
@@ -73,8 +70,8 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             let msg = match item {
                 Ok(m) => m,
                 Err(e) => {
-                    // Truncated copy: keep everything read so far.
-                    eprintln!("Warnung: {}: {e}", bag.display());
+                    // Truncated copy: keep everything read so far; anything else fails.
+                    bag_read_error(bag, e)?;
                     break;
                 }
             };
@@ -109,6 +106,11 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+    }
+    lidar_picker.finish()?;
+    imu_picker.finish()?;
+    if frames == 0 {
+        return Err("keine LiDAR-Frames (sensor_msgs/PointCloud2) gelesen".into());
     }
     imu.flush()?;
     lidar.flush()?;
