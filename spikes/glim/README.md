@@ -69,6 +69,36 @@ Windows mit `\` nichts).
   8 GB MSVC-Toolchain zum Bauen, GLIM-Ausgaben enthalten Log-Fehler zu fehlenden ROS-/Viewer-Configs
   (harmlos).
 
+## Nachtrag: Hilti 2022 `exp14_basement_2` (Task 10, nur macOS)
+
+Objektive Referenz statt RayStudio. Vergleich mit der Rust-Grundlinie: `docs/entscheidungen/0001-slam-basis.md`.
+
+- Hesai XT-32: Feld `timestamp` (f64) enthält **absolute** Zeiten. `export-glim` schreibt sie seit Task 10
+  relativ zum Frame-Stempel (vorher f32 der absoluten Zeit = unbrauchbar).
+- Extrinsik aus `calibration/calibration_files/lidar_calibration.yaml` (LiDAR-Lage im IMU-Rahmen, `qx qy qz qw`).
+  GLIM braucht die Umkehrung: `T_lidar_imu = [-0.00855, -0.001, 0.055, 0.7071068, -0.7071068, 0, 0]`.
+  Die Konfiguration wird lokal erzeugt (nicht im Repo, Datensatz CC BY-NC-SA):
+
+```
+mkdir -p spikes/glim/out/hilti && cp -r spikes/glim/config spikes/glim/out/hilti/config
+# in out/hilti/config/config_sensors.json "T_lidar_imu" wie oben eintragen
+driftless export-glim $DRIFTLESS_TESTDATA/hilti2022/projekt -o <tmp>/input
+spikes/glim/.deps/prefix/bin/glim_driftless spikes/glim/out/hilti/config <tmp>/input <tmp>/dump
+driftless compare <tmp>/dump/traj_imu.txt $DRIFTLESS_TESTDATA/hilti2022/exp14_basement_2_imu.txt --max-dt 0.05
+```
+
+| Lauf | ATE | Laufzeit | Spitzen-RAM |
+|---|---|---|---|
+| Standard, 8 Threads (3 Läufe) | 0,62 / 0,79 / 1,18 m | 3,9–4,1 s (+ Export 5,2 s) | 407–427 MB |
+| 1 Thread (Vorverarbeitung + Odometrie) | 0,75 m (reproduzierbar) | 9,5–10,3 s | ≈ 520 MB |
+| 1 Thread, `initialization_mode` LOOSE | 0,46 m | 9,2 s | 537 MB |
+| 1 Thread, Voxel 0,25 m, 20 000 Punkte | 1,04 m | 14,7 s | 813 MB |
+
+- Mit 8 Threads ist das Ergebnis **nicht reproduzierbar** (auf JMK6 war es das).
+- Der Fehler entsteht in den ersten ≈ 13 s (schnelles Anheben und Loslaufen), danach bleibt er gleich.
+  GLIM meldet laufend „IMU prediction is not good / T_lidar_imu is not accurate“; die Rust-Grundlinie kommt mit
+  derselben Extrinsik auf 0,074 m. Ursache nicht weiter untersucht.
+
 ## Aufbau
 
 ```

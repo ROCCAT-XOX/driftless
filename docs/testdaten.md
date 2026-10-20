@@ -30,9 +30,22 @@ $DRIFTLESS_TESTDATA/
     shading/
       trj.txt             Referenztrajektorie
       smooth.las          Referenz-Punktwolke
+  hilti2022/
+    exp14_basement_2.bag            Hilti SLAM Challenge 2022 (Hesai XT-32, Alphasense)
+    exp14_basement_2_imu.txt        Referenz-Laufbahn (TUM, IMU-Rahmen, 10 Hz)
+    projekt/LIDAR_exp14.bag         harter Link auf die Bag (Symlinks werden nicht verfolgt)
+    calibration/lidar_calibration.yaml   LiDAR-IMU-Extrinsik (von Hugging Face)
 ```
 
-Die Dateien stammen aus einem Testscan mit dem 3DMakerPro-Scanner. Die
+Hilti-Daten: CC BY-NC-SA 3.0, nur lokal zum Testen; nichts davon kommt ins Repo.
+Beispiel:
+
+```sh
+driftless odom $DRIFTLESS_TESTDATA/hilti2022/projekt -o <ziel> \
+  --lidar-to-imu -0.001 -0.00855 0.055 0.7071068 -0.7071068 0 0
+```
+
+Die Dateien unter `Test/` stammen aus einem Testscan mit dem 3DMakerPro-Scanner. Die
 Referenzdateien (`trj.txt`, `smooth.las`) dienen nur zum Vergleich; Software
 des Scanner-Herstellers wird nicht ins Repository uebernommen.
 

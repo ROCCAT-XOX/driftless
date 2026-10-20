@@ -1,0 +1,104 @@
+# 0001 – SLAM-Basis: GLIM oder eigener Rust-Kern
+
+Stand: 2026-10-20 · Status: **Vorschlag, Entscheidung durch Yannick offen**
+
+## Frage
+
+Welche Grundlage berechnet in Driftless die Laufbahn (LiDAR-IMU-SLAM)?
+
+- **GLIM** (C++, MIT) als externer Prozess – Spike A, `spikes/glim/`
+- **Eigene Rust-Grundlinie** (`crates/driftless-odom`, `driftless odom`) – Spike B, noch ohne Schleifenschluss
+
+## Messung
+
+Zwei Aufnahmen, beide Kandidaten mit Standardeinstellungen, gemessen auf dem MacBook Pro M4 Pro.
+ATE = mittlere Abweichung (RMSE) nach bester Ausrichtung (`driftless compare --max-dt 0.05`).
+
+- **Eigener Scan JMK6** (`Test`, 266 s, Innenraum): verglichen mit RayStudio `trj.txt`.
+  Das ist **keine Wahrheit**, nur Übereinstimmung mit einem anderen Programm.
+- **Hilti SLAM Challenge 2022, `exp14_basement_2`** (74 s, Keller, Hesai XT-32 + Alphasense-IMU):
+  verglichen mit der Referenz-Laufbahn des Datensatzes. Das ist eine **objektive Referenz**.
+  Lizenz CC BY-NC-SA 3.0: nur lokal genutzt, nichts davon im Repo.
+
+| | GLIM – JMK6 | Rust – JMK6 | GLIM – Hilti | Rust – Hilti |
+|---|---|---|---|---|
+| ATE | 0,060 m (nur Odometrie 0,116 m) | **0,018 m** | 0,62 / 0,79 / 1,18 m (3 Läufe); 0,75 m mit 1 Thread | **0,074 m** |
+| Start↔Ende (Referenz) | 5,394 m (5,382) | 5,407 m (5,382) | 20,0–20,6 m (21,303) | 21,419 m (21,303) |
+| Weglänge (Referenz) | 84,1 m (98,9¹) | 86,9 m (98,9¹) | 36,5–39,9 m (37,8) | 38,8 m (37,8) |
+| Laufzeit | 7,2–8,0 s + Export 1,1 s | 6,2–6,9 s | 3,9–4,1 s + Export 5,2 s | 7,0–7,1 s |
+| Spitzen-RAM | ≈ 235 MB | 63–72 MB | 410–430 MB (Export 89 MB) | 190–200 MB |
+| gleiches Ergebnis bei jedem Lauf | ja | ja (bitgleich) | **nein** (nur mit 1 Thread) | ja (bitgleich) |
+
+¹ RayStudio liefert 200 Hz mit Zittern; zu GLIMs Zeitstempeln abgetastet sind es 87,9 m.
+
+Weitere Befunde:
+
+- **Ohne Entzerrung** (Rust, `--no-deskew`): JMK6 0,040 m, Hilti 0,254 m. Die IMU-Entzerrung bringt also viel.
+- **GLIM auf Hilti:** Der Fehler entsteht in den ersten ≈ 13 s (das Gerät wird schnell angehoben und losgetragen:
+  bis 2 m daneben), danach läuft GLIM sauber weiter. GLIM meldet durchgehend „IMU prediction is not good“.
+  Drei Versuche, das zu verbessern, halfen nicht (feinere Voxel 1,04 m, lockere Initialisierung 0,46 m, 1 Thread 0,75 m).
+  Mit mehr Abstimmung wird GLIM vermutlich besser – aber Standard-GLIM ist hier nicht zuverlässig.
+- **Extrinsik Hilti:** aus `lidar_calibration.yaml`, Reihenfolge `qx qy qz qw` wörtlich. Andere Lesarten
+  ergeben 1,5–3,8 m (Rust). Für GLIM wurde die Umkehrung eingetragen.
+- **Laufzeit Rust** enthält das zweimalige Lesen der Bag (Hilti 6,2 GB mit Kamerabildern). GLIM braucht vorher
+  den Export (`driftless export-glim`).
+
+**Vorsicht beim Lesen der Zahlen:**
+
+- Die Rust-Grundlinie wurde am JMK6-Scan abgestimmt. Ihre 1,8 cm dort sind nicht unabhängig.
+- Hilti ist für beide Kandidaten unbekannt: Rust lief mit unveränderten Parametern, nur die Extrinsik wurde übergeben.
+- Das ist **eine** Hilti-Sequenz (74 s, kein Rundgang). Schleifenschluss wird damit nicht geprüft.
+  GLIMs Vorteil (globale Optimierung) kommt hier kaum zum Tragen.
+- Rust hat noch keinen Schleifenschluss. Bei langen Aufnahmen wächst die Drift, das zeigen diese Daten nicht.
+
+## Bewertung
+
+| Kriterium | GLIM | Rust-Grundlinie |
+|---|---|---|
+| Baut auf macOS / Windows | ja / ja, aber nur mit 5 eigenen Patches und 8 GB MSVC-Werkzeugen | ja / ja (cargo, CI grün auf beiden) |
+| Genauigkeit (Hilti = Wahrheit) | 0,6–1,2 m mit Standardeinstellungen | 0,074 m |
+| Laufzeit | schnell (mit Export ähnlich wie Rust) | schnell, 10–40× schneller als Echtzeit |
+| RAM | 235–430 MB | 63–200 MB |
+| Gleiche Ergebnisse je Lauf | auf Hilti nein (Threads); zwischen Mac und Windows leicht anders | ja, bitgleich |
+| Lizenzen | MIT/BSD/Apache/MPL – als eigener Prozess unkritisch | MIT/Apache, `cargo deny` grün |
+| Wartung | hoch: Windows-Patches selbst pflegen; stiller 32-bit-`long`-Fehler gefunden (falsche Ergebnisse ohne Meldung); GTSAM ist eine Alpha (4.3a1); Eigen-Version festnageln; Upstream testet nur Ubuntu | eigener Code: wir pflegen alles selbst, aber in einer Sprache und mit Tests |
+| **GPU auf Mac (Metal) und RTX (wgpu)** – Vorgabe Yannick | **nein**: GLIMs GPU-Teil braucht CUDA, also nur NVIDIA, nicht auf dem Mac | **ja, möglich**: der ICP-Kern ist schon als „je Punkt rechnen, dann fest summieren“ gebaut und kann als wgpu-Rechenschritt laufen (noch nicht umgesetzt) |
+| Weg zu Schleifenschluss | vorhanden (globale Optimierung über Teilkarten) | fehlt: Teilkarten + Pose-Graph + Erkennung müssen gebaut werden |
+| Manuelle Korrektur „in Sekunden“ | GTSAM-Graph liegt vor, aber Bedienung nur über GLIMs eigenen Viewer (C++/ImGui) oder eigene C++-Brücke | eigener Pose-Graph über Teilkarten: wenige hundert Knoten, sollte in Millisekunden lösen (noch nicht gebaut); voll in unserer Hand |
+| Zuverlässigkeit | Windows-Fehler ohne Meldung; Hilti-Start daneben; Ergebnis schwankt je Lauf | auf beiden Aufnahmen stabil; aber lose gekoppelt (keine Beschleunigungs-Bias-Schätzung, langer LiDAR-Ausfall driftet schnell) |
+
+## Empfehlung
+
+**Eigener Rust-Kern als SLAM-Basis.** GLIM bleibt nur als Vergleichswerkzeug im Spike-Ordner (wird nicht ausgeliefert).
+
+Gründe:
+
+1. **Genauer auf der objektiven Referenz:** 7 cm gegen 60–120 cm, ohne Abstimmung auf Hilti.
+2. **GPU-Vorgabe:** Nur der Rust-Weg kann über wgpu auf Mac und RTX rechnen. GLIM ginge nur mit CUDA.
+3. **Zuverlässigkeit vor Geschwindigkeit:** bitgleiche Ergebnisse, ein Werkzeugkasten (cargo), keine
+   Windows-Patches mit stillen Rechenfehlern.
+4. **Korrektur in Sekunden** verlangt ohnehin einen eigenen Pose-Graph in der Oberfläche. Den bauen wir
+   besser gleich in Rust als eine Brücke zu GTSAM.
+
+Was es kostet, wenn das falsch ist:
+
+- Der Rust-Kern braucht noch Arbeit, die GLIM schon hat: Teilkarten, Pose-Graph, automatischer
+  Schleifenschluss, eine engere IMU-Kopplung (Bias-Schätzung). Grob einige Wochen.
+- Stellt sich in Meilenstein 2 heraus, dass das nicht reicht (z. B. große Außenszenen, lange Flure ohne Merkmale),
+  ist der Rückweg offen: Das Austauschformat ist dasselbe (Laufbahn als TUM + Punktwolke), GLIM-Treiber,
+  Patches und Bauskripte liegen in `spikes/glim/`. Verloren wäre die Zeit für den eigenen Schleifenschluss;
+  dazu kämen GLIMs Wartungslast und der Verzicht auf GPU am Mac.
+
+## Offene Punkte für Meilenstein 2
+
+- **Pose-Graph über Teilkarten** (z. B. alle 5–10 m eine Teilkarte), Lösung in Millisekunden; Grundlage für die
+  manuelle Korrektur „zwei Stellen gleich“.
+- **Automatischer Schleifenschluss:** Kandidaten finden (Nähe + Ortserkennung), mit ICP prüfen, nur sichere übernehmen.
+- **Drift-Anzeige:** Abweichung je Teilkarte nach dem Schleifenschluss sichtbar machen.
+- **Engere IMU-Kopplung** (iterativer Kalman-Filter mit Bias-Schätzung), Verhalten bei LiDAR-Ausfall.
+- **GPU-Pfad:** ICP-Schritt als wgpu-Rechenschritt, Ergebnis gegen die CPU-Version prüfen (gleiche Zahlen).
+- **Mehr Testdaten mit Wahrheit:** weitere Hilti-Sequenzen mit Rundgang (Schleifenschluss), eigene Aufnahme mit
+  Drift (langer Flur, Treppenhaus) und von Hand gemessenen Strecken.
+
+Quelle Hilti-Daten: Hilti SLAM Challenge 2022 (Hilti Research), CC BY-NC-SA 3.0,
+https://huggingface.co/datasets/Hilti-Research/hilti-slam-challenge-2022

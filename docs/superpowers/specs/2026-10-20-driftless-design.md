@@ -66,6 +66,8 @@ in der Oberfläche erkennen und von Hand beheben.
   (FAST-LIO/FAST-LIVO, CGAL, OpenSplat, gnss-rtk) und keine Inria-3DGS-Abkömmlinge.
 - **Plattformen:** macOS 15+ auf Apple Silicon (Entwicklung auf MacBook Pro M4 Pro, 48 GB) und Windows 11 x64
   (Test auf Windows-PC mit RTX 5080). Linux darf nebenbei laufen, wird aber nicht aktiv gepflegt.
+- **GPU:** Rechenintensive Schritte und 3D-Ansicht nutzen die GPU auf Mac (Metal) und Windows (RTX, DX12/Vulkan)
+  über wgpu; CUDA höchstens optional. Zuverlässigkeit vor Geschwindigkeit. (Vorgabe Yannick, 20.10.2026)
 - **Datenmengen:** Testscan 266 s ≈ 2.663 LiDAR-Frames, 53.000 IMU-Werte, 1.741 Bilder à 12 MP, 12,5 Mio. Punkte
   im Ergebnis; Bags 3,2 GB. Ganze Aufnahmen dürfen nicht komplett in den RAM müssen.
 - **Testdaten:** liegen nur lokal (nicht im Repo). Referenzergebnisse von RayStudio aus dem Testprojekt
