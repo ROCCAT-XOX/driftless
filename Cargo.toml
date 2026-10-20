@@ -5,6 +5,7 @@ members = [
     "crates/driftless-traj",
     "crates/driftless-odom",
     "crates/driftless-slam",
+    "crates/driftless-map",
     "crates/driftless-graph",
     "crates/driftless-cli",
 ]

@@ -1,0 +1,24 @@
+[package]
+name = "driftless-map"
+description = "Driftless: dichte Punktwolke aus der korrigierten Laufbahn, LAS/PLY-Export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+driftless-io = { path = "../driftless-io" }
+driftless-odom = { path = "../driftless-odom" }
+driftless-traj = { path = "../driftless-traj" }
+las = "0.11"
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+rayon = "1.12.0"
+thiserror = "2"
+
+[dev-dependencies]
+driftless-odom = { path = "../driftless-odom", features = ["test-util"] }
+driftless-slam = { path = "../driftless-slam" }

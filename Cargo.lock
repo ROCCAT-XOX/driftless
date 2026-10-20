@@ -1106,6 +1106,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "driftless-map"
+version = "0.1.0"
+dependencies = [
+ "driftless-io",
+ "driftless-odom",
+ "driftless-slam",
+ "driftless-traj",
+ "las",
+ "nalgebra",
+ "rayon",
+ "thiserror",
+]
+
+[[package]]
 name = "driftless-odom"
 version = "0.1.0"
 dependencies = [
