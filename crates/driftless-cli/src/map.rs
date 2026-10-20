@@ -237,8 +237,6 @@ fn clean_json(s: &CleanStats) -> Value {
     json!({"kept": s.kept, "ghosts": s.ghosts, "outliers": s.outliers})
 }
 
-/// Colour statistics with the gains summarised per camera (count, smallest, largest and mean
-/// gain per channel) instead of one entry per image.
 /// Warnings about a colour run that the user should see (German, without the "Warnung: ").
 fn color_warnings(s: &ColorStats) -> Vec<String> {
     let mut out = Vec::new();
@@ -259,6 +257,8 @@ fn color_warnings(s: &ColorStats) -> Vec<String> {
     out
 }
 
+/// Colour statistics with the gains summarised per camera (count, smallest, largest and mean
+/// gain per channel) instead of one entry per image.
 fn color_json(s: &ColorStats) -> Value {
     struct Sum {
         n: usize,
