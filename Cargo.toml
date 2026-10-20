@@ -15,3 +15,11 @@ repository = "https://github.com/ROCCAT-XOX/driftless"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# The odometry tests run whole synthetic sequences; unoptimised nalgebra/kiddo make them slow.
+[profile.dev.package.driftless-odom]
+opt-level = 2
+[profile.dev.package.nalgebra]
+opt-level = 2
+[profile.dev.package.kiddo]
+opt-level = 2

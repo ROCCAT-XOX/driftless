@@ -3,6 +3,7 @@
 mod compare;
 mod export_glim;
 mod inspect;
+mod odom;
 mod view;
 
 use clap::{Parser, Subcommand};
@@ -25,6 +26,8 @@ enum Command {
     View(view::Args),
     /// Spike: LiDAR- und IMU-Daten als Binärstrom für den GLIM-Treiber (spikes/glim)
     ExportGlim(export_glim::Args),
+    /// LiDAR-IMU-Odometrie (Rust-Grundlinie): traj.tum und map.las
+    Odom(odom::Args),
 }
 
 fn main() -> ExitCode {
@@ -34,6 +37,7 @@ fn main() -> ExitCode {
         Command::Compare(args) => compare::run(&args),
         Command::View(args) => view::run(&args),
         Command::ExportGlim(args) => export_glim::run(&args),
+        Command::Odom(args) => odom::run(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
