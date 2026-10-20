@@ -3,8 +3,8 @@
 //! points inside a submap never move; only the anchors do.
 
 use crate::loops::{
-    find_candidates, match_manual_loops, verify, verify_manual, LoopCheck, LoopConfig, LoopVerdict,
-    ManualLoop, ManualLoopError, ManualMatch,
+    find_candidates, match_manual_loops, position_only_relative, verify, verify_manual, LoopCheck,
+    LoopConfig, LoopVerdict, ManualLoop, ManualLoopError, ManualMatch,
 };
 use crate::submap::{Submap, SubmapBuilder, SubmapConfig};
 use driftless_graph::se3::residual;
@@ -20,7 +20,12 @@ use std::collections::HashSet;
 const ROT_INFO: f64 = 1e4;
 const TRANS_INFO: f64 = 1e3;
 /// Translation information (per m²) of a manual loop whose ICP failed; its rotation is free.
-const POSITION_ONLY_INFO: f64 = 1e2;
+/// As stiff as a rotation-wise accepted loop: the user states that the places are the same.
+const POSITION_ONLY_INFO: f64 = 1e4;
+/// The measurement of a position-only loop is recomputed until it moves less than this (m)…
+const POSITION_ONLY_TOL: f64 = 1e-3;
+/// …or this many optimisations have run.
+const POSITION_ONLY_MAX_SOLVES: u32 = 10;
 /// Odometry edges keep at least this share of their information, however bad the submap.
 const MIN_ODOM_WEIGHT: f64 = 0.05;
 /// Cauchy width of the loop edges. Wide (nearly quadratic within 100 σ), so a loop pulls in
@@ -292,7 +297,7 @@ pub fn close_loops(
             fixed: 0,
         };
         graph.edges.extend(edges);
-        let report = optimize(&mut graph, MAX_ITER);
+        let report = optimize_position_only(&mut graph, odom_edges.len(), &active, loops);
 
         let worst = active
             .iter()
@@ -309,4 +314,46 @@ pub fn close_loops(
             None => return (graph.nodes, Some(report)),
         }
     }
+}
+
+/// Optimises `graph` (loop edge `j` = `graph.edges[first_loop + j]` belongs to
+/// `loops[active[j]]`). A position-only loop must bring its two marked frames together, but
+/// where anchor `b` has to sit for that depends on the relative rotation of the two anchors,
+/// which the optimisation changes. So its measurement is recomputed from the optimised
+/// anchors ([`position_only_relative`]) and the graph optimised again from there, until no
+/// measurement moves by [`POSITION_ONLY_TOL`] or after [`POSITION_ONLY_MAX_SOLVES`]
+/// optimisations. The final measurements are written back to `relative`. The report spans
+/// all optimisations (initial cost of the first, final cost of the last).
+fn optimize_position_only(
+    graph: &mut PoseGraph,
+    first_loop: usize,
+    active: &[usize],
+    loops: &mut [LoopCheck],
+) -> OptimizeReport {
+    let mut report = optimize(graph, MAX_ITER);
+    for _ in 1..POSITION_ONLY_MAX_SOLVES {
+        let mut moved = 0.0f64;
+        for (j, &k) in active.iter().enumerate() {
+            let (LoopVerdict::PositionOnly(_), Some(marked)) = (&loops[k].verdict, loops[k].marked)
+            else {
+                continue;
+            };
+            let e = &mut graph.edges[first_loop + j];
+            let rotation = (graph.nodes[e.from].inverse() * graph.nodes[e.to]).rotation;
+            let z = position_only_relative(&marked, &rotation);
+            moved = moved.max((z.translation.vector - e.measurement.translation.vector).norm());
+            e.measurement = z;
+            loops[k].relative = z;
+        }
+        if moved < POSITION_ONLY_TOL {
+            break;
+        }
+        let next = optimize(graph, MAX_ITER);
+        report = OptimizeReport {
+            iterations: report.iterations + next.iterations,
+            initial_cost: report.initial_cost,
+            ..next
+        };
+    }
+    report
 }

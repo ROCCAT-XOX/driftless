@@ -10,7 +10,7 @@ use crate::report::scan_start;
 use crate::submap::Submap;
 use driftless_odom::icp::{align, IcpParams, IcpResult, IcpTarget};
 use driftless_odom::{voxel_downsample, DEGENERACY_GOOD};
-use nalgebra::{Isometry3, Vector3};
+use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 
 /// Thresholds of the loop search and verification.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +27,9 @@ pub struct LoopConfig {
     pub icp_voxel: f64,
     /// Smallest share of source points with a correspondence at the final pose.
     pub min_inlier_ratio: f64,
+    /// The same for a manual loop: the user vouches for the place, and the two submaps
+    /// usually cover it from different stretches of the walk.
+    pub manual_min_inlier_ratio: f64,
     /// Largest point-to-plane RMS at the final pose (m).
     pub max_rms: f64,
     /// Smallest [`IcpResult::degeneracy`] at the final pose.
@@ -42,6 +45,7 @@ impl Default for LoopConfig {
             max_candidates: 3,
             icp_voxel: 0.25,
             min_inlier_ratio: 0.5,
+            manual_min_inlier_ratio: 0.25,
             max_rms: 0.05,
             // The weakest position direction must be at least partly fixed by the geometry.
             min_degeneracy: 0.3 * DEGENERACY_GOOD,
@@ -83,6 +87,8 @@ pub struct LoopCheck {
     pub verdict: LoopVerdict,
     /// Set by the user instead of found automatically.
     pub manual: bool,
+    /// Manual loops: positions of the two marked frames in the anchor frames of `a` and `b`.
+    pub marked: Option<[Vector3<f64>; 2]>,
 }
 
 /// A loop the user marks by hand: the places at times `a_t` and `b_t` (seconds since the
@@ -332,32 +338,55 @@ pub fn verify(
     cfg: &LoopConfig,
 ) -> LoopCheck {
     let init = anchors[c.a].inverse() * anchors[c.b];
-    check_pair(submaps, c.a, c.b, &init, &STAGES, cfg)
+    check_pair(submaps, c.a, c.b, &init, &STAGES, cfg.min_inlier_ratio, cfg)
 }
 
 /// Verifies a manual loop like [`verify`], but starting from the two marked frames at the
-/// same position (each keeps the rotation of the current anchors) and with a first ICP stage
-/// of 2 m. A failed ICP gives [`LoopVerdict::PositionOnly`] with `relative` = that start, so
-/// the loop still ties the positions together. `manual` is set.
+/// same position (each keeps the rotation of the current anchors), with a first ICP stage
+/// of 2 m and `manual_min_inlier_ratio`. A failed ICP gives [`LoopVerdict::PositionOnly`]
+/// with `relative` = that start ([`position_only_relative`]), so the loop still ties the
+/// marked positions together. `manual` and `marked` are set.
 pub fn verify_manual(
     submaps: &[Submap],
     anchors: &[Isometry3<f64>],
     m: &ManualMatch,
     cfg: &LoopConfig,
 ) -> LoopCheck {
-    let offset_a = submaps[m.a].frames[m.frame_a].offset;
-    let offset_b = submaps[m.b].frames[m.frame_b].offset;
-    let pose_a = anchors[m.a] * offset_a;
-    let mut pose_b = anchors[m.b] * offset_b;
-    pose_b.translation = pose_a.translation;
-    let init = anchors[m.a].inverse() * (pose_b * offset_b.inverse());
-    let mut check = check_pair(submaps, m.a, m.b, &init, &MANUAL_STAGES, cfg);
+    let marked = [
+        submaps[m.a].frames[m.frame_a].offset.translation.vector,
+        submaps[m.b].frames[m.frame_b].offset.translation.vector,
+    ];
+    let current = anchors[m.a].inverse() * anchors[m.b];
+    let init = position_only_relative(&marked, &current.rotation);
+    let mut check = check_pair(
+        submaps,
+        m.a,
+        m.b,
+        &init,
+        &MANUAL_STAGES,
+        cfg.manual_min_inlier_ratio,
+        cfg,
+    );
     check.manual = true;
+    check.marked = Some(marked);
     if let LoopVerdict::Rejected(why) = check.verdict {
         check.verdict = LoopVerdict::PositionOnly(why);
         check.relative = init;
     }
     check
+}
+
+/// Pose of the anchor of `b` in the anchor frame of `a` that puts the marked frames
+/// (`marked`, positions in their anchor frames) at the same place for the relative rotation
+/// `rotation`: translation `marked[0] − rotation · marked[1]`.
+pub fn position_only_relative(
+    marked: &[Vector3<f64>; 2],
+    rotation: &UnitQuaternion<f64>,
+) -> Isometry3<f64> {
+    Isometry3::from_parts(
+        Translation3::from(marked[0] - rotation * marked[1]),
+        *rotation,
+    )
 }
 
 /// Registers the points of `b` against those of `a` from `init` (pose of the anchor of `b`
@@ -368,6 +397,7 @@ fn check_pair(
     b: usize,
     init: &Isometry3<f64>,
     stages: &[f64],
+    min_inlier_ratio: f64,
     cfg: &LoopConfig,
 ) -> LoopCheck {
     let mut check = LoopCheck {
@@ -379,6 +409,7 @@ fn check_pair(
         degeneracy: 0.0,
         verdict: LoopVerdict::Rejected("zu wenig Überlappung"),
         manual: false,
+        marked: None,
     };
     let pts_a = to_f64(&submaps[a].points);
     let pts_b = to_f64(&submaps[b].points);
@@ -393,7 +424,7 @@ fn check_pair(
     check.inlier_ratio = m.inlier_ratio;
     check.rms = m.residual_rms;
     check.degeneracy = m.degeneracy;
-    check.verdict = if m.inlier_ratio < cfg.min_inlier_ratio {
+    check.verdict = if m.inlier_ratio < min_inlier_ratio {
         LoopVerdict::Rejected("zu wenig Überlappung")
     } else if !converged {
         LoopVerdict::Rejected("ICP nicht konvergiert")

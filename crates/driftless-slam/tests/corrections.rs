@@ -6,6 +6,7 @@ use driftless_slam::{
     SlamConfig, Submap, SubmapFrame, POSITION_ONLY,
 };
 use driftless_traj::nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
+use std::f64::consts::FRAC_PI_2;
 use std::fs;
 
 #[test]
@@ -141,8 +142,8 @@ fn duplicate_manual_loop_errors() {
     assert!(e.to_string().contains("doppelte Schleife"), "{e}");
 }
 
-/// Without points the ICP of a manual loop fails: the loop then only pulls the two marked
-/// positions together (with less weight than the odometry) and is reported as manual.
+/// Without points the ICP of a manual loop fails: the loop then still pulls the two marked
+/// positions together and is reported as manual.
 #[test]
 fn manual_loop_without_icp_keeps_position_only() {
     let (s, a) = line(4);
@@ -155,7 +156,7 @@ fn manual_loop_without_icp_keeps_position_only() {
     assert!(r.graph.is_some());
     let poses = r.poses();
     let gap = (poses[0].p - poses[poses.len() - 1].p).norm();
-    assert!(gap < 0.9 * 3.9, "marked positions still {gap} m apart");
+    assert!(gap < 0.1 * 3.9, "marked positions still {gap} m apart");
     let rep = driftless_slam::SlamReport::new(&r);
     assert!(rep.loops[0].manual && rep.loops[0].accepted);
     assert!(rep.loops[0]
@@ -180,6 +181,7 @@ fn manual_loop_is_never_rejected_as_inconsistent() {
         degeneracy: 0.2,
         verdict: LoopVerdict::Accepted,
         manual,
+        marked: None,
     };
     let mut auto = vec![check(false)];
     close_loops(&odom, &quality, &mut auto);
@@ -194,4 +196,74 @@ fn manual_loop_is_never_rejected_as_inconsistent() {
     assert!(report.is_some());
     let d = (anchors[9].translation.vector - anchors[0].translation.vector).norm();
     assert!(d < 5.0, "manual loop did not pull: {d} m");
+}
+
+/// Two laps of an 8 m square, one submap per side, its 10 frames 0.8 m apart along the side;
+/// the odometry turns 5° too far at every corner. A manual loop marks the last frame of the
+/// first side (7.2 m from its anchor) and the same place on the second lap. The ICP fails
+/// (no points), so the loop is position only, and bringing the marked frames together needs
+/// the anchors to turn: a measurement fixed from the odometry rotation would leave them
+/// apart by the rotation change times the 7.2 m lever.
+#[test]
+fn position_only_loop_brings_marked_frames_together() {
+    let side = 8.0;
+    let corner = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), FRAC_PI_2);
+    let drift = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 5f64.to_radians());
+    let step = Isometry3::from_parts(Translation3::new(side, 0.0, 0.0), corner);
+    let mut anchors = vec![Isometry3::identity()];
+    for _ in 0..4 {
+        let mut z = step;
+        z.rotation = drift * z.rotation;
+        anchors.push(anchors[anchors.len() - 1] * z);
+    }
+    let submaps: Vec<Submap> = anchors
+        .iter()
+        .enumerate()
+        .map(|(id, anchor)| Submap {
+            id,
+            anchor: *anchor,
+            frames: (0..10)
+                .map(|i| SubmapFrame {
+                    index: id * 10 + i,
+                    t: 100.0 + (id * 10 + i) as f64 * 0.1,
+                    offset: planar(i as f64 * 0.8, 0.0, 0.0),
+                    quality: FrameQuality::first(),
+                })
+                .collect(),
+            points: Vec::new(),
+        })
+        .collect();
+    let marked =
+        |s: &[Isometry3<f64>], id: usize| (s[id] * submaps[id].frames[9].offset).translation.vector;
+    let before = (marked(&anchors, 0) - marked(&anchors, 4)).norm();
+
+    // frame 9 of submap 0 is at 0.9 s, frame 9 of submap 4 at 4.9 s
+    let r = solve(
+        submaps.clone(),
+        anchors.clone(),
+        &[manual(0.9, 4.9)],
+        &SlamConfig::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(r.loops[0].verdict, LoopVerdict::PositionOnly(_)),
+        "{:?}",
+        r.loops
+    );
+    let after = (marked(&r.anchors, 0) - marked(&r.anchors, 4)).norm();
+    let turned = (anchors[0].inverse() * anchors[4])
+        .rotation
+        .angle_to(&(r.anchors[0].inverse() * r.anchors[4]).rotation);
+    eprintln!(
+        "marked frames {before:.3} -> {after:.4} m apart, relative rotation changed {:.2}°",
+        turned.to_degrees()
+    );
+    assert!(before > 1.0, "drift too small: {before} m");
+    // pinning the anchors at the odometry rotation would leave the marked frames this far
+    // apart: the rotation change times the 7.2 m lever
+    assert!(
+        turned * 7.2 > 5.0 * 0.02,
+        "no rotation correction needed: {turned} rad"
+    );
+    assert!(after < 0.02, "marked frames still {after} m apart");
 }

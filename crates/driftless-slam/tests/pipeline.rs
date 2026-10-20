@@ -6,7 +6,7 @@ use driftless_odom::testutil::{
 use driftless_odom::OdomConfig;
 use driftless_slam::{
     close_loops, run_slam, solve, LoopCheck, LoopConfig, LoopVerdict, ManualLoop, SlamConfig,
-    SlamReport, SlamResult, Submap, SubmapConfig,
+    SlamReport, SlamResult, Submap,
 };
 use driftless_traj::nalgebra::{Isometry3, Matrix6, Translation3, UnitQuaternion, Vector3};
 use driftless_traj::{start_end_gap, Pose};
@@ -21,22 +21,12 @@ fn run(
     duration: f64,
     gyro_bias_z: f64,
 ) -> SlamResult {
-    run_with(traj, scene, duration, gyro_bias_z, &SlamConfig::default())
-}
-
-fn run_with(
-    traj: &dyn Trajectory,
-    scene: &driftless_odom::testutil::Scene,
-    duration: f64,
-    gyro_bias_z: f64,
-    cfg: &SlamConfig,
-) -> SlamResult {
     let frames = lidar_frames(scene, traj, 0.0, duration, 360, &Isometry3::identity());
     let mut imu = imu_samples(traj, -IMU_MARGIN, duration + IMU_MARGIN, 200.0);
     for s in imu.iter_mut().filter(|s| s.stamp > 2.0) {
         s.gyro[2] += gyro_bias_z;
     }
-    let (r, stats) = run_slam(frames.into_iter(), &imu, cfg);
+    let (r, stats) = run_slam(frames.into_iter(), &imu, &SlamConfig::default());
     assert_eq!(stats.frames_used, r.poses().len());
     r
 }
@@ -219,28 +209,16 @@ fn with_injected_drift(r: &SlamResult) -> (Vec<Submap>, Vec<Isometry3<f64>>) {
 
 /// With the automatic search switched off (search radius 0) the drifted room loop keeps its
 /// start-end gap; one manual loop between the still phases at start and end closes it. The
-/// submaps are about one lap long (13 m of the 12.6 m circle), so the first and the last one
-/// both see the whole room. Even then the synthetic 16-ring scans leave many points without
-/// a usable plane: the perfect alignment (rms 4 mm) reaches an inlier ratio of only 0.48, so
-/// the test lowers `min_inlier_ratio` to 0.4 (with 5 m submaps it is 0.34).
+/// first and the last submap share only part of the room (inlier ratio 0.34, below the
+/// automatic 0.5), which `manual_min_inlier_ratio` (0.25) allows for.
 #[test]
 fn manual_loop_fixes_missed_loop() {
-    let c = circle();
-    let laps = SlamConfig {
-        submap: SubmapConfig {
-            max_length: 13.0,
-            max_frames: 1000,
-        },
-        ..SlamConfig::default()
-    };
-    let r = run_with(&c, &room_scene(), c.duration(), 0.1, &laps);
-    assert!(r.submaps.len() >= 3, "{} submaps", r.submaps.len());
+    let r = room_loop();
     let (submaps, anchors) = with_injected_drift(&r);
     let cfg = SlamConfig {
         loops: LoopConfig {
             base_radius: 0.0,
             radius_per_m: 0.0,
-            min_inlier_ratio: 0.4,
             ..LoopConfig::default()
         },
         ..SlamConfig::default()
@@ -386,6 +364,7 @@ fn accepted(a: usize, b: usize, relative: Isometry3<f64>) -> LoopCheck {
         degeneracy: 0.2,
         verdict: LoopVerdict::Accepted,
         manual: false,
+        marked: None,
     }
 }
 
