@@ -5,7 +5,9 @@
 //! - **clean**: ghosts and outliers removed → `clean.las`, `removed.las`, `clean.bin`
 //! - **color**: coloured from the camera images → `color.las`, `color.ply`
 //!
-//! plus `map.json` (settings, statistics and runtimes of the steps, peak memory).
+//! plus `map.json` (settings, statistics and runtimes of the steps, peak memory, and under
+//! `stale` the files of earlier runs that no longer fit; they get a warning, nothing is ever
+//! deleted).
 //!
 //! The requested step always runs; the step before it is taken from its `*.bin` in the folder
 //! if that was written for the same input and settings (input id as in `submaps.bin`), and
@@ -544,6 +546,50 @@ impl MapRun<'_> {
     }
 }
 
+/// Output files of each step, and the file of the step before it that they are made from.
+const STEP_FILES: [(&str, &[&str], &str); 3] = [
+    ("dense", &["dense.las", DENSE_BIN], "traj.tum"),
+    (
+        "clean",
+        &["clean.las", "removed.las", CLEAN_BIN],
+        "dense.las",
+    ),
+    ("color", &["color.las", "color.ply"], "clean.las"),
+];
+
+/// Output files in `out` of steps that have no current entry in `steps` (not run and no
+/// longer fitting, or skipped): they are from an earlier run. Nothing is deleted; each group
+/// gets a warning. Returns their names, in step order.
+fn warn_stale(out: &Path, steps: &BTreeMap<&'static str, Value>) -> Vec<String> {
+    let mut stale = Vec::new();
+    for (step, files, source) in STEP_FILES {
+        let current = steps.get(step).is_some_and(|e| e.get("skipped").is_none());
+        if current {
+            continue;
+        }
+        let found: Vec<&str> = files
+            .iter()
+            .copied()
+            .filter(|f| out.join(f).exists())
+            .collect();
+        if found.is_empty() {
+            continue;
+        }
+        let verb = if found.len() == 1 {
+            "stammt"
+        } else {
+            "stammen"
+        };
+        let fits = if found.len() == 1 { "passt" } else { "passen" };
+        eprintln!(
+            "Warnung: {} {verb} aus einem früheren Lauf und {fits} nicht mehr zu {source}",
+            found.join(", ")
+        );
+        stale.extend(found.iter().map(|f| f.to_string()));
+    }
+    stale
+}
+
 pub fn run(args: &Args) -> Result<(), BoxError> {
     let start = Instant::now();
     if !matches!(args.downscale, 1 | 2 | 4) {
@@ -598,8 +644,9 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
         ..ColorConfig::default()
     };
     let dense_id = format!(
-        "driftless map dense\n{}lidar_topic {:?}\nimu_topic {:?}\n{odom:?}\ntraj {:016x} {}\n\
+        "driftless {} map dense\n{}lidar_topic {:?}\nimu_topic {:?}\n{odom:?}\ntraj {:016x} {}\n\
          {dense_cfg:?}\n",
+        env!("CARGO_PKG_VERSION"),
         bag_list(&project.lidar_bags)?,
         args.lidar_topic,
         args.imu_topic,
@@ -653,7 +700,7 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
             match color {
                 Ok(input) => run.run_color(cloud, input)?,
                 Err(why) => {
-                    eprintln!("Warnung: nicht eingefärbt, {why}; color.las und color.ply fehlen");
+                    eprintln!("Warnung: nicht eingefärbt, {why}");
                     run.steps.insert("color", json!({"skipped": why}));
                 }
             }
@@ -676,11 +723,14 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
         }
     }
 
+    let stale = warn_stale(&run.out, &run.steps);
+
     let peak = peak_rss_bytes();
     let report = json!({
         "settings": settings,
         "steps": run.steps,
         "seconds_total": seconds(start),
+        "stale": stale,
         "peak_rss_bytes": peak,
     });
     let report_path = run.path(REPORT);

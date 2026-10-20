@@ -254,6 +254,7 @@ fn map_without_images_skips_color() {
         .as_str()
         .unwrap()
         .contains("keine Kamerabilder"));
+    assert_eq!(json["stale"], serde_json::json!([]));
 
     map(&dir, &out, &["--step", "color"])
         .failure()
@@ -269,6 +270,35 @@ fn map_without_images_skips_color() {
         .failure()
         .stderr(predicate::str::contains("keine Kalibrierung"));
     assert!(!out.join("dense.las").exists(), "fails before any work");
+}
+
+#[test]
+fn map_skipped_color_marks_old_color_stale() {
+    let dir = tmp("map-stale-color");
+    scan_with_images(&dir);
+    let out = dir.join("out");
+    slam(&dir, &out);
+    map(&dir, &out, &[]).success();
+    let color = fs::read(out.join("color.las")).unwrap();
+    fs::remove_dir_all(dir.join("calibration")).unwrap();
+    map(&dir, &out, &[])
+        .success()
+        .stderr(predicate::str::contains(
+            "nicht eingefärbt, keine Kalibrierung",
+        ))
+        .stderr(predicate::str::contains(
+            "color.las, color.ply stammen aus einem früheren Lauf und passen nicht mehr zu \
+             clean.las",
+        ))
+        .stderr(predicate::str::contains("fehlen").not());
+    let json = map_json(&out);
+    assert!(json["steps"]["color"]["skipped"].is_string());
+    assert_eq!(json["stale"], serde_json::json!(["color.las", "color.ply"]));
+    assert_eq!(
+        fs::read(out.join("color.las")).unwrap(),
+        color,
+        "not deleted"
+    );
 }
 
 #[test]
@@ -307,6 +337,7 @@ fn map_step_color_reuses_clean() {
     assert_eq!(map_json(&out)["settings"]["clean"]["outliers"], false);
 
     // Another trajectory: the dense cloud is rebuilt.
+    let color = fs::read(out.join("color.las")).unwrap();
     let traj = fs::read_to_string(out.join("traj.tum")).unwrap();
     let shifted: String = traj
         .lines()
@@ -325,10 +356,35 @@ fn map_step_color_reuses_clean() {
         .stdout(predicate::str::contains(
             "dense.bin gehört zu einer anderen Eingabe",
         ))
-        .stdout(predicate::str::contains("Dicht:"));
+        .stdout(predicate::str::contains("Dicht:"))
+        .stderr(predicate::str::contains(
+            "Warnung: color.las, color.ply stammen aus einem früheren Lauf und passen nicht \
+             mehr zu clean.las",
+        ));
     let json = map_json(&out);
     assert_eq!(json["steps"]["dense"]["reused"], false);
     assert!(json["steps"]["color"].is_null(), "colour no longer fits");
+    assert_eq!(json["stale"], serde_json::json!(["color.las", "color.ply"]));
+    // Nothing is deleted.
+    assert_eq!(fs::read(out.join("color.las")).unwrap(), color);
+
+    // After `--step dense` with another voxel size the cleaned cloud is stale too.
+    map(&dir, &out, &["--step", "dense", "--voxel", "0.05"])
+        .success()
+        .stderr(predicate::str::contains(
+            "clean.las, removed.las, clean.bin stammen aus einem früheren Lauf und passen \
+             nicht mehr zu dense.las",
+        ));
+    assert_eq!(
+        map_json(&out)["stale"],
+        serde_json::json!([
+            "clean.las",
+            "removed.las",
+            "clean.bin",
+            "color.las",
+            "color.ply"
+        ])
+    );
 }
 
 #[test]
