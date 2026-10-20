@@ -186,6 +186,100 @@ fn view_bad_trajectory_fails_before_opening_output() {
     assert!(!dir.join("out.rrd").exists());
 }
 
+/// A `driftless slam` output folder: 3 submaps (poses every 0.5 s), one accepted, one
+/// rejected and one manual position-only loop.
+fn slam_output(name: &str) -> PathBuf {
+    use driftless_slam::report::{BeforeAfter, LoopReport, SlamReport, SubmapReport};
+    let dir = tmp(name);
+    let sm = |id: usize, t: f64, quality: f32, x: f64| SubmapReport {
+        id,
+        t_start: t,
+        t_end: t + 1.0,
+        quality,
+        anchor: [x, 0.5, 0.0],
+        odom_anchor: [x, 0.0, 0.0],
+    };
+    let lp = |a, b, manual, accepted, reason: Option<&str>| LoopReport {
+        a,
+        b,
+        manual,
+        accepted,
+        reason: reason.map(String::from),
+        inlier_ratio: 0.5,
+        rms: 0.1,
+    };
+    let report = SlamReport {
+        submaps: vec![
+            sm(0, 0.0, 1.0, 0.0),
+            sm(1, 2.0, 0.5, 2.0),
+            sm(2, 4.0, 0.0, 4.0),
+        ],
+        loops: vec![
+            lp(0, 2, false, true, None),
+            lp(0, 1, false, false, Some("zu wenige Übereinstimmungen")),
+            lp(1, 2, true, true, Some("nur Position verbunden")),
+        ],
+        graph: None,
+        start_end_gap: BeforeAfter {
+            before: 1.0,
+            after: 0.1,
+        },
+        path_length: BeforeAfter {
+            before: 5.0,
+            after: 5.0,
+        },
+    };
+    fs::write(
+        dir.join("slam.json"),
+        serde_json::to_string(&report).unwrap(),
+    )
+    .unwrap();
+    let tum = |dy: f64| {
+        (0..12)
+            .map(|i| {
+                format!(
+                    "{} {} {dy} 0 0 0 0 1\n",
+                    100.0 + i as f64 * 0.5,
+                    i as f64 * 0.5
+                )
+            })
+            .collect::<String>()
+    };
+    fs::write(dir.join("traj.tum"), tum(0.5)).unwrap();
+    fs::write(dir.join("traj_odom.tum"), tum(0.0)).unwrap();
+    dir
+}
+
+#[test]
+fn view_slam_logs_quality_and_loops() {
+    let dir = hilti_style_project("slam", true);
+    let out = slam_output("slam-out");
+    view(&dir, &["--slam", out.to_str().unwrap()]).success();
+    let rrd = fs::read(dir.join("out.rrd")).unwrap();
+    for entity in [
+        "slam/trajectory",
+        "slam/odometry",
+        "slam/loops",
+        "slam/anchors",
+    ] {
+        assert!(
+            rrd.windows(entity.len()).any(|w| w == entity.as_bytes()),
+            "{entity} fehlt in der Aufzeichnung"
+        );
+    }
+}
+
+#[test]
+fn view_slam_missing_report_errors() {
+    let dir = hilti_style_project("slam-missing", true);
+    let out = tmp("slam-empty");
+    view(&dir, &["--slam", out.to_str().unwrap()])
+        .failure()
+        .stderr(predicate::str::contains("Fehler"))
+        .stderr(predicate::str::contains("slam.json"));
+    assert!(!dir.join("out.rrd").exists());
+}
+
 /// Real recording; prints runtime. Run with `cargo test -- --ignored --nocapture`.
 #[test]
 #[ignore]

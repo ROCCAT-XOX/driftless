@@ -7,6 +7,7 @@ use crate::topics::{file_name, TopicPicker};
 use driftless_io::bag::{BagError, BagReader};
 use driftless_io::msg::{decode_compressed_image, decode_imu, decode_pointcloud2, LidarFrame};
 use driftless_io::project::discover_project;
+use driftless_slam::SlamReport;
 use driftless_traj::read_tum;
 use std::path::PathBuf;
 
@@ -23,6 +24,10 @@ pub struct Args {
     /// Trajektorie (TUM-Datei) als Linie einblenden
     #[arg(long)]
     traj: Option<PathBuf>,
+    /// Ausgabeordner von `driftless slam` (slam.json, traj.tum, traj_odom.tum): Laufbahn nach
+    /// Güte eingefärbt, Odometrie, Schleifen und Teilkarten-Anker einblenden
+    #[arg(long, value_name = "ORDNER")]
+    slam: Option<PathBuf>,
     /// PointCloud2-Topic (Standard: das einzige in der Bag)
     #[arg(long)]
     lidar_topic: Option<String>,
@@ -73,6 +78,158 @@ fn camera_entity(topic: &str) -> String {
         *first = first.strip_prefix("camera_").unwrap_or(first);
     }
     format!("camera/{}", parts.join("/"))
+}
+
+/// Colour of a submap quality: red (0) via yellow (0.5) to green (1).
+fn quality_color(quality: f32) -> [u8; 3] {
+    let q = if quality.is_finite() {
+        quality.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let ramp = |x: f32| (x * 255.0).round() as u8;
+    if q < 0.5 {
+        [255, ramp(q * 2.0), 0]
+    } else {
+        [ramp(2.0 - q * 2.0), 255, 0]
+    }
+}
+
+const LOOP_ACCEPTED: [u8; 3] = [0, 200, 0];
+const LOOP_REJECTED: [u8; 3] = [140, 140, 140];
+const LOOP_MANUAL: [u8; 3] = [40, 120, 255];
+
+/// Everything of a `driftless slam` output the viewer shows, read and checked up front.
+struct SlamView {
+    report: SlamReport,
+    corrected: Vec<driftless_traj::Pose>,
+    odometry: Vec<driftless_traj::Pose>,
+}
+
+fn load_slam(dir: &std::path::Path) -> Result<SlamView, BoxError> {
+    let json_path = dir.join("slam.json");
+    let text = std::fs::read_to_string(&json_path)
+        .map_err(|e| format!("{} nicht lesbar: {e}", json_path.display()))?;
+    let report: SlamReport = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "{} ist kein gültiger SLAM-Bericht: {e}",
+            json_path.display()
+        )
+    })?;
+    Ok(SlamView {
+        report,
+        corrected: read_tum(&dir.join("traj.tum"))?,
+        odometry: read_tum(&dir.join("traj_odom.tum"))?,
+    })
+}
+
+fn xyz(p: &driftless_traj::Pose) -> [f32; 3] {
+    [p.p.x as f32, p.p.y as f32, p.p.z as f32]
+}
+
+fn xyz64(p: [f64; 3]) -> [f32; 3] {
+    [p[0] as f32, p[1] as f32, p[2] as f32]
+}
+
+/// One line strip per submap: a pose belongs to the last submap that started at or before
+/// it (times are seconds since the first pose). Each strip also ends on the first point of
+/// the next one, so the coloured line has no gaps. Submaps without poses are skipped.
+fn trajectory_strips(view: &SlamView) -> (Vec<Vec<[f32; 3]>>, Vec<[u8; 3]>) {
+    let submaps = &view.report.submaps;
+    let Some(t0) = view.corrected.first().map(|p| p.t) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut groups: Vec<Vec<[f32; 3]>> = vec![Vec::new(); submaps.len()];
+    for pose in &view.corrected {
+        let t = pose.t - t0;
+        let idx = submaps
+            .partition_point(|m| m.t_start <= t)
+            .saturating_sub(1);
+        if let Some(g) = groups.get_mut(idx) {
+            g.push(xyz(pose));
+        }
+    }
+    let mut strips: Vec<Vec<[f32; 3]>> = Vec::new();
+    let mut colors = Vec::new();
+    let mut last: Option<usize> = None;
+    for (i, g) in groups.iter().enumerate() {
+        if g.is_empty() {
+            continue;
+        }
+        if let Some(prev) = last {
+            strips[prev].push(g[0]);
+        }
+        strips.push(g.clone());
+        colors.push(quality_color(submaps[i].quality));
+        last = Some(strips.len() - 1);
+    }
+    (strips, colors)
+}
+
+fn log_slam(rec: &rerun::RecordingStream, view: &SlamView) -> Result<(), BoxError> {
+    let (strips, colors) = trajectory_strips(view);
+    rec.log_static(
+        "slam/trajectory",
+        &rerun::LineStrips3D::new(strips)
+            .with_colors(
+                colors
+                    .iter()
+                    .map(|c| rerun::Color::from_rgb(c[0], c[1], c[2])),
+            )
+            .with_radii([rerun::Radius::new_ui_points(2.5)]),
+    )?;
+    rec.log_static(
+        "slam/odometry",
+        &rerun::LineStrips3D::new([view.odometry.iter().map(xyz).collect::<Vec<_>>()])
+            .with_colors([rerun::Color::from_rgb(130, 130, 130)])
+            .with_radii([rerun::Radius::new_ui_points(0.8)]),
+    )?;
+
+    let submaps = &view.report.submaps;
+    let mut strips = Vec::new();
+    let mut colors = Vec::new();
+    let mut labels = Vec::new();
+    for l in &view.report.loops {
+        let (Some(a), Some(b)) = (submaps.get(l.a), submaps.get(l.b)) else {
+            continue;
+        };
+        strips.push(vec![xyz64(a.anchor), xyz64(b.anchor)]);
+        let c = if l.manual {
+            LOOP_MANUAL
+        } else if l.accepted {
+            LOOP_ACCEPTED
+        } else {
+            LOOP_REJECTED
+        };
+        colors.push(rerun::Color::from_rgb(c[0], c[1], c[2]));
+        labels.push(match &l.reason {
+            Some(why) => format!("{}↔{} ({why})", l.a, l.b),
+            None => format!("{}↔{}", l.a, l.b),
+        });
+    }
+    rec.log_static(
+        "slam/loops",
+        &rerun::LineStrips3D::new(strips)
+            .with_colors(colors)
+            .with_labels(labels)
+            .with_radii([rerun::Radius::new_ui_points(1.5)]),
+    )?;
+
+    rec.log_static(
+        "slam/anchors",
+        &rerun::Points3D::new(submaps.iter().map(|m| xyz64(m.anchor)))
+            .with_colors(submaps.iter().map(|m| {
+                let c = quality_color(m.quality);
+                rerun::Color::from_rgb(c[0], c[1], c[2])
+            }))
+            .with_labels(
+                submaps
+                    .iter()
+                    .map(|m| format!("{}: {:.0}–{:.0} s", m.id, m.t_start, m.t_end)),
+            )
+            .with_radii([rerun::Radius::new_ui_points(4.0)]),
+    )?;
+    Ok(())
 }
 
 fn set_stamp(rec: &rerun::RecordingStream, stamp: f64) {
@@ -246,6 +403,10 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
         ),
         None => None,
     };
+    let slam = match &args.slam {
+        Some(dir) => Some(load_slam(dir)?),
+        None => None,
+    };
     let mut warnings = Vec::new();
     let all_bags: Vec<PathBuf> = project
         .lidar_bags
@@ -268,6 +429,9 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
     if let Some(line) = line {
         rec.log_static("trajectory", &rerun::LineStrips3D::new([line]))?;
     }
+    if let Some(view) = &slam {
+        log_slam(&rec, view)?;
+    }
     let mut counts = Counts::default();
     for plan in &plans {
         log_bag(&rec, plan, args.every, &mut counts, &mut warnings)?;
@@ -288,7 +452,16 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
 
 #[cfg(test)]
 mod tests {
-    use super::camera_entity;
+    use super::{camera_entity, quality_color};
+
+    #[test]
+    fn quality_color_endpoints() {
+        assert_eq!(quality_color(0.0), [255, 0, 0]);
+        assert_eq!(quality_color(0.5), [255, 255, 0]);
+        assert_eq!(quality_color(1.0), [0, 255, 0]);
+        assert_eq!(quality_color(-3.0), [255, 0, 0]);
+        assert_eq!(quality_color(f32::NAN), [255, 0, 0]);
+    }
 
     #[test]
     fn camera_entities() {
