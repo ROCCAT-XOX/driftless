@@ -6,14 +6,18 @@
 //!              `f32 x y z, f32 intensity, f32 t_rel, u32 ring` (24 bytes).
 //!
 //! Records are written in bag order; invalid points are already dropped by the decoder.
+//! Absolute per-point stamps (Hesai) are turned into offsets from the frame stamp, offsets
+//! below zero are written as 0 (same rule as the odometry, `driftless_odom::deskew`).
 
 use driftless_io::bag::BagReader;
 use driftless_io::msg::{decode_imu, decode_pointcloud2};
 use driftless_io::project::discover_project;
-use std::collections::HashMap;
+use driftless_odom::deskew::point_time_base;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+
+use crate::topics::pick_topic;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -22,6 +26,12 @@ pub struct Args {
     /// Zielordner für imu.bin und lidar.bin
     #[arg(short = 'o', long = "out")]
     out: PathBuf,
+    /// PointCloud2-Topic (Standard: das einzige in der Bag)
+    #[arg(long)]
+    lidar_topic: Option<String>,
+    /// Imu-Topic (Standard: das einzige in der Bag)
+    #[arg(long)]
+    imu_topic: Option<String>,
 }
 
 const IMU_MAGIC: &[u8; 8] = b"DLIMU01\0";
@@ -39,12 +49,27 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         (0u64, 0u64, 0u64, 0u64, 0u64);
     for bag in &project.lidar_bags {
         let mut reader = BagReader::open(bag)?;
-        let types: HashMap<String, String> = reader
-            .connections()
+        let lidar_topic = pick_topic(
+            &reader,
+            "sensor_msgs/PointCloud2",
+            args.lidar_topic.as_deref(),
+            "--lidar-topic",
+        )?;
+        let imu_topic = pick_topic(
+            &reader,
+            "sensor_msgs/Imu",
+            args.imu_topic.as_deref(),
+            "--imu-topic",
+        )?;
+        let topics: Vec<&str> = lidar_topic
             .iter()
-            .map(|c| (c.topic.clone(), c.msg_type.clone()))
+            .chain(&imu_topic)
+            .map(String::as_str)
             .collect();
-        for item in reader.messages(&[]) {
+        if topics.is_empty() {
+            continue;
+        }
+        for item in reader.messages(&topics) {
             let msg = match item {
                 Ok(m) => m,
                 Err(e) => {
@@ -53,8 +78,8 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
             };
-            match types.get(&msg.topic).map(String::as_str) {
-                Some("sensor_msgs/Imu") => match decode_imu(&msg.data) {
+            if imu_topic.as_ref() == Some(&msg.topic) {
+                match decode_imu(&msg.data) {
                     Ok(s) => {
                         for v in [s.stamp].iter().chain(&s.accel).chain(&s.gyro) {
                             imu.write_all(&v.to_le_bytes())?;
@@ -62,13 +87,16 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                         samples += 1;
                     }
                     Err(_) => errors += 1,
-                },
-                Some("sensor_msgs/PointCloud2") => match decode_pointcloud2(&msg.data) {
+                }
+            } else {
+                match decode_pointcloud2(&msg.data) {
                     Ok(f) => {
+                        let base = point_time_base(&f);
                         lidar.write_all(&f.stamp.to_le_bytes())?;
                         lidar.write_all(&(f.points.len() as u32).to_le_bytes())?;
                         for p in &f.points {
-                            for v in [p.xyz[0], p.xyz[1], p.xyz[2], p.intensity, p.t_rel as f32] {
+                            let t_rel = (p.t_rel - base).max(0.0) as f32;
+                            for v in [p.xyz[0], p.xyz[1], p.xyz[2], p.intensity, t_rel] {
                                 lidar.write_all(&v.to_le_bytes())?;
                             }
                             lidar.write_all(&u32::from(p.ring).to_le_bytes())?;
@@ -78,8 +106,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                         dropped += u64::from(f.dropped);
                     }
                     Err(_) => errors += 1,
-                },
-                _ => {}
+                }
             }
         }
     }

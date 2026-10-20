@@ -4,6 +4,7 @@ mod compare;
 mod export_glim;
 mod inspect;
 mod odom;
+mod topics;
 mod view;
 
 use clap::{Parser, Subcommand};

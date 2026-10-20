@@ -108,3 +108,143 @@ fn odom_missing_folder_fails() {
         .failure()
         .stderr(predicate::str::contains("nicht gefunden"));
 }
+
+/// Static box-room bag: LiDAR on `lidar_topic`, IMU on `/vanjee_imu_packets`, optionally a
+/// second PointCloud2 topic `/other` with a single far point per frame.
+fn room_bag(dir: &std::path::Path, lidar_topic: &str, with_other_cloud: bool) {
+    let mut w = BagWriter::new(Compression::None);
+    let lc = w.add_connection(lidar_topic, "sensor_msgs/PointCloud2");
+    let ic = w.add_connection("/vanjee_imu_packets", "sensor_msgs/Imu");
+    let oc = with_other_cloud.then(|| w.add_connection("/other", "sensor_msgs/PointCloud2"));
+    let t0 = 1000.0;
+    for i in 0..=300 {
+        let s = t0 + i as f64 * 0.005;
+        let imu = ImuSample {
+            stamp: s,
+            gyro: [0.0; 3],
+            accel: [0.0, 0.0, 9.81],
+        };
+        w.write_message(ic, time(s), &encode_imu(&imu));
+        if i % 20 == 0 && i < 300 {
+            w.write_message(lc, time(s), &encode_pointcloud2(s, "lidar", &room_scan()));
+            if let Some(oc) = oc {
+                let far = [LidarPoint {
+                    xyz: [30.0, 0.0, 0.0],
+                    intensity: 1.0,
+                    ring: 0,
+                    t_rel: 0.0,
+                }];
+                w.write_message(oc, time(s + 0.001), &encode_pointcloud2(s, "o", &far));
+            }
+        }
+    }
+    fs::write(dir.join("LIDAR_0.bag"), w.finish()).unwrap();
+}
+
+fn las_min_x(path: &std::path::Path) -> f64 {
+    let mut las = las::Reader::from_path(path).unwrap();
+    let data = las.read_all().unwrap();
+    data.points()
+        .map(|p| p.unwrap().x)
+        .fold(f64::INFINITY, f64::min)
+}
+
+#[test]
+fn odom_applies_lidar_to_imu_extrinsic() {
+    let dir = tmp("extrinsic");
+    room_bag(&dir, "/vanjee_722z", false);
+    let (plain, turned) = (dir.join("plain"), dir.join("turned"));
+    let odom = |out: &PathBuf, extra: &[&str]| {
+        Command::cargo_bin("driftless")
+            .unwrap()
+            .arg("odom")
+            .arg(&dir)
+            .arg("-o")
+            .arg(out)
+            .args(extra)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("15 Posen"));
+    };
+    odom(&plain, &[]);
+    // 180° about z (qz = 1): the room x range [-4, 6] becomes [-6, 4].
+    odom(
+        &turned,
+        &["--lidar-to-imu", "0", "0", "0", "0", "0", "1", "0"],
+    );
+    assert!(las_min_x(&plain.join("map.las")) > -4.5);
+    assert!(las_min_x(&turned.join("map.las")) < -5.5);
+    let traj = driftless_traj::read_tum(&turned.join("traj.tum")).unwrap();
+    assert!(traj.iter().all(|p| p.p.norm() < 0.02));
+}
+
+#[test]
+fn odom_rejects_malformed_extrinsic() {
+    let dir = tmp("bad-extrinsic");
+    room_bag(&dir, "/vanjee_722z", false);
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .arg("odom")
+        .arg(&dir)
+        .arg("-o")
+        .arg(dir.join("out"))
+        .args(["--lidar-to-imu", "0", "0", "0", "0", "0", "0", "0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Quaternion"));
+}
+
+#[test]
+fn odom_refuses_ambiguous_lidar_topics_and_selects_by_name() {
+    let dir = tmp("topics");
+    room_bag(&dir, "/hesai/pandar", true);
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .arg("odom")
+        .arg(&dir)
+        .arg("-o")
+        .arg(dir.join("a"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("/hesai/pandar"))
+        .stderr(predicate::str::contains("/other"))
+        .stderr(predicate::str::contains("--lidar-topic"));
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .arg("odom")
+        .arg(&dir)
+        .arg("-o")
+        .arg(dir.join("b"))
+        .args(["--lidar-topic", "/hesai/pandar"])
+        .args(["--imu-topic", "/vanjee_imu_packets"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("15 Posen"));
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .arg("odom")
+        .arg(&dir)
+        .arg("-o")
+        .arg(dir.join("c"))
+        .args(["--lidar-topic", "/nope"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("/nope"));
+}
+
+#[test]
+fn odom_without_deskew_runs() {
+    let dir = tmp("no-deskew");
+    room_bag(&dir, "/vanjee_722z", false);
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .arg("odom")
+        .arg(&dir)
+        .arg("-o")
+        .arg(dir.join("out"))
+        .arg("--no-deskew")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("15 Posen"))
+        .stdout(predicate::str::contains("ohne Deskew"));
+}

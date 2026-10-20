@@ -76,6 +76,30 @@ fn pipeline_handles_lidar_to_imu_extrinsic() {
     assert!(dev < 0.1, "end deviation {dev} m");
 }
 
+/// `deskew: false` takes every point as captured at the frame end (for comparisons).
+#[test]
+fn pipeline_deskew_can_be_switched_off() {
+    let walk = Walk {
+        still: 1.0,
+        speed: 1.0,
+    };
+    let scene = corridor_scene();
+    let frames = lidar_frames(&scene, &walk, 0.0, 6.0, 360, &Isometry3::identity());
+    let imu = imu_samples(&walk, -0.5, 6.5, 200.0);
+    let on = run_odometry(frames.clone().into_iter(), &imu, &OdomConfig::default());
+    let cfg = OdomConfig {
+        deskew: false,
+        ..OdomConfig::default()
+    };
+    let off = run_odometry(frames.into_iter(), &imu, &cfg);
+    assert!(OdomConfig::default().deskew);
+    assert_eq!(off.poses.len(), on.poses.len());
+    assert_ne!(off.poses, on.poses);
+    let last = off.poses.last().unwrap();
+    let dev = (last.p - walk.pose(last.t).translation.vector).norm();
+    assert!(dev < 0.5, "end deviation without deskew {dev} m");
+}
+
 #[test]
 fn odometry_is_deterministic() {
     let (_, a) = corridor_run(4.0, Isometry3::identity());

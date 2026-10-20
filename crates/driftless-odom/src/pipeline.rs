@@ -34,6 +34,9 @@ pub struct OdomConfig {
     pub icp_max_iter: u32,
     /// LiDAR → IMU (body) extrinsic. Poses are reported for the body frame.
     pub lidar_to_imu: Isometry3<f64>,
+    /// Motion-compensate each sweep with the IMU prediction. `false` treats all points as
+    /// captured at the frame end (only for comparisons).
+    pub deskew: bool,
 }
 
 impl Default for OdomConfig {
@@ -45,6 +48,7 @@ impl Default for OdomConfig {
             min_range: 0.5,
             icp_max_iter: 30,
             lidar_to_imu: Isometry3::identity(),
+            deskew: true,
         }
     }
 }
@@ -148,7 +152,11 @@ pub fn run_odometry(
             .unwrap_or_else(|| ImuState::at_rest(fp.t_start, start_rot));
         let motion = propagate(&start, &imu, &model, fp.t_end);
         let pred = motion[motion.len() - 1].clone();
-        let body = deskew(&fp.points, &motion, fp.t_end);
+        let body = if cfg.deskew {
+            deskew(&fp.points, &motion, fp.t_end)
+        } else {
+            deskew(&fp.points, &[], fp.t_end)
+        };
 
         let pose = match &target {
             Some(tgt) => {

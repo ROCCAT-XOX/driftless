@@ -27,23 +27,30 @@ pub struct FramePoints {
     pub clamped: usize,
 }
 
-/// Converts a frame to body-frame points with absolute times.
-///
-/// Point times are offsets from `frame.stamp` (JMK6/Vanjee). If the largest one exceeds
-/// [`ABSOLUTE_TIME_THRESHOLD`], the field holds absolute stamps (e.g. Hesai) and the frame
-/// stamp is subtracted first. Offsets below zero are clamped to zero.
-pub fn frame_points(frame: &LidarFrame, lidar_to_imu: &Isometry3<f64>) -> FramePoints {
+/// Value to subtract from the per-point time field to get an offset from `frame.stamp`:
+/// `frame.stamp` if the field holds absolute stamps (largest finite value above
+/// [`ABSOLUTE_TIME_THRESHOLD`]), else 0.
+pub fn point_time_base(frame: &LidarFrame) -> f64 {
     let max_t = frame
         .points
         .iter()
         .map(|p| p.t_rel)
         .filter(|t| t.is_finite())
         .fold(f64::NEG_INFINITY, f64::max);
-    let base = if max_t > ABSOLUTE_TIME_THRESHOLD {
+    if max_t > ABSOLUTE_TIME_THRESHOLD {
         frame.stamp
     } else {
         0.0
-    };
+    }
+}
+
+/// Converts a frame to body-frame points with absolute times.
+///
+/// Point times are offsets from `frame.stamp` (JMK6/Vanjee). If the largest one exceeds
+/// [`ABSOLUTE_TIME_THRESHOLD`], the field holds absolute stamps (e.g. Hesai) and the frame
+/// stamp is subtracted first. Offsets below zero are clamped to zero.
+pub fn frame_points(frame: &LidarFrame, lidar_to_imu: &Isometry3<f64>) -> FramePoints {
+    let base = point_time_base(frame);
     let (mut skipped, mut clamped) = (0, 0);
     let mut points = Vec::with_capacity(frame.points.len());
     let (mut t_start, mut t_end) = (f64::INFINITY, f64::NEG_INFINITY);

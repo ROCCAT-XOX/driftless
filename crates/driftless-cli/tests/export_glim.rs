@@ -115,3 +115,52 @@ fn export_glim_missing_folder_fails() {
         .failure()
         .stderr(predicate::str::contains("nicht gefunden"));
 }
+
+/// Hesai-style absolute per-point stamps become offsets from the frame stamp; the LiDAR
+/// topic can be chosen by name when a bag holds several.
+#[test]
+fn export_glim_normalises_absolute_point_times_and_selects_topic() {
+    let dir = tmp("hesai");
+    let mut w = BagWriter::new(Compression::None);
+    let lc = w.add_connection("/hesai/pandar", "sensor_msgs/PointCloud2");
+    let oc = w.add_connection("/other", "sensor_msgs/PointCloud2");
+    let ic = w.add_connection("/alphasense/imu", "sensor_msgs/Imu");
+    let s = 1_649_764_528.063_481;
+    let imu = ImuSample {
+        stamp: s,
+        gyro: [0.0; 3],
+        accel: [0.0, 9.81, 0.0],
+    };
+    w.write_message(ic, time(s), &encode_imu(&imu));
+    let pts = [point(1.0, 0, s), point(2.0, 1, s + 0.05)];
+    w.write_message(lc, time(s), &encode_pointcloud2(s, "PandarXT-32", &pts));
+    w.write_message(oc, time(s), &encode_pointcloud2(s, "o", &pts[..1]));
+    fs::write(dir.join("LIDAR_0.bag"), w.finish()).unwrap();
+
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .args(["export-glim"])
+        .arg(&dir)
+        .arg("-o")
+        .arg(dir.join("a"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--lidar-topic"));
+
+    let out = dir.join("b");
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .args(["export-glim"])
+        .arg(&dir)
+        .arg("-o")
+        .arg(&out)
+        .args(["--lidar-topic", "/hesai/pandar"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 LiDAR-Frames"));
+    let lidar = fs::read(out.join("lidar.bin")).unwrap();
+    assert_eq!(lidar.len(), 8 + 12 + 2 * 24);
+    assert_eq!(u32_at(&lidar, 16), 2);
+    assert_eq!(f32_at(&lidar, 20 + 16), 0.0);
+    assert!((f32_at(&lidar, 20 + 24 + 16) - 0.05).abs() < 1e-6);
+}

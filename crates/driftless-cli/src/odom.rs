@@ -3,12 +3,13 @@
 //!
 //! The IMU is read first (small), the LiDAR frames are then streamed from a reader thread.
 
+use crate::topics::pick_topic;
 use driftless_io::bag::BagReader;
 use driftless_io::msg::{decode_imu, decode_pointcloud2, ImuSample, LidarFrame};
 use driftless_io::project::discover_project;
 use driftless_odom::{run_odometry, OdomConfig};
+use driftless_traj::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 use driftless_traj::{path_length, start_end_gap, write_tum};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
@@ -24,39 +25,38 @@ pub struct Args {
     /// Zielordner für traj.tum und map.las
     #[arg(short = 'o', long = "out")]
     out: PathBuf,
+    /// LiDAR-Lage im IMU-Rahmen: x y z qx qy qz qw (Standard: Identität)
+    #[arg(long, num_args = 7, value_names = ["X", "Y", "Z", "QX", "QY", "QZ", "QW"], allow_negative_numbers = true)]
+    lidar_to_imu: Option<Vec<f64>>,
+    /// PointCloud2-Topic (Standard: das einzige in der Bag)
+    #[arg(long)]
+    lidar_topic: Option<String>,
+    /// Imu-Topic (Standard: das einzige in der Bag)
+    #[arg(long)]
+    imu_topic: Option<String>,
+    /// Punkte nicht mit der IMU-Bewegung entzerren (nur zum Vergleich)
+    #[arg(long)]
+    no_deskew: bool,
 }
 
-/// Topics of `msg_type` in this bag.
-fn topics_of(reader: &BagReader<std::io::BufReader<fs::File>>, msg_type: &str) -> Vec<String> {
-    let types: HashMap<&str, &str> = reader
-        .connections()
-        .iter()
-        .map(|c| (c.topic.as_str(), c.msg_type.as_str()))
-        .collect();
-    let mut t: Vec<String> = types
-        .into_iter()
-        .filter(|(_, ty)| *ty == msg_type)
-        .map(|(topic, _)| topic.to_string())
-        .collect();
-    t.sort();
-    t
-}
-
-/// Calls `f` with every message of `msg_type` in `bags` until it returns `false`. A read error
-/// (truncated copy) ends that bag with a warning; everything before it is kept.
+/// Calls `f` with every message of `msg_type` in `bags` until it returns `false`, from the
+/// topic chosen by [`pick_topic`]. A read error (truncated copy) ends that bag with a warning;
+/// everything before it is kept. Fails if no bag has a matching topic.
 fn for_each_message(
     bags: &[PathBuf],
     msg_type: &str,
+    wanted: Option<&str>,
+    option: &str,
     mut f: impl FnMut(&[u8]) -> bool,
 ) -> Result<(), String> {
+    let mut found = false;
     for bag in bags {
         let mut reader = BagReader::open(bag).map_err(|e| format!("{}: {e}", bag.display()))?;
-        let topics = topics_of(&reader, msg_type);
-        if topics.is_empty() {
+        let Some(topic) = pick_topic(&reader, msg_type, wanted, option)? else {
             continue;
-        }
-        let topics: Vec<&str> = topics.iter().map(String::as_str).collect();
-        for item in reader.messages(&topics) {
+        };
+        found = true;
+        for item in reader.messages(&[topic.as_str()]) {
             match item {
                 Ok(m) => {
                     if !f(&m.data) {
@@ -70,7 +70,26 @@ fn for_each_message(
             }
         }
     }
-    Ok(())
+    match (found, wanted) {
+        (true, _) | (false, None) => Ok(()),
+        (false, Some(w)) => Err(format!("Topic {w} ({msg_type}) in keiner LIDAR-Bag")),
+    }
+}
+
+/// `x y z qx qy qz qw` (LiDAR pose in the IMU frame) → isometry. The quaternion is normalised.
+fn parse_extrinsic(v: &[f64]) -> Result<Isometry3<f64>, String> {
+    let [x, y, z, qx, qy, qz, qw] = v else {
+        return Err("--lidar-to-imu braucht 7 Zahlen: x y z qx qy qz qw".into());
+    };
+    let q = Quaternion::new(*qw, *qx, *qy, *qz);
+    let finite = [x, y, z].iter().all(|v| v.is_finite());
+    if !finite || !q.norm().is_finite() || q.norm() <= 1e-6 {
+        return Err("--lidar-to-imu: ungültige Quaternion oder Position".into());
+    }
+    Ok(Isometry3::from_parts(
+        Translation3::new(*x, *y, *z),
+        UnitQuaternion::from_quaternion(q),
+    ))
 }
 
 fn write_las(path: &Path, points: &[[f32; 3]]) -> Result<(), Box<dyn std::error::Error>> {
@@ -91,33 +110,55 @@ fn write_las(path: &Path, points: &[[f32; 3]]) -> Result<(), Box<dyn std::error:
 
 pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
+    let cfg = OdomConfig {
+        lidar_to_imu: match &args.lidar_to_imu {
+            Some(v) => parse_extrinsic(v)?,
+            None => Isometry3::identity(),
+        },
+        deskew: !args.no_deskew,
+        ..OdomConfig::default()
+    };
     let project = discover_project(&args.folder)?;
     fs::create_dir_all(&args.out)?;
 
     let mut imu: Vec<ImuSample> = Vec::new();
     let mut bad = 0usize;
-    for_each_message(&project.lidar_bags, IMU_TYPE, |data| {
-        match decode_imu(data) {
-            Ok(s) => imu.push(s),
-            Err(_) => bad += 1,
-        }
-        true
-    })?;
+    let imu_topic = args.imu_topic.as_deref();
+    for_each_message(
+        &project.lidar_bags,
+        IMU_TYPE,
+        imu_topic,
+        "--imu-topic",
+        |data| {
+            match decode_imu(data) {
+                Ok(s) => imu.push(s),
+                Err(_) => bad += 1,
+            }
+            true
+        },
+    )?;
 
     let bags = project.lidar_bags.clone();
+    let lidar_topic = args.lidar_topic.clone();
     let (tx, rx) = sync_channel::<LidarFrame>(16);
     let reader = std::thread::spawn(move || {
         let mut bad = 0usize;
-        let r = for_each_message(&bags, CLOUD_TYPE, |data| match decode_pointcloud2(data) {
-            Ok(f) => tx.send(f).is_ok(),
-            Err(_) => {
-                bad += 1;
-                true
-            }
-        });
+        let r = for_each_message(
+            &bags,
+            CLOUD_TYPE,
+            lidar_topic.as_deref(),
+            "--lidar-topic",
+            |data| match decode_pointcloud2(data) {
+                Ok(f) => tx.send(f).is_ok(),
+                Err(_) => {
+                    bad += 1;
+                    true
+                }
+            },
+        );
         r.map(|()| bad)
     });
-    let result = run_odometry(rx.into_iter(), &imu, &OdomConfig::default());
+    let result = run_odometry(rx.into_iter(), &imu, &cfg);
     bad += reader.join().map_err(|_| "Lesethread abgestürzt")??;
 
     write_tum(&args.out.join("traj.tum"), &result.poses)?;
@@ -146,8 +187,9 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         bad
     );
     println!(
-        "Laufzeit {:.1} s → {}",
+        "Laufzeit {:.1} s{} → {}",
         start.elapsed().as_secs_f64(),
+        if cfg.deskew { "" } else { " (ohne Deskew)" },
         args.out.display()
     );
     Ok(())
