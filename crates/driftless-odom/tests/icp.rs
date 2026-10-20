@@ -45,6 +45,62 @@ fn icp_recovers_known_transform() {
     assert!(da < 0.1, "rotation error {da}°");
 }
 
+/// Registers the room problem with everything moved by `shift` (world points, truth, init).
+fn shifted_room_result(shift: Vector3<f64>) -> (Isometry3<f64>, Isometry3<f64>) {
+    let scene = room_scene();
+    let to_shift = Isometry3::translation(shift.x, shift.y, shift.z);
+    let target_pts = scene
+        .surface_samples(0.1, 0.0)
+        .into_iter()
+        .map(|p| p + shift)
+        .collect();
+    let target = IcpTarget::new(target_pts).unwrap();
+    let truth = to_shift
+        * Isometry3::from_parts(
+            Vector3::new(0.12, -0.1, 0.12).into(),
+            UnitQuaternion::from_axis_angle(
+                &Unit::new_normalize(Vector3::new(0.2, 0.1, 1.0)),
+                5f64.to_radians(),
+            ),
+        );
+    let inv = truth.inverse();
+    let source: Vec<Vector3<f64>> = voxel_downsample(&scene.surface_samples(0.1, 0.05), 0.3)
+        .iter()
+        .map(|p| (inv * Point3::from(*p + shift)).coords)
+        .collect();
+    let r = align(&source, &target, &to_shift, &IcpParams::default());
+    (r.pose, truth)
+}
+
+#[test]
+fn icp_result_does_not_depend_on_distance_from_origin() {
+    let (near, truth_near) = shifted_room_result(Vector3::zeros());
+    let shift = Vector3::new(400.0, -300.0, 20.0); // ≈ 500 m
+    let (far, truth_far) = shifted_room_result(shift);
+    for (pose, truth) in [(near, truth_near), (far, truth_far)] {
+        let err = pose.inverse() * truth;
+        assert!(
+            err.translation.vector.norm() < 0.01,
+            "{}",
+            err.translation.vector.norm()
+        );
+        assert!(
+            err.rotation.angle().to_degrees() < 0.1,
+            "{}",
+            err.rotation.angle().to_degrees()
+        );
+    }
+    // Same answer relative to the shift.
+    let far_local = Isometry3::translation(-shift.x, -shift.y, -shift.z) * far;
+    let d = near.inverse() * far_local;
+    assert!(
+        d.translation.vector.norm() < 1e-4,
+        "{}",
+        d.translation.vector.norm()
+    );
+    assert!(d.rotation.angle() < 1e-5, "{}", d.rotation.angle());
+}
+
 #[test]
 fn voxel_downsample_keeps_one_point_per_voxel_in_input_order() {
     let pts = vec![

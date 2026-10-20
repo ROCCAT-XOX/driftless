@@ -42,6 +42,28 @@ fn pipeline_straight_corridor() {
     assert!(!r.map_points.is_empty());
 }
 
+/// Gyro bias appearing after the static start: only ICP can correct the yaw drift.
+#[test]
+fn pipeline_corrects_gyro_drift_with_icp() {
+    let walk = Walk {
+        still: 1.0,
+        speed: 1.0,
+    };
+    let scene = corridor_scene();
+    let frames = lidar_frames(&scene, &walk, 0.0, 26.0, 360, &Isometry3::identity());
+    let mut imu = imu_samples(&walk, -0.5, 26.5, 200.0);
+    for s in imu.iter_mut().filter(|s| s.stamp > 2.0) {
+        s.gyro[2] += 0.02; // 1.15°/s
+    }
+    let r = run_odometry(frames.into_iter(), &imu, &OdomConfig::default());
+    let last = r.poses.last().unwrap();
+    let truth = walk.pose(last.t);
+    let dev = (last.p - truth.translation.vector).norm();
+    let yaw = (last.q.inverse() * truth.rotation).angle().to_degrees();
+    assert!(dev < 0.3, "end deviation {dev} m");
+    assert!(yaw < 0.5, "end rotation error {yaw}°");
+}
+
 #[test]
 fn pipeline_handles_lidar_to_imu_extrinsic() {
     let ext = Isometry3::new(

@@ -91,8 +91,10 @@ pub struct IcpResult {
     pub correspondences: usize,
 }
 
-/// Weighted residual row for one source point: Jacobian w.r.t. `[rotation, translation]`
-/// (left perturbation in the world frame), residual and robust weight.
+/// Weighted residual row for one source point: Jacobian w.r.t. `[rotation, translation]`,
+/// residual and robust weight. The perturbation rotates about the current body position
+/// (`q' = R_δ (q − t) + t + τ`), so neither the Jacobian nor the motion prior depends on how
+/// far the body is from the world origin.
 struct Term {
     j: Vector6<f64>,
     r: f64,
@@ -101,6 +103,7 @@ struct Term {
 
 fn point_term(
     q: &Vector3<f64>,
+    center: &Vector3<f64>,
     target: &IcpTarget,
     p: &IcpParams,
     k: NonZeroUsize,
@@ -147,17 +150,17 @@ fn point_term(
     if r.abs() > p.max_corr_dist {
         return None;
     }
-    let rot = q.cross(&n);
+    let rot = (q - center).cross(&n);
     let j = Vector6::new(rot.x, rot.y, rot.z, n.x, n.y, n.z);
     let w = 1.0 / (1.0 + (r / p.kernel).powi(2));
     Some(Term { j, r, w })
 }
 
-/// Offset of `pose` from `prior` as a left perturbation `[rotation, translation]`.
+/// Offset of `pose` from `prior` in the perturbation of [`Term`]: world-frame rotation
+/// difference and body position difference (independent of the world origin).
 fn prior_offset(pose: &Isometry3<f64>, prior: &Isometry3<f64>) -> Vector6<f64> {
-    let d = pose.rotation * prior.rotation.inverse();
-    let r = d.scaled_axis();
-    let t = pose.translation.vector - d * prior.translation.vector;
+    let r = (pose.rotation * prior.rotation.inverse()).scaled_axis();
+    let t = pose.translation.vector - prior.translation.vector;
     Vector6::new(r.x, r.y, r.z, t.x, t.y, t.z)
 }
 
@@ -178,9 +181,13 @@ pub fn align(
         correspondences: 0,
     };
     for it in 1..=params.max_iter {
+        let center = pose.translation.vector;
         let terms: Vec<Option<Term>> = source
             .par_iter()
-            .map(|s| point_term(&(pose * Point3::from(*s)).coords, target, params, k))
+            .map(|s| {
+                let q = (pose * Point3::from(*s)).coords;
+                point_term(&q, &center, target, params, k)
+            })
             .collect();
         let (mut h, mut g, mut used) = (Matrix6::<f64>::zeros(), Vector6::<f64>::zeros(), 0);
         for t in terms.iter().flatten() {
@@ -207,11 +214,11 @@ pub fn align(
         let dx = -chol.solve(&g);
         let d_rot = Vector3::new(dx[0], dx[1], dx[2]);
         let d_trans = Vector3::new(dx[3], dx[4], dx[5]);
-        let update = Isometry3::from_parts(
-            Translation3::from(d_trans),
-            UnitQuaternion::from_scaled_axis(d_rot),
+        // Rotate about the body position, then shift.
+        pose = Isometry3::from_parts(
+            Translation3::from(pose.translation.vector + d_trans),
+            UnitQuaternion::from_scaled_axis(d_rot) * pose.rotation,
         );
-        pose = update * pose;
         result.pose = pose;
         if d_rot.norm() < params.eps_rot && d_trans.norm() < params.eps_trans {
             result.converged = true;
