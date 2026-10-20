@@ -4,22 +4,24 @@ Stand: 2026-10-21 · gemessen auf dem MacBook Pro M4 Pro (14 Kerne, 48 GB), Rele
 
 ## Kurzfassung
 
-- `driftless slam` + `driftless map` laufen auf allen drei JMK6-Aufnahmen durch, zwei volle Läufe
-  sind bitgleich (`traj.tum`, `dense.las`, `clean.las`, `removed.las`, `color.las`, `color.ply`).
+- `driftless slam` + `driftless map` laufen auf allen drei Aufnahmen durch. Auf den beiden JMK6-Aufnahmen
+  vom 20.10. sind zwei volle Läufe bitgleich (`traj.tum`, `dense.las`, `clean.las`,
+  `removed.las`, `color.las`, `color.ply`); `Test` wurde je Messung nur einmal gelaufen.
 - **Zeit- und Speicherziel eingehalten:** Testscan `Test` (266 s, 1.741 Bilder) mit den neuen
   Standardwerten in **140 s** (SLAM 9 s + Karte 131 s), Spitzen-RAM **4,0 GB**. Ziel war < 15 min
   und < 8 GB.
 - **Voxelgröße der dichten Wolke von 2 cm auf 1 cm gesenkt** (einzige geänderte Voreinstellung).
   Bei 2 cm sehen Nahansichten sichtbar löchrig aus. Mit 1 cm sind Pflanze, Tapetenstreifen und
-  Kissen erkennbar. Kosten auf `Test`: 2,4× so viele Punkte, Zeit 84 → 140 s, RAM 1,4 → 4,0 GB.
+  Kissen erkennbar. Kosten auf `Test`: 2,5× so viele Punkte, Zeit 84 → 140 s, RAM 1,4 → 4,0 GB.
 - **Eingefärbt** werden 98,4 % (`Test`) und 99,2–99,3 % (JMK6-Aufnahmen) der Punkte.
 - **Belichtungsabgleich:** Die neue Kennzahl „Kamera-Unterschied“ reagiert auf Belichtung und
   Weißabgleich. Der Abgleich senkt sie auf `Test` um 46 % (1,42 → 0,76 sRGB-Stufen) und auf den
   JMK6-Aufnahmen um 57–64 %. Der „Bild-Versatz“ (Helligkeit je Bild über die Zeit) sinkt
-  um 44–55 %. Die alte Streuung sinkt nur um 4–10 %.
-- **Die extremen Belichtungsfaktoren auf `Test` (0,28–3,98) sind echt.** Sie gehören zu sehr
-  dunklen bzw. sehr hellen Bildern, also zur Belichtungsautomatik der Kamera. Ein Fehler der
-  Anpassung ist das nicht. Der Grenzwert 4 wird aber in 6 von 1.677 Bildern erreicht.
+  um 44–56 %. Die alte Streuung sinkt nur um 4–10 %.
+- **Die extremen Belichtungsfaktoren auf `Test` (einzelne Kanäle 0,28–3,98) sind echt.** Sie
+  gehören zu sehr dunklen bzw. sehr hellen Bildern, also zur Belichtungsautomatik der Kamera. Ein
+  Fehler der Anpassung ist das nicht. Die Grenzen (1/4 und 4) werden bei 1 cm nicht erreicht: Der
+  größte Kanalwert ist 3,98 (ein Kanal in einem Bild der linken Kamera, 0,4 % unter 4).
 - **RayStudio `smooth.las` hat keine Farben.** Alle 12,5 Mio. Punkte tragen dieselbe Farbe
   (0, 166, 252), die Intensität ist 0. Verglichen werden konnten deshalb nur Lage und Dichte,
   nicht die Farbe.
@@ -84,37 +86,41 @@ Alle Farbwerte sind sRGB-Stufen (0–255), Mittel über die drei Kanäle.
   Mittel des jeweiligen Punktes abweichen. Das erfasst auch Belichtungswechsel über die Zeit
   innerhalb einer Kamera (früh/spät). Der größte Teil der Faktoren auf `Test` ändert sich über die
   Zeit, nicht zwischen den Kameras (siehe unten).
-- Auf `Test` ist der Kamera-Unterschied schon vorher klein (≈ 1 Stufe). Die beiden Kameras
-  belichten dort fast gleich: Der Median der Faktoren liegt links bei 0,97 und rechts bei 0,82.
-  Bei den JMK6-Aufnahmen ist er 5–8 Stufen. Das ist der Farbstich, der in Aufgabe 6 zu sehen war.
+- Auf `Test` ist der Kamera-Unterschied schon vorher klein (≈ 1,4 Stufen), obwohl die Mediane
+  der Faktoren links bei 0,97 und rechts bei 0,82 liegen, also rund 18 % auseinander. Der Grund
+  ist wohl, dass `Test` dunkel ist (18 % Faktor verschieben dunkle sRGB-Werte nur um wenige
+  Stufen) und dass der größte Teil der Faktoren über die Zeit variiert, nicht zwischen den
+  Kameras. Das wurde nicht weiter untersucht. Bei den JMK6-Aufnahmen ist der Unterschied 7–8
+  Stufen. Das ist der Farbstich, der in Aufgabe 6 zu sehen war.
 - Bei 1 cm sinkt der Kamera-Unterschied auf `Test` weniger stark als bei 2 cm (−46 % statt −79 %).
   Mehr Punkte in Ecken und an Kanten werden von beiden Kameras gesehen. Nicht untersucht ist, ob
   das an der Blickwinkel-Abhängigkeit der Oberflächen liegt oder an Restfehlern der Lage.
 
 ### Sind die extremen Faktoren auf `Test` echt?
 
-Geprüft mit einem Wegwerf-Programm (nicht im Repo): Es hat die Faktoren je Bild zusammen mit der
-mittleren Helligkeit und dem Anteil fast schwarzer bzw. weißer Pixel des Bildes ausgegeben.
+Die Faktoren je Bild wurden mit einem Wegwerf-Test (nicht im Repo) auf dem Standardlauf mit
+1 cm neu gemessen. Die Zeilen mit „Bildhelligkeit“ und „je 15 s“ stammen aus einer früheren
+Messung mit einem Wegwerf-Programm, das die Faktoren mit der mittleren Helligkeit des Bildes
+verglich. Dessen Voxelgröße ist nicht festgehalten und es wurde nicht neu gemessen.
 
 | | Wert |
 |---|---|
-| Korrelation log(Faktor) ↔ log(mittlere Bildhelligkeit) | 0,75 |
-| Faktor (geometrisches Mittel der Kanäle): 1 % / Median / 99 % | 0,41 / 0,89 / 2,91 |
-| Bilder mit Faktor < 0,5 / > 2 | 95 / 318 |
-| Bilder mit einem Kanal am Grenzwert (1/4 oder 4) | 6 von 1.677 (alle grün, linke Kamera) |
-| Median der Faktoren je 15 s, erste 60 s | 2,1–2,6 |
-| Median der Faktoren je 15 s, ab 60 s | 0,5–1,3 |
-| größter Sprung zwischen zwei Bildern einer Kamera (log) | 0,67 links, 0,39 rechts |
+| Faktor (geometrisches Mittel der Kanäle): Minimum / 1 % / Median / 99 % / Maximum | 0,32 / 0,42 / 0,89 / 2,77 / 3,76 |
+| Bilder mit Faktor < 0,5 / > 2 (geometrisches Mittel) | 42 / 218 von 1.677 |
+| Einzelkanal-Faktoren: kleinster / größter | 0,28 / 3,98 |
+| Bilder mit einem Kanal ≥ 3,9 / ≥ 3,99 / ≤ 0,26 | 1 / 0 / 0 |
+| Korrelation log(Faktor) ↔ log(mittlere Bildhelligkeit) (frühere Messung) | 0,75 |
+| Median der Faktoren je 15 s, erste 60 s / ab 60 s (frühere Messung) | 2,1–2,6 / 0,5–1,3 |
 
-- Die kleinsten Faktoren (≈ 0,25, 149–151 s) gehören zu Bildern eines dunklen Großraumbüros am
-  Abend: mittlere Helligkeit 23–29 von 255, 41–51 % fast schwarze Pixel, die Fenster sind dunkel.
-- Die größten Faktoren (≈ 3,2–3,3, 18–44 s) gehören zu Bildern eines kleinen weißen Büros direkt
-  unter der Deckenleuchte: mittlere Helligkeit 97–118, weiße Wände. Im Bild ist außerdem der Arm
-  des Bedieners zu sehen.
+- Die kleinsten Faktoren gehören zu Bildern eines dunklen Großraumbüros am Abend: mittlere
+  Helligkeit 23–29 von 255, 41–51 % fast schwarze Pixel, die Fenster sind dunkel.
+- Die größten Faktoren gehören zu Bildern eines kleinen weißen Büros direkt unter der
+  Deckenleuchte: mittlere Helligkeit 97–118, weiße Wände. Im Bild ist außerdem der Arm des
+  Bedieners zu sehen.
 - Die Faktoren folgen also der Belichtungsautomatik von Raum zu Raum und sind keine Panne der
-  Anpassung. Der Grenzwert `max_gain = 4` wird im grünen Kanal von 6 Bildern erreicht; dort wäre
-  der wahre Faktor wohl noch kleiner. Geändert wurde nichts: 6 Bilder rechtfertigen keinen
-  höheren Grenzwert, der Fehlanpassungen mehr Spielraum gäbe.
+  Anpassung. Bei 1 cm stößt kein Kanal an den Grenzwert (`max_gain = 4`, kleinster Wert 1/4);
+  der größte Wert liegt knapp darunter (3,98). Bei Scans mit noch größeren Sprüngen kann der
+  Grenzwert greifen. Geändert wurde nichts.
 
 ### Dichte und Aussehen: 2 cm, 1,5 cm, 1 cm
 
@@ -142,10 +148,10 @@ gemessen.
 - Deutlich besser im Bild: Bei `143623`, Innenansicht 1 ist die Zimmerpflanze bei 2 cm fast
   unsichtbar, bei 1 cm klar zu erkennen. Ebenso die Streifen der Tapete und der Fernseher mit
   Spiegelungen. Innenansicht 2 zeigt bei 1 cm Kissen, Blumentopf und Lamellen des Fensters
-  geschlossen, bei 2 cm nur als Punktewolke. Die Bildfüllung steigt auf das 1,7- bis 3,7-Fache.
+  geschlossen, bei 2 cm nur als Punktewolke. Die Bildfüllung steigt auf das 1,6- bis 3,7-Fache.
 - 1,5 cm liegt sichtbar dazwischen und bringt nicht den Sprung, der bei 1 cm zu sehen ist.
 - Ziel bleibt klar eingehalten: `Test` 140 s statt 15 min, 4,0 GB statt 8 GB.
-- **Preis:** Speicher und Dateien etwa 2,5×, Einfärben 1,8× so lang. Ein Scan, der doppelt so lang
+- **Preis:** Dateien etwa 2,5×, Speicher 2,8×, Einfärben 1,8× so lang. Ein Scan, der doppelt so lang
   ist wie `Test` (≈ 9 min in denselben Räumen), käme hochgerechnet auf ≈ 8 GB. Für solche Scans
   gibt es `--voxel 0.02` (RAM 1,4 GB auf `Test`).
 - Mehr Punkte werden eingefärbt (95,2 → 98,4 % auf `Test`). Bei 1 cm kann ein Punkt seinen
@@ -271,8 +277,15 @@ wurde er mit der CLI (`map.json`, `/usr/bin/time -l`).
 - **Farbgrenzen auf großen Flächen** (Boden in `Test`) bleiben sichtbar. Der Abgleich hat einen
   Faktor je Bild. Ungleiches Licht innerhalb eines Bildes (Fenster gegen Raum) kann er nicht
   ausgleichen.
-- **Grenzwert der Faktoren:** 6 Bilder erreichen ihn auf `Test`. Bei Scans mit noch größeren
-  Helligkeitssprüngen werden mehr Bilder begrenzt und bleiben zu dunkel oder zu hell.
+- **Grenzwert der Faktoren:** Auf `Test` bei 1 cm erreicht ihn kein Kanal (größter Wert 3,98 von
+  4). Bei Scans mit noch größeren Helligkeitssprüngen werden Bilder begrenzt und bleiben dann zu
+  dunkel oder zu hell.
+- **Schärfe hängt von der Helligkeit ab.** Die Schärfe eines Bildes ist die Varianz des
+  Laplace-Filters auf den unnormierten Grauwerten und wächst etwa mit dem Quadrat der Helligkeit.
+  Dunkle Bilder (z. B. das Großraumbüro am Abend auf `Test`) bekommen daher ein kleineres
+  Gewicht und fallen eher unter die Grenze „unscharf“ (0,4 × Median). Auf `Test` wurden 64 von
+  1.741 Bildern als unscharf übersprungen; ob es vor allem dunkle sind, ist nicht gemessen.
+  Vorgemerkt für Meilenstein 4 (Normieren, z. B. Varianz / Mittel²).
 - **Bereinigung entfernt auch Feststehendes** an Pflanzen und schräg getroffenen Kanten. Wie viel,
   ist ohne Wahrheit nicht gemessen, nur im Bild gesehen. Ob Türen bewegt wurden, ist unbekannt.
 - **Speicher wächst mit der Punktzahl** (≈ 0,55 kB je Punkt beim Einfärben). Sehr lange Scans mit

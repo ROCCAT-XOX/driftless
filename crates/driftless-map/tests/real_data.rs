@@ -178,13 +178,25 @@ impl FullRun {
     }
 }
 
+/// A temporary output folder that is removed on drop, also when a test panics.
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// SLAM, dense, clean and colour of the scan in `folder`, as `driftless slam` and
 /// `driftless map` run them with their defaults; the output files go to a temporary folder
 /// and only their hashes are kept.
 fn full_run(folder: &Path, tag: &str) -> FullRun {
     let bags = discover_project(folder).unwrap().lidar_bags;
     let cfg = SlamConfig::default();
-    let out = std::env::temp_dir().join(format!("driftless-map-full-{tag}-{}", std::process::id()));
+    let guard = TempDir(
+        std::env::temp_dir().join(format!("driftless-map-full-{tag}-{}", std::process::id())),
+    );
+    let out = guard.0.clone();
     std::fs::create_dir_all(&out).unwrap();
 
     let start = Instant::now();
@@ -231,7 +243,7 @@ fn full_run(folder: &Path, tag: &str) -> FullRun {
         .iter()
         .map(|&f| (f, content_hash(&std::fs::read(out.join(f)).unwrap())))
         .collect();
-    std::fs::remove_dir_all(&out).unwrap();
+    drop(guard);
     FullRun {
         seconds: [slam_s, dense_s, clean_s, color_s],
         dense_points: dense.points,
@@ -307,7 +319,7 @@ fn test_scan_exposure_reduces_camera_difference() {
 fn jmk6_scans_run_and_are_deterministic() {
     for name in ["20261020143415", "20261020143623"] {
         let Some(folder) = scan(&format!("jmk6-2026-10-20/{name}")) else {
-            return;
+            continue;
         };
         let a = full_run(&folder, &format!("{name}-a"));
         a.print(name);

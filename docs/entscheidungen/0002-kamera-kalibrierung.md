@@ -93,7 +93,7 @@ Laufzeit `calib-check` (12 Bilder je Kamera): Test 43 s, 143415 14 s, 143623 20 
 2. **`K` gilt für das um 90° gegen den Uhrzeigersinn gedrehte Bild** (3000 × 4000). Gespeicherter Bildpunkt
    `(x, y)` = `(4000 − 1 − y', x')` des gedrehten Bildpunkts `(x', y')`.
 3. **Zeitversatz +0,03 s**: Ein Bild mit Stempel `t` wurde zur LiDAR-Zeit `t + 0,03 s` aufgenommen
-   (Mittel der drei Messungen auf `Test`: +0,03 / +0,05 / +0,03 s).
+   (Mittel der drei Messungen auf `Test`: +0,03 / +0,05 / +0,03 s; die Kurve ist zwischen 0 und +0,05 s flach, Unsicherheit etwa ±0,05 s).
 
 Im Code (`crates/driftless-io/src/calib.rs`): `CALIB_MATRIX_DIRECTION`, `CALIB_IMAGE_ROTATION`,
 `CAMERA_TIME_OFFSET_S`. `load_calibration` rechnet `K` und die Matrix gleich auf das gespeicherte Bild um:
@@ -107,7 +107,7 @@ Handgerät unmöglich, kein Bezug zu LiDAR ↔ Kamera erkennbar) und `initial_gu
 
 ## Offen
 
-- Zeitversatz: nur auf einer Aufnahme deutlich messbar; Unsicherheit etwa ±0,02 s. Eine Aufnahme mit
+- Zeitversatz: nur auf einer Aufnahme deutlich messbar; er liegt bei 0 … +0,05 s, Unsicherheit etwa ±0,05 s, +0,03 s als Standard. Die rechte Kamera hat einen Doppelgipfel. Eine Aufnahme mit
   schnellen Drehungen vor Kanten (Türrahmen, Säulen) würde ihn genauer bestimmen.
 - Die Kalibrierung selbst (Matrix, `K`) wird nicht verfeinert; die beste Güte liegt bei 1,8–2,4.
 - Gilt für die JMK6. Andere Geräte mit anderem `calib.json` brauchen eine eigene Messung mit `calib-check`.

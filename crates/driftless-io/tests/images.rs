@@ -126,6 +126,41 @@ fn image_stream_counts_bad_images() {
 }
 
 #[test]
+fn truncated_image_bag_keeps_images_before_the_cut() {
+    let mut w = BagWriter::new(Compression::None).messages_per_chunk(1);
+    let conn = w.add_connection("/camera_left/image_raw", "sensor_msgs/CompressedImage");
+    let jpg = solid_jpeg(32, 24, [0, 255, 0]);
+    for sec in 1..=6u32 {
+        let msg = encode_compressed_image(&CompressedImage {
+            stamp: sec as f64,
+            format: "jpeg".into(),
+            data: jpg.clone(),
+        });
+        w.write_message(conn, Time { sec, nsec: 0 }, &msg);
+    }
+    let mut bytes = w.finish();
+    let cut = bytes.len() * 7 / 10;
+    bytes.truncate(cut);
+    let dir = std::env::temp_dir().join(format!("driftless_images_trunc_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.bag");
+    std::fs::write(&path, bytes).unwrap();
+
+    let topics = vec!["/camera_left/image_raw".to_string()];
+    let mut stamps = Vec::new();
+    let stats = for_each_image(&[path], &topics, 1, |r| {
+        stamps.push(r.unwrap().stamp);
+        true
+    })
+    .expect("a truncated bag is not an error");
+    assert_eq!(stats.truncated, 1);
+    assert_eq!(stats.frames, stamps.len());
+    assert!(!stamps.is_empty() && stamps.len() < 6, "{stamps:?}");
+    assert!(stamps.windows(2).all(|p| p[0] < p[1]));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn oversized_header_is_rejected_without_allocating() {
     // Take a valid JPEG and patch the SOF0 dimensions to 16000x16000.
     let mut jpg = solid_jpeg(64, 48, [1, 2, 3]);

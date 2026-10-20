@@ -64,6 +64,9 @@ pub struct ImageStats {
     pub frames: usize,
     /// Images that could not be decoded (delivered as `Err`).
     pub bad: usize,
+    /// Bags that ended in a cut (e.g. recording stopped abruptly): the images before the
+    /// cut were delivered, the rest of that bag is missing.
+    pub truncated: usize,
 }
 
 /// Decodes a JPEG to RGB8. `downscale` (1, 2 or 4) averages 1x1, 2x2 or 4x4 blocks;
@@ -149,7 +152,9 @@ fn decode_message(msg: &RawMessage, downscale: u32) -> Result<Frame, ImageError>
 /// Streams all images of `topics` from `bags` (in the given bag order, file order within a bag)
 /// to `f`. Decoding runs on a few rayon threads, but frames reach `f` strictly in bag order and
 /// at most one decoded image per worker is held at a time. Undecodable images are passed to `f`
-/// as `Err` and counted in `ImageStats::bad`. `f` returns `false` to stop early.
+/// as `Err` and counted in `ImageStats::bad`. A truncated bag ends like a complete one (the
+/// images before the cut are kept) and is counted in `ImageStats::truncated`; any other read
+/// error fails. `f` returns `false` to stop early.
 pub fn for_each_image(
     bags: &[PathBuf],
     topics: &[String],
@@ -183,7 +188,15 @@ pub fn for_each_image(
     for path in bags {
         let mut reader = BagReader::open(path)?;
         for msg in reader.messages(&topic_refs) {
-            batch.push(msg?);
+            let msg = match msg {
+                Ok(m) => m,
+                Err(BagError::Truncated { .. }) => {
+                    stats.truncated += 1;
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+            batch.push(msg);
             if batch.len() == workers && !flush(&mut batch, &mut stats) {
                 return Ok(stats);
             }

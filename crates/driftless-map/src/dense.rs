@@ -20,7 +20,7 @@ pub const POSE_TIME_TOLERANCE: f64 = 1e-6;
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenseConfig {
     /// Edge of the voxels of which each keeps one point (m). 1 cm: at 2 cm close-ups look
-    /// visibly sparse; on the 266 s test scan 1 cm needs 2.4× the points, 4.0 GB peak memory
+    /// visibly sparse; on the 266 s test scan 1 cm needs 2.5× the points, 4.0 GB peak memory
     /// and 140 s for slam + map (see `docs/ergebnisse/2026-10-21-meilenstein-3.md`).
     pub voxel: f64,
     /// Points farther from the LiDAR are left out (m).

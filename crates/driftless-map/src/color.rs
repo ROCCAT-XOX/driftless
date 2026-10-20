@@ -168,6 +168,8 @@ pub struct ColorStats {
     pub images_outside_trajectory: usize,
     /// Images that could not be decoded, of an unknown camera or of the wrong size.
     pub images_bad: usize,
+    /// Image bags that were cut short; the images before the cut were used.
+    pub image_bags_truncated: usize,
     pub points_colored: usize,
     pub points_uncolored: usize,
     /// Gain of every used image, in (capture time, camera name) order.
@@ -269,9 +271,9 @@ fn quality_pass(
     poses: &[Pose],
     cams: &[ColorCamera],
     cfg: &ColorConfig,
-) -> Result<Vec<ImageRecord>, MapError> {
+) -> Result<(Vec<ImageRecord>, usize), MapError> {
     let mut found: Vec<Measured> = Vec::new();
-    for_each_image(&images.bags, &images.topics, SHARPNESS_DOWNSCALE, |frame| {
+    let read = for_each_image(&images.bags, &images.topics, SHARPNESS_DOWNSCALE, |frame| {
         let (camera, stamp, quality) = match frame {
             Err(_) => (None, f64::NAN, None),
             Ok(frame) => match frame_camera(&frame, cams, SHARPNESS_DOWNSCALE) {
@@ -292,6 +294,7 @@ fn quality_pass(
         true
     })
     .map_err(|e| MapError::Images(e.to_string()))?;
+    let truncated = read.truncated;
 
     let on_traj: Vec<f64> = found
         .iter()
@@ -349,7 +352,7 @@ fn quality_pass(
             *rank = u32::try_from(r).expect("fewer than 2^32 images");
         }
     }
-    Ok(records)
+    Ok((records, truncated))
 }
 
 /// Surface normal (if the neighbourhood is planar) and spacing (mean distance of the
@@ -560,13 +563,14 @@ pub fn colorize(
             )));
         }
     }
-    let records = quality_pass(&images, poses, cams, cfg)?;
+    let (records, bags_truncated) = quality_pass(&images, poses, cams, cfg)?;
     let count = |f: fn(&Status) -> bool| records.iter().filter(|r| f(&r.status)).count();
     let mut stats = ColorStats {
         images_used: count(|s| matches!(s, Status::Used { .. })),
         images_blurry: count(|s| *s == Status::Blurry),
         images_outside_trajectory: count(|s| *s == Status::Outside),
         images_bad: count(|s| *s == Status::Bad),
+        image_bags_truncated: bags_truncated,
         ..ColorStats::default()
     };
 

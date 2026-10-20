@@ -29,7 +29,7 @@ use driftless_odom::OdomConfig;
 use driftless_slam::SlamConfig;
 use driftless_traj::{read_tum, Pose};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -239,6 +239,26 @@ fn clean_json(s: &CleanStats) -> Value {
 
 /// Colour statistics with the gains summarised per camera (count, smallest, largest and mean
 /// gain per channel) instead of one entry per image.
+/// Warnings about a colour run that the user should see (German, without the "Warnung: ").
+fn color_warnings(s: &ColorStats) -> Vec<String> {
+    let mut out = Vec::new();
+    if s.image_bags_truncated > 0 {
+        out.push(format!(
+            "{} Bilddatei(en) sind abgeschnitten, die Bilder bis dahin wurden genutzt",
+            s.image_bags_truncated
+        ));
+    }
+    let cameras: BTreeSet<&str> = s.gains.iter().map(|g| g.camera.as_str()).collect();
+    if cameras.len() > 1 && s.camera_difference_points == 0 {
+        out.push(
+            "die Kameras sehen keine gemeinsamen Punkte, Belichtung zwischen ihnen nicht \
+             abgeglichen"
+                .into(),
+        );
+    }
+    out
+}
+
 fn color_json(s: &ColorStats) -> Value {
     struct Sum {
         n: usize,
@@ -277,6 +297,7 @@ fn color_json(s: &ColorStats) -> Value {
         "images_blurry": s.images_blurry,
         "images_outside_trajectory": s.images_outside_trajectory,
         "images_bad": s.images_bad,
+        "image_bags_truncated": s.image_bags_truncated,
         "points_colored": s.points_colored,
         "points_uncolored": s.points_uncolored,
         "colored_share": if points == 0 { 0.0 } else { s.points_colored as f64 / points as f64 },
@@ -524,6 +545,9 @@ impl MapRun<'_> {
             &input.cams,
             &self.color_cfg,
         )?;
+        for w in color_warnings(&stats) {
+            eprintln!("Warnung: {w}");
+        }
         write_las(&self.path("color.las"), &cloud)?;
         write_ply(&self.path("color.ply"), &cloud)?;
         let share = 100.0 * stats.points_colored as f64 / cloud.len().max(1) as f64;
@@ -751,4 +775,46 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
         report_path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use driftless_map::ImageGain;
+
+    fn gain(camera: &str) -> ImageGain {
+        ImageGain {
+            camera: camera.into(),
+            stamp: 0.0,
+            gain: [1.0; 3],
+        }
+    }
+
+    #[test]
+    fn warns_when_cameras_share_no_points() {
+        let mut s = ColorStats {
+            gains: vec![gain("left"), gain("right")],
+            ..ColorStats::default()
+        };
+        let w = color_warnings(&s);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("keine gemeinsamen Punkte"), "{w:?}");
+        // Shared points, or only one camera in use: no warning.
+        s.camera_difference_points = 500;
+        assert!(color_warnings(&s).is_empty());
+        s.camera_difference_points = 0;
+        s.gains = vec![gain("left")];
+        assert!(color_warnings(&s).is_empty());
+    }
+
+    #[test]
+    fn warns_about_truncated_image_bags() {
+        let s = ColorStats {
+            image_bags_truncated: 1,
+            ..ColorStats::default()
+        };
+        let w = color_warnings(&s);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("abgeschnitten"), "{w:?}");
+    }
 }
