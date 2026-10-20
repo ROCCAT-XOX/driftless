@@ -6,13 +6,11 @@
 
 use crate::{Cloud, MapError};
 use driftless_io::msg::{ImuSample, LidarFrame};
-use driftless_odom::deskew::frame_points;
 use driftless_odom::voxel_map::{voxel_key, FixedState, VoxelKey};
 use driftless_odom::{run_odometry_with, FrameOutput, OdomConfig, OdomStats};
 use driftless_traj::Pose;
 use nalgebra::{Isometry3, Point3, Translation3, Vector3};
 use rayon::prelude::*;
-use std::cell::RefCell;
 use std::collections::hash_map::{Entry, HashMap};
 
 /// Largest difference between a corrected pose's time and its frame's end time (s). TUM files
@@ -63,7 +61,8 @@ impl DenseConfig {
 /// filter) with the LiDAR position they were seen from, all in world coordinates.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RaySource {
-    /// LiDAR origin per used frame.
+    /// LiDAR origin per used frame, at the frame end (the time the sweep is deskewed to;
+    /// an approximation for points captured earlier in the sweep).
     pub sensor: Vec<[f32; 3]>,
     /// Ray end points, frame by frame.
     pub ends: Vec<[f32; 3]>,
@@ -88,7 +87,9 @@ fn to_f32(v: &Vector3<f64>) -> [f32; 3] {
     [v.x as f32, v.y as f32, v.z as f32]
 }
 
-/// A body point in the world and its distance to the LiDAR.
+/// A body point in the world and its distance to the LiDAR. The sweep is deskewed to the
+/// frame end, so the distance is taken from the LiDAR position at the frame end (an
+/// approximation: the point was seen from wherever the LiDAR was at its capture time).
 struct Placed {
     world: Vector3<f64>,
     range: f32,
@@ -108,25 +109,6 @@ fn place(
         world: (pose * Point3::from(*p)).coords,
         range: d2.sqrt() as f32,
     })
-}
-
-/// Intensity of every point `run_odometry_with` keeps of `frame`, in the order of
-/// [`FrameOutput::body_points`]: the same time filter ([`frame_points`]) and range filter.
-fn kept_intensities(frame: &LidarFrame, cfg: &OdomConfig) -> Vec<f32> {
-    let fp = frame_points(frame, &cfg.lidar_to_imu);
-    let origin = cfg.lidar_to_imu.translation.vector;
-    let (min2, max2) = (cfg.min_range.powi(2), cfg.max_range.powi(2));
-    frame
-        .points
-        .iter()
-        .filter(|lp| lp.t_rel.is_finite())
-        .zip(&fp.points)
-        .filter(|(_, tp)| {
-            let d2 = (tp.p - origin).norm_squared();
-            d2 >= min2 && d2 <= max2
-        })
-        .map(|(lp, _)| lp.intensity)
-        .collect()
 }
 
 /// Cloud with one point per voxel: the nearest seen so far; on a tie the earlier one stays.
@@ -192,10 +174,6 @@ pub fn build_dense(
     let mut points_in_range = 0u64;
     let mut time_error: Option<MapError> = None;
 
-    // The sink sees a frame right after the iterator handed it out, so this holds the
-    // intensities of the frame being placed.
-    let intensities = RefCell::new(Vec::new());
-    let frames = frames.inspect(|f| *intensities.borrow_mut() = kept_intensities(f, odom_cfg));
     let mut sink = |f: FrameOutput| {
         if time_error.is_some() {
             return;
@@ -211,12 +189,6 @@ pub fn build_dense(
             });
             return;
         }
-        let intensity = intensities.borrow();
-        assert_eq!(
-            intensity.len(),
-            f.body_points.len(),
-            "intensity filter out of step with the odometry"
-        );
         let pose = Isometry3::from_parts(Translation3::from(c.p), c.q);
         let frame = u32::try_from(f.index).expect("fewer than 2^32 frames");
         let placed: Vec<Option<Placed>> = f
@@ -227,7 +199,7 @@ pub fn build_dense(
         rays.sensor
             .push(to_f32(&(pose * Point3::from(origin)).coords));
         let mut k = 0usize;
-        for (p, &i) in placed.iter().zip(intensity.iter()) {
+        for (p, &i) in placed.iter().zip(f.intensity) {
             let Some(p) = p else { continue };
             if k.is_multiple_of(cfg.ray_step) {
                 rays.ends.push(to_f32(&p.world));

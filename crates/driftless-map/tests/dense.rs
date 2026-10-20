@@ -194,6 +194,71 @@ fn dense_voxel_keeps_nearest() {
     assert_eq!(rays.frame_start, vec![0, 1, 2, 3, 4]);
 }
 
+/// Every dense point keeps the intensity of its own return, also when the odometry and the
+/// dense range filter drop points around it (bad time, too close, too far).
+#[test]
+fn dense_keeps_intensity_of_each_return() {
+    let still = Walk {
+        still: 100.0,
+        speed: 0.0,
+    };
+    let imu = imu_samples(&still, 0.0, 3.0, 200.0);
+    let lp = |xyz: [f32; 3], intensity: f32, t_rel: f64| LidarPoint {
+        xyz,
+        intensity,
+        ring: 0,
+        t_rel,
+    };
+    // Kept returns: distinct voxels, intensity 1, 2, 3, ... in order.
+    let kept = |frame: usize, k: usize| {
+        let i = (frame * 10 + k) as f32;
+        ([1.0 + 0.1 * i, 0.5 + 0.03 * i, 0.2], 1.0 + i)
+    };
+    let mut frames = Vec::new();
+    for f in 0..3 {
+        let mut points = vec![
+            lp([2.0, 0.0, 0.0], 99.0, f64::NAN), // no valid time: dropped by the odometry
+            lp([0.2, 0.0, 0.0], 98.0, 0.0),      // inside the odometry's min range
+        ];
+        for k in 0..6 {
+            let (xyz, i) = kept(f, k);
+            points.push(lp(xyz, i, 0.0));
+            if k == 2 {
+                points.push(lp([40.0, 1.0, 0.0], 97.0, 0.0)); // beyond the dense max range
+            }
+        }
+        frames.push(LidarFrame {
+            stamp: 1.5 + 0.1 * f as f64,
+            points,
+            dropped: 0,
+        });
+    }
+    let corrected: Vec<Pose> = (0..3)
+        .map(|f| pose(1.5 + 0.1 * f as f64, &Isometry3::identity()))
+        .collect();
+    let (cloud, _, _) = build_dense(
+        frames.into_iter(),
+        &imu,
+        &OdomConfig::default(),
+        &corrected,
+        &DenseConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(cloud.len(), 18);
+    for f in 0..3 {
+        for k in 0..6 {
+            let (xyz, want) = kept(f, k);
+            let j = cloud
+                .xyz
+                .iter()
+                .position(|p| (0..3).all(|a| (p[a] - xyz[a]).abs() < 1e-4))
+                .unwrap_or_else(|| panic!("return {f}/{k} missing"));
+            assert_eq!(cloud.intensity[j], want, "return {f}/{k}");
+            assert_eq!(cloud.frame[j], f as u32);
+        }
+    }
+}
+
 #[test]
 fn dense_rejects_pose_count_mismatch() {
     let scan = room_scan(2.0);

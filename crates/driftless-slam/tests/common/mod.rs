@@ -45,5 +45,7 @@ pub fn frame<'a>(
         pose,
         quality,
         body_points: pts,
+        // The submaps ignore intensity; leaked so the slice lives as long as `pts`.
+        intensity: Vec::leak(vec![0.0; pts.len()]),
     }
 }

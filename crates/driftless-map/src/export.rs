@@ -28,7 +28,8 @@ fn las_offset(cloud: &Cloud) -> [f64; 3] {
 }
 
 /// LAS 1.2: point format 3 (XYZ, intensity, GPS time, RGB) if the cloud has colours,
-/// otherwise format 1 (without RGB). GPS time holds the capture time as is.
+/// otherwise format 1 (without RGB). GPS time holds the capture time as raw Unix seconds
+/// (not GPS week or adjusted standard GPS time).
 pub fn write_las(path: &Path, cloud: &Cloud) -> Result<(), MapError> {
     let err = |source| MapError::Las {
         path: path.display().to_string(),

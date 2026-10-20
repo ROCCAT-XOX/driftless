@@ -95,7 +95,14 @@ fn sink_sees_every_used_frame() {
     let frames = lidar_frames(&room_scene(), &walk, 0.0, 3.0, 360, &Isometry3::identity());
     let imu = imu_samples(&walk, -0.5, 3.5, 200.0);
     let mut seen: Vec<(usize, Pose, usize)> = Vec::new();
-    let mut sink = |f: FrameOutput| seen.push((f.index, f.pose.clone(), f.body_points.len()));
+    let mut sink = |f: FrameOutput| {
+        assert_eq!(
+            f.intensity.len(),
+            f.body_points.len(),
+            "one intensity per point"
+        );
+        seen.push((f.index, f.pose.clone(), f.body_points.len()));
+    };
     let r = run_odometry_with(frames.into_iter(), &imu, &OdomConfig::default(), &mut sink);
     assert_eq!(seen.len(), r.poses.len());
     assert!(seen.iter().enumerate().all(|(i, s)| s.0 == i));
