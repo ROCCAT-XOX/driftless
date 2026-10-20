@@ -11,6 +11,13 @@ pub mod deskew;
 pub mod icp;
 pub mod imu_integrate;
 pub mod pipeline;
+pub mod quality;
+#[cfg(feature = "test-util")]
+pub mod testutil;
 pub mod voxel_map;
 
-pub use pipeline::{run_odometry, OdomConfig, OdomResult, OdomStats};
+pub use pipeline::{
+    run_odometry, run_odometry_with, OdomConfig, OdomResult, OdomStats, OUTPUT_MAP_VOXEL,
+};
+pub use quality::{FrameOutput, FrameQuality, DEGENERACY_GOOD};
+pub use voxel_map::voxel_downsample;

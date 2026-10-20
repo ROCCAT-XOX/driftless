@@ -1,4 +1,4 @@
-mod common;
+use driftless_odom::testutil as common;
 
 use common::{imu_samples, room_scene, Spin, Trajectory, G};
 use driftless_io::msg::{ImuSample, LidarFrame, LidarPoint};

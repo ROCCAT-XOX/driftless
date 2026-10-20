@@ -1,4 +1,4 @@
-mod common;
+use driftless_odom::testutil as common;
 
 use common::{corridor_scene, imu_samples, lidar_frames, Trajectory, Walk};
 use driftless_io::bag::BagReader;
@@ -106,6 +106,7 @@ fn odometry_is_deterministic() {
     let (_, b) = corridor_run(4.0, Isometry3::identity());
     assert_eq!(a.poses, b.poses);
     assert_eq!(a.map_points, b.map_points);
+    assert_eq!(a.quality, b.quality);
 }
 
 #[test]

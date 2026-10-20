@@ -1,0 +1,24 @@
+[package]
+name = "driftless-slam"
+description = "Driftless: Teilkarten, Schleifenerkennung und Schleifenschluss"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+driftless-graph = { path = "../driftless-graph" }
+driftless-io = { path = "../driftless-io" }
+driftless-odom = { path = "../driftless-odom" }
+driftless-traj = { path = "../driftless-traj" }
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+[dev-dependencies]
+driftless-odom = { path = "../driftless-odom", features = ["test-util"] }

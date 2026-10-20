@@ -89,6 +89,16 @@ pub struct IcpResult {
     pub converged: bool,
     /// Correspondences used in the last iteration.
     pub correspondences: usize,
+    /// Weighted RMS of the point-to-plane residuals in the last iteration (m).
+    pub residual_rms: f64,
+    /// Correspondences per source point in the last iteration.
+    pub inlier_ratio: f64,
+    /// Eigenvalues of the point-to-plane Hessian without the motion prior, ascending, each
+    /// divided by the correspondence count (rotation and translation mixed: rad / m units).
+    pub constraint: [f64; 6],
+    /// Smallest eigenvalue of the translation block of that Hessian per correspondence:
+    /// how well the weakest direction of the position is fixed by the geometry.
+    pub degeneracy: f64,
 }
 
 /// Weighted residual row for one source point: Jacobian w.r.t. `[rotation, translation]`,
@@ -164,6 +174,28 @@ fn prior_offset(pose: &Isometry3<f64>, prior: &Isometry3<f64>) -> Vector6<f64> {
     Vector6::new(r.x, r.y, r.z, t.x, t.y, t.z)
 }
 
+/// Eigenvalues of the geometry-only Hessian `h` (ascending) and the smallest eigenvalue of
+/// its translation block, both per correspondence. Zero without correspondences.
+fn constraint(h: &Matrix6<f64>, used: usize) -> ([f64; 6], f64) {
+    if used == 0 {
+        return ([0.0; 6], 0.0);
+    }
+    let n = used as f64;
+    let mut all = [0.0; 6];
+    for (a, e) in all.iter_mut().zip(h.symmetric_eigen().eigenvalues.iter()) {
+        *a = e / n;
+    }
+    all.sort_by(f64::total_cmp);
+    let trans: Matrix3<f64> = h.fixed_view::<3, 3>(3, 3).into_owned();
+    let weakest = trans
+        .symmetric_eigen()
+        .eigenvalues
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    (all, weakest / n)
+}
+
 /// Aligns `source` (body frame) to `target` (world frame) starting at `init`, which also
 /// serves as the motion prior.
 pub fn align(
@@ -179,6 +211,10 @@ pub fn align(
         iterations: 0,
         converged: false,
         correspondences: 0,
+        residual_rms: 0.0,
+        inlier_ratio: 0.0,
+        constraint: [0.0; 6],
+        degeneracy: 0.0,
     };
     for it in 1..=params.max_iter {
         let center = pose.translation.vector;
@@ -190,13 +226,23 @@ pub fn align(
             })
             .collect();
         let (mut h, mut g, mut used) = (Matrix6::<f64>::zeros(), Vector6::<f64>::zeros(), 0);
+        let (mut wr2, mut wsum) = (0.0, 0.0);
         for t in terms.iter().flatten() {
             h += t.j * t.j.transpose() * t.w;
             g += t.j * (t.r * t.w);
+            wr2 += t.w * t.r * t.r;
+            wsum += t.w;
             used += 1;
         }
         result.iterations = it;
         result.correspondences = used;
+        result.residual_rms = if wsum > 0.0 { (wr2 / wsum).sqrt() } else { 0.0 };
+        result.inlier_ratio = if source.is_empty() {
+            0.0
+        } else {
+            used as f64 / source.len() as f64
+        };
+        (result.constraint, result.degeneracy) = constraint(&h, used);
         if used < 6 {
             break;
         }
