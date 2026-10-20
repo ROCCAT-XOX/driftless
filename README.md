@@ -3,9 +3,13 @@
 Open-source desktop software for processing handheld LiDAR scans — drift-corrected, cleanly colourised,
 correctable by hand. Runs natively on **macOS (Apple Silicon)** and **Windows**.
 
-> Status: early development, command line only. Milestone 2 done: LiDAR-IMU odometry, SLAM with automatic
-> loop closure and manual corrections (`slam`, `correct`), debug viewer. Results on real scans:
-> [docs/ergebnisse/2026-10-20-meilenstein-2.md](docs/ergebnisse/2026-10-20-meilenstein-2.md) (German).
+> Status: early development, command line only. Milestone 3 done: dense point cloud from the corrected
+> trajectory (1 cm voxels), cleaned of ghosts and outliers, coloured from the camera images with exposure
+> and white balance across cameras and time (`map`). A 4.4-minute scan with 1,741 images takes about
+> 2.5 minutes and 4 GB on an M4 Pro. Milestone 2: LiDAR-IMU odometry, SLAM with automatic loop closure and
+> manual corrections (`slam`, `correct`), debug viewer. Results on real scans (German):
+> [milestone 3](docs/ergebnisse/2026-10-21-meilenstein-3.md),
+> [milestone 2](docs/ergebnisse/2026-10-20-meilenstein-2.md).
 
 ## Why
 
@@ -58,6 +62,7 @@ Then the map:
 ```sh
 driftless map <scan> --slam out              # dense, clean, colour → out/color.las
 driftless map <scan> --slam out --step color --downscale 1   # recolour only, reuses clean.bin
+driftless map <scan> --slam out --voxel 0.02 # coarser cloud: about 1/3 of the memory, for long scans
 driftless view <scan> --cloud out/color.las
 ```
 

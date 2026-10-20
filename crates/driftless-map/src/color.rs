@@ -21,7 +21,8 @@
 
 use crate::clean::spread_axes;
 use crate::exposure::{
-    apply_gains, estimate_gains, sample_observations, view_spread, ExposureConfig, ImageGain,
+    apply_gains, camera_difference, estimate_gains, image_offset, sample_observations, view_spread,
+    ExposureConfig, ImageGain,
 };
 use crate::sharpness::sharpness;
 use crate::visibility::{visible_points, PointGrid, Seen};
@@ -179,6 +180,20 @@ pub struct ColorStats {
     /// averaged over the channels and over the points with at least 2 views.
     pub spread_before: f64,
     pub spread_after: f64,
+    /// Systematic colour difference between the cameras on the points they both see, before
+    /// and after the equalisation: per camera pair the mean difference of the two cameras'
+    /// view colours, in sRGB units (0–255), averaged over the channels (absolute value) and
+    /// the pairs. It reacts to exposure and white balance, not to the scatter of single views.
+    pub camera_difference_before: f64,
+    pub camera_difference_after: f64,
+    /// Points with views from at least 2 cameras (once per camera pair).
+    pub camera_difference_points: usize,
+    /// Mean colour offset of the images before and after the equalisation: per image, the
+    /// mean difference of its views to their points' mean colour, in sRGB units (0–255),
+    /// averaged over the channels (absolute value) and the images (weighted by views). It
+    /// reacts to exposure changes over time as well as between the cameras.
+    pub image_offset_before: f64,
+    pub image_offset_after: f64,
 }
 
 /// What the quality pass found for one image of the stream.
@@ -656,16 +671,23 @@ pub fn colorize(
         Status::Used { rank, .. } => rank,
         _ => unreachable!("only used images"),
     });
+    let cameras: Vec<usize> = used.iter().map(|r| r.camera).collect();
     stats.spread_before = view_spread(&slots, k);
+    let before = camera_difference(&slots, k, &cameras);
+    stats.image_offset_before = image_offset(&slots, k, used.len());
     let gains = if cfg.exposure.samples == 0 {
         vec![[1.0; 3]; used.len()]
     } else {
-        let cameras = used.iter().map(|r| r.camera).collect();
-        let obs = sample_observations(&slots, k, cameras, cfg.exposure.samples);
+        let obs = sample_observations(&slots, k, cameras.clone(), cfg.exposure.samples);
         estimate_gains(&obs, &cfg.exposure)
     };
     apply_gains(&mut slots, &gains);
     stats.spread_after = view_spread(&slots, k);
+    let after = camera_difference(&slots, k, &cameras);
+    stats.image_offset_after = image_offset(&slots, k, used.len());
+    stats.camera_difference_before = before.value;
+    stats.camera_difference_after = after.value;
+    stats.camera_difference_points = before.points;
     let all = gains.iter().flatten();
     stats.gain_min = all.clone().copied().reduce(f32::min).unwrap_or(1.0);
     stats.gain_max = all.copied().reduce(f32::max).unwrap_or(1.0);

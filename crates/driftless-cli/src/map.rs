@@ -288,6 +288,11 @@ fn color_json(s: &ColorStats) -> Value {
         },
         "spread_before": s.spread_before,
         "spread_after": s.spread_after,
+        "camera_difference_before": s.camera_difference_before,
+        "camera_difference_after": s.camera_difference_after,
+        "camera_difference_points": s.camera_difference_points,
+        "image_offset_before": s.image_offset_before,
+        "image_offset_after": s.image_offset_after,
     })
 }
 

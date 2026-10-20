@@ -382,6 +382,140 @@ pub(crate) fn view_spread(slots: &[View], k: usize) -> f64 {
     }
 }
 
+/// Systematic colour difference between the cameras on the points they both see.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct CameraDifference {
+    /// sRGB units (0–255), see [`camera_difference`].
+    pub(crate) value: f64,
+    /// Points with views from at least 2 cameras (counted once per camera pair).
+    pub(crate) points: usize,
+}
+
+/// Systematic colour difference between the cameras: for every camera pair and every point
+/// with views from both, the difference of the two cameras' mean view colours per channel
+/// (sRGB, 0–255); per pair the absolute value of its mean over the points, averaged over the
+/// channels; then averaged over the pairs, weighted by their points. Unlike the spread, the
+/// scatter of single views averages out and what remains is the offset an exposure or white
+/// balance difference between the cameras causes. `cameras[rank]` is the camera of each
+/// image; 0 without such points.
+pub(crate) fn camera_difference(slots: &[View], k: usize, cameras: &[usize]) -> CameraDifference {
+    let n = cameras.iter().max().map_or(0, |&c| c + 1);
+    // Per chunk of points: (summed difference per channel, points) of every camera pair
+    // `a * n + b`; chunks are summed in order, so the result is the same in every run.
+    let partial: Vec<Vec<([f64; 3], usize)>> = slots
+        .par_chunks(k * SUM_CHUNK)
+        .map(|chunk| {
+            let mut pairs = vec![([0.0f64; 3], 0usize); n * n];
+            let mut sum = vec![([0.0f64; 3], 0usize); n];
+            for s in chunk.chunks(k) {
+                sum.fill(([0.0; 3], 0));
+                for v in s.iter().filter(|v| v.weight > 0.0) {
+                    let e = &mut sum[cameras[v.rank as usize]];
+                    for (a, c) in e.0.iter_mut().zip(v.rgb) {
+                        *a += srgb_value(c);
+                    }
+                    e.1 += 1;
+                }
+                for a in 0..n {
+                    for b in a + 1..n {
+                        let ((sa, na), (sb, nb)) = (sum[a], sum[b]);
+                        if na > 0 && nb > 0 {
+                            let e = &mut pairs[a * n + b];
+                            for c in 0..3 {
+                                e.0[c] += sa[c] / na as f64 - sb[c] / nb as f64;
+                            }
+                            e.1 += 1;
+                        }
+                    }
+                }
+            }
+            pairs
+        })
+        .collect();
+    let mut pairs = vec![([0.0f64; 3], 0usize); n * n];
+    for chunk in &partial {
+        add_sums(&mut pairs, chunk);
+    }
+    let points: usize = pairs.iter().map(|p| p.1).sum();
+    if points == 0 {
+        return CameraDifference::default();
+    }
+    let value = pairs
+        .iter()
+        .filter(|p| p.1 > 0)
+        .map(|(sum, m)| sum.iter().map(|s| (s / *m as f64).abs()).sum::<f64>() / 3.0 * *m as f64)
+        .sum::<f64>()
+        / points as f64;
+    CameraDifference { value, points }
+}
+
+/// Points per chunk of the colour metrics' partial sums.
+const SUM_CHUNK: usize = 1 << 16;
+
+/// Adds `part` to `total` entry by entry.
+fn add_sums(total: &mut [([f64; 3], usize)], part: &[([f64; 3], usize)]) {
+    for (t, p) in total.iter_mut().zip(part) {
+        for c in 0..3 {
+            t.0[c] += p.0[c];
+        }
+        t.1 += p.1;
+    }
+}
+
+/// Mean colour offset of the images: every view of a point with at least 2 views differs from
+/// the mean of that point's views (sRGB, 0–255, per channel); per image the mean of these
+/// differences over its views, as an absolute value averaged over the channels; then averaged
+/// over the images, weighted by their views. The scatter of single views averages out within
+/// an image; what remains is how much brighter or darker (or tinted) the image as a whole
+/// shows the scan, from the camera or from the exposure at the time. Images are numbered by
+/// the views' rank, `images` of them; 0 without such points.
+pub(crate) fn image_offset(slots: &[View], k: usize, images: usize) -> f64 {
+    // Per chunk of points: (summed difference to the point's mean per channel, views) of
+    // every image; chunks are summed in order.
+    let partial: Vec<Vec<([f64; 3], usize)>> = slots
+        .par_chunks(k * SUM_CHUNK)
+        .map(|chunk| {
+            let mut sums = vec![([0.0f64; 3], 0usize); images];
+            let mut views: Vec<(u32, [f64; 3])> = Vec::with_capacity(k);
+            for s in chunk.chunks(k) {
+                views.clear();
+                views.extend(
+                    s.iter()
+                        .filter(|v| v.weight > 0.0)
+                        .map(|v| (v.rank, v.rgb.map(srgb_value))),
+                );
+                if views.len() < 2 {
+                    continue;
+                }
+                let m = views.len() as f64;
+                let mean: [f64; 3] =
+                    std::array::from_fn(|c| views.iter().map(|v| v.1[c]).sum::<f64>() / m);
+                for (i, col) in &views {
+                    let e = &mut sums[*i as usize];
+                    for c in 0..3 {
+                        e.0[c] += col[c] - mean[c];
+                    }
+                    e.1 += 1;
+                }
+            }
+            sums
+        })
+        .collect();
+    let mut sums = vec![([0.0f64; 3], 0usize); images];
+    for chunk in &partial {
+        add_sums(&mut sums, chunk);
+    }
+    let views: usize = sums.iter().map(|s| s.1).sum();
+    if views == 0 {
+        return 0.0;
+    }
+    sums.iter()
+        .filter(|s| s.1 > 0)
+        .map(|(sum, _)| sum.iter().map(|s| s.abs()).sum::<f64>() / 3.0)
+        .sum::<f64>()
+        / views as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -145,6 +145,62 @@ fn recovers_injected_gains() {
 }
 
 #[test]
+fn camera_difference_drops_after_equalisation() {
+    // The right camera is 1.3× brighter and bluish: on points both cameras see, its views are
+    // systematically brighter. The equalisation must remove most of that offset; the plain
+    // spread mixes it with the scatter of the views and reacts less.
+    let (_, stats) = run(&ColorConfig::default());
+    println!(
+        "camera difference {:.2} → {:.2} on {} points; spread {:.2} → {:.2}",
+        stats.camera_difference_before,
+        stats.camera_difference_after,
+        stats.camera_difference_points,
+        stats.spread_before,
+        stats.spread_after
+    );
+    assert!(stats.camera_difference_points > 100, "{stats:?}");
+    assert!(stats.camera_difference_before > 10.0, "{stats:?}");
+    assert!(
+        stats.camera_difference_after < 0.2 * stats.camera_difference_before,
+        "{stats:?}"
+    );
+    // Without the equalisation nothing changes.
+    let off = ColorConfig {
+        exposure: ExposureConfig {
+            samples: 0,
+            ..ExposureConfig::default()
+        },
+        ..ColorConfig::default()
+    };
+    let (_, plain) = run(&off);
+    assert_eq!(
+        plain.camera_difference_before,
+        plain.camera_difference_after
+    );
+    assert_eq!(
+        plain.camera_difference_before,
+        stats.camera_difference_before
+    );
+}
+
+#[test]
+fn image_offset_drops_after_equalisation() {
+    // The left camera brightens from 0.8 to 1.2 over the walk and the right one is brighter:
+    // most points are seen by a few images close in time, so the offsets are small, but each
+    // image's mean offset must mostly vanish after the equalisation.
+    let (_, stats) = run(&ColorConfig::default());
+    println!(
+        "image offset {:.2} → {:.2}",
+        stats.image_offset_before, stats.image_offset_after
+    );
+    assert!(stats.image_offset_before > 1.0, "{stats:?}");
+    assert!(
+        stats.image_offset_after < 0.2 * stats.image_offset_before,
+        "{stats:?}"
+    );
+}
+
+#[test]
 fn gains_are_clamped() {
     // Image 1 sees everything 100× brighter than image 0: unclamped gains 0.1 and 10.
     let mut obs = Observations::new(vec![0, 0]);

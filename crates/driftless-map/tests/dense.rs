@@ -155,7 +155,7 @@ fn frame(stamp: f64, xyz: [f32; 3], intensity: f32) -> LidarFrame {
     }
 }
 
-/// Four frames of a still device see the same 2 cm voxel from 3 m and (corrected pose moved
+/// Four frames of a still device see the same 1 cm voxel from 3 m and (corrected pose moved
 /// 1 m closer) from 2 m: the nearer point wins, a tie keeps the earlier frame.
 #[test]
 fn dense_voxel_keeps_nearest() {
