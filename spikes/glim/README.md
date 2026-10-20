@@ -75,8 +75,10 @@ Objektive Referenz statt RayStudio. Vergleich mit der Rust-Grundlinie: `docs/ent
 
 - Hesai XT-32: Feld `timestamp` (f64) enthält **absolute** Zeiten. `export-glim` schreibt sie seit Task 10
   relativ zum Frame-Stempel (vorher f32 der absoluten Zeit = unbrauchbar).
-- Extrinsik aus `calibration/calibration_files/lidar_calibration.yaml` (LiDAR-Lage im IMU-Rahmen, `qx qy qz qw`).
+- Extrinsik aus `calibration/lidar_calibration.yaml` (LiDAR-Lage im IMU-Rahmen, `qx qy qz qw`).
   GLIM braucht die Umkehrung: `T_lidar_imu = [-0.00855, -0.001, 0.055, 0.7071068, -0.7071068, 0, 0]`.
+  Quelle der Kalibrierwerte (Extrinsik und Bias unten): Hilti SLAM Challenge 2022, `lidar_calibration.yaml`,
+  Lizenz CC BY-NC-SA 3.0, https://hilti-challenge.com/dataset-2022.html
   Die Konfiguration wird lokal erzeugt (nicht im Repo, Datensatz CC BY-NC-SA):
 
 ```
@@ -103,7 +105,8 @@ Daher eingerichtet (zusätzlich zur Extrinsik):
 - `config_odometry_cpu.json`: `"initialization_mode": "NAIVE"`, `"initialization_window_size": 1.0`
   (Schwerkraft aus dem Mittel der Beschleunigung, Geschwindigkeit 0).
 - `config_sensors.json`: `"imu_bias": [0.0608, 0.0835, 0.0571, -0.00154, -0.00134, 0.00030]`
-  (`bias_a`, `bias_g` aus `lidar_calibration.yaml`); `imu_acc_noise` 0,01, `imu_gyro_noise` 0,002
+  (`bias_a`, `bias_g` aus `lidar_calibration.yaml`; Quelle: Hilti SLAM Challenge 2022, CC BY-NC-SA 3.0,
+  https://hilti-challenge.com/dataset-2022.html); `imu_acc_noise` 0,01, `imu_gyro_noise` 0,002
   (geschätzt, die Kalibrierung enthält keine Rauschwerte).
 - Treiber: `DRIFTLESS_GLIM_MAX_LAG=0` (Umgebungsvariable). GLIMs Odometrie-Thread verarbeitet vor jedem Frame alle
   bis dahin eingespeisten IMU-Daten; mit Rückstand hängt das Ergebnis (z. B. auf welchem Frame die
@@ -176,7 +179,7 @@ cp spikes/glim/out/dump/traj_imu.txt spikes/glim/out/glim_traj.tum
 cargo run -p driftless-cli -- compare spikes/glim/out/glim_traj.tum $DRIFTLESS_TESTDATA/Test/shading/trj.txt
 ```
 
-Windows (VM `10.100.200.33`, alles unter `C:\Tools`):
+Windows (Windows-Test-VM, alles unter `C:\Tools`):
 
 ```
 # einmalig: VS 2022 Build Tools nach C:\Tools\VSBuildTools (Workload VCTools + CMake + Clang),

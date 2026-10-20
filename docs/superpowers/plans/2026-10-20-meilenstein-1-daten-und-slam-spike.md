@@ -14,7 +14,7 @@
 
 - Lizenz Apache-2.0 OR MIT; keine GPL/AGPL/Inria-3DGS-Abhängigkeit (auch nicht transitiv – `cargo deny check licenses` muss grün sein).
 - macOS arm64 und Windows x64 nativ; CI baut und testet beide. Kein WSL, kein ROS.
-- Scan-Daten nie ins Repo. Echte Testdaten liegen unter `$DRIFTLESS_TESTDATA` (lokal: `~/Documents/Privat/driftless-testdata`); Tests darauf sind `#[ignore]` und laufen mit `cargo test -- --ignored`.
+- Scan-Daten nie ins Repo. Echte Testdaten liegen unter `$DRIFTLESS_TESTDATA` (Pfad lokal frei wählbar); Tests darauf sind `#[ignore]` und laufen mit `cargo test -- --ignored`.
 - Nichts aus RayStudio übernehmen (Code, Dateien, Modelle, Texte). Referenzdateien des Testprojekts (`trj.txt`, `smooth.las`) nur lokal zum Vergleich.
 - Ganze Aufnahmen nicht komplett in den RAM: Bags werden streamend gelesen (Chunk für Chunk).
 - Feste Gerätedaten JMK6: Topics `/vanjee_722z` (PointCloud2, Felder x,y,z,intensity f32, ring u16, timestamp f64 relativ, point_step 26), `/vanjee_imu_packets` (Imu, 200 Hz, Orientierung = 0), `/camera_left/image_raw`, `/camera_right/image_raw` (CompressedImage, `jpeg`).
@@ -41,7 +41,7 @@
 
 - [ ] **Step 1:** Workspace anlegen, `rust-toolchain.toml` mit `channel = "stable"`, Workspace-weite Lints (`clippy::all` warn).
 - [ ] **Step 2:** CI: Matrix `macos-14` (arm64) und `windows-latest`; Jobs `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test --workspace`, `cargo deny check licenses` (erlaubt: MIT, Apache-2.0, BSD-2/3, ISC, Zlib, Unicode-3.0, MPL-2.0 nur für Abhängigkeiten ohne Codeübernahme).
-- [ ] **Step 3:** Testdaten lokal kopieren (nicht ins Repo): vom Windows-Testrechner (RayStudio-Projektordner `Test`) → `~/Documents/Privat/driftless-testdata/Test/` die Dateien `LIDAR_Test.bag`, `IMAGE_Test.bag`, `calibration/calib.json`, `project_parameters.json`, `Test.ini`, `shading/trj.txt`, `shading/smooth.las`. `docs/testdaten.md` beschreibt Aufbau und Variable, ohne persönliche Pfade.
+- [ ] **Step 3:** Testdaten lokal kopieren (nicht ins Repo): vom Windows-Testrechner (RayStudio-Projektordner `Test`) → `$DRIFTLESS_TESTDATA/Test/` die Dateien `LIDAR_Test.bag`, `IMAGE_Test.bag`, `calibration/calib.json`, `project_parameters.json`, `Test.ini`, `shading/trj.txt`, `shading/smooth.las`. `docs/testdaten.md` beschreibt Aufbau und Variable, ohne persönliche Pfade.
 - [ ] **Step 4:** `cargo test --workspace` grün lokal; Push; CI grün auf beiden Plattformen.
 - [ ] **Step 5:** Commit `chore: Workspace, CI und Testdaten-Konvention`.
 
@@ -110,7 +110,7 @@
   - `fn load_calibration(path: &Path) -> Result<Calibration, CalibError>`
   - `pub struct Project { root: PathBuf, lidar_bags: Vec<PathBuf>, image_bags: Vec<PathBuf>, calibration: Option<PathBuf>, problems: Vec<String> }`; `fn discover_project(root: &Path) -> Result<Project, ProjectError>` – erkennt `LIDAR_*.bag`, `IMAGE_*.bag`, `calibration/calib.json`; fehlende Teile landen in `problems`.
 
-- [ ] **Step 1: Failing tests:** `parses_two_fisheye_cameras` (Fixture → Kameras `left`,`right`, KB-Koeffizienten), `missing_camera_bag_is_problem`, `missing_calib_is_problem`, `empty_dir_is_error`, `#[ignore] real_project_jmk6` (SN `JMK6001330`, model `JMK6`).
+- [ ] **Step 1: Failing tests:** `parses_two_fisheye_cameras` (Fixture → Kameras `left`,`right`, KB-Koeffizienten), `missing_camera_bag_is_problem`, `missing_calib_is_problem`, `empty_dir_is_error`, `#[ignore] real_project_jmk6` (SN `<Seriennummer>`, model `JMK6`).
 - [ ] **Step 2:** FAIL. **Step 3:** Implementieren mit serde; unbekannte Felder ignorieren. **Step 4:** grün.
 - [ ] **Step 5:** Commit `feat(io): Kalibrierung und Projekt-Erkennung`.
 
