@@ -108,7 +108,7 @@ fn max_theta_stops_at_monotonicity_limit() {
         },
         width: 100,
         height: 100,
-        lidar_to_cam_raw: None,
+        lidar_to_cam: None,
     };
     let cam = Camera::from_calib("x", &calib).unwrap();
     // 1 + 3 k1 θ² = 0 -> θ = sqrt(1/0.6)
@@ -122,7 +122,7 @@ fn pinhole_round_trip() {
         model: CameraModel::Pinhole,
         width: 640,
         height: 480,
-        lidar_to_cam_raw: None,
+        lidar_to_cam: None,
     };
     let cam = Camera::from_calib("p", &calib).unwrap();
     let dir = Vector3::new(0.1, -0.2, 1.0).normalize();
