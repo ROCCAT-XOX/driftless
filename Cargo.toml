@@ -4,6 +4,7 @@ members = [
     "crates/driftless-io",
     "crates/driftless-traj",
     "crates/driftless-odom",
+    "crates/driftless-graph",
     "crates/driftless-cli",
 ]
 
@@ -23,4 +24,9 @@ opt-level = 2
 [profile.dev.package.nalgebra]
 opt-level = 2
 [profile.dev.package.kiddo]
+opt-level = 2
+# Pose graph tests factorise sparse normal equations; unoptimised builds are ~30x slower.
+[profile.dev.package.driftless-graph]
+opt-level = 2
+[profile.dev.package.nalgebra-sparse]
 opt-level = 2
