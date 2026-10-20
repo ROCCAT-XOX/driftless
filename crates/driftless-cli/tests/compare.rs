@@ -58,6 +58,10 @@ fn compare_json_output() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v["ate_rmse_m"].as_f64().unwrap() < 1e-9);
     assert_eq!(v["matched_poses"], 20);
+    // Counts are integers in JSON, not floats.
+    assert_eq!(v["poses"]["a"], 20);
+    assert_eq!(v["poses"]["b"], 20);
+    assert!(v["poses"]["a"].is_u64());
     assert!(v["path_length_m"]["a"].as_f64().unwrap() > 0.0);
 }
 

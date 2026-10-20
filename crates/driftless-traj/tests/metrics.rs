@@ -1,5 +1,6 @@
 use driftless_traj::{
-    align_umeyama, ate_rmse, path_length, read_tum, start_end_gap, write_tum, Pose, TrajError,
+    align_umeyama, ate_rmse, match_count, path_length, read_tum, start_end_gap, write_tum, Pose,
+    TrajError,
 };
 use nalgebra::{Isometry3, UnitQuaternion, Vector3};
 
@@ -261,4 +262,23 @@ fn real_trj_compares_with_itself_zero() {
     assert_eq!(poses.len(), 53_174);
     assert!(ate_rmse(&poses, &poses, DT).unwrap() < 1e-9);
     assert!(path_length(&poses) > 0.0);
+}
+
+#[test]
+fn match_count_agrees_with_alignment_rule() {
+    let est: Vec<Pose> = (0..10)
+        .map(|i| pose(i as f64, Vector3::new(i as f64, 0.0, 0.0)))
+        .collect();
+    // gt covers t = 0..5 only, plus one pose 0.004 s off t = 7.
+    let mut gt: Vec<Pose> = (0..6)
+        .map(|i| pose(i as f64, Vector3::new(i as f64, 0.0, 0.0)))
+        .collect();
+    gt.push(pose(7.004, Vector3::zeros()));
+    assert_eq!(match_count(&est, &gt, 0.003), 6);
+    assert_eq!(match_count(&est, &gt, DT), 7);
+    assert_eq!(match_count(&est, &[], DT), 0);
+    // Unsorted input gives the same count.
+    let mut shuffled = est.clone();
+    shuffled.reverse();
+    assert_eq!(match_count(&shuffled, &gt, DT), 7);
 }

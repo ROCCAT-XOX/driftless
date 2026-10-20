@@ -1,6 +1,6 @@
 //! `driftless compare <a.tum> <b.tum> [--max-dt S] [--json]`: yardstick between two trajectories.
 
-use driftless_traj::{ate_rmse, path_length, read_tum, start_end_gap};
+use driftless_traj::{ate_rmse, match_count, path_length, read_tum, start_end_gap};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -19,18 +19,18 @@ pub struct Args {
 }
 
 #[derive(Serialize, Debug)]
-pub struct Pair {
-    pub a: f64,
-    pub b: f64,
+pub struct Pair<T> {
+    pub a: T,
+    pub b: T,
 }
 
 #[derive(Serialize, Debug)]
 pub struct Report {
     pub ate_rmse_m: f64,
     pub matched_poses: usize,
-    pub poses: Pair,
-    pub start_end_gap_m: Pair,
-    pub path_length_m: Pair,
+    pub poses: Pair<usize>,
+    pub start_end_gap_m: Pair<f64>,
+    pub path_length_m: Pair<f64>,
 }
 
 pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -40,13 +40,13 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let a = read_tum(&args.a)?;
     let b = read_tum(&args.b)?;
     let ate = ate_rmse(&a, &b, args.max_dt)?;
-    let matched = count_matches(&a, &b, args.max_dt);
+    let matched = match_count(&a, &b, args.max_dt);
     let r = Report {
         ate_rmse_m: ate,
         matched_poses: matched,
         poses: Pair {
-            a: a.len() as f64,
-            b: b.len() as f64,
+            a: a.len(),
+            b: b.len(),
         },
         start_end_gap_m: Pair {
             a: start_end_gap(&a),
@@ -72,18 +72,4 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         println!("Zugeordnete Posen: {}", r.matched_poses);
     }
     Ok(())
-}
-
-/// Number of `a` poses that have a `b` pose within `max_dt` (same rule as the metric).
-fn count_matches(a: &[driftless_traj::Pose], b: &[driftless_traj::Pose], max_dt: f64) -> usize {
-    let mut bt: Vec<f64> = b.iter().map(|p| p.t).collect();
-    bt.sort_by(f64::total_cmp);
-    a.iter()
-        .filter(|e| {
-            let i = bt.partition_point(|&t| t < e.t);
-            let lo = i.checked_sub(1).map(|j| (bt[j] - e.t).abs());
-            let hi = bt.get(i).map(|t| (t - e.t).abs());
-            lo.into_iter().chain(hi).fold(f64::INFINITY, f64::min) <= max_dt
-        })
-        .count()
 }

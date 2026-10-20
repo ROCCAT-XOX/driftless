@@ -3,7 +3,7 @@
 mod metrics;
 mod tum;
 
-pub use metrics::{align_umeyama, ate_rmse, path_length, start_end_gap};
+pub use metrics::{align_umeyama, ate_rmse, match_count, path_length, start_end_gap};
 pub use nalgebra;
 pub use tum::{read_tum, write_tum};
 

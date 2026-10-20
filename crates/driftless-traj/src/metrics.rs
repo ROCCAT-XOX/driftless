@@ -20,8 +20,8 @@ fn sorted(poses: &[Pose]) -> Cow<'_, [Pose]> {
 }
 
 /// For each `est` pose the nearest-in-time `gt` pose within `max_dt`.
-/// Returns matched position pairs `(est, gt)`.
-fn match_positions(est: &[Pose], gt: &[Pose], max_dt: f64) -> Result<Pairs, TrajError> {
+/// Returns matched position pairs `(est, gt)`; may be empty or short.
+fn matched_pairs(est: &[Pose], gt: &[Pose], max_dt: f64) -> Pairs {
     let (est, gt) = (sorted(est), sorted(gt));
     let mut pairs = Vec::new();
     for e in est.iter() {
@@ -36,6 +36,17 @@ fn match_positions(est: &[Pose], gt: &[Pose], max_dt: f64) -> Result<Pairs, Traj
             }
         }
     }
+    pairs
+}
+
+/// Number of `est` poses that have a `gt` pose within `max_dt`: the pairs [`ate_rmse`] and
+/// [`align_umeyama`] work on (they fail below three).
+pub fn match_count(est: &[Pose], gt: &[Pose], max_dt: f64) -> usize {
+    matched_pairs(est, gt, max_dt).len()
+}
+
+fn match_positions(est: &[Pose], gt: &[Pose], max_dt: f64) -> Result<Pairs, TrajError> {
+    let pairs = matched_pairs(est, gt, max_dt);
     if pairs.len() < MIN_MATCHES {
         return Err(TrajError::TooFewMatches {
             found: pairs.len(),
