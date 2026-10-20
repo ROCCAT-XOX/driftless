@@ -6,6 +6,7 @@ use crate::icp::{align, IcpParams, IcpTarget};
 use crate::imu_integrate::{
     estimate_initialisation, propagate, sanitise_imu, ImuCleanup, ImuModel, ImuState,
 };
+use crate::quality::{FrameOutput, FrameQuality};
 use crate::voxel_map::{voxel_downsample, voxel_key, FixedState, VoxelKey, VoxelMap};
 use driftless_io::msg::{ImuSample, LidarFrame};
 use driftless_traj::Pose;
@@ -76,6 +77,8 @@ pub struct OdomResult {
     pub poses: Vec<Pose>,
     /// Deskewed scan points in the world frame, one per [`OUTPUT_MAP_VOXEL`] voxel.
     pub map_points: Vec<[f32; 3]>,
+    /// Registration quality per entry of `poses`.
+    pub quality: Vec<FrameQuality>,
     pub stats: OdomStats,
 }
 
@@ -97,6 +100,16 @@ pub fn run_odometry(
     frames: impl Iterator<Item = LidarFrame>,
     imu: &[ImuSample],
     cfg: &OdomConfig,
+) -> OdomResult {
+    run_odometry_with(frames, imu, cfg, &mut |_| {})
+}
+
+/// [`run_odometry`] that also hands every used frame to `sink`, in order.
+pub fn run_odometry_with(
+    frames: impl Iterator<Item = LidarFrame>,
+    imu: &[ImuSample],
+    cfg: &OdomConfig,
+    sink: &mut dyn FnMut(FrameOutput),
 ) -> OdomResult {
     let (imu, cleanup) = sanitise_imu(imu);
     let init = estimate_initialisation(&imu, INIT_WINDOW_S);
@@ -132,6 +145,7 @@ pub fn run_odometry(
         points: Vec::new(),
     };
     let mut poses = Vec::new();
+    let mut quality = Vec::new();
 
     for frame in frames {
         stats.frames_in += 1;
@@ -158,17 +172,18 @@ pub fn run_odometry(
             deskew(&fp.points, &[], fp.t_end)
         };
 
-        let pose = match &target {
+        let (pose, frame_quality) = match &target {
             Some(tgt) => {
                 let source = voxel_downsample(&body, cfg.voxel_size);
                 let r = align(&source, tgt, &pred.pose(), &icp_params);
                 stats.icp_iterations += u64::from(r.iterations);
-                if r.correspondences < 6 {
+                let icp_ok = r.correspondences >= 6;
+                if !icp_ok {
                     stats.icp_failures += 1;
                 }
-                r.pose
+                (r.pose, FrameQuality::from_icp(&r, icp_ok))
             }
-            None => pred.pose(),
+            None => (pred.pose(), FrameQuality::first()),
         };
 
         // The ICP position correction over this frame mostly stems from a velocity error;
@@ -197,16 +212,25 @@ pub fn run_odometry(
             out_map.add(&(pose * Point3::from(*p)).coords);
         }
 
-        poses.push(Pose {
+        let out_pose = Pose {
             t: fp.t_end,
             p: pose.translation.vector,
             q: pose.rotation,
+        };
+        sink(FrameOutput {
+            index: poses.len(),
+            pose: out_pose.clone(),
+            quality: frame_quality,
+            body_points: &body,
         });
+        poses.push(out_pose);
+        quality.push(frame_quality);
         stats.frames_used += 1;
     }
     OdomResult {
         poses,
         map_points: out_map.points,
+        quality,
         stats,
     }
 }

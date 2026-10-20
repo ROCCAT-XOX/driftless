@@ -106,6 +106,7 @@ fn odometry_is_deterministic() {
     let (_, b) = corridor_run(4.0, Isometry3::identity());
     assert_eq!(a.poses, b.poses);
     assert_eq!(a.map_points, b.map_points);
+    assert_eq!(a.quality, b.quality);
 }
 
 #[test]
