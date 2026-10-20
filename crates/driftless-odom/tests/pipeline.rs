@@ -1,4 +1,4 @@
-mod common;
+use driftless_odom::testutil as common;
 
 use common::{corridor_scene, imu_samples, lidar_frames, Trajectory, Walk};
 use driftless_io::bag::BagReader;

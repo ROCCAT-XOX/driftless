@@ -1103,10 +1103,20 @@ name = "driftless-odom"
 version = "0.1.0"
 dependencies = [
  "driftless-io",
+ "driftless-odom",
  "driftless-traj",
  "kiddo",
  "nalgebra",
  "rayon",
+]
+
+[[package]]
+name = "driftless-slam"
+version = "0.1.0"
+dependencies = [
+ "driftless-odom",
+ "driftless-traj",
+ "nalgebra",
 ]
 
 [[package]]

@@ -10,6 +10,10 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exposes `testutil` (synthetic scenes, trajectories, sensors) to other crates' tests.
+test-util = []
+
 [dependencies]
 driftless-io = { path = "../driftless-io" }
 driftless-traj = { path = "../driftless-traj" }
@@ -19,3 +23,5 @@ rayon = "1"
 
 [dev-dependencies]
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
+# Self dev-dependency: enables `test-util` for the integration tests in tests/.
+driftless-odom = { path = ".", features = ["test-util"] }

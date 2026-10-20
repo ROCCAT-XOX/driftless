@@ -4,6 +4,7 @@ members = [
     "crates/driftless-io",
     "crates/driftless-traj",
     "crates/driftless-odom",
+    "crates/driftless-slam",
     "crates/driftless-graph",
     "crates/driftless-cli",
 ]
@@ -20,6 +21,8 @@ all = { level = "warn", priority = -1 }
 
 # The odometry tests run whole synthetic sequences; unoptimised nalgebra/kiddo make them slow.
 [profile.dev.package.driftless-odom]
+opt-level = 2
+[profile.dev.package.driftless-slam]
 opt-level = 2
 [profile.dev.package.nalgebra]
 opt-level = 2

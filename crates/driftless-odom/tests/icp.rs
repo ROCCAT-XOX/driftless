@@ -1,4 +1,4 @@
-mod common;
+use driftless_odom::testutil as common;
 
 use common::room_scene;
 use driftless_odom::icp::{align, IcpParams, IcpTarget};

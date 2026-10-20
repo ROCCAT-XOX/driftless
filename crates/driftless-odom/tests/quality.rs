@@ -1,4 +1,4 @@
-mod common;
+use driftless_odom::testutil as common;
 
 use common::{aabb, imu_samples, lidar_frames, room_scene, Scene, Trajectory, Walk};
 use driftless_odom::{run_odometry, run_odometry_with, FrameOutput, OdomConfig, OdomResult};

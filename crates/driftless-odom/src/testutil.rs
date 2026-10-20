@@ -1,5 +1,4 @@
-//! Synthetic scenes, trajectories and sensors for the odometry tests.
-#![allow(dead_code)] // each test file uses a different subset
+//! Synthetic scenes, trajectories and sensors for tests (feature `test-util`).
 
 use driftless_io::msg::{ImuSample, LidarFrame, LidarPoint};
 use driftless_traj::nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
