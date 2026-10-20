@@ -5,6 +5,7 @@ mod compare;
 mod correct;
 mod export_glim;
 mod inspect;
+mod map;
 mod odom;
 mod scan_input;
 mod slam;
@@ -41,6 +42,9 @@ enum Command {
     /// Prüft die Kamera-Kalibrierung per Test-Projektion: Richtung der LiDAR↔Kamera-Matrix
     /// und Zeitversatz der Bilder (calib_check.json, Überlagerungsbilder)
     CalibCheck(calib_check::Args),
+    /// Karte eines SLAM-Laufs: dichte Wolke (dense.las), bereinigt (clean.las, removed.las),
+    /// eingefärbt (color.las, color.ply) und map.json; jeder Schritt einzeln startbar
+    Map(map::Args),
 }
 
 fn main() -> ExitCode {
@@ -54,6 +58,7 @@ fn main() -> ExitCode {
         Command::Slam(args) => slam::run(&args),
         Command::Correct(args) => correct::run(&args),
         Command::CalibCheck(args) => calib_check::run(&args),
+        Command::Map(args) => map::run(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

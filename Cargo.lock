@@ -1069,17 +1069,20 @@ dependencies = [
  "assert_cmd",
  "clap",
  "driftless-io",
+ "driftless-map",
  "driftless-odom",
  "driftless-slam",
  "driftless-traj",
  "jpeg-encoder",
  "las",
+ "libc",
  "png",
  "predicates",
  "rayon",
  "rerun",
  "serde",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

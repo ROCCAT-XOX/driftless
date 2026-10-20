@@ -41,12 +41,85 @@ pub struct Args {
     /// Nur jedes N-te Kamerabild loggen
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
     every: u32,
+    /// Punktwolke (LAS, z. B. color.las von `driftless map`) einblenden: mit ihren Farben,
+    /// ohne Farben grau nach Intensität; über 5 Mio. Punkte gleichmäßig ausgedünnt
+    #[arg(long, value_name = "DATEI.las")]
+    cloud: Option<PathBuf>,
     /// Statt den Viewer zu starten in diese .rrd-Datei schreiben (kein Fenster)
     #[arg(long, value_name = "DATEI.rrd")]
     dry_run: Option<PathBuf>,
 }
 
 type BoxError = Box<dyn std::error::Error>;
+
+/// At most this many points of a `--cloud` are shown.
+pub const MAX_CLOUD_POINTS: u64 = 5_000_000;
+
+/// Keep every `cloud_stride(n)`-th point of `n` so that at most [`MAX_CLOUD_POINTS`] remain.
+fn cloud_stride(n: u64) -> u64 {
+    n.div_ceil(MAX_CLOUD_POINTS).max(1)
+}
+
+/// A LAS cloud, thinned to every [`cloud_stride`]-th point (always the same ones).
+struct CloudView {
+    name: String,
+    total: u64,
+    xyz: Vec<[f32; 3]>,
+    colors: Vec<rerun::Color>,
+    /// Colours from the file (else gray from intensity).
+    rgb: bool,
+}
+
+fn load_cloud(path: &std::path::Path) -> Result<CloudView, BoxError> {
+    let err = |e: las::Error| format!("{}: {e}", path.display());
+    let mut reader = las::Reader::from_path(path).map_err(err)?;
+    let total = reader.header().number_of_points();
+    let rgb = reader.header().point_format().has_color;
+    let stride = cloud_stride(total);
+    let mut xyz = Vec::new();
+    let mut gray = Vec::new();
+    let mut colors = Vec::new();
+    let mut batch = las::PointDataBuilder::new()
+        .for_header(reader.header())
+        .build();
+    let mut i = 0u64;
+    while reader.fill_points(1 << 20, &mut batch).map_err(err)? > 0 {
+        for p in batch.points() {
+            let p = p.map_err(err)?;
+            let take = i.is_multiple_of(stride);
+            i += 1;
+            if !take {
+                continue;
+            }
+            xyz.push([p.x as f32, p.y as f32, p.z as f32]);
+            match (rgb, p.color) {
+                (true, Some(c)) => colors.push(rerun::Color::from_rgb(
+                    (c.red >> 8) as u8,
+                    (c.green >> 8) as u8,
+                    (c.blue >> 8) as u8,
+                )),
+                _ => gray.push(p.intensity),
+            }
+        }
+    }
+    if !rgb {
+        let max = gray.iter().copied().max().unwrap_or(0).max(1);
+        colors = gray
+            .iter()
+            .map(|&i| {
+                let v = (u32::from(i) * 255 / u32::from(max)) as u8;
+                rerun::Color::from_rgb(v, v, v)
+            })
+            .collect();
+    }
+    Ok(CloudView {
+        name: file_name(path),
+        total,
+        xyz,
+        colors,
+        rgb,
+    })
+}
 
 /// Grayscale ramp, normalised per frame to the maximum intensity.
 fn intensity_colors(frame: &LidarFrame) -> Vec<rerun::Color> {
@@ -415,6 +488,10 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
         Some(dir) => Some(load_slam(dir)?),
         None => None,
     };
+    let cloud = match &args.cloud {
+        Some(path) => Some(load_cloud(path)?),
+        None => None,
+    };
     let mut warnings = Vec::new();
     let all_bags: Vec<PathBuf> = project
         .lidar_bags
@@ -440,6 +517,14 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
     if let Some(view) = &slam {
         log_slam(&rec, view)?;
     }
+    if let Some(c) = &cloud {
+        rec.log_static(
+            "map/cloud",
+            &rerun::Points3D::new(c.xyz.iter().copied())
+                .with_colors(c.colors.iter().copied())
+                .with_radii([rerun::Radius::new_ui_points(1.0)]),
+        )?;
+    }
     let scan_start = slam.as_ref().map(|v| v.report.scan_start);
     let mut counts = Counts::default();
     for plan in &plans {
@@ -460,6 +545,15 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
         "{} LiDAR-Frames, {} IMU-Messungen, {} Kamerabilder geloggt",
         counts.lidar, counts.imu, counts.images
     );
+    if let Some(c) = &cloud {
+        println!(
+            "Wolke {}: {} von {} Punkten ({})",
+            c.name,
+            c.xyz.len(),
+            c.total,
+            if c.rgb { "Farbe" } else { "Intensität" }
+        );
+    }
     if slam.is_some() {
         println!(
             "Zeitleiste {SCAN_TIMELINE}: Sekunden ab Scan-Beginn, wie `driftless correct loop` sie erwartet"
@@ -473,7 +567,9 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{camera_entity, quality_color, trajectory_strips, SlamView};
+    use super::{
+        camera_entity, cloud_stride, quality_color, trajectory_strips, SlamView, MAX_CLOUD_POINTS,
+    };
     use driftless_slam::report::{BeforeAfter, SlamReport, SubmapReport};
     use driftless_traj::nalgebra::{UnitQuaternion, Vector3};
     use driftless_traj::Pose;
@@ -522,6 +618,23 @@ mod tests {
         assert_eq!(strips[0].len(), 2, "{strips:?}");
         assert_eq!(strips[1].len(), 2, "{strips:?}");
         assert_eq!(strips[1][0], [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn cloud_stride_keeps_at_most_the_limit() {
+        for n in [
+            0,
+            1,
+            MAX_CLOUD_POINTS,
+            MAX_CLOUD_POINTS + 1,
+            12_500_000,
+            3 * MAX_CLOUD_POINTS,
+        ] {
+            let s = cloud_stride(n);
+            assert!(n.div_ceil(s) <= MAX_CLOUD_POINTS, "{n}");
+        }
+        assert_eq!(cloud_stride(MAX_CLOUD_POINTS), 1);
+        assert_eq!(cloud_stride(MAX_CLOUD_POINTS + 1), 2);
     }
 
     #[test]

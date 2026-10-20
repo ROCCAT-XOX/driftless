@@ -83,6 +83,10 @@ impl CleanConfig {
         if !(self.ghost_ratio.is_finite() && self.ghost_ratio >= 0.0) {
             return bad("Verhältnis der Geistersuche darf nicht negativ sein");
         }
+        // With 0, a voxel no ray touches (0 passes ≥ ratio · 0 hits) would be free space.
+        if self.min_passes == 0 {
+            return bad("Mindestzahl der Durchgänge der Geistersuche muss mindestens 1 sein");
+        }
         if self.outlier_k == 0 {
             return bad("Nachbarzahl des Ausreißerfilters muss mindestens 1 sein");
         }

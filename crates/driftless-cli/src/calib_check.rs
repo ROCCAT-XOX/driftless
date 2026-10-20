@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const IMAGE_TYPE: &str = "sensor_msgs/CompressedImage";
+pub(crate) const IMAGE_TYPE: &str = "sensor_msgs/CompressedImage";
 /// Time offsets tested: `step / 100` s for every step (−0.20 … +0.20 s).
 pub const OFFSET_STEPS: std::ops::RangeInclusive<i32> = -20..=20;
 /// LiDAR points within this time (s) of an image are projected into it.
@@ -517,7 +517,7 @@ fn summarise(scores: &[Score]) -> (Summary, usize, usize) {
 }
 
 /// All `sensor_msgs/CompressedImage` topics of the image bags, sorted.
-fn image_topics(bags: &[PathBuf]) -> Result<Vec<String>, String> {
+pub(crate) fn image_topics(bags: &[PathBuf]) -> Result<Vec<String>, String> {
     let mut topics = BTreeSet::new();
     for bag in bags {
         let reader = BagReader::open(bag).map_err(|e| format!("{}: {e}", file_name(bag)))?;

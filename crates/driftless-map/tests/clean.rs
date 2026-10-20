@@ -401,6 +401,11 @@ fn clean_rejects_bad_config() {
             ..CleanConfig::default()
         },
         CleanConfig {
+            // 0 would make every voxel no ray touches a ghost
+            min_passes: 0,
+            ..CleanConfig::default()
+        },
+        CleanConfig {
             outlier_k: 0,
             ..CleanConfig::default()
         },
