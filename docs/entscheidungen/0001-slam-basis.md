@@ -11,7 +11,7 @@ Welche Grundlage berechnet in Driftless die Laufbahn (LiDAR-IMU-SLAM)?
 
 ## Messung
 
-Zwei Aufnahmen, beide Kandidaten mit Standardeinstellungen, gemessen auf dem MacBook Pro M4 Pro.
+Zwei Aufnahmen; die Rust-Grundlinie lief mit Standardeinstellungen, GLIM zuerst ebenfalls (Standard), auf Hilti danach zusätzlich eingerichtet (Fußnote ²); gemessen auf dem MacBook Pro M4 Pro.
 ATE = mittlere Abweichung (RMSE) nach bester Ausrichtung (`driftless compare --max-dt 0.05`).
 
 - **Eigener Scan JMK6** (`Test`, 266 s, Innenraum): verglichen mit RayStudio `trj.txt`.
@@ -73,7 +73,7 @@ Weitere Befunde:
 | Laufzeit | schnell (mit Export ähnlich wie Rust) | schnell, 10–40× schneller als Echtzeit |
 | RAM | 235–430 MB | 63–200 MB |
 | Gleiche Ergebnisse je Lauf | mit 1 Thread und Schritt-für-Schritt-Treiber ja; mit 8 Threads auf Hilti nein; zwischen Mac und Windows leicht anders | ja, bitgleich |
-| Lizenzen | MIT/BSD/Apache/MPL – als eigener Prozess unkritisch | MIT/Apache, `cargo deny` grün |
+| Lizenzen | MIT/BSD/Apache/MPL – als eigener Prozess unkritisch | nur Abhängigkeiten unter MIT, Apache-2.0 (auch mit LLVM-Ausnahme), BSD-2/3, ISC, Zlib, Unicode-3.0, MPL-2.0, BSL-1.0, CDLA-Permissive-2.0 (so erlaubt es `deny.toml`); `cargo deny` grün |
 | Wartung | hoch: Windows-Patches selbst pflegen; stiller 32-bit-`long`-Fehler gefunden (falsche Ergebnisse ohne Meldung); GTSAM ist eine Alpha (4.3a1); Eigen-Version festnageln; Upstream testet nur Ubuntu | eigener Code: wir pflegen alles selbst, aber in einer Sprache und mit Tests |
 | **GPU auf Mac (Metal) und RTX (wgpu)** – Vorgabe Yannick | **nein**: GLIMs GPU-Teil braucht CUDA, also nur NVIDIA, nicht auf dem Mac | **ja, möglich**: der ICP-Kern ist schon als „je Punkt rechnen, dann fest summieren“ gebaut und kann als wgpu-Rechenschritt laufen (noch nicht umgesetzt) |
 | Weg zu Schleifenschluss | vorhanden (globale Optimierung über Teilkarten) | fehlt: Teilkarten + Pose-Graph + Erkennung müssen gebaut werden |

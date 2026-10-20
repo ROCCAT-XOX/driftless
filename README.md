@@ -23,6 +23,20 @@ JSON) and aims to produce better results on any machine.
 
 Design: [docs/superpowers/specs/2026-10-20-driftless-design.md](docs/superpowers/specs/2026-10-20-driftless-design.md) (German)
 
+## Commands
+
+Build with `cargo build --release`; the binary is `driftless`. Folder arguments are a scan folder with
+`LIDAR_*.bag` (and optionally `IMAGE_*.bag`, `calibration/calib.json`). Test data and how to set it up:
+[docs/testdaten.md](docs/testdaten.md).
+
+| Command | What it does |
+|---|---|
+| `driftless inspect <folder> [--json]` | Report on a scan: device, duration, topics with counts and rates, problems |
+| `driftless view <folder> [--traj t.tum] [--lidar-topic T] [--imu-topic T]` | Debug viewer (rerun): point clouds, IMU, camera images, optional trajectory |
+| `driftless odom <folder> -o <dir> [--lidar-to-imu x y z qx qy qz qw]` | LiDAR-IMU odometry (Rust baseline); writes `traj.tum` and `map.las` |
+| `driftless export-glim <folder> -o <dir>` | Writes `imu.bin` and `lidar.bin` for the GLIM spike (`spikes/glim/`) |
+| `driftless compare <a.tum> <b.tum> [--json]` | Trajectory yardstick: ATE after alignment, path length, start-to-end gap |
+
 ## Legal
 
 Driftless is an independent project and not affiliated with 3DMakerPro. It reads open data formats

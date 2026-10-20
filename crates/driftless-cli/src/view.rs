@@ -8,7 +8,7 @@ use driftless_io::bag::{BagError, BagReader};
 use driftless_io::msg::{decode_compressed_image, decode_imu, decode_pointcloud2, LidarFrame};
 use driftless_io::project::discover_project;
 use driftless_traj::read_tum;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const TIMELINE: &str = "stamp";
 const CLOUD_TYPE: &str = "sensor_msgs/PointCloud2";

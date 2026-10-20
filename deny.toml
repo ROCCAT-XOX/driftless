@@ -21,3 +21,10 @@ allow = [
     "CDLA-Permissive-2.0",  # webpki-roots (CA data) via ureq/ehttp
 ]
 confidence-threshold = 0.9
+
+[advisories]
+# `paste` (proc-macro, unmaintained, no vulnerability) is pulled in by the debug viewer `rerun`
+# (re_query, re_string_interner, ...). Nothing for us to upgrade; revisit on the next rerun update.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; build-time macro only, transitive via rerun" },
+]
