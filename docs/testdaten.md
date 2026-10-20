@@ -33,7 +33,7 @@ $DRIFTLESS_TESTDATA/
   hilti2022/
     exp14_basement_2.bag            Hilti SLAM Challenge 2022 (Hesai XT-32, Alphasense)
     exp14_basement_2_imu.txt        Referenz-Laufbahn (TUM, IMU-Rahmen, 10 Hz)
-    projekt/LIDAR_exp14.bag         harter Link auf die Bag (Symlinks werden nicht verfolgt)
+    projekt/LIDAR_exp14.bag         Symlink auf die Bag (`ln -s ../exp14_basement_2.bag LIDAR_exp14.bag`)
     calibration/lidar_calibration.yaml   LiDAR-IMU-Extrinsik (von Hugging Face)
 ```
 

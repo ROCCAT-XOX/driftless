@@ -70,7 +70,8 @@ pub fn discover_project(root: &Path) -> Result<Project, ProjectError> {
     let mut image_bags = Vec::new();
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() {
+        // `Path::is_file` follows symlinks (`DirEntry::file_type` does not).
+        if !entry.path().is_file() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
