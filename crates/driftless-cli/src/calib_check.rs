@@ -116,38 +116,12 @@ fn working_downscale(width: u32) -> u32 {
     }
 }
 
-/// The camera model for images decoded with block averaging by `d` (pixel centres at
-/// integer coordinates, partial blocks dropped).
-fn scaled_camera(cam: &Camera, d: u32) -> Camera {
-    let s = f64::from(d);
-    Camera {
-        width: cam.width / d,
-        height: cam.height / d,
-        fx: cam.fx / s,
-        fy: cam.fy / s,
-        cx: (cam.cx + 0.5) / s - 0.5,
-        cy: (cam.cy + 0.5) / s - 0.5,
-        ..cam.clone()
-    }
-}
-
 /// Gray image with the gradient magnitude normalised to mean 1.
 struct Gradient {
     width: usize,
     height: usize,
     gray: Vec<u8>,
     grad: Vec<f32>,
-}
-
-fn to_gray(img: &RgbImage) -> Vec<u8> {
-    img.data
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .map(|p| {
-            ((77 * u32::from(p[0]) + 150 * u32::from(p[1]) + 29 * u32::from(p[2]) + 128) >> 8) as u8
-        })
-        .collect()
 }
 
 /// 3x3 box blur, edges clamped.
@@ -202,7 +176,7 @@ fn mean(v: &[f32]) -> f64 {
 
 /// Image sharpness: mean Sobel magnitude of the gray image.
 fn sharpness(img: &RgbImage) -> f64 {
-    let gray: Vec<f32> = to_gray(img).into_iter().map(f32::from).collect();
+    let gray: Vec<f32> = img.to_gray().into_iter().map(f32::from).collect();
     mean(&sobel(&gray, img.width as usize, img.height as usize))
 }
 
@@ -210,7 +184,7 @@ fn sharpness(img: &RgbImage) -> f64 {
 /// the same; a score of 1 is what randomly placed points get).
 fn gradient(img: &RgbImage) -> Gradient {
     let (w, h) = (img.width as usize, img.height as usize);
-    let gray = to_gray(img);
+    let gray = img.to_gray();
     let g: Vec<f32> = gray.iter().map(|&v| f32::from(v)).collect();
     let mut grad = box_blur(&sobel(&box_blur(&g, w, h), w, h), w, h);
     let m = mean(&grad);
@@ -593,7 +567,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             let d = working_downscale(c.width);
             downscale = downscale.max(d);
             cameras.entry(name.clone()).or_default().push(CameraSetup {
-                camera: scaled_camera(&Camera::from_calib(name, c)?, d),
+                camera: Camera::from_calib(name, c)?.downscaled(d),
                 lidar_cam: lidar_to_cam.inverse(),
             });
         }

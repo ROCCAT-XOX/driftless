@@ -21,5 +21,7 @@ rayon = "1.12.0"
 thiserror = "2"
 
 [dev-dependencies]
+driftless-io = { path = "../driftless-io", features = ["test-util"] }
+jpeg-encoder = "0.7.1"
 driftless-odom = { path = "../driftless-odom", features = ["test-util"] }
 driftless-slam = { path = "../driftless-slam" }

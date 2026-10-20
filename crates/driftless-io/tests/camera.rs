@@ -130,3 +130,25 @@ fn pinhole_round_trip() {
     assert!((cam.unproject(uv).unwrap() - dir).norm() < 1e-12);
     assert!(cam.project(&Vector3::new(0.0, 0.0, -1.0)).is_none());
 }
+
+#[test]
+fn downscaled_camera_matches_block_averaged_pixels() {
+    for cam in cameras() {
+        for d in [2u32, 4] {
+            let small = cam.downscaled(d);
+            assert_eq!((small.width, small.height), (cam.width / d, cam.height / d));
+            for p in [Vector3::new(0.3, -0.2, 1.0), Vector3::new(-1.0, 0.5, 0.8)] {
+                let (Some(full), Some(sub)) = (cam.project(&p), small.project(&p)) else {
+                    continue;
+                };
+                // Block (bx, by) averages full pixels d·bx … d·bx + d − 1: its centre is at
+                // full-resolution coordinate d·bx + (d − 1) / 2.
+                let s = f64::from(d);
+                for k in 0..2 {
+                    let want = (full[k] - (s - 1.0) / 2.0) / s;
+                    assert!((sub[k] - want).abs() < 1e-9, "{} d={d}", cam.name);
+                }
+            }
+        }
+    }
+}

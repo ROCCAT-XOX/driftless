@@ -1,15 +1,21 @@
 //! Dense cloud of a real JMK6 scan in `$DRIFTLESS_TESTDATA` (see `docs/testdaten.md`): SLAM,
 //! trajectory through a TUM file (as `traj.tum` of `driftless slam`), then the dense cloud
-//! and LAS/PLY, and its cleaning. Prints point counts and timings; skips when the data is
-//! missing.
+//! and LAS/PLY, its cleaning and colouring. Prints point counts and timings; skips when the
+//! data is missing. `DRIFTLESS_COLOR_OUT=<dir>` keeps the coloured cloud (`color.las`,
+//! `color.ply`) there.
 //!
 //! `cargo test --release -p driftless-map --test real_data -- --ignored --nocapture`
 
 use driftless_io::bag::BagReader;
+use driftless_io::calib::load_calibration;
+use driftless_io::camera::Camera;
 use driftless_io::msg::{decode_imu, decode_pointcloud2, ImuSample, LidarFrame};
 use driftless_io::project::discover_project;
 use driftless_io::testdata;
-use driftless_map::{build_dense, clean, write_las, write_ply, CleanConfig, DenseConfig};
+use driftless_map::{
+    build_dense, clean, colorize, write_las, write_ply, CleanConfig, ColorCamera, ColorConfig,
+    DenseConfig, ImageSource,
+};
 use driftless_slam::{run_slam, SlamConfig};
 use driftless_traj::{read_tum, write_tum};
 use std::path::{Path, PathBuf};
@@ -161,4 +167,86 @@ fn jmk6_scan_143623_clean() {
         "cleaning removed more than 10 %"
     );
     std::fs::remove_dir_all(&out).unwrap();
+}
+
+#[test]
+#[ignore = "needs DRIFTLESS_TESTDATA"]
+fn jmk6_scan_143623_color() {
+    let Some(folder) = testdata::path("jmk6-2026-10-20/20261020143623").filter(|p| p.exists())
+    else {
+        eprintln!("SKIPPED: {} not set or scan missing", testdata::ENV_VAR);
+        return;
+    };
+    let project = discover_project(&folder).unwrap();
+    let bags = project.lidar_bags.clone();
+    let imu = read_imu(&bags);
+    let cfg = SlamConfig::default();
+    let (slam, _) = with_frames(&bags, |frames| run_slam(frames, &imu, &cfg));
+    let poses = slam.poses();
+    let (cloud, rays, _) = with_frames(&bags, |frames| {
+        build_dense(frames, &imu, &cfg.odom, &poses, &DenseConfig::default())
+    })
+    .unwrap();
+    let (mut cloud, _, _) = clean(cloud, &rays, &CleanConfig::default()).unwrap();
+
+    let calib = load_calibration(project.calibration.as_ref().unwrap()).unwrap();
+    let cams: Vec<ColorCamera> = calib
+        .cameras
+        .iter()
+        .map(|(name, c)| {
+            ColorCamera::new(
+                Camera::from_calib(name, c).unwrap(),
+                &c.lidar_to_cam.unwrap(),
+                &cfg.odom.lidar_to_imu,
+            )
+        })
+        .collect();
+    let mut topics: Vec<String> = Vec::new();
+    for bag in &project.image_bags {
+        let r = BagReader::open(bag).unwrap();
+        topics.extend(
+            r.connections()
+                .iter()
+                .filter(|c| c.msg_type == "sensor_msgs/CompressedImage")
+                .map(|c| c.topic.clone()),
+        );
+    }
+    topics.sort();
+    topics.dedup();
+    let images = ImageSource {
+        bags: project.image_bags.clone(),
+        topics,
+    };
+
+    let start = Instant::now();
+    let stats = colorize(&mut cloud, images, &poses, &cams, &ColorConfig::default()).unwrap();
+    let color_s = start.elapsed().as_secs_f64();
+    println!(
+        "143623: colour {color_s:.1} s; {} points, {} coloured ({:.1} %); images {} used, {} \
+         blurry, {} outside, {} bad",
+        cloud.len(),
+        stats.points_colored,
+        100.0 * stats.points_colored as f64 / cloud.len() as f64,
+        stats.images_used,
+        stats.images_blurry,
+        stats.images_outside_trajectory,
+        stats.images_bad,
+    );
+    match std::env::var_os("DRIFTLESS_COLOR_OUT") {
+        Some(dir) => {
+            let out = PathBuf::from(dir);
+            std::fs::create_dir_all(&out).unwrap();
+            write_las(&out.join("color.las"), &cloud).unwrap();
+            write_ply(&out.join("color.ply"), &cloud).unwrap();
+        }
+        None => {
+            let out =
+                std::env::temp_dir().join(format!("driftless-map-color-{}", std::process::id()));
+            std::fs::create_dir_all(&out).unwrap();
+            write_las(&out.join("color.las"), &cloud).unwrap();
+            std::fs::remove_dir_all(&out).unwrap();
+        }
+    }
+    assert!(stats.images_used > 0);
+    assert!(stats.points_colored > cloud.len() / 2);
 }

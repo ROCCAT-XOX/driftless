@@ -150,6 +150,20 @@ fn walk_ray(from: &[f32; 3], to: &[f32; 3], voxel: f64, mut visit: impl FnMut(Vo
     visit(cur, true);
 }
 
+/// Principal axes of a covariance matrix with the spread along each, least spread first.
+pub(crate) fn spread_axes(cov: &Matrix3<f64>) -> [(f64, Vector3<f64>); 3] {
+    // nalgebra 0.33.3 can pair the eigenvalues of a nearly diagonal matrix with the wrong
+    // eigenvectors (the vectors themselves are right); the spread along each vector is its
+    // true eigenvalue.
+    let axes = cov.symmetric_eigen().eigenvectors;
+    let mut spread: [(f64, Vector3<f64>); 3] = std::array::from_fn(|i| {
+        let v = axes.column(i).into_owned();
+        (v.dot(&(cov * v)), v)
+    });
+    spread.sort_by(|a, b| a.0.total_cmp(&b.0));
+    spread
+}
+
 /// Point moments of a voxel, relative to its lowest corner.
 #[derive(Clone, Copy)]
 struct Moments {
@@ -183,15 +197,7 @@ impl Moments {
         let c = f64::from(self.n);
         let mean = self.sum / c;
         let cov = self.outer / c - mean * mean.transpose();
-        // nalgebra 0.33.3 can pair the eigenvalues of a nearly diagonal matrix with the wrong
-        // eigenvectors (the vectors themselves are right); the spread along each vector is
-        // its true eigenvalue.
-        let axes = cov.symmetric_eigen().eigenvectors;
-        let mut spread: [(f64, Vector3<f64>); 3] = std::array::from_fn(|i| {
-            let v = axes.column(i).into_owned();
-            (v.dot(&(cov * v)), v)
-        });
-        spread.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let spread = spread_axes(&cov);
         let (least, middle) = (spread[0].0, spread[1].0);
         (least < 0.1 * middle).then_some(spread[0].1)
     }

@@ -33,6 +33,21 @@ pub struct RgbImage {
     pub data: Vec<u8>,
 }
 
+impl RgbImage {
+    /// Gray values (BT.601 weights, integer arithmetic), row-major.
+    pub fn to_gray(&self) -> Vec<u8> {
+        self.data
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| {
+                ((77 * u32::from(p[0]) + 150 * u32::from(p[1]) + 29 * u32::from(p[2]) + 128) >> 8)
+                    as u8
+            })
+            .collect()
+    }
+}
+
 /// One camera image from a bag.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {

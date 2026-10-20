@@ -1113,6 +1113,7 @@ dependencies = [
  "driftless-odom",
  "driftless-slam",
  "driftless-traj",
+ "jpeg-encoder",
  "kiddo",
  "las",
  "nalgebra",

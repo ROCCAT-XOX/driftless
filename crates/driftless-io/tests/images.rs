@@ -143,3 +143,13 @@ fn oversized_header_is_rejected_without_allocating() {
     jpg[sof + 5..sof + 9].copy_from_slice(&[0, 0, 0, 0]);
     assert!(decode_jpeg(&jpg, 1).is_err());
 }
+
+#[test]
+fn gray_uses_bt601_weights() {
+    let img = driftless_io::images::RgbImage {
+        width: 3,
+        height: 1,
+        data: vec![255, 255, 255, 255, 0, 0, 0, 0, 255],
+    };
+    assert_eq!(img.to_gray(), vec![255, 77, 29]);
+}

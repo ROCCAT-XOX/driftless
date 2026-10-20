@@ -85,6 +85,22 @@ impl Camera {
         })
     }
 
+    /// The camera model for its images decoded with block averaging by `d`
+    /// ([`crate::images::decode_jpeg`]): pixel centres stay at integer coordinates and
+    /// partial blocks at the right/bottom edge are dropped.
+    pub fn downscaled(&self, d: u32) -> Camera {
+        let s = f64::from(d);
+        Camera {
+            width: self.width / d,
+            height: self.height / d,
+            fx: self.fx / s,
+            fy: self.fy / s,
+            cx: (self.cx + 0.5) / s - 0.5,
+            cy: (self.cy + 0.5) / s - 0.5,
+            ..self.clone()
+        }
+    }
+
     /// Projects a point in the camera frame to pixel coordinates.
     /// `None` if the point is beyond `max_theta` or falls outside the image.
     pub fn project(&self, p_cam: &Vector3<f64>) -> Option<[f64; 2]> {

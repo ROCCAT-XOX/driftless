@@ -4,17 +4,23 @@
 //! deskewed sweep comes back in the body frame, and places it with the SLAM-corrected pose of
 //! that frame. One point is kept per voxel: the one seen from closest, since near points are
 //! the most accurate. [`clean`] removes ghosts (things that moved) and isolated outliers;
-//! [`write_las`] and [`write_ply`] write the [`Cloud`].
+//! [`colorize`] colours it from the camera images (visibility by depth buffer, image quality,
+//! weighted blend of the best views); [`write_las`] and [`write_ply`] write the [`Cloud`].
 
 mod clean;
 mod cloud;
+mod color;
 mod dense;
 mod export;
+mod sharpness;
+pub mod visibility;
 
 pub use clean::{clean, find_ghosts, find_outliers, CleanConfig, CleanStats};
 pub use cloud::Cloud;
+pub use color::{colorize, ColorCamera, ColorConfig, ColorStats, ImageSource};
 pub use dense::{build_dense, DenseConfig, DenseStats, RaySource};
 pub use export::{write_las, write_ply};
+pub use sharpness::sharpness;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MapError {
@@ -32,6 +38,8 @@ pub enum MapError {
         pose_t: f64,
         frame_t: f64,
     },
+    #[error("Kamerabilder: {0}")]
+    Images(String),
     #[error("ungültige Einstellung: {0}")]
     Config(String),
     #[error("{path}: {source}")]

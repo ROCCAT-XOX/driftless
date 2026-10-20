@@ -34,6 +34,13 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.nalgebra-sparse]
 opt-level = 2
+# The colour tests ray-cast, JPEG-encode and decode synthetic camera images.
+[profile.dev.package.driftless-map]
+opt-level = 2
+[profile.dev.package.jpeg-encoder]
+opt-level = 2
+[profile.dev.package.zune-jpeg]
+opt-level = 2
 # `calib-check` projects every LiDAR point into every image variant; its tests run the binary.
 [profile.dev.package.driftless-cli]
 opt-level = 2
