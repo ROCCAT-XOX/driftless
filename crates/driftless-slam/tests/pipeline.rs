@@ -5,7 +5,8 @@ use driftless_odom::testutil::{
 };
 use driftless_odom::OdomConfig;
 use driftless_slam::{
-    close_loops, run_slam, solve, LoopCheck, LoopVerdict, SlamConfig, SlamReport, SlamResult,
+    close_loops, run_slam, solve, LoopCheck, LoopConfig, LoopVerdict, ManualLoop, SlamConfig,
+    SlamReport, SlamResult, Submap, SubmapConfig,
 };
 use driftless_traj::nalgebra::{Isometry3, Matrix6, Translation3, UnitQuaternion, Vector3};
 use driftless_traj::{start_end_gap, Pose};
@@ -20,12 +21,22 @@ fn run(
     duration: f64,
     gyro_bias_z: f64,
 ) -> SlamResult {
+    run_with(traj, scene, duration, gyro_bias_z, &SlamConfig::default())
+}
+
+fn run_with(
+    traj: &dyn Trajectory,
+    scene: &driftless_odom::testutil::Scene,
+    duration: f64,
+    gyro_bias_z: f64,
+    cfg: &SlamConfig,
+) -> SlamResult {
     let frames = lidar_frames(scene, traj, 0.0, duration, 360, &Isometry3::identity());
     let mut imu = imu_samples(traj, -IMU_MARGIN, duration + IMU_MARGIN, 200.0);
     for s in imu.iter_mut().filter(|s| s.stamp > 2.0) {
         s.gyro[2] += gyro_bias_z;
     }
-    let (r, stats) = run_slam(frames.into_iter(), &imu, &SlamConfig::default());
+    let (r, stats) = run_slam(frames.into_iter(), &imu, cfg);
     assert_eq!(stats.frames_used, r.poses().len());
     r
 }
@@ -188,13 +199,9 @@ fn slam_closes_synthetic_loop() {
     assert!(after < 0.05, "start-end gap after {after} m");
 }
 
-/// The room loop with additional odometry drift injected into the submap anchors, growing
-/// along the submaps to `trans` and `yaw` (about the start) at the last one. Submap 0 (mostly
-/// the static start) finds no loop of its own, so the drift of its odometry edge (1/7 of the
-/// total) cannot be removed; everything after it is tied together by the loops.
-#[test]
-fn solve_removes_injected_drift() {
-    let r = room_loop();
+/// The submaps of `r` with odometry drift injected into their anchors, growing along the
+/// submaps to 0.33 m and 3° yaw (about the start) at the last one.
+fn with_injected_drift(r: &SlamResult) -> (Vec<Submap>, Vec<Isometry3<f64>>) {
     let n = r.submaps.len();
     let (trans, yaw) = (Vector3::new(0.25, -0.2, 0.05), 3f64.to_radians());
     let mut submaps = r.submaps.clone();
@@ -207,7 +214,73 @@ fn solve_removes_injected_drift() {
         m.anchor = drift * m.anchor;
     }
     let anchors = submaps.iter().map(|m| m.anchor).collect();
-    let d = solve(submaps, anchors, &[], &SlamConfig::default());
+    (submaps, anchors)
+}
+
+/// With the automatic search switched off (search radius 0) the drifted room loop keeps its
+/// start-end gap; one manual loop between the still phases at start and end closes it. The
+/// submaps are about one lap long (13 m of the 12.6 m circle), so the first and the last one
+/// both see the whole room. Even then the synthetic 16-ring scans leave many points without
+/// a usable plane: the perfect alignment (rms 4 mm) reaches an inlier ratio of only 0.48, so
+/// the test lowers `min_inlier_ratio` to 0.4 (with 5 m submaps it is 0.34).
+#[test]
+fn manual_loop_fixes_missed_loop() {
+    let c = circle();
+    let laps = SlamConfig {
+        submap: SubmapConfig {
+            max_length: 13.0,
+            max_frames: 1000,
+        },
+        ..SlamConfig::default()
+    };
+    let r = run_with(&c, &room_scene(), c.duration(), 0.1, &laps);
+    assert!(r.submaps.len() >= 3, "{} submaps", r.submaps.len());
+    let (submaps, anchors) = with_injected_drift(&r);
+    let cfg = SlamConfig {
+        loops: LoopConfig {
+            base_radius: 0.0,
+            radius_per_m: 0.0,
+            min_inlier_ratio: 0.4,
+            ..LoopConfig::default()
+        },
+        ..SlamConfig::default()
+    };
+    let auto = solve(submaps.clone(), anchors.clone(), &[], &cfg).unwrap();
+    assert!(auto.loops.is_empty(), "{:?}", auto.loops);
+    let before = start_end_gap(&auto.poses());
+    assert!(before > 0.25, "injected drift too small: {before} m");
+
+    let end = SlamReport::new(&auto).submaps.last().unwrap().t_end;
+    let m = ManualLoop {
+        a_t: 0.5,
+        b_t: end - 0.5,
+    };
+    let d = solve(submaps, anchors, &[m], &cfg).unwrap();
+    for l in &d.loops {
+        eprintln!(
+            "{}↔{} {:?} inlier {:.3} rms {:.4}",
+            l.a, l.b, l.verdict, l.inlier_ratio, l.rms
+        );
+    }
+    let after = start_end_gap(&d.poses());
+    eprintln!("start-end gap {before:.4} -> {after:.4} m");
+    assert_eq!(d.loops.len(), 1);
+    assert!(d.loops[0].manual);
+    assert_eq!(d.loops[0].verdict, LoopVerdict::Accepted);
+    assert_eq!((d.loops[0].a, d.loops[0].b), (0, d.submaps.len() - 1));
+    assert!(after < 0.05, "start-end gap {before} -> {after} m");
+}
+
+/// The room loop with additional odometry drift injected into the submap anchors, growing
+/// along the submaps to `trans` and `yaw` (about the start) at the last one. Submap 0 (mostly
+/// the static start) finds no loop of its own, so the drift of its odometry edge (1/7 of the
+/// total) cannot be removed; everything after it is tied together by the loops.
+#[test]
+fn solve_removes_injected_drift() {
+    let r = room_loop();
+    let n = r.submaps.len();
+    let (submaps, anchors) = with_injected_drift(&r);
+    let d = solve(submaps, anchors, &[], &SlamConfig::default()).unwrap();
     let (before, after) = (start_end_gap(&d.odom_poses()), start_end_gap(&d.poses()));
     for l in &d.loops {
         eprintln!(

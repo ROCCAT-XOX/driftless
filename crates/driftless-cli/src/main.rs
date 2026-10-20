@@ -1,6 +1,7 @@
 //! `driftless`: command line entry point. Each subcommand lives in its own module.
 
 mod compare;
+mod correct;
 mod export_glim;
 mod inspect;
 mod odom;
@@ -31,8 +32,11 @@ enum Command {
     ExportGlim(export_glim::Args),
     /// LiDAR-IMU-Odometrie (Rust-Grundlinie): traj.tum und map.las
     Odom(odom::Args),
-    /// SLAM mit Schleifenschluss: traj.tum, traj_odom.tum, map.las, slam.json
+    /// SLAM mit Schleifenschluss: traj.tum, traj_odom.tum, map.las, slam.json, submaps.bin
     Slam(slam::Args),
+    /// Manuelle Korrekturen eines SLAM-Laufs (corrections.toml): auflisten, Schleife
+    /// eintragen, ab- und einschalten
+    Correct(correct::Args),
 }
 
 fn main() -> ExitCode {
@@ -44,6 +48,7 @@ fn main() -> ExitCode {
         Command::ExportGlim(args) => export_glim::run(&args),
         Command::Odom(args) => odom::run(&args),
         Command::Slam(args) => slam::run(&args),
+        Command::Correct(args) => correct::run(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

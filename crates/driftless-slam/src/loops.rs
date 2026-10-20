@@ -6,6 +6,7 @@
 //! the loop only if the alignment overlaps enough, fits tightly, is well constrained and
 //! comes out the same when the roles are swapped.
 
+use crate::report::scan_start;
 use crate::submap::Submap;
 use driftless_odom::icp::{align, IcpParams, IcpResult, IcpTarget};
 use driftless_odom::{voxel_downsample, DEGENERACY_GOOD};
@@ -60,7 +61,13 @@ pub enum LoopVerdict {
     Accepted,
     /// Reason for the user (German).
     Rejected(&'static str),
+    /// A manual loop whose ICP failed for the given reason (German): it only ties the two
+    /// positions together ([`POSITION_ONLY`]).
+    PositionOnly(&'static str),
 }
+
+/// Warning for a manual loop whose ICP failed.
+pub const POSITION_ONLY: &str = "Stelle passt nicht sauber, nur Position übernommen";
 
 /// Outcome of [`verify`].
 #[derive(Debug, Clone, PartialEq)]
@@ -79,15 +86,143 @@ pub struct LoopCheck {
 }
 
 /// A loop the user marks by hand: the places at times `a_t` and `b_t` (seconds since the
-/// start of the scan) are the same. Handled by [`crate::solve`] from Task 6 on.
+/// start of the scan, [`crate::scan_start`]) are the same.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManualLoop {
     pub a_t: f64,
     pub b_t: f64,
 }
 
+/// A [`ManualLoop`] matched to the submaps: the frame nearest in time to each of its two
+/// times, ordered so that `a < b`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManualMatch {
+    pub a: usize,
+    pub b: usize,
+    /// Index into `submaps[a].frames` and `submaps[b].frames`.
+    pub frame_a: usize,
+    pub frame_b: usize,
+}
+
+/// Why manual loops cannot be used; the messages are for the user (German).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ManualLoopError {
+    /// `t` lies outside `0..=end` (seconds since the start of the scan).
+    OutsideScan { t: f64, end: f64 },
+    /// Both times fall into the same submap.
+    SameSubmap { a_t: f64, b_t: f64, submap: usize },
+    /// Two manual loops join the same pair of submaps.
+    Duplicate {
+        first: ManualLoop,
+        second: ManualLoop,
+        a: usize,
+        b: usize,
+    },
+}
+
+impl std::fmt::Display for ManualLoopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ManualLoopError::OutsideScan { t, end } => write!(
+                f,
+                "Zeit {t} s liegt außerhalb des Scans (0 bis {end:.1} s ab Scan-Beginn)"
+            ),
+            ManualLoopError::SameSubmap { a_t, b_t, submap } => write!(
+                f,
+                "Schleife {a_t} s ↔ {b_t} s: beide Zeiten liegen in derselben Teilkarte \
+                 {submap}; eine Schleife verbindet zwei verschiedene Stellen des Rundgangs"
+            ),
+            ManualLoopError::Duplicate {
+                first,
+                second,
+                a,
+                b,
+            } => write!(
+                f,
+                "doppelte Schleife: {} s ↔ {} s und {} s ↔ {} s verbinden beide die \
+                 Teilkarten {a} und {b}; eine davon deaktivieren",
+                first.a_t, first.b_t, second.a_t, second.b_t
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ManualLoopError {}
+
+/// Submap and frame index of the frame nearest in time to `t` (seconds since the start of
+/// the scan); earlier frames win ties.
+fn locate(submaps: &[Submap], t: f64) -> Result<(usize, usize), ManualLoopError> {
+    let t0 = scan_start(submaps);
+    let end = submaps
+        .last()
+        .and_then(|m| m.frames.last())
+        .map_or(0.0, |f| f.t - t0);
+    if submaps.is_empty() || !(0.0..=end).contains(&t) {
+        return Err(ManualLoopError::OutsideScan { t, end });
+    }
+    let abs = t0 + t;
+    let mut best = (f64::INFINITY, 0, 0);
+    for (s, m) in submaps.iter().enumerate() {
+        for (i, fr) in m.frames.iter().enumerate() {
+            let d = (fr.t - abs).abs();
+            if d < best.0 {
+                best = (d, s, i);
+            }
+        }
+    }
+    Ok((best.1, best.2))
+}
+
+/// Matches every manual loop to its two submaps. Fails on a time outside the scan, on both
+/// times in the same submap and on two loops between the same pair of submaps.
+pub fn match_manual_loops(
+    submaps: &[Submap],
+    manual: &[ManualLoop],
+) -> Result<Vec<ManualMatch>, ManualLoopError> {
+    let mut out: Vec<ManualMatch> = Vec::with_capacity(manual.len());
+    for (k, l) in manual.iter().enumerate() {
+        let (sa, fa) = locate(submaps, l.a_t)?;
+        let (sb, fb) = locate(submaps, l.b_t)?;
+        if sa == sb {
+            return Err(ManualLoopError::SameSubmap {
+                a_t: l.a_t,
+                b_t: l.b_t,
+                submap: sa,
+            });
+        }
+        let m = if sa < sb {
+            ManualMatch {
+                a: sa,
+                b: sb,
+                frame_a: fa,
+                frame_b: fb,
+            }
+        } else {
+            ManualMatch {
+                a: sb,
+                b: sa,
+                frame_a: fb,
+                frame_b: fa,
+            }
+        };
+        if let Some(j) = out.iter().position(|o| (o.a, o.b) == (m.a, m.b)) {
+            return Err(ManualLoopError::Duplicate {
+                first: manual[j].clone(),
+                second: manual[k].clone(),
+                a: m.a,
+                b: m.b,
+            });
+        }
+        out.push(m);
+    }
+    Ok(out)
+}
+
 /// Coarse-to-fine correspondence distances of the verification ICP (m).
 const STAGES: [f64; 3] = [1.0, 0.5, 0.25];
+/// The same for a manual loop: the user marks the place only roughly, so the first stage
+/// searches up to 2 m.
+const MANUAL_STAGES: [f64; 4] = [2.0, 1.0, 0.5, 0.25];
 /// Largest difference between the two registration directions (m, rad).
 const SWAP_MAX_TRANS: f64 = 0.05;
 const SWAP_MAX_ROT: f64 = 1.0 * std::f64::consts::PI / 180.0;
@@ -168,10 +303,11 @@ fn register(
     source: &[Vector3<f64>],
     target: &IcpTarget,
     init: &Isometry3<f64>,
+    stages: &[f64],
 ) -> (Isometry3<f64>, bool, IcpResult) {
     let mut pose = *init;
     let mut converged = false;
-    for d in STAGES {
+    for &d in stages {
         let r = align(source, target, &pose, &stage_params(d));
         pose = r.pose;
         converged = r.converged;
@@ -180,7 +316,7 @@ fn register(
     // from the final pose measures the pose itself.
     let fine = IcpParams {
         max_iter: 1,
-        ..stage_params(STAGES[STAGES.len() - 1])
+        ..stage_params(stages[stages.len() - 1])
     };
     let at_pose = align(source, target, &pose, &fine);
     (pose, converged, at_pose)
@@ -196,25 +332,63 @@ pub fn verify(
     cfg: &LoopConfig,
 ) -> LoopCheck {
     let init = anchors[c.a].inverse() * anchors[c.b];
+    check_pair(submaps, c.a, c.b, &init, &STAGES, cfg)
+}
+
+/// Verifies a manual loop like [`verify`], but starting from the two marked frames at the
+/// same position (each keeps the rotation of the current anchors) and with a first ICP stage
+/// of 2 m. A failed ICP gives [`LoopVerdict::PositionOnly`] with `relative` = that start, so
+/// the loop still ties the positions together. `manual` is set.
+pub fn verify_manual(
+    submaps: &[Submap],
+    anchors: &[Isometry3<f64>],
+    m: &ManualMatch,
+    cfg: &LoopConfig,
+) -> LoopCheck {
+    let offset_a = submaps[m.a].frames[m.frame_a].offset;
+    let offset_b = submaps[m.b].frames[m.frame_b].offset;
+    let pose_a = anchors[m.a] * offset_a;
+    let mut pose_b = anchors[m.b] * offset_b;
+    pose_b.translation = pose_a.translation;
+    let init = anchors[m.a].inverse() * (pose_b * offset_b.inverse());
+    let mut check = check_pair(submaps, m.a, m.b, &init, &MANUAL_STAGES, cfg);
+    check.manual = true;
+    if let LoopVerdict::Rejected(why) = check.verdict {
+        check.verdict = LoopVerdict::PositionOnly(why);
+        check.relative = init;
+    }
+    check
+}
+
+/// Registers the points of `b` against those of `a` from `init` (pose of the anchor of `b`
+/// in the anchor frame of `a`) through `stages` and checks the result.
+fn check_pair(
+    submaps: &[Submap],
+    a: usize,
+    b: usize,
+    init: &Isometry3<f64>,
+    stages: &[f64],
+    cfg: &LoopConfig,
+) -> LoopCheck {
     let mut check = LoopCheck {
-        a: c.a,
-        b: c.b,
-        relative: init,
+        a,
+        b,
+        relative: *init,
         inlier_ratio: 0.0,
         rms: 0.0,
         degeneracy: 0.0,
         verdict: LoopVerdict::Rejected("zu wenig Überlappung"),
         manual: false,
     };
-    let pts_a = to_f64(&submaps[c.a].points);
-    let pts_b = to_f64(&submaps[c.b].points);
+    let pts_a = to_f64(&submaps[a].points);
+    let pts_b = to_f64(&submaps[b].points);
     let src_b = voxel_downsample(&pts_b, cfg.icp_voxel);
     let src_a = voxel_downsample(&pts_a, cfg.icp_voxel);
     let (Some(target_a), Some(target_b)) = (IcpTarget::new(pts_a), IcpTarget::new(pts_b)) else {
         return check;
     };
 
-    let (relative, converged, m) = register(&src_b, &target_a, &init);
+    let (relative, converged, m) = register(&src_b, &target_a, init, stages);
     check.relative = relative;
     check.inlier_ratio = m.inlier_ratio;
     check.rms = m.residual_rms;
@@ -228,7 +402,7 @@ pub fn verify(
     } else if m.degeneracy < cfg.min_degeneracy {
         LoopVerdict::Rejected("schlecht bestimmt")
     } else {
-        let (swapped, _, _) = register(&src_a, &target_b, &init.inverse());
+        let (swapped, _, _) = register(&src_a, &target_b, &init.inverse(), stages);
         let diff = relative * swapped;
         if diff.translation.vector.norm() > SWAP_MAX_TRANS || diff.rotation.angle() > SWAP_MAX_ROT {
             LoopVerdict::Rejected("nicht eindeutig")

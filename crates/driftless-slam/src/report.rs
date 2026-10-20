@@ -1,7 +1,7 @@
 //! `slam.json`: what the SLAM run did, for the user and the viewer. Times are seconds since
 //! the start of the scan ([`scan_start`]).
 
-use crate::loops::LoopVerdict;
+use crate::loops::{LoopVerdict, POSITION_ONLY};
 use crate::pipeline::SlamResult;
 use crate::submap::Submap;
 use driftless_traj::{path_length, start_end_gap};
@@ -39,8 +39,11 @@ pub struct LoopReport {
     pub a: usize,
     pub b: usize,
     pub manual: bool,
+    /// The loop takes part in the pose graph (also a manual loop that only ties the
+    /// positions together).
     pub accepted: bool,
-    /// Why the loop was rejected (German); `None` if accepted.
+    /// Why the loop was rejected, or the warning of a manual loop that only ties the
+    /// positions together (German); `None` if fully accepted.
     pub reason: Option<String>,
     pub inlier_ratio: f64,
     pub rms: f64,
@@ -98,10 +101,11 @@ impl SlamReport {
                 a: c.a,
                 b: c.b,
                 manual: c.manual,
-                accepted: c.verdict == LoopVerdict::Accepted,
+                accepted: !matches!(c.verdict, LoopVerdict::Rejected(_)),
                 reason: match c.verdict {
                     LoopVerdict::Accepted => None,
                     LoopVerdict::Rejected(why) => Some(why.to_string()),
+                    LoopVerdict::PositionOnly(why) => Some(format!("{POSITION_ONLY} ({why})")),
                 },
                 inlier_ratio: c.inlier_ratio,
                 rms: c.rms,
