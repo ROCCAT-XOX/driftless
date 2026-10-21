@@ -392,7 +392,12 @@ fn rejects_view_dependent_highlights() {
         let stats = colorize(&mut cloud, images.clone(), poses, cams, cfg).unwrap();
         (floor_match(painted, &cloud), stats)
     };
-    let ((n, on), stats) = run(&ColorConfig::default());
+    // The rule is off by default (experimental).
+    assert!(!ColorConfig::default().highlights);
+    let ((n, on), stats) = run(&ColorConfig {
+        highlights: true,
+        ..ColorConfig::default()
+    });
     // Without the rule and with neighbouring images kept (as in Meilenstein 3): the spots
     // show. (Views 1 s apart alone already avoid many of them here, since every second image
     // has one; real reflections are not that kind.)

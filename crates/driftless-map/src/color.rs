@@ -21,7 +21,8 @@
 //!    by its camera's edge falloff at the view's angle (see [`crate::exposure`]), both fitted
 //!    on the kept views.
 //! 2. Views beyond [`ColorConfig::rim_theta`] are left out, unless the point has no other.
-//! 3. Highlights are rejected: the reference luminance is the second darkest view's (the
+//! 3. Highlights are rejected (experimental, [`ColorConfig::highlights`], off by default): the
+//!    reference luminance is the second darkest view's (the
 //!    darkest's below 3 views); a view brighter than it by more than
 //!    [`ColorConfig::highlight_ratio`] and [`ColorConfig::highlight_abs`] is left out.
 //!    Highlights are additive and follow the camera over several images; the second darkest
@@ -145,7 +146,9 @@ pub struct ColorConfig {
     /// Kept views of the same camera lie at least this far apart in capture time (s): a
     /// reflection moves with the camera, so views from a short stretch of the walk all show it.
     pub view_gap: f64,
-    /// Reject highlights (see the module docs).
+    /// Reject highlights (see the module docs). Experimental and off by default: on Promedia
+    /// the rejection raised `seam_jump` from 4.7 to 7.7–8.4 (sRGB levels) for 22–33 % fewer
+    /// floor highlights, at every threshold tried.
     pub highlights: bool,
     /// A view is a highlight if its luminance exceeds the reference by this share …
     pub highlight_ratio: f64,
@@ -171,9 +174,9 @@ impl Default for ColorConfig {
             views_kept: 6,
             views_blended: 6,
             view_gap: 1.0,
-            highlights: true,
-            highlight_ratio: 0.3,
-            highlight_abs: 0.02,
+            highlights: false,
+            highlight_ratio: 1.0,
+            highlight_abs: 0.05,
             rim_theta: 85f64.to_radians(),
             exposure: ExposureConfig::default(),
         }
@@ -1302,6 +1305,13 @@ mod tests {
         );
     }
 
+    fn with_highlights() -> ColorConfig {
+        ColorConfig {
+            highlights: true,
+            ..ColorConfig::default()
+        }
+    }
+
     /// A view of linear gray `y` with weight `w` from image `rank` at `theta_deg`.
     fn gray(w: f32, rank: u32, y: f32, theta_deg: f32) -> View {
         View::new(w, rank, [y; 3], theta_deg.to_radians())
@@ -1309,7 +1319,7 @@ mod tests {
 
     #[test]
     fn highlights_are_rejected_against_the_second_darkest() {
-        let cfg = ColorConfig::default();
+        let cfg = with_highlights();
         // Two of five views are highlights (the best two); the rest show 0.2.
         let s = [
             gray(1.0, 0, 0.6, 0.0),
@@ -1338,7 +1348,7 @@ mod tests {
 
     #[test]
     fn few_views_are_never_all_rejected() {
-        let cfg = ColorConfig::default();
+        let cfg = with_highlights();
         let one = [gray(1.0, 0, 0.9, 0.0), EMPTY, EMPTY];
         let m = mix(&one, &cfg);
         assert_eq!((m.rejected, m.main), (0, 0));
@@ -1352,7 +1362,7 @@ mod tests {
 
     #[test]
     fn dark_outlier_does_not_become_reference() {
-        let cfg = ColorConfig::default();
+        let cfg = with_highlights();
         let mut s = [gray(0.5, 0, 0.3, 0.0); 6];
         for (r, v) in s.iter_mut().enumerate() {
             v.rank = r as u32;
@@ -1407,7 +1417,7 @@ mod tests {
 
     #[test]
     fn rim_views_only_used_when_nothing_else() {
-        let cfg = ColorConfig::default();
+        let cfg = with_highlights();
         // The rim view is the best and the darkest: left out of blend and reference.
         let s = [
             gray(1.0, 0, 0.05, 92.0),
