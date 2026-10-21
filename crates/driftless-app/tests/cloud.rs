@@ -257,3 +257,85 @@ fn missing_file_is_a_german_error() {
         other => panic!("{other:?}"),
     }
 }
+
+/// Foreign writers may leave the header bounds zero; the origin then comes from the first
+/// point, so UTM-scale coordinates keep millimetres.
+#[test]
+fn zero_header_bounds_keep_mm_precision() {
+    let dir = tmp("app-cloud-zero-bounds");
+    let path = dir.join("fremd.las");
+    let base = [512_345.678, 5_412_345.678, 312.345];
+    let points: Vec<[f64; 3]> = (0..50)
+        .map(|i| {
+            let f = f64::from(i);
+            [
+                base[0] + f * 0.731,
+                base[1] - f * 0.417,
+                base[2] + f * 0.013,
+            ]
+        })
+        .collect();
+    write_raw_las(&path, &points, base.map(f64::floor));
+    // LAS 1.2 header: max/min x, y, z as six doubles at bytes 179..227.
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[179..227].fill(0);
+    std::fs::write(&path, bytes).unwrap();
+    let header = las::Reader::from_path(&path).unwrap().header().bounds();
+    assert_eq!([header.min.x, header.max.y], [0.0, 0.0], "bounds zeroed");
+    let p = load_las(&path, None, &Progress::new()).unwrap();
+    assert!((p.origin[0] - base[0]).abs() < 1.0, "origin {:?}", p.origin);
+    for (i, want) in points.iter().enumerate() {
+        let a = absolute(&p, i);
+        for k in 0..3 {
+            assert!((a[k] - want[k]).abs() <= 0.001, "point {i} axis {k}");
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// LAS format 3 as some foreign writers produce it: colours and intensity in 0–255.
+fn write_8bit_las(path: &Path, colors: &[[u16; 3]], intensity: &[u16]) {
+    let mut builder = las::Builder::from((1, 2));
+    builder.point_format = las::point::Format::new(3).unwrap();
+    let mut w = las::Writer::from_path(path, builder.into_header().unwrap()).unwrap();
+    for (i, (c, &it)) in colors.iter().zip(intensity).enumerate() {
+        w.write_point(las::Point {
+            x: i as f64,
+            y: 0.0,
+            z: 0.0,
+            intensity: it,
+            gps_time: Some(0.0),
+            color: Some(las::Color::new(c[0], c[1], c[2])),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    w.close().unwrap();
+}
+
+#[test]
+fn eight_bit_colour_and_intensity_are_scaled() {
+    let dir = tmp("app-cloud-8bit");
+    let path = dir.join("fremd.las");
+    write_8bit_las(&path, &[[255, 128, 0], [10, 20, 30]], &[200, 7]);
+    let p = load_las(&path, None, &Progress::new()).unwrap();
+    assert_eq!(p.rgb, Some(vec![[255, 128, 0], [10, 20, 30]]));
+    assert_eq!(p.intensity, vec![200, 7]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// 16-bit files keep `>> 8`, even for dark points, once any value exceeds 255.
+#[test]
+fn sixteen_bit_dark_points_stay_dark() {
+    let dir = tmp("app-cloud-16bit");
+    let path = dir.join("dunkel.las");
+    write_8bit_las(
+        &path,
+        &[[255, 128, 0], [65_535, 25_700, 257]],
+        &[200, 51_400],
+    );
+    let p = load_las(&path, None, &Progress::new()).unwrap();
+    assert_eq!(p.rgb, Some(vec![[0, 0, 0], [255, 100, 1]]));
+    assert_eq!(p.intensity, vec![0, 200]);
+    std::fs::remove_dir_all(dir).unwrap();
+}

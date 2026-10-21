@@ -74,9 +74,12 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
 /// A perspective view from `eye` towards `target` (z up), 60° vertical, aspect 4:3,
 /// 1000 pixels high.
 fn view(eye: [f32; 3], target: [f32; 3], min_spacing_px: f32) -> ViewInfo {
+    view_near(eye, target, min_spacing_px, 0.05)
+}
+
+fn view_near(eye: [f32; 3], target: [f32; 3], min_spacing_px: f32, near: f32) -> ViewInfo {
     let fov_y = 60f32.to_radians();
     let aspect = 4.0 / 3.0;
-    let near = 0.05;
     let f = normalize([0, 1, 2].map(|k| target[k] - eye[k]));
     let r = normalize(cross(f, [0.0, 0.0, 1.0]));
     let u = cross(r, f);
@@ -536,4 +539,39 @@ fn refinement_stops_at_min_spacing() {
     for &i in &ids[1..] {
         assert!(on_screen(parent[i as usize]) > 2.0, "node {i}");
     }
+}
+
+/// A huge leaf of equal points right at the eye comes up first but does not fit the budget:
+/// it is skipped and everything else in view is still drawn.
+#[test]
+fn oversized_leaf_does_not_end_selection() {
+    let mut points = random_points(200_000, 31, [1000.0, 1000.0, 1000.0]);
+    points.xyz.extend(vec![[999.0, 999.0, 999.0]; 1_000_000]);
+    let points = PointSet::from_xyz([0.0; 3], points.xyz);
+    let tree = build(&points);
+    let huge = tree
+        .nodes
+        .iter()
+        .position(|n| n.count as usize > LEAF_MAX && n.children.iter().all(|&c| c == NO_NODE))
+        .expect("an oversized leaf") as u32;
+    assert_eq!(u32::from(tree.nodes[huge as usize].depth), MAX_DEPTH);
+    // Eye right behind the leaf, looking through it: the leaf has the largest spacing on
+    // screen of all nodes.
+    let leaf = &tree.nodes[huge as usize];
+    let eye = leaf.max().map(|m| m + 1e-4);
+    let v = view_near(eye, [500.0, 500.0, 500.0], 0.0, 1e-5);
+    let first = select_nodes(&tree, &v, usize::MAX);
+    assert!(first.contains(&huge), "leaf in view");
+    let ids = select_nodes(&tree, &v, 500_000);
+    assert!(!ids.contains(&huge));
+    let chosen: HashSet<u32> = ids.iter().copied().collect();
+    let want: HashSet<u32> = (0..tree.nodes.len() as u32)
+        .filter(|&i| i != huge)
+        .filter(|&i| {
+            let n = &tree.nodes[i as usize];
+            v.frustum.intersects_aabb(n.min, n.max())
+        })
+        .collect();
+    assert_eq!(chosen, want);
+    assert!(total_count(&tree, &ids) <= 500_000);
 }

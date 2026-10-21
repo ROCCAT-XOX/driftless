@@ -73,10 +73,38 @@ impl PointSet {
     }
 }
 
+/// Points checked against the header bounds before trusting them for the origin.
+const ORIGIN_SAMPLE: usize = 16;
+
+/// Centre of the header bounds in whole metres, or the first point in whole metres if the
+/// bounds are not finite, all zero, or miss one of the `first` points (stale header of a
+/// foreign writer); 0 without points.
+fn origin_of(bounds: &las::Bounds, first: &[[f64; 3]]) -> [f64; 3] {
+    let Some(p0) = first.first() else {
+        return [0.0; 3];
+    };
+    let min = [bounds.min.x, bounds.min.y, bounds.min.z];
+    let max = [bounds.max.x, bounds.max.y, bounds.max.z];
+    // Slack for the LAS coordinate rounding.
+    const SLACK: f64 = 0.01;
+    let usable = min.iter().chain(&max).all(|v| v.is_finite())
+        && min.iter().chain(&max).any(|&v| v != 0.0)
+        && first
+            .iter()
+            .all(|p| (0..3).all(|k| p[k] >= min[k] - SLACK && p[k] <= max[k] + SLACK));
+    if usable {
+        [0, 1, 2].map(|k| ((min[k] + max[k]) / 2.0).round())
+    } else {
+        p0.map(f64::round)
+    }
+}
+
 /// Reads a LAS file in batches of 2²⁰ points (phase [`PHASE_LOAD`], total from the header,
 /// a cancel check per batch). With `slam`, each point's time `gps_time − scan_start` picks
 /// its submap ([`submap_at`]) and so its quality. LAS intensity 0–65535 becomes `>> 8`; a
-/// file whose intensities are all 0 (none recorded) is shown [`MID_GRAY`].
+/// file whose intensities are all 0 (none recorded) is shown [`MID_GRAY`]. Files whose
+/// colours (or intensities) never exceed 255 store 8-bit values; those are taken as they are.
+/// The origin comes from the header bounds unless they do not fit the first points.
 pub fn load_las(
     path: &Path,
     slam: Option<&SlamReport>,
@@ -87,25 +115,10 @@ pub fn load_las(
     let header = reader.header();
     let total = header.number_of_points();
     let has_color = header.point_format().has_color;
-    let origin = if total == 0 {
-        [0.0; 3]
-    } else {
-        let b = header.bounds();
-        let centre = [
-            (b.min.x + b.max.x),
-            (b.min.y + b.max.y),
-            (b.min.z + b.max.z),
-        ]
-        .map(|s| (s / 2.0).round());
-        if centre.iter().all(|c| c.is_finite()) {
-            centre
-        } else {
-            [0.0; 3]
-        }
-    };
+    let bounds = header.bounds();
     let capacity = usize::try_from(total).unwrap_or(0);
     let mut out = PointSet {
-        origin,
+        origin: [0.0; 3],
         xyz: Vec::with_capacity(capacity),
         rgb: has_color.then(|| Vec::with_capacity(capacity)),
         intensity: Vec::with_capacity(capacity),
@@ -126,6 +139,11 @@ pub fn load_las(
     let mut batch = las::PointDataBuilder::new()
         .for_header(reader.header())
         .build();
+    // Low bytes of colour and intensity, kept until the whole file shows whether it stores
+    // 16-bit values (as the LAS spec says) or 8-bit ones (as some foreign writers do).
+    let mut low: Vec<[u8; 4]> = Vec::with_capacity(capacity);
+    let (mut max_rgb, mut max_intensity) = (0u16, 0u16);
+    let mut first_batch = true;
     loop {
         if progress.is_cancelled() {
             return Err(StepError::Cancelled);
@@ -134,6 +152,16 @@ pub fn load_las(
         if read == 0 {
             break;
         }
+        if first_batch {
+            first_batch = false;
+            let mut first = Vec::with_capacity(ORIGIN_SAMPLE);
+            for p in batch.points().take(ORIGIN_SAMPLE) {
+                let p = p.map_err(err)?;
+                first.push([p.x, p.y, p.z]);
+            }
+            out.origin = origin_of(&bounds, &first);
+        }
+        let origin = out.origin;
         for p in batch.points() {
             let p = p.map_err(err)?;
             out.xyz.push([
@@ -141,11 +169,14 @@ pub fn load_las(
                 (p.y - origin[1]) as f32,
                 (p.z - origin[2]) as f32,
             ]);
+            let c = p.color.unwrap_or_default();
             if let Some(rgb) = &mut out.rgb {
-                let c = p.color.unwrap_or_default();
                 rgb.push([c.red, c.green, c.blue].map(|v| (v >> 8) as u8));
+                max_rgb = max_rgb.max(c.red).max(c.green).max(c.blue);
             }
             out.intensity.push((p.intensity >> 8) as u8);
+            max_intensity = max_intensity.max(p.intensity);
+            low.push([c.red, c.green, c.blue, p.intensity].map(|v| v as u8));
             out.flags.push(p.user_data);
             match p.gps_time {
                 Some(g) => {
@@ -163,6 +194,18 @@ pub fn load_las(
         }
         progress.advance(read);
     }
+    // 8-bit values: scaled ×257 to 16 bits and back, i.e. taken as they are.
+    if let Some(rgb) = out.rgb.as_mut().filter(|_| max_rgb <= 255) {
+        for (c, l) in rgb.iter_mut().zip(&low) {
+            *c = [l[0], l[1], l[2]];
+        }
+    }
+    if max_intensity <= 255 {
+        for (i, l) in out.intensity.iter_mut().zip(&low) {
+            *i = l[3];
+        }
+    }
+    drop(low);
     if out.intensity.iter().all(|&i| i == 0) {
         out.intensity.fill(MID_GRAY);
     }

@@ -413,7 +413,8 @@ impl Ord for Candidate {
 
 /// The nodes to draw, at most `budget` points in all: starting at the root, always the node
 /// with the largest point spacing on screen next, as long as it fits the budget (the first
-/// that does not ends the choice). Only nodes in the view volume, only children of chosen
+/// that does not ends the choice, except a leaf over [`LEAF_MAX`] points, which is only
+/// skipped). Only nodes in the view volume, only children of chosen
 /// nodes, and those only while the parent's spacing on screen exceeds `min_spacing_px`.
 pub fn select_nodes(tree: &Octree, view: &ViewInfo, budget: usize) -> Vec<u32> {
     let mut out = Vec::new();
@@ -432,6 +433,11 @@ pub fn select_nodes(tree: &Octree, view: &ViewInfo, budget: usize) -> Vec<u32> {
         let n = &tree.nodes[node as usize];
         let count = n.count as usize;
         if used + count > budget {
+            // An oversized leaf (many equal points at MAX_DEPTH) is skipped, so that it
+            // does not end the choice for the whole frame; any other node ends it.
+            if n.is_leaf() && count > LEAF_MAX {
+                continue;
+            }
             break;
         }
         used += count;
