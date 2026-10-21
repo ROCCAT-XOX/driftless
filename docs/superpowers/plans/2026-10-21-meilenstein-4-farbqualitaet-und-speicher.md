@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Die eingefärbte Wolke aus Meilenstein 3 wird sichtbar sauberer (keine Lampen-Spiegelungen auf Böden, kein Randabfall der Fisheyes, Schärfe unabhängig von der Helligkeit, weichere Übergänge zwischen Bildern, „ohne Farbe“ in den Dateien), die Bereinigung entfernt Punkte, die durch Fenster gemessen wurden, und glättet Wände, und die 9,7-min-Aufnahme Promedia läuft bei 1 cm mit < 4 GB Spitzen-RAM.
+**Goal:** Die eingefärbte Wolke aus Meilenstein 3 wird sichtbar sauberer (keine Lampen-Spiegelungen auf Böden, kein Randabfall der Fisheyes, Schärfe unabhängig von der Helligkeit, weichere Übergänge zwischen Bildern, „ohne Farbe“ in den Dateien), die Bereinigung entfernt Punkte, die durch Fenster gemessen wurden, und glättet Wände, und die 9,7-min-Aufnahme Büro läuft bei 1 cm mit < 4 GB Spitzen-RAM.
 
 **Architecture:** Alles bleibt in `driftless-map` und hinter `driftless map`. `color` behält mehr Ansichten je Punkt (kompakt gespeichert), schätzt Randabfall je Kamera gemeinsam mit den Belichtungsfaktoren und verwirft vor der Mischung Ansichten, die heller sind als die robuste Referenz des Punktes. `clean` bekommt zwei neue Teilschritte: `through` (Strahl läuft durch ein Loch in einer senkrechten Wand mit Wand darüber und darunter = Fensterband) und `smooth` (Projektion auf die lokale Ebene, nur in ebenen Nachbarschaften). Der Speicher sinkt vor allem durch einen anderen Allokator: Gemessen war der lebende Speicher nie über 2,42 GB, der Rest (bis 9,9 GB) bleibt beim macOS-Allokator nach den Bild-für-Bild-Zwischenpuffern liegen.
 
@@ -16,8 +16,8 @@
 - macOS arm64 und Windows x64 nativ, CI grün auf beiden; `rust-version = "1.99"`.
 - Deterministisch: zwei Läufe → byte-gleiche Ausgabedateien (feste Reduktionsreihenfolge, `FixedState`, ganzzahlige Zähler).
 - Spec: „Nichts wird überschrieben, jede Korrektur ist ein rücknehmbarer Schritt.“ Entfernte Punkte landen mit Grund in `removed.las`; jeder neue Teilschritt ist abschaltbar (`--no-through`, `--no-smooth`, `--no-highlights`); `dense.las` bleibt ungeglättet.
-- Speicher: Promedia (`jmk6-2026-10-20/20261020173822`, 582 s, 3.831 Bilder) bei 1 cm in jedem Schritt Spitzen-RAM < 4 GB (M3: 9,94 GB); `Test` weiter < 8 GB.
-- Zeit (M4 Pro): `Test` `slam + map` < 15 min (M3: 140 s); Promedia `map` < 15 min (M3: 338 s).
+- Speicher: Büro (`jmk6-2026-10-20/20261020173822`, 582 s, 3.831 Bilder) bei 1 cm in jedem Schritt Spitzen-RAM < 4 GB (M3: 9,94 GB); `Test` weiter < 8 GB.
+- Zeit (M4 Pro): `Test` `slam + map` < 15 min (M3: 140 s); Büro `map` < 15 min (M3: 338 s).
 - GPU (wgpu, Spec) bleibt außerhalb dieses Meilensteins, ebenso Gaussian Splatting. Neue schwere Schleifen als reine Per-Element-Funktionen + feste Reduktion (wie `visibility.rs`, `clean.rs`).
 - Code-Kommentare Englisch, Meldungen Deutsch. Scan-Daten, Bilder, Seriennummern, IPs, persönliche Pfade nie ins Repo; Tests mit echten Daten `#[ignore]`, über `$DRIFTLESS_TESTDATA`.
 
@@ -31,7 +31,7 @@
 
 ---
 
-### Task 1: Speicher – Allokator, kompakte Ansichten, Promedia als Testdaten
+### Task 1: Speicher – Allokator, kompakte Ansichten, Büro als Testdaten
 
 **Files:**
 - Modify: `crates/driftless-cli/Cargo.toml`, `crates/driftless-cli/src/main.rs` (`#[global_allocator] static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;`, `mimalloc = { version = "0.1", default-features = false }`), `crates/driftless-map/src/color.rs`, `crates/driftless-map/src/exposure.rs`, `docs/testdaten.md`
@@ -40,7 +40,7 @@
 **Interfaces:**
 - Produces: `pub(crate) struct View { pub(crate) weight: f32, pub(crate) rank: u32, pub(crate) rgb: [u16; 3] /* linear × 65535 */, pub(crate) theta: u16 /* θ / π × 65535 */ }` (16 B statt 20 B) mit `View::linear(&self) -> [f32; 3]` und `View::theta(&self) -> f32`; `ColorConfig.views_per_point` wird zu `views_kept` und `views_blended` (hier beide 3, Verhalten wie M3; Task 4 setzt `views_kept = 6`). `slots` wird erst nach `local_geometry` angelegt; `local_geometry` baut den Baum auf `f32`.
 
-Messung beim Planen (Promedia, 1 cm, je `--step` einzeln, Release, zählender Allokator; Zahlen für das Ergebnisdokument):
+Messung beim Planen (Büro, 1 cm, je `--step` einzeln, Release, zählender Allokator; Zahlen für das Ergebnisdokument):
 
 | Schritt | Spitzen-RSS | lebender Speicher Spitze | Zeit |
 |---|---|---|---|
@@ -53,8 +53,8 @@ Lebend beim Einfärben (15 Mio. Punkte): Wolke 28 B/Punkt (0,42 GB), `slots` 3 �
 
 - [ ] **Step 1: Tests** – `memory.rs`: `colorize_live_heap_per_point` (synthetische Szene `walk_data()`, zählender Allokator: Spitze des lebenden Speichers während `colorize` ≤ 200 B × Punkte + 64 MB). Bestehende `color.rs`/`exposure.rs`-Tests laufen mit `views_kept = 3, views_blended = 3` unverändert (Ergebnis byte-gleich zu vorher bis auf die u16-Rundung: Farben ±1/255). `view_round_trip` (Einheitstest: `rgb`/`theta` über u16 auf 1e-4 genau).
 - [ ] **Step 2–4:** FAIL → implementieren → PASS (`cargo test -p driftless-map`), `cargo deny check` nach `mimalloc`.
-- [ ] **Step 5: Messen** Promedia `--step dense|clean|color` je mit `/usr/bin/time -l` (Spitzen-RSS je < 4 GB), Werte notieren. `docs/testdaten.md`: Promedia-Aufnahme (Ordnername, 582 s, 3.831 Bilder, Büro mit Deckenleuchten und Fensterbändern, Drift ohne Schleifen 2,16 m → 0,13 m) ohne persönliche Daten.
-- [ ] **Step 6: Commit** `perf(map): mimalloc und kompakte Ansichten, Promedia unter 4 GB`
+- [ ] **Step 5: Messen** Büro `--step dense|clean|color` je mit `/usr/bin/time -l` (Spitzen-RSS je < 4 GB), Werte notieren. `docs/testdaten.md`: Büro-Aufnahme (Ordnername, 582 s, 3.831 Bilder, Büro mit Deckenleuchten und Fensterbändern, Drift ohne Schleifen 2,16 m → 0,13 m) ohne persönliche Daten.
+- [ ] **Step 6: Commit** `perf(map): mimalloc und kompakte Ansichten, Büro unter 4 GB`
 
 ### Task 2: Schärfe unabhängig von der Helligkeit
 
@@ -83,7 +83,7 @@ Lebend beim Einfärben (15 Mio. Punkte): Wolke 28 B/Punkt (0,42 GB), `slots` 3 �
   - `ExposureConfig.vignetting: bool` (Standard an); `ColorStats.vignetting: Vignetting`, `ColorStats.vignette_residual_before/after: f64` = je Kamera größter Betrag des mittleren Luminanz-Rests (log, in %) über θ-Klassen von 10° mit ≥ 1.000 Beobachtungen, Mittel über die Kameras; `ColorStats.images_gain_clamped: usize`.
   - Anwendung vor der Mischung: Ansicht / (`g_i` · `V_cam(θ)`).
 
-Befund beim Planen (Promedia, 1 cm): Faktoren stoßen an beide Grenzen (0,25 und 4,0), die Streuung steigt durch den Abgleich (6,71 → 6,94). Probelauf mit `max_gain = 8`: 387 von 3.701 Bildern mit Faktor < 0,25, fast alle in einem Block 342–371 s nach Start (beide Kameras, 0,16–0,30), dazu 6 Bilder bei 17 s mit 3,6–4,4; Kamera-Unterschied danach schlechter (0,58 → 0,73), Streuung 7,02. **Entscheidung: `max_gain` bleibt 4**, geklemmte Bilder werden gezählt (`images_gain_clamped`, Promedia heute 498 = 13 %) und gewarnt; Ursache des Blocks (heller Raum ohne Überlappung oder Überbelichtung) klärt Task 9 an den Bildern.
+Befund beim Planen (Büro, 1 cm): Faktoren stoßen an beide Grenzen (0,25 und 4,0), die Streuung steigt durch den Abgleich (6,71 → 6,94). Probelauf mit `max_gain = 8`: 387 von 3.701 Bildern mit Faktor < 0,25, fast alle in einem Block 342–371 s nach Start (beide Kameras, 0,16–0,30), dazu 6 Bilder bei 17 s mit 3,6–4,4; Kamera-Unterschied danach schlechter (0,58 → 0,73), Streuung 7,02. **Entscheidung: `max_gain` bleibt 4**, geklemmte Bilder werden gezählt (`images_gain_clamped`, Büro heute 498 = 13 %) und gewarnt; Ursache des Blocks (heller Raum ohne Überlappung oder Überbelichtung) klärt Task 9 an den Bildern.
 
 - [ ] **Step 1: Tests** – `recovers_injected_vignetting` (beide Kameras `V = 1 − 0,5·(θ/θmax)²` in die gerenderten Bilder, dazu die Faktoren aus `recovers_injected_gains`: `V` auf 3 % genau in allen θ-Klassen, Faktoren weiter auf 3 %; Rest nachher < 0,3 × vorher). `vignetting_unobservable_stays_flat` (alle Ansichten θ < 20°: `coeffs == 0`). `vignetting_off_matches_m3_gains` (`vignetting = false` → gleiche Faktoren wie `estimate_gains` vorher). `gains_at_clamp_are_counted`. `exposure_is_deterministic` erweitert.
 - [ ] **Step 2–4:** FAIL → implementieren → PASS.
@@ -102,7 +102,7 @@ Befund beim Planen (Promedia, 1 cm): Faktoren stoßen an beide Grenzen (0,25 und
   - `ColorConfig { highlight_ratio: f64 /* 0.3 */, highlight_abs: f64 /* 0.02 linear */, highlights: bool /* an */, views_kept: usize /* 6 */, views_blended: usize /* 3 */ }`. 6 statt 3 behaltene Ansichten: Bilder je Kamera ≈ 3,3/s, die 6 besten liegen ≈ 1 s auseinander; 8 kosteten 0,5 GB mehr (Task 1).
   - Weiche Mischung: von den übrigen Ansichten (nach Gewicht) die besten `views_blended` mit Gewicht `w_k − w_(views_blended+1)` (0, wenn es keine weitere gibt); sind alle Gewichte danach 0, die unveränderten Gewichte. So wechselt die Farbe stetig, wenn zwischen Nachbarpunkten die 3. und 4. Ansicht die Plätze tauschen (Ursache harter Nähte).
   - Abgleich-Reihenfolge: Faktoren + Randabfall auf allen behaltenen Ansichten (Huber dämpft Glanz), dann Glanz verwerfen, dann mischen.
-  - Nähte (Ergebnis M3: Kamera-Unterschied bei 1 cm auf `Test` nur −46 %): Auf Promedia sinkt er bei 1 cm um 83 % (3,33 → 0,58). Die −46 % auf `Test` sind also kein 1-cm-Effekt, sondern kleine Absolutwerte (1,42 → 0,76 Stufen) einer dunklen Szene. Was an Nähten bleibt, kommt aus Randabfall (Task 3), Glanz (oben), dem harten Schnitt nach 3 Ansichten (weiche Mischung) und geklemmten Bildern (Task 3); gemessen mit `seam_jump_*`.
+  - Nähte (Ergebnis M3: Kamera-Unterschied bei 1 cm auf `Test` nur −46 %): Auf der Büro-Aufnahme sinkt er bei 1 cm um 83 % (3,33 → 0,58). Die −46 % auf `Test` sind also kein 1-cm-Effekt, sondern kleine Absolutwerte (1,42 → 0,76 Stufen) einer dunklen Szene. Was an Nähten bleibt, kommt aus Randabfall (Task 3), Glanz (oben), dem harten Schnitt nach 3 Ansichten (weiche Mischung) und geklemmten Bildern (Task 3); gemessen mit `seam_jump_*`.
   - `ColorStats`: `views_rejected`, `points_with_rejected`, `floor_highlight_share_before/after` (Bodenpunkte: Normale `|n_z| > 0,9`, Höhe < Laufbahnhöhe − 0,8 m; Anteil mit `Y > 1,3 × Median Y` ihrer 0,5-m-Zelle; „vorher“ = ohne Verwerfen und harte Mischung, aus denselben Ansichten), `seam_jump_before/after` (bis 200.000 gleichmäßig gewählte ebene Punkte mit ihren 4 nächsten Nachbarn ≤ 2 Voxel, Normalen ≤ 10°: mittleres `|ΔY|` in sRGB-Stufen bei verschiedenem Hauptbild minus bei gleichem Hauptbild; Hauptbild = Ansicht mit dem größten Mischgewicht).
 
 - [ ] **Step 1: Tests** – `rejects_view_dependent_highlights` (Boden der Testszene, in jedem 2. Bild ein heller Fleck +120 sRGB, der mit der Kamera wandert: > 95 % der Bodenpunkte auf ±`TOL` der Bodenfarbe; mit `highlights = false` < 85 %). `few_views_are_never_all_rejected` (1 und 2 Ansichten: Farbe bleibt, `colored = true`). `dark_outlier_does_not_become_reference` (5 gleiche Ansichten + 1 sehr dunkle: nichts verworfen). `soft_blend_is_continuous` (Einheitstest: Gewichte 4. ≈ 3. → Farbe ändert sich beim Tausch um < 1/255). `seam_jump_drops_with_soft_blend` (Szene mit zwei Bildgruppen unterschiedlicher Restbelichtung). Bestehende Farbtests grün.
@@ -174,8 +174,8 @@ Befund beim Planen (Promedia, 1 cm): Faktoren stoßen an beide Grenzen (0,25 und
 - Modify: `crates/driftless-map/tests/real_data.rs` (`#[ignore]`), `docs/testdaten.md`, `README.md`; Standardwerte nur, wenn die Messung es verlangt (jede Änderung im Ergebnis begründet)
 - Create: `crates/driftless-cli/tests/real_data.rs` (`#[ignore]`, startet `env!("CARGO_BIN_EXE_driftless")`), `docs/ergebnisse/YYYY-MM-DD-meilenstein-4.md` (Datum des Messtags)
 
-- [ ] **Step 1: Messen** auf `Test`, `143415`, `143623` und Promedia, je M3-Stand (Commit `49d16ea`) gegen M4: Glanzanteil Boden, Kamera-Unterschied, Bild-Versatz, Nahtsprung, Randabfall-Rest, Bilder am Grenzwert, Schärfe-Helligkeit-Korrelation und unscharfe Bilder, Durchblick-Punkte (davon > 5 m von der Laufbahn), Wanddicke (auch RayStudio `smooth.las` auf `Test`), Spitzen-RAM je Schritt (`/usr/bin/time -l`), Laufzeit je Schritt. Ausschnitt-Renderings (Boden unter Deckenleuchten in Promedia, Fensterseite von oben, Wand im Schnitt) lokal unter `$DRIFTLESS_TESTDATA/ergebnisse-m4/`.
-- [ ] **Step 2: Tests mit gemessenen Schranken** – CLI-Crate: `promedia_map_under_4_gb_and_15_min` (je `--step` ein Kindprozess, `peak_rss_bytes` aus `map.json`); Map-Crate: `floor_highlights_drop` (Promedia: nachher ≤ 0,5 × vorher), `vignette_residual_drops` (nachher ≤ 0,5 × vorher), `camera_difference_not_worse` (≤ M3-Wert × 1,05), `through_removes_outside_points` (Promedia: Durchblick > 0, davon ≥ 80 % > 3 m von der Laufbahn), `walls_thinner` (`Test`: Dicke nachher ≤ 0,7 × vorher), `jmk6_scans_run_and_are_deterministic` erweitert um Promedia.
+- [ ] **Step 1: Messen** auf `Test`, `143415`, `143623` und der Büro-Aufnahme, je M3-Stand (Commit `49d16ea`) gegen M4: Glanzanteil Boden, Kamera-Unterschied, Bild-Versatz, Nahtsprung, Randabfall-Rest, Bilder am Grenzwert, Schärfe-Helligkeit-Korrelation und unscharfe Bilder, Durchblick-Punkte (davon > 5 m von der Laufbahn), Wanddicke (auch RayStudio `smooth.las` auf `Test`), Spitzen-RAM je Schritt (`/usr/bin/time -l`), Laufzeit je Schritt. Ausschnitt-Renderings (Boden unter Deckenleuchten im Büro, Fensterseite von oben, Wand im Schnitt) lokal unter `$DRIFTLESS_TESTDATA/ergebnisse-m4/`.
+- [ ] **Step 2: Tests mit gemessenen Schranken** – CLI-Crate: `office_map_under_4_gb_and_15_min` (je `--step` ein Kindprozess, `peak_rss_bytes` aus `map.json`); Map-Crate: `floor_highlights_drop` (Büro: nachher ≤ 0,5 × vorher), `vignette_residual_drops` (nachher ≤ 0,5 × vorher), `camera_difference_not_worse` (≤ M3-Wert × 1,05), `through_removes_outside_points` (Büro: Durchblick > 0, davon ≥ 80 % > 3 m von der Laufbahn), `walls_thinner` (`Test`: Dicke nachher ≤ 0,7 × vorher), `jmk6_scans_run_and_are_deterministic` erweitert um Büro.
 - [ ] **Step 3: Ergebnisdokument** (Deutsch, Tabellen, ehrliche Grenzen: bodentiefe Fenster, Glanz in allen Ansichten, Wahrheit fehlt) und Doku.
 - [ ] **Step 4: Gesamtprüfung** – `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo deny check`, `cargo fmt --all --check`, `cargo test --release -- --ignored`.
 - [ ] **Step 5: Commit** `test(map): Prüfung mit echten Daten, Ergebnisse Meilenstein 4`

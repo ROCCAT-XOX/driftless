@@ -27,7 +27,7 @@ fn p32(x: f64, y: f64, z: f64) -> [f32; 3] {
 }
 
 /// Wall y = 2 (x 0–2, z 0–2) on a jittered 1.25 cm grid, noise across the wall within
-/// ±2 cm: normal with a standard deviation of 7 mm (Promedia: 6.5 mm), cut at ±2 cm.
+/// ±2 cm: normal with a standard deviation of 7 mm (Büro: 6.5 mm), cut at ±2 cm.
 fn noisy_wall(seed: u64) -> Vec<[f32; 3]> {
     let mut rng = Lcg(seed);
     let mut xyz = Vec::new();

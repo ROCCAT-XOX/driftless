@@ -152,7 +152,7 @@ pub struct ColorConfig {
     /// short stretch of the walk all show it.
     pub view_gap: f64,
     /// Down-weight highlights (see the module docs). Experimental and off by default: on
-    /// Promedia it lowered the floor highlights by 28–33 % but raised `seam_jump` from 4.4 to
+    /// Büro it lowered the floor highlights by 28–33 % but raised `seam_jump` from 4.4 to
     /// 5.5–6.3 sRGB levels (dropping the views instead: 7.7–8.4), at every setting tried.
     pub highlights: bool,
     /// The unit of a view's luminance excess over the reference is the larger of this share
