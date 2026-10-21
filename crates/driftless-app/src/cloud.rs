@@ -31,6 +31,8 @@ pub struct PointSet {
     pub t: Vec<f32>,
     /// Quality of the point's submap × 255; 255 without a report.
     pub quality: Vec<u8>,
+    /// Whether `quality` comes from a SLAM report; without one it is unknown (all 255).
+    pub quality_known: bool,
     /// LAS `user_data`: 1 = without measured colour, or the removal reason.
     pub flags: Vec<u8>,
 }
@@ -46,6 +48,7 @@ impl PointSet {
             intensity: vec![MID_GRAY; n],
             t: vec![0.0; n],
             quality: vec![255; n],
+            quality_known: false,
             flags: vec![0; n],
         }
     }
@@ -126,6 +129,7 @@ pub fn load_las(
         intensity: Vec::with_capacity(capacity),
         t: Vec::with_capacity(capacity),
         quality: Vec::with_capacity(capacity),
+        quality_known: slam.is_some(),
         flags: Vec::with_capacity(capacity),
     };
     // Time zero: the scan start of the report, else the first point's time.
@@ -228,6 +232,12 @@ pub struct LoadedCloud {
     pub tree: Octree,
     pub load_seconds: f64,
     pub build_seconds: f64,
+    /// What „alles zeigen“ frames ([`view_bounds`]); `None` without points.
+    pub view_bounds: Option<([f32; 3], [f32; 3])>,
+    /// Lowest and highest z of all points (relative), for the height cut.
+    pub z_range: [f32; 2],
+    /// A height (relative z) just below the ceiling ([`estimate_ceiling`]), if there is one.
+    pub ceiling: Option<f32>,
 }
 
 impl LoadedCloud {
@@ -240,7 +250,12 @@ impl LoadedCloud {
     ) -> Result<Self, StepError> {
         let t = Instant::now();
         let tree = build_octree(&points, progress)?;
+        // Computed here, in the job, so that the window does not wait for them.
+        let (min, max) = points.bounds();
         Ok(LoadedCloud {
+            view_bounds: view_bounds(&points),
+            z_range: [min[2], max[2]],
+            ceiling: estimate_ceiling(&points),
             path,
             points,
             tree,
@@ -274,4 +289,88 @@ pub fn load_cloud(
         t.elapsed().as_secs_f64(),
         progress,
     )
+}
+
+/// Points looked at by [`view_bounds`] at most.
+const BOUNDS_SAMPLE: usize = 200_000;
+/// Share of the points cut off on each side of each axis by [`view_bounds`].
+pub const BOUNDS_CUT: f64 = 0.005;
+
+/// The box „alles zeigen“ frames: per axis from the 0,5 % to the 99,5 % point
+/// ([`BOUNDS_CUT`]) of an evenly spread sample, so that a few far outliers do not shrink the
+/// cloud to a dot. Up to 1 % of the points per axis may therefore lie outside the frame.
+/// `None` without points.
+pub fn view_bounds(points: &PointSet) -> Option<([f32; 3], [f32; 3])> {
+    let n = points.len();
+    if n == 0 {
+        return None;
+    }
+    let step = n.div_ceil(BOUNDS_SAMPLE);
+    let mut min = [0.0; 3];
+    let mut max = [0.0; 3];
+    for k in 0..3 {
+        let mut v: Vec<f32> = points.xyz.iter().step_by(step).map(|p| p[k]).collect();
+        v.sort_unstable_by(f32::total_cmp);
+        let cut = ((v.len() as f64 * BOUNDS_CUT) as usize).min((v.len() - 1) / 2);
+        min[k] = v[cut];
+        max[k] = v[v.len() - 1 - cut];
+    }
+    Some((min, max))
+}
+
+/// Points looked at by [`estimate_ceiling`] at most.
+const CEILING_SAMPLE: usize = 1_000_000;
+/// Height of a bin of the z histogram (m).
+const CEILING_BIN: f32 = 0.05;
+/// Most bins (a taller cloud gets wider bins).
+const CEILING_MAX_BINS: usize = 20_000;
+/// A bin is part of a horizontal layer when it holds this many times the median bin …
+const CEILING_DENSE: f64 = 4.0;
+/// … and at least this share of the sample.
+const CEILING_MIN_SHARE: f64 = 0.005;
+/// How far below the layer the estimate lies (m).
+const CEILING_MARGIN: f32 = 0.05;
+
+/// A height just below the ceiling: the topmost dense horizontal layer of the z histogram
+/// (5 cm bins over an evenly spread sample; dense = 4 × the median occupied bin and 0,5 %
+/// of the points), minus 5 cm under its lowest bin. `None` if the cloud is flat or has no
+/// dense layer above another one (nothing that looks like floor and ceiling).
+pub fn estimate_ceiling(points: &PointSet) -> Option<f32> {
+    let n = points.len();
+    if n == 0 {
+        return None;
+    }
+    let step = n.div_ceil(CEILING_SAMPLE);
+    let z: Vec<f32> = points.xyz.iter().step_by(step).map(|p| p[2]).collect();
+    let (lo, hi) = z
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| {
+            (a.min(v), b.max(v))
+        });
+    let span = hi - lo;
+    if span.is_nan() || span <= 4.0 * CEILING_BIN {
+        return None;
+    }
+    let bins = (((hi - lo) / CEILING_BIN).ceil() as usize).clamp(1, CEILING_MAX_BINS);
+    let width = (hi - lo) / bins as f32;
+    let mut count = vec![0u32; bins];
+    for &v in &z {
+        let b = (((v - lo) / width) as usize).min(bins - 1);
+        count[b] += 1;
+    }
+    let mut occupied: Vec<u32> = count.iter().copied().filter(|&c| c > 0).collect();
+    occupied.sort_unstable();
+    let median = f64::from(occupied[occupied.len() / 2]);
+    let threshold = (CEILING_DENSE * median).max(CEILING_MIN_SHARE * z.len() as f64);
+    let dense = |b: usize| f64::from(count[b]) >= threshold;
+    let top = (0..bins).rev().find(|&b| dense(b))?;
+    let mut bottom = top;
+    while bottom > 0 && dense(bottom - 1) {
+        bottom -= 1;
+    }
+    // Another dense layer below (the floor) makes the top one a ceiling.
+    if !(0..bottom).any(dense) {
+        return None;
+    }
+    Some(lo + bottom as f32 * width - CEILING_MARGIN)
 }

@@ -5,7 +5,7 @@ use driftless_app::camera::{Camera, CameraMode};
 use driftless_app::cloud::PointSet;
 use driftless_app::lod::{build_octree, build_octree_with, Octree, PointVertex, LEAF_MAX};
 use driftless_app::render::{
-    headless_device, ColorMode, FrameParams, LineVertex, PointRenderer, RenderTarget,
+    headless_device, ColorMode, FrameParams, LineVertex, PointRenderer, RenderTarget, NO_CUT,
 };
 use driftless_app::synthetic::Rng;
 use driftless_io::progress::Progress;
@@ -53,6 +53,8 @@ fn frame(cam: &Camera, mode: ColorMode) -> FrameParams {
         color_mode: mode,
         round: false,
         background: BACKGROUND,
+        quality_known: true,
+        z_range: NO_CUT,
     }
 }
 
@@ -89,7 +91,7 @@ fn render(
 ) -> Image {
     let (device, queue) = (&gpu.device, &gpu.queue);
     let target = RenderTarget::new(device, [SIZE; 2], FORMAT);
-    let mut renderer = PointRenderer::new(device, FORMAT);
+    let mut renderer = PointRenderer::new(device, queue, FORMAT);
     renderer.upload_cloud(device, queue, tree);
     renderer.set_overlay(device, lines, markers);
     let drawn: Vec<u32> = (0..tree.nodes.len() as u32).collect();
@@ -380,4 +382,86 @@ fn chunks_beyond_first_render() {
     let cam = camera([0.0; 3], 0.0);
     let image = render(&gpu, &tree, &frame(&cam, ColorMode::Rgb), &[], &[]);
     assert!(near(image.centre(), RED, 2), "{:?}", image.centre());
+}
+
+#[test]
+fn quality_mode_unknown_is_gray() {
+    let Some(gpu) = gpu() else { return };
+    let cam = camera([0.0; 3], 0.0);
+    let mut points = cloud(vec![[2.0, 0.0, 0.0]], vec![BLUE]);
+    points.quality = vec![0];
+    let tree = tree(&points);
+    let f = FrameParams {
+        quality_known: false,
+        ..frame(&cam, ColorMode::Quality)
+    };
+    let c = render(&gpu, &tree, &f, &[], &[]).centre();
+    assert!(near(c, [128; 3], 2), "{c:?}");
+}
+
+#[test]
+fn height_cut_hides_points_not_markers() {
+    let Some(gpu) = gpu() else { return };
+    let cam = camera([0.0; 3], 0.0);
+    let tree = tree(&cloud(vec![[2.0, 0.0, 0.0]], vec![RED]));
+    let cut = |z_range| FrameParams {
+        z_range,
+        ..frame(&cam, ColorMode::Rgb)
+    };
+    // the point (z = 0) inside the cut: drawn; outside: not
+    assert!(near(
+        render(&gpu, &tree, &cut([-1.0, 1.0]), &[], &[]).centre(),
+        RED,
+        2
+    ));
+    assert!(is_background(
+        render(&gpu, &tree, &cut([0.5, 1.0]), &[], &[]).centre()
+    ));
+    assert!(is_background(
+        render(&gpu, &tree, &cut([-1.0, -0.5]), &[], &[]).centre()
+    ));
+    // a marker at the same place stays
+    let marker = PointVertex {
+        pos: [2.0, 0.0, 0.0],
+        rgbi: 0xff00_ff00,
+        extra: 0,
+    };
+    let c = render(&gpu, &tree, &cut([0.5, 1.0]), &[], &[marker]).centre();
+    assert!(near(c, [0, 255, 0], 2), "{c:?}");
+}
+
+/// With timestamp queries the renderer reports the GPU time of a frame, without waiting.
+#[test]
+fn gpu_time_comes_back() {
+    use driftless_app::render::with_timestamps;
+    if gpu().is_none() {
+        return;
+    }
+    let setup = match egui_kittest::wgpu::default_wgpu_setup() {
+        egui_wgpu::WgpuSetup::CreateNew(s) => egui_wgpu::WgpuSetup::CreateNew(with_timestamps(s)),
+        other => other,
+    };
+    let rs =
+        egui_kittest::wgpu::create_render_state(setup, egui_wgpu::RendererOptions::PREDICTABLE);
+    let mut renderer = PointRenderer::new(&rs.device, &rs.queue, FORMAT);
+    if !renderer.has_gpu_timer() {
+        eprintln!("keine Zeitstempel, Test übersprungen");
+        return;
+    }
+    let tree = tree(&cloud(vec![[2.0, 0.0, 0.0]], vec![RED]));
+    renderer.upload_cloud(&rs.device, &rs.queue, &tree);
+    let target = RenderTarget::new(&rs.device, [SIZE; 2], FORMAT);
+    let f = frame(&camera([0.0; 3], 0.0), ColorMode::Rgb);
+    let mut got = None;
+    for _ in 0..200 {
+        renderer.render(&rs.device, &rs.queue, &target, &f, &tree, &[0]);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        got = renderer.gpu_ms(&rs.device);
+        if got.is_some() {
+            break;
+        }
+    }
+    let ms = got.expect("GPU time");
+    eprintln!("GPU {ms} ms");
+    assert!(ms > 0.0 && ms < 1000.0);
 }

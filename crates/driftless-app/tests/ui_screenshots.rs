@@ -24,10 +24,10 @@ fn harness(app: DriftlessApp, rs: egui_wgpu::RenderState) -> Harness<'static, Dr
         .build_ui_state(|ui, app: &mut DriftlessApp| app.show(ui), app)
 }
 
-/// Frames until the load has ended and the view has drawn.
+/// Frames until the load and the upload have ended and the view has drawn.
 fn wait_loaded(h: &mut Harness<'_, DriftlessApp>) {
     let deadline = Instant::now() + Duration::from_secs(600);
-    while h.state().is_loading() || h.state().cloud().is_none() {
+    while h.state().is_loading() || h.state().cloud().is_none() || h.state().view().is_uploading() {
         h.step();
         assert!(Instant::now() < deadline, "cloud not loaded");
         std::thread::sleep(Duration::from_millis(20));
@@ -128,4 +128,15 @@ fn ui_screenshots() {
     view.color_mode = ColorMode::Rgb;
     view.budget = 1_000_000;
     shot(&mut h, &dir, "buero_budget_1mio");
+    // from above with the ceiling cut away: the rooms instead of the roofs
+    let summary = h.state().state().cloud.clone().unwrap();
+    let ceiling = summary.ceiling.expect("Decke erkannt");
+    eprintln!("z {:?}, Decke bei {ceiling:.2} m", summary.z_range);
+    let view = &mut h.state_mut().state_mut().view;
+    view.budget = 6_000_000;
+    view.cut = Some([summary.z_range[0], ceiling]);
+    let camera = h.state_mut().view_mut().camera_mut();
+    camera.pitch = -89f32.to_radians();
+    camera.distance *= 0.8;
+    shot(&mut h, &dir, "buero_ohne_decke");
 }

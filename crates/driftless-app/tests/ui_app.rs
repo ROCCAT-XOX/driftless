@@ -319,7 +319,7 @@ fn args_take_synthetic_count() {
     };
     assert_eq!(args(&["--synthetic", "5"]), Ok(synthetic(5)));
     assert_eq!(
-        args(&["--synthetic", "50.000.000"]),
+        args(&["--synthetic", "50_000_000"]),
         Ok(synthetic(50_000_000))
     );
     assert_eq!(
@@ -333,6 +333,11 @@ fn args_take_synthetic_count() {
         &["--synthetic"][..],
         &["--synthetic", "0"],
         &["--synthetic", "viele"],
+        &["--synthetic", "5.5"],
+        &["--synthetic", "50.000.000"],
+        &["--synthetic", "-5"],
+        &["--synthetic", "_5"],
+        &["--synthetic", "+5"],
     ] {
         assert!(args(bad).is_err(), "{bad:?}");
     }
@@ -394,4 +399,36 @@ fn selecting_a_cloud_loads_it() {
     // selecting the shown cloud again does not load it again
     app.apply(Action::Select(Selection::Cloud(b)));
     assert!(!app.is_loading());
+}
+
+/// A, then C (cancels A), then A again: A is loaded after all, not left cancelled.
+#[test]
+fn reselecting_a_cancelled_cloud_loads_it() {
+    let dir = tmp("ui-wolke-zurueck");
+    let write = |name: &str, n: usize| {
+        let path = dir.join(name);
+        let mut builder = las::Builder::from((1, 2));
+        builder.point_format = las::point::Format::new(1).unwrap();
+        let mut w = las::Writer::from_path(&path, builder.into_header().unwrap()).unwrap();
+        for i in 0..n {
+            w.write_point(las::Point {
+                x: i as f64 * 0.01,
+                y: 1.0,
+                z: 2.0,
+                gps_time: Some(i as f64),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        w.close().unwrap();
+        path
+    };
+    let (a, c) = (write("a.las", 2_000_000), write("c.las", 1_000));
+    let mut app = app();
+    app.apply(Action::Select(Selection::Cloud(a.clone())));
+    app.apply(Action::Select(Selection::Cloud(c)));
+    app.apply(Action::Select(Selection::Cloud(a.clone())));
+    tick_until(&mut app, |app| !app.is_loading());
+    assert_eq!(errors(&app), Vec::<String>::new());
+    assert_eq!(app.cloud().map(|c| c.path.clone()), Some(a));
 }

@@ -50,7 +50,15 @@ pub struct FrameParams {
     pub round: bool,
     /// Clear colour, RGBA 0..1, written as is.
     pub background: [f32; 4],
+    /// Whether the cloud carries submap qualities; without, [`ColorMode::Quality`] is gray.
+    pub quality_known: bool,
+    /// Height cut (relative z, inclusive): points outside are not drawn; markers always are.
+    /// [`NO_CUT`] draws everything.
+    pub z_range: [f32; 2],
 }
+
+/// A height cut that keeps every point.
+pub const NO_CUT: [f32; 2] = [f32::MIN, f32::MAX];
 
 /// The uniform block of both shaders (`Frame` in the WGSL).
 #[repr(C)]
@@ -61,7 +69,9 @@ struct Uniforms {
     point_px: f32,
     color_mode: u32,
     round: u32,
-    _pad: [u32; 3],
+    quality_known: u32,
+    z_min: f32,
+    z_max: f32,
 }
 
 impl Uniforms {
@@ -73,7 +83,9 @@ impl Uniforms {
             point_px,
             color_mode: color_mode as u32,
             round: u32::from(frame.round),
-            _pad: [0; 3],
+            quality_known: u32::from(frame.quality_known),
+            z_min: frame.z_range[0],
+            z_max: frame.z_range[1],
         }
     }
 }
@@ -138,6 +150,131 @@ impl RenderTarget {
 struct Block {
     range: Range<u32>,
     buffer: wgpu::Buffer,
+    /// All its vertices are written (only then is it drawn).
+    filled: bool,
+}
+
+/// Size of a vertex on the GPU (bytes).
+pub const VERTEX_BYTES: u64 = size_of::<PointVertex>() as u64;
+
+/// How far an upload of the blocks has got: block `block`, vertices before `offset` of it
+/// are written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UploadCursor {
+    pub block: usize,
+    pub offset: u32,
+}
+
+/// The next pieces to write, at most `max_vertices` (≥ 1) in all: (block, vertex range
+/// relative to the block). Moves `cursor` past them; empty when all is written.
+pub fn upload_slices(
+    chunks: &[Range<u32>],
+    cursor: &mut UploadCursor,
+    max_vertices: u32,
+) -> Vec<(usize, Range<u32>)> {
+    let mut left = max_vertices.max(1);
+    let mut out = Vec::new();
+    while left > 0 {
+        let Some(chunk) = chunks.get(cursor.block) else {
+            break;
+        };
+        let len = chunk.end - chunk.start;
+        let take = (len - cursor.offset).min(left);
+        if take > 0 {
+            out.push((cursor.block, cursor.offset..cursor.offset + take));
+        }
+        left -= take;
+        cursor.offset += take;
+        if cursor.offset >= len {
+            cursor.block += 1;
+            cursor.offset = 0;
+        }
+    }
+    out
+}
+
+/// Readbacks of the GPU time in flight at most.
+const TIMER_SLOTS: usize = 4;
+
+/// The GPU time of a frame from two timestamps (begin of the render pass, begin of an empty
+/// pass after it), read
+/// back without waiting: each frame resolves into a free readback buffer and maps it; a
+/// later frame takes the result once the map is done.
+struct GpuTimer {
+    queries: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    slots: Vec<TimerSlot>,
+    /// Nanoseconds per tick.
+    period: f32,
+    last_ms: Option<f32>,
+}
+
+struct TimerSlot {
+    buffer: wgpu::Buffer,
+    /// In use by a frame; `ready` is set by the map callback.
+    busy: bool,
+    ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl GpuTimer {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
+        if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return None;
+        }
+        let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("3D-Ansicht Zeit"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2,
+        });
+        let buffer = |label, usage| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: 16,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let resolve = buffer(
+            "Zeit auflösen",
+            wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let slots = (0..TIMER_SLOTS)
+            .map(|_| TimerSlot {
+                buffer: buffer(
+                    "Zeit lesen",
+                    wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                ),
+                busy: false,
+                ready: Default::default(),
+            })
+            .collect();
+        Some(GpuTimer {
+            queries,
+            resolve,
+            slots,
+            period: queue.get_timestamp_period(),
+            last_ms: None,
+        })
+    }
+
+    /// Takes the results of finished readbacks (newest wins).
+    fn collect(&mut self) {
+        use std::sync::atomic::Ordering;
+        for slot in &mut self.slots {
+            if slot.busy && slot.ready.load(Ordering::Acquire) {
+                if let Ok(bytes) = slot.buffer.slice(..).get_mapped_range() {
+                    let t: &[u64] = bytemuck::cast_slice(&bytes);
+                    if t[1] > t[0] {
+                        self.last_ms = Some((t[1] - t[0]) as f32 * self.period / 1e6);
+                    }
+                    drop(bytes);
+                    slot.buffer.unmap();
+                }
+                slot.ready.store(false, Ordering::Release);
+                slot.busy = false;
+            }
+        }
+    }
 }
 
 /// Draws a cloud uploaded with [`PointRenderer::upload_cloud`] and an overlay.
@@ -152,11 +289,15 @@ pub struct PointRenderer {
     blocks: Vec<Block>,
     lines_buffer: Option<(wgpu::Buffer, u32)>,
     markers_buffer: Option<(wgpu::Buffer, u32)>,
+    /// How far the cloud is written into `blocks`.
+    upload: UploadCursor,
+    /// `None` without timestamp queries on the device.
+    timer: Option<GpuTimer>,
 }
 
 impl PointRenderer {
     /// Pipelines for a colour target of `format` and a depth target of [`DEPTH_FORMAT`].
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("3D-Ansicht Parameter"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -281,25 +422,104 @@ impl PointRenderer {
             blocks: Vec::new(),
             lines_buffer: None,
             markers_buffer: None,
+            upload: UploadCursor::default(),
+            timer: GpuTimer::new(device, queue),
         }
     }
 
-    /// One vertex buffer per block of `tree.chunks`; replaces the previous cloud. An empty
-    /// cloud has no blocks.
-    pub fn upload_cloud(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, tree: &Octree) {
+    /// Whether GPU times of drawn frames are still on their way back.
+    pub fn gpu_timer_pending(&self) -> bool {
+        self.timer
+            .as_ref()
+            .is_some_and(|t| t.slots.iter().any(|s| s.busy))
+    }
+
+    /// Whether the device measures GPU time ([`wgpu::Features::TIMESTAMP_QUERY`]).
+    pub fn has_gpu_timer(&self) -> bool {
+        self.timer.is_some()
+    }
+
+    /// The GPU time of the latest frame whose time has come back (ms); never waits.
+    pub fn gpu_ms(&mut self, device: &wgpu::Device) -> Option<f32> {
+        let timer = self.timer.as_mut()?;
+        // Runs the map callbacks of finished work, without blocking.
+        let _ = device.poll(wgpu::PollType::Poll);
+        timer.collect();
+        timer.last_ms
+    }
+
+    /// Creates one empty vertex buffer per block of `tree.chunks` (replacing the previous
+    /// cloud); [`PointRenderer::upload_step`] then fills them. A block is drawn once it is
+    /// full.
+    pub fn begin_upload(&mut self, device: &wgpu::Device, tree: &Octree) {
         self.blocks.clear();
+        self.upload = UploadCursor::default();
         for range in &tree.chunks {
-            let vertices = &tree.vertices[range.start as usize..range.end as usize];
-            let Some(buffer) = vertex_buffer(device, "Wolke Block", bytemuck::cast_slice(vertices))
-            else {
+            let bytes = u64::from(range.end - range.start) * VERTEX_BYTES;
+            if bytes == 0 {
                 continue;
-            };
-            queue.write_buffer(&buffer, 0, bytemuck::cast_slice(vertices));
+            }
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Wolke Block"),
+                size: bytes,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
             self.blocks.push(Block {
                 range: range.clone(),
                 buffer,
+                filled: false,
             });
         }
+    }
+
+    /// Writes the next vertices of `tree` (the tree of [`PointRenderer::begin_upload`]), at
+    /// most `max_bytes` (at least one vertex); returns the bytes written.
+    pub fn upload_step(&mut self, queue: &wgpu::Queue, tree: &Octree, max_bytes: u64) -> u64 {
+        let max_vertices = (max_bytes / VERTEX_BYTES).clamp(1, u64::from(u32::MAX)) as u32;
+        let chunks: Vec<Range<u32>> = self.blocks.iter().map(|b| b.range.clone()).collect();
+        let mut written = 0;
+        for (b, rel) in upload_slices(&chunks, &mut self.upload, max_vertices) {
+            let block = &mut self.blocks[b];
+            let start = (block.range.start + rel.start) as usize;
+            let end = (block.range.start + rel.end) as usize;
+            let bytes: &[u8] = bytemuck::cast_slice(&tree.vertices[start..end]);
+            queue.write_buffer(&block.buffer, u64::from(rel.start) * VERTEX_BYTES, bytes);
+            written += bytes.len() as u64;
+            if rel.end == block.range.end - block.range.start {
+                block.filled = true;
+            }
+        }
+        written
+    }
+
+    /// Share of the cloud written, 0..1 (1 for an empty cloud).
+    pub fn upload_fraction(&self) -> f32 {
+        let total: u64 = self
+            .blocks
+            .iter()
+            .map(|b| u64::from(b.range.len() as u32))
+            .sum();
+        if total == 0 {
+            return 1.0;
+        }
+        let done: u64 = self.blocks[..self.upload.block.min(self.blocks.len())]
+            .iter()
+            .map(|b| u64::from(b.range.len() as u32))
+            .sum::<u64>()
+            + u64::from(self.upload.offset);
+        (done as f64 / total as f64) as f32
+    }
+
+    pub fn upload_done(&self) -> bool {
+        self.upload.block >= self.blocks.len()
+    }
+
+    /// One vertex buffer per block of `tree.chunks`, filled at once; replaces the previous
+    /// cloud. An empty cloud has no blocks. (The view uploads in slices instead.)
+    pub fn upload_cloud(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, tree: &Octree) {
+        self.begin_upload(device, tree);
+        self.upload_step(queue, tree, u64::MAX);
     }
 
     /// Lines (pairs of vertices) and markers, both relative to the cloud's origin; replaces
@@ -326,7 +546,7 @@ impl PointRenderer {
     /// and submits its own work (returned here) before the next call writes them again;
     /// two frames must never be recorded into one submission.
     pub fn render(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         target: &RenderTarget,
@@ -342,9 +562,21 @@ impl PointRenderer {
         queue.write_buffer(
             &self.marker_uniforms,
             0,
-            bytemuck::bytes_of(&Uniforms::new(frame, frame.marker_px, ColorMode::Rgb)),
+            bytemuck::bytes_of(&Uniforms::new(
+                &FrameParams {
+                    z_range: NO_CUT,
+                    ..*frame
+                },
+                frame.marker_px,
+                ColorMode::Rgb,
+            )),
         );
         let draws = self.draws(tree, drawn);
+        // A free readback for the GPU time; without one this frame is not timed.
+        let timer_slot = self
+            .timer
+            .as_ref()
+            .and_then(|t| t.slots.iter().position(|s| !s.busy));
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("3D-Ansicht"),
@@ -370,7 +602,11 @@ impl PointRenderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: timer_slot.map(|_| wgpu::RenderPassTimestampWrites {
+                    query_set: &self.timer.as_ref().expect("Zeitmesser").queries,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: None,
+                }),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -399,7 +635,46 @@ impl PointRenderer {
                 pass.draw(0..4, 0..*count);
             }
         }
-        queue.submit([encoder.finish()])
+        if let (Some(timer), Some(i)) = (&self.timer, timer_slot) {
+            // The end as the beginning of an empty pass after ours (same target, so it
+            // starts when ours is done): Metal writes end-of-pass timestamps too late for
+            // the resolve that follows, and drops empty compute passes.
+            drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("3D-Ansicht Ende"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: Some(wgpu::RenderPassTimestampWrites {
+                    query_set: &timer.queries,
+                    beginning_of_pass_write_index: Some(1),
+                    end_of_pass_write_index: None,
+                }),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            }));
+            encoder.resolve_query_set(&timer.queries, 0..2, &timer.resolve, 0);
+            encoder.copy_buffer_to_buffer(&timer.resolve, 0, &timer.slots[i].buffer, 0, 16);
+        }
+        let submitted = queue.submit([encoder.finish()]);
+        if let (Some(timer), Some(i)) = (&mut self.timer, timer_slot) {
+            let slot = &mut timer.slots[i];
+            slot.busy = true;
+            let ready = slot.ready.clone();
+            slot.buffer
+                .slice(..)
+                // set also on failure, so that the slot is freed
+                .map_async(wgpu::MapMode::Read, move |_| {
+                    ready.store(true, std::sync::atomic::Ordering::Release);
+                });
+        }
+        submitted
     }
 
     /// (block, instances relative to the block) for every slice of a drawn node, sorted by
@@ -417,6 +692,10 @@ impl PointRenderer {
                 if block.range.start >= end {
                     break;
                 }
+                if !block.filled {
+                    b += 1;
+                    continue;
+                }
                 let s = start.max(block.range.start);
                 let e = end.min(block.range.end);
                 out.push((b, s - block.range.start..e - block.range.start));
@@ -426,18 +705,6 @@ impl PointRenderer {
         out.sort_by_key(|(block, _)| *block);
         out
     }
-}
-
-/// A vertex buffer for `bytes` (not filled), or `None` when empty.
-fn vertex_buffer(device: &wgpu::Device, label: &str, bytes: &[u8]) -> Option<wgpu::Buffer> {
-    (!bytes.is_empty()).then(|| {
-        device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(label),
-            size: bytes.len() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
-    })
 }
 
 /// A vertex buffer holding `bytes`, or `None` when empty.
@@ -483,4 +750,18 @@ pub fn headless_device() -> Option<(wgpu::Device, wgpu::Queue, wgpu::AdapterInfo
             .ok()?;
         Some((device, queue, info))
     })
+}
+
+/// `setup` that also asks for [`wgpu::Features::TIMESTAMP_QUERY`] where the adapter has it,
+/// so that the view can show the GPU time of its frames.
+pub fn with_timestamps(mut setup: egui_wgpu::WgpuSetupCreateNew) -> egui_wgpu::WgpuSetupCreateNew {
+    let base = setup.device_descriptor.clone();
+    setup.device_descriptor = std::sync::Arc::new(move |adapter| {
+        let mut desc = base(adapter);
+        if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            desc.required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+        desc
+    });
+    setup
 }

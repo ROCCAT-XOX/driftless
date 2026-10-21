@@ -3,7 +3,9 @@
 use driftless_app::camera::Camera;
 use driftless_app::cloud::PointSet;
 use driftless_app::lod::{build_octree, build_octree_with, Octree};
-use driftless_app::pick::{pick_point, pick_pose, project, relative_to, to_physical};
+use driftless_app::pick::{
+    pick_point, pick_point_in, pick_pose, project, relative_to, to_physical,
+};
 use driftless_app::synthetic::Rng;
 use driftless_io::progress::Progress;
 use nalgebra::Vector3;
@@ -297,4 +299,27 @@ fn degenerate_viewport_picks_nothing() {
             None
         );
     }
+}
+
+/// The height cut hides points from picking as from drawing: the nearer point lies above
+/// the cut, so the farther one is picked.
+#[test]
+fn pick_respects_height_cut() {
+    let cam = Camera {
+        target: Vector3::new(-4.0, 0.0, 0.0),
+        yaw: std::f32::consts::PI,
+        pitch: 0.0,
+        distance: 10.0,
+        ..Camera::default()
+    };
+    // near point slightly above, far point slightly below z = 0
+    let tree = tree_of(vec![[4.0, 0.0, 0.01], [2.0, 0.0, -0.01]]);
+    let near = tree.vertices.iter().position(|v| v.pos[0] == 4.0).unwrap() as u32;
+    let far = tree.vertices.iter().position(|v| v.pos[0] == 2.0).unwrap() as u32;
+    let nodes = all_nodes(&tree);
+    let pick = |range| pick_point_in(&tree, &nodes, &cam, VIEWPORT, CENTRE, 10.0, range);
+    assert_eq!(pick([f32::MIN, f32::MAX]), Some(near));
+    assert_eq!(pick([-1.0, 0.0]), Some(far));
+    assert_eq!(pick([0.0, 1.0]), Some(near));
+    assert_eq!(pick([0.5, 1.0]), None);
 }

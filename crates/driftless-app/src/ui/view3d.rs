@@ -11,13 +11,15 @@
 
 use super::{text, ViewSettings};
 use crate::camera::{fly_motion, Camera, CameraMode, FlyKeys, ZOOM_FACTOR};
-use crate::cloud::{LoadedCloud, PointSet};
+use crate::cloud::LoadedCloud;
 use crate::lod::{select_nodes, PointVertex};
-use crate::pick::{pick_point, to_physical};
-use crate::render::{ColorMode, FrameParams, PointRenderer, RenderTarget};
+use crate::pick::{pick_point_in, to_physical};
+use crate::render::{ColorMode, FrameParams, PointRenderer, RenderTarget, NO_CUT};
 use eframe::egui::{self, Color32, Key, PointerButton, Rect, Sense, Ui};
 use egui_wgpu::wgpu;
 use std::time::{Duration, Instant};
+
+pub use crate::cloud::view_bounds;
 
 /// Format of the offscreen image. Not an sRGB format: the shaders write the LAS sRGB bytes
 /// as they are, and egui expects textures that are not sRGB-aware (it would convert twice).
@@ -36,11 +38,22 @@ const WHEEL_STEP: f32 = 50.0;
 const FLY_SPEED_PER_DIAGONAL: f32 = 0.05;
 const FLY_SPEED_MIN: f32 = 1.0;
 const FLY_SPEED_MAX: f32 = 50.0;
-/// Longest wait for the GPU when timing a frame.
-const GPU_WAIT: Duration = Duration::from_millis(250);
+/// Most bytes of a new cloud written to the GPU per frame, so that uploading 1 GB does not
+/// stop the window: about 20 frames for 50 million points.
+pub const UPLOAD_SLICE_BYTES: u64 = 50_000_000;
+/// Two frames drawn closer than this count as continuous drawing (frame-to-frame time).
+const CONTINUOUS: Duration = Duration::from_millis(500);
+/// While GPU times are on their way, the view looks again this often.
+const TIMER_POLL: Duration = Duration::from_millis(16);
 /// Background of the view, sRGB 0..1 as written.
 const BACKGROUND: [f32; 4] = [0.08, 0.085, 0.09, 1.0];
 const MARKER_COLOR: u32 = 0xffff_ffff;
+
+/// [`BACKGROUND`] for egui (the same sRGB bytes).
+fn background_color() -> Color32 {
+    let [r, g, b, _] = BACKGROUND.map(|v| (v * 255.0).round() as u8);
+    Color32::from_rgb(r, g, b)
+}
 
 /// What the view reports from a click.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,32 +114,6 @@ pub fn effective_color_mode(mode: ColorMode, has_rgb: bool) -> ColorMode {
     }
 }
 
-/// Points looked at by [`view_bounds`] at most.
-const BOUNDS_SAMPLE: usize = 200_000;
-/// Share of the points cut off on each side of each axis by [`view_bounds`].
-const BOUNDS_CUT: f64 = 0.005;
-
-/// The box „show everything“ frames: per axis from the 0,5 % to the 99,5 % point of an
-/// evenly spread sample, so that a few far outliers do not shrink the cloud to a dot.
-/// `None` without points.
-pub fn view_bounds(points: &PointSet) -> Option<([f32; 3], [f32; 3])> {
-    let n = points.len();
-    if n == 0 {
-        return None;
-    }
-    let step = n.div_ceil(BOUNDS_SAMPLE);
-    let mut min = [0.0; 3];
-    let mut max = [0.0; 3];
-    for k in 0..3 {
-        let mut v: Vec<f32> = points.xyz.iter().step_by(step).map(|p| p[k]).collect();
-        v.sort_unstable_by(f32::total_cmp);
-        let cut = ((v.len() as f64 * BOUNDS_CUT) as usize).min((v.len() - 1) / 2);
-        min[k] = v[cut];
-        max[k] = v[v.len() - 1 - cut];
-    }
-    Some((min, max))
-}
-
 /// What the properties show of a picked point.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PointInfo {
@@ -139,8 +126,8 @@ pub struct PointInfo {
     pub intensity: u8,
     /// `None` for a cloud without colours or a point without measured colour.
     pub rgb: Option<[u8; 3]>,
-    /// Quality of the point's submap × 255.
-    pub quality: u8,
+    /// Quality of the point's submap × 255; `None` without SLAM report.
+    pub quality: Option<u8>,
     /// The removal reason of a point of `removed.las` (its flags), else `None`.
     pub removed: Option<u8>,
 }
@@ -158,7 +145,7 @@ pub fn point_info(cloud: &LoadedCloud, index: u32) -> PointInfo {
         t: p.t[i],
         intensity: p.intensity[i],
         rgb: p.rgb.as_ref().map(|c| c[i]).filter(|_| coloured),
-        quality: p.quality[i],
+        quality: p.quality_known.then_some(p.quality[i]),
         removed,
     }
 }
@@ -173,6 +160,7 @@ struct FrameKey {
     round: bool,
     budget: usize,
     picked: Option<u32>,
+    z_range: [f32; 2],
 }
 
 /// A press of the primary button inside the view, until it is released.
@@ -195,8 +183,14 @@ pub struct View3d {
     drawn: Vec<u32>,
     drawn_points: usize,
     frame_ms: f32,
-    /// The cloud on the GPU is the current one.
+    /// The current cloud's upload has begun (it is filled slice by slice).
     uploaded: bool,
+    /// Bytes written to the GPU in the last frame.
+    last_upload_bytes: u64,
+    /// When the last frame was drawn (for the frame-to-frame time without GPU timer).
+    last_render_at: Option<Instant>,
+    /// The frame time is GPU time (else CPU time between frames).
+    gpu_timed: bool,
     /// Bounds of the cloud, from the upload.
     bounds: Option<([f32; 3], [f32; 3])>,
     /// Show everything at the next frame with a usable size.
@@ -205,12 +199,15 @@ pub struct View3d {
     press: Option<Press>,
     /// The picked point (index in the point set), marked in the view.
     picked: Option<u32>,
+    /// The height cut of this frame (picking uses it too).
+    z_range: [f32; 2],
 }
 
 impl View3d {
     /// The program replaced the cloud: upload it and show all of it at the next frame.
     pub fn cloud_replaced(&mut self) {
         self.uploaded = false;
+        self.last_render_at = None;
         self.picked = None;
         self.drawn.clear();
         self.drawn_points = 0;
@@ -222,9 +219,27 @@ impl View3d {
         self.drawn_points
     }
 
-    /// Time of the last frame drawn (ms): choosing the nodes plus the GPU until done.
+    /// Time of the last frame (ms): the GPU time of its drawing where the device has
+    /// timestamp queries ([`View3d::gpu_timed`]), else the time from the frame before
+    /// while drawing continuously (CPU, includes waiting for the display), else the CPU
+    /// time of choosing and recording. Never waits for the GPU.
     pub fn frame_ms(&self) -> f32 {
         self.frame_ms
+    }
+
+    pub fn gpu_timed(&self) -> bool {
+        self.gpu_timed
+    }
+
+    /// Bytes of the cloud written to the GPU in the last frame (at most
+    /// [`UPLOAD_SLICE_BYTES`]).
+    pub fn last_upload_bytes(&self) -> u64 {
+        self.last_upload_bytes
+    }
+
+    /// Whether the cloud is still being written to the GPU.
+    pub fn is_uploading(&self) -> bool {
+        !self.uploaded || self.renderer.as_ref().is_some_and(|r| !r.upload_done())
     }
 
     pub fn camera(&self) -> &Camera {
@@ -260,15 +275,30 @@ impl View3d {
 
         let renderer = self
             .renderer
-            .get_or_insert_with(|| PointRenderer::new(device, VIEW_FORMAT));
+            .get_or_insert_with(|| PointRenderer::new(device, queue, VIEW_FORMAT));
         if !self.uploaded {
-            let renderer = &mut *renderer;
-            renderer.upload_cloud(device, queue, &cloud.tree);
+            renderer.begin_upload(device, &cloud.tree);
             renderer.set_overlay(device, &[], &[]);
-            self.bounds = view_bounds(&cloud.points);
+            self.bounds = cloud.view_bounds;
             self.uploaded = true;
             self.frame_all = true;
             self.last = None;
+        }
+        self.last_upload_bytes = 0;
+        if !renderer.upload_done() {
+            // A slice per frame; the window stays usable meanwhile.
+            self.last_upload_bytes = renderer.upload_step(queue, &cloud.tree, UPLOAD_SLICE_BYTES);
+            let percent = (renderer.upload_fraction() * 100.0).round();
+            ui.painter().rect_filled(rect, 0.0, background_color());
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                text::uploading(percent),
+                egui::TextStyle::Body.resolve(ui.style()),
+                Color32::LIGHT_GRAY,
+            );
+            ui.ctx().request_repaint();
+            return None;
         }
         if self.frame_all {
             if let Some((min, max)) = self.bounds {
@@ -278,6 +308,7 @@ impl View3d {
         }
         self.camera.set_mode(settings.camera_mode);
 
+        self.z_range = settings.cut.unwrap_or(NO_CUT);
         let event = self.input(ui, &response, rect, ppp, viewport, cloud);
         if let Some(ViewEvent::PickedPoint(i)) = event {
             self.set_picked(device, cloud, Some(i));
@@ -317,6 +348,7 @@ impl View3d {
             round: settings.round,
             budget: settings.budget,
             picked: self.picked,
+            z_range: settings.cut.unwrap_or(NO_CUT),
         };
         if self.last.as_ref() != Some(&key) {
             let started = Instant::now();
@@ -336,28 +368,42 @@ impl View3d {
                 color_mode: key.color_mode,
                 round: key.round,
                 background: BACKGROUND,
+                quality_known: cloud.points.quality_known,
+                z_range: key.z_range,
             };
-            if let (Some(target), Some(renderer)) = (&self.target, &self.renderer) {
+            if let (Some(target), Some(renderer)) = (&self.target, &mut self.renderer) {
                 // `render` writes the shared uniform buffers and submits its own work, so
                 // this frame is complete before anything else is drawn into the view.
-                let submitted =
-                    renderer.render(device, queue, target, &frame, &cloud.tree, &self.drawn);
-                // Waiting here times the GPU work as well; egui could not show the image
-                // before it is done anyway.
-                let _ = device.poll(wgpu::PollType::Wait {
-                    submission_index: Some(submitted),
-                    timeout: Some(GPU_WAIT),
-                });
+                renderer.render(device, queue, target, &frame, &cloud.tree, &self.drawn);
             }
-            self.frame_ms = started.elapsed().as_secs_f32() * 1000.0;
+            let now = Instant::now();
+            self.frame_ms = match self.last_render_at {
+                Some(prev) if now - prev < CONTINUOUS => (now - prev).as_secs_f32() * 1000.0,
+                _ => (now - started).as_secs_f32() * 1000.0,
+            };
+            self.last_render_at = Some(now);
             self.last = Some(key);
         }
 
+        if let Some(renderer) = &mut self.renderer {
+            if let Some(ms) = renderer.gpu_ms(device) {
+                self.frame_ms = ms;
+                self.gpu_timed = true;
+            }
+            if renderer.gpu_timer_pending() {
+                ui.ctx().request_repaint_after(TIMER_POLL);
+            }
+        }
         if let Some(id) = self.texture {
             let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             ui.painter().image(id, rect, uv, Color32::WHITE);
         }
-        let stats = text::drawn_stats(self.drawn_points, cloud.points.len(), self.frame_ms);
+        let stats = text::drawn_stats(
+            self.drawn_points,
+            cloud.points.len(),
+            self.frame_ms,
+            self.gpu_timed,
+        );
         let help = match settings.camera_mode {
             CameraMode::Orbit => text::VIEW_HELP_ORBIT,
             CameraMode::Fly => text::VIEW_HELP_FLY,
@@ -408,6 +454,7 @@ impl View3d {
         viewport: [f32; 2],
         cloud: &LoadedCloud,
     ) -> Option<ViewEvent> {
+        let z_range = self.z_range;
         let ctx = ui.ctx();
         let mode = self.camera.mode;
         let shift = ctx.input(|i| i.modifiers.shift);
@@ -484,13 +531,14 @@ impl View3d {
             if let (Some(p), Some(pos)) = (self.press.take(), pos) {
                 if is_click(p.time, time, p.moved) {
                     let pixel = to_physical([pos.x, pos.y], [rect.min.x, rect.min.y], ppp);
-                    let hit = pick_point(
+                    let hit = pick_point_in(
                         &cloud.tree,
                         &self.drawn,
                         &self.camera,
                         viewport,
                         pixel,
                         PICK_RADIUS * ppp,
+                        z_range,
                     );
                     event = hit.map(|v| ViewEvent::PickedPoint(cloud.tree.source[v as usize]));
                 }
@@ -520,14 +568,16 @@ impl View3d {
         let Some(pos) = pos else {
             return true;
         };
+        let z_range = self.z_range;
         let pixel = to_physical([pos.x, pos.y], [rect.min.x, rect.min.y], ppp);
-        pick_point(
+        pick_point_in(
             &cloud.tree,
             &self.drawn,
             &self.camera,
             viewport,
             pixel,
             PICK_RADIUS * ppp,
+            z_range,
         )
         .is_none()
     }

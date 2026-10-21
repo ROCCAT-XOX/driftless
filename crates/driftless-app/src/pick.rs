@@ -64,6 +64,28 @@ pub fn pick_point(
     pixel_px: [f32; 2],
     radius_px: f32,
 ) -> Option<u32> {
+    pick_point_in(
+        tree,
+        drawn,
+        cam,
+        viewport_px,
+        pixel_px,
+        radius_px,
+        [f32::MIN, f32::MAX],
+    )
+}
+
+/// Like [`pick_point`], but only points whose z lies in `z_range` (inclusive), as the
+/// height cut of the view draws them.
+pub fn pick_point_in(
+    tree: &Octree,
+    drawn: &[u32],
+    cam: &Camera,
+    viewport_px: [f32; 2],
+    pixel_px: [f32; 2],
+    radius_px: f32,
+    z_range: [f32; 2],
+) -> Option<u32> {
     if !valid_viewport(viewport_px) {
         return None;
     }
@@ -77,6 +99,9 @@ pub fn pick_point(
     let mut best: Option<(f32, u32)> = None;
     for &id in drawn {
         let node = &tree.nodes[id as usize];
+        if node.min[2] > z_range[1] || node.max()[2] < z_range[0] {
+            continue;
+        }
         let v = nalgebra::Vector3::from(node.centre()) - ray.origin;
         let along = v.dot(&ray.dir);
         let perp = (v - ray.dir * along).norm();
@@ -88,6 +113,9 @@ pub fn pick_point(
         let range = node.first..node.first + node.count;
         for i in range {
             let p = tree.vertices[i as usize].pos;
+            if p[2] < z_range[0] || p[2] > z_range[1] {
+                continue;
+            }
             let Some((_, z)) = hit(&view_proj, p, viewport_px, pixel_px, radius_px) else {
                 continue;
             };

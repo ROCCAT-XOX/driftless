@@ -108,6 +108,9 @@ pub struct ViewSettings {
     pub show_odometry: bool,
     pub show_loops: bool,
     pub show_submaps: bool,
+    /// Height cut: lowest and highest z drawn (relative to the cloud's origin); `None`
+    /// draws everything. Reset when another cloud is shown.
+    pub cut: Option<[f32; 2]>,
 }
 
 impl Default for ViewSettings {
@@ -122,6 +125,7 @@ impl Default for ViewSettings {
             show_odometry: false,
             show_loops: true,
             show_submaps: false,
+            cut: None,
         }
     }
 }
@@ -132,6 +136,12 @@ pub struct CloudSummary {
     pub path: PathBuf,
     pub points: usize,
     pub has_rgb: bool,
+    /// Whether the cloud has submap qualities (a SLAM report).
+    pub quality_known: bool,
+    /// Lowest and highest relative z.
+    pub z_range: [f32; 2],
+    /// A height just below the ceiling, if one was found.
+    pub ceiling: Option<f32>,
 }
 
 /// The last frame of the 3D view.
@@ -140,6 +150,8 @@ pub struct ViewStats {
     pub drawn: usize,
     pub total: usize,
     pub frame_ms: f32,
+    /// `frame_ms` is GPU time (else time between frames).
+    pub gpu: bool,
 }
 
 /// A scan as the tree shows it. Read from disk by [`AppState::refresh`], not every frame.

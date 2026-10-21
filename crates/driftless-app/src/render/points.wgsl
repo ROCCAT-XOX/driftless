@@ -8,9 +8,11 @@ struct Frame {
     color_mode: u32,
     // 1 = discard outside the circle.
     round: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    // 0 = the cloud has no submap quality: quality mode shows neutral gray.
+    quality_known: u32,
+    // Height cut: points with z outside z_min..z_max are not drawn.
+    z_min: f32,
+    z_max: f32,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -46,8 +48,8 @@ fn vs_main(
     let corner = vec2<f32>(f32(corner_index & 1u), f32(corner_index >> 1u)) * 2.0 - 1.0;
     out.corner = corner;
     let clip = frame.view_proj * vec4<f32>(pos, 1.0);
-    if clip.w <= 0.0 {
-        // Behind the eye: outside the clip volume.
+    if clip.w <= 0.0 || pos.z < frame.z_min || pos.z > frame.z_max {
+        // Behind the eye or cut away: outside the clip volume.
         out.clip = vec4<f32>(0.0, 0.0, -1.0, 1.0);
     } else {
         // Corners ±0.5 point across, in clip space: point_px / viewport_px · 2 · w.
@@ -59,7 +61,11 @@ fn vs_main(
             out.color = vec3<f32>(byte(rgbi, 24u));
         }
         case 2u: {
-            out.color = quality_color(byte(extra, 0u));
+            if frame.quality_known != 0u {
+                out.color = quality_color(byte(extra, 0u));
+            } else {
+                out.color = vec3<f32>(0.5);
+            }
         }
         default: {
             out.color = vec3<f32>(byte(rgbi, 0u), byte(rgbi, 8u), byte(rgbi, 16u));

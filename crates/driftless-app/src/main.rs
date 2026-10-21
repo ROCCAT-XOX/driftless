@@ -3,6 +3,7 @@
 // No console window next to the program on Windows (debug builds keep it for messages).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use driftless_app::render;
 use driftless_app::ui::{parse_args, text, DriftlessApp};
 use eframe::egui;
 use std::process::ExitCode;
@@ -23,6 +24,13 @@ fn main() -> ExitCode {
             .with_title(text::APP_TITLE)
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([800.0, 500.0]),
+        // GPU timestamps where available, for the frame time of the 3D view
+        wgpu_options: egui_wgpu::WgpuConfiguration {
+            wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(render::with_timestamps(
+                egui_wgpu::WgpuSetupCreateNew::without_display_handle(),
+            )),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let result = eframe::run_native(

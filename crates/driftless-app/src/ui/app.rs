@@ -40,16 +40,22 @@ pub struct Args {
     pub synthetic: Option<usize>,
 }
 
-/// Reads the arguments: at most one project folder, `--synthetic N` with 1 ≤ N < 2³².
+/// Reads the arguments: at most one project folder, `--synthetic N` with 1 ≤ N < 2³²
+/// written as digits, optionally grouped with '_' (`50_000_000`).
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut out = Args::default();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "--synthetic" {
             let value = args.next();
+            // digits, optionally grouped with '_' (no signs, no decimal points)
             let n = value
                 .as_deref()
-                .and_then(|v| v.replace(['.', '_'], "").parse::<u32>().ok())
+                .filter(|v| {
+                    v.starts_with(|c: char| c.is_ascii_digit())
+                        && v.chars().all(|c| c.is_ascii_digit() || c == '_')
+                })
+                .and_then(|v| v.replace('_', "").parse::<u32>().ok())
                 .filter(|&n| n > 0)
                 .ok_or_else(|| text::bad_synthetic(value.as_deref()))?;
             out.synthetic = Some(n as usize);
@@ -174,6 +180,15 @@ impl DriftlessApp {
         self.cloud.as_ref()
     }
 
+    pub fn view(&self) -> &View3d {
+        &self.view
+    }
+
+    /// The 3D view (tests and tools move its camera).
+    pub fn view_mut(&mut self) -> &mut View3d {
+        &mut self.view
+    }
+
     /// True while a cloud is loaded or waits to be.
     pub fn is_loading(&self) -> bool {
         self.loader.is_busy() || self.next_load.is_some()
@@ -184,11 +199,17 @@ impl DriftlessApp {
     /// loaded again.
     fn load(&mut self, source: CloudSource) {
         let path = source.path();
-        let shown = self.cloud.as_ref().is_some_and(|c| c.path == path);
-        if self.loading.as_ref().map(CloudSource::path) == Some(path.clone())
-            || (shown && self.loading.is_none())
-        {
+        let cancelling = self.loader.status().is_some_and(|s| s.cancelling);
+        if self.loading.as_ref().map(CloudSource::path) == Some(path.clone()) {
+            // The same load again: keep it running, or, if it is being cancelled for
+            // another one, start it again once it has stopped.
+            self.next_load = cancelling.then_some(source);
+            return;
+        }
+        if self.cloud.as_ref().is_some_and(|c| c.path == path) {
+            // Back to the cloud shown: a load of another one is not needed any more.
             self.next_load = None;
+            self.loader.cancel();
             return;
         }
         if self.loader.is_busy() {
@@ -238,7 +259,11 @@ impl DriftlessApp {
                         path: cloud.path.clone(),
                         points: cloud.points.len(),
                         has_rgb: cloud.points.rgb.is_some(),
+                        quality_known: cloud.points.quality_known,
+                        z_range: cloud.z_range,
+                        ceiling: cloud.ceiling,
                     });
+                    self.state.view.cut = None;
                     self.state.picked = None;
                     self.state.view_stats = None;
                     self.cloud = Some(*cloud);
@@ -687,6 +712,7 @@ impl DriftlessApp {
                 drawn: self.view.drawn_points(),
                 total: cloud.points.len(),
                 frame_ms: self.view.frame_ms(),
+                gpu: self.view.gpu_timed(),
             });
             // the right panel was drawn before the view: show the new numbers next frame
             if stats != self.state.view_stats {

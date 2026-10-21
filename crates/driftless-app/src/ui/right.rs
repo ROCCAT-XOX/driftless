@@ -11,7 +11,7 @@
 
 use super::status::count;
 use super::view3d::{color_modes, effective_color_mode, PointInfo};
-use super::{text, Action, AppState, ScanNode, Selection, ViewSettings};
+use super::{text, Action, AppState, CloudSummary, ScanNode, Selection, ViewSettings};
 use crate::camera::CameraMode;
 use crate::project::{MapInfo, RunInfo, ScanState};
 use crate::render::ColorMode;
@@ -104,9 +104,21 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
             ui.separator();
             let has_rgb = state.cloud.as_ref().is_none_or(|c| c.has_rgb);
             view_settings_edit(ui, &mut state.view, has_rgb);
-            if let Some(stats) = &state.view_stats {
-                ui.label(text::drawn_stats(stats.drawn, stats.total, stats.frame_ms));
+            if state.cloud.as_ref().is_some_and(|c| !c.quality_known) {
+                ui.weak(text::QUALITY_NONE_HINT);
             }
+            if let Some(cloud) = &state.cloud {
+                cut_edit(ui, &mut state.view.cut, cloud);
+            }
+            if let Some(stats) = &state.view_stats {
+                ui.label(text::drawn_stats(
+                    stats.drawn,
+                    stats.total,
+                    stats.frame_ms,
+                    stats.gpu,
+                ));
+            }
+            ui.weak(text::FRAME_ALL_HINT);
             ui.separator();
             point_shown(ui, state.picked.as_ref());
         });
@@ -167,6 +179,50 @@ fn view_settings_edit(ui: &mut Ui, view: &mut ViewSettings, has_rgb: bool) {
     });
 }
 
+/// The height cut: z min / z max over the cloud's z range, „Decke ausblenden“ (z max just
+/// below the estimated ceiling) and „Zurücksetzen“.
+fn cut_edit(ui: &mut Ui, cut: &mut Option<[f32; 2]>, cloud: &CloudSummary) {
+    let [lo, hi] = cloud.z_range;
+    ui.strong(text::CUT).on_hover_text(text::CUT_HINT);
+    let mut range = cut.unwrap_or([lo, hi]);
+    let mut changed = false;
+    for (label, k) in [(text::CUT_Z_MIN, 0), (text::CUT_Z_MAX, 1)] {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            let slider = egui::Slider::new(&mut range[k], lo..=hi.max(lo))
+                .step_by(0.05)
+                .custom_formatter(|v, _| text::height(v as f32))
+                .custom_parser(|s| parse_decimal(s.trim_end_matches('m').trim()));
+            changed |= ui.add(slider).changed();
+        });
+    }
+    if changed {
+        // the other end follows, so that the range never turns over
+        if range[0] > range[1] {
+            range = [range[0].min(range[1]), range[0].max(range[1])];
+        }
+        *cut = Some(range);
+    }
+    ui.horizontal(|ui| {
+        let button = ui.add_enabled(
+            cloud.ceiling.is_some(),
+            egui::Button::new(text::HIDE_CEILING),
+        );
+        if button.clicked() {
+            if let Some(ceiling) = cloud.ceiling {
+                *cut = Some([range[0], ceiling.max(lo)]);
+            }
+        }
+        button.on_disabled_hover_text(text::NO_CEILING);
+        if ui
+            .add_enabled(cut.is_some(), egui::Button::new(text::CUT_RESET))
+            .clicked()
+        {
+            *cut = None;
+        }
+    });
+}
+
 /// A number with a decimal comma or point.
 fn parse_decimal(s: &str) -> Option<f64> {
     s.trim().replace(',', ".").parse().ok()
@@ -209,7 +265,10 @@ pub fn point_lines(info: &PointInfo) -> Vec<(&'static str, String)> {
         ),
         (
             text::POINT_QUALITY,
-            text::decimal(f64::from(info.quality) / 255.0, 2),
+            info.quality.map_or_else(
+                || text::QUALITY_UNKNOWN.to_string(),
+                |q| text::decimal(f64::from(q) / 255.0, 2),
+            ),
         ),
     ];
     if let Some(code) = info.removed {

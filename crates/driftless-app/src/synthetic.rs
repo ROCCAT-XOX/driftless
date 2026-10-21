@@ -102,6 +102,7 @@ pub fn synthetic_cloud(n: usize, seed: u64) -> PointSet {
         intensity,
         t,
         quality,
+        quality_known: true,
         flags,
     }
 }

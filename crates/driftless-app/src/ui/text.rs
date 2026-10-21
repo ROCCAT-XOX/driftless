@@ -111,6 +111,20 @@ pub const POINT_QUALITY: &str = "Güte der Teilkarte";
 pub const POINT_REMOVED: &str = "Entfernt als";
 pub const NO_COLOR: &str = "ohne Farbe";
 pub const NO_POINT: &str = "Kein Punkt angeklickt";
+/// Point info and quality mode of a cloud without SLAM report.
+pub const QUALITY_UNKNOWN: &str = "unbekannt";
+pub const CUT: &str = "Schnitt";
+pub const CUT_Z_MIN: &str = "z min";
+pub const CUT_Z_MAX: &str = "z max";
+pub const HIDE_CEILING: &str = "Decke ausblenden";
+pub const NO_CEILING: &str = "Keine Decke erkannt";
+pub const CUT_RESET: &str = "Zurücksetzen";
+pub const CUT_HINT: &str =
+    "Höhen relativ zum Wolkenursprung; Punkte außerhalb werden weder gezeichnet noch angeklickt";
+/// Hover text of the view: what „alles zeigen“ frames.
+pub const FRAME_ALL_HINT: &str =
+    "Alles zeigen rahmt die Wolke ohne die äußersten 0,5 % je Achse ein (ferne Ausreißer)";
+pub const QUALITY_NONE_HINT: &str = "Ohne SLAM-Bericht: Güte unbekannt, grau gezeigt";
 
 // Check of a scan (right panel)
 pub const INSPECT_RESULT: &str = "Prüfbericht";
@@ -310,14 +324,26 @@ pub fn point_count(n: usize) -> String {
     }
 }
 
-/// „gezeichnet 5,9 Mio. von 15,6 Mio. Punkten · 8,4 ms“.
-pub fn drawn_stats(drawn: usize, total: usize, frame_ms: f32) -> String {
+/// „gezeichnet 5,9 Mio. von 15,6 Mio. Punkten · 8,4 ms GPU“; without GPU timer the time
+/// between frames: „… · 16,7 ms je Bild“.
+pub fn drawn_stats(drawn: usize, total: usize, frame_ms: f32, gpu: bool) -> String {
     format!(
-        "gezeichnet {} von {} Punkten · {} ms",
+        "gezeichnet {} von {} Punkten · {} ms {}",
         point_count(drawn),
         point_count(total),
-        decimal(f64::from(frame_ms), 1)
+        decimal(f64::from(frame_ms), 1),
+        if gpu { "GPU" } else { "je Bild" }
     )
+}
+
+/// „Wolke wird hochgeladen … 40 %“.
+pub fn uploading(percent: f32) -> String {
+    format!("Wolke wird hochgeladen … {percent:.0} %")
+}
+
+/// A height of the cut: „2,85 m“.
+pub fn height(z: f32) -> String {
+    format!("{} m", decimal(f64::from(z), 2))
 }
 
 /// The name of the synthetic cloud of `n` points.

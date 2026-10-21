@@ -96,6 +96,7 @@ fn pick_info_formats_absolute_coordinates() {
     points.intensity = vec![10, 77];
     points.t = vec![0.0, 12.5];
     points.quality = vec![255, 204];
+    points.quality_known = true;
     let c = cloud("/k/color.las", points);
     let info = point_info(&c, 1);
     // f64 origin + f32 relative: millimetres survive
@@ -118,6 +119,70 @@ fn pick_info_formats_absolute_coordinates() {
     assert_eq!(value(text::POINT_COLOR), "200 / 120 / 40");
     assert_eq!(value(text::POINT_QUALITY), "0,80");
     assert!(lines.iter().all(|(l, _)| *l != text::POINT_REMOVED));
+}
+
+/// Without a SLAM report the quality is unknown, not perfect.
+#[test]
+fn pick_info_quality_unknown_without_report() {
+    let points = PointSet::from_xyz([0.0; 3], vec![[1.0, 2.0, 3.0]]);
+    assert!(!points.quality_known);
+    let c = cloud("/k/dense.las", points);
+    let info = point_info(&c, 0);
+    assert_eq!(info.quality, None);
+    let lines = right::point_lines(&info);
+    assert!(lines.contains(&(text::POINT_QUALITY, text::QUALITY_UNKNOWN.to_string())));
+}
+
+/// A box room (floor, four walls, ceiling at 3 m, as the synthetic rooms): the ceiling is
+/// found just below 3 m, above most of the walls; a flat cloud has none.
+#[test]
+fn ceiling_estimate_on_box_room() {
+    use driftless_app::cloud::estimate_ceiling;
+    use driftless_app::synthetic::synthetic_cloud;
+    let room = synthetic_cloud(250_000, 3);
+    let z = estimate_ceiling(&room).expect("ceiling");
+    assert!(z > 2.7 && z < 3.0, "ceiling estimate {z}");
+    // the cut keeps the walls up to there and hides the whole ceiling plate
+    let ceiling_points = room.xyz.iter().filter(|p| p[2] > 2.99).count();
+    let hidden = room.xyz.iter().filter(|p| p[2] > z).count();
+    assert!(hidden >= ceiling_points && hidden < ceiling_points * 2);
+    let floor = PointSet::from_xyz(
+        [0.0; 3],
+        (0..10_000)
+            .map(|i| [(i % 100) as f32 * 0.1, (i / 100) as f32 * 0.1, 0.0])
+            .collect(),
+    );
+    assert_eq!(estimate_ceiling(&floor), None);
+    assert_eq!(estimate_ceiling(&PointSet::default()), None);
+    // computed in the load job, with the z range for the sliders
+    let c = cloud("/k/raum.las", room);
+    assert_eq!(c.ceiling, Some(z));
+    assert!(c.z_range[0] < 0.0 && c.z_range[1] > 3.0);
+}
+
+/// The planner of the sliced upload: never more than the limit per call, every vertex once,
+/// in order.
+#[test]
+fn upload_slices_respect_limit() {
+    use driftless_app::render::{upload_slices, UploadCursor};
+    let chunks = vec![0..10, 10..13, 13..30];
+    let mut cursor = UploadCursor::default();
+    let mut seen = Vec::new();
+    loop {
+        let slices = upload_slices(&chunks, &mut cursor, 4);
+        if slices.is_empty() {
+            break;
+        }
+        let n: u32 = slices.iter().map(|(_, r)| r.end - r.start).sum();
+        assert!(n <= 4 && n > 0, "{slices:?}");
+        for (b, r) in slices {
+            for v in r {
+                seen.push(chunks[b].start + v);
+            }
+        }
+    }
+    assert_eq!(seen, (0..30).collect::<Vec<u32>>());
+    assert_eq!(cursor.block, 3);
 }
 
 #[test]
@@ -183,13 +248,14 @@ fn removed_reason_text() {
 #[test]
 fn drawn_stats_text() {
     assert_eq!(
-        text::drawn_stats(5_900_000, 15_600_000, 8.44),
-        "gezeichnet 5,9 Mio. von 15,6 Mio. Punkten · 8,4 ms"
+        text::drawn_stats(5_900_000, 15_600_000, 8.44, true),
+        "gezeichnet 5,9 Mio. von 15,6 Mio. Punkten · 8,4 ms GPU"
     );
     assert_eq!(
-        text::drawn_stats(300_000, 300_000, 1.0),
-        "gezeichnet 300.000 von 300.000 Punkten · 1,0 ms"
+        text::drawn_stats(300_000, 300_000, 16.7, false),
+        "gezeichnet 300.000 von 300.000 Punkten · 16,7 ms je Bild"
     );
+    assert_eq!(text::uploading(40.0), "Wolke wird hochgeladen … 40 %");
 }
 
 #[test]
@@ -257,7 +323,58 @@ fn view_shows_point_colours_unchanged() {
     }
 }
 
-/// The time of a frame of the 3D view (choosing the nodes plus the GPU) while orbiting a
+/// A new cloud reaches the GPU in slices: no frame writes more than
+/// [`UPLOAD_SLICE_BYTES`], the view says so meanwhile, and then draws the whole cloud.
+#[test]
+fn upload_is_spread_over_frames() {
+    use driftless_app::ui::view3d::UPLOAD_SLICE_BYTES;
+    use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
+    use egui_kittest::Harness;
+    if headless_device().is_none() {
+        eprintln!("kein GPU-Adapter, Test übersprungen");
+        return;
+    }
+    // 3 million points: 60 MB, more than one slice
+    let points = driftless_app::synthetic::synthetic_cloud(3_000_000, 2);
+    let c = cloud("/k/gross.las", points);
+    let total = c.tree.vertices.len() as u64 * driftless_app::render::VERTEX_BYTES;
+    assert!(total > UPLOAD_SLICE_BYTES);
+    let rs = create_render_state(
+        default_wgpu_setup(),
+        egui_wgpu::RendererOptions::PREDICTABLE,
+    );
+    let r = rs.clone();
+    let mut h = Harness::builder()
+        .with_size([300.0, 200.0])
+        .renderer(WgpuTestRenderer::from_render_state(rs))
+        .build_ui_state(
+            move |ui, (view, c): &mut (View3d, Option<LoadedCloud>)| {
+                egui::CentralPanel::no_frame().show(ui, |ui| {
+                    view.show(ui, &r, c.as_ref(), &ViewSettings::default());
+                });
+            },
+            (View3d::default(), None),
+        );
+    // the cloud arrives after the harness has settled, as from the loader
+    h.state_mut().1 = Some(c);
+    let mut written = 0;
+    let mut frames = 0;
+    while frames == 0 || h.state().0.is_uploading() {
+        h.step();
+        let bytes = h.state().0.last_upload_bytes();
+        assert!(bytes <= UPLOAD_SLICE_BYTES, "{bytes} bytes in one frame");
+        written += bytes;
+        frames += 1;
+        assert!(frames < 100);
+    }
+    assert_eq!(written, total);
+    assert!(frames >= 2, "{frames} frames");
+    h.step();
+    assert!(h.state().0.drawn_points() > 0);
+}
+
+/// The GPU time of a frame of the 3D view (timestamp queries; without them the time
+/// between frames) and the time of a UI step, while orbiting a
 /// synthetic cloud of 50 million points, at budgets of 6 and 12 million, in a view of
 /// 1000 × 800 points at 2 pixels per point (Retina). Only prints. Run with
 /// `cargo test -p driftless-app --release --test view3d -- --ignored --nocapture`.
@@ -281,13 +398,16 @@ fn synthetic_50m_frame_time() {
         "{}: generated {generate:.1} s, octree {:.1} s",
         info.name, c.build_seconds
     );
-    let rs = create_render_state(
-        default_wgpu_setup(),
-        egui_wgpu::RendererOptions::PREDICTABLE,
-    );
+    // with GPU timestamps where the adapter has them, as the program asks for
+    let setup = match default_wgpu_setup() {
+        egui_wgpu::WgpuSetup::CreateNew(s) => {
+            egui_wgpu::WgpuSetup::CreateNew(driftless_app::render::with_timestamps(s))
+        }
+        other => other,
+    };
+    let rs = create_render_state(setup, egui_wgpu::RendererOptions::PREDICTABLE);
     let r = rs.clone();
     let state = (View3d::default(), c, ViewSettings::default());
-    // building the harness draws the first frame: upload (UI thread) and pipelines
     let t = Instant::now();
     let mut h = Harness::builder()
         .with_size([1000.0, 800.0])
@@ -301,13 +421,21 @@ fn synthetic_50m_frame_time() {
             },
             state,
         );
+    // the upload in slices: the longest frame meanwhile
+    let mut longest = t.elapsed().as_secs_f64();
+    let mut frames = 1;
+    while h.state().0.is_uploading() {
+        let t = Instant::now();
+        h.step();
+        longest = longest.max(t.elapsed().as_secs_f64());
+        frames += 1;
+    }
     eprintln!(
-        "first frame with upload {:.0} ms",
-        t.elapsed().as_secs_f64() * 1000.0
+        "upload over {frames} frames, longest frame {:.0} ms",
+        longest * 1000.0
     );
     for budget in [6_000_000, 12_000_000] {
         h.state_mut().2.budget = budget;
-        // the first frames upload the cloud and build the pipelines
         for _ in 0..3 {
             h.step();
         }
@@ -316,20 +444,28 @@ fn synthetic_50m_frame_time() {
             let full = view.camera().distance;
             view.camera_mut().distance = full * distance;
             let mut times = Vec::new();
+            let mut steps = Vec::new();
             let mut drawn = 0;
             for _ in 0..60 {
                 h.state_mut().0.camera_mut().orbit(6.0, 0.0);
+                let t = Instant::now();
                 h.step();
+                steps.push(t.elapsed().as_secs_f32() * 1000.0);
+                // paced like a 60 Hz display, so that the GPU times come back in between
+                std::thread::sleep(std::time::Duration::from_millis(16));
                 times.push(h.state().0.frame_ms());
                 drawn = h.state().0.drawn_points();
             }
+            steps.sort_by(f32::total_cmp);
+            let gpu = h.state().0.gpu_timed();
             h.state_mut().0.camera_mut().distance = full;
             times.sort_by(f32::total_cmp);
             eprintln!(
-                "budget {budget}, distance ×{distance}: {drawn} points drawn, frame median {:.1} ms, 90 % {:.1} ms, max {:.1} ms",
+                "budget {budget}, distance ×{distance}: {drawn} points drawn, frame (GPU: {gpu}) median {:.1} ms, 90 % {:.1} ms, max {:.1} ms; UI step median {:.1} ms",
                 times[times.len() / 2],
                 times[times.len() * 9 / 10],
-                times[times.len() - 1]
+                times[times.len() - 1],
+                steps[steps.len() / 2]
             );
         }
     }
