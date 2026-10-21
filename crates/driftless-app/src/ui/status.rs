@@ -18,22 +18,25 @@ pub fn show(ui: &mut Ui, state: &AppState) -> Option<Action> {
         Some(job) => job_line(ui, job, &mut action),
         None => message_line(ui, state.messages.last(), &mut action),
     });
-    let header = format!("{} ({})", text::LOG, state.log.len());
-    egui::CollapsingHeader::new(header)
+    egui::CollapsingHeader::new(text::log_header(state.log.len()))
         .id_salt("protokoll")
         .default_open(false)
         .show(ui, |ui| {
+            // Only the visible lines are laid out: the log holds up to 10 000.
+            let row = ui.text_style_height(&egui::TextStyle::Body);
             egui::ScrollArea::vertical()
                 .max_height(LOG_HEIGHT)
                 .auto_shrink([false, true])
                 .stick_to_bottom(true)
-                .show(ui, |ui| {
+                .show_rows(ui, row, state.log.len(), |ui, rows| {
                     let warn = ui.visuals().warn_fg_color;
-                    for line in &state.log {
-                        match line {
-                            LogLine::Info(t) => ui.label(t),
-                            LogLine::Warning(t) => ui.label(RichText::new(t).color(warn)),
+                    for line in &state.log[rows] {
+                        let label = match line {
+                            LogLine::Info(t) => egui::Label::new(t),
+                            LogLine::Warning(t) => egui::Label::new(RichText::new(t).color(warn)),
                         };
+                        // one row per line, so that the row height holds
+                        ui.add(label.truncate());
                     }
                 });
         });
@@ -66,7 +69,7 @@ fn job_line(ui: &mut Ui, job: &JobStatus, action: &mut Option<Action>) {
             }
         }
     }
-    ui.label(duration(job.seconds));
+    ui.label(text::duration(job.seconds));
     if job.cancelling {
         ui.add_enabled(false, egui::Button::new(text::CANCELLING));
     } else if ui.button(text::CANCEL).clicked() {
@@ -102,14 +105,4 @@ pub fn count(n: u64) -> String {
         out.push(c);
     }
     out
-}
-
-/// „12 s“ below a minute, else „3:05 min“ (seconds cut off, not rounded).
-pub fn duration(seconds: f64) -> String {
-    let s = seconds.max(0.0) as u64;
-    if s < 60 {
-        format!("{s} s")
-    } else {
-        format!("{}:{:02} min", s / 60, s % 60)
-    }
 }

@@ -14,7 +14,7 @@ fn main() -> ExitCode {
     let project = match parse_args(std::env::args().skip(1)) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Fehler: {e}");
+            report(&text::start_error(&e));
             return ExitCode::from(2);
         }
     };
@@ -33,8 +33,21 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("Fehler: Fenster nicht startbar: {e}");
+            report(&text::window_failed(&e.to_string()));
             ExitCode::FAILURE
         }
     }
+}
+
+/// An error before or instead of the window: on stderr, and where a release build has no
+/// console (Windows) also in a message box.
+fn report(message: &str) {
+    eprintln!("{message}");
+    #[cfg(all(windows, not(debug_assertions)))]
+    let _ = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title(text::APP_TITLE)
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }

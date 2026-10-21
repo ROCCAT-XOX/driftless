@@ -1,7 +1,9 @@
-//! Every text the window shows, in one place (German). Texts built from values are
-//! functions next to the panel that builds them; their fixed parts are here.
+//! Every text the program shows, in one place (German): fixed texts as constants, texts
+//! with values as small functions.
 
 pub const APP_TITLE: &str = "Driftless";
+/// Name of a new project whose folder has no name (a drive root).
+pub const DEFAULT_PROJECT_NAME: &str = "Projekt";
 
 // Project
 pub const NEW_PROJECT: &str = "Neues Projekt …";
@@ -42,3 +44,62 @@ pub const SWITCH_AFTER_CANCEL: &str =
     "Der laufende Schritt wird abgebrochen; danach wird das andere Projekt geöffnet";
 pub const NOT_YET: &str = "Noch nicht verfügbar";
 pub const LAST_PROJECT_GONE: &str = "Zuletzt geöffnetes Projekt nicht lesbar";
+pub const CLOSE_AFTER_CANCEL: &str =
+    "Der laufende Schritt wird abgebrochen; danach schließt das Fenster";
+const USAGE: &str = "Aufruf: driftless-app [projekt-ordner]";
+
+pub fn project_opened(name: &str) -> String {
+    format!("Projekt {name} geöffnet")
+}
+
+pub fn scan_missing(name: &str) -> String {
+    format!("{name} ({SCAN_MISSING})")
+}
+
+pub fn log_header(lines: usize) -> String {
+    format!("{LOG} ({lines})")
+}
+
+pub fn job_done(label: &str, duration: &str) -> String {
+    format!("{label} {JOB_DONE} ({duration})")
+}
+
+pub fn job_cancelled(label: &str) -> String {
+    format!("{label} {JOB_CANCELLED}")
+}
+
+pub fn job_failed(label: &str, error: &str) -> String {
+    format!("{label}: {error}")
+}
+
+pub fn last_project_gone(error: &str) -> String {
+    format!("{LAST_PROJECT_GONE}: {error}")
+}
+
+// Start (command line)
+pub fn unknown_option(arg: &str) -> String {
+    format!("unbekannte Option {arg}; {USAGE}")
+}
+
+pub fn one_project_only() -> String {
+    format!("nur ein Projektordner möglich; {USAGE}")
+}
+
+/// An error at start, before the window exists (stderr and, without console, a message box).
+pub fn start_error(error: &str) -> String {
+    format!("Fehler: {error}")
+}
+
+pub fn window_failed(error: &str) -> String {
+    format!("Fehler: Fenster nicht startbar: {error}")
+}
+
+/// „12 s“ below a minute, else „3:05 min“ (seconds cut off, not rounded).
+pub fn duration(seconds: f64) -> String {
+    let s = seconds.max(0.0) as u64;
+    if s < 60 {
+        format!("{s} s")
+    } else {
+        format!("{}:{:02} min", s / 60, s % 60)
+    }
+}

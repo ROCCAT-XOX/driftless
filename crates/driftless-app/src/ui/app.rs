@@ -2,7 +2,7 @@
 
 use super::{left, status, text, Action, AppState, Selection, UiMessage};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
-use crate::project::Project;
+use crate::project::{canonical, Project};
 use driftless_io::progress::Progress;
 use driftless_steps::StepError;
 use eframe::egui;
@@ -17,6 +17,8 @@ const LAST_PROJECT_KEY: &str = "letztes_projekt";
 const REPAINT_WHILE_BUSY: Duration = Duration::from_millis(100);
 /// Lines kept in the log; older ones are dropped.
 const LOG_LIMIT: usize = 10_000;
+/// Messages kept for the status bar (it shows the last); older ones are dropped.
+const MESSAGE_LIMIT: usize = 100;
 const LEFT_WIDTH: f32 = 280.0;
 
 /// The arguments of `driftless-app`: at most one project folder.
@@ -24,14 +26,10 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<PathB
     let mut project = None;
     for arg in args {
         if arg.starts_with('-') {
-            return Err(format!(
-                "unbekannte Option {arg}; Aufruf: driftless-app [projekt-ordner]"
-            ));
+            return Err(text::unknown_option(&arg));
         }
         if project.is_some() {
-            return Err(
-                "nur ein Projektordner möglich; Aufruf: driftless-app [projekt-ordner]".into(),
-            );
+            return Err(text::one_project_only());
         }
         project = Some(PathBuf::from(arg));
     }
@@ -48,6 +46,10 @@ pub struct DriftlessApp {
     pending: Option<Action>,
     /// The window title last sent.
     title: String,
+    /// Closing waits for the cancelled step; the window closes once it has ended.
+    closing: bool,
+    /// The stored last project could not be opened: forget it on the next save.
+    forget_last: bool,
 }
 
 impl DriftlessApp {
@@ -58,6 +60,8 @@ impl DriftlessApp {
             jobs: JobRunner::new(repaint),
             pending: None,
             title: String::new(),
+            closing: false,
+            forget_last: false,
         }
     }
 
@@ -70,13 +74,62 @@ impl DriftlessApp {
         let mut app = DriftlessApp::new(Arc::new(move || ctx.request_repaint()));
         if let Some(dir) = project {
             app.apply(Action::OpenProject(dir));
-        } else if let Some(last) = cc.storage.and_then(|s| s.get_string(LAST_PROJECT_KEY)) {
-            match Project::open(Path::new(&last)) {
-                Ok(p) => app.set_project(p),
-                Err(e) => app.error(format!("{}: {e}", text::LAST_PROJECT_GONE)),
-            }
+        } else {
+            let last = cc.storage.and_then(|s| s.get_string(LAST_PROJECT_KEY));
+            app.restore_last(last.as_deref());
         }
         app
+    }
+
+    /// Opens the stored last project (an empty value is none). If it cannot be opened, the
+    /// message is shown once and the value is forgotten ([`DriftlessApp::last_to_store`]).
+    pub fn restore_last(&mut self, stored: Option<&str>) {
+        let Some(last) = stored.filter(|s| !s.is_empty()) else {
+            return;
+        };
+        match Project::open(Path::new(last)) {
+            Ok(p) => self.set_project(p),
+            Err(e) => {
+                self.error(text::last_project_gone(&e.to_string()));
+                self.forget_last = true;
+            }
+        }
+    }
+
+    /// What to store as the last project: the open one, empty to forget a gone one, `None`
+    /// to keep what is stored. A folder whose path is not valid UTF-8 is not stored (the
+    /// storage holds text, and a changed path would point elsewhere).
+    pub fn last_to_store(&self) -> Option<String> {
+        match &self.state.project {
+            Some(p) => p.dir.to_str().map(str::to_string),
+            None if self.forget_last => Some(String::new()),
+            None => None,
+        }
+    }
+
+    /// The window asks to close. While a step runs the close is put off (returns false):
+    /// the step is cancelled and [`DriftlessApp::take_close`] says when to close, so the
+    /// window never waits for it inside the event loop.
+    pub fn close_requested(&mut self) -> bool {
+        if !self.jobs.is_busy() {
+            return true;
+        }
+        if !self.closing {
+            self.closing = true;
+            self.pending = None;
+            self.jobs.cancel();
+            self.info(text::CLOSE_AFTER_CANCEL.to_string());
+        }
+        false
+    }
+
+    /// True once, after a put-off close, when the step has ended.
+    pub fn take_close(&mut self) -> bool {
+        if self.closing && !self.jobs.is_busy() {
+            self.closing = false;
+            return true;
+        }
+        false
     }
 
     pub fn state(&self) -> &AppState {
@@ -111,11 +164,10 @@ impl DriftlessApp {
     }
 
     fn finished(&mut self, f: JobFinished) {
-        let secs = status::duration(f.seconds);
         match f.result {
-            Ok(_) => self.info(format!("{} {} ({secs})", f.label, text::JOB_DONE)),
-            Err(StepError::Cancelled) => self.info(format!("{} {}", f.label, text::JOB_CANCELLED)),
-            Err(StepError::Failed(m)) => self.error(format!("{}: {m}", f.label)),
+            Ok(_) => self.info(text::job_done(&f.label, &text::duration(f.seconds))),
+            Err(StepError::Cancelled) => self.info(text::job_cancelled(&f.label)),
+            Err(StepError::Failed(m)) => self.error(text::job_failed(&f.label, &m)),
         }
         // the step may have added runs or maps
         self.state.refresh();
@@ -131,9 +183,10 @@ impl DriftlessApp {
                     .set_title(text::DIALOG_NEW_PROJECT)
                     .pick_folder()
                 {
-                    let name = dir
-                        .file_name()
-                        .map_or_else(|| "Projekt".into(), |n| n.to_string_lossy().into_owned());
+                    let name = dir.file_name().map_or_else(
+                        || text::DEFAULT_PROJECT_NAME.into(),
+                        |n| n.to_string_lossy().into_owned(),
+                    );
                     self.apply(Action::NewProject { dir, name });
                 }
             }
@@ -144,6 +197,12 @@ impl DriftlessApp {
                 {
                     self.apply(Action::OpenProject(dir));
                 }
+            }
+            Action::OpenProject(dir) if self.is_open(&dir) => {
+                // already shown: nothing to switch, nothing to cancel (a pending switch to
+                // another project is dropped, the user chose this one)
+                self.pending = None;
+                self.state.refresh();
             }
             switch @ (Action::OpenProject(_) | Action::NewProject { .. })
                 if self.jobs.is_busy() =>
@@ -203,8 +262,15 @@ impl DriftlessApp {
     }
 
     fn set_project(&mut self, project: Project) {
-        self.info(format!("Projekt {} geöffnet", project.name));
+        self.info(text::project_opened(&project.name));
         self.state.set_project(project);
+    }
+
+    fn is_open(&self, dir: &Path) -> bool {
+        match (&self.state.project, canonical(dir)) {
+            (Some(p), Ok(dir)) => p.dir == dir,
+            _ => false,
+        }
     }
 
     /// Changes a copy of the project and saves it; only a saved change is shown, so the
@@ -227,11 +293,18 @@ impl DriftlessApp {
     }
 
     fn info(&mut self, text: String) {
-        self.state.messages.push(UiMessage::Info(text));
+        self.message(UiMessage::Info(text));
     }
 
     fn error(&mut self, text: String) {
-        self.state.messages.push(UiMessage::Error(text));
+        self.message(UiMessage::Error(text));
+    }
+
+    fn message(&mut self, m: UiMessage) {
+        let messages = &mut self.state.messages;
+        messages.push(m);
+        let over = messages.len().saturating_sub(MESSAGE_LIMIT);
+        messages.drain(..over);
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
@@ -244,15 +317,21 @@ impl DriftlessApp {
             self.title = title;
         }
     }
-}
 
-impl eframe::App for DriftlessApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.tick();
-        if self.wants_repaint_while_busy() {
-            ui.ctx().request_repaint_after(REPAINT_WHILE_BUSY);
+    /// One frame of the window (what [`eframe::App::ui`] does; without eframe for tests).
+    pub fn show(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.viewport().close_requested()) && !self.close_requested() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        self.update_title(ui.ctx());
+        self.tick();
+        if self.take_close() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if self.wants_repaint_while_busy() {
+            ctx.request_repaint_after(REPAINT_WHILE_BUSY);
+        }
+        self.update_title(&ctx);
 
         let mut actions: Vec<Action> = Vec::new();
         let has_project = self.state.project.is_some();
@@ -289,10 +368,16 @@ impl eframe::App for DriftlessApp {
             self.apply(action);
         }
     }
+}
+
+impl eframe::App for DriftlessApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show(ui);
+    }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if let Some(p) = &self.state.project {
-            storage.set_string(LAST_PROJECT_KEY, p.dir.to_string_lossy().into_owned());
+        if let Some(last) = self.last_to_store() {
+            storage.set_string(LAST_PROJECT_KEY, last);
         }
     }
 }

@@ -43,7 +43,7 @@ fn scan_node(ui: &mut Ui, state: &AppState, scan: &ScanNode, action: &mut Option
         |ui| match &scan.state {
             ScanState::Ready => ui.selectable_label(selected, &scan.name),
             ScanState::Missing(reason) => {
-                let label = format!("{} ({})", scan.name, text::SCAN_MISSING);
+                let label = text::scan_missing(&scan.name);
                 let weak = ui.visuals().weak_text_color();
                 ui.selectable_label(selected, RichText::new(label).color(weak))
                     .on_hover_text(reason)
