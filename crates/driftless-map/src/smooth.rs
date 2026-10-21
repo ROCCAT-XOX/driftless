@@ -124,8 +124,8 @@ fn fit(pts: impl Iterator<Item = Vector3<f64>>) -> (Vector3<f64>, Vector3<f64>, 
 }
 
 /// New position of point `p` given its neighbours `rel` (relative to `p`, `p` itself
-/// included, nearest first; the first `inner` within half the radius): the projection onto their plane, capped at `max_shift`, or
-/// `None` if they do not lie on a plane.
+/// included, nearest first; the first `inner` within half the radius): the projection onto
+/// their plane, capped at `max_shift`, or `None` if they do not lie on a plane.
 ///
 /// Near an edge a few points of the other surface pass the planarity test and tilt the plane
 /// towards them, and a tilted plane keeps them as inliers. The plane the point moves onto is

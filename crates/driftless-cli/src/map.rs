@@ -23,7 +23,7 @@ use driftless_io::project::{discover_project, Project};
 use driftless_map::{
     build_dense, clean, colorize, content_hash, load_stage, save_stage, write_las, write_ply,
     write_removed_las, CleanConfig, CleanStats, Cloud, ColorCamera, ColorConfig, ColorStats,
-    DenseConfig, DenseStats, ImageSource, RaySource, StageError,
+    DenseConfig, DenseStats, ExposureConfig, ImageSource, RaySource, SmoothConfig, StageError,
 };
 use driftless_odom::OdomConfig;
 use driftless_slam::SlamConfig;
@@ -71,6 +71,19 @@ pub struct Args {
     /// Ausreißer nicht entfernen
     #[arg(long)]
     no_outliers: bool,
+    /// Durchblick-Punkte (hinter Fenstern gemessen) nicht entfernen
+    #[arg(long)]
+    no_through: bool,
+    /// Wände nicht auf ihre lokale Ebene glätten
+    #[arg(long)]
+    no_smooth: bool,
+    /// Glanzlichter beim Einfärben abwerten (experimentell: senkt Spiegelungen auf Böden, macht
+    /// aber die Übergänge zwischen Bildern sichtbarer)
+    #[arg(long)]
+    highlights: bool,
+    /// Randabfall der Kameras nicht mitschätzen
+    #[arg(long)]
+    no_vignetting: bool,
     /// Voxelgröße der dichten Wolke in m (ein Punkt je Voxel)
     #[arg(long, value_name = "M", default_value_t = DenseConfig::default().voxel)]
     voxel: f64,
@@ -270,7 +283,8 @@ fn color_warnings(s: &ColorStats) -> Vec<String> {
                 .into(),
         );
     }
-    if s.images_gain_clamped > 0 {
+    // More than 1 % of the images.
+    if s.images_gain_clamped * 100 > s.images_used {
         out.push(format!(
             "{} Bilder ({:.0} %) stoßen an die Grenze des Belichtungsabgleichs",
             s.images_gain_clamped,
@@ -326,6 +340,14 @@ fn color_json(s: &ColorStats, cameras: &[&str]) -> Value {
         "images_blurry": s.images_blurry,
         "images_outside_trajectory": s.images_outside_trajectory,
         "images_bad": s.images_bad,
+        "sharpness_brightness_rank_corr": s.sharpness_brightness_rank_corr,
+        "views_rejected": s.views_rejected,
+        "points_with_rejected": s.points_with_rejected,
+        "views_rim_excluded": s.views_rim_excluded,
+        "floor_highlight_share_before": s.floor_highlight_share_before,
+        "floor_highlight_share_after": s.floor_highlight_share_after,
+        "seam_jump_before": s.seam_jump_before,
+        "seam_jump_after": s.seam_jump_after,
         "image_bags_truncated": s.image_bags_truncated,
         "points_colored": s.points_colored,
         "points_uncolored": s.points_uncolored,
@@ -399,6 +421,11 @@ fn settings_json(
             "max_angular_rate": k.max_angular_rate,
             "views_kept": k.views_kept,
             "views_blended": k.views_blended,
+            "view_gap": k.view_gap,
+            "highlights": k.highlights,
+            "highlight_ratio": k.highlight_ratio,
+            "highlight_abs": k.highlight_abs,
+            "rim_theta": k.rim_theta,
             "exposure": {
                 "smooth": k.exposure.smooth,
                 "max_gain": k.exposure.max_gain,
@@ -623,6 +650,19 @@ impl MapRun<'_> {
             stats.gain_max,
             start.elapsed().as_secs_f64()
         );
+        println!(
+            "Farbqualität: {} Glanzansichten verworfen ({} Punkte), {} Randansichten ausgelassen; \
+             Bodenglanz {:.1} → {:.1} %, Nahtsprung {:.1} → {:.1}, Randabfall {:.1} → {:.1} %",
+            stats.views_rejected,
+            stats.points_with_rejected,
+            stats.views_rim_excluded,
+            100.0 * stats.floor_highlight_share_before,
+            100.0 * stats.floor_highlight_share_after,
+            stats.seam_jump_before,
+            stats.seam_jump_after,
+            stats.vignette_residual_before,
+            stats.vignette_residual_after
+        );
         let id = self.ids.color.clone().expect("colour input exists");
         let names: Vec<&str> = input.cams.iter().map(|c| c.camera.name.as_str()).collect();
         self.record(
@@ -727,10 +767,20 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
     let clean_cfg = CleanConfig {
         ghosts: !args.no_ghosts,
         outliers: !args.no_outliers,
+        through: !args.no_through,
+        smooth: SmoothConfig {
+            enabled: !args.no_smooth,
+            ..SmoothConfig::default()
+        },
         ..CleanConfig::default()
     };
     let color_cfg = ColorConfig {
         downscale: args.downscale,
+        highlights: args.highlights,
+        exposure: ExposureConfig {
+            vignetting: !args.no_vignetting,
+            ..ExposureConfig::default()
+        },
         ..ColorConfig::default()
     };
     let dense_id = format!(
@@ -877,6 +927,18 @@ mod tests {
         let w = color_warnings(&s);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("abgeschnitten"), "{w:?}");
+    }
+
+    #[test]
+    fn clamped_gains_warn_above_one_percent_only() {
+        let clamped = |n| ColorStats {
+            images_used: 200,
+            images_gain_clamped: n,
+            ..ColorStats::default()
+        };
+        assert!(color_warnings(&clamped(0)).is_empty());
+        assert!(color_warnings(&clamped(2)).is_empty(), "exactly 1 %");
+        assert_eq!(color_warnings(&clamped(3)).len(), 1);
     }
 
     #[test]

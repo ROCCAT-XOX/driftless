@@ -173,7 +173,10 @@ fn map_all_writes_outputs() {
         .stdout(predicate::str::contains("Dicht:"))
         .stdout(predicate::str::contains("Bereinigt:"))
         .stdout(predicate::str::contains("Geister"))
+        .stdout(predicate::str::contains("Durchblick"))
+        .stdout(predicate::str::contains("Wanddicke"))
         .stdout(predicate::str::contains("Eingefärbt:"))
+        .stdout(predicate::str::contains("Glanzansichten"))
         .stdout(predicate::str::contains(format!("Bilder {IMAGES} genutzt")))
         .stdout(predicate::str::contains("Laufzeit"));
     for f in [
@@ -209,6 +212,32 @@ fn map_all_writes_outputs() {
     assert_eq!(json["settings"]["clean"]["ghosts"], true);
     assert_eq!(json["settings"]["clean"]["through"], true);
     assert_eq!(json["settings"]["color"]["downscale"], 2);
+    assert_eq!(json["settings"]["clean"]["smooth"]["enabled"], true);
+    assert_eq!(json["settings"]["color"]["highlights"], false);
+    assert_eq!(json["settings"]["color"]["exposure"]["vignetting"], true);
+    for k in ["view_gap", "highlight_ratio", "highlight_abs", "rim_theta"] {
+        assert!(json["settings"]["color"][k].is_number(), "{k}");
+    }
+    let smooth = &steps["clean"]["stats"]["smooth"];
+    for k in ["moved", "mean_shift", "thickness_before", "thickness_after"] {
+        assert!(smooth[k].is_number(), "smooth.{k}");
+    }
+    for k in [
+        "views_rejected",
+        "points_with_rejected",
+        "views_rim_excluded",
+        "floor_highlight_share_before",
+        "floor_highlight_share_after",
+        "seam_jump_before",
+        "seam_jump_after",
+        "vignette_residual_before",
+        "vignette_residual_after",
+        "sharpness_brightness_rank_corr",
+    ] {
+        assert!(color[k].is_number(), "color.{k}");
+    }
+    assert!(color["gains"]["clamped_images"].is_number());
+    assert!(color["vignetting"]["left"].is_array());
     if cfg!(any(unix, windows)) {
         assert!(json["peak_rss_bytes"].as_u64().unwrap() > 1_000_000);
     }
@@ -218,6 +247,10 @@ fn map_all_writes_outputs() {
     assert_eq!(removed, ghosts + through + outliers);
     let points = las_points(&out.join("color.las"));
     assert_eq!(points.len() as u64, kept);
+    // `user_data` marks the points without a measured colour.
+    let uncolored = points.iter().filter(|p| p.user_data == 1).count() as u64;
+    assert_eq!(uncolored, color["points_uncolored"].as_u64().unwrap());
+    assert!(uncolored > 0 && uncolored < kept, "{uncolored} of {kept}");
     // The plain +x wall in front of the camera has its colour.
     let wall: Vec<las::Color> = points
         .iter()
@@ -387,6 +420,97 @@ fn map_step_color_reuses_clean() {
             "color.ply"
         ])
     );
+}
+
+#[test]
+fn map_no_smooth_keeps_dense_coordinates() {
+    let dir = tmp("map-nosmooth");
+    scan_with_images(&dir);
+    let out = dir.join("out");
+    slam(&dir, &out);
+    map(
+        &dir,
+        &out,
+        &["--step", "clean", "--no-smooth", "--no-through"],
+    )
+    .success()
+    .stdout(predicate::str::contains("geglättet").not());
+    let json = map_json(&out);
+    assert_eq!(json["settings"]["clean"]["smooth"]["enabled"], false);
+    assert_eq!(json["settings"]["clean"]["through"], false);
+    let stats = &json["steps"]["clean"]["stats"];
+    assert_eq!(stats["smooth"]["moved"], 0);
+    assert_eq!(stats["through"], 0);
+    // Every kept point is a dense point, unchanged (both LAS files round the same way).
+    let key = |p: &las::Point| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits());
+    let dense: std::collections::HashSet<_> =
+        las_points(&out.join("dense.las")).iter().map(key).collect();
+    let clean = las_points(&out.join("clean.las"));
+    assert!(clean.len() > 1000);
+    assert!(clean.iter().all(|p| dense.contains(&key(p))));
+
+    // The switches change the step ids: the smoothed result is not reused.
+    map(&dir, &out, &["--step", "clean"])
+        .success()
+        .stdout(predicate::str::contains("Wanddicke"));
+    assert_eq!(
+        map_json(&out)["settings"]["clean"]["smooth"]["enabled"],
+        true
+    );
+}
+
+#[test]
+fn map_switches_are_recorded() {
+    let dir = tmp("map-switches");
+    scan_with_images(&dir);
+    let out = dir.join("out");
+    slam(&dir, &out);
+    map(&dir, &out, &["--highlights", "--no-vignetting"]).success();
+    let s = map_json(&out)["settings"].clone();
+    assert_eq!(s["color"]["highlights"], true);
+    assert_eq!(s["color"]["exposure"]["vignetting"], false);
+}
+
+#[test]
+fn m3_folder_is_rebuilt_not_misread() {
+    let dir = tmp("map-m3");
+    scan_with_images(&dir);
+    let out = dir.join("out");
+    slam(&dir, &out);
+    map(&dir, &out, &[]).success();
+    let clean = fs::read(out.join("clean.las")).unwrap();
+
+    // Make the folder look like Meilenstein 3: the step files carry another input id and
+    // map.json has no entry that fits.
+    for f in ["dense.bin", "clean.bin"] {
+        // Layout: magic (4), version (4), hash of the input id (8).
+        let mut bytes = fs::read(out.join(f)).unwrap();
+        bytes[8..16].copy_from_slice(&driftless_map::content_hash(b"meilenstein-3").to_le_bytes());
+        fs::write(out.join(f), bytes).unwrap();
+    }
+    let mut json = map_json(&out);
+    for step in ["dense", "clean", "color"] {
+        json["steps"][step]["input_id"] = "0000000000000000".into();
+    }
+    fs::write(out.join("map.json"), json.to_string()).unwrap();
+
+    map(&dir, &out, &["--step", "clean"])
+        .success()
+        .stdout(predicate::str::contains(
+            "dense.bin gehört zu einer anderen Eingabe",
+        ))
+        .stdout(predicate::str::contains("Dicht:"))
+        .stdout(predicate::str::contains("Bereinigt:"))
+        // The colour files are from the "old" run and no longer fit: warned, not deleted.
+        .stderr(predicate::str::contains(
+            "color.las, color.ply stammen aus einem früheren Lauf",
+        ));
+    assert_eq!(fs::read(out.join("clean.las")).unwrap(), clean);
+    let json = map_json(&out);
+    assert_eq!(json["steps"]["dense"]["reused"], false);
+    assert_eq!(json["steps"]["clean"]["reused"], false);
+    assert!(json["steps"]["color"].is_null());
+    assert_eq!(json["stale"], serde_json::json!(["color.las", "color.ply"]));
 }
 
 #[test]
