@@ -1,0 +1,106 @@
+diff --git a/include/glim/mapping/callbacks.hpp b/include/glim/mapping/callbacks.hpp
+index 0abfff1..e551e04 100644
+--- a/include/glim/mapping/callbacks.hpp
++++ b/include/glim/mapping/callbacks.hpp
+@@ -17,8 +17,8 @@ class NonlinearFactorGraph;
+ 
+ namespace gtsam_points {
+ class ISAM2Ext;
+-class ISAM2ResultExt;
+-class LevenbergMarquardtOptimizationStatus;
++struct ISAM2ResultExt;
++struct LevenbergMarquardtOptimizationStatus;
+ }  // namespace gtsam_points
+ 
+ namespace glim {
+diff --git a/include/glim/mapping/global_mapping_pose_graph.hpp b/include/glim/mapping/global_mapping_pose_graph.hpp
+index 379acf6..22f5987 100644
+--- a/include/glim/mapping/global_mapping_pose_graph.hpp
++++ b/include/glim/mapping/global_mapping_pose_graph.hpp
+@@ -20,7 +20,7 @@ class ISAM2Ext;
+ class StreamTempBufferRoundRobin;
+ 
+ class GaussianVoxelMap;
+-class NearestNeighborSearch;
++struct NearestNeighborSearch;
+ }  // namespace gtsam_points
+ 
+ namespace glim {
+diff --git a/include/glim/odometry/loose_initial_state_estimation.hpp b/include/glim/odometry/loose_initial_state_estimation.hpp
+index a44d7a2..2b25d96 100644
+--- a/include/glim/odometry/loose_initial_state_estimation.hpp
++++ b/include/glim/odometry/loose_initial_state_estimation.hpp
+@@ -6,7 +6,7 @@
+ namespace gtsam_points {
+ struct FlatContainer;
+ template <typename VoxelContents>
+-class IncrementalVoxelMap;
++struct IncrementalVoxelMap;
+ using iVox = IncrementalVoxelMap<FlatContainer>;
+ }  // namespace gtsam_points
+ 
+diff --git a/include/glim/odometry/odometry_estimation_cpu.hpp b/include/glim/odometry/odometry_estimation_cpu.hpp
+index 08bcb76..355fce0 100644
+--- a/include/glim/odometry/odometry_estimation_cpu.hpp
++++ b/include/glim/odometry/odometry_estimation_cpu.hpp
+@@ -7,7 +7,7 @@ namespace gtsam_points {
+ class GaussianVoxelMapCPU;
+ struct FlatContainer;
+ template <typename VoxelContents>
+-class IncrementalVoxelMap;
++struct IncrementalVoxelMap;
+ using iVox = IncrementalVoxelMap<FlatContainer>;
+ }  // namespace gtsam_points
+ 
+diff --git a/include/glim/odometry/odometry_estimation_ct.hpp b/include/glim/odometry/odometry_estimation_ct.hpp
+index cfdf945..1ada7b2 100644
+--- a/include/glim/odometry/odometry_estimation_ct.hpp
++++ b/include/glim/odometry/odometry_estimation_ct.hpp
+@@ -13,7 +13,7 @@ class Values;
+ namespace gtsam_points {
+ struct FlatContainer;
+ template <typename VoxelContents>
+-class IncrementalVoxelMap;
++struct IncrementalVoxelMap;
+ using iVox = IncrementalVoxelMap<FlatContainer>;
+ 
+ class IncrementalCovarianceVoxelMap;
+diff --git a/include/glim/odometry/robust_initial_state_estimation.hpp b/include/glim/odometry/robust_initial_state_estimation.hpp
+index f307cae..1c10851 100644
+--- a/include/glim/odometry/robust_initial_state_estimation.hpp
++++ b/include/glim/odometry/robust_initial_state_estimation.hpp
+@@ -10,7 +10,7 @@ class Values;
+ namespace gtsam_points {
+ struct FlatContainer;
+ template <typename VoxelContents>
+-class IncrementalVoxelMap;
++struct IncrementalVoxelMap;
+ using iVox = IncrementalVoxelMap<FlatContainer>;
+ }  // namespace gtsam_points
+ 
+diff --git a/include/glim/util/data_validator.hpp b/include/glim/util/data_validator.hpp
+index 9314de0..05624ed 100644
+--- a/include/glim/util/data_validator.hpp
++++ b/include/glim/util/data_validator.hpp
+@@ -6,7 +6,7 @@
+ 
+ namespace glim {
+ 
+-class RawPoints;
++struct RawPoints;
+ class TimeKeeper;
+ 
+ class DataValidator {
+diff --git a/include/glim/viewer/interactive_viewer.hpp b/include/glim/viewer/interactive_viewer.hpp
+index fd6fa8d..63d323a 100644
+--- a/include/glim/viewer/interactive_viewer.hpp
++++ b/include/glim/viewer/interactive_viewer.hpp
+@@ -25,7 +25,7 @@ class NonlinearFactorGraph;
+ 
+ namespace gtsam_points {
+ class ISAM2Ext;
+-class ISAM2ResultExt;
++struct ISAM2ResultExt;
+ }  // namespace gtsam_points
+ 
+ namespace glim {

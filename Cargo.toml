@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/driftless-io",
+    "crates/driftless-traj",
+    "crates/driftless-odom",
+    "crates/driftless-slam",
+    "crates/driftless-map",
+    "crates/driftless-graph",
+    "crates/driftless-steps",
+    "crates/driftless-app",
+    "crates/driftless-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/ROCCAT-XOX/driftless"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# The odometry tests run whole synthetic sequences; unoptimised nalgebra/kiddo make them slow.
+[profile.dev.package.driftless-odom]
+opt-level = 2
+[profile.dev.package.driftless-slam]
+opt-level = 2
+[profile.dev.package.nalgebra]
+opt-level = 2
+[profile.dev.package.kiddo]
+opt-level = 2
+# Pose graph tests factorise sparse normal equations; unoptimised builds are ~30x slower.
+[profile.dev.package.driftless-graph]
+opt-level = 2
+[profile.dev.package.nalgebra-sparse]
+opt-level = 2
+# The colour tests ray-cast, JPEG-encode and decode synthetic camera images.
+[profile.dev.package.driftless-map]
+opt-level = 2
+[profile.dev.package.jpeg-encoder]
+opt-level = 2
+[profile.dev.package.zune-jpeg]
+opt-level = 2
+# The step tests run whole synthetic scans (odometry, map) through the library.
+[profile.dev.package.driftless-steps]
+opt-level = 2
+# The project tests run whole synthetic scans (SLAM, map) through the steps.
+[profile.dev.package.driftless-app]
+opt-level = 2
+# `calib-check` projects every LiDAR point into every image variant; its tests run the binary.
+[profile.dev.package.driftless-cli]
+opt-level = 2

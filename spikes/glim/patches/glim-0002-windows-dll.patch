@@ -1,0 +1,397 @@
+diff --git a/include/glim/mapping/callbacks.hpp b/include/glim/mapping/callbacks.hpp
+index 0abfff1..fea1144 100644
+--- a/include/glim/mapping/callbacks.hpp
++++ b/include/glim/mapping/callbacks.hpp
+@@ -34,7 +34,7 @@ struct SubMappingCallbacks {
+    * @param stamp  Timestamp
+    * @param image  Image
+    */
+-  static CallbackSlot<void(const double stamp, const cv::Mat& image)> on_insert_image;
++  GLIM_API static CallbackSlot<void(const double stamp, const cv::Mat& image)> on_insert_image;
+ #endif
+ 
+   /**
+@@ -43,40 +43,40 @@ struct SubMappingCallbacks {
+    * @param linear_acc    Linear acceleration
+    * @param angular_vel   Angular velocity
+    */
+-  static CallbackSlot<void(const double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel)> on_insert_imu;
++  GLIM_API static CallbackSlot<void(const double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel)> on_insert_imu;
+ 
+   /**
+    * @brief Odometry estimation result input callback
+    * @param frame  Marginalized odometry estimation frame
+    */
+-  static CallbackSlot<void(const EstimationFrame::ConstPtr& frame)> on_insert_frame;
++  GLIM_API static CallbackSlot<void(const EstimationFrame::ConstPtr& frame)> on_insert_frame;
+ 
+   /**
+    * @brief SubMap keyframe creation callback
+    * @param id        SubMap ID
+    * @param keyframe  New keyframe
+    */
+-  static CallbackSlot<void(int id, const EstimationFrame::ConstPtr& keyframe)> on_new_keyframe;
++  GLIM_API static CallbackSlot<void(int id, const EstimationFrame::ConstPtr& keyframe)> on_new_keyframe;
+ 
+   /**
+    * @brief SubMap optimization callback (just before optimization)
+    * @param graph   Factor graph
+    * @param values  Values to be optimized
+    */
+-  static CallbackSlot<void(gtsam::NonlinearFactorGraph& graph, gtsam::Values& values)> on_optimize_submap;
++  GLIM_API static CallbackSlot<void(gtsam::NonlinearFactorGraph& graph, gtsam::Values& values)> on_optimize_submap;
+ 
+   /**
+    * @brief Optimization status callback
+    * @param status  Optimization status
+    * @param values  Current estimate
+    */
+-  static CallbackSlot<void(const gtsam_points::LevenbergMarquardtOptimizationStatus& status, const gtsam::Values& values)> on_optimization_status;
++  GLIM_API static CallbackSlot<void(const gtsam_points::LevenbergMarquardtOptimizationStatus& status, const gtsam::Values& values)> on_optimization_status;
+ 
+   /**
+    * @brief SubMap creation callback
+    * @param submap  New SubMap
+    */
+-  static CallbackSlot<void(const SubMap::ConstPtr& submap)> on_new_submap;
++  GLIM_API static CallbackSlot<void(const SubMap::ConstPtr& submap)> on_new_submap;
+ };
+ 
+ /**
+@@ -90,7 +90,7 @@ struct GlobalMappingCallbacks {
+    * @param stamp  Timestamp
+    * @param image  Image
+    */
+-  static CallbackSlot<void(const double stamp, const cv::Mat& image)> on_insert_image;
++  GLIM_API static CallbackSlot<void(const double stamp, const cv::Mat& image)> on_insert_image;
+ #endif
+ 
+   /**
+@@ -99,7 +99,7 @@ struct GlobalMappingCallbacks {
+    * @param linear_acc   Linear acceleration
+    * @param angular_vel  Angular velocity
+    */
+-  static CallbackSlot<void(const double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel)> on_insert_imu;
++  GLIM_API static CallbackSlot<void(const double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel)> on_insert_imu;
+ 
+   /**
+    * @brief SubMap input callback
+@@ -107,7 +107,7 @@ struct GlobalMappingCallbacks {
+    * @note  submap->T_world_origin is updated in the global mapping thread
+    *        Accessing it from another thread is not thread-safe
+    */
+-  static CallbackSlot<void(const SubMap::ConstPtr& submap)> on_insert_submap;
++  GLIM_API static CallbackSlot<void(const SubMap::ConstPtr& submap)> on_insert_submap;
+ 
+   /**
+    * @brief SubMap states update callback
+@@ -115,7 +115,7 @@ struct GlobalMappingCallbacks {
+    * @note  submap->T_world_origin are updated in the global mapping thread
+    *        Accessing them from another thread is not thread-safe
+    */
+-  static CallbackSlot<void(const std::vector<SubMap::Ptr>& submaps)> on_update_submaps;
++  GLIM_API static CallbackSlot<void(const std::vector<SubMap::Ptr>& submaps)> on_update_submaps;
+ 
+   /**
+    * @brief Global optimization callback (just before optimization)
+@@ -123,32 +123,32 @@ struct GlobalMappingCallbacks {
+    * @param new_factors  New factors to be inserted into the factor graph
+    * @param new_values   New values to be inserted into the factor graph
+    */
+-  static CallbackSlot<void(gtsam_points::ISAM2Ext& isam2, gtsam::NonlinearFactorGraph& new_factors, gtsam::Values& new_values)> on_smoother_update;
++  GLIM_API static CallbackSlot<void(gtsam_points::ISAM2Ext& isam2, gtsam::NonlinearFactorGraph& new_factors, gtsam::Values& new_values)> on_smoother_update;
+ 
+   /**
+    * @brief Global optimization result callback (just after optimization)
+    * @param isam2   iSAM2 optimizer
+    * @param result  iSAM2 result
+    */
+-  static CallbackSlot<void(gtsam_points::ISAM2Ext& isam2, const gtsam_points::ISAM2ResultExt& result)> on_smoother_update_result;
++  GLIM_API static CallbackSlot<void(gtsam_points::ISAM2Ext& isam2, const gtsam_points::ISAM2ResultExt& result)> on_smoother_update_result;
+ 
+   /**
+    * @brief Request the global mapping module to perform optimization
+    * @note  This is a special inverse-direction callback slot
+    */
+-  static CallbackSlot<void()> request_to_optimize;
++  GLIM_API static CallbackSlot<void()> request_to_optimize;
+ 
+   /**
+    * @brief Request the global mapping module to detect and recover from a graph corruption
+    * @note  This is a special inverse-direction callback slot
+    */
+-  static CallbackSlot<void()> request_to_recover;
++  GLIM_API static CallbackSlot<void()> request_to_recover;
+ 
+   /**
+    * @brief Request the global mapping module to find new overlapping submaps
+    * @param min_overlap  Minimum overlap rate between submaps
+    * @note  This is a special inverse-direction callback slot
+    */
+-  static CallbackSlot<void(double)> request_to_find_overlapping_submaps;
++  GLIM_API static CallbackSlot<void(double)> request_to_find_overlapping_submaps;
+ };
+ }  // namespace glim
+\ No newline at end of file
+diff --git a/include/glim/odometry/callbacks.hpp b/include/glim/odometry/callbacks.hpp
+index 06e0b52..07b0ef3 100644
+--- a/include/glim/odometry/callbacks.hpp
++++ b/include/glim/odometry/callbacks.hpp
+@@ -32,13 +32,13 @@ public:
+    * @param points         Input points
+    * @param T_world_lidar  Estimated LiDAR pose w.r.t. the first frame
+    */
+-  static CallbackSlot<void(const PreprocessedFrame::ConstPtr& points, const Eigen::Isometry3d& T_odom_lidar)> on_updated;
++  GLIM_API static CallbackSlot<void(const PreprocessedFrame::ConstPtr& points, const Eigen::Isometry3d& T_odom_lidar)> on_updated;
+ 
+   /**
+    * @brief IMU state initialization termination callback
+    * @param estimated_frame  Estimated LiDAR-IMU state
+    */
+-  static CallbackSlot<void(const EstimationFrame::ConstPtr& estimated_frame)> on_finished;
++  GLIM_API static CallbackSlot<void(const EstimationFrame::ConstPtr& estimated_frame)> on_finished;
+ };
+ 
+ /**
+@@ -52,7 +52,7 @@ struct OdometryEstimationCallbacks {
+    * @param stamp  Timestamp
+    * @param image  Image
+    */
+-  static CallbackSlot<void(const double stamp, const cv::Mat& image)> on_insert_image;
++  GLIM_API static CallbackSlot<void(const double stamp, const cv::Mat& image)> on_insert_image;
+ #endif
+ 
+   /**
+@@ -61,26 +61,26 @@ struct OdometryEstimationCallbacks {
+    * @param linear_acc   Linear acceleration
+    * @param angular_vel  Angular velocity
+    */
+-  static CallbackSlot<void(const double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel)> on_insert_imu;
++  GLIM_API static CallbackSlot<void(const double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel)> on_insert_imu;
+ 
+   /**
+    * @brief PointCloud input callback
+    * @param frame  Preprocessed point cloud frame
+    */
+-  static CallbackSlot<void(const PreprocessedFrame::Ptr& frame)> on_insert_frame;
++  GLIM_API static CallbackSlot<void(const PreprocessedFrame::Ptr& frame)> on_insert_frame;
+ 
+   /**
+    * @brief New odometry estimation frame creation callback (Sensor state predicted with IMU forward integration)
+    * @param frame  Odometry estimation frame (deskewed points and initial transformation estimate)
+    */
+-  static CallbackSlot<void(const EstimationFrame::ConstPtr& frame)> on_new_frame;
++  GLIM_API static CallbackSlot<void(const EstimationFrame::ConstPtr& frame)> on_new_frame;
+ 
+   /**
+    * @brief New odometry estimation frame update callback (Sensor state corrected with point cloud observation)
+    * @param frame  Updated odometry estimation frame
+    * @note  This is equivalent to `on_update_frames` with only the latest frame
+    */
+-  static CallbackSlot<void(const EstimationFrame::ConstPtr& frame)> on_update_new_frame;
++  GLIM_API static CallbackSlot<void(const EstimationFrame::ConstPtr& frame)> on_update_new_frame;
+ 
+   /**
+    * @brief Odometry estimation frames update callback
+@@ -88,7 +88,7 @@ struct OdometryEstimationCallbacks {
+    * @note  Sensor states will be updated in the odometry estimation thread
+    *        Accessing them from another thread is not thread-safe
+    */
+-  static CallbackSlot<void(const std::vector<EstimationFrame::ConstPtr>& frames)> on_update_frames;
++  GLIM_API static CallbackSlot<void(const std::vector<EstimationFrame::ConstPtr>& frames)> on_update_frames;
+ 
+   /**
+    * @brief Odometry estimation keyframes update callback
+@@ -96,19 +96,19 @@ struct OdometryEstimationCallbacks {
+    * @note  Sensor states will be updated in the odometry estimation thread
+    *        Accessing them from another thread is not thread-safe
+    */
+-  static CallbackSlot<void(const std::vector<EstimationFrame::ConstPtr>& keyframes)> on_update_keyframes;
++  GLIM_API static CallbackSlot<void(const std::vector<EstimationFrame::ConstPtr>& keyframes)> on_update_keyframes;
+ 
+   /**
+    * @brief Odometry estimation frame marginalization callback
+    * @param marginalized_frames  Marginalized odometry frames
+    */
+-  static CallbackSlot<void(const std::vector<EstimationFrame::ConstPtr>& marginalized_frames)> on_marginalized_frames;
++  GLIM_API static CallbackSlot<void(const std::vector<EstimationFrame::ConstPtr>& marginalized_frames)> on_marginalized_frames;
+ 
+   /**
+    * @brief Odometry estimation keyframe marginalization callback
+    * @param marginalized_keyframes  Marginalized odometry keyframes
+    */
+-  static CallbackSlot<void(const std::vector<EstimationFrame::ConstPtr>& marginalized_keyframes)> on_marginalized_keyframes;
++  GLIM_API static CallbackSlot<void(const std::vector<EstimationFrame::ConstPtr>& marginalized_keyframes)> on_marginalized_keyframes;
+ 
+   /**
+    * @brief Odometry estimation optimization callback (just before optimization)
+@@ -116,7 +116,7 @@ struct OdometryEstimationCallbacks {
+    * @param new_factors  New factors to be inserted into the graph
+    * @param new_values   New values to be inserted into the graph
+    */
+-  static CallbackSlot<void(
++  GLIM_API static CallbackSlot<void(
+     gtsam_points::IncrementalFixedLagSmootherExtWithFallback& smoother,
+     gtsam::NonlinearFactorGraph& new_factors,
+     gtsam::Values& new_values,
+@@ -127,13 +127,13 @@ struct OdometryEstimationCallbacks {
+    * @brief Odometry estimation optimization callback (just after optimization)
+    * @param smoother     FixedLagSmoother
+    */
+-  static CallbackSlot<void(gtsam_points::IncrementalFixedLagSmootherExtWithFallback& smoother)> on_smoother_update_finish;
++  GLIM_API static CallbackSlot<void(gtsam_points::IncrementalFixedLagSmootherExtWithFallback& smoother)> on_smoother_update_finish;
+ 
+   /**
+    * @brief Smoother corruption callback
+    * @note  We should not forget that FixedLagSmoothers are in "gtsam_unstable" directory!!
+    */
+-  static CallbackSlot<void(double)> on_smoother_corruption;
++  GLIM_API static CallbackSlot<void(double)> on_smoother_corruption;
+ 
+   /**
+    * @brief Request to compute marginal covariances of the latest frame (X(i), V(i), B(i)).
+@@ -141,7 +141,7 @@ struct OdometryEstimationCallbacks {
+    * @note  This should only be called in the initialization of extension modules.
+    *        Calling this while the odometry estimation is running may lead to undefined behavior.
+    */
+-  static CallbackSlot<void()> request_to_compute_covariances;
++  GLIM_API static CallbackSlot<void()> request_to_compute_covariances;
+ };
+ 
+ }  // namespace glim
+\ No newline at end of file
+diff --git a/include/glim/preprocess/callbacks.hpp b/include/glim/preprocess/callbacks.hpp
+index f2222e1..72eee35 100644
+--- a/include/glim/preprocess/callbacks.hpp
++++ b/include/glim/preprocess/callbacks.hpp
+@@ -15,27 +15,27 @@ struct PreprocessCallbacks {
+    * @brief Raw points arrival callback
+    * @param points  Raw points received from the sensor
+    */
+-  static CallbackSlot<void(const RawPoints::ConstPtr& points)> on_raw_points_received;
++  GLIM_API static CallbackSlot<void(const RawPoints::ConstPtr& points)> on_raw_points_received;
+ 
+   /**
+    * @brief Preprocessing start callback.
+    * @note  begin -> (here) -> downsampling -> filtering & outlier removal -> end
+    * @param points  Points to be preprocessed (can be modified)
+    */
+-  static CallbackSlot<void(gtsam_points::PointCloudCPU::Ptr& points)> on_preprocessing_begin;
++  GLIM_API static CallbackSlot<void(gtsam_points::PointCloudCPU::Ptr& points)> on_preprocessing_begin;
+ 
+   /**
+    * @brief Downsampling finished callback
+    * @note  begin -> downsampling -> (here) -> filtering & outlier removal -> end
+    * @param points  Points after downsampling (can be modified)
+    */
+-  static CallbackSlot<void(gtsam_points::PointCloudCPU::Ptr& points)> on_downsampling_finished;
++  GLIM_API static CallbackSlot<void(gtsam_points::PointCloudCPU::Ptr& points)> on_downsampling_finished;
+ 
+   /**
+    * @brief Filtering finished callback
+    * @note  begin -> downsampling -> filtering & outlier removal -> (here) -> end
+    * @param points  Points after filtering (can be modified)
+    */
+-  static CallbackSlot<void(gtsam_points::PointCloudCPU::Ptr& points)> on_filtering_finished;
++  GLIM_API static CallbackSlot<void(gtsam_points::PointCloudCPU::Ptr& points)> on_filtering_finished;
+ };
+ }  // namespace glim
+\ No newline at end of file
+diff --git a/include/glim/util/callback_slot.hpp b/include/glim/util/callback_slot.hpp
+index 7f9cb69..e85373f 100644
+--- a/include/glim/util/callback_slot.hpp
++++ b/include/glim/util/callback_slot.hpp
+@@ -1,5 +1,19 @@
+ #pragma once
+ 
++// Static data members shared between libglim and the dynamically loaded modules
++// must be exported/imported explicitly on Windows.
++#ifndef GLIM_API
++#if defined(_WIN32)
++#if defined(glim_EXPORTS)
++#define GLIM_API __declspec(dllexport)
++#else
++#define GLIM_API __declspec(dllimport)
++#endif
++#else
++#define GLIM_API
++#endif
++#endif
++
+ #include <vector>
+ #include <algorithm>
+ #include <functional>
+diff --git a/src/glim/util/load_module.cpp b/src/glim/util/load_module.cpp
+index 2244331..98f1f5d 100644
+--- a/src/glim/util/load_module.cpp
++++ b/src/glim/util/load_module.cpp
+@@ -1,33 +1,61 @@
+ #include <glim/util/load_module.hpp>
+ 
+-#include <dlfcn.h>
+ #include <spdlog/spdlog.h>
+ 
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <dlfcn.h>
++#endif
++
+ namespace glim {
+ 
+-void open_so(const std::string& so_name) {
+-  void* handle = dlopen(so_name.c_str(), RTLD_LAZY);
++#ifdef _WIN32
++static void* open_handle(const std::string& so_name) {
++  HMODULE handle = LoadLibraryA(so_name.c_str());
+   if (handle == nullptr) {
+-    spdlog::warn("failed to open {}", so_name);
+-    spdlog::warn("{}", dlerror());
++    spdlog::warn("failed to open {} (error {})", so_name, GetLastError());
+   }
++  return handle;
+ }
+ 
+-void* load_symbol(const std::string& so_name, const std::string& symbol_name) {
++static void* find_symbol(void* handle, const std::string& so_name, const std::string& symbol_name) {
++  auto* func = reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(handle), symbol_name.c_str()));
++  if (func == nullptr) {
++    spdlog::warn("failed to find symbol={} in {} (error {})", symbol_name, so_name, GetLastError());
++  }
++  return func;
++}
++#else
++static void* open_handle(const std::string& so_name) {
+   void* handle = dlopen(so_name.c_str(), RTLD_LAZY);
+   if (handle == nullptr) {
+     spdlog::warn("failed to open {}", so_name);
+     spdlog::warn("{}", dlerror());
+-    return nullptr;
+   }
++  return handle;
++}
+ 
++static void* find_symbol(void* handle, const std::string& so_name, const std::string& symbol_name) {
+   auto* func = dlsym(handle, symbol_name.c_str());
+   if (func == nullptr) {
+     spdlog::warn("failed to find symbol={} in {}", symbol_name, so_name);
+     spdlog::warn("{}", dlerror());
+   }
+-
+   return func;
+ }
++#endif
++
++void open_so(const std::string& so_name) {
++  open_handle(so_name);
++}
++
++void* load_symbol(const std::string& so_name, const std::string& symbol_name) {
++  void* handle = open_handle(so_name);
++  if (handle == nullptr) {
++    return nullptr;
++  }
++  return find_symbol(handle, so_name, symbol_name);
++}
+ 
+ }  // namespace glim

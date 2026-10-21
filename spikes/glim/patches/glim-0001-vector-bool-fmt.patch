@@ -1,0 +1,13 @@
+diff --git a/include/glim/util/convert_to_string.hpp b/include/glim/util/convert_to_string.hpp
+index 24f73c0..3cb07be 100644
+--- a/include/glim/util/convert_to_string.hpp
++++ b/include/glim/util/convert_to_string.hpp
+@@ -23,7 +23,7 @@ std::string convert_to_string(const std::vector<T2>& values) {
+     if (i) {
+       sst << ",";
+     }
+-    sst << convert_to_string(values[i]);
++    sst << convert_to_string(static_cast<T2>(values[i]));
+   }
+   sst << "]";
+   return sst.str();

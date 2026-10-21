@@ -1,0 +1,18 @@
+/target
+**/*.rs.bk
+.DS_Store
+# Scan data never goes into the repository (privacy, size)
+*.bag
+*.las
+*.laz
+*.e57
+*.pcd
+*.ply
+*.amap
+*.amx
+/data/
+/testdata/local/
+
+# GLIM spike: locally built dependencies and run outputs
+spikes/glim/.deps/
+spikes/glim/out/
