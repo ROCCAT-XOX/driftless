@@ -1,10 +1,12 @@
-//! The map of real JMK6 scans in `$DRIFTLESS_TESTDATA` (see `docs/testdaten.md`): SLAM,
+//! The map of real scans in `$DRIFTLESS_TESTDATA` (see `docs/testdaten.md`): SLAM,
 //! trajectory through a TUM file (as `traj.tum` of `driftless slam`), then the dense cloud
-//! and LAS/PLY, its cleaning and colouring, with the default settings of `driftless map`.
-//! Prints point counts and timings; skips when the data is missing. `DRIFTLESS_COLOR_OUT=<dir>`
-//! keeps the coloured cloud of 143623 (`color.las`, `color.ply`) there.
+//! and LAS/PLY, its cleaning and colouring, with the default settings of `driftless map`, on
+//! `Test`, the two short JMK6 scans and the long Promedia scan. Prints point counts and
+//! timings; skips when the data is missing. `DRIFTLESS_COLOR_OUT=<dir>` keeps the coloured
+//! cloud of 143623 (`color.las`, `color.ply`) there.
 //!
-//! The bounds are measured values with a margin, see `docs/ergebnisse/2026-10-21-meilenstein-3.md`.
+//! The bounds are measured values with a margin, see `docs/ergebnisse/2026-10-21-meilenstein-3.md`
+//! and `docs/ergebnisse/2026-10-21-meilenstein-4.md`.
 //!
 //! `cargo test --release -p driftless-map --test real_data -- --ignored --nocapture`
 
@@ -17,9 +19,10 @@ use driftless_io::testdata;
 use driftless_map::{
     build_dense, clean, colorize, content_hash, write_las, write_ply, write_removed_las,
     CleanConfig, CleanStats, ColorCamera, ColorConfig, ColorStats, DenseConfig, ImageSource,
+    RemovalReason,
 };
 use driftless_slam::{run_slam, SlamConfig};
-use driftless_traj::{read_tum, write_tum};
+use driftless_traj::{read_tum, write_tum, Pose};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -32,6 +35,34 @@ const TEST_SCAN_COLORED_SHARE: f64 = 0.984;
 /// and image offset after / before (measured 0.57 / 1.01 = 0.56); bounds with margin.
 const TEST_SCAN_CAMERA_DIFFERENCE_RATIO: f64 = 0.7;
 const TEST_SCAN_IMAGE_OFFSET_RATIO: f64 = 0.75;
+
+/// The scans of the shared runs: name, folder in the test data, and whether the run also
+/// colours once with the highlight rule switched on.
+const SCANS: [(&str, &str, bool); 4] = [
+    ("Test", "Test", false),
+    ("20261020143415", "jmk6-2026-10-20/20261020143415", false),
+    ("20261020143623", "jmk6-2026-10-20/20261020143623", false),
+    ("Promedia", "jmk6-2026-10-20/20261020173822", true),
+];
+/// Camera difference after the equalisation of Meilenstein 3 (commit 49d16ea, default
+/// settings), per scan of [`SCANS`] (sRGB levels); Meilenstein 4 may be at most
+/// [`CAMERA_DIFFERENCE_SLACK`] times that (measured 0.19, 0.94, 0.48 and 0.06).
+const M3_CAMERA_DIFFERENCE: [f64; 4] = [0.764, 2.975, 3.123, 0.575];
+const CAMERA_DIFFERENCE_SLACK: f64 = 1.05;
+/// Promedia with `highlights` on: floor highlight share after ≤ this × before (measured
+/// 0.0497 / 0.0663 = 0.75).
+const PROMEDIA_FLOOR_HIGHLIGHT_RATIO: f64 = 0.8;
+/// Promedia by default: the floor highlight share may change by at most this share of itself.
+const DEFAULT_FLOOR_CHANGE: f64 = 0.02;
+/// The edge falloff fit may leave the residual at most this much higher (percentage points;
+/// measured −0.19 on Test, +0.02 on Promedia).
+const VIGNETTE_RESIDUAL_SLACK: f64 = 0.1;
+/// Promedia: at least this share of the points removed as seen through a window lie more
+/// than [`THROUGH_FAR`] m from the trajectory (measured 0.94 of 24,699).
+const PROMEDIA_THROUGH_FAR_SHARE: f64 = 0.8;
+const THROUGH_FAR: f64 = 3.0;
+/// Test: wall thickness after the smoothing ≤ this × before (measured 1.06 / 6.07 mm = 0.18).
+const TEST_WALL_THICKNESS_RATIO: f64 = 0.7;
 
 /// Topic of the first connection of `msg_type` in the bag.
 fn topic(bag: &Path, msg_type: &str) -> String {
@@ -134,6 +165,11 @@ struct FullRun {
     dense_points: usize,
     clean: CleanStats,
     color: ColorStats,
+    /// Colouring of the same cleaned cloud with the highlight rule switched on, if asked for.
+    highlights: Option<ColorStats>,
+    /// Points removed as seen through a window that lie more than [`THROUGH_FAR`] m from the
+    /// trajectory.
+    through_far: usize,
     /// Content hash of every output file (`traj.tum`, `dense.las`, `clean.las`,
     /// `removed.las`, `color.las`, `color.ply`).
     hashes: Vec<(&'static str, u64)>,
@@ -152,20 +188,27 @@ impl FullRun {
     fn print(&self, name: &str) {
         let [s, d, c, k] = self.seconds;
         let x = &self.color;
+        let m = &self.clean.smooth;
         println!(
             "{name}: SLAM {s:.1} s, dense {d:.1} s, clean {c:.1} s, colour {k:.1} s, total \
-             {:.1} s; {} dense points, {} kept, {} ghosts, {} through, {} outliers; {:.1} % coloured, \
-             images {} used / {} blurry; gains {:.2}…{:.2}; spread {:.2} → {:.2}, camera \
-             difference {:.2} → {:.2} ({} points), image offset {:.2} → {:.2} (sRGB)",
+             {:.1} s; {} dense points, {} kept, {} ghosts, {} through ({} > {THROUGH_FAR} m), {} \
+             outliers; walls {:.2} → {:.2} mm; {:.1} % coloured, images {} used / {} blurry / {} \
+             clamped; gains {:.2}…{:.2}; spread {:.2} → {:.2}, camera difference {:.2} → {:.2} \
+             ({} points), image offset {:.2} → {:.2} (sRGB); edge falloff residual {:.2} → {:.2} \
+             %; floor highlights {:.4} → {:.4}; seams {:.2} → {:.2}",
             self.total_seconds(),
             self.dense_points,
             self.clean.kept,
             self.clean.ghosts,
             self.clean.through,
+            self.through_far,
             self.clean.outliers,
+            1000.0 * m.thickness_before,
+            1000.0 * m.thickness_after,
             100.0 * self.colored_share(),
             x.images_used,
             x.images_blurry,
+            x.images_gain_clamped,
             x.gain_min,
             x.gain_max,
             x.spread_before,
@@ -175,7 +218,24 @@ impl FullRun {
             x.camera_difference_points,
             x.image_offset_before,
             x.image_offset_after,
+            x.vignette_residual_before,
+            x.vignette_residual_after,
+            x.floor_highlight_share_before,
+            x.floor_highlight_share_after,
+            x.seam_jump_before,
+            x.seam_jump_after,
         );
+        if let Some(h) = &self.highlights {
+            println!(
+                "{name} with highlights: floor highlights {:.4} → {:.4}; seams {:.2} → {:.2}; \
+                 {} views rejected",
+                h.floor_highlight_share_before,
+                h.floor_highlight_share_after,
+                h.seam_jump_before,
+                h.seam_jump_after,
+                h.views_rejected,
+            );
+        }
     }
 }
 
@@ -188,10 +248,20 @@ impl Drop for TempDir {
     }
 }
 
+/// Distance of `p` to the nearest pose of `poses` (m).
+fn trajectory_distance(p: &[f32; 3], poses: &[Pose]) -> f64 {
+    let p = driftless_traj::nalgebra::Vector3::from(p.map(f64::from));
+    poses
+        .iter()
+        .map(|q| (q.p - p).norm())
+        .fold(f64::INFINITY, f64::min)
+}
+
 /// SLAM, dense, clean and colour of the scan in `folder`, as `driftless slam` and
 /// `driftless map` run them with their defaults; the output files go to a temporary folder
-/// and only their hashes are kept.
-fn full_run(folder: &Path, tag: &str) -> FullRun {
+/// and only their hashes are kept. With `highlights` the cleaned cloud is coloured a second
+/// time with the highlight rule on (not timed, no files).
+fn full_run(folder: &Path, tag: &str, highlights: bool) -> FullRun {
     let bags = discover_project(folder).unwrap().lidar_bags;
     let cfg = SlamConfig::default();
     let guard = TempDir(
@@ -223,11 +293,26 @@ fn full_run(folder: &Path, tag: &str) -> FullRun {
     drop(rays);
     write_las(&out.join("clean.las"), &kept).unwrap();
     write_removed_las(&out.join("removed.las"), &removed, &reasons).unwrap();
-    drop(removed);
     let clean_s = start.elapsed().as_secs_f64();
+    let through_far = removed
+        .xyz
+        .iter()
+        .zip(&reasons)
+        .filter(|&(p, &r)| {
+            r == RemovalReason::Through && trajectory_distance(p, &poses) > THROUGH_FAR
+        })
+        .count();
+    drop(removed);
 
-    let start = Instant::now();
     let (cams, images) = color_input(folder, &cfg.odom.lidar_to_imu);
+    let highlights = highlights.then(|| {
+        let cfg = ColorConfig {
+            highlights: true,
+            ..ColorConfig::default()
+        };
+        colorize(&mut kept.clone(), images.clone(), &poses, &cams, &cfg).unwrap()
+    });
+    let start = Instant::now();
     let color = colorize(&mut kept, images, &poses, &cams, &ColorConfig::default()).unwrap();
     write_las(&out.join("color.las"), &kept).unwrap();
     write_ply(&out.join("color.ply"), &kept).unwrap();
@@ -251,20 +336,32 @@ fn full_run(folder: &Path, tag: &str) -> FullRun {
         dense_points: dense.points,
         clean: clean_stats,
         color,
+        highlights,
+        through_far,
         hashes,
     }
 }
 
-/// The full run of the Test scan, shared by the tests that check it.
+/// The full run of scan `i` of [`SCANS`], shared by the tests that check it.
+fn shared_run(i: usize) -> Option<&'static FullRun> {
+    static RUNS: [OnceLock<Option<FullRun>>; SCANS.len()] = [const { OnceLock::new() }; 4];
+    let (name, rel, highlights) = SCANS[i];
+    RUNS[i]
+        .get_or_init(|| {
+            let folder = scan(rel)?;
+            let run = full_run(&folder, name, highlights);
+            run.print(name);
+            Some(run)
+        })
+        .as_ref()
+}
+
 fn test_scan() -> Option<&'static FullRun> {
-    static RUN: OnceLock<Option<FullRun>> = OnceLock::new();
-    RUN.get_or_init(|| {
-        let folder = scan("Test")?;
-        let run = full_run(&folder, "test");
-        run.print("Test");
-        Some(run)
-    })
-    .as_ref()
+    shared_run(0)
+}
+
+fn promedia() -> Option<&'static FullRun> {
+    shared_run(3)
 }
 
 #[test]
@@ -318,14 +415,95 @@ fn test_scan_exposure_reduces_camera_difference() {
 
 #[test]
 #[ignore = "needs DRIFTLESS_TESTDATA"]
+fn camera_difference_not_worse() {
+    for (i, &(name, ..)) in SCANS.iter().enumerate() {
+        let Some(run) = shared_run(i) else { continue };
+        let (now, m3) = (run.color.camera_difference_after, M3_CAMERA_DIFFERENCE[i]);
+        assert!(
+            now <= CAMERA_DIFFERENCE_SLACK * m3,
+            "{name}: camera difference {now:.3}, Meilenstein 3 {m3:.3}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs DRIFTLESS_TESTDATA"]
+fn vignette_residual_not_worse() {
+    // Test and Promedia (+0.0 pp each); 143623 sits at +0.099 pp, right at the bound, and is
+    // only reported (see the results of Meilenstein 4).
+    for i in [0, 3] {
+        let name = SCANS[i].0;
+        let Some(run) = shared_run(i) else { continue };
+        let c = &run.color;
+        assert!(
+            c.vignette_residual_after <= c.vignette_residual_before + VIGNETTE_RESIDUAL_SLACK,
+            "{name}: edge falloff residual {:.3} → {:.3} %",
+            c.vignette_residual_before,
+            c.vignette_residual_after
+        );
+    }
+}
+
+/// The highlight rule is off by default (the floor stays nearly as it is); switched on, it lowers
+/// the reflections of the ceiling lights on the Promedia floor.
+#[test]
+#[ignore = "needs DRIFTLESS_TESTDATA"]
+fn floor_highlights_drop_when_switched_on() {
+    let Some(run) = promedia() else { return };
+    let c = &run.color;
+    // Only the rim exclusion acts by default (measured −0.3 %).
+    assert!(
+        (c.floor_highlight_share_after - c.floor_highlight_share_before).abs()
+            <= DEFAULT_FLOOR_CHANGE * c.floor_highlight_share_before,
+        "default run changed the floor: {:.4} → {:.4}",
+        c.floor_highlight_share_before,
+        c.floor_highlight_share_after
+    );
+    assert_eq!(c.views_rejected, 0);
+    let h = run.highlights.as_ref().expect("run with highlights");
+    assert!(h.floor_highlight_share_before > 0.0, "{h:?}");
+    assert!(
+        h.floor_highlight_share_after
+            <= PROMEDIA_FLOOR_HIGHLIGHT_RATIO * h.floor_highlight_share_before,
+        "floor highlights {:.4} → {:.4}",
+        h.floor_highlight_share_before,
+        h.floor_highlight_share_after
+    );
+}
+
+#[test]
+#[ignore = "needs DRIFTLESS_TESTDATA"]
+fn through_removes_outside_points() {
+    let Some(run) = promedia() else { return };
+    let through = run.clean.through;
+    assert!(through > 0, "nothing removed as seen through a window");
+    assert!(
+        run.through_far as f64 >= PROMEDIA_THROUGH_FAR_SHARE * through as f64,
+        "{} of {through} through points more than {THROUGH_FAR} m from the trajectory",
+        run.through_far
+    );
+}
+
+#[test]
+#[ignore = "needs DRIFTLESS_TESTDATA"]
+fn walls_thinner() {
+    let Some(run) = test_scan() else { return };
+    let s = &run.clean.smooth;
+    assert!(s.thickness_before > 0.0, "{s:?}");
+    assert!(
+        s.thickness_after <= TEST_WALL_THICKNESS_RATIO * s.thickness_before,
+        "wall thickness {:.2} → {:.2} mm",
+        1000.0 * s.thickness_before,
+        1000.0 * s.thickness_after
+    );
+}
+
+#[test]
+#[ignore = "needs DRIFTLESS_TESTDATA"]
 fn jmk6_scans_run_and_are_deterministic() {
-    for name in ["20261020143415", "20261020143623"] {
-        let Some(folder) = scan(&format!("jmk6-2026-10-20/{name}")) else {
-            continue;
-        };
-        let a = full_run(&folder, &format!("{name}-a"));
-        a.print(name);
-        let b = full_run(&folder, &format!("{name}-b"));
+    for (i, &(name, rel, _)) in SCANS.iter().enumerate().skip(1) {
+        let Some(a) = shared_run(i) else { continue };
+        let b = full_run(&scan(rel).unwrap(), &format!("{name}-b"), false);
         assert_eq!(a.hashes, b.hashes, "{name}: two runs differ");
         assert!(
             a.color.images_used > 100,

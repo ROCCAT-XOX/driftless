@@ -3,11 +3,16 @@
 Open-source desktop software for processing handheld LiDAR scans — drift-corrected, cleanly colourised,
 correctable by hand. Runs natively on **macOS (Apple Silicon)** and **Windows**.
 
-> Status: early development, command line only. Milestone 3 done: dense point cloud from the corrected
-> trajectory (1 cm voxels), cleaned of ghosts and outliers, coloured from the camera images with exposure
-> and white balance across cameras and time (`map`). A 4.4-minute scan with 1,741 images takes about
-> 2.5 minutes and 4 GB on an M4 Pro. Milestone 2: LiDAR-IMU odometry, SLAM with automatic loop closure and
-> manual corrections (`slam`, `correct`), debug viewer. Results on real scans (German):
+> Status: early development, command line only. Milestone 4 done: a 9.7-minute scan with 3,831 images
+> now maps in about 6 minutes with under 4 GB peak memory (was 9.9 GB); walls are projected onto their
+> local plane (about 6 mm → 1.4 mm thick), points measured through windows are removed, colour blending
+> excludes the dark fisheye rim and keeps views spread over time (fewer seams), the camera colour
+> difference is lower, and `removed.las` / PLY say why a point was removed or has no colour. Lamp
+> reflections on floors are only reduced with the experimental `--highlights`. Milestone 3: dense point
+> cloud from the corrected trajectory (1 cm voxels), cleaned of ghosts and outliers, coloured from the
+> camera images with exposure and white balance across cameras and time (`map`). Milestone 2: LiDAR-IMU
+> odometry, SLAM with automatic loop closure and manual corrections (`slam`, `correct`), debug viewer.
+> Results on real scans (German): [milestone 4](docs/ergebnisse/2026-10-21-meilenstein-4.md),
 > [milestone 3](docs/ergebnisse/2026-10-21-meilenstein-3.md),
 > [milestone 2](docs/ergebnisse/2026-10-20-meilenstein-2.md).
 

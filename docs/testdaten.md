@@ -79,15 +79,26 @@ Die Tests mit echten Daten für SLAM: `cargo test --release -p driftless-slam --
 (Schranken und Messwerte: `docs/ergebnisse/2026-10-20-meilenstein-2.md`).
 
 Für die Karte (dicht, bereinigt, eingefärbt) auf `Test` und beiden JMK6-Aufnahmen:
-`cargo test --release -p driftless-map --test real_data -- --ignored --nocapture` (≈ 3 min;
+`cargo test --release -p driftless-map --test real_data -- --ignored --nocapture` (ohne Promedia ≈ 4 min;
 Schranken und Messwerte: `docs/ergebnisse/2026-10-21-meilenstein-3.md`).
 
 **`Test/shading/smooth.las` hat keine Farben:** LAS 1.3, Punktformat 2, 12,5 Mio. Punkte, aber
 alle mit derselben Farbe (0, 166, 252) und Intensität 0. Vergleichbar sind nur Lage und Dichte.
 `trj.txt` liegt im selben Rahmen wie unsere `traj.tum` (Ausrichtung dreht 0,4°, verschiebt 2 cm).
 
-Renderings und Vergleichsbilder liegen nur lokal unter `$DRIFTLESS_TESTDATA/ergebnisse-m3/`
-(nicht im Repo).
+Renderings und Vergleichsbilder liegen nur lokal unter `$DRIFTLESS_TESTDATA/ergebnisse-m3/` und
+`$DRIFTLESS_TESTDATA/ergebnisse-m4/` (nicht im Repo).
+
+Seit Meilenstein 4 laufen die Karten-Tests auch auf Promedia (zwei volle Läufe, bitgleich, dazu ein
+Einfärben mit `--highlights`), zusammen ≈ 22 min. Speicher und Zeit von Promedia prüft die CLI, je
+Schritt ein eigener Prozess (≈ 7 min):
+`cargo test --release -p driftless-cli --test real_data -- --ignored --nocapture`
+(Schranken und Messwerte: `docs/ergebnisse/2026-10-21-meilenstein-4.md`).
+
+**Liegen die Testdaten in einem iCloud-Ordner** (z. B. unter `~/Documents` mit „Mac-Speicher
+optimieren“), lagert macOS große Dateien bei knappem Speicher aus (`ls -lO` zeigt `dataless`). Das
+Lesen bricht dann mit „Operation timed out (os error 60)“ ab. Vorher herunterladen:
+`brctl download <datei>` und warten, bis `dataless` verschwindet.
 
 Die Dateien unter `Test/` stammen aus einem Testscan mit dem 3DMakerPro-Scanner. Die
 Referenzdateien (`trj.txt`, `smooth.las`) dienen nur zum Vergleich; Software

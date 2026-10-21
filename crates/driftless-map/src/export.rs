@@ -40,7 +40,7 @@ pub fn write_las(path: &Path, cloud: &Cloud) -> Result<(), MapError> {
 }
 
 /// Like [`write_las`] for the removed points: `user_data` holds the [`RemovalReason`] code
-/// (1 ghost, 2 outlier).
+/// (1 ghost, 2 outlier, 3 seen through a window).
 ///
 /// # Panics
 /// If `reasons` does not have one entry per point.
