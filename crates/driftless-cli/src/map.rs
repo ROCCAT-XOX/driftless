@@ -41,7 +41,7 @@ const CLEAN_BIN: &str = "clean.bin";
 /// Part of the clean step's input id: raised whenever the cleaning gives another result
 /// (or other files) for the same settings, so an older `clean.bin` / `removed.las` is
 /// rebuilt instead of reused. 2: removal reasons in `removed.las`, points seen through
-/// windows.
+/// windows. 3: kept points projected onto their local plane (thinner walls).
 const CLEAN_VERSION: u32 = 3;
 const REPORT: &str = "map.json";
 

@@ -209,12 +209,29 @@ fn smooth_is_deterministic() {
     let b = smooth_surfaces(&xyz, &cfg);
     assert_eq!(a, b);
 
-    // Each point is moved from the input coordinates, so the order does not matter.
-    let rev: Vec<[f32; 3]> = xyz.iter().rev().copied().collect();
-    let (out_rev, _) = smooth_surfaces(&rev, &cfg);
-    for (p, q) in a.0.iter().zip(out_rev.iter().rev()) {
-        for i in 0..3 {
-            assert!((p[i] - q[i]).abs() < 1e-5, "{p:?} {q:?}");
+    // Each point is moved from the input coordinates and neighbours at the same distance are
+    // ordered by their coordinates, so the order of the points does not matter, also on a
+    // grid full of equal distances.
+    let mut grid = Vec::new();
+    for i in 0..60u32 {
+        for j in 0..60u32 {
+            let z = 0.003 * f64::from((i * 7 + j * 3) % 5);
+            grid.push(p32(0.01 * f64::from(i), 0.01 * f64::from(j), z));
+        }
+    }
+    for pts in [xyz, grid] {
+        let (out, _) = smooth_surfaces(&pts, &cfg);
+        // A fixed permutation: reversed, then every 7th point first.
+        let n = pts.len();
+        let order: Vec<usize> = (0..n)
+            .rev()
+            .filter(|i| i % 7 == 0)
+            .chain((0..n).rev().filter(|i| i % 7 != 0))
+            .collect();
+        let shuffled: Vec<[f32; 3]> = order.iter().map(|&i| pts[i]).collect();
+        let (out_s, _) = smooth_surfaces(&shuffled, &cfg);
+        for (k, &i) in order.iter().enumerate() {
+            assert_eq!(out_s[k], out[i], "point {i}");
         }
     }
 }

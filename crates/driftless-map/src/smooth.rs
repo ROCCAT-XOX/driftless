@@ -3,16 +3,16 @@
 //! The LiDAR measures a wall as a band of 3–5 cm. Averaging inside the 1 cm voxels of the
 //! dense cloud does not make it thinner, the voxels are smaller than the band. Instead each
 //! point takes its neighbours within [`SmoothConfig::radius`] (at most
-//! [`SmoothConfig::max_neighbours`], evenly spaced by distance: the nearest ones of a dense
-//! cloud would span a ball no wider than the band), fits a plane through their centroid
+//! [`SmoothConfig::max_neighbours`], evenly spaced in distance rank: the nearest ones of a
+//! dense cloud would span a ball no wider than the band), fits a plane through their centroid
 //! (least spread axis of their covariance) and, if they lie on a plane (least spread below
 //! [`SmoothConfig::planarity`] times the middle one), moves onto it, by at most
 //! [`SmoothConfig::max_shift`]. Corners, edges and thin rods have no planar neighbourhood
 //! and stay where they are.
 //!
-//! Every point is moved from the input coordinates, never from already moved ones, so the
-//! result does not depend on the order the points run in; the step is a pure function per
-//! point.
+//! Every point is moved from the input coordinates, never from already moved ones, and
+//! neighbours at the same distance are ordered by their coordinates, so the result does not
+//! depend on the order the points run in; the step is a pure function per point.
 
 use crate::clean::{block_moments, spread_axes, vec3, Moments};
 use driftless_odom::voxel_map::{voxel_key, FixedState, VoxelKey};
@@ -50,7 +50,7 @@ pub struct SmoothConfig {
     pub enabled: bool,
     /// Neighbours are the points within this distance (m) ...
     pub radius: f64,
-    /// ... at most this many, evenly spaced by distance ...
+    /// ... at most this many, evenly spaced in distance rank ...
     pub max_neighbours: usize,
     /// ... and at least this many (the point itself included), else the point stays.
     pub min_neighbours: usize,
@@ -124,7 +124,7 @@ fn fit(pts: impl Iterator<Item = Vector3<f64>>) -> (Vector3<f64>, Vector3<f64>, 
 }
 
 /// New position of point `p` given its neighbours `rel` (relative to `p`, `p` itself
-/// included, nearest first): the projection onto their plane, capped at `max_shift`, or
+/// included, nearest first; the first `inner` within half the radius): the projection onto their plane, capped at `max_shift`, or
 /// `None` if they do not lie on a plane.
 ///
 /// Near an edge a few points of the other surface pass the planarity test and tilt the plane
@@ -135,15 +135,13 @@ fn fit(pts: impl Iterator<Item = Vector3<f64>>) -> (Vector3<f64>, Vector3<f64>, 
 /// [`REFITS`] times, to the neighbours within [`INLIER_SIGMAS`] times the RMS distance of
 /// the last fit (at least [`MIN_BAND`], at most `max_shift`). On a plain wall that comes
 /// back to all neighbours.
-fn project(rel: &[Vector3<f64>], cfg: &SmoothConfig) -> Option<Vector3<f64>> {
+fn project(rel: &[Vector3<f64>], inner: usize, cfg: &SmoothConfig) -> Option<Vector3<f64>> {
     // Written so that NaN spreads (degenerate neighbourhoods) count as not planar.
     let planar = |least: f64, middle: f64| least < cfg.planarity * middle;
     let mut plane = fit(rel.iter().copied());
     if !planar(plane.2, plane.3) {
         return None;
     }
-    let half = 0.25 * cfg.radius * cfg.radius;
-    let inner = rel.partition_point(|d| d.norm_squared() <= half);
     if inner >= cfg.min_neighbours {
         let near = fit(rel[..inner].iter().copied());
         if planar(near.2, near.3) {
@@ -193,21 +191,34 @@ pub fn smooth_surfaces(xyz: &[[f32; 3]], cfg: &SmoothConfig) -> (Vec<[f32; 3]>, 
     let tree: ImmutableKdTree<f32, 3> =
         ImmutableKdTree::new_from_slice(xyz).expect("fewer than 2^32 points");
     let r2 = (cfg.radius * cfg.radius) as f32;
+    let half = (0.25 * cfg.radius * cfg.radius) as f32;
     let shifts: Vec<Option<[f32; 3]>> = xyz
         .par_iter()
         .map(|p| {
-            let nn = tree.query(p).within::<SquaredEuclidean<f32>>(r2).execute();
+            let mut nn = tree.query(p).within::<SquaredEuclidean<f32>>(r2).execute();
+            // Ties in distance are broken by the coordinates, not by the order of the
+            // kd-tree, which depends on the input order.
+            nn.sort_by(|a, b| {
+                a.distance.total_cmp(&b.distance).then_with(|| {
+                    let bits = |i: u32| xyz[i as usize].map(f32::to_bits);
+                    bits(a.item).cmp(&bits(b.item))
+                })
+            });
             let found = nn.len();
             if found < cfg.min_neighbours {
                 return None;
             }
             let origin = vec3(p);
-            // Evenly spaced by distance, so that the neighbourhood spans the whole radius.
+            // Evenly spaced in distance rank, so that the neighbourhood spans the whole
+            // radius.
             let take = found.min(cfg.max_neighbours);
-            let rel: Vec<Vector3<f64>> = (0..take)
-                .map(|i| vec3(&xyz[nn[i * found / take].item as usize]) - origin)
+            let picked = (0..take).map(|i| &nn[i * found / take]);
+            let rel: Vec<Vector3<f64>> = picked
+                .clone()
+                .map(|x| vec3(&xyz[x.item as usize]) - origin)
                 .collect();
-            let q = origin + project(&rel, cfg)?;
+            let inner = picked.take_while(|x| x.distance <= half).count();
+            let q = origin + project(&rel, inner, cfg)?;
             let q = [q.x as f32, q.y as f32, q.z as f32];
             (q != *p).then_some(q)
         })
