@@ -305,6 +305,10 @@ fn colorize_rejects_bad_config_and_cameras() {
             ..ColorConfig::default()
         },
         ColorConfig {
+            highlight_abs: 0.0,
+            ..ColorConfig::default()
+        },
+        ColorConfig {
             rim_theta: 0.0,
             ..ColorConfig::default()
         },
@@ -437,11 +441,12 @@ fn few_views_are_never_all_rejected() {
         stamp: T0 + 2.0,
         edit: Box::new(with_highlight),
     }];
+    // More than `view_gap` apart, so a point keeps both views.
     let two = [
         shot(0, T0 + 2.0),
         Shot {
             camera: 0,
-            stamp: T0 + 2.1,
+            stamp: T0 + 3.1,
             edit: Box::new(with_highlight),
         },
     ];
@@ -457,6 +462,9 @@ fn few_views_are_never_all_rejected() {
             let mut cloud = surface_cloud(&painted);
             let stats = colorize(&mut cloud, images.clone(), &poses, &cams, &cfg).unwrap();
             assert_eq!(stats.images_used, shots.len(), "{stats:?}");
+            // With two views the bright one is down-weighted on the points under the spot.
+            let lowered = highlights && shots.len() == 2;
+            assert_eq!(stats.views_rejected > 1000, lowered, "{name}: {stats:?}");
             colored.push(cloud.colored.unwrap());
         }
         // Every point seen keeps a colour, however bright its views.
