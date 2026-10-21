@@ -15,11 +15,12 @@ use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_odom::OdomConfig;
 use driftless_slam::{
-    build_submaps, load_cache, save_cache, solve, Corrections, LoopVerdict, SlamConfig, SlamReport,
-    SlamResult, POSITION_ONLY,
+    build_submaps, load_cache, match_manual_loops, save_cache, solve, Corrections, LoopVerdict,
+    ManualLoop, SlamConfig, SlamReport, SlamResult, Submap, POSITION_ONLY,
 };
 use driftless_traj::write_tum;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -98,10 +99,11 @@ fn input_id(bags: &[PathBuf], settings: &SlamSettings, cfg: &SlamConfig) -> Resu
 /// order. Phases: „IMU lesen“, „LiDAR lesen“ (or „Zwischenspeicher laden“ for a reuse),
 /// „Schleifen schließen“, „Schreiben“.
 ///
-/// A cancel is honoured after the odometry, before `submaps.bin` is written, before
-/// `traj.tum` is renamed to `traj.vorher.tum` (reuse) and before the outputs are written; a
-/// cancelled run leaves the output folder as it was. Once the outputs are being written the
-/// run is finished.
+/// A cancel is honoured while the frames are read and right after them, before
+/// `submaps.bin` is written (full run), and after the pose graph, before `traj.tum` is
+/// renamed to `traj.vorher.tum` (reuse). A cancelled run leaves the output folder as it was
+/// (a full run into a new folder leaves it empty). From the replaced `submaps.bin` or the
+/// rename on the run is not interruptible and finishes, also when cancelled meanwhile.
 pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, StepError> {
     let start = Instant::now();
     let out = &req.out;
@@ -125,14 +127,17 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
     let result = if req.reuse {
         progress.phase("Zwischenspeicher laden", None);
         let (submaps, odom_anchors) = load_cache(&cache, &input).map_err(failed)?;
+        let traj = out.join("traj.tum");
+        // A run made without history (e.g. by the CLI) is kept before it is replaced, with the
+        // corrections it was computed with.
+        let import = (req.history && history::list(out).is_empty() && traj.exists())
+            .then(|| corrections_of_run(out, &submaps, &corrections));
         progress.phase("Schleifen schließen", None);
         let result = solve(submaps, odom_anchors, &manual, &cfg).map_err(solve_hint)?;
         // The last check: renaming, writing and recording belong together.
         check_cancel(progress)?;
-        let traj = out.join("traj.tum");
-        if req.history && history::list(out).is_empty() && traj.exists() {
-            // A run made without history (e.g. by the CLI): keep it before it is replaced.
-            history::record(out, HistoryKind::Imported, 0.0)?;
+        if let Some(then) = &import {
+            history::record_with(out, HistoryKind::Imported, 0.0, Some(then))?;
         }
         let previous = out.join("traj.vorher.tum");
         if traj.exists() {
@@ -181,7 +186,6 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
             imu.len(),
             bad + read.bad
         ));
-        check_cancel(progress)?;
         result
     };
 
@@ -206,6 +210,33 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
         seconds,
         history,
     })
+}
+
+/// The corrections of `current` with the switches of the run whose `slam.json` lies in
+/// `out`: an entry is on iff its two submaps are joined by a manual loop there (only the
+/// first entry of a pair, since a pair takes one loop). Without a readable `slam.json` all
+/// are off.
+fn corrections_of_run(out: &Path, submaps: &[Submap], current: &Corrections) -> Corrections {
+    let pairs: BTreeSet<(usize, usize)> = fs::read_to_string(out.join("slam.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<SlamReport>(&t).ok())
+        .map(|r| {
+            r.loops
+                .iter()
+                .filter(|l| l.manual)
+                .map(|l| (l.a.min(l.b), l.a.max(l.b)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut used = BTreeSet::new();
+    let mut then = current.clone();
+    for l in &mut then.loops {
+        let pair = match_manual_loops(submaps, &[ManualLoop { a_t: l.a, b_t: l.b }])
+            .ok()
+            .and_then(|m| m.first().map(|m| (m.a.min(m.b), m.a.max(m.b))));
+        l.enabled = pair.is_some_and(|p| pairs.contains(&p) && used.insert(p));
+    }
+    then
 }
 
 /// Writes everything but the cache; returns the report and the number of map points.

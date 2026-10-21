@@ -110,6 +110,50 @@ fn reuse_of_run_without_history_keeps_it_first() {
     assert_eq!(history::list(&out).len(), 3);
 }
 
+/// The kept state of a run made without history has the switches that run was computed
+/// with, not the ones of the corrections file at the reuse.
+#[test]
+fn imported_state_has_the_switches_of_its_run() {
+    // 12 s: two submaps, a manual loop between them is allowed
+    let dir = tmp("steps-history-import-flags");
+    room_bag_secs(&dir, true, 12.0);
+    let out = dir.join("out");
+    slam(&dir, &out, false, false);
+    correct::add_loop(&out, 1.0, 11.0, "neu").unwrap();
+    slam(&dir, &out, true, true);
+    let list = history::list(&out);
+    assert_eq!(list[0].kind, HistoryKind::Imported);
+    let then = Corrections::load(&list[0].dir.join(CORRECTIONS_FILE)).unwrap();
+    assert_eq!(then.loops.len(), 1);
+    assert!(!then.loops[0].enabled, "the run had no loop");
+    // back to that state: the new loop is switched off, not removed
+    assert_eq!(history::restore_flags(&out, 1).unwrap(), 1);
+    let now = Corrections::load(&out.join(CORRECTIONS_FILE)).unwrap();
+    assert_eq!(now.loops.len(), 1);
+    assert!(!now.loops[0].enabled);
+
+    // a run made with the loop keeps it on
+    let out = dir.join("out2");
+    slam(&dir, &out, false, false);
+    correct::add_loop(&out, 1.0, 11.0, "").unwrap();
+    slam(&dir, &out, true, false);
+    slam(&dir, &out, true, true);
+    let first = &history::list(&out)[0];
+    assert_eq!(first.kind, HistoryKind::Imported);
+    let then = Corrections::load(&first.dir.join(CORRECTIONS_FILE)).unwrap();
+    assert!(then.loops[0].enabled);
+}
+
+#[test]
+fn record_without_slam_json() {
+    let out = tmp("steps-history-no-json");
+    fs::write(out.join("traj.tum"), "1000 0 0 0 0 0 0 1\n").unwrap();
+    let dir = history::record(&out, HistoryKind::Full, 1.0).unwrap();
+    assert!(dir.join("traj.tum").is_file());
+    assert!(!dir.join("slam.json").exists());
+    assert_eq!(history::list(&out).len(), 1);
+}
+
 fn write_corrections(path: &Path, flags: &[bool]) {
     let mut c = Corrections::default();
     for (i, on) in flags.iter().enumerate() {

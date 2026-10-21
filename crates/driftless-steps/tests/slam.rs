@@ -113,6 +113,37 @@ fn slam_cancelled_writes_nothing() {
     let err = run_slam(&request(&dir, &out, false), &cancel_at("LiDAR lesen", 5)).unwrap_err();
     assert_eq!(err, StepError::Cancelled);
     assert_eq!(files(&out), before);
+
+    // also over a run with other settings, whose submaps.bin a full run would replace
+    let mut other = request(&dir, &out, false);
+    other.settings.lidar_to_imu = Some([0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+    run_slam(&other, &Progress::new()).unwrap();
+    let before = files(&out);
+    let err = run_slam(&request(&dir, &out, false), &cancel_at("LiDAR lesen", 5)).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    assert_eq!(files(&out), before);
+}
+
+/// Once `submaps.bin` is replaced, a full run finishes even when cancelled: the folder never
+/// holds a cache of one run next to the trajectory of another.
+#[test]
+fn full_run_finishes_after_the_cache_is_written() {
+    let dir = tmp("steps-slam-late-cancel");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    let p = cancel_at("Schleifen schließen", 0);
+    let outcome = run_slam(&request(&dir, &out, false), &p).unwrap();
+    assert!(p.is_cancelled());
+    assert_eq!(outcome.report.submaps.len(), 1);
+    let reference = dir.join("reference");
+    run_slam(&request(&dir, &reference, false), &Progress::new()).unwrap();
+    for f in ["traj.tum", "slam.json", "submaps.bin", "map.las"] {
+        assert_eq!(
+            fs::read(out.join(f)).unwrap(),
+            fs::read(reference.join(f)).unwrap(),
+            "{f}"
+        );
+    }
 }
 
 #[test]

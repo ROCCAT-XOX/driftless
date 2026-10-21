@@ -87,21 +87,36 @@ fn numbers(out: &Path) -> Vec<u32> {
 
 /// Records the current result of the run folder `out` as a new state and returns its folder.
 /// The number is one more than the largest present; `stand.toml` is written last, so an
-/// interrupted copy is never listed.
+/// interrupted copy is never listed. A missing `slam.json` is left out of the state.
 pub fn record(out: &Path, kind: HistoryKind, seconds: f64) -> Result<PathBuf, StepError> {
+    record_with(out, kind, seconds, None)
+}
+
+/// [`record`] with `corrections` stored instead of a copy of the current file.
+pub(crate) fn record_with(
+    out: &Path,
+    kind: HistoryKind,
+    seconds: f64,
+    corrections: Option<&Corrections>,
+) -> Result<PathBuf, StepError> {
     let nr = numbers(out).into_iter().max().unwrap_or(0) + 1;
     let dir = state_dir(out, nr);
     let fail = |e: &dyn std::fmt::Display| format!("Stand {} nicht schreibbar: {e}", dir.display());
     fs::create_dir_all(&dir).map_err(|e| fail(&e))?;
-    for file in ["traj.tum", "slam.json"] {
-        fs::copy(out.join(file), dir.join(file)).map_err(|e| fail(&format!("{file}: {e}")))?;
+    let copy = |file: &str| {
+        fs::copy(out.join(file), dir.join(file)).map_err(|e| fail(&format!("{file}: {e}")))
+    };
+    copy("traj.tum")?;
+    if out.join("slam.json").exists() {
+        copy("slam.json")?;
     }
-    let corrections = out.join(CORRECTIONS_FILE);
-    if corrections.exists() {
-        fs::copy(&corrections, dir.join(CORRECTIONS_FILE))
-            .map_err(|e| fail(&format!("{CORRECTIONS_FILE}: {e}")))?;
-    } else {
-        Corrections::default().save(&dir.join(CORRECTIONS_FILE))?;
+    let path = out.join(CORRECTIONS_FILE);
+    match corrections {
+        Some(c) => c.save(&dir.join(CORRECTIONS_FILE))?,
+        None if path.exists() => {
+            copy(CORRECTIONS_FILE)?;
+        }
+        None => Corrections::default().save(&dir.join(CORRECTIONS_FILE))?,
     }
     let state = State {
         nr,
