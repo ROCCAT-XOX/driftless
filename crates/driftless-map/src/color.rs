@@ -21,12 +21,14 @@
 //!    by its camera's edge falloff at the view's angle (see [`crate::exposure`]), both fitted
 //!    on the kept views.
 //! 2. Views beyond [`ColorConfig::rim_theta`] are left out, unless the point has no other.
-//! 3. Highlights are rejected (experimental, [`ColorConfig::highlights`], off by default): the
-//!    reference luminance is the second darkest view's (the
-//!    darkest's below 3 views); a view brighter than it by more than
-//!    [`ColorConfig::highlight_ratio`] and [`ColorConfig::highlight_abs`] is left out.
-//!    Highlights are additive and follow the camera over several images; the second darkest
-//!    view survives one too dark outlier and up to `views_kept − 2` highlighted views.
+//! 3. Highlights are down-weighted (experimental, [`ColorConfig::highlights`], off by
+//!    default): the reference luminance is the second darkest view's (the darkest's below 3
+//!    views); a brighter view's weight is multiplied by `exp(−q²)`, `q` its excess over the
+//!    reference in units of the larger of [`ColorConfig::highlight_ratio`] × reference and
+//!    [`ColorConfig::highlight_abs`]. Highlights are additive and follow the camera over
+//!    several images; the second darkest view survives one too dark outlier and up to
+//!    `views_kept − 2` highlighted views. Dropping such views outright made neighbouring
+//!    points flip between view sets and raised the seams far more.
 //! 4. Blend: the weighted mean of the best [`ColorConfig::views_blended`] remaining views in
 //!    linear RGB, written as sRGB. (A soft blend with weights `w_k − w_(b+1)`, continuous where
 //!    the last blended and the first unblended view swap places, made the seams worse: it
@@ -146,13 +148,14 @@ pub struct ColorConfig {
     /// Kept views of the same camera lie at least this far apart in capture time (s): a
     /// reflection moves with the camera, so views from a short stretch of the walk all show it.
     pub view_gap: f64,
-    /// Reject highlights (see the module docs). Experimental and off by default: on Promedia
-    /// the rejection raised `seam_jump` from 4.7 to 7.7–8.4 (sRGB levels) for 22–33 % fewer
-    /// floor highlights, at every threshold tried.
+    /// Down-weight highlights (see the module docs). Experimental and off by default: on
+    /// Promedia it lowered the floor highlights by 28–33 % but raised `seam_jump` from 4.4 to
+    /// 5.5–6.3 sRGB levels (dropping the views instead: 7.7–8.4), at every setting tried.
     pub highlights: bool,
-    /// A view is a highlight if its luminance exceeds the reference by this share …
+    /// The unit of a view's luminance excess over the reference is the larger of this share
+    /// of the reference …
     pub highlight_ratio: f64,
-    /// … and by this much (linear).
+    /// … and this (linear).
     pub highlight_abs: f64,
     /// Views farther than this from the optical axis (rad) are left out of the blend and of
     /// the highlight reference, unless all of a point's views are.
@@ -175,8 +178,8 @@ impl Default for ColorConfig {
             views_blended: 6,
             view_gap: 1.0,
             highlights: false,
-            highlight_ratio: 1.0,
-            highlight_abs: 0.05,
+            highlight_ratio: 0.5,
+            highlight_abs: 0.03,
             rim_theta: 85f64.to_radians(),
             exposure: ExposureConfig::default(),
         }
@@ -281,7 +284,8 @@ pub struct ColorStats {
     /// on the trajectory (0 without at least 2 images or without variation). Close to 0 means
     /// the sharpness does not follow the brightness.
     pub sharpness_brightness_rank_corr: f64,
-    /// Views rejected as highlights, and the points with at least one of them.
+    /// Views down-weighted as highlights to `exp(−1)` or less (excess over the reference above
+    /// one unit), and the points with at least one of them.
     pub views_rejected: usize,
     pub points_with_rejected: usize,
     /// Views left out for lying beyond [`ColorConfig::rim_theta`] (points with only such
@@ -787,7 +791,7 @@ struct Mix {
     linear: Option<[f32; 3]>,
     /// Image (rank) of the view with the largest blend weight; `u32::MAX` without views.
     main: u32,
-    /// Views rejected as highlights.
+    /// Views down-weighted as highlights to `exp(−1)` or less.
     rejected: usize,
     /// Views left out beyond the rim.
     rim: usize,
@@ -846,21 +850,44 @@ fn mix(slots: &[View], cfg: &ColorConfig) -> Mix {
         }
     }
     let reference = if n >= 3 { second } else { dark };
-    let bright = |v: &View| {
-        let y = luminance(v.linear());
-        cfg.highlights
-            && y > reference * (1.0 + cfg.highlight_ratio)
-            && y - reference > cfg.highlight_abs
+    // Highlights: weight × exp(−q²), q the excess over the reference in units of
+    // max(ratio · reference, abs). Continuous, so neighbouring points do not flip between view
+    // sets (dropping views outright raised the seams far more).
+    let scale = (reference * cfg.highlight_ratio).max(cfg.highlight_abs);
+    let excess = |v: &View| ((luminance(v.linear()) - reference) / scale).max(0.0);
+    let w = |v: &View| {
+        let w = f64::from(v.weight);
+        if cfg.highlights {
+            let q = excess(v);
+            w * (-q * q).exp()
+        } else {
+            w
+        }
     };
-    let rejected = slots.iter().filter(|v| candidate(v) && bright(v)).count();
-    let kept = || slots.iter().filter(|v| candidate(v) && !bright(v));
+    let rejected = if cfg.highlights {
+        slots
+            .iter()
+            .filter(|v| candidate(v) && excess(v) > 1.0)
+            .count()
+    } else {
+        0
+    };
+    let top = || {
+        slots
+            .iter()
+            .filter(|v| candidate(v))
+            .take(cfg.views_blended)
+    };
+    // The first of the largest blend weights.
+    let main = top()
+        .fold(None::<&View>, |m, v| match m {
+            Some(b) if w(b) >= w(v) => Some(b),
+            _ => Some(v),
+        })
+        .map_or(u32::MAX, |v| v.rank);
     Mix {
-        linear: weighted_mean(
-            kept()
-                .take(cfg.views_blended)
-                .map(|v| (f64::from(v.weight), v.linear())),
-        ),
-        main: kept().next().map_or(u32::MAX, |v| v.rank),
+        linear: weighted_mean(top().map(|v| (w(v), v.linear()))),
+        main,
         rejected,
         rim,
     }
@@ -1358,6 +1385,26 @@ mod tests {
         let m = mix(&two, &cfg);
         assert_eq!((m.rejected, m.main), (1, 1));
         assert!((m.linear.unwrap()[0] - 0.1).abs() < 1e-3, "{m:?}");
+    }
+
+    #[test]
+    fn highlight_weight_is_continuous() {
+        // A view crossing one unit of excess (where the hard rule dropped it) changes the
+        // colour only a little, and a clear highlight hardly counts.
+        let cfg = with_highlights();
+        let colour = |y: f32| {
+            let s = [
+                gray(1.0, 0, y, 0.0),
+                gray(0.9, 1, 0.2, 0.0),
+                gray(0.8, 2, 0.2, 0.0),
+                EMPTY,
+            ];
+            mix(&s, &cfg).linear.unwrap()[0]
+        };
+        let unit = 0.2 * cfg.highlight_ratio as f32;
+        let (below, above) = (colour(0.2 + 0.999 * unit), colour(0.2 + 1.001 * unit));
+        assert!((below - above).abs() < 1e-3, "{below} vs {above}");
+        assert!((colour(0.9) - 0.2).abs() < 1e-3, "{}", colour(0.9));
     }
 
     #[test]
