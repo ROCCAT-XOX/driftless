@@ -114,8 +114,8 @@ fn ui_screenshots() {
         eprintln!("DRIFTLESS_TESTDATA nicht gesetzt, echte Wolke übersprungen");
         return;
     };
-    let run = data.join("ergebnisse-buero");
-    let path = run.join("color.las");
+    let run = data.join("ergebnisse-m5/buero");
+    let path = run.join("karte/color.las");
     if !path.exists() {
         eprintln!("{} fehlt, echte Wolke übersprungen", path.display());
         return;

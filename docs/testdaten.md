@@ -104,6 +104,30 @@ Die Dateien unter `Test/` stammen aus einem Testscan mit dem 3DMakerPro-Scanner.
 Referenzdateien (`trj.txt`, `smooth.las`) dienen nur zum Vergleich; Software
 des Scanner-Herstellers wird nicht ins Repository uebernommen.
 
+## Programm (Meilenstein 5)
+
+Die Tests des Programms mit echten Daten lesen die Ausgaben des Release-CLI unter
+`$DRIFTLESS_TESTDATA/ergebnisse-m5/` (nicht im Repo):
+
+```
+ergebnisse-m5/
+  buero/          driftless slam <Büro> -o …/buero, dann driftless map <Büro> --slam …/buero
+    karte/color.las   Kopie von buero/color.las (die Wolke, die die Tests laden)
+  test/           dasselbe für Test
+```
+
+```sh
+cargo test -p driftless-app --release --test real_data -- --ignored --nocapture --test-threads 1
+cargo test -p driftless-app --release --test lod_memory_real -- --ignored --nocapture
+cargo test -p driftless-app --release --test view3d -- --ignored --nocapture   # 50 Mio., GPU
+DRIFTLESS_SHOTS=<ordner> cargo test -p driftless-app --release --test ui_screenshots -- --ignored --nocapture
+```
+
+`app_steps_match_cli` rechnet `Test` wie das Programm (≈ 3 min) und vergleicht alle Dateien mit
+`ergebnisse-m5/test`; nach einer Änderung an SLAM oder Karte also zuerst die CLI-Ausgaben neu
+erzeugen. Bildschirmfotos nur in einen Ordner außerhalb des Repos (Schranken und Messwerte:
+`docs/ergebnisse/2026-10-22-meilenstein-5.md`).
+
 ## Fehlersuche-Viewer
 
 `driftless view <ordner>` braucht den rerun-Viewer in passender Version:
