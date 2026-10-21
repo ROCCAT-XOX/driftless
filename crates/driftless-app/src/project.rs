@@ -260,20 +260,35 @@ fn from_stored(base: &Path, text: &str) -> PathBuf {
     out
 }
 
+/// Windows device names, which name no folder whatever the extension.
+const WINDOWS_DEVICES: [&str; 22] = [
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
 /// A scan id names exactly one folder in `scans/`: a single plain name, without `/`, `\`
-/// and `:`, not `.` or `..`.
+/// and `:`, not `.` or `..`. Windows drops a trailing dot or space (`".. "` would become
+/// `..`) and maps device names to devices, so both are refused on every platform.
 fn check_id(id: &str) -> Result<(), ProjectError> {
     let mut parts = Path::new(id).components();
     let single = matches!(
         (parts.next(), parts.next()),
         (Some(Component::Normal(_)), None)
     );
-    if single && !id.contains(['/', '\\', ':']) && id != "." && id != ".." {
+    let stem = id.split('.').next().unwrap_or("").trim_end().to_lowercase();
+    if single
+        && !id.contains(['/', '\\', ':'])
+        && id != "."
+        && id != ".."
+        && !id.ends_with(['.', ' '])
+        && !WINDOWS_DEVICES.contains(&stem.as_str())
+    {
         Ok(())
     } else {
         Err(ProjectError(format!(
             "ungültige Scan-Kennung „{id}“: erlaubt ist nur ein einfacher Ordnername \
-             (ohne /, \\ und :, nicht . oder ..)"
+             (ohne /, \\ und :, nicht . oder .., ohne Punkt oder Leerzeichen am Ende, kein \
+             Windows-Gerätename)"
         )))
     }
 }

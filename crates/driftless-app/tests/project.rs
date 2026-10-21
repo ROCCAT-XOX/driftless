@@ -580,7 +580,8 @@ fn relative_and_windows_style_paths() {
 fn bad_scan_ids_are_refused() {
     let dir = tmp("app-bad-ids");
     let bad = [
-        "", ".", "..", "../x", "a/b", "a\\b", "/abs", "C:\\x", "c:", "a:b", "x/..",
+        "", ".", "..", "../x", "a/b", "a\\b", "/abs", "C:\\x", "c:", "a:b", "x/..", ".. ", "...",
+        "scan.", "scan ", "NUL", "con.txt", "Com1",
     ];
     for (n, id) in bad.iter().enumerate() {
         let pdir = dir.join(format!("p{n}"));
