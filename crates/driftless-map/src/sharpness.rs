@@ -1,11 +1,13 @@
-//! Image sharpness: variance of the Laplacian of the gray image, divided by the squared mean
-//! gray value.
+//! Image sharpness: variance of the Laplacian of the gray image, divided by the mean gray
+//! value.
 //!
 //! Blur (focus or motion) removes the high frequencies the Laplacian responds to, so the
-//! variance drops. Scaling all pixels by a factor scales the Laplacian by the same factor, so
-//! dividing by the squared mean makes the value independent of the exposure (dimensionless).
-//! It still depends on resolution and scene content, so it is only compared between images of
-//! the same scan at the same resolution (see [`crate::ColorConfig::min_sharpness`]).
+//! variance drops. Dividing by the mean makes the value grow with the contrast in proportion to
+//! the brightness instead of with its square. Image noise does not grow with the square of the
+//! brightness, so dividing by the squared mean (as first tried in Meilenstein 4) made bright
+//! images look "blurry". It still depends on resolution and scene content, so it is only
+//! compared between images of the same scan at the same resolution (see
+//! [`crate::ColorConfig::min_sharpness`]).
 
 use driftless_io::images::RgbImage;
 use rayon::prelude::*;
@@ -25,7 +27,7 @@ fn row_moments(gray: &[u8], w: usize, y: usize) -> (f64, f64) {
 pub const SHARPNESS_MIN_MEAN: f64 = 16.0;
 
 /// Variance of the 4-neighbour Laplacian of the gray image over its interior pixels divided by
-/// `max(mean gray, SHARPNESS_MIN_MEAN)²`; 0 for images smaller than 3 × 3. Rows are summed in
+/// `max(mean gray, SHARPNESS_MIN_MEAN)`; 0 for images smaller than 3 × 3. Rows are summed in
 /// parallel and reduced in row order, so the result is the same in every run.
 pub fn sharpness(img: &RgbImage) -> f64 {
     measure(img).0
@@ -50,7 +52,7 @@ pub(crate) fn measure(img: &RgbImage) -> (f64, f64) {
     let var = (s2 / n - mean * mean).max(0.0);
     let total: u64 = gray.iter().map(|&g| u64::from(g)).sum();
     let gray_mean = total as f64 / gray.len() as f64;
-    (var / gray_mean.max(SHARPNESS_MIN_MEAN).powi(2), gray_mean)
+    (var / gray_mean.max(SHARPNESS_MIN_MEAN), gray_mean)
 }
 
 #[cfg(test)]
@@ -124,11 +126,12 @@ mod tests {
     }
 
     #[test]
-    fn brightness_scaling_keeps_sharpness() {
+    fn brightness_scaling_is_proportional() {
         let base = image(64, 48, texture);
         let (a, b) = (sharpness(&base), sharpness(&scaled(&base, 0.3)));
         assert!(a > 0.0);
-        assert!((a - b).abs() < 0.05 * a, "{a} vs {b}");
+        // Unnormalised variance would give 0.09, the squared-mean normalisation 1.0.
+        assert!((b / a - 0.3).abs() < 0.03, "{a} vs {b}");
     }
 
     #[test]
@@ -176,7 +179,7 @@ mod tests {
         let dot = sharpness(&image(5, 5, |x, y| if (x, y) == (2, 2) { 200 } else { 0 }));
         let (s, s2) = (-800.0 + 4.0 * 200.0, 640_000.0 + 4.0 * 40_000.0);
         // Mean gray is 200 / 25 = 8, below the floor, so the floor is the divisor.
-        let want: f64 = (s2 / 9.0 - (s / 9.0f64).powi(2)) / SHARPNESS_MIN_MEAN.powi(2);
+        let want: f64 = (s2 / 9.0 - (s / 9.0f64).powi(2)) / SHARPNESS_MIN_MEAN;
         assert!((dot - want).abs() < 1e-9, "{dot} vs {want}");
     }
 }
