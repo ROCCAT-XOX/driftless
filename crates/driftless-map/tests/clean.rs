@@ -1,7 +1,7 @@
 use driftless_io::msg::{ImuSample, LidarFrame, LidarPoint};
 use driftless_map::{
-    build_dense, clean, find_ghosts, find_outliers, CleanConfig, CleanStats, Cloud, DenseConfig,
-    MapError, RaySource,
+    build_dense, clean, find_ghosts, find_outliers, write_removed_las, CleanConfig, CleanStats,
+    Cloud, DenseConfig, MapError, RaySource, RemovalReason,
 };
 use driftless_odom::testutil::{aabb, imu_samples, room_scene, Aabb, Scene, Trajectory, Walk};
 use driftless_odom::{run_odometry, OdomConfig};
@@ -320,7 +320,7 @@ fn clean_is_deterministic() {
     let (cloud, rays) = moving_scan();
     let a = clean(cloud.clone(), &rays, &CleanConfig::default()).unwrap();
     let b = clean(cloud, &rays, &CleanConfig::default()).unwrap();
-    assert!(a.2.ghosts > 0 && a.2.kept > 0);
+    assert!(a.3.ghosts > 0 && a.3.kept > 0);
     assert_eq!(a, b);
 }
 
@@ -345,7 +345,8 @@ fn removed_plus_kept_equals_input() {
     let (mut cloud, rays) = moving_scan();
     cloud.rgb = Some((0..cloud.len()).map(|i| [i as u8, 0, 0]).collect());
     cloud.colored = Some((0..cloud.len()).map(|i| i % 3 == 0).collect());
-    let (kept, removed, stats) = clean(cloud.clone(), &rays, &CleanConfig::default()).unwrap();
+    let (kept, removed, reasons, stats) =
+        clean(cloud.clone(), &rays, &CleanConfig::default()).unwrap();
     assert_eq!(kept.len() + removed.len(), cloud.len());
     assert_eq!(
         stats,
@@ -356,6 +357,21 @@ fn removed_plus_kept_equals_input() {
         }
     );
     assert_eq!(stats.ghosts + stats.outliers, removed.len());
+    assert_eq!(reasons.len(), removed.len());
+    assert_eq!(
+        reasons
+            .iter()
+            .filter(|&&r| r == RemovalReason::Ghost)
+            .count(),
+        stats.ghosts
+    );
+    assert_eq!(
+        reasons
+            .iter()
+            .filter(|&&r| r == RemovalReason::Outlier)
+            .count(),
+        stats.outliers
+    );
     assert!(stats.ghosts > 0 && stats.outliers > 0);
     assert_eq!(sorted_bits(&[&kept, &removed]), sorted_bits(&[&cloud]));
     for c in [&kept, &removed] {
@@ -369,16 +385,16 @@ fn removed_plus_kept_equals_input() {
         outliers: false,
         ..CleanConfig::default()
     };
-    let (kept, removed, stats) = clean(cloud.clone(), &rays, &off).unwrap();
+    let (kept, removed, reasons, stats) = clean(cloud.clone(), &rays, &off).unwrap();
     assert_eq!(kept, cloud);
-    assert!(removed.is_empty());
+    assert!(removed.is_empty() && reasons.is_empty());
     assert_eq!(
         (stats.ghosts, stats.outliers, stats.kept),
         (0, 0, cloud.len())
     );
 
     // Ghosts only: the same ghosts as `find_ghosts`.
-    let (_, removed, stats) = clean(cloud.clone(), &rays, &only_ghosts()).unwrap();
+    let (_, removed, _, stats) = clean(cloud.clone(), &rays, &only_ghosts()).unwrap();
     let ghosts = find_ghosts(&cloud, &rays, &CleanConfig::default());
     assert_eq!(removed.len(), ghosts.iter().filter(|&&g| g).count());
     assert_eq!(stats.outliers, 0);
@@ -417,7 +433,28 @@ fn clean_rejects_bad_config() {
         let r = clean(cloud.clone(), &rays, &cfg);
         assert!(matches!(r, Err(MapError::Config(_))), "{cfg:?}");
     }
-    let (kept, removed, stats) = clean(cloud, &rays, &CleanConfig::default()).unwrap();
+    let (kept, removed, _, stats) = clean(cloud, &rays, &CleanConfig::default()).unwrap();
     assert!(kept.is_empty() && removed.is_empty());
     assert_eq!(stats, CleanStats::default());
+}
+
+#[test]
+fn removed_las_carries_reason() {
+    let (cloud, rays) = moving_scan();
+    let (_, removed, reasons, _) = clean(cloud, &rays, &CleanConfig::default()).unwrap();
+    let dir = std::env::temp_dir().join(format!("driftless-removed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("removed.las");
+    write_removed_las(&path, &removed, &reasons).unwrap();
+    let mut r = las::Reader::from_path(&path).unwrap();
+    let got: Vec<u8> = r
+        .read_all()
+        .unwrap()
+        .points()
+        .map(|p| p.unwrap().user_data)
+        .collect();
+    let want: Vec<u8> = reasons.iter().map(|&r| r as u8).collect();
+    assert_eq!(got, want);
+    assert!(got.contains(&1) && got.contains(&2));
+    std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -97,6 +97,14 @@ impl CleanConfig {
     }
 }
 
+/// Why [`clean`] removed a point; the value is written to `removed.las` as `user_data`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RemovalReason {
+    Ghost = 1,
+    Outlier = 2,
+}
+
 /// Point counts of [`clean`]: removed by reason (each point counts once, ghost before
 /// outlier) and kept.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -379,7 +387,8 @@ pub fn find_outliers(cloud: &Cloud, cfg: &CleanConfig) -> Vec<bool> {
     outlier_flags(&cloud.xyz, cfg.outlier_k, cfg.outlier_sigma)
 }
 
-/// Splits `cloud` into (kept, removed). With [`CleanConfig::ghosts`] the ghosts go (see
+/// Splits `cloud` into (kept, removed, reasons); `reasons` has one entry per removed point,
+/// in the same order. With [`CleanConfig::ghosts`] the ghosts go (see
 /// [`find_ghosts`], rays from [`crate::build_dense`]), then with [`CleanConfig::outliers`]
 /// the outliers among the remaining points (see [`find_outliers`]): isolated scraps a ghost
 /// left behind count as outliers. Both parts keep the point order and all columns.
@@ -392,14 +401,15 @@ pub fn clean(
     cloud: Cloud,
     rays: &RaySource,
     cfg: &CleanConfig,
-) -> Result<(Cloud, Cloud, CleanStats), MapError> {
+) -> Result<(Cloud, Cloud, Vec<RemovalReason>, CleanStats), MapError> {
     cfg.check()?;
     let mut keep = if cfg.ghosts {
         find_ghosts(&cloud, rays, cfg).iter().map(|&g| !g).collect()
     } else {
         vec![true; cloud.len()]
     };
-    let ghosts = keep.iter().filter(|&&k| !k).count();
+    let ghost_flags: Vec<bool> = keep.iter().map(|&k| !k).collect();
+    let ghosts = ghost_flags.iter().filter(|&&g| g).count();
     let mut outliers = 0;
     if cfg.outliers {
         let rest: Vec<usize> = (0..cloud.len()).filter(|&i| keep[i]).collect();
@@ -414,13 +424,23 @@ pub fn clean(
             }
         }
     }
+    let reasons = (0..keep.len())
+        .filter(|&i| !keep[i])
+        .map(|i| {
+            if ghost_flags[i] {
+                RemovalReason::Ghost
+            } else {
+                RemovalReason::Outlier
+            }
+        })
+        .collect();
     let (kept, removed) = cloud.select(&keep);
     let stats = CleanStats {
         ghosts,
         outliers,
         kept: kept.len(),
     };
-    Ok((kept, removed, stats))
+    Ok((kept, removed, reasons, stats))
 }
 
 #[cfg(test)]

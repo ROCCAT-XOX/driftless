@@ -19,11 +19,11 @@ mod sharpness;
 mod stage;
 pub mod visibility;
 
-pub use clean::{clean, find_ghosts, find_outliers, CleanConfig, CleanStats};
+pub use clean::{clean, find_ghosts, find_outliers, CleanConfig, CleanStats, RemovalReason};
 pub use cloud::Cloud;
 pub use color::{colorize, ColorCamera, ColorConfig, ColorStats, ImageSource};
 pub use dense::{build_dense, DenseConfig, DenseStats, RaySource};
-pub use export::{write_las, write_ply, LAS_SCALE};
+pub use export::{write_las, write_ply, write_removed_las, LAS_SCALE};
 pub use exposure::{
     estimate_exposure, estimate_gains, ExposureConfig, ImageGain, Observations, ViewObs,
     Vignetting, DARK, SATURATED, VIGNETTE_MIN_OBSERVATIONS, VIGNETTE_MIN_POINT_SPREAD,

@@ -15,8 +15,8 @@ use driftless_io::msg::{decode_imu, decode_pointcloud2, ImuSample, LidarFrame};
 use driftless_io::project::discover_project;
 use driftless_io::testdata;
 use driftless_map::{
-    build_dense, clean, colorize, content_hash, write_las, write_ply, CleanConfig, CleanStats,
-    ColorCamera, ColorConfig, ColorStats, DenseConfig, ImageSource,
+    build_dense, clean, colorize, content_hash, write_las, write_ply, write_removed_las,
+    CleanConfig, CleanStats, ColorCamera, ColorConfig, ColorStats, DenseConfig, ImageSource,
 };
 use driftless_slam::{run_slam, SlamConfig};
 use driftless_traj::{read_tum, write_tum};
@@ -217,10 +217,11 @@ fn full_run(folder: &Path, tag: &str) -> FullRun {
     let dense_s = start.elapsed().as_secs_f64();
 
     let start = Instant::now();
-    let (mut kept, removed, clean_stats) = clean(cloud, &rays, &CleanConfig::default()).unwrap();
+    let (mut kept, removed, reasons, clean_stats) =
+        clean(cloud, &rays, &CleanConfig::default()).unwrap();
     drop(rays);
     write_las(&out.join("clean.las"), &kept).unwrap();
-    write_las(&out.join("removed.las"), &removed).unwrap();
+    write_removed_las(&out.join("removed.las"), &removed, &reasons).unwrap();
     drop(removed);
     let clean_s = start.elapsed().as_secs_f64();
 
@@ -416,7 +417,7 @@ fn jmk6_scan_143623_clean() {
     let points = cloud.len();
 
     let start = Instant::now();
-    let (kept, removed, stats) = clean(cloud, &rays, &CleanConfig::default()).unwrap();
+    let (kept, removed, reasons, stats) = clean(cloud, &rays, &CleanConfig::default()).unwrap();
     let clean_s = start.elapsed().as_secs_f64();
     println!(
         "143623: clean {clean_s:.1} s; {points} points, {} rays -> {} kept, {} ghosts, {} \
@@ -429,7 +430,7 @@ fn jmk6_scan_143623_clean() {
     let out = std::env::temp_dir().join(format!("driftless-map-clean-{}", std::process::id()));
     std::fs::create_dir_all(&out).unwrap();
     write_las(&out.join("clean.las"), &kept).unwrap();
-    write_las(&out.join("removed.las"), &removed).unwrap();
+    write_removed_las(&out.join("removed.las"), &removed, &reasons).unwrap();
     assert_eq!(kept.len() + removed.len(), points);
     assert!(
         stats.kept > points * 9 / 10,
@@ -455,7 +456,7 @@ fn jmk6_scan_143623_color() {
         build_dense(frames, &imu, &cfg.odom, &poses, &DenseConfig::default())
     })
     .unwrap();
-    let (mut cloud, _, _) = clean(cloud, &rays, &CleanConfig::default()).unwrap();
+    let (mut cloud, _, _, _) = clean(cloud, &rays, &CleanConfig::default()).unwrap();
 
     let (cams, images) = color_input(&folder, &cfg.odom.lidar_to_imu);
 

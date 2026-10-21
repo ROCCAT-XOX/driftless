@@ -22,8 +22,8 @@ use driftless_io::camera::Camera;
 use driftless_io::project::{discover_project, Project};
 use driftless_map::{
     build_dense, clean, colorize, content_hash, load_stage, save_stage, write_las, write_ply,
-    CleanConfig, CleanStats, Cloud, ColorCamera, ColorConfig, ColorStats, DenseConfig, DenseStats,
-    ImageSource, RaySource, StageError,
+    write_removed_las, CleanConfig, CleanStats, Cloud, ColorCamera, ColorConfig, ColorStats,
+    DenseConfig, DenseStats, ImageSource, RaySource, StageError,
 };
 use driftless_odom::OdomConfig;
 use driftless_slam::SlamConfig;
@@ -517,10 +517,10 @@ impl MapRun<'_> {
 
     fn run_clean(&mut self, cloud: Cloud, rays: RaySource) -> Result<Cloud, BoxError> {
         let start = Instant::now();
-        let (kept, removed, stats) = clean(cloud, &rays, &self.clean_cfg)?;
+        let (kept, removed, reasons, stats) = clean(cloud, &rays, &self.clean_cfg)?;
         drop(rays);
         write_las(&self.path("clean.las"), &kept)?;
-        write_las(&self.path("removed.las"), &removed)?;
+        write_removed_las(&self.path("removed.las"), &removed, &reasons)?;
         drop(removed);
         let id = self.ids.clean.clone();
         save_stage(&self.path(CLEAN_BIN), &id, &kept, None)
