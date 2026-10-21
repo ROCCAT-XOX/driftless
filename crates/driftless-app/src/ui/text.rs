@@ -124,7 +124,8 @@ pub const CUT_HINT: &str =
 /// Hover text of the view: what „alles zeigen“ frames.
 pub const FRAME_ALL_HINT: &str =
     "Alles zeigen rahmt die Wolke ohne die äußersten 0,5 % je Achse ein (ferne Ausreißer)";
-pub const QUALITY_NONE_HINT: &str = "Ohne SLAM-Bericht: Güte unbekannt, grau gezeigt";
+pub const QUALITY_NONE_HINT: &str =
+    "Ohne SLAM-Bericht oder ohne Punktzeiten: Güte unbekannt, grau gezeigt";
 
 // Manual corrections (right panel)
 pub const CORRECTIONS: &str = "Korrekturen";
@@ -235,6 +236,18 @@ pub fn job_cancelled(label: &str) -> String {
 
 pub fn job_failed(label: &str, error: &str) -> String {
     format!("{label}: {error}")
+}
+
+/// After the message of a manual correction that could not be applied.
+pub const BAD_CORRECTION_HINT: &str = "Den Eintrag unter „Korrekturen“ ausschalten und neu \
+     rechnen (die Teilkarten sind gespeichert)";
+
+/// The message of a failed step; a bad correction with the hint how to switch it off here.
+pub fn step_error(e: &driftless_steps::StepError) -> String {
+    match e {
+        driftless_steps::StepError::BadCorrection(m) => format!("{m}\n{BAD_CORRECTION_HINT}"),
+        e => e.to_string(),
+    }
 }
 
 /// „fertig (12,3 s)“; „fertig“ without a known runtime.

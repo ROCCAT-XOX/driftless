@@ -126,24 +126,19 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
     let cache = out.join(CACHE_FILE);
     let corrections = Corrections::load(&out.join(CORRECTIONS_FILE))?;
     let manual = corrections.manual_loops();
-    // A bad correction fails only in `solve`; the cache is written by then.
-    let solve_hint = |e: driftless_slam::ManualLoopError| {
-        format!(
-            "{e}\nKorrektur mit `driftless correct {out} list` suchen, mit `driftless correct {out} \
-             disable <nr>` abschalten und `driftless slam` mit denselben Angaben und `--reuse` \
-             erneut starten (der Zwischenspeicher ist geschrieben)",
-            out = out.display(),
-        )
-    };
+    // A bad correction fails only in `solve`; the cache is written by then. The CLI and the
+    // app each add their own hint how to switch it off.
+    let solve_hint = |e: driftless_slam::ManualLoopError| StepError::BadCorrection(e.to_string());
     check_cancel(progress)?;
 
     let result = if req.reuse {
         progress.phase("Zwischenspeicher laden", None);
         let (submaps, odom_anchors) = load_cache(&cache, &input).map_err(failed)?;
         let traj = out.join("traj.tum");
-        // A run made without history (e.g. by the CLI) is kept before it is replaced, with the
-        // corrections it was computed with.
-        let import = (req.history && history::list(out).is_empty() && traj.exists())
+        // A result the history does not hold (a run made without history, e.g. by the CLI, or
+        // one recomputed by the CLI after the last state) is kept before it is replaced, with
+        // the corrections it was computed with.
+        let import = (req.history && traj.exists() && !history::holds_current(out))
             .then(|| corrections_of_run(out, &submaps, &corrections));
         progress.phase("Schleifen schließen", None);
         let result = solve(submaps, odom_anchors, &manual, &cfg).map_err(solve_hint)?;

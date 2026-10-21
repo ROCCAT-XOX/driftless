@@ -29,8 +29,9 @@ pub enum HistoryKind {
     Full,
     /// Recomputed from `submaps.bin`.
     Reuse,
-    /// A run made without history (e.g. by `driftless slam`), kept before the first reuse
-    /// of the desktop program replaces it.
+    /// A result the history does not hold (a run made without history, or recomputed
+    /// without it, e.g. by `driftless slam`), kept before a reuse of the desktop program
+    /// replaces it.
     Imported,
 }
 
@@ -151,6 +152,21 @@ pub fn list(out: &Path) -> Vec<HistoryEntry> {
         .collect();
     entries.sort_by_key(|e| e.nr);
     entries
+}
+
+/// Whether the newest readable state of `out` has the current `traj.tum` (byte-equal). False
+/// without states, or when `traj.tum` was replaced since (e.g. by `driftless slam --reuse`).
+pub fn holds_current(out: &Path) -> bool {
+    let Some(newest) = list(out).pop() else {
+        return false;
+    };
+    match (
+        fs::read(newest.dir.join("traj.tum")),
+        fs::read(out.join("traj.tum")),
+    ) {
+        (Ok(then), Ok(now)) => then == now,
+        _ => false,
+    }
 }
 
 /// Switches the corrections of `out` back to state `nr`: entry i gets the switch it had in

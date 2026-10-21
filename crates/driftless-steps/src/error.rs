@@ -9,13 +9,17 @@ pub enum StepError {
     Cancelled,
     /// Failed; the message is shown as it is (the CLI prefixes "Fehler: ").
     Failed(String),
+    /// A manual correction could not be applied; `submaps.bin` is written, so a reuse works
+    /// once the entry is switched off. The message has no hint how: the CLI and the desktop
+    /// program each add their own.
+    BadCorrection(String),
 }
 
 impl fmt::Display for StepError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StepError::Cancelled => f.write_str("abgebrochen"),
-            StepError::Failed(m) => f.write_str(m),
+            StepError::Failed(m) | StepError::BadCorrection(m) => f.write_str(m),
         }
     }
 }

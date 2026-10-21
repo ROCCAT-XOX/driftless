@@ -20,7 +20,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Octree build of the Büro cloud at most (s); measured 2–3 s on the M4 Pro.
+/// Octree build of the Büro cloud at most (s); measured 0.20 s on the M4 Pro.
 const BUERO_BUILD_MAX_S: f64 = 10.0;
 /// A recompute of the Büro run after a loop, as the program does it, at most (s).
 const BUERO_REUSE_MAX_S: f64 = 15.0;
@@ -187,6 +187,11 @@ fn buero_scan_reuse_in_seconds() {
     );
     assert!(copy.join("traj.vorher.tum").is_file());
     assert_eq!(fs::read(copy.join("traj.vorher.tum")).unwrap(), before);
+    assert_ne!(
+        fs::read(copy.join("traj.tum")).unwrap(),
+        before,
+        "the loop moved the trajectory"
+    );
     assert!(states.len() >= 2, "übernommen and the recompute");
     assert!(
         seconds <= BUERO_REUSE_MAX_S,

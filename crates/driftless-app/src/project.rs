@@ -871,10 +871,10 @@ pub struct MapDone {
 }
 
 /// Runs SLAM for the scan `scan_id`, with history. A full run always gets a new folder, which
-/// is removed again if the run is cancelled or fails. A reuse of a run without states (e.g.
-/// one made by the CLI) first keeps its result as state „übernommen“ (`run_slam`); one
-/// without `lauf.toml` whose cache needs other than the default settings is refused with a
-/// message saying so.
+/// is removed again if the run is cancelled or fails. A reuse of a run whose result no state
+/// holds (e.g. one made or recomputed by the CLI) first keeps it as state „übernommen“
+/// (`run_slam`); one without `lauf.toml` whose cache needs other than the default settings
+/// is refused with a message saying so.
 pub fn run_slam_job(
     project: &Project,
     scan_id: &str,
@@ -923,8 +923,7 @@ pub fn run_slam_job(
 /// Why a reuse of a run cannot be computed here: an added CLI run has no `lauf.toml`, its
 /// settings are only assumed, and its cache needs others.
 fn reuse_refusal(req: &SlamRequest) -> Result<(), StepError> {
-    let assumed = !req.out.join(RUN_FILE).exists();
-    if assumed && req.out.join(CACHE_FILE).is_file() && !cache_fits(req) {
+    if settings_differ(req) {
         return Err(format!(
             "Lauf wurde mit anderen Einstellungen gerechnet als den Standardwerten (z. B. \
              --lidar-to-imu, --lidar-topic oder --imu-topic) und lässt sich hier nicht neu \
@@ -934,6 +933,35 @@ fn reuse_refusal(req: &SlamRequest) -> Result<(), StepError> {
         .into());
     }
     Ok(())
+}
+
+/// Why a map of `run` cannot be made here: as [`reuse_refusal`], the odometry of the map
+/// would use the assumed default settings, not the ones the run was computed with.
+fn map_refusal(run: &RunInfo, scan: &Path) -> Result<(), StepError> {
+    let req = SlamRequest {
+        scan: scan.to_path_buf(),
+        out: run.dir.clone(),
+        settings: run.settings.clone(),
+        reuse: true,
+        history: false,
+    };
+    if settings_differ(&req) {
+        return Err(format!(
+            "Lauf wurde mit anderen Einstellungen gerechnet als den Standardwerten (z. B. \
+             --lidar-to-imu, --lidar-topic oder --imu-topic); die Karte lässt sich hier nicht \
+             rechnen; mit `driftless map <scan> --slam {}` und denselben Angaben rechnen",
+            run.dir.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// A run without `lauf.toml` (its settings only assumed) whose `submaps.bin` was written with
+/// other settings. Without a cache this cannot be told, and the run counts as fitting.
+fn settings_differ(req: &SlamRequest) -> bool {
+    let assumed = !req.out.join(RUN_FILE).exists();
+    assumed && req.out.join(CACHE_FILE).is_file() && !cache_fits(req)
 }
 
 /// Restores the switches of the corrections of `run` as in its state `nr`, then recomputes it
@@ -985,7 +1013,8 @@ pub fn restore_job(
 }
 
 /// Makes a map of `run` from the scan folder `scan` into the folder [`map_dir_for`] picks; a
-/// new folder is removed again if the map is cancelled or fails.
+/// new folder is removed again if the map is cancelled or fails. Refused like a reuse for a
+/// run without `lauf.toml` whose cache needs other than the default settings.
 pub fn run_map_job(
     run: &RunInfo,
     scan: &Path,
@@ -993,6 +1022,7 @@ pub fn run_map_job(
     progress: &Progress,
 ) -> Result<MapDone, StepError> {
     settings.check()?;
+    map_refusal(run, scan)?;
     let input = MapInput {
         scan: scan.to_path_buf(),
         slam_dir: run.dir.clone(),

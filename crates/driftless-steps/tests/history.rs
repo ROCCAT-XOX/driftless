@@ -110,6 +110,44 @@ fn reuse_of_run_without_history_keeps_it_first() {
     assert_eq!(history::list(&out).len(), 3);
 }
 
+/// A run of the app recomputed by the CLI (no state): the next reuse of the app keeps the
+/// CLI's trajectory as a state, so the reuses after it cannot replace it unseen.
+#[test]
+fn reuse_after_a_cli_reuse_keeps_the_cli_result() {
+    // 12 s: two submaps, a manual loop moves the trajectory
+    let dir = tmp("steps-history-cli-between");
+    room_bag_secs(&dir, true, 12.0);
+    let out = dir.join("out");
+    slam(&dir, &out, false, true).unwrap();
+    correct::add_loop(&out, 1.0, 11.0, "").unwrap();
+    assert_eq!(slam(&dir, &out, true, false), None);
+    let cli = fs::read(out.join("traj.tum")).unwrap();
+    assert_ne!(
+        fs::read(history::list(&out)[0].dir.join("traj.tum")).unwrap(),
+        cli
+    );
+
+    slam(&dir, &out, true, true).unwrap();
+    slam(&dir, &out, true, true).unwrap();
+    slam(&dir, &out, true, true).unwrap();
+    let list = history::list(&out);
+    let kinds: Vec<HistoryKind> = list.iter().map(|e| e.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            HistoryKind::Full,
+            HistoryKind::Imported,
+            HistoryKind::Reuse,
+            HistoryKind::Reuse,
+            HistoryKind::Reuse
+        ]
+    );
+    assert_eq!(fs::read(list[1].dir.join("traj.tum")).unwrap(), cli);
+    // the CLI run had the loop on
+    let then = Corrections::load(&list[1].dir.join(CORRECTIONS_FILE)).unwrap();
+    assert!(then.loops[0].enabled);
+}
+
 /// The kept state of a run made without history has the switches that run was computed
 /// with, not the ones of the corrections file at the reuse.
 #[test]

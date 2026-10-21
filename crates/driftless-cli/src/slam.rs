@@ -5,6 +5,7 @@
 
 use driftless_steps::scan::extrinsic_values;
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
+use driftless_steps::StepError;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -43,6 +44,14 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         reuse: args.reuse,
         history: false,
     };
-    run_slam(&req, &crate::console())?;
+    run_slam(&req, &crate::console()).map_err(|e| match e {
+        StepError::BadCorrection(m) => StepError::Failed(format!(
+            "{m}\nKorrektur mit `driftless correct {out} list` suchen, mit `driftless correct {out} \
+             disable <nr>` abschalten und `driftless slam` mit denselben Angaben und `--reuse` \
+             erneut starten (der Zwischenspeicher ist geschrieben)",
+            out = args.out.display(),
+        )),
+        e => e,
+    })?;
     Ok(())
 }

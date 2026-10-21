@@ -139,6 +139,7 @@ fn quality_from_submap_time() {
     // Points at 0 s and 1.5 s → submap 0, 3 s → submap 1, 10 s → submap 2.
     let q = |x: f32| (x * 255.0).round() as u8;
     assert_eq!(p.quality, vec![q(0.2), q(0.2), q(0.6), q(1.0)]);
+    assert!(p.quality_known);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -167,6 +168,10 @@ fn run_cloud_without_intensity_is_mid_gray() {
     assert_eq!(p.intensity, vec![128, 128]);
     assert_eq!(p.t, vec![0.0, 0.0]);
     assert_eq!(p.quality, vec![255, 255]);
+    // with the run's report, too: without point times no submap can be picked
+    let slam = report(1_700_000_000.0, &[0.0], &[0.5]);
+    let p = load_las(&path, Some(&slam), &Progress::new()).unwrap();
+    assert!(!p.quality_known);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

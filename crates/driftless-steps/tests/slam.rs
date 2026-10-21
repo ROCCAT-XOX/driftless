@@ -209,3 +209,27 @@ fn cache_fits_checks_scan_and_settings() {
     req.settings.lidar_topic = Some("/lidar".into());
     assert!(!cache_fits(&req));
 }
+
+/// A correction that does not fit fails as `BadCorrection` after the cache is written; the
+/// message names the problem only (the CLI and the app add how to switch it off).
+#[test]
+fn bad_correction_fails_after_the_cache() {
+    let dir = tmp("steps-slam-bad-correction");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    // the scan is 1.5 s long
+    fs::write(
+        out.join("corrections.toml"),
+        "[[loop]]\na = 0.5\nb = 30.0\nenabled = true\n",
+    )
+    .unwrap();
+    let err = run_slam(&request(&dir, &out, false), &Progress::new()).unwrap_err();
+    let StepError::BadCorrection(m) = &err else {
+        panic!("{err:?}");
+    };
+    assert!(m.contains("außerhalb des Scans"), "{m}");
+    assert!(!m.contains("driftless"), "{m}");
+    assert_eq!(err.to_string(), *m);
+    assert!(out.join("submaps.bin").exists());
+}

@@ -31,7 +31,8 @@ pub struct PointSet {
     pub t: Vec<f32>,
     /// Quality of the point's submap × 255; 255 without a report.
     pub quality: Vec<u8>,
-    /// Whether `quality` comes from a SLAM report; without one it is unknown (all 255).
+    /// Whether `quality` comes from a SLAM report; without one, or for a file without point
+    /// times (e.g. a run's `map.las`), it is unknown (all 255).
     pub quality_known: bool,
     /// LAS `user_data`: 1 = without measured colour, or the removal reason.
     pub flags: Vec<u8>,
@@ -141,6 +142,8 @@ pub fn load_las(
             .map_or(255, |m| (m.quality.clamp(0.0, 1.0) * 255.0).round() as u8)
     };
 
+    // The point format of a file has times for all points or for none.
+    let mut timed = false;
     progress.phase(PHASE_LOAD, Some(total));
     let mut batch = las::PointDataBuilder::new()
         .for_header(reader.header())
@@ -186,6 +189,7 @@ pub fn load_las(
             out.flags.push(p.user_data);
             match p.gps_time {
                 Some(g) => {
+                    timed = true;
                     let start = *t0.get_or_insert(g);
                     let t = g - start;
                     out.t.push(t as f32);
@@ -212,6 +216,8 @@ pub fn load_las(
         }
     }
     drop(low);
+    // without times the report cannot pick a submap
+    out.quality_known &= timed;
     if out.intensity.iter().all(|&i| i == 0) {
         out.intensity.fill(MID_GRAY);
     }

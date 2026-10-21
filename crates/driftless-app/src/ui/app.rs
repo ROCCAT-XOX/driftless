@@ -515,7 +515,7 @@ impl DriftlessApp {
                 // a cancel for the next load needs no message
                 Err(StepError::Cancelled) if self.next_load.is_some() => {}
                 Err(StepError::Cancelled) => self.info(text::job_cancelled(&f.label)),
-                Err(StepError::Failed(m)) => self.error(text::job_failed(&f.label, &m)),
+                Err(e) => self.error(text::job_failed(&f.label, &text::step_error(&e))),
             }
         }
         if !self.loader.is_busy() {
@@ -797,8 +797,8 @@ impl DriftlessApp {
                 self.info(text::job_cancelled(&f.label));
                 None
             }
-            Err(StepError::Failed(m)) => {
-                self.error(text::job_failed(&f.label, &m));
+            Err(e) => {
+                self.error(text::job_failed(&f.label, &text::step_error(&e)));
                 None
             }
         };

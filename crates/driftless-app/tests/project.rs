@@ -692,6 +692,74 @@ fn reuse_of_cli_run_with_other_settings_explains_why() {
     assert!(!out.join("verlauf").exists());
 }
 
+/// A map of an added CLI run computed with other than the default settings is refused like
+/// a reuse, instead of being made with the default odometry settings.
+#[test]
+fn map_of_cli_run_with_other_settings_is_refused() {
+    let dir = tmp("app-cli-other-settings-map");
+    let raw = scan(&dir, "scan", 1.5);
+    let out = dir.join("cli");
+    let req = SlamRequest {
+        scan: raw.clone(),
+        out: out.clone(),
+        settings: SlamSettings {
+            lidar_to_imu: Some([0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+            ..SlamSettings::default()
+        },
+        reuse: false,
+        history: false,
+    };
+    run_slam(&req, &Progress::new()).unwrap();
+    let before = files(&out);
+    let entries = names(&out);
+    let mut p = Project::create(&dir.join("p"), "P").unwrap();
+    let id = p.add_scan(&raw).unwrap();
+    p.add_run(&id, &out).unwrap();
+
+    let run = p.runs(&id).remove(0);
+    let err = run_map_job(&run, &raw, &settings(MapStep::All), &Progress::new())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.starts_with("Lauf wurde mit anderen Einstellungen gerechnet"),
+        "{err}"
+    );
+    assert!(err.contains("Karte"), "{err}");
+    assert_eq!(files(&out), before);
+    assert_eq!(names(&out), entries, "no map folder");
+
+    // with the default settings the map is made
+    let plain = dir.join("cli-plain");
+    cli_slam(&raw, &plain, false);
+    p.add_run(&id, &plain).unwrap();
+    let run = p
+        .runs(&id)
+        .into_iter()
+        .find(|r| r.dir == canon(&plain))
+        .unwrap();
+    run_map_job(&run, &raw, &settings(MapStep::All), &Progress::new()).unwrap();
+}
+
+/// A correction that does not fit: the app's message says how to switch it off in the
+/// program, not with CLI commands.
+#[test]
+fn bad_correction_hint_points_to_the_panel() {
+    let dir = tmp("app-bad-correction");
+    let (p, id) = project_with_run(&dir, 1.5);
+    let run = p.runs(&id).remove(0);
+    fs::write(
+        run.dir.join("corrections.toml"),
+        "[[loop]]\na = 0.5\nb = 30.0\nenabled = true\n",
+    )
+    .unwrap();
+    let err = run_slam_job(&p, &id, &SlamJob::Reuse(run), &Progress::new()).unwrap_err();
+    assert!(matches!(err, StepError::BadCorrection(_)), "{err:?}");
+    let shown = driftless_app::ui::text::step_error(&err);
+    assert!(shown.contains("außerhalb des Scans"), "{shown}");
+    assert!(shown.contains("„Korrekturen“"), "{shown}");
+    assert!(!shown.contains("driftless"), "{shown}");
+}
+
 #[test]
 fn add_run_checks_the_scan() {
     let dir = tmp("app-run-scan");

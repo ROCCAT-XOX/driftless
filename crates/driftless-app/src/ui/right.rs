@@ -260,7 +260,7 @@ fn cut_edit(ui: &mut Ui, cut: &mut Option<[f32; 2]>, cloud: &CloudSummary) {
         );
         if button.clicked() {
             if let Some(ceiling) = cloud.ceiling {
-                *cut = Some([range[0], ceiling.max(lo)]);
+                *cut = Some(below_ceiling(range, ceiling, lo));
             }
         }
         button.on_disabled_hover_text(text::NO_CEILING);
@@ -271,6 +271,13 @@ fn cut_edit(ui: &mut Ui, cut: &mut Option<[f32; 2]>, cloud: &CloudSummary) {
             *cut = None;
         }
     });
+}
+
+/// The cut of „Decke ausblenden“: z max at the ceiling (not below the cloud's lowest point
+/// `lo`), z min kept but never above z max, so that the range never turns over.
+fn below_ceiling(range: [f32; 2], ceiling: f32, lo: f32) -> [f32; 2] {
+    let top = ceiling.max(lo);
+    [range[0].min(top), top]
 }
 
 /// A number with a decimal comma or point.
@@ -658,5 +665,19 @@ fn inspect_table(ui: &mut Ui, state: &AppState, id: &str) {
     for p in &r.problems {
         let warn = ui.visuals().warn_fg_color;
         ui.label(RichText::new(p).color(warn));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hiding_the_ceiling_never_turns_the_range_over() {
+        assert_eq!(below_ceiling([0.5, 4.0], 2.5, 0.0), [0.5, 2.5]);
+        // z min above the ceiling follows it down
+        assert_eq!(below_ceiling([3.0, 4.0], 2.5, 0.0), [2.5, 2.5]);
+        // a ceiling below the cloud is taken as its lowest point
+        assert_eq!(below_ceiling([0.5, 4.0], -1.0, 0.0), [0.0, 0.0]);
     }
 }
