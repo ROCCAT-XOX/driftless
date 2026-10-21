@@ -873,12 +873,11 @@ pub fn run_map_job(
     })
 }
 
-#[cfg(test)]
+// Unix paths: `/p` is not absolute on Windows.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    // Unix paths: `/p` is not absolute on Windows.
-    #[cfg(unix)]
     #[test]
     fn stored_paths() {
         let base = Path::new("/p");
