@@ -19,6 +19,9 @@ allow = [
     # Both come in through the debug viewer `rerun`:
     "BSL-1.0",              # xxhash-rust via re_log_encoding
     "CDLA-Permissive-2.0",  # webpki-roots (CA data) via ureq/ehttp
+    # Both only for the fonts embedded by `epaint_default_fonts` (eframe `default_fonts`):
+    "OFL-1.1",              # Noto Emoji
+    "Ubuntu-font-1.0",      # Ubuntu-Light
 ]
 confidence-threshold = 0.9
 

@@ -10,16 +10,23 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "driftless-app"
+path = "src/main.rs"
+
 [dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
 driftless-io = { path = "../driftless-io" }
 driftless-slam = { path = "../driftless-slam" }
 driftless-steps = { path = "../driftless-steps" }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "accesskit", "persistence"] }
 # wgpu only through `egui_wgpu::wgpu`, so that both always agree.
 egui-wgpu = "0.36"
 las = "0.11"
+mimalloc = { version = "0.1", default-features = false }
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }
 pollster = "0.4"
+rfd = "0.17"
 rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -28,3 +35,4 @@ toml = "1"
 [dev-dependencies]
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
 driftless-map = { path = "../driftless-map" }
+egui_kittest = "0.36"

@@ -5,6 +5,14 @@
 //! panic inside a job becomes an error instead of taking the program down. Several runners
 //! can exist side by side (a loader and a helper for quick jobs); each runs one job.
 //!
+//! Contract with the UI: the runner wakes the UI only once, when a job ends (the `repaint`
+//! callback, called after the result is ready, so the next [`JobRunner::poll`] finds it).
+//! Progress does not wake it. So the UI must
+//! - call [`JobRunner::poll`] on every frame (a result is handed out only there, and the
+//!   runner stays busy until it was taken), and
+//! - while [`JobRunner::is_busy`], ask for the next frame itself (`request_repaint_after`,
+//!   about 10 per second), so that phase, counter and runtime move.
+//!
 //! Closing: dropping a runner cancels its job and then waits for the thread **without a
 //! time limit**. The steps check the cancel flag between their units of work and only
 //! write files in whole pieces after their last check, so waiting is what keeps a file
@@ -34,17 +42,25 @@ pub enum JobOutput {
     Done,
 }
 
-/// `start` was refused because a job is running.
+/// Why `start` did not start the job.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Busy(pub String);
+pub enum StartError {
+    /// A job is running (its label), or its result was not taken yet.
+    Busy(String),
+    /// The system gave no thread (the reason).
+    Spawn(String),
+}
 
-impl fmt::Display for Busy {
+impl fmt::Display for StartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Es läuft schon: {}", self.0)
+        match self {
+            StartError::Busy(label) => write!(f, "Es läuft schon: {label}"),
+            StartError::Spawn(e) => write!(f, "Hintergrund-Thread nicht startbar: {e}"),
+        }
     }
 }
 
-impl std::error::Error for Busy {}
+impl std::error::Error for StartError {}
 
 /// The running job at one moment.
 #[derive(Debug, Clone)]
@@ -95,9 +111,9 @@ impl JobRunner {
         &mut self,
         label: impl Into<String>,
         job: impl FnOnce(&Progress) -> Result<JobOutput, StepError> + Send + 'static,
-    ) -> Result<(), Busy> {
+    ) -> Result<(), StartError> {
         if let Some(r) = &self.running {
-            return Err(Busy(r.label.clone()));
+            return Err(StartError::Busy(r.label.clone()));
         }
         let label = label.into();
         let progress = Progress::new();
@@ -112,7 +128,7 @@ impl JobRunner {
                 let _ = tx.send(result);
                 repaint();
             })
-            .map_err(|_| Busy(label.clone()))?;
+            .map_err(|e| StartError::Spawn(e.to_string()))?;
         self.running = Some(Running {
             label,
             progress,

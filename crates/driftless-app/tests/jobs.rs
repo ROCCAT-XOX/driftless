@@ -3,7 +3,7 @@ use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use driftless_app::jobs::{JobOutput, JobRunner};
+use driftless_app::jobs::{JobOutput, JobRunner, StartError};
 use driftless_io::progress::LogLine;
 use driftless_steps::StepError;
 
@@ -82,6 +82,7 @@ fn second_job_is_refused_while_busy() {
     })
     .unwrap();
     let busy = r.start("zweiter", |_| Ok(JobOutput::Done)).unwrap_err();
+    assert_eq!(busy, StartError::Busy("erster".into()));
     assert_eq!(busy.to_string(), "Es läuft schon: erster");
     tx.send(()).unwrap();
     wait_finished(&mut r);
@@ -177,7 +178,25 @@ fn repaint_is_requested_on_finish() {
     }));
     r.start("fertig", |_| Ok(JobOutput::Done)).unwrap();
     wait_until(|| count.load(Ordering::SeqCst) >= 1);
-    wait_finished(&mut r);
+    // the repaint comes after the result was sent: the woken UI finds it at once
+    assert!(r.poll().is_some());
+}
+
+#[test]
+fn dropping_runner_with_unpolled_result() {
+    let mut r = runner();
+    let (done_tx, done) = channel::<()>();
+    r.start("fertig, nicht abgeholt", move |p| {
+        p.info("ende");
+        done_tx.send(()).unwrap();
+        Ok(JobOutput::Done)
+    })
+    .unwrap();
+    done.recv().unwrap();
+    // the thread may still be between send and return; drop joins it without hanging
+    let t = Instant::now();
+    drop(r);
+    assert!(t.elapsed() < Duration::from_secs(5));
 }
 
 #[test]
