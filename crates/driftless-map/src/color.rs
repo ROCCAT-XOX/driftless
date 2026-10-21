@@ -24,7 +24,7 @@ use crate::exposure::{
     apply_gains, camera_difference, estimate_gains, image_offset, sample_observations, view_spread,
     ExposureConfig, ImageGain,
 };
-use crate::sharpness::sharpness;
+use crate::sharpness::measure;
 use crate::visibility::{visible_points, PointGrid, Seen};
 use crate::{Cloud, MapError};
 use driftless_io::calib::CAMERA_TIME_OFFSET_S;
@@ -202,6 +202,10 @@ pub struct ColorStats {
     /// reacts to exposure changes over time as well as between the cameras.
     pub image_offset_before: f64,
     pub image_offset_after: f64,
+    /// Spearman rank correlation between the sharpness and the mean gray value of the images
+    /// on the trajectory (0 without at least 2 images or without variation). Close to 0 means
+    /// the sharpness does not follow the brightness.
+    pub sharpness_brightness_rank_corr: f64,
 }
 
 /// What the quality pass found for one image of the stream.
@@ -253,6 +257,48 @@ fn median(v: &[f64]) -> Option<f64> {
     }
 }
 
+/// Average ranks (1-based; ties share the mean of their positions) in input order.
+fn average_ranks(v: &[f64]) -> Vec<f64> {
+    let mut order: Vec<usize> = (0..v.len()).collect();
+    order.sort_by(|&a, &b| v[a].total_cmp(&v[b]).then(a.cmp(&b)));
+    let mut ranks = vec![0.0; v.len()];
+    let mut i = 0;
+    while i < order.len() {
+        let mut j = i;
+        while j + 1 < order.len() && v[order[j + 1]] == v[order[i]] {
+            j += 1;
+        }
+        let rank = 0.5 * ((i + 1 + j + 1) as f64);
+        for &o in &order[i..=j] {
+            ranks[o] = rank;
+        }
+        i = j + 1;
+    }
+    ranks
+}
+
+/// Spearman rank correlation (Pearson on average ranks); 0 for fewer than 2 pairs or if one
+/// side has no variation.
+fn spearman(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() || a.len() < 2 {
+        return 0.0;
+    }
+    let (ra, rb) = (average_ranks(a), average_ranks(b));
+    let n = ra.len() as f64;
+    let (ma, mb) = (ra.iter().sum::<f64>() / n, rb.iter().sum::<f64>() / n);
+    let (mut cov, mut va, mut vb) = (0.0, 0.0, 0.0);
+    for (x, y) in ra.iter().zip(&rb) {
+        cov += (x - ma) * (y - mb);
+        va += (x - ma) * (x - ma);
+        vb += (y - mb) * (y - mb);
+    }
+    if va == 0.0 || vb == 0.0 {
+        0.0
+    } else {
+        cov / (va * vb).sqrt()
+    }
+}
+
 /// Camera index of a frame and whether its size fits the camera decoded at `downscale`.
 fn frame_camera(frame: &Frame, cams: &[ColorCamera], downscale: u32) -> Option<usize> {
     let c = cams.iter().position(|c| c.camera.name == frame.camera)?;
@@ -267,8 +313,8 @@ struct Measured {
     /// `None`: undecodable, unknown camera or wrong size.
     camera: Option<usize>,
     stamp: f64,
-    /// (sharpness, angular rate) if the capture time lies on the trajectory.
-    quality: Option<(f64, f64)>,
+    /// (sharpness, angular rate, mean gray) if the capture time lies on the trajectory.
+    quality: Option<(f64, f64, f64)>,
 }
 
 /// Pass 1: status of every image of the stream, in stream order.
@@ -277,7 +323,7 @@ fn quality_pass(
     poses: &[Pose],
     cams: &[ColorCamera],
     cfg: &ColorConfig,
-) -> Result<(Vec<ImageRecord>, usize), MapError> {
+) -> Result<(Vec<ImageRecord>, usize, f64), MapError> {
     let mut found: Vec<Measured> = Vec::new();
     let read = for_each_image(&images.bags, &images.topics, SHARPNESS_DOWNSCALE, |frame| {
         let (camera, stamp, quality) = match frame {
@@ -286,8 +332,10 @@ fn quality_pass(
                 None => (None, frame.stamp, None),
                 Some(c) => {
                     let t = frame.stamp + cfg.time_offset;
-                    let quality = interpolate_pose(poses, t)
-                        .map(|_| (sharpness(&frame.rgb), angular_rate(poses, t)));
+                    let quality = interpolate_pose(poses, t).map(|_| {
+                        let (sharp, mean) = measure(&frame.rgb);
+                        (sharp, angular_rate(poses, t), mean)
+                    });
                     (Some(c), frame.stamp, quality)
                 }
             },
@@ -306,6 +354,11 @@ fn quality_pass(
         .iter()
         .filter_map(|f| f.quality.map(|q| q.0))
         .collect();
+    let brightness: Vec<f64> = found
+        .iter()
+        .filter_map(|f| f.quality.map(|q| q.2))
+        .collect();
+    let corr = spearman(&on_traj, &brightness);
     let median = median(&on_traj).unwrap_or(0.0);
     let limit = cfg.min_sharpness * median;
     let mut records: Vec<ImageRecord> = found
@@ -321,10 +374,10 @@ fn quality_pass(
                 status: match (camera, quality) {
                     (None, _) => Status::Bad,
                     (Some(_), None) => Status::Outside,
-                    (Some(_), Some((s, rate))) if s < limit || rate > cfg.max_angular_rate => {
+                    (Some(_), Some((s, rate, _))) if s < limit || rate > cfg.max_angular_rate => {
                         Status::Blurry
                     }
-                    (Some(_), Some((s, _))) => Status::Used {
+                    (Some(_), Some((s, _, _))) => Status::Used {
                         rank: 0,
                         sharpness_norm: if median > 0.0 {
                             (s / median).min(1.0) as f32
@@ -358,7 +411,7 @@ fn quality_pass(
             *rank = u32::try_from(r).expect("fewer than 2^32 images");
         }
     }
-    Ok((records, truncated))
+    Ok((records, truncated, corr))
 }
 
 /// Surface normal (if the neighbourhood is planar) and spacing (mean distance of the
@@ -613,7 +666,7 @@ pub fn colorize(
             )));
         }
     }
-    let (records, bags_truncated) = quality_pass(&images, poses, cams, cfg)?;
+    let (records, bags_truncated, rank_corr) = quality_pass(&images, poses, cams, cfg)?;
     let count = |f: fn(&Status) -> bool| records.iter().filter(|r| f(&r.status)).count();
     let mut stats = ColorStats {
         images_used: count(|s| matches!(s, Status::Used { .. })),
@@ -621,6 +674,7 @@ pub fn colorize(
         images_outside_trajectory: count(|s| *s == Status::Outside),
         images_bad: count(|s| *s == Status::Bad),
         image_bags_truncated: bags_truncated,
+        sharpness_brightness_rank_corr: rank_corr,
         ..ColorStats::default()
     };
 
@@ -773,6 +827,29 @@ pub fn colorize(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rank_corr_of_brightness_ramp() {
+        let ramp: Vec<f64> = (0..20).map(f64::from).collect();
+        let rev: Vec<f64> = ramp.iter().rev().copied().collect();
+        // Monotone (even non-linear) relations give exactly +1 / -1.
+        let cubed: Vec<f64> = ramp.iter().map(|x| x * x * x).collect();
+        assert!((super::spearman(&ramp, &cubed) - 1.0).abs() < 1e-12);
+        assert!((super::spearman(&ramp, &rev) + 1.0).abs() < 1e-12);
+        // Ties get average ranks.
+        assert_eq!(
+            super::average_ranks(&[5.0, 1.0, 5.0, 5.0, 2.0]),
+            vec![4.0, 1.0, 4.0, 4.0, 2.0]
+        );
+        // Symmetric (non-monotone) relation: 0.
+        let sym = [-2.0, -1.0, 0.0, 1.0, 2.0];
+        let sq: Vec<f64> = sym.iter().map(|x| x * x).collect();
+        assert!(super::spearman(&sym, &sq).abs() < 1e-12);
+        // Degenerate input.
+        assert_eq!(super::spearman(&[1.0], &[2.0]), 0.0);
+        assert_eq!(super::spearman(&[1.0, 1.0, 1.0], &[1.0, 2.0, 3.0]), 0.0);
+        assert_eq!(super::spearman(&[], &[]), 0.0);
+    }
+
     use super::*;
 
     #[test]
