@@ -478,14 +478,15 @@ fn view_weight(
 }
 
 /// One kept view of a point; `weight == 0` marks an empty slot. 16 bytes: the colour and the
-/// angle are stored as `u16` (the colour's step of 1/65535 in linear light is below one
-/// sRGB level everywhere, the angle's below 0.003°).
+/// angle are stored as `u16`. The colour covers linear 0 to [`RGB_RANGE`] (a view divided by
+/// an exposure gain of at least 1/4 can exceed 1) in steps of about 6e-5, the angle steps by
+/// below 0.003°.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct View {
     pub(crate) weight: f32,
     /// The image's position in (capture time, camera name) order.
     pub(crate) rank: u32,
-    /// Linear RGB × 65535.
+    /// Linear RGB / [`RGB_RANGE`] × 65535.
     pub(crate) rgb: [u16; 3],
     /// Angle from the optical axis: θ / π × 65535.
     pub(crate) theta: u16,
@@ -498,9 +499,13 @@ const EMPTY: View = View {
     theta: 0,
 };
 
-/// `v` (clamped to 0–1) as a `u16` over the full range.
-fn pack(v: f32) -> u16 {
-    (v.clamp(0.0, 1.0) * 65535.0).round() as u16
+/// Largest linear colour a view can hold: the inverse of the smallest exposure gain
+/// ([`crate::exposure::ExposureConfig::max_gain`] of 4 at its default).
+const RGB_RANGE: f32 = 4.0;
+
+/// `v` (clamped to 0 to `range`) as a `u16` over the full range.
+fn pack(v: f32, range: f32) -> u16 {
+    (v.clamp(0.0, range) / range * 65535.0).round() as u16
 }
 
 impl View {
@@ -509,14 +514,14 @@ impl View {
         View {
             weight,
             rank,
-            rgb: rgb.map(pack),
-            theta: pack(theta / std::f32::consts::PI),
+            rgb: rgb.map(|c| pack(c, RGB_RANGE)),
+            theta: pack(theta / std::f32::consts::PI, 1.0),
         }
     }
 
     /// Linear RGB.
     pub(crate) fn linear(&self) -> [f32; 3] {
-        self.rgb.map(|c| f32::from(c) / 65535.0)
+        self.rgb.map(|c| f32::from(c) / 65535.0 * RGB_RANGE)
     }
 
     /// Angle from the optical axis (rad).
@@ -527,7 +532,7 @@ impl View {
 
     /// Replaces the colour by linear `rgb`.
     pub(crate) fn set_linear(&mut self, rgb: [f32; 3]) {
-        self.rgb = rgb.map(pack);
+        self.rgb = rgb.map(|c| pack(c, RGB_RANGE));
     }
 
     /// Higher weight first; equal weights: the earlier image (capture time, camera name).
@@ -816,10 +821,12 @@ mod tests {
             ([0.123_456, 0.9, 0.000_1], 1.0),
             ([lin[17], lin[200], lin[255]], 2.1),
             ([2.0, -1.0, 0.3], std::f32::consts::PI),
+            ([3.9, 1.5, 4.0], 0.5),
+            ([9.0, 1.0, 0.0], 0.0),
         ] {
             let v = View::new(0.7, 5, rgb, theta);
             for (a, b) in v.linear().iter().zip(rgb) {
-                assert!((a - b.clamp(0.0, 1.0)).abs() < 1e-4, "{a} vs {b}");
+                assert!((a - b.clamp(0.0, RGB_RANGE)).abs() < 1e-4, "{a} vs {b}");
             }
             assert!((v.theta() - theta).abs() < 1e-4, "{} vs {theta}", v.theta());
             assert_eq!((v.weight, v.rank), (0.7, 5));
