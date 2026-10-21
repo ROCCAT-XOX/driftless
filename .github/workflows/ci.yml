@@ -25,6 +25,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # Release-only code paths of the app (no console window on Windows).
+      - run: cargo clippy --release -p driftless-app --bins -- -D warnings
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
