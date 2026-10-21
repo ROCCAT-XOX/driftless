@@ -330,6 +330,44 @@ fn markers_use_marker_size_and_rgb() {
     assert!(is_background(image.at(SIZE / 2 + 10, SIZE / 2)));
 }
 
+/// Markers lie on top: a marker behind a nearer point is still drawn.
+#[test]
+fn markers_draw_over_nearer_points() {
+    let Some(gpu) = gpu() else { return };
+    let tree = tree(&cloud(vec![[2.0, 0.0, 0.0]], vec![RED]));
+    let marker = PointVertex {
+        pos: [6.0, 0.0, 0.0],
+        rgbi: 0x00ff_ffff,
+        extra: 0,
+    };
+    let cam = camera([0.0; 3], 0.0);
+    let image = render(&gpu, &tree, &frame(&cam, ColorMode::Rgb), &[], &[marker]);
+    let c = image.centre();
+    assert!(near(c, [255; 3], 1), "{c:?}");
+}
+
+/// `extra` of a marker scales its size in percent of `marker_px` (0 = 100 %).
+#[test]
+fn marker_size_from_extra() {
+    let Some(gpu) = gpu() else { return };
+    let tree = tree(&PointSet::default());
+    let marker = |extra| PointVertex {
+        pos: [2.0, 0.0, 0.0],
+        rgbi: 0x00ff_ffff,
+        extra,
+    };
+    let cam = camera([0.0; 3], 0.0);
+    let mut f = frame(&cam, ColorMode::Rgb);
+    f.marker_px = 16.0;
+    // 50 %: 8 px across, so 6 px from the centre is background, 2 px is the marker
+    let image = render(&gpu, &tree, &f, &[], &[marker(50)]);
+    assert!(near(image.at(SIZE / 2 + 2, SIZE / 2), [255; 3], 1));
+    assert!(is_background(image.at(SIZE / 2 + 6, SIZE / 2)));
+    // 100 %
+    let image = render(&gpu, &tree, &f, &[], &[marker(100)]);
+    assert!(near(image.at(SIZE / 2 + 6, SIZE / 2), [255; 3], 1));
+}
+
 #[test]
 fn round_points_leave_corners_free() {
     let Some(gpu) = gpu() else { return };

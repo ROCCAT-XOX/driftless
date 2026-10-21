@@ -1,18 +1,21 @@
 //! The program: carries out the panels' actions, owns the job runners, the dialogs, the
-//! loaded cloud and the 3D view.
+//! loaded cloud, the run drawn over it and the 3D view.
 
-use super::view3d::{point_info, View3d, ViewEvent};
+use super::correct::{Corrected, RunLoaded};
+use super::view3d::{point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
     actions, left, right, status, text, Action, AppState, CloudSummary, InspectResult, Selection,
     UiMessage, ViewStats,
 };
 use crate::cloud::{load_cloud, LoadedCloud};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
+use crate::overlay::RunOverlay;
 use crate::project::{canonical, Project};
 use crate::synthetic::synthetic_cloud;
 use driftless_io::progress::Progress;
-use driftless_steps::StepError;
+use driftless_steps::{correct, StepError};
 use eframe::egui;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,13 +95,27 @@ impl CloudSource {
     }
 }
 
+/// Quick work of the helper runner, one at a time.
+#[derive(Debug, Clone, PartialEq)]
+enum HelperTask {
+    /// The statuses of the map folders of this tree version.
+    MapStatus(u64),
+    /// The overlay and the corrections of a run folder.
+    LoadRun(PathBuf),
+    /// [`Action::AddLoop`] or [`Action::SetLoopEnabled`]: they read `submaps.bin`.
+    Correct(Action),
+}
+
 pub struct DriftlessApp {
     state: AppState,
     /// The processing steps, one at a time. Dropping it (closing the window) cancels the
     /// running step and waits for it.
     jobs: JobRunner,
-    /// Quick work off the UI thread that is no step: the status of the map folders.
+    /// Quick work off the UI thread that is no step ([`HelperTask`]).
     helper: JobRunner,
+    /// What the helper does next, and what it is doing.
+    helper_queue: VecDeque<HelperTask>,
+    helper_running: Option<HelperTask>,
     /// Loads clouds and builds their levels of detail, beside a running step.
     loader: JobRunner,
     /// What the loader is loading, and what to load once it has stopped.
@@ -106,13 +123,17 @@ pub struct DriftlessApp {
     next_load: Option<CloudSource>,
     /// The cloud shown; a new one replaces it only when it is ready.
     cloud: Option<LoadedCloud>,
+    /// The run folder the cloud shown was loaded with.
+    cloud_run: Option<PathBuf>,
+    /// The run drawn in the view: the selected one, else the cloud's.
+    overlay: Option<RunOverlay>,
+    /// Raised whenever [`DriftlessApp::overlay`] changed.
+    overlay_version: u64,
     view: View3d,
     /// The GPU of the window; `None` without wgpu (tests): then there is no 3D view.
     render_state: Option<egui_wgpu::RenderState>,
-    /// The [`AppState::tree_version`] the map statuses were last asked for, and the one of
-    /// the job running on [`DriftlessApp::helper`].
+    /// The [`AppState::tree_version`] the map statuses were last asked for.
     status_asked: u64,
-    status_running: Option<u64>,
     /// A project switch that waits until the cancelled step has stopped: until then the
     /// step may still write into the old project, which therefore stays shown.
     pending: Option<Action>,
@@ -131,14 +152,18 @@ impl DriftlessApp {
             state: AppState::default(),
             jobs: JobRunner::new(repaint.clone()),
             helper: JobRunner::new(repaint.clone()),
+            helper_queue: VecDeque::new(),
+            helper_running: None,
             loader: JobRunner::new(repaint),
             loading: None,
             next_load: None,
             cloud: None,
+            cloud_run: None,
+            overlay: None,
+            overlay_version: 0,
             view: View3d::default(),
             render_state: None,
             status_asked: 0,
-            status_running: None,
             pending: None,
             title: String::new(),
             closing: false,
@@ -189,6 +214,124 @@ impl DriftlessApp {
         &mut self.view
     }
 
+    /// The run drawn in the view.
+    pub fn overlay(&self) -> Option<&RunOverlay> {
+        self.overlay.as_ref()
+    }
+
+    /// The pose `pose` of the drawn run was clicked: in the mode „Stellen wählen“ it sets
+    /// the next place of the corrections (what the view's [`ViewEvent::PickedPose`] does).
+    pub fn pose_picked(&mut self, pose: usize) {
+        let Some(o) = &self.overlay else {
+            return;
+        };
+        if pose < o.poses.len() && self.state.correct.run.as_ref() == Some(&o.run) {
+            let t = o.time_of(pose);
+            self.state.correct.place(t);
+        }
+    }
+
+    /// The poses of the places of the corrections, to mark them.
+    fn picks(&self) -> Vec<usize> {
+        let (Some(o), c) = (&self.overlay, &self.state.correct) else {
+            return Vec::new();
+        };
+        if c.run.as_ref() != Some(&o.run) {
+            return Vec::new();
+        }
+        [c.a.t, c.b.t]
+            .into_iter()
+            .flatten()
+            .filter_map(|t| o.pose_at(t))
+            .collect()
+    }
+
+    /// Follows the selection: the run of the selection, else of the cloud, is drawn and its
+    /// corrections are shown; reading them is queued for the helper.
+    fn sync_run(&mut self) {
+        let wanted = self
+            .state
+            .selected_run()
+            .map(|(_, r)| r.dir.clone())
+            .or_else(|| self.cloud_run.clone());
+        if self.state.correct.for_run(wanted.as_deref()) {
+            if self.overlay.take().is_some() {
+                self.overlay_version += 1;
+            }
+            self.helper_queue
+                .retain(|t| !matches!(t, HelperTask::LoadRun(_)));
+            if let Some(run) = wanted {
+                self.helper_queue.push_back(HelperTask::LoadRun(run));
+            }
+        }
+    }
+
+    /// Reads the drawn run again (after it was recomputed).
+    fn reload_run(&mut self, run: &Path) {
+        if self.state.correct.run.as_deref() == Some(run) {
+            let task = HelperTask::LoadRun(run.to_path_buf());
+            if !self.helper_queue.contains(&task) {
+                self.helper_queue.push_back(task);
+            }
+        }
+    }
+
+    fn run_loaded(&mut self, loaded: RunLoaded) {
+        if self.state.correct.run.as_ref() != Some(&loaded.run) {
+            return;
+        }
+        self.state.correct.corrections = Some(loaded.corrections);
+        match loaded.overlay {
+            Ok(mut o) => {
+                o.set_origin(self.cloud.as_ref().map(|c| c.tree.origin));
+                self.overlay = Some(o);
+            }
+            Err(e) => {
+                self.overlay = None;
+                self.error(e);
+            }
+        }
+        self.overlay_version += 1;
+    }
+
+    /// A change of the corrections ended: its answer goes into the panel unchanged.
+    fn corrected(&mut self, action: &Action, result: Result<JobOutput, StepError>) {
+        let c = &mut self.state.correct;
+        c.busy = false;
+        let (Action::AddLoop { run, .. } | Action::SetLoopEnabled { run, .. }) = action else {
+            return;
+        };
+        let shown = c.run.as_ref() == Some(run);
+        match result {
+            Ok(JobOutput::Corrected(done)) => {
+                if done.changed {
+                    c.changed.insert(done.run.clone());
+                }
+                if shown {
+                    if done.added {
+                        c.clear_places();
+                    }
+                    c.corrections = Some(Ok(done.corrections));
+                    c.message = Some(UiMessage::Info(done.message));
+                }
+            }
+            Ok(_) => {}
+            Err(e) if shown => c.message = Some(UiMessage::Error(e.to_string())),
+            Err(e) => self.error(e.to_string()),
+        }
+    }
+
+    /// Queues a change of the corrections (one at a time).
+    fn change_corrections(&mut self, action: Action) {
+        let c = &mut self.state.correct;
+        if c.busy {
+            return;
+        }
+        c.busy = true;
+        c.message = None;
+        self.helper_queue.push_back(HelperTask::Correct(action));
+    }
+
     /// True while a cloud is loaded or waits to be.
     pub fn is_loading(&self) -> bool {
         self.loader.is_busy() || self.next_load.is_some()
@@ -198,6 +341,11 @@ impl DriftlessApp {
     /// shown stays until the new one is ready. The cloud shown or being loaded is not
     /// loaded again.
     fn load(&mut self, source: CloudSource) {
+        self.load_with(source, false);
+    }
+
+    /// [`DriftlessApp::load`]; with `force` also the cloud shown (its file was rewritten).
+    fn load_with(&mut self, source: CloudSource, force: bool) {
         let path = source.path();
         let cancelling = self.loader.status().is_some_and(|s| s.cancelling);
         if self.loading.as_ref().map(CloudSource::path) == Some(path.clone()) {
@@ -206,7 +354,7 @@ impl DriftlessApp {
             self.next_load = cancelling.then_some(source);
             return;
         }
-        if self.cloud.as_ref().is_some_and(|c| c.path == path) {
+        if !force && self.cloud.as_ref().is_some_and(|c| c.path == path) {
             // Back to the cloud shown: a load of another one is not needed any more.
             self.next_load = None;
             self.loader.cancel();
@@ -246,9 +394,17 @@ impl DriftlessApp {
     /// Takes a loaded cloud and starts the load that waited.
     fn tick_loader(&mut self) {
         if let Some(f) = self.loader.poll() {
-            self.loading = None;
+            let source = self.loading.take();
             match f.result {
                 Ok(JobOutput::Cloud(cloud)) => {
+                    self.cloud_run = match source {
+                        Some(CloudSource::File { run, .. }) => run,
+                        _ => None,
+                    };
+                    if let Some(o) = &mut self.overlay {
+                        o.set_origin(Some(cloud.tree.origin));
+                        self.overlay_version += 1;
+                    }
                     self.info(text::cloud_loaded(
                         &cloud.path,
                         cloud.points.len(),
@@ -311,14 +467,16 @@ impl DriftlessApp {
         }
     }
 
-    /// Loads the `map.las` of the run in `dir`, if there is one.
+    /// Loads the `map.las` of the run in `dir`, if there is one, also when it is shown
+    /// (a recomputed run rewrote it).
     fn load_run_cloud(&mut self, dir: &Path) {
         let cloud = self.state.run(dir).and_then(|(_, r)| r.cloud.clone());
         if let Some(path) = cloud {
-            self.load(CloudSource::File {
+            let source = CloudSource::File {
                 path,
                 run: Some(dir.to_path_buf()),
-            });
+            };
+            self.load_with(source, true);
         }
     }
 
@@ -397,31 +555,84 @@ impl DriftlessApp {
     pub fn wants_repaint_while_busy(&self) -> bool {
         self.jobs.is_busy()
             || self.helper.is_busy()
+            || !self.helper_queue.is_empty()
             || self.is_loading()
             || self.status_asked != self.state.tree_version
     }
 
-    /// Takes finished map statuses and starts computing them again when the tree changed.
+    /// Takes what the helper finished and starts its next task: queued ones first, then the
+    /// map statuses when the tree changed.
     fn tick_helper(&mut self) {
         if let Some(f) = self.helper.poll() {
-            let asked = self.status_running.take();
-            if let (Ok(JobOutput::MapStatus(status)), Some(v)) = (f.result, asked) {
-                // an older tree's statuses are dropped; the newer job follows
-                if v == self.state.tree_version {
-                    self.state.map_status = *status;
+            match (self.helper_running.take(), f.result) {
+                (Some(HelperTask::MapStatus(v)), Ok(JobOutput::MapStatus(status))) => {
+                    // an older tree's statuses are dropped; the newer job follows
+                    if v == self.state.tree_version {
+                        self.state.map_status = *status;
+                    }
                 }
+                (Some(HelperTask::LoadRun(_)), Ok(JobOutput::Run(loaded))) => {
+                    self.run_loaded(*loaded);
+                }
+                (Some(HelperTask::Correct(action)), result) => self.corrected(&action, result),
+                _ => {}
             }
         }
+        if self.helper.is_busy() {
+            return;
+        }
         let version = self.state.tree_version;
-        if self.status_asked != version && !self.helper.is_busy() {
-            let job = self.state.map_status_job();
-            let started = self.helper.start(text::MAP_STATUS_JOB, move |_| {
-                Ok(JobOutput::MapStatus(Box::new(job())))
-            });
-            if started.is_ok() {
-                self.status_asked = version;
-                self.status_running = Some(version);
+        let task = self
+            .helper_queue
+            .pop_front()
+            .or_else(|| (self.status_asked != version).then_some(HelperTask::MapStatus(version)));
+        if let Some(task) = task {
+            self.start_helper(task);
+        }
+    }
+
+    fn start_helper(&mut self, task: HelperTask) {
+        let started = match &task {
+            HelperTask::MapStatus(_) => {
+                let job = self.state.map_status_job();
+                self.helper.start(text::MAP_STATUS_JOB, move |_| {
+                    Ok(JobOutput::MapStatus(Box::new(job())))
+                })
             }
+            HelperTask::LoadRun(run) => {
+                let run = run.clone();
+                self.helper.start(text::LOAD_RUN_JOB, move |_| {
+                    let overlay = RunOverlay::load(&run, None).map_err(|e| e.to_string());
+                    let corrections = correct::load(&run).map_err(|e| e.to_string());
+                    Ok(JobOutput::Run(Box::new(RunLoaded {
+                        run,
+                        overlay,
+                        corrections,
+                    })))
+                })
+            }
+            HelperTask::Correct(action) => {
+                let action = action.clone();
+                self.helper.start(text::CORRECT_JOB, move |_| {
+                    Ok(JobOutput::Corrected(Box::new(change_corrections(&action)?)))
+                })
+            }
+        };
+        match started {
+            Ok(()) => {
+                if let HelperTask::MapStatus(v) = task {
+                    self.status_asked = v;
+                }
+                self.helper_running = Some(task);
+            }
+            // the map statuses are asked again at the next frame
+            Err(_) if matches!(task, HelperTask::MapStatus(_)) => {}
+            Err(e) => match &task {
+                HelperTask::Correct(action) => {
+                    self.corrected(action, Err(StepError::Failed(e.to_string())))
+                }
+                _ => self.error(e.to_string()),
+            },
         }
     }
 
@@ -434,8 +645,9 @@ impl DriftlessApp {
         let over = self.state.log.len().saturating_sub(LOG_LIMIT);
         self.state.log.drain(..over);
         self.state.job = self.jobs.status();
-        self.tick_helper();
         self.tick_loader();
+        self.sync_run();
+        self.tick_helper();
     }
 
     fn finished(&mut self, f: JobFinished) {
@@ -458,7 +670,10 @@ impl DriftlessApp {
         self.reload_project();
         match (output, step) {
             (Some(JobOutput::Slam(done)), _) => {
+                // computed with the corrections as they are now
+                self.state.correct.changed.remove(&done.run_dir);
                 self.state.selection = Selection::Run(done.run_dir.clone());
+                self.reload_run(&done.run_dir);
                 self.load_run_cloud(&done.run_dir);
             }
             (Some(JobOutput::Map(done)), _) => {
@@ -553,6 +768,12 @@ impl DriftlessApp {
             Action::Select(selection) => {
                 self.state.selection = selection;
                 self.load_selected();
+                // choosing the shown run again reads it again (e.g. after `driftless correct`)
+                if let Some(run) = self.state.correct.run.clone() {
+                    if self.state.selected_run().is_some_and(|(_, r)| r.dir == run) {
+                        self.reload_run(&run);
+                    }
+                }
             }
             Action::LoadCloud { path, run } => self.load(CloudSource::File { path, run }),
             // the status bar shows the step if one runs, else the load
@@ -570,9 +791,10 @@ impl DriftlessApp {
                     self.error(e);
                 }
             }
-            Action::AddLoop { .. }
-            | Action::SetLoopEnabled { .. }
-            | Action::RestoreHistory { .. } => self.info(text::NOT_YET.to_string()),
+            change @ (Action::AddLoop { .. } | Action::SetLoopEnabled { .. }) => {
+                self.change_corrections(change)
+            }
+            Action::RestoreHistory { .. } => self.info(text::NOT_YET.to_string()),
         }
     }
 
@@ -696,17 +918,30 @@ impl DriftlessApp {
                 actions.extend(right::show(ui, &mut self.state));
             });
         let mut event = None;
-        egui::CentralPanel::no_frame().show(ui, |ui| match (&self.render_state, &self.cloud) {
-            (Some(rs), Some(cloud)) => {
-                event = self.view.show(ui, rs, Some(cloud), &self.state.view);
+        let picks = self.picks();
+        let overlay = self.overlay.as_ref().map(|run| ViewOverlay {
+            run,
+            version: self.overlay_version,
+            picks: &picks,
+            pick_places: self.state.correct.picking,
+        });
+        let shown = self.cloud.is_some() || overlay.is_some();
+        egui::CentralPanel::no_frame().show(ui, |ui| match (&self.render_state, shown) {
+            (Some(rs), true) => {
+                event = self
+                    .view
+                    .show(ui, rs, self.cloud.as_ref(), overlay, &self.state.view);
             }
-            (None, Some(_)) => {
+            (None, true) => {
                 ui.centered_and_justified(|ui| ui.weak(text::VIEW_NO_GPU));
             }
-            (_, None) => {
+            (_, false) => {
                 ui.centered_and_justified(|ui| ui.weak(text::VIEW_EMPTY));
             }
         });
+        if let Some(ViewEvent::PickedPose(i)) = event {
+            self.pose_picked(i);
+        }
         if let Some(cloud) = &self.cloud {
             let stats = Some(ViewStats {
                 drawn: self.view.drawn_points(),
@@ -727,6 +962,34 @@ impl DriftlessApp {
             self.apply(action);
         }
     }
+}
+
+/// Carries out a change of the corrections of a run as `driftless correct` does (checked
+/// against `submaps.bin`), then reads the file again.
+fn change_corrections(action: &Action) -> Result<Corrected, StepError> {
+    let (run, message, changed, added) = match action {
+        Action::AddLoop { run, a, b, note } => {
+            let nr = correct::add_loop(run, *a, *b, note)?;
+            (run, text::loop_added(nr), true, true)
+        }
+        Action::SetLoopEnabled { run, nr, enabled } => {
+            let changed = correct::set_enabled(run, *nr, *enabled)?;
+            (
+                run,
+                text::loop_switched(*nr, *enabled, changed),
+                changed,
+                false,
+            )
+        }
+        _ => return Err(text::NOT_A_STEP.into()),
+    };
+    Ok(Corrected {
+        run: run.clone(),
+        message,
+        changed,
+        added,
+        corrections: correct::load(run)?,
+    })
 }
 
 impl eframe::App for DriftlessApp {

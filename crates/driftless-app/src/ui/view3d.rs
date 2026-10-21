@@ -7,13 +7,19 @@
 //! Mouse and keys: orbiting with the left button, panning with the right or middle button
 //! or Shift, zooming with the wheel; flying with W/A/S/D and Q/E, looking with the right
 //! button, Shift faster; F or a double click into the empty = show everything; a click
-//! without dragging picks a point.
+//! without dragging picks a point, or, in the mode „Stellen wählen“, a pose of the trajectory.
+//!
+//! Over the cloud the view draws the run of [`ViewOverlay`] (trajectory, odometry, loops,
+//! anchors, picked places); without a cloud the run alone. The height cut applies to the
+//! points only: the trajectory is neither cut nor kept from being clicked by it, so the
+//! places of a loop can be chosen with the ceiling cut away or not.
 
 use super::{text, ViewSettings};
 use crate::camera::{fly_motion, Camera, CameraMode, FlyKeys, ZOOM_FACTOR};
 use crate::cloud::LoadedCloud;
-use crate::lod::{select_nodes, PointVertex};
-use crate::pick::{pick_point_in, to_physical};
+use crate::lod::{select_nodes, Octree, PointVertex};
+use crate::overlay::RunOverlay;
+use crate::pick::{pick_point_in, pick_pose, to_physical};
 use crate::render::{ColorMode, FrameParams, PointRenderer, RenderTarget, NO_CUT};
 use eframe::egui::{self, Color32, Key, PointerButton, Rect, Sense, Ui};
 use egui_wgpu::wgpu;
@@ -30,8 +36,9 @@ pub const CLICK_MAX_MOVE: f32 = 4.0;
 pub const CLICK_MAX_SECONDS: f64 = 0.3;
 /// Points within this distance (points) of the mouse can be picked.
 const PICK_RADIUS: f32 = 6.0;
-/// Diameter of the marker on the picked point (points).
-const MARKER_PX: f32 = 10.0;
+/// Diameter of the largest markers – the picked point and the picked places (points); the
+/// submap anchors are half as large.
+pub const MARKER_PX: f32 = 14.0;
 /// One step of the mouse wheel (points of scrolling).
 const WHEEL_STEP: f32 = 50.0;
 /// Flying speed: this fraction of the cloud's diagonal per second, within the bounds (m/s).
@@ -60,8 +67,29 @@ fn background_color() -> Color32 {
 pub enum ViewEvent {
     /// The index of the clicked point in the cloud's [`crate::cloud::PointSet`].
     PickedPoint(u32),
-    /// The index of the clicked pose of the trajectory (used from the trajectory overlay on).
+    /// The index of the clicked pose of the trajectory ([`RunOverlay::poses`]).
     PickedPose(usize),
+}
+
+/// The run drawn over the cloud.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewOverlay<'a> {
+    pub run: &'a RunOverlay,
+    /// Raised by the program whenever `run` changed (also its origin).
+    pub version: u64,
+    /// Poses marked as picked places.
+    pub picks: &'a [usize],
+    /// A click picks a pose instead of a point („Stellen wählen“).
+    pub pick_places: bool,
+}
+
+/// What the overlay was built from; an equal key needs no new overlay.
+#[derive(Debug, Clone, PartialEq)]
+struct OverlayKey {
+    version: Option<u64>,
+    layers: [bool; 4],
+    picks: Vec<usize>,
+    picked: Option<u32>,
 }
 
 /// The size of the offscreen image for a panel of `panel_points` at `ppp` pixels per
@@ -161,6 +189,7 @@ struct FrameKey {
     budget: usize,
     picked: Option<u32>,
     z_range: [f32; 2],
+    overlay: u64,
 }
 
 /// A press of the primary button inside the view, until it is released.
@@ -201,6 +230,11 @@ pub struct View3d {
     picked: Option<u32>,
     /// The height cut of this frame (picking uses it too).
     z_range: [f32; 2],
+    /// What the overlay on the GPU shows, and how often it was replaced.
+    overlay_key: Option<OverlayKey>,
+    overlay_count: u64,
+    /// The run whose trajectory was framed while there was no cloud.
+    framed_run: Option<std::path::PathBuf>,
 }
 
 impl View3d {
@@ -209,6 +243,7 @@ impl View3d {
         self.uploaded = false;
         self.last_render_at = None;
         self.picked = None;
+        self.overlay_key = None;
         self.drawn.clear();
         self.drawn_points = 0;
         self.last = None;
@@ -251,13 +286,14 @@ impl View3d {
         &mut self.camera
     }
 
-    /// Fills `ui` with the view of `cloud` (nothing to draw without one or for a panel of
-    /// size 0). Returns what a click picked.
+    /// Fills `ui` with the view of `cloud` and `overlay` (nothing to draw without either or
+    /// for a panel of size 0). Returns what a click picked.
     pub fn show(
         &mut self,
         ui: &mut Ui,
         render_state: &egui_wgpu::RenderState,
         cloud: Option<&LoadedCloud>,
+        overlay: Option<ViewOverlay<'_>>,
         settings: &ViewSettings,
     ) -> Option<ViewEvent> {
         let size = ui.available_size();
@@ -266,7 +302,9 @@ impl View3d {
         if !(rect.width() >= 1.0 && rect.height() >= 1.0) {
             return None;
         }
-        let cloud = cloud?;
+        if cloud.is_none() && overlay.is_none() {
+            return None;
+        }
         let ppp = ui.ctx().pixels_per_point();
         let px = target_size(rect.size(), ppp);
         let viewport = [px[0] as f32, px[1] as f32];
@@ -276,18 +314,30 @@ impl View3d {
         let renderer = self
             .renderer
             .get_or_insert_with(|| PointRenderer::new(device, queue, VIEW_FORMAT));
+        // stands in for the cloud while only a run is shown (allocates nothing)
+        let empty = Octree::default();
+        let tree = cloud.map_or(&empty, |c| &c.tree);
         if !self.uploaded {
-            renderer.begin_upload(device, &cloud.tree);
-            renderer.set_overlay(device, &[], &[]);
-            self.bounds = cloud.view_bounds;
+            renderer.begin_upload(device, tree);
+            self.bounds = cloud.and_then(|c| c.view_bounds);
             self.uploaded = true;
-            self.frame_all = true;
+            self.frame_all = cloud.is_some();
+            self.overlay_key = None;
             self.last = None;
+        }
+        if cloud.is_none() {
+            // only the run: frame its trajectory once
+            let run = overlay.map(|o| o.run);
+            if run.map(|r| &r.run) != self.framed_run.as_ref() {
+                self.framed_run = run.map(|r| r.run.clone());
+                self.bounds = run.and_then(RunOverlay::bounds);
+                self.frame_all = true;
+            }
         }
         self.last_upload_bytes = 0;
         if !renderer.upload_done() {
             // A slice per frame; the window stays usable meanwhile.
-            self.last_upload_bytes = renderer.upload_step(queue, &cloud.tree, UPLOAD_SLICE_BYTES);
+            self.last_upload_bytes = renderer.upload_step(queue, tree, UPLOAD_SLICE_BYTES);
             let percent = (renderer.upload_fraction() * 100.0).round();
             ui.painter().rect_filled(rect, 0.0, background_color());
             ui.painter().text(
@@ -309,10 +359,11 @@ impl View3d {
         self.camera.set_mode(settings.camera_mode);
 
         self.z_range = settings.cut.unwrap_or(NO_CUT);
-        let event = self.input(ui, &response, rect, ppp, viewport, cloud);
+        let event = self.input(ui, &response, rect, ppp, viewport, cloud, overlay, settings);
         if let Some(ViewEvent::PickedPoint(i)) = event {
-            self.set_picked(device, cloud, Some(i));
+            self.picked = Some(i);
         }
+        self.update_overlay(device, cloud, overlay, settings);
 
         // The target follows the panel size; egui shows it under one texture id.
         if self.target.as_ref().map(|t| t.size) != Some(px) {
@@ -338,7 +389,7 @@ impl View3d {
             self.last = None;
         }
 
-        let has_rgb = cloud.points.rgb.is_some();
+        let has_rgb = cloud.is_some_and(|c| c.points.rgb.is_some());
         let point_px = (settings.point_px * ppp).max(1.0);
         let key = FrameKey {
             view_proj: self.camera.view_proj(aspect).into(),
@@ -349,16 +400,20 @@ impl View3d {
             budget: settings.budget,
             picked: self.picked,
             z_range: settings.cut.unwrap_or(NO_CUT),
+            overlay: self.overlay_count,
         };
         if self.last.as_ref() != Some(&key) {
             let started = Instant::now();
             // Refine while the points of a node are farther apart on screen than drawn.
             let info = self.camera.view_info(viewport, point_px);
-            self.drawn = select_nodes(&cloud.tree, &info, settings.budget);
+            self.drawn = match cloud {
+                Some(c) => select_nodes(&c.tree, &info, settings.budget),
+                None => Vec::new(),
+            };
             self.drawn_points = self
                 .drawn
                 .iter()
-                .map(|&i| cloud.tree.nodes[i as usize].count as usize)
+                .map(|&i| tree.nodes[i as usize].count as usize)
                 .sum();
             let frame = FrameParams {
                 view_proj: key.view_proj,
@@ -368,13 +423,13 @@ impl View3d {
                 color_mode: key.color_mode,
                 round: key.round,
                 background: BACKGROUND,
-                quality_known: cloud.points.quality_known,
+                quality_known: cloud.is_some_and(|c| c.points.quality_known),
                 z_range: key.z_range,
             };
             if let (Some(target), Some(renderer)) = (&self.target, &mut self.renderer) {
                 // `render` writes the shared uniform buffers and submits its own work, so
                 // this frame is complete before anything else is drawn into the view.
-                renderer.render(device, queue, target, &frame, &cloud.tree, &self.drawn);
+                renderer.render(device, queue, target, &frame, tree, &self.drawn);
             }
             let now = Instant::now();
             self.frame_ms = match self.last_render_at {
@@ -400,11 +455,12 @@ impl View3d {
         }
         let stats = text::drawn_stats(
             self.drawn_points,
-            cloud.points.len(),
+            cloud.map_or(0, |c| c.points.len()),
             self.frame_ms,
             self.gpu_timed,
         );
         let help = match settings.camera_mode {
+            _ if overlay.is_some_and(|o| o.pick_places) => text::VIEW_HELP_PICK,
             CameraMode::Orbit => text::VIEW_HELP_ORBIT,
             CameraMode::Fly => text::VIEW_HELP_FLY,
         };
@@ -428,23 +484,50 @@ impl View3d {
         event
     }
 
-    fn set_picked(&mut self, device: &wgpu::Device, cloud: &LoadedCloud, picked: Option<u32>) {
-        self.picked = picked;
-        let markers: Vec<PointVertex> = picked
-            .and_then(|i| cloud.points.xyz.get(i as usize))
+    /// Puts the run of `overlay` and the marker of the picked point on the GPU when they
+    /// changed.
+    fn update_overlay(
+        &mut self,
+        device: &wgpu::Device,
+        cloud: Option<&LoadedCloud>,
+        overlay: Option<ViewOverlay<'_>>,
+        settings: &ViewSettings,
+    ) {
+        let key = OverlayKey {
+            version: overlay.map(|o| o.version),
+            layers: [
+                settings.show_trajectory,
+                settings.show_odometry,
+                settings.show_loops,
+                settings.show_submaps,
+            ],
+            picks: overlay.map_or_else(Vec::new, |o| o.picks.to_vec()),
+            picked: self.picked,
+        };
+        if self.overlay_key.as_ref() == Some(&key) {
+            return;
+        }
+        let (lines, mut markers) =
+            overlay.map_or_else(Default::default, |o| o.run.lines(settings, o.picks));
+        // the picked point first, so that picked places lie over it
+        let point = self
+            .picked
+            .and_then(|i| cloud?.points.xyz.get(i as usize))
             .map(|&pos| PointVertex {
                 pos,
                 rgbi: MARKER_COLOR,
                 extra: 0,
-            })
-            .into_iter()
-            .collect();
+            });
+        markers.splice(0..0, point);
         if let Some(renderer) = &mut self.renderer {
-            renderer.set_overlay(device, &[], &markers);
+            renderer.set_overlay(device, &lines, &markers);
         }
+        self.overlay_key = Some(key);
+        self.overlay_count += 1;
     }
 
     /// Mouse and keys of one frame; a click picks.
+    #[allow(clippy::too_many_arguments)]
     fn input(
         &mut self,
         ui: &Ui,
@@ -452,7 +535,9 @@ impl View3d {
         rect: Rect,
         ppp: f32,
         viewport: [f32; 2],
-        cloud: &LoadedCloud,
+        cloud: Option<&LoadedCloud>,
+        overlay: Option<ViewOverlay<'_>>,
+        settings: &ViewSettings,
     ) -> Option<ViewEvent> {
         let z_range = self.z_range;
         let ctx = ui.ctx();
@@ -531,16 +616,26 @@ impl View3d {
             if let (Some(p), Some(pos)) = (self.press.take(), pos) {
                 if is_click(p.time, time, p.moved) {
                     let pixel = to_physical([pos.x, pos.y], [rect.min.x, rect.min.y], ppp);
-                    let hit = pick_point_in(
-                        &cloud.tree,
-                        &self.drawn,
-                        &self.camera,
-                        viewport,
-                        pixel,
-                        PICK_RADIUS * ppp,
-                        z_range,
-                    );
-                    event = hit.map(|v| ViewEvent::PickedPoint(cloud.tree.source[v as usize]));
+                    // the trajectory is not cut by the height cut, so its poses are not either
+                    let places = overlay.filter(|o| o.pick_places && settings.show_trajectory);
+                    event = match (places, cloud) {
+                        (Some(o), _) => {
+                            let vp = self.camera.view_proj(viewport[0] / viewport[1]);
+                            pick_pose(&o.run.positions, &vp, viewport, pixel, PICK_RADIUS * ppp)
+                                .map(ViewEvent::PickedPose)
+                        }
+                        (None, Some(cloud)) => pick_point_in(
+                            &cloud.tree,
+                            &self.drawn,
+                            &self.camera,
+                            viewport,
+                            pixel,
+                            PICK_RADIUS * ppp,
+                            z_range,
+                        )
+                        .map(|v| ViewEvent::PickedPoint(cloud.tree.source[v as usize])),
+                        (None, None) => None,
+                    };
                 }
             }
         }
@@ -562,10 +657,10 @@ impl View3d {
         rect: Rect,
         ppp: f32,
         viewport: [f32; 2],
-        cloud: &LoadedCloud,
+        cloud: Option<&LoadedCloud>,
         pos: Option<egui::Pos2>,
     ) -> bool {
-        let Some(pos) = pos else {
+        let (Some(pos), Some(cloud)) = (pos, cloud) else {
             return true;
         };
         let z_range = self.z_range;

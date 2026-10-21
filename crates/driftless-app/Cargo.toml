@@ -19,6 +19,7 @@ bytemuck = { version = "1.25", features = ["derive"] }
 driftless-io = { path = "../driftless-io" }
 driftless-slam = { path = "../driftless-slam" }
 driftless-steps = { path = "../driftless-steps" }
+driftless-traj = { path = "../driftless-traj" }
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "accesskit", "persistence"] }
 # wgpu only through `egui_wgpu::wgpu`, so that both always agree.
 egui-wgpu = "0.36"

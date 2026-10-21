@@ -305,7 +305,7 @@ fn view_shows_point_colours_unchanged() {
         .renderer(WgpuTestRenderer::from_render_state(rs))
         .build_ui(move |ui| {
             egui::CentralPanel::no_frame().show(ui, |ui| {
-                view.show(ui, &r, Some(&c), &settings);
+                view.show(ui, &r, Some(&c), None, &settings);
             });
         });
     h.run();
@@ -350,7 +350,7 @@ fn upload_is_spread_over_frames() {
         .build_ui_state(
             move |ui, (view, c): &mut (View3d, Option<LoadedCloud>)| {
                 egui::CentralPanel::no_frame().show(ui, |ui| {
-                    view.show(ui, &r, c.as_ref(), &ViewSettings::default());
+                    view.show(ui, &r, c.as_ref(), None, &ViewSettings::default());
                 });
             },
             (View3d::default(), None),
@@ -416,7 +416,7 @@ fn synthetic_50m_frame_time() {
         .build_ui_state(
             move |ui, (view, c, settings): &mut (View3d, LoadedCloud, ViewSettings)| {
                 egui::CentralPanel::no_frame().show(ui, |ui| {
-                    view.show(ui, &r, Some(c), settings);
+                    view.show(ui, &r, Some(c), None, settings);
                 });
             },
             state,
@@ -469,4 +469,113 @@ fn synthetic_50m_frame_time() {
             );
         }
     }
+}
+
+/// Without a cloud the view draws the run alone, framed on its trajectory; in the mode
+/// „Stellen wählen“ a click on the trajectory picks the pose there – also with a height cut
+/// that would hide points at its height (the cut is for points only).
+#[test]
+fn trajectory_alone_is_drawn_and_its_poses_clicked() {
+    use driftless_app::overlay::RunOverlay;
+    use driftless_app::pick::project;
+    use driftless_app::ui::view3d::{ViewEvent, ViewOverlay};
+    use driftless_slam::report::{BeforeAfter, SubmapReport};
+    use driftless_slam::SlamReport;
+    use driftless_traj::nalgebra::{UnitQuaternion, Vector3};
+    use driftless_traj::Pose;
+    use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
+    use egui_kittest::Harness;
+    if headless_device().is_none() {
+        eprintln!("kein GPU-Adapter, Test übersprungen");
+        return;
+    }
+    let none = BeforeAfter {
+        before: 0.0,
+        after: 0.0,
+    };
+    let poses: Vec<Pose> = (0..=20)
+        .map(|i| Pose {
+            t: 100.0 + f64::from(i),
+            p: Vector3::new(500_000.0 + f64::from(i), 5_400_000.0, 100.0),
+            q: UnitQuaternion::identity(),
+        })
+        .collect();
+    let mut run = RunOverlay {
+        run: PathBuf::from("/k/slam-001"),
+        scan_start: 100.0,
+        poses: poses.clone(),
+        odometry: poses,
+        origin: [0.0; 3],
+        positions: Vec::new(),
+        odometry_positions: Vec::new(),
+        report: SlamReport {
+            scan_start: 100.0,
+            submaps: vec![SubmapReport {
+                id: 0,
+                t_start: 0.0,
+                t_end: 20.0,
+                quality: 1.0,
+                anchor: [500_000.0, 5_400_000.0, 100.0],
+                odom_anchor: [500_000.0, 5_400_000.0, 100.0],
+            }],
+            loops: Vec::new(),
+            graph: None,
+            start_end_gap: none.clone(),
+            path_length: none,
+        },
+    };
+    run.set_origin(None);
+    let settings = ViewSettings {
+        // a cut far below the trajectory: points there would be hidden
+        cut: Some([-10.0, -5.0]),
+        ..ViewSettings::default()
+    };
+    let rs = create_render_state(
+        default_wgpu_setup(),
+        egui_wgpu::RendererOptions::PREDICTABLE,
+    );
+    let r = rs.clone();
+    type State = (View3d, RunOverlay, Option<ViewEvent>);
+    let mut h = Harness::builder()
+        .with_size([300.0, 200.0])
+        .with_pixels_per_point(1.0)
+        .renderer(WgpuTestRenderer::from_render_state(rs))
+        .build_ui_state(
+            move |ui, (view, run, event): &mut State| {
+                egui::CentralPanel::no_frame().show(ui, |ui| {
+                    let overlay = ViewOverlay {
+                        run,
+                        version: 1,
+                        picks: &[],
+                        pick_places: true,
+                    };
+                    if let Some(e) = view.show(ui, &r, None, Some(overlay), &settings) {
+                        *event = Some(e);
+                    }
+                });
+            },
+            (View3d::default(), run, None),
+        );
+    h.run();
+    // pose 5 on the screen
+    let (view, run, _) = h.state();
+    let vp = view.camera().view_proj(300.0 / 200.0);
+    let p = project(&vp, run.positions[5], [300.0, 200.0]).unwrap();
+    let pos = egui::pos2(p[0], p[1]);
+    let image = h.render().unwrap();
+    let c = image.get_pixel(p[0].round() as u32, p[1].round() as u32).0;
+    assert!(c[1] > 200 && c[0] < 60, "green trajectory at pose 5: {c:?}");
+    let button = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    h.event(button(true));
+    h.step();
+    h.event(button(false));
+    h.step();
+    assert_eq!(h.state().2, Some(ViewEvent::PickedPose(5)));
 }

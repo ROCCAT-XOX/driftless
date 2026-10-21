@@ -1,12 +1,14 @@
 //! Pictures of the whole window for looking at by eye (colours, levels of detail, layout):
 //! a synthetic cloud and, if `$DRIFTLESS_TESTDATA` has it, the colour cloud of the
-//! Büro-Scan. Written as PNG into `$DRIFTLESS_SHOTS` (skipped without it); never commit
+//! Büro-Scan, with its run drawn over it and two places picked for a loop (nothing is written
+//! into the test data: the project lives in `$DRIFTLESS_SHOTS`). Written as PNG into `$DRIFTLESS_SHOTS` (skipped without it); never commit
 //! them. Run with
 //! `DRIFTLESS_SHOTS=/tmp/shots cargo test -p driftless-app --release --test ui_screenshots -- --ignored --nocapture`.
 
 use driftless_app::camera::CameraMode;
+use driftless_app::project::{canonical, Project};
 use driftless_app::render::{headless_device, ColorMode};
-use driftless_app::ui::{Action, DriftlessApp};
+use driftless_app::ui::{Action, DriftlessApp, Selection};
 use eframe::egui;
 use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
 use egui_kittest::Harness;
@@ -116,7 +118,7 @@ fn ui_screenshots() {
     view.camera_mode = CameraMode::Orbit;
     h.state_mut().apply(Action::LoadCloud {
         path,
-        run: Some(run),
+        run: Some(run.clone()),
     });
     wait_loaded(&mut h);
     shot(&mut h, &dir, "buero_farbe");
@@ -139,4 +141,54 @@ fn ui_screenshots() {
     camera.pitch = -89f32.to_radians();
     camera.distance *= 0.8;
     shot(&mut h, &dir, "buero_ohne_decke");
+
+    // the run in a project: the corrections panel, the trajectory by quality, the loops, the
+    // anchors and two picked places (the start and the pose of the end nearest to it)
+    let scan = data.join("jmk6-2026-10-20/20261020173822");
+    if !scan.is_dir() {
+        eprintln!("{} fehlt, Korrektur-Bild übersprungen", scan.display());
+        return;
+    }
+    let project_dir = dir.join("projekt-korrektur");
+    let _ = std::fs::remove_dir_all(&project_dir);
+    let mut project = Project::create(&project_dir, "Büro").unwrap();
+    let id = project.add_scan(&scan).unwrap();
+    project.add_run(&id, &run).unwrap();
+    project.save().unwrap();
+    h.state_mut().apply(Action::OpenProject(project_dir));
+    let run = canonical(&run).unwrap();
+    h.state_mut()
+        .apply(Action::Select(Selection::Run(run.clone())));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while h.state().overlay().is_none_or(|o| o.run != run)
+        || h.state().state().correct.corrections.is_none()
+    {
+        h.step();
+        assert!(Instant::now() < deadline, "run not read");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let overlay = h.state().overlay().unwrap().clone();
+    let start = overlay.positions[0];
+    let half = overlay.poses.len() / 2;
+    let end = (half..overlay.poses.len())
+        .min_by(|&i, &j| {
+            let d = |k: usize| {
+                let p = overlay.positions[k];
+                (0..3).map(|a| (p[a] - start[a]).powi(2)).sum::<f32>()
+            };
+            d(i).total_cmp(&d(j))
+        })
+        .unwrap();
+    eprintln!(
+        "Stellen: {:.1} s und {:.1} s",
+        overlay.time_of(0),
+        overlay.time_of(end)
+    );
+    let view = &mut h.state_mut().state_mut().view;
+    view.show_submaps = true;
+    view.show_odometry = true;
+    h.state_mut().state_mut().correct.picking = true;
+    h.state_mut().pose_picked(0);
+    h.state_mut().pose_picked(end);
+    shot(&mut h, &dir, "buero_korrektur");
 }

@@ -226,9 +226,10 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
 }
 
 /// The corrections of `current` with the switches of the run whose `slam.json` lies in
-/// `out`: an entry is on iff its two submaps are joined by a manual loop there (only the
-/// first entry of a pair, since a pair takes one loop). Without a readable `slam.json` all
-/// are off.
+/// `out`: an entry is on iff its two submaps are joined by a manual loop there. A pair takes
+/// one loop, so only one entry of a pair is on: the first entry that is on now, else the
+/// first one (an entry switched off since the run). Without a readable `slam.json` all are
+/// off.
 fn corrections_of_run(out: &Path, submaps: &[Submap], current: &Corrections) -> Corrections {
     let pairs: BTreeSet<(usize, usize)> = fs::read_to_string(out.join("slam.json"))
         .ok()
@@ -243,11 +244,19 @@ fn corrections_of_run(out: &Path, submaps: &[Submap], current: &Corrections) -> 
         .unwrap_or_default();
     let mut used = BTreeSet::new();
     let mut then = current.clone();
-    for l in &mut then.loops {
-        let pair = match_manual_loops(submaps, &[ManualLoop { a_t: l.a, b_t: l.b }])
+    let pair_of = |l: &driftless_slam::LoopEntry| {
+        match_manual_loops(submaps, &[ManualLoop { a_t: l.a, b_t: l.b }])
             .ok()
-            .and_then(|m| m.first().map(|m| (m.a.min(m.b), m.a.max(m.b))));
-        l.enabled = pair.is_some_and(|p| pairs.contains(&p) && used.insert(p));
+            .and_then(|m| m.first().map(|m| (m.a.min(m.b), m.a.max(m.b))))
+    };
+    let entries: Vec<_> = then.loops.iter().map(|l| (pair_of(l), l.enabled)).collect();
+    // entries that are on now claim their pair first
+    for claim_enabled in [true, false] {
+        for (l, (pair, on)) in then.loops.iter_mut().zip(&entries) {
+            if *on == claim_enabled {
+                l.enabled = pair.is_some_and(|p| pairs.contains(&p) && used.insert(p));
+            }
+        }
     }
     then
 }

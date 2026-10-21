@@ -1638,6 +1638,7 @@ dependencies = [
  "driftless-map",
  "driftless-slam",
  "driftless-steps",
+ "driftless-traj",
  "eframe",
  "egui-wgpu",
  "egui_kittest",

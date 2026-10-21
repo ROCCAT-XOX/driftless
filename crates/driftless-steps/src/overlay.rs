@@ -1,8 +1,10 @@
 //! How a SLAM run is drawn, shared by the debug viewer and the desktop program: the colour
 //! ramp of the submap quality, the colours of the loops and which submap a pose belongs to.
 
+use crate::error::{failed, StepError};
 use driftless_slam::report::{LoopReport, SlamReport, SubmapReport};
-use driftless_traj::Pose;
+use driftless_traj::{read_tum, Pose};
+use std::path::Path;
 
 /// Slack when comparing times read from `traj.tum` (9 decimals) with `slam.json`.
 pub const TIME_TOLERANCE: f64 = 1e-6;
@@ -49,36 +51,72 @@ fn xyz(p: &Pose) -> [f32; 3] {
     [p.p.x as f32, p.p.y as f32, p.p.z as f32]
 }
 
-/// One line strip per submap of `report` through the poses of `corrected` (see
-/// [`submap_at`]), coloured by quality. Each strip also ends on the first point of the next
-/// one, so the coloured line has no gaps. Submaps without poses are skipped.
+/// One group of pose indices per submap of `report` through the poses of `corrected` (see
+/// [`submap_at`]), with the index of that submap (for its quality colour). Each group also
+/// ends on the first pose of the next one, so the coloured line has no gaps. Submaps without
+/// poses are skipped.
+pub fn trajectory_groups(report: &SlamReport, corrected: &[Pose]) -> Vec<(Vec<usize>, usize)> {
+    let submaps = &report.submaps;
+    let t0 = report.scan_start;
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); submaps.len()];
+    for (i, pose) in corrected.iter().enumerate() {
+        if let Some(g) = groups.get_mut(submap_at(submaps, pose.t - t0)) {
+            g.push(i);
+        }
+    }
+    let mut out: Vec<(Vec<usize>, usize)> = Vec::new();
+    for (submap, g) in groups.into_iter().enumerate() {
+        let Some(&first) = g.first() else {
+            continue;
+        };
+        if let Some((prev, _)) = out.last_mut() {
+            prev.push(first);
+        }
+        out.push((g, submap));
+    }
+    out
+}
+
+/// One line strip per submap of `report` through the poses of `corrected`
+/// ([`trajectory_groups`]), coloured by quality.
 pub fn trajectory_strips(
     report: &SlamReport,
     corrected: &[Pose],
 ) -> (Vec<Vec<[f32; 3]>>, Vec<[u8; 3]>) {
-    let submaps = &report.submaps;
-    let t0 = report.scan_start;
-    let mut groups: Vec<Vec<[f32; 3]>> = vec![Vec::new(); submaps.len()];
-    for pose in corrected {
-        if let Some(g) = groups.get_mut(submap_at(submaps, pose.t - t0)) {
-            g.push(xyz(pose));
-        }
-    }
-    let mut strips: Vec<Vec<[f32; 3]>> = Vec::new();
-    let mut colors = Vec::new();
-    let mut last: Option<usize> = None;
-    for (i, g) in groups.iter().enumerate() {
-        if g.is_empty() {
-            continue;
-        }
-        if let Some(prev) = last {
-            strips[prev].push(g[0]);
-        }
-        strips.push(g.clone());
-        colors.push(quality_color(submaps[i].quality));
-        last = Some(strips.len() - 1);
-    }
-    (strips, colors)
+    trajectory_groups(report, corrected)
+        .into_iter()
+        .map(|(g, submap)| {
+            let strip = g.iter().map(|&i| xyz(&corrected[i])).collect();
+            (strip, quality_color(report.submaps[submap].quality))
+        })
+        .unzip()
+}
+
+/// What a `driftless slam` output folder holds for drawing it: the report, the corrected
+/// trajectory and the odometry.
+#[derive(Debug, Clone)]
+pub struct RunTrack {
+    pub report: SlamReport,
+    pub corrected: Vec<Pose>,
+    pub odometry: Vec<Pose>,
+}
+
+/// Reads `slam.json`, `traj.tum` and `traj_odom.tum` of the run folder `dir`.
+pub fn load_run(dir: &Path) -> Result<RunTrack, StepError> {
+    let json_path = dir.join("slam.json");
+    let text = std::fs::read_to_string(&json_path)
+        .map_err(|e| format!("{} nicht lesbar: {e}", json_path.display()))?;
+    let report: SlamReport = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "{} ist kein gültiger SLAM-Bericht: {e}; mit `driftless slam` neu erzeugen",
+            json_path.display()
+        )
+    })?;
+    Ok(RunTrack {
+        report,
+        corrected: read_tum(&dir.join("traj.tum")).map_err(failed)?,
+        odometry: read_tum(&dir.join("traj_odom.tum")).map_err(failed)?,
+    })
 }
 
 #[cfg(test)]
@@ -124,6 +162,9 @@ mod tests {
             pose(scan_start + 1.0, 2.0),
         ];
         let (strips, colors) = trajectory_strips(&report, &corrected);
+        // the same strips as pose indices
+        let groups = trajectory_groups(&report, &corrected);
+        assert_eq!(groups, [(vec![0, 1], 0), (vec![1, 2], 1)]);
         assert_eq!(colors, [quality_color(1.0), quality_color(0.0)]);
         assert_eq!(strips[0].len(), 2, "{strips:?}");
         assert_eq!(strips[1].len(), 2, "{strips:?}");

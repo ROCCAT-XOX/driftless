@@ -144,6 +144,27 @@ fn imported_state_has_the_switches_of_its_run() {
     assert!(then.loops[0].enabled);
 }
 
+/// A disabled entry before the enabled one on the same pair of submaps does not take the
+/// pair: the entry the run was computed with is the one recorded as on.
+#[test]
+fn imported_state_prefers_the_enabled_entry_of_a_pair() {
+    let dir = tmp("steps-history-import-claim");
+    room_bag_secs(&dir, true, 12.0);
+    let out = dir.join("out");
+    slam(&dir, &out, false, false);
+    correct::add_loop(&out, 1.0, 11.0, "alt").unwrap();
+    correct::set_enabled(&out, 1, false).unwrap();
+    // the same two submaps, other times: allowed while entry 1 is off
+    correct::add_loop(&out, 2.0, 11.5, "neu").unwrap();
+    slam(&dir, &out, true, false);
+    slam(&dir, &out, true, true);
+    let first = &history::list(&out)[0];
+    assert_eq!(first.kind, HistoryKind::Imported);
+    let then = Corrections::load(&first.dir.join(CORRECTIONS_FILE)).unwrap();
+    let flags: Vec<bool> = then.loops.iter().map(|l| l.enabled).collect();
+    assert_eq!(flags, [false, true]);
+}
+
 #[test]
 fn record_without_slam_json() {
     let out = tmp("steps-history-no-json");

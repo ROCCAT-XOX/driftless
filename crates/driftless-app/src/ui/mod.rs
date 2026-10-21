@@ -4,6 +4,7 @@
 
 pub mod actions;
 mod app;
+pub mod correct;
 pub mod left;
 pub mod right;
 pub mod status;
@@ -208,6 +209,8 @@ pub struct AppState {
     pub view_stats: Option<ViewStats>,
     /// The point clicked in the 3D view.
     pub picked: Option<view3d::PointInfo>,
+    /// The manual corrections of the run the view draws.
+    pub correct: correct::CorrectState,
 }
 
 impl AppState {

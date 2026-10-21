@@ -280,6 +280,7 @@ impl GpuTimer {
 /// Draws a cloud uploaded with [`PointRenderer::upload_cloud`] and an overlay.
 pub struct PointRenderer {
     points: wgpu::RenderPipeline,
+    markers: wgpu::RenderPipeline,
     lines: wgpu::RenderPipeline,
     /// Uniforms for the cloud and for the markers (other size, always [`ColorMode::Rgb`]).
     cloud_uniforms: wgpu::Buffer,
@@ -349,16 +350,17 @@ impl PointRenderer {
         let line_attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Uint32];
         let pipeline = |label,
                         shader: &wgpu::ShaderModule,
+                        vertex_entry,
                         buffer: wgpu::VertexBufferLayout<'_>,
                         topology,
-                        depth_write,
+                        depth: (bool, wgpu::CompareFunction),
                         blend| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: shader,
-                    entry_point: Some("vs_main"),
+                    entry_point: Some(vertex_entry),
                     compilation_options: Default::default(),
                     buffers: &[Some(buffer)],
                 },
@@ -368,8 +370,8 @@ impl PointRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(depth_write),
-                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                    depth_write_enabled: Some(depth.0),
+                    depth_compare: Some(depth.1),
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
@@ -388,32 +390,46 @@ impl PointRenderer {
                 cache: None,
             })
         };
+        let point_buffer = wgpu::VertexBufferLayout {
+            array_stride: size_of::<PointVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &point_attributes,
+        };
         let points = pipeline(
             "Punkte",
             &points_shader,
-            wgpu::VertexBufferLayout {
-                array_stride: size_of::<PointVertex>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &point_attributes,
-            },
+            "vs_main",
+            point_buffer.clone(),
             wgpu::PrimitiveTopology::TriangleStrip,
-            true,
+            (true, wgpu::CompareFunction::GreaterEqual),
+            wgpu::BlendState::REPLACE,
+        );
+        // Markers lie on top of everything (no depth test), in the order given.
+        let markers = pipeline(
+            "Marker",
+            &points_shader,
+            "vs_marker",
+            point_buffer,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            (false, wgpu::CompareFunction::Always),
             wgpu::BlendState::REPLACE,
         );
         let lines = pipeline(
             "Linien",
             &lines_shader,
+            "vs_main",
             wgpu::VertexBufferLayout {
                 array_stride: size_of::<LineVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &line_attributes,
             },
             wgpu::PrimitiveTopology::LineList,
-            false,
+            (false, wgpu::CompareFunction::GreaterEqual),
             wgpu::BlendState::ALPHA_BLENDING,
         );
         PointRenderer {
             points,
+            markers,
             lines,
             cloud_bind: bind(&cloud_uniforms),
             marker_bind: bind(&marker_uniforms),
@@ -523,7 +539,9 @@ impl PointRenderer {
     }
 
     /// Lines (pairs of vertices) and markers, both relative to the cloud's origin; replaces
-    /// the previous overlay.
+    /// the previous overlay. Lines are hidden behind nearer points; markers lie on top of
+    /// everything, later ones over earlier ones, in their RGB colour, `extra` giving the size
+    /// in percent of [`FrameParams::marker_px`] (0 = 100 %).
     pub fn set_overlay(
         &mut self,
         device: &wgpu::Device,
@@ -629,7 +647,7 @@ impl PointRenderer {
                 pass.draw(0..*count, 0..1);
             }
             if let Some((buffer, count)) = &self.markers_buffer {
-                pass.set_pipeline(&self.points);
+                pass.set_pipeline(&self.markers);
                 pass.set_bind_group(0, &self.marker_bind, &[]);
                 pass.set_vertex_buffer(0, buffer.slice(..));
                 pass.draw(0..4, 0..*count);

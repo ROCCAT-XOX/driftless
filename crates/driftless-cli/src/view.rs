@@ -7,7 +7,7 @@ use driftless_io::bag::{BagError, BagReader};
 use driftless_io::msg::{decode_compressed_image, decode_imu, decode_pointcloud2, LidarFrame};
 use driftless_io::project::discover_project;
 use driftless_slam::SlamReport;
-use driftless_steps::overlay::{loop_color, quality_color, trajectory_strips};
+use driftless_steps::overlay::{load_run, loop_color, quality_color, trajectory_strips};
 use driftless_steps::scan::{
     file_name, TopicPicker, CLOUD_TYPE, IMAGE_TYPE as COMPRESSED_IMAGE_TYPE, IMU_TYPE,
 };
@@ -163,19 +163,11 @@ struct SlamView {
 }
 
 fn load_slam(dir: &std::path::Path) -> Result<SlamView, BoxError> {
-    let json_path = dir.join("slam.json");
-    let text = std::fs::read_to_string(&json_path)
-        .map_err(|e| format!("{} nicht lesbar: {e}", json_path.display()))?;
-    let report: SlamReport = serde_json::from_str(&text).map_err(|e| {
-        format!(
-            "{} ist kein gültiger SLAM-Bericht: {e}; mit `driftless slam` neu erzeugen",
-            json_path.display()
-        )
-    })?;
+    let track = load_run(dir)?;
     Ok(SlamView {
-        report,
-        corrected: read_tum(&dir.join("traj.tum"))?,
-        odometry: read_tum(&dir.join("traj_odom.tum"))?,
+        report: track.report,
+        corrected: track.corrected,
+        odometry: track.odometry,
     })
 }
 

@@ -126,6 +126,37 @@ pub const FRAME_ALL_HINT: &str =
     "Alles zeigen rahmt die Wolke ohne die äußersten 0,5 % je Achse ein (ferne Ausreißer)";
 pub const QUALITY_NONE_HINT: &str = "Ohne SLAM-Bericht: Güte unbekannt, grau gezeigt";
 
+// Manual corrections (right panel)
+pub const CORRECTIONS: &str = "Korrekturen";
+pub const CORRECTIONS_HINT: &str = "Zwei Stellen der Laufbahn wählen, an denen der Scan dieselbe \
+     Umgebung zeigt; die Schleife zieht sie beim Neurechnen zusammen";
+pub const PICK_PLACES: &str = "Stellen wählen";
+pub const PICK_PLACES_HINT: &str =
+    "Ein Klick auf die Laufbahn in der 3D-Ansicht setzt Stelle A, der nächste Stelle B";
+pub const PLACE_A: &str = "Stelle A";
+pub const PLACE_B: &str = "Stelle B";
+pub const PLACE_HINT: &str = "Zeit ab Scan-Beginn in s";
+pub const NEXT_PLACE_A: &str = "Nächster Klick auf die Laufbahn: Stelle A";
+pub const NEXT_PLACE_B: &str = "Nächster Klick auf die Laufbahn: Stelle B";
+pub const NOTE: &str = "Notiz";
+pub const ADD_LOOP: &str = "Schleife eintragen";
+pub const ADD_LOOP_NEEDS_PLACES: &str = "Zuerst Stelle A und Stelle B wählen";
+pub const CHANGED_RECOMPUTE: &str = "Geändert – jetzt neu rechnen";
+pub const RECOMPUTE_NOW: &str = "Jetzt neu rechnen";
+pub const NO_CORRECTIONS: &str = "Noch keine Korrekturen";
+pub const CORRECTIONS_READING: &str = "Korrekturen werden gelesen …";
+pub const CORRECTION_BUSY: &str = "Korrektur wird gespeichert …";
+/// The columns of the list, as `driftless correct <lauf> list` prints them.
+pub const CORRECTION_COLUMNS: [&str; 6] =
+    ["Nr", "Status", "a (s)", "b (s)", "hinzugefügt", "Notiz"];
+pub const LOOP_ACTIVE: &str = "aktiv";
+pub const LOOP_DISABLED: &str = "deaktiviert";
+pub const LOOP_SWITCH_HINT: &str = "Ein- oder ausschalten; gilt beim nächsten Neurechnen";
+/// Labels of the background jobs of the corrections (not shown in the status bar).
+pub const LOAD_RUN_JOB: &str = "Lauf lesen";
+pub const CORRECT_JOB: &str = "Korrektur speichern";
+pub const VIEW_HELP_PICK: &str = "Stellen wählen: Klick auf die Laufbahn setzt die nächste Stelle";
+
 // Check of a scan (right panel)
 pub const INSPECT_RESULT: &str = "Prüfbericht";
 pub const DEVICE: &str = "Gerät";
@@ -163,6 +194,24 @@ pub const LAST_PROJECT_GONE: &str = "Zuletzt geöffnetes Projekt nicht lesbar";
 pub const CLOSE_AFTER_CANCEL: &str =
     "Der laufende Schritt wird abgebrochen; danach schließt das Fenster";
 const USAGE: &str = "Aufruf: driftless-app [--synthetic N] [projekt-ordner]";
+
+pub fn loop_added(nr: usize) -> String {
+    format!("Schleife eingetragen (Eintrag {nr})")
+}
+
+pub fn loop_switched(nr: usize, enabled: bool, changed: bool) -> String {
+    match (enabled, changed) {
+        (true, true) => format!("Eintrag {nr} eingeschaltet"),
+        (false, true) => format!("Eintrag {nr} ausgeschaltet"),
+        (true, false) => format!("Eintrag {nr} war schon eingeschaltet"),
+        (false, false) => format!("Eintrag {nr} war schon ausgeschaltet"),
+    }
+}
+
+/// A time of a place in the field: one decimal.
+pub fn place_time(t: f64) -> String {
+    decimal(t, 1)
+}
 
 pub fn project_opened(name: &str) -> String {
     format!("Projekt {name} geöffnet")

@@ -7,8 +7,10 @@
 //! locked while a step runs and while the scan cannot be read; selecting and viewing stay
 //! possible.
 //!
-//! Below them, always: how the 3D view draws („Ansicht“) and the point clicked in it.
+//! A run also shows its manual corrections ([`correct`]). Below them, always: how the 3D
+//! view draws („Ansicht“) and the point clicked in it.
 
+use super::correct;
 use super::status::count;
 use super::view3d::{color_modes, effective_color_mode, PointInfo};
 use super::{text, Action, AppState, CloudSummary, ScanNode, Selection, ViewSettings};
@@ -80,7 +82,11 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
                 }
                 Target::Scan(scan) => scan_steps(ui, state, scan, &mut action),
                 Target::Run { scan, run, map } => {
-                    run_steps(ui, state, scan, run, map.as_ref(), &mut action)
+                    run_steps(ui, state, scan, run, map.as_ref(), &mut action);
+                    ui.separator();
+                    if let Some(a) = correct::show(ui, state) {
+                        action = Some(a);
+                    }
                 }
             }
             ui.separator();

@@ -31,6 +31,7 @@ use std::time::Instant;
 
 use crate::cloud::LoadedCloud;
 use crate::project::{MapDone, MapStatus, SlamDone};
+use crate::ui::correct::{Corrected, RunLoaded};
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
 use driftless_steps::inspect;
 use driftless_steps::StepError;
@@ -47,6 +48,10 @@ pub enum JobOutput {
     Cloud(Box<LoadedCloud>),
     /// The status of every map folder of the tree (helper runner).
     MapStatus(Box<BTreeMap<PathBuf, MapStatus>>),
+    /// The overlay and the corrections of a run (helper runner).
+    Run(Box<RunLoaded>),
+    /// `corrections.toml` after a change (helper runner).
+    Corrected(Box<Corrected>),
     /// Nothing to hand back; the job's effect is on disk.
     Done,
 }
