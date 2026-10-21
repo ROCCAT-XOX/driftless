@@ -4,8 +4,10 @@ Stand: 2026-10-22 · gemessen auf dem MacBook Pro M4 Pro (14 Kerne, 48 GB, Metal
 
 Meilenstein 5 bringt das Programm `driftless-app`: Projekte mit Scans, Läufen und Karten, die
 Schritte des CLI (Prüfen, SLAM, Neu rechnen, Karte), eine 3D-Ansicht mit Detailstufen und Höhenschnitt,
-die Laufbahn nach Güte mit Schleifen, Schleifen per Klick, Vorher/Nachher und Verlauf. SLAM und Karte
-sind gegenüber Meilenstein 4 unverändert (die Büro-Laufbahn ist bitgleich mit der aus Meilenstein 4).
+die Laufbahn nach Güte mit Schleifen, Schleifen per Klick, Vorher/Nachher und Verlauf. SLAM ist
+gegenüber Meilenstein 4 unverändert (die fünf SLAM-Dateien des Büros sind bitgleich mit denen aus
+Meilenstein 4). Die Karte aus dem Programm ist bytegleich mit der aus dem CLI; gegen Meilenstein 4 ist
+sie nicht verglichen.
 
 ## Kurzfassung
 
@@ -16,7 +18,7 @@ sind gegenüber Meilenstein 4 unverändert (die Büro-Laufbahn ist bitgleich mit
   Umkreisen braucht ein Bild auf dem M4 Pro im Median **6–11 ms GPU-Zeit** (90–160 Bilder/s), bei
   Budget 6 Mio. wie bei 12 Mio. Das Standardbudget bleibt **6 Mio.**
 - **Neu rechnen nach einer Schleife** (Büro, wie im Programm): **5,9 s** vom Eintragen der Schleife bis
-  zur neuen Laufbahn (Schranke 15 s).
+  zur neuen Laufbahn, ohne Neuladen der Ansicht (Schranke 15 s).
 - **Programm = CLI:** SLAM und Karte aus dem Programm schreiben auf `Test` dieselben 13 Dateien wie
   `driftless slam` und `driftless map`, Byte für Byte (`map.json` ohne Laufzeiten).
 - **RTX 5080 (Windows): offen.** Das Programm für Windows baut die CI bei jedem Pull Request als

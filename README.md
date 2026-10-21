@@ -4,7 +4,7 @@ Open-source desktop software for processing handheld LiDAR scans — drift-corre
 correctable by hand. Runs natively on **macOS (Apple Silicon)** and **Windows**.
 
 > Status: early development. Milestone 5 done: a desktop program (`driftless-app`) with projects, the
-> steps of the command line, a 3D view with levels of detail (the 15.6-million-point office scan loads in
+> steps of the command line, a 3D view with levels of detail (the 14.96-million-point office scan loads in
 > under 2 s), the trajectory coloured by quality, loops marked by two clicks and recomputed in seconds,
 > before/after comparison and a history of states. Earlier: map in about 7 minutes with under 4 GB for a
 > 9.7-minute scan, thinner walls, window views removed (milestone 4), dense, cleaned and coloured map
@@ -84,7 +84,7 @@ interface is German. It runs the same steps as the command line (`inspect`, `sla
 
 - **Project:** „Projekt → Neues Projekt …“ in an empty folder, then „Scan hinzufügen …“ (a scan folder
   as above). Runs made with the command line can be added with „Lauf hinzufügen …“.
-- **Steps** (middle panel, for the selected scan, run or map): „Prüfen“, „SLAM rechnen“, „Neu rechnen
+- **Steps** (right panel, for the selected scan, run or map): „Prüfen“, „SLAM rechnen“, „Neu rechnen
   (aus Teilkarten)“, „Karte rechnen“ with the switches of `driftless map`. One step runs at a time, with
   progress in the status bar; „Abbrechen“ leaves no half-written files.
 - **3D view:** a map or cloud from the tree; colour, intensity or quality of the submap; orbit (left
