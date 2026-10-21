@@ -353,7 +353,8 @@ fn settings_json(
             "zbuffer_scale": k.zbuffer_scale,
             "min_sharpness": k.min_sharpness,
             "max_angular_rate": k.max_angular_rate,
-            "views_per_point": k.views_per_point,
+            "views_kept": k.views_kept,
+            "views_blended": k.views_blended,
             "exposure": {
                 "smooth": k.exposure.smooth,
                 "max_gain": k.exposure.max_gain,

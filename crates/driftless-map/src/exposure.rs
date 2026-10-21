@@ -327,7 +327,7 @@ pub(crate) fn sample_observations(
             slots[j * k..(j + 1) * k]
                 .iter()
                 .filter(|v| v.weight > 0.0)
-                .map(|v| (v.rank, v.rgb)),
+                .map(|v| (v.rank, v.linear())),
         );
         obs.push_point(&views);
     }
@@ -341,9 +341,11 @@ pub(crate) fn apply_gains(slots: &mut [View], gains: &[[f32; 3]]) {
         .filter(|v| v.weight > 0.0)
         .for_each(|v| {
             let g = &gains[v.rank as usize];
-            for (c, g) in v.rgb.iter_mut().zip(g) {
+            let mut c = v.linear();
+            for (c, g) in c.iter_mut().zip(g) {
                 *c /= g;
             }
+            v.set_linear(c);
         });
 }
 
@@ -357,7 +359,7 @@ pub(crate) fn view_spread(slots: &[View], k: usize) -> f64 {
             let views: Vec<[f64; 3]> = s
                 .iter()
                 .filter(|v| v.weight > 0.0)
-                .map(|v| v.rgb.map(srgb_value))
+                .map(|v| v.linear().map(srgb_value))
                 .collect();
             (views.len() >= 2).then(|| {
                 let m = views.len() as f64;
@@ -411,7 +413,7 @@ pub(crate) fn camera_difference(slots: &[View], k: usize, cameras: &[usize]) -> 
                 sum.fill(([0.0; 3], 0));
                 for v in s.iter().filter(|v| v.weight > 0.0) {
                     let e = &mut sum[cameras[v.rank as usize]];
-                    for (a, c) in e.0.iter_mut().zip(v.rgb) {
+                    for (a, c) in e.0.iter_mut().zip(v.linear()) {
                         *a += srgb_value(c);
                     }
                     e.1 += 1;
@@ -482,7 +484,7 @@ pub(crate) fn image_offset(slots: &[View], k: usize, images: usize) -> f64 {
                 views.extend(
                     s.iter()
                         .filter(|v| v.weight > 0.0)
-                        .map(|v| (v.rank, v.rgb.map(srgb_value))),
+                        .map(|v| (v.rank, v.linear().map(srgb_value))),
                 );
                 if views.len() < 2 {
                     continue;

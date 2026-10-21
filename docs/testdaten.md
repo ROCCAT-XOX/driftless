@@ -52,6 +52,13 @@ $DRIFTLESS_TESTDATA/
 Zwei Aufnahmen liegen unter `jmk6-2026-10-20/`: `20261020143415` (63 s, ≈ 15 m) und
 `20261020143623` (108 s, ≈ 21 m, endet nahe am Start: Start↔Ende schon in der Odometrie 2,6 cm). Ein RayStudio-Ergebnis gibt es dazu nicht.
 
+Eine dritte, lange Aufnahme ist der Größentest für Speicher und Zeit: `20261020173822`
+(Promedia, 582 s, 3.831 Bilder): ein Büro mit Deckenleuchten und Fensterbändern (Spiegelungen
+und Durchblicke, die Meilenstein 4 behandelt). Der Drift ohne Schleifenschluss beträgt 2,16 m und
+mit automatischem Schleifenschluss 0,13 m. Bei 1 cm Voxelgröße hat die dichte Wolke 15,6 Mio.
+Punkte. Eine Referenz gibt es nicht; die Ergebnisse (`slam`, `map`) liegen lokal unter
+`$DRIFTLESS_TESTDATA/ergebnisse-promedia3/`, nicht im Repo.
+
 **exp04 (Rundgang):** dieselbe Extrinsik wie exp14. Die Referenz ist keine dichte Laufbahn, sondern
 7 Kontrollpunkte im Abstand von ≈ 20 s, je eine Zeile `t x y z 0 0 0 1` (TUM-Format, Lage nur als
 Platzhalter); erster und letzter Punkt sind dieselbe Stelle. Gemessen wird die Abweichung an den

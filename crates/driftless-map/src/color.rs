@@ -11,8 +11,8 @@
 //!    it sees (see [`crate::visibility`]) get a view with weight
 //!    `w = cos(incidence) / (1 + d²/4) · edge falloff(θ) · sharpness_norm` and the colour
 //!    there (bilinear, in linear RGB). Each point keeps its
-//!    [`ColorConfig::views_per_point`] best views; its colour is their weighted mean in
-//!    linear RGB, written as sRGB.
+//!    [`ColorConfig::views_kept`] best views; its colour is the weighted mean of the best
+//!    [`ColorConfig::views_blended`] of them in linear RGB, written as sRGB.
 //!
 //! Before the blend, each view's colour is divided by its image's exposure and white-balance
 //! gain (see [`crate::exposure`]), fitted on the kept views.
@@ -105,8 +105,10 @@ pub struct ColorConfig {
     pub min_sharpness: f64,
     /// Images taken while the device turned faster are skipped (rad/s, from the trajectory).
     pub max_angular_rate: f64,
-    /// Views kept and blended per point.
-    pub views_per_point: usize,
+    /// Views kept per point (the best ones; also what the exposure fit sees).
+    pub views_kept: usize,
+    /// Views blended into a point's colour: the best `views_blended` of the kept ones.
+    pub views_blended: usize,
     /// Exposure and white balance between the images.
     pub exposure: ExposureConfig,
 }
@@ -121,7 +123,8 @@ impl Default for ColorConfig {
             zbuffer_scale: 4,
             min_sharpness: 0.4,
             max_angular_rate: 1.0,
-            views_per_point: 3,
+            views_kept: 3,
+            views_blended: 3,
             exposure: ExposureConfig::default(),
         }
     }
@@ -151,8 +154,11 @@ impl ColorConfig {
         if self.max_angular_rate.is_nan() || self.max_angular_rate <= 0.0 {
             return bad("höchste Drehrate muss größer als 0 sein");
         }
-        if self.views_per_point == 0 {
+        if self.views_kept == 0 {
             return bad("Ansichten je Punkt müssen mindestens 1 sein");
+        }
+        if self.views_blended == 0 || self.views_blended > self.views_kept {
+            return bad("gemischte Ansichten müssen zwischen 1 und den behaltenen liegen");
         }
         self.exposure.check()
     }
@@ -361,33 +367,33 @@ fn local_geometry(xyz: &[[f32; 3]]) -> (Vec<Option<Vector3<f32>>>, Vec<f32>) {
     if xyz.len() < 2 {
         return (vec![None; xyz.len()], vec![0.0; xyz.len()]);
     }
-    let points: Vec<[f64; 3]> = xyz.iter().map(|p| p.map(f64::from)).collect();
-    let tree: ImmutableKdTree<f64, 3> =
-        ImmutableKdTree::new_from_slice(&points).expect("fewer than 2^32 points");
+    // The tree is built on the cloud's own f32 coordinates: no f64 copy of the cloud.
+    let tree: ImmutableKdTree<f32, 3> =
+        ImmutableKdTree::new_from_slice(xyz).expect("fewer than 2^32 points");
+    let at = |i: u32| Vector3::from(xyz[i as usize].map(f64::from));
     // The point itself comes back with distance 0, hence + 1.
-    let k = NonZeroUsize::new((NORMAL_NEIGHBOURS + 1).min(points.len())).expect("k > 0");
-    points
-        .par_iter()
+    let k = NonZeroUsize::new((NORMAL_NEIGHBOURS + 1).min(xyz.len())).expect("k > 0");
+    xyz.par_iter()
         .map(|p| {
             let nn = tree
                 .query(p)
-                .nearest_n::<SquaredEuclidean<f64>>(k)
+                .nearest_n::<SquaredEuclidean<f32>>(k)
                 .execute();
             let others = &nn[1..];
             let m = others.len().min(SPACING_NEIGHBOURS);
-            let spacing = others[..m].iter().map(|x| x.distance.sqrt()).sum::<f64>() / m as f64;
+            let spacing = others[..m]
+                .iter()
+                .map(|x| f64::from(x.distance).sqrt())
+                .sum::<f64>()
+                / m as f64;
             let normal = (nn.len() >= 3)
                 .then(|| {
                     let c = nn.len() as f64;
-                    let mean = nn
-                        .iter()
-                        .map(|x| Vector3::from(points[x.item as usize]))
-                        .sum::<Vector3<f64>>()
-                        / c;
+                    let mean = nn.iter().map(|x| at(x.item)).sum::<Vector3<f64>>() / c;
                     let cov = nn
                         .iter()
                         .map(|x| {
-                            let d = Vector3::from(points[x.item as usize]) - mean;
+                            let d = at(x.item) - mean;
                             d * d.transpose()
                         })
                         .sum::<Matrix3<f64>>()
@@ -471,23 +477,59 @@ fn view_weight(
     cos_inc / (1.0 + d * d / 4.0) * falloff as f32 * sharpness_norm
 }
 
-/// One kept view of a point; `weight == 0` marks an empty slot.
+/// One kept view of a point; `weight == 0` marks an empty slot. 16 bytes: the colour and the
+/// angle are stored as `u16` (the colour's step of 1/65535 in linear light is below one
+/// sRGB level everywhere, the angle's below 0.003°).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct View {
     pub(crate) weight: f32,
     /// The image's position in (capture time, camera name) order.
     pub(crate) rank: u32,
-    /// Linear RGB.
-    pub(crate) rgb: [f32; 3],
+    /// Linear RGB × 65535.
+    pub(crate) rgb: [u16; 3],
+    /// Angle from the optical axis: θ / π × 65535.
+    pub(crate) theta: u16,
 }
 
 const EMPTY: View = View {
     weight: 0.0,
     rank: u32::MAX,
-    rgb: [0.0; 3],
+    rgb: [0; 3],
+    theta: 0,
 };
 
+/// `v` (clamped to 0–1) as a `u16` over the full range.
+fn pack(v: f32) -> u16 {
+    (v.clamp(0.0, 1.0) * 65535.0).round() as u16
+}
+
 impl View {
+    /// A view with linear colour `rgb` seen at `theta` (rad) from the optical axis.
+    pub(crate) fn new(weight: f32, rank: u32, rgb: [f32; 3], theta: f32) -> View {
+        View {
+            weight,
+            rank,
+            rgb: rgb.map(pack),
+            theta: pack(theta / std::f32::consts::PI),
+        }
+    }
+
+    /// Linear RGB.
+    pub(crate) fn linear(&self) -> [f32; 3] {
+        self.rgb.map(|c| f32::from(c) / 65535.0)
+    }
+
+    /// Angle from the optical axis (rad).
+    #[allow(dead_code)] // read by the edge falloff fit
+    pub(crate) fn theta(&self) -> f32 {
+        f32::from(self.theta) / 65535.0 * std::f32::consts::PI
+    }
+
+    /// Replaces the colour by linear `rgb`.
+    pub(crate) fn set_linear(&mut self, rgb: [f32; 3]) {
+        self.rgb = rgb.map(pack);
+    }
+
     /// Higher weight first; equal weights: the earlier image (capture time, camera name).
     fn better_than(&self, other: &View) -> bool {
         self.weight > other.weight || (self.weight == other.weight && self.rank < other.rank)
@@ -502,13 +544,16 @@ fn keep_best(slots: &mut [View], v: View) {
     }
 }
 
-/// Weighted mean of the views in linear RGB as sRGB; `None` without views.
-fn blend(slots: &[View]) -> Option<[u8; 3]> {
+/// Weighted mean of the best `blended` views in linear RGB as sRGB; `None` without views.
+fn blend(slots: &[View], blended: usize) -> Option<[u8; 3]> {
     let (mut sum, mut wsum) = ([0.0f64; 3], 0.0f64);
-    for v in slots.iter().filter(|v| v.weight > 0.0) {
+    for v in slots[..blended.min(slots.len())]
+        .iter()
+        .filter(|v| v.weight > 0.0)
+    {
         let w = f64::from(v.weight);
         wsum += w;
-        for (s, c) in sum.iter_mut().zip(v.rgb) {
+        for (s, c) in sum.iter_mut().zip(v.linear()) {
             *s += w * f64::from(c);
         }
     }
@@ -574,13 +619,15 @@ pub fn colorize(
         ..ColorStats::default()
     };
 
-    let k = cfg.views_per_point;
-    let mut slots = vec![EMPTY; cloud.len() * k];
+    let k = cfg.views_kept;
     let last_used = records
         .iter()
         .rposition(|r| matches!(r.status, Status::Used { .. }));
+    // Allocated after `local_geometry`, whose k-d tree is the memory peak of the setup.
+    let mut slots = Vec::new();
     if let (Some(last_used), false) = (last_used, cloud.is_empty()) {
         let (normals, spacing) = local_geometry(&cloud.xyz);
+        slots = vec![EMPTY; cloud.len() * k];
         let grid = PointGrid::new(&cloud.xyz);
         let lin = linear_table();
         let scaled: Vec<Camera> = cams
@@ -650,7 +697,7 @@ pub fn colorize(
                     );
                     (weight > 0.0).then(|| {
                         let rgb = sample_linear(&frame.rgb, s.proj.uv, &lin);
-                        (s.index, View { weight, rank, rgb })
+                        (s.index, View::new(weight, rank, rgb, s.proj.theta))
                     })
                 })
                 .collect();
@@ -666,6 +713,7 @@ pub fn colorize(
         }
     }
 
+    slots.resize(cloud.len() * k, EMPTY);
     // Exposure and white balance, fitted on the kept views. Images by rank.
     let mut used: Vec<&ImageRecord> = records
         .iter()
@@ -709,7 +757,7 @@ pub fn colorize(
     let (rgb, colored): (Vec<[u8; 3]>, Vec<bool>) = slots
         .par_chunks(k)
         .zip(grays.par_iter())
-        .map(|(s, &g)| blend(s).map_or(([g; 3], false), |c| (c, true)))
+        .map(|(s, &g)| blend(s, cfg.views_blended).map_or(([g; 3], false), |c| (c, true)))
         .unzip();
     stats.points_colored = colored.iter().filter(|&&c| c).count();
     stats.points_uncolored = colored.len() - stats.points_colored;
@@ -734,11 +782,7 @@ mod tests {
 
     #[test]
     fn keep_best_orders_by_weight_then_rank() {
-        let v = |weight, rank| View {
-            weight,
-            rank,
-            rgb: [0.0; 3],
-        };
+        let v = |weight, rank| View::new(weight, rank, [0.0; 3], 0.0);
         let mut slots = [EMPTY; 3];
         for x in [v(0.5, 4), v(0.9, 7), v(0.5, 2), v(0.1, 0), v(0.5, 3)] {
             keep_best(&mut slots, x);
@@ -755,14 +799,36 @@ mod tests {
     #[test]
     fn blend_averages_in_linear_light() {
         let lin = linear_table();
-        let view = |c: u8| View {
-            weight: 1.0,
-            rank: 0,
-            rgb: [lin[c as usize]; 3],
-        };
+        let view = |c: u8| View::new(1.0, 0, [lin[c as usize]; 3], 0.0);
         // Black and white mix to linear 0.5, i.e. sRGB 188, not 128.
-        assert_eq!(blend(&[view(0), view(255), EMPTY]), Some([188; 3]));
-        assert_eq!(blend(&[EMPTY; 2]), None);
+        assert_eq!(blend(&[view(0), view(255), EMPTY], 3), Some([188; 3]));
+        assert_eq!(blend(&[EMPTY; 2], 2), None);
+        // Only the best `blended` views count.
+        assert_eq!(blend(&[view(255), view(0), EMPTY], 1), Some([255; 3]));
+    }
+
+    #[test]
+    fn view_round_trip() {
+        assert_eq!(std::mem::size_of::<View>(), 16);
+        let lin = linear_table();
+        for (rgb, theta) in [
+            ([0.0, 0.5, 1.0], 0.0),
+            ([0.123_456, 0.9, 0.000_1], 1.0),
+            ([lin[17], lin[200], lin[255]], 2.1),
+            ([2.0, -1.0, 0.3], std::f32::consts::PI),
+        ] {
+            let v = View::new(0.7, 5, rgb, theta);
+            for (a, b) in v.linear().iter().zip(rgb) {
+                assert!((a - b.clamp(0.0, 1.0)).abs() < 1e-4, "{a} vs {b}");
+            }
+            assert!((v.theta() - theta).abs() < 1e-4, "{} vs {theta}", v.theta());
+            assert_eq!((v.weight, v.rank), (0.7, 5));
+        }
+        // Every sRGB level survives the packing.
+        for c in 0..=255u8 {
+            let v = View::new(1.0, 0, [lin[c as usize]; 3], 0.0);
+            assert_eq!(to_srgb(v.linear()[0]), c);
+        }
     }
 
     #[test]

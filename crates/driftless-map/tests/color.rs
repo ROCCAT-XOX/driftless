@@ -277,7 +277,7 @@ fn colorize_rejects_bad_config_and_cameras() {
             ..ColorConfig::default()
         },
         ColorConfig {
-            views_per_point: 0,
+            views_kept: 0,
             ..ColorConfig::default()
         },
         ColorConfig {
