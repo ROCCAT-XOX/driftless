@@ -265,13 +265,20 @@ struct Seen {
 
 impl Seen {
     fn new(obs: &Observations, c: usize) -> Seen {
+        // Upper bound of the observations: exact capacities keep the buffers from doubling.
+        let usable = obs
+            .views
+            .iter()
+            .filter(|v| (DARK..=SATURATED).contains(&v.rgb[c]))
+            .count();
         let mut seen = Seen {
             cameras: obs.cameras.clone(),
-            starts: vec![0],
-            image: Vec::new(),
-            theta: Vec::new(),
-            log: Vec::new(),
+            starts: Vec::with_capacity(obs.points() + 1),
+            image: Vec::with_capacity(usable),
+            theta: Vec::with_capacity(usable),
+            log: Vec::with_capacity(usable),
         };
+        seen.starts.push(0);
         for j in 0..obs.points() {
             let start = seen.log.len();
             for v in obs
@@ -346,8 +353,11 @@ fn fit_channel(
 /// of this camera over [`VIGNETTE_MIN_POINT_SPREAD`] (5 % to 95 % quantile). Only the second shows the falloff: a camera
 /// that sees every point at the same angle in all its images (standing still) cannot.
 fn observable(seen: &Seen, cam: usize) -> bool {
-    let mut theta: Vec<f64> = Vec::new();
-    let mut deviation: Vec<f64> = Vec::new();
+    let views = (0..seen.image.len())
+        .filter(|&k| seen.camera(k) == cam)
+        .count();
+    let mut theta: Vec<f64> = Vec::with_capacity(views);
+    let mut deviation: Vec<f64> = Vec::with_capacity(views);
     for j in 0..seen.points() {
         let start = theta.len();
         let range = seen.range(j);
@@ -610,20 +620,39 @@ pub(crate) fn sample_observations(
     cameras: Vec<usize>,
     samples: usize,
 ) -> Observations {
-    let eligible: Vec<usize> = slots
+    let eligible: Vec<bool> = slots
         .par_chunks(k)
         .map(|s| s.iter().filter(|v| v.weight > 0.0).count() >= 2)
-        .collect::<Vec<bool>>()
-        .iter()
-        .enumerate()
-        .filter_map(|(j, &e)| e.then_some(j))
         .collect();
-    let m = eligible.len();
+    let m = eligible.iter().filter(|&&e| e).count();
     let take = m.min(samples);
+    // The `s`-th sample is the `s · m / take`-th eligible point; one pass in cloud order.
+    let mut picked: Vec<usize> = Vec::with_capacity(take);
+    let mut nth = 0usize;
+    for (j, &e) in eligible.iter().enumerate() {
+        if picked.len() == take {
+            break;
+        }
+        if e {
+            if nth == picked.len() * m / take {
+                picked.push(j);
+            }
+            nth += 1;
+        }
+    }
+    drop(eligible);
+    let count = |j: usize| {
+        slots[j * k..(j + 1) * k]
+            .iter()
+            .filter(|v| v.weight > 0.0)
+            .count()
+    };
+    let total = picked.iter().map(|&j| count(j)).sum();
     let mut obs = Observations::new(cameras);
+    obs.starts.reserve_exact(take);
+    obs.views.reserve_exact(total);
     let mut views = Vec::with_capacity(k);
-    for s in 0..take {
-        let j = eligible[s * m / take];
+    for j in picked {
         views.clear();
         views.extend(
             slots[j * k..(j + 1) * k]

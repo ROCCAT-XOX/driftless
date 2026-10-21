@@ -11,12 +11,23 @@
 //!    it sees (see [`crate::visibility`]) get a view with weight
 //!    `w = cos(incidence) / (1 + d²/4) · edge falloff(θ) · sharpness_norm` and the colour
 //!    there (bilinear, in linear RGB). Each point keeps its
-//!    [`ColorConfig::views_kept`] best views; its colour is the weighted mean of the best
-//!    [`ColorConfig::views_blended`] of them in linear RGB, written as sRGB.
+//!    [`ColorConfig::views_kept`] best views.
 //!
-//! Before the blend, each view's colour is divided by its image's exposure and white-balance
-//! gain and by its camera's edge falloff at the view's angle (see [`crate::exposure`]), both
-//! fitted on the kept views.
+//! Then, per point:
+//!
+//! 1. Each kept view's colour is divided by its image's exposure and white-balance gain and
+//!    by its camera's edge falloff at the view's angle (see [`crate::exposure`]), both fitted
+//!    on the kept views.
+//! 2. Views beyond [`ColorConfig::rim_theta`] are left out, unless the point has no other.
+//! 3. Highlights are rejected: the reference luminance is the second darkest view's (the
+//!    darkest's below 3 views); a view brighter than it by more than
+//!    [`ColorConfig::highlight_ratio`] and [`ColorConfig::highlight_abs`] is left out.
+//!    Highlights are additive and follow the camera over several images; the second darkest
+//!    view survives one too dark outlier and up to `views_kept − 2` highlighted views.
+//! 4. Soft blend: the best [`ColorConfig::views_blended`] remaining views, each weighted by
+//!    its weight minus the next remaining view's (all unchanged if that leaves nothing), in
+//!    linear RGB, written as sRGB. The colour then changes smoothly where two neighbouring
+//!    points' last blended and first unblended views swap places.
 //!
 //! Points no image sees get a gray from their intensity and `colored = false`.
 
@@ -52,6 +63,22 @@ pub const SPACING_NEIGHBOURS: usize = 4;
 /// Gray of an uncoloured point with intensity 0; the cloud's 99th intensity percentile and
 /// above get 255. Dark returns stay visible and are not mistaken for black surfaces.
 pub const GRAY_MIN: u8 = 64;
+/// Points sampled for the seam metric ([`ColorStats::seam_jump_after`]).
+pub const SEAM_SAMPLES: usize = 200_000;
+/// Nearest neighbours of a seam sample that are compared with it.
+pub const SEAM_NEIGHBOURS: usize = 4;
+/// Seam neighbours lie within this many voxels; the voxel is the cloud's median spacing.
+pub const SEAM_RADIUS_VOXELS: f64 = 2.0;
+/// Seam neighbours' normals differ from the sample's by at most this angle (rad).
+pub const SEAM_MAX_NORMAL_ANGLE: f64 = 10.0 * std::f64::consts::PI / 180.0;
+/// Floor points of the highlight metric: normal with `|n_z|` above this.
+pub const FLOOR_NORMAL_Z: f32 = 0.9;
+/// Floor points lie this far below the trajectory's median height (m).
+pub const FLOOR_BELOW_TRAJECTORY: f64 = 0.8;
+/// Floor cells of the highlight metric (m, in x and y).
+pub const FLOOR_CELL: f64 = 0.5;
+/// A floor point counts as highlighted above this factor of its cell's median luminance.
+pub const FLOOR_HIGHLIGHT: f64 = 1.3;
 
 /// The camera images of a scan: every pass streams them again from the bags.
 #[derive(Debug, Clone, PartialEq)]
@@ -108,8 +135,18 @@ pub struct ColorConfig {
     pub max_angular_rate: f64,
     /// Views kept per point (the best ones; also what the exposure fit sees).
     pub views_kept: usize,
-    /// Views blended into a point's colour: the best `views_blended` of the kept ones.
+    /// Views blended into a point's colour: the best `views_blended` of the kept ones that
+    /// remain after the rim and the highlights are left out.
     pub views_blended: usize,
+    /// Reject highlights (see the module docs).
+    pub highlights: bool,
+    /// A view is a highlight if its luminance exceeds the reference by this share …
+    pub highlight_ratio: f64,
+    /// … and by this much (linear).
+    pub highlight_abs: f64,
+    /// Views farther than this from the optical axis (rad) are left out of the blend and of
+    /// the highlight reference, unless all of a point's views are.
+    pub rim_theta: f64,
     /// Exposure and white balance between the images.
     pub exposure: ExposureConfig,
 }
@@ -124,8 +161,12 @@ impl Default for ColorConfig {
             zbuffer_scale: 4,
             min_sharpness: 0.4,
             max_angular_rate: 1.0,
-            views_kept: 3,
+            views_kept: 6,
             views_blended: 3,
+            highlights: true,
+            highlight_ratio: 0.3,
+            highlight_abs: 0.02,
+            rim_theta: 85f64.to_radians(),
             exposure: ExposureConfig::default(),
         }
     }
@@ -160,6 +201,15 @@ impl ColorConfig {
         }
         if self.views_blended == 0 || self.views_blended > self.views_kept {
             return bad("gemischte Ansichten müssen zwischen 1 und den behaltenen liegen");
+        }
+        if !(self.highlight_ratio.is_finite() && self.highlight_ratio >= 0.0) {
+            return bad("Glanzlicht-Verhältnis darf nicht negativ sein");
+        }
+        if !(self.highlight_abs.is_finite() && self.highlight_abs >= 0.0) {
+            return bad("Glanzlicht-Abstand darf nicht negativ sein");
+        }
+        if !(self.rim_theta.is_finite() && self.rim_theta > 0.0) {
+            return bad("Randwinkel muss größer als 0 sein");
         }
         self.exposure.check()
     }
@@ -217,6 +267,27 @@ pub struct ColorStats {
     /// on the trajectory (0 without at least 2 images or without variation). Close to 0 means
     /// the sharpness does not follow the brightness.
     pub sharpness_brightness_rank_corr: f64,
+    /// Views rejected as highlights, and the points with at least one of them.
+    pub views_rejected: usize,
+    pub points_with_rejected: usize,
+    /// Views left out for lying beyond [`ColorConfig::rim_theta`] (points with only such
+    /// views keep them and are not counted).
+    pub views_rim_excluded: usize,
+    /// Share of the floor points (normal `|n_z|` > [`FLOOR_NORMAL_Z`], lower than the
+    /// trajectory's median height minus [`FLOOR_BELOW_TRAJECTORY`], coloured) whose linear
+    /// luminance exceeds [`FLOOR_HIGHLIGHT`] × the median of their [`FLOOR_CELL`] cell.
+    /// Before: the best [`ColorConfig::views_blended`] views blended with their weights,
+    /// nothing left out (as in Meilenstein 3); after: the final colour. Same views.
+    pub floor_highlight_share_before: f64,
+    pub floor_highlight_share_after: f64,
+    /// Colour jumps between images: up to [`SEAM_SAMPLES`] planar points, evenly over the
+    /// cloud, each with its [`SEAM_NEIGHBOURS`] nearest neighbours within
+    /// [`SEAM_RADIUS_VOXELS`] whose normals differ by at most [`SEAM_MAX_NORMAL_ANGLE`]; the
+    /// mean absolute luminance difference (sRGB levels) of the pairs whose main images (the
+    /// view with the largest blend weight) differ, minus that of the pairs with the same
+    /// main image. 0 if either kind is missing. Before and after as for the floor.
+    pub seam_jump_before: f64,
+    pub seam_jump_after: f64,
 }
 
 /// What the quality pass found for one image of the stream.
@@ -425,11 +496,17 @@ fn quality_pass(
     Ok((records, truncated, corr))
 }
 
-/// Surface normal (if the neighbourhood is planar) and spacing (mean distance of the
-/// [`SPACING_NEIGHBOURS`] nearest other points; 0 without neighbours) of every point.
-fn local_geometry(xyz: &[[f32; 3]]) -> (Vec<Option<Vector3<f32>>>, Vec<f32>) {
+/// A seam sample and its neighbours (see [`ColorStats::seam_jump_after`]); `u32::MAX` marks
+/// a missing neighbour.
+type SeamSample = (u32, [u32; SEAM_NEIGHBOURS]);
+
+/// Per point the surface normal (if the neighbourhood is planar) and the spacing (mean
+/// distance of the [`SPACING_NEIGHBOURS`] nearest other points; 0 without neighbours), and the
+/// seam samples with their neighbours.
+#[allow(clippy::type_complexity)]
+fn local_geometry(xyz: &[[f32; 3]]) -> (Vec<Option<Vector3<f32>>>, Vec<f32>, Vec<SeamSample>) {
     if xyz.len() < 2 {
-        return (vec![None; xyz.len()], vec![0.0; xyz.len()]);
+        return (vec![None; xyz.len()], vec![0.0; xyz.len()], Vec::new());
     }
     // The tree is built on the cloud's own f32 coordinates: no f64 copy of the cloud.
     let tree: ImmutableKdTree<f32, 3> =
@@ -437,7 +514,8 @@ fn local_geometry(xyz: &[[f32; 3]]) -> (Vec<Option<Vector3<f32>>>, Vec<f32>) {
     let at = |i: u32| Vector3::from(xyz[i as usize].map(f64::from));
     // The point itself comes back with distance 0, hence + 1.
     let k = NonZeroUsize::new((NORMAL_NEIGHBOURS + 1).min(xyz.len())).expect("k > 0");
-    xyz.par_iter()
+    let (normals, spacing): (Vec<Option<Vector3<f32>>>, Vec<f32>) = xyz
+        .par_iter()
         .map(|p| {
             let nn = tree
                 .query(p)
@@ -468,7 +546,39 @@ fn local_geometry(xyz: &[[f32; 3]]) -> (Vec<Option<Vector3<f32>>>, Vec<f32>) {
                 .flatten();
             (normal, spacing as f32)
         })
-        .unzip()
+        .unzip();
+
+    // Seam samples: evenly over the planar points, neighbours on the same plane.
+    let voxel = median(&spacing.iter().map(|&s| f64::from(s)).collect::<Vec<_>>()).unwrap_or(0.0);
+    let radius2 = (SEAM_RADIUS_VOXELS * voxel).powi(2) as f32;
+    let planar: Vec<u32> = (0..xyz.len() as u32)
+        .filter(|&i| normals[i as usize].is_some())
+        .collect();
+    let take = planar.len().min(SEAM_SAMPLES);
+    let k = NonZeroUsize::new((SEAM_NEIGHBOURS + 1).min(xyz.len())).expect("k > 0");
+    let min_cos = SEAM_MAX_NORMAL_ANGLE.cos() as f32;
+    let seam: Vec<SeamSample> = (0..take)
+        .into_par_iter()
+        .map(|s| {
+            let i = planar[s * planar.len() / take];
+            let n = normals[i as usize].expect("planar");
+            let mut out = [u32::MAX; SEAM_NEIGHBOURS];
+            let nn = tree
+                .query(&xyz[i as usize])
+                .nearest_n::<SquaredEuclidean<f32>>(k)
+                .execute();
+            let near = nn.iter().filter(|x| x.item != i).take(SEAM_NEIGHBOURS);
+            for (o, x) in out.iter_mut().zip(near) {
+                let same_plane =
+                    normals[x.item as usize].is_some_and(|m| n.dot(&m).abs() >= min_cos);
+                if x.distance <= radius2 && same_plane {
+                    *o = x.item;
+                }
+            }
+            (i, out)
+        })
+        .collect();
+    (normals, spacing, seam)
 }
 
 /// sRGB value → linear, for all 256 values.
@@ -612,20 +722,204 @@ fn keep_best(slots: &mut [View], v: View) {
     }
 }
 
-/// Weighted mean of the best `blended` views in linear RGB as sRGB; `None` without views.
-fn blend(slots: &[View], blended: usize) -> Option<[u8; 3]> {
+/// Linear luminance (Rec. 709).
+fn luminance(c: [f32; 3]) -> f64 {
+    0.2126 * f64::from(c[0]) + 0.7152 * f64::from(c[1]) + 0.0722 * f64::from(c[2])
+}
+
+/// Weighted mean of linear colours; `None` without positive weight.
+fn weighted_mean(views: impl Iterator<Item = (f64, [f32; 3])>) -> Option<[f32; 3]> {
     let (mut sum, mut wsum) = ([0.0f64; 3], 0.0f64);
-    for v in slots[..blended.min(slots.len())]
-        .iter()
-        .filter(|v| v.weight > 0.0)
-    {
-        let w = f64::from(v.weight);
+    for (w, c) in views {
         wsum += w;
-        for (s, c) in sum.iter_mut().zip(v.linear()) {
+        for (s, c) in sum.iter_mut().zip(c) {
             *s += w * f64::from(c);
         }
     }
-    (wsum > 0.0).then(|| sum.map(|s| to_srgb((s / wsum) as f32)))
+    (wsum > 0.0).then(|| sum.map(|s| (s / wsum) as f32))
+}
+
+/// What the blend makes of one point's views.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Mix {
+    /// Blended linear colour; `None` without views.
+    linear: Option<[f32; 3]>,
+    /// Image (rank) of the view with the largest blend weight; `u32::MAX` without views.
+    main: u32,
+    /// Views rejected as highlights.
+    rejected: usize,
+    /// Views left out beyond the rim.
+    rim: usize,
+}
+
+impl Mix {
+    fn srgb(&self) -> Option<[u8; 3]> {
+        self.linear.map(|c| c.map(to_srgb))
+    }
+
+    /// Luminance in sRGB levels (0–255).
+    fn srgb_luminance(&self) -> Option<f64> {
+        self.linear.map(|c| srgb_value(luminance(c) as f32))
+    }
+}
+
+/// Meilenstein 3's blend: the best `blended` views (sorted best first) with their weights,
+/// nothing left out.
+fn hard_mix(slots: &[View], blended: usize) -> Mix {
+    let top = slots[..blended.min(slots.len())]
+        .iter()
+        .filter(|v| v.weight > 0.0);
+    Mix {
+        linear: weighted_mean(top.clone().map(|v| (f64::from(v.weight), v.linear()))),
+        main: top.clone().next().map_or(u32::MAX, |v| v.rank),
+        rejected: 0,
+        rim: 0,
+    }
+}
+
+/// The colour of a point from its views (sorted best first, exposure applied): rim views
+/// and highlights left out, soft blend (see the module docs).
+fn mix(slots: &[View], cfg: &ColorConfig) -> Mix {
+    let valid = |v: &View| v.weight > 0.0;
+    let inside = |v: &View| valid(v) && f64::from(v.theta()) <= cfg.rim_theta;
+    let any_inside = slots.iter().any(inside);
+    let candidate = |v: &View| if any_inside { inside(v) } else { valid(v) };
+    let rim = if any_inside {
+        slots.iter().filter(|v| valid(v) && !inside(v)).count()
+    } else {
+        0
+    };
+    // Darkest and second darkest candidate.
+    let (mut dark, mut second, mut n) = (f64::INFINITY, f64::INFINITY, 0usize);
+    for y in slots
+        .iter()
+        .filter(|v| candidate(v))
+        .map(|v| luminance(v.linear()))
+    {
+        n += 1;
+        if y < dark {
+            second = dark;
+            dark = y;
+        } else if y < second {
+            second = y;
+        }
+    }
+    let reference = if n >= 3 { second } else { dark };
+    let bright = |v: &View| {
+        let y = luminance(v.linear());
+        cfg.highlights
+            && y > reference * (1.0 + cfg.highlight_ratio)
+            && y - reference > cfg.highlight_abs
+    };
+    let rejected = slots.iter().filter(|v| candidate(v) && bright(v)).count();
+    let kept = || slots.iter().filter(|v| candidate(v) && !bright(v));
+    let b = cfg.views_blended;
+    let next = kept().nth(b).map_or(0.0, |v| f64::from(v.weight));
+    let soft = kept().take(b).any(|v| f64::from(v.weight) > next);
+    let weight = |v: &View| f64::from(v.weight) - if soft { next } else { 0.0 };
+    Mix {
+        linear: weighted_mean(kept().take(b).map(|v| (weight(v), v.linear()))),
+        main: kept().next().map_or(u32::MAX, |v| v.rank),
+        rejected,
+        rim,
+    }
+}
+
+/// Share of the points with a luminance above [`FLOOR_HIGHLIGHT`] × their cell's median, from
+/// (cell, luminance) entries; sorts them.
+fn highlight_share(entries: &mut [([i64; 2], f32)]) -> f64 {
+    if entries.is_empty() {
+        return 0.0;
+    }
+    entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let mut bright = 0usize;
+    for cell in entries.chunk_by(|a, b| a.0 == b.0) {
+        let m = cell.len();
+        let median = if m % 2 == 1 {
+            f64::from(cell[m / 2].1)
+        } else {
+            0.5 * (f64::from(cell[m / 2 - 1].1) + f64::from(cell[m / 2].1))
+        };
+        bright += cell
+            .iter()
+            .filter(|e| f64::from(e.1) > FLOOR_HIGHLIGHT * median)
+            .count();
+    }
+    bright as f64 / entries.len() as f64
+}
+
+/// [`ColorStats::floor_highlight_share_before`] and `_after` of the points `floor`.
+fn floor_highlight_shares(
+    slots: &[View],
+    k: usize,
+    cfg: &ColorConfig,
+    xyz: &[[f32; 3]],
+    floor: &[u32],
+) -> (f64, f64) {
+    let cell = |c: f32| (f64::from(c) / FLOOR_CELL).floor() as i64;
+    let entries: Vec<([i64; 2], f32, f32)> = floor
+        .par_iter()
+        .filter_map(|&i| {
+            let i = i as usize;
+            let s = &slots[i * k..(i + 1) * k];
+            let before = hard_mix(s, cfg.views_blended).linear?;
+            let after = mix(s, cfg).linear?;
+            let p = xyz[i];
+            Some((
+                [cell(p[0]), cell(p[1])],
+                luminance(before) as f32,
+                luminance(after) as f32,
+            ))
+        })
+        .collect();
+    let mut column: Vec<([i64; 2], f32)> = entries.iter().map(|e| (e.0, e.1)).collect();
+    let before = highlight_share(&mut column);
+    // Refilled entry by entry (the cell and the luminance of the same point).
+    for (c, e) in column.iter_mut().zip(&entries) {
+        *c = (e.0, e.2);
+    }
+    drop(entries);
+    (before, highlight_share(&mut column))
+}
+
+/// [`ColorStats::seam_jump_before`] and `_after` over the seam samples.
+fn seam_jumps(slots: &[View], k: usize, cfg: &ColorConfig, seam: &[SeamSample]) -> (f64, f64) {
+    let point = |i: u32| &slots[i as usize * k..(i as usize + 1) * k];
+    // Per sample: (summed |ΔY|, pairs) with the same and with different main images, before
+    // and after; summed in sample order.
+    let partial: Vec<[(f64, usize); 4]> = seam
+        .par_iter()
+        .map(|&(i, near)| {
+            let mut sums = [(0.0, 0usize); 4];
+            let (hb, ha) = (hard_mix(point(i), cfg.views_blended), mix(point(i), cfg));
+            for &j in near.iter().filter(|&&j| j != u32::MAX) {
+                let (nb, na) = (hard_mix(point(j), cfg.views_blended), mix(point(j), cfg));
+                for (slot, (a, b)) in [(0, (hb, nb)), (2, (ha, na))] {
+                    if let (Some(ya), Some(yb)) = (a.srgb_luminance(), b.srgb_luminance()) {
+                        let e = &mut sums[slot + usize::from(a.main != b.main)];
+                        e.0 += (ya - yb).abs();
+                        e.1 += 1;
+                    }
+                }
+            }
+            sums
+        })
+        .collect();
+    let mut sums = [(0.0, 0usize); 4];
+    for p in &partial {
+        for (t, p) in sums.iter_mut().zip(p) {
+            t.0 += p.0;
+            t.1 += p.1;
+        }
+    }
+    let jump = |same: (f64, usize), diff: (f64, usize)| {
+        if same.1 == 0 || diff.1 == 0 {
+            0.0
+        } else {
+            diff.0 / diff.1 as f64 - same.0 / same.1 as f64
+        }
+    };
+    (jump(sums[0], sums[1]), jump(sums[2], sums[3]))
 }
 
 /// Gray from intensity: [`GRAY_MIN`] at 0, 255 at the cloud's 99th percentile and above.
@@ -694,8 +988,12 @@ pub fn colorize(
         .rposition(|r| matches!(r.status, Status::Used { .. }));
     // Allocated after `local_geometry`, whose k-d tree is the memory peak of the setup.
     let mut slots = Vec::new();
+    // Per point: whether its normal is nearly vertical (floor or ceiling).
+    let mut horizontal: Vec<bool> = Vec::new();
+    let mut seam: Vec<SeamSample> = Vec::new();
     if let (Some(last_used), false) = (last_used, cloud.is_empty()) {
-        let (normals, spacing) = local_geometry(&cloud.xyz);
+        let (normals, spacing, samples) = local_geometry(&cloud.xyz);
+        seam = samples;
         slots = vec![EMPTY; cloud.len() * k];
         let grid = PointGrid::new(&cloud.xyz);
         let lin = linear_table();
@@ -780,6 +1078,10 @@ pub fn colorize(
         if let Some(e) = failure {
             return Err(e);
         }
+        horizontal = normals
+            .iter()
+            .map(|n| n.is_some_and(|n| n.z.abs() > FLOOR_NORMAL_Z))
+            .collect();
     }
 
     slots.resize(cloud.len() * k, EMPTY);
@@ -839,11 +1141,37 @@ pub fn colorize(
         })
         .collect();
 
+    // Highlights and seams, before (Meilenstein 3's blend) and after.
+    let pose_z: Vec<f64> = poses.iter().map(|p| p.p.z).collect();
+    let floor_z = median(&pose_z).unwrap_or(0.0) - FLOOR_BELOW_TRAJECTORY;
+    let floor: Vec<u32> = (0..horizontal.len() as u32)
+        .filter(|&i| horizontal[i as usize] && f64::from(cloud.xyz[i as usize][2]) < floor_z)
+        .collect();
+    drop(horizontal);
+    (
+        stats.floor_highlight_share_before,
+        stats.floor_highlight_share_after,
+    ) = floor_highlight_shares(&slots, k, cfg, &cloud.xyz, &floor);
+    drop(floor);
+    (stats.seam_jump_before, stats.seam_jump_after) = seam_jumps(&slots, k, cfg, &seam);
+    drop(seam);
+    (
+        stats.views_rejected,
+        stats.points_with_rejected,
+        stats.views_rim_excluded,
+    ) = slots
+        .par_chunks(k)
+        .map(|s| {
+            let m = mix(s, cfg);
+            (m.rejected, usize::from(m.rejected > 0), m.rim)
+        })
+        .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+
     let grays = intensity_grays(&cloud.intensity);
     let (rgb, colored): (Vec<[u8; 3]>, Vec<bool>) = slots
         .par_chunks(k)
         .zip(grays.par_iter())
-        .map(|(s, &g)| blend(s, cfg.views_blended).map_or(([g; 3], false), |c| (c, true)))
+        .map(|(s, &g)| mix(s, cfg).srgb().map_or(([g; 3], false), |c| (c, true)))
         .unzip();
     stats.points_colored = colored.iter().filter(|&&c| c).count();
     stats.points_uncolored = colored.len() - stats.points_colored;
@@ -909,11 +1237,137 @@ mod tests {
     fn blend_averages_in_linear_light() {
         let lin = linear_table();
         let view = |c: u8| View::new(1.0, 0, [lin[c as usize]; 3], 0.0);
+        let blend = |s: &[View], b: usize| hard_mix(s, b).srgb();
         // Black and white mix to linear 0.5, i.e. sRGB 188, not 128.
         assert_eq!(blend(&[view(0), view(255), EMPTY], 3), Some([188; 3]));
         assert_eq!(blend(&[EMPTY; 2], 2), None);
         // Only the best `blended` views count.
         assert_eq!(blend(&[view(255), view(0), EMPTY], 1), Some([255; 3]));
+        // Equal weights: the soft blend keeps them.
+        let cfg = ColorConfig {
+            highlights: false,
+            ..ColorConfig::default()
+        };
+        assert_eq!(
+            mix(&[view(0), view(255), EMPTY], &cfg).srgb(),
+            Some([188; 3])
+        );
+    }
+
+    /// A view of linear gray `y` with weight `w` from image `rank` at `theta_deg`.
+    fn gray(w: f32, rank: u32, y: f32, theta_deg: f32) -> View {
+        View::new(w, rank, [y; 3], theta_deg.to_radians())
+    }
+
+    #[test]
+    fn highlights_are_rejected_against_the_second_darkest() {
+        let cfg = ColorConfig::default();
+        // Two of five views are highlights (the best two); the rest show 0.2.
+        let s = [
+            gray(1.0, 0, 0.6, 0.0),
+            gray(0.9, 1, 0.5, 0.0),
+            gray(0.8, 2, 0.2, 0.0),
+            gray(0.7, 3, 0.21, 0.0),
+            gray(0.6, 4, 0.2, 0.0),
+            EMPTY,
+        ];
+        let m = mix(&s, &cfg);
+        assert_eq!(m.rejected, 2);
+        assert_eq!(m.main, 2);
+        assert!((m.linear.unwrap()[0] - 0.2).abs() < 0.01, "{m:?}");
+        // Slightly brighter, or bright by little in absolute terms: kept.
+        let dim = [gray(1.0, 0, 0.012, 0.0), gray(0.9, 1, 0.01, 0.0), EMPTY];
+        assert_eq!(mix(&dim, &cfg).rejected, 0);
+        let near = [gray(1.0, 0, 0.25, 0.0), gray(0.9, 1, 0.2, 0.0), EMPTY];
+        assert_eq!(mix(&near, &cfg).rejected, 0);
+        // Switched off: nothing rejected.
+        let off = ColorConfig {
+            highlights: false,
+            ..ColorConfig::default()
+        };
+        assert_eq!(mix(&s, &off).rejected, 0);
+    }
+
+    #[test]
+    fn few_views_are_never_all_rejected() {
+        let cfg = ColorConfig::default();
+        let one = [gray(1.0, 0, 0.9, 0.0), EMPTY, EMPTY];
+        let m = mix(&one, &cfg);
+        assert_eq!((m.rejected, m.main), (0, 0));
+        assert!(m.linear.is_some());
+        // Two views: the darker is the reference and stays.
+        let two = [gray(1.0, 0, 0.9, 0.0), gray(0.5, 1, 0.1, 0.0), EMPTY];
+        let m = mix(&two, &cfg);
+        assert_eq!((m.rejected, m.main), (1, 1));
+        assert!((m.linear.unwrap()[0] - 0.1).abs() < 1e-3, "{m:?}");
+    }
+
+    #[test]
+    fn dark_outlier_does_not_become_reference() {
+        let cfg = ColorConfig::default();
+        let mut s = [gray(0.5, 0, 0.3, 0.0); 6];
+        for (r, v) in s.iter_mut().enumerate() {
+            v.rank = r as u32;
+            v.weight = 1.0 - 0.1 * r as f32;
+        }
+        // The best view sees the operator's shadow.
+        s[0].set_linear([0.01; 3]);
+        assert_eq!(mix(&s, &cfg).rejected, 0);
+    }
+
+    #[test]
+    fn soft_blend_is_continuous() {
+        let cfg = ColorConfig::default();
+        let eps = 1e-4;
+        // The 3rd and 4th view swap places between two neighbouring points.
+        let a = [
+            gray(1.0, 0, 0.3, 0.0),
+            gray(0.9, 1, 0.3, 0.0),
+            View::new(0.5, 2, [0.6, 0.3, 0.3], 0.0),
+            View::new(0.5 - eps, 3, [0.3, 0.3, 0.6], 0.0),
+            EMPTY,
+            EMPTY,
+        ];
+        let mut b = a;
+        b.swap(2, 3);
+        b[2].weight = 0.5;
+        b[3].weight = 0.5 - eps;
+        let (ma, mb) = (mix(&a, &cfg), mix(&b, &cfg));
+        let (ca, cb) = (ma.linear.unwrap(), mb.linear.unwrap());
+        for c in 0..3 {
+            assert!((ca[c] - cb[c]).abs() < 1.0 / 255.0, "{ca:?} vs {cb:?}");
+        }
+        // The hard cut jumps.
+        let (ha, hb) = (
+            hard_mix(&a, 3).linear.unwrap(),
+            hard_mix(&b, 3).linear.unwrap(),
+        );
+        assert!((ha[0] - hb[0]).abs() > 0.05, "{ha:?} vs {hb:?}");
+    }
+
+    #[test]
+    fn rim_views_only_used_when_nothing_else() {
+        let cfg = ColorConfig::default();
+        // The rim view is the best and the darkest: left out of blend and reference.
+        let s = [
+            gray(1.0, 0, 0.05, 92.0),
+            gray(0.5, 1, 0.3, 30.0),
+            gray(0.4, 2, 0.3, 40.0),
+            EMPTY,
+        ];
+        let m = mix(&s, &cfg);
+        assert_eq!((m.rim, m.rejected, m.main), (1, 0, 1));
+        assert!((m.linear.unwrap()[0] - 0.3).abs() < 1e-3, "{m:?}");
+        // Only rim views: used as before, not counted.
+        let rim = [
+            gray(1.0, 0, 0.05, 92.0),
+            gray(0.5, 1, 0.06, 95.0),
+            EMPTY,
+            EMPTY,
+        ];
+        let m = mix(&rim, &cfg);
+        assert_eq!((m.rim, m.main), (0, 0));
+        assert!(m.linear.is_some());
     }
 
     #[test]

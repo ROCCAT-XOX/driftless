@@ -6,7 +6,8 @@ mod common;
 
 use common::*;
 use driftless_map::{
-    colorize, ColorConfig, ColorStats, ExposureConfig, ImageSource, MapError, Vignetting,
+    colorize, ColorCamera, ColorConfig, ColorStats, ExposureConfig, ImageSource, MapError,
+    Vignetting,
 };
 use driftless_traj::nalgebra::{Isometry3, UnitQuaternion, Vector3};
 
@@ -295,6 +296,18 @@ fn colorize_rejects_bad_config_and_cameras() {
             max_angular_rate: f64::NAN,
             ..ColorConfig::default()
         },
+        ColorConfig {
+            highlight_ratio: -0.1,
+            ..ColorConfig::default()
+        },
+        ColorConfig {
+            highlight_abs: f64::NAN,
+            ..ColorConfig::default()
+        },
+        ColorConfig {
+            rim_theta: 0.0,
+            ..ColorConfig::default()
+        },
     ];
     for cfg in &bad {
         let r = colorize(&mut cloud, images.clone(), poses, cams, cfg);
@@ -315,4 +328,186 @@ fn colorize_rejects_bad_config_and_cameras() {
     };
     let r = colorize(&mut cloud, missing, poses, cams, &ColorConfig::default());
     assert!(matches!(r, Err(MapError::Images(_))));
+}
+
+/// The walk with a highlight in every second image of each camera.
+fn highlight_data() -> &'static (
+    Painted,
+    ImageSource,
+    Vec<driftless_traj::Pose>,
+    Vec<ColorCamera>,
+) {
+    static DATA: std::sync::OnceLock<(
+        Painted,
+        ImageSource,
+        Vec<driftless_traj::Pose>,
+        Vec<ColorCamera>,
+    )> = std::sync::OnceLock::new();
+    DATA.get_or_init(|| {
+        let painted = walk_scene();
+        let cams = cameras();
+        let traj = walk();
+        let shots: Vec<Shot> = (1..=11)
+            .flat_map(|i| {
+                [0, 1].map(|c| Shot {
+                    camera: c,
+                    stamp: T0 + 0.5 * f64::from(i),
+                    edit: if i % 2 == 0 {
+                        Box::new(with_highlight)
+                    } else {
+                        Box::new(|rgb| rgb)
+                    },
+                })
+            })
+            .collect();
+        let images = write_bag("highlight", &painted, &traj, &cams, &shots);
+        (painted, images, poses(&traj, 6.0), cams)
+    })
+}
+
+/// Coloured floor points at least 10 cm from another colour (see [`Match`]) and the share of
+/// them within [`TOL`] of the floor colour.
+fn floor_match(painted: &Painted, cloud: &driftless_map::Cloud) -> (usize, f64) {
+    let rgb = cloud.rgb.as_ref().unwrap();
+    let colored = cloud.colored.as_ref().unwrap();
+    let floor: Vec<usize> = (0..cloud.len())
+        .filter(|&i| {
+            let p = Vector3::from(cloud.xyz[i].map(f64::from));
+            colored[i] && on_floor(painted, &p) && !near_boundary(painted, &p, 0.1)
+        })
+        .collect();
+    let good = floor.iter().filter(|&&i| close(rgb[i], FLOOR, TOL)).count();
+    (floor.len(), good as f64 / floor.len().max(1) as f64)
+}
+
+#[test]
+fn rejects_view_dependent_highlights() {
+    let (painted, images, poses, cams) = highlight_data();
+    let run = |cfg: &ColorConfig| {
+        let mut cloud = surface_cloud(painted);
+        let stats = colorize(&mut cloud, images.clone(), poses, cams, cfg).unwrap();
+        (floor_match(painted, &cloud), stats)
+    };
+    let ((n, on), stats) = run(&ColorConfig::default());
+    let ((n_off, off), stats_off) = run(&ColorConfig {
+        highlights: false,
+        ..ColorConfig::default()
+    });
+    println!("on: {n} floor points, {on:.3} good, {stats:?}");
+    println!("off: {n_off} floor points, {off:.3} good");
+    assert!(n > 1000, "{n}");
+    assert!(on > 0.95, "{on}");
+    assert!(off < 0.85, "{off}");
+    assert!(
+        stats.views_rejected > 0 && stats.points_with_rejected > 0,
+        "{stats:?}"
+    );
+    assert_eq!(stats_off.views_rejected, 0);
+    assert!(
+        stats.floor_highlight_share_after < 0.5 * stats.floor_highlight_share_before,
+        "{stats:?}"
+    );
+    // Without the rule the share is the same as before: the soft blend alone keeps the spots.
+    assert!(
+        stats_off.floor_highlight_share_after > 0.5 * stats_off.floor_highlight_share_before,
+        "{stats_off:?}"
+    );
+}
+
+#[test]
+fn few_views_are_never_all_rejected() {
+    let painted = walk_scene();
+    let cams = cameras();
+    let traj = walk();
+    let one = [Shot {
+        camera: 0,
+        stamp: T0 + 2.0,
+        edit: Box::new(with_highlight),
+    }];
+    let two = [
+        shot(0, T0 + 2.0),
+        Shot {
+            camera: 0,
+            stamp: T0 + 2.1,
+            edit: Box::new(with_highlight),
+        },
+    ];
+    let poses = poses(&traj, 6.0);
+    for (name, shots) in [("one-view", &one[..]), ("two-views", &two[..])] {
+        let images = write_bag(name, &painted, &traj, &cams, shots);
+        let mut colored = Vec::new();
+        for highlights in [true, false] {
+            let cfg = ColorConfig {
+                highlights,
+                ..ColorConfig::default()
+            };
+            let mut cloud = surface_cloud(&painted);
+            let stats = colorize(&mut cloud, images.clone(), &poses, &cams, &cfg).unwrap();
+            assert_eq!(stats.images_used, shots.len(), "{stats:?}");
+            colored.push(cloud.colored.unwrap());
+        }
+        // Every point seen keeps a colour, however bright its views.
+        assert_eq!(colored[0], colored[1], "{name}");
+        assert!(colored[0].iter().filter(|&&c| c).count() > 1000, "{name}");
+    }
+}
+
+/// The walk with every second stamp `gain` times brighter (linear), no exposure fit: the
+/// difference stays and shows wherever a point's views change.
+fn seam_stats(name: &str, gain: f64) -> ColorStats {
+    let painted = walk_scene();
+    let cams = cameras();
+    let traj = walk();
+    let shots: Vec<Shot> = (1..=11)
+        .flat_map(|i| {
+            let g = if i % 2 == 0 { gain } else { 1.0 };
+            [0, 1].map(move |c| Shot {
+                camera: c,
+                stamp: T0 + 0.5 * f64::from(i),
+                edit: Box::new(move |rgb: Vec<u8>| {
+                    rgb.into_iter()
+                        .map(|v| {
+                            let l = (f64::from(v) / 255.0).powf(2.2) * g;
+                            (l.min(1.0).powf(1.0 / 2.2) * 255.0).round() as u8
+                        })
+                        .collect()
+                }),
+            })
+        })
+        .collect();
+    let images = write_bag(name, &painted, &traj, &cams, &shots);
+    let poses = poses(&traj, 6.0);
+    let cfg = ColorConfig {
+        exposure: ExposureConfig {
+            samples: 0,
+            ..ExposureConfig::default()
+        },
+        ..ColorConfig::default()
+    };
+    let mut cloud = surface_cloud(&painted);
+    colorize(&mut cloud, images, &poses, &cams, &cfg).unwrap()
+}
+
+#[test]
+fn seam_jump_measures_exposure_seams() {
+    // The brief expected the soft blend to lower the jump here; it does not (see the Task 4
+    // report): the jump of differing main images grows as the main view gains weight.
+    let flat = seam_stats("seam-flat", 1.0);
+    let grouped = seam_stats("seam-grouped", 1.2);
+    println!(
+        "seam jump: equal exposure {:.2} -> {:.2}, two groups {:.2} -> {:.2}",
+        flat.seam_jump_before,
+        flat.seam_jump_after,
+        grouped.seam_jump_before,
+        grouped.seam_jump_after
+    );
+    for s in [&flat, &grouped] {
+        assert!(s.seam_jump_before.is_finite() && s.seam_jump_after.is_finite());
+    }
+    assert!(
+        flat.seam_jump_before < 0.5 && flat.seam_jump_after < 0.5,
+        "{flat:?}"
+    );
+    assert!(grouped.seam_jump_before > 1.0, "{grouped:?}");
+    assert!(grouped.seam_jump_after > 1.0, "{grouped:?}");
 }

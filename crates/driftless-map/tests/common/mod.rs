@@ -357,3 +357,34 @@ pub fn walk_data() -> &'static (Painted, ImageSource, Vec<Pose>, Vec<ColorCamera
         (painted, images, poses(&traj, 6.0), cams)
     })
 }
+
+/// Brightness added by [`with_highlight`] (sRGB levels).
+pub const HIGHLIGHT: u8 = 120;
+
+/// Width of the highlight's soft edge (pixels).
+pub const HIGHLIGHT_EDGE: f64 = 24.0;
+
+/// A bright spot that moves with the camera: +[`HIGHLIGHT`] in every channel inside a disc
+/// below the image centre, where the cameras of [`cameras`] see the floor. Its edge fades
+/// over [`HIGHLIGHT_EDGE`] like a real highlight's; a hard edge would make these images
+/// the sharpest of the scan and so the best views of every point.
+pub fn with_highlight(mut rgb: Vec<u8>) -> Vec<u8> {
+    let (cx, cy, r) = (f64::from(W) / 2.0, 0.78 * f64::from(H), 0.16 * f64::from(W));
+    for v in 0..H {
+        for u in 0..W {
+            let (du, dv) = (f64::from(u) - cx, f64::from(v) - cy);
+            let s = ((r - (du * du + dv * dv).sqrt()) / HIGHLIGHT_EDGE).clamp(0.0, 1.0);
+            let add = (f64::from(HIGHLIGHT) * s * s * (3.0 - 2.0 * s)).round() as u8;
+            let i = ((v * W + u) * 3) as usize;
+            for c in &mut rgb[i..i + 3] {
+                *c = c.saturating_add(add);
+            }
+        }
+    }
+    rgb
+}
+
+/// Whether surface point `p` lies on the floor of `painted`'s room.
+pub fn on_floor(painted: &Painted, p: &Vector3<f64>) -> bool {
+    (p.z - painted.scene.room.min.z).abs() < 1e-3 && painted.color_at(p) == FLOOR
+}
