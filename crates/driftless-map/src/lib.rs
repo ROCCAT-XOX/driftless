@@ -5,7 +5,7 @@
 //! that frame. One point is kept per voxel: the one seen from closest, since near points are
 //! the most accurate. [`clean`] removes ghosts (things that moved) and isolated outliers;
 //! [`colorize`] colours it from the camera images (visibility by depth buffer, image quality,
-//! exposure and white balance between the images, weighted blend of the best views);
+//! exposure, white balance and edge falloff of the images, weighted blend of the best views);
 //! [`write_las`] and [`write_ply`] write the [`Cloud`]; [`save_stage`] and [`load_stage`] keep
 //! it between the steps at full precision.
 
@@ -24,7 +24,11 @@ pub use cloud::Cloud;
 pub use color::{colorize, ColorCamera, ColorConfig, ColorStats, ImageSource};
 pub use dense::{build_dense, DenseConfig, DenseStats, RaySource};
 pub use export::{write_las, write_ply, LAS_SCALE};
-pub use exposure::{estimate_gains, ExposureConfig, ImageGain, Observations, DARK, SATURATED};
+pub use exposure::{
+    estimate_exposure, estimate_gains, ExposureConfig, ImageGain, Observations, ViewObs,
+    Vignetting, DARK, SATURATED, VIGNETTE_MIN_OBSERVATIONS, VIGNETTE_MIN_POINT_SPREAD,
+    VIGNETTE_MIN_SPREAD, VIGNETTE_ROUNDS,
+};
 pub use sharpness::sharpness;
 pub use stage::{content_hash, load_stage, save_stage, StageError};
 

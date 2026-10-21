@@ -19,6 +19,17 @@
 //! The `a_j` are eliminated (for given gains each is the mean of its point's
 //! `log c_ij − log g_i`), which leaves a sparse, symmetric system in the image gains only. It
 //! is solved by conjugate gradients without forming the matrix, in a fixed order.
+//!
+//! The fisheyes also darken towards the image edge. With [`ExposureConfig::vignetting`] the
+//! model becomes `c_ij = g_i · V_cam(θ_ij) · a_j` with `V(θ) = exp(b1·θ² + b2·θ⁴)` per camera
+//! and channel (θ the view's angle from the optical axis), and per channel
+//! [`VIGNETTE_ROUNDS`] alternating steps fit (a) the gains as above on `log c − log V` and
+//! (b) per camera `b1, b2` by weighted least squares (2 × 2, the Huber weights of (a)) on
+//! `log c − log g_i − log a_j`, the `a_j` again eliminated; a last (a) fits the gains to the
+//! final falloff. There is no constant term: `V(0) = 1`, the overall brightness stays fixed by
+//! `mean(log g) = 0`. A camera whose views barely differ in θ (5 % to 95 % quantile closer
+//! than [`VIGNETTE_MIN_SPREAD`] overall, or than [`VIGNETTE_MIN_POINT_SPREAD`] between the views
+//! of the same point), or that has fewer than [`VIGNETTE_MIN_OBSERVATIONS`] keeps `V = 1`. Each view is divided by `g_i · V_cam(θ)` before the blend.
 
 use crate::color::{srgb_value, View};
 use crate::MapError;
@@ -39,6 +50,16 @@ const ROBUST_ROUNDS: usize = 3;
 const HUBER_DELTA: f64 = 0.1;
 /// The conjugate gradients stop once the residual is this share of the right-hand side.
 const CG_TOLERANCE: f64 = 1e-10;
+/// Alternations between the gains and the edge falloff, per channel.
+pub const VIGNETTE_ROUNDS: usize = 3;
+/// A camera's falloff is fitted only if the 5 % to 95 % quantile range of its views' angles
+/// from the optical axis reaches this (rad) ...
+pub const VIGNETTE_MIN_SPREAD: f64 = 0.35;
+/// ... the same range of the deviations from the mean angle of the same point's views of the
+/// camera reaches this (rad, about 3°; Promedia: 0.18–0.23) ...
+pub const VIGNETTE_MIN_POINT_SPREAD: f64 = 0.05;
+/// ... and it has at least this many observations in the channel.
+pub const VIGNETTE_MIN_OBSERVATIONS: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExposureConfig {
@@ -49,6 +70,8 @@ pub struct ExposureConfig {
     pub max_gain: f64,
     /// Points used for the fit; 0 turns the equalisation off (every gain 1).
     pub samples: usize,
+    /// Fit the edge falloff of every camera together with the gains.
+    pub vignetting: bool,
 }
 
 impl Default for ExposureConfig {
@@ -57,6 +80,7 @@ impl Default for ExposureConfig {
             smooth: 1.0,
             max_gain: 4.0,
             samples: 50_000,
+            vignetting: true,
         }
     }
 }
@@ -84,7 +108,17 @@ pub struct Observations {
     cameras: Vec<usize>,
     /// Point `j`'s views are `views[starts[j]..starts[j + 1]]`.
     starts: Vec<usize>,
-    views: Vec<(u32, [f32; 3])>,
+    views: Vec<ViewObs>,
+}
+
+/// One observation of a point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewObs {
+    pub image: u32,
+    /// Observed linear colour.
+    pub rgb: [f32; 3],
+    /// Angle from the image's optical axis (rad).
+    pub theta: f32,
 }
 
 impl Observations {
@@ -98,10 +132,12 @@ impl Observations {
         }
     }
 
-    /// Adds a point with its views: (image, observed linear colour), at most one per image.
-    pub fn push_point(&mut self, views: &[(u32, [f32; 3])]) {
+    /// Adds a point with its views, at most one per image.
+    pub fn push_point(&mut self, views: &[ViewObs]) {
         assert!(
-            views.iter().all(|v| (v.0 as usize) < self.cameras.len()),
+            views
+                .iter()
+                .all(|v| (v.image as usize) < self.cameras.len()),
             "view of an unknown image"
         );
         self.views.extend_from_slice(views);
@@ -116,7 +152,8 @@ impl Observations {
         self.starts.len() - 1
     }
 
-    fn point(&self, j: usize) -> &[(u32, [f32; 3])] {
+    /// The views of point `j`.
+    pub fn point(&self, j: usize) -> &[ViewObs] {
         &self.views[self.starts[j]..self.starts[j + 1]]
     }
 }
@@ -132,10 +169,58 @@ pub struct ImageGain {
     pub gain: [f32; 3],
 }
 
+/// Edge falloff of every camera: `V(θ) = exp(b1·θ² + b2·θ⁴)` per channel, `V(0) = 1`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Vignetting {
+    /// Per camera (as numbered in [`Observations::new`]), per channel: `[b1, b2]` (θ in rad).
+    pub coeffs: Vec<[[f64; 2]; 3]>,
+    /// Factors are clamped to `[1/max_gain, 1]`.
+    pub max_gain: f64,
+}
+
+impl Default for Vignetting {
+    fn default() -> Self {
+        Vignetting::flat(0, ExposureConfig::default().max_gain)
+    }
+}
+
+impl Vignetting {
+    /// `V = 1` for `cameras` cameras.
+    pub fn flat(cameras: usize, max_gain: f64) -> Vignetting {
+        Vignetting {
+            coeffs: vec![[[0.0; 2]; 3]; cameras],
+            max_gain,
+        }
+    }
+
+    /// Falloff of `camera` in `channel` at `theta` (rad) from the optical axis, in
+    /// `[1/max_gain, 1]`; 1 for an unknown camera.
+    pub fn factor(&self, camera: usize, channel: usize, theta: f32) -> f32 {
+        self.log_factor(camera, channel, f64::from(theta)).exp() as f32
+    }
+
+    fn log_factor(&self, camera: usize, channel: usize, theta: f64) -> f64 {
+        let Some(c) = self.coeffs.get(camera) else {
+            return 0.0;
+        };
+        let [b1, b2] = c[channel];
+        let t2 = theta * theta;
+        (b1 * t2 + b2 * t2 * t2).clamp(-self.max_gain.max(1.0).ln(), 0.0)
+    }
+}
+
 /// Gain triple of every image of `obs` (linear RGB), clamped to
-/// `[1/max_gain, max_gain]`. Images without usable observations follow their neighbours of
-/// the same camera; with none at all every gain is 1. Same input, same result.
+/// `[1/max_gain, max_gain]`; the edge falloff is fitted with them but not returned (see
+/// [`estimate_exposure`]).
 pub fn estimate_gains(obs: &Observations, cfg: &ExposureConfig) -> Vec<[f32; 3]> {
+    estimate_exposure(obs, cfg).0
+}
+
+/// Gain triple of every image of `obs` (linear RGB), clamped to `[1/max_gain, max_gain]`, and
+/// the edge falloff of every camera (flat with [`ExposureConfig::vignetting`] off). Images
+/// without usable observations follow their neighbours of the same camera; with none at all
+/// every gain is 1. Same input, same result.
+pub fn estimate_exposure(obs: &Observations, cfg: &ExposureConfig) -> (Vec<[f32; 3]>, Vignetting) {
     let n = obs.images();
     let bound = cfg.max_gain.max(1.0).ln();
     // Consecutive images of the same camera.
@@ -149,56 +234,280 @@ pub fn estimate_gains(obs: &Observations, cfg: &ExposureConfig) -> Vec<[f32; 3]>
             pairs.push((prev, i));
         }
     }
+    let mut vignetting = Vignetting::flat(last.len(), cfg.max_gain);
     let mut gains = vec![[1.0f32; 3]; n];
     for c in 0..3 {
-        let x = solve_channel(obs, c, &pairs, cfg.smooth);
+        let seen = Seen::new(obs, c);
+        let x = if cfg.vignetting {
+            fit_channel(&seen, &pairs, cfg.smooth, c, &mut vignetting)
+        } else {
+            fit_gains(&seen, &seen.log, &pairs, cfg.smooth).0
+        };
         for (g, x) in gains.iter_mut().zip(x) {
             g[c] = x.clamp(-bound, bound).exp() as f32;
         }
     }
-    gains
+    (gains, vignetting)
 }
 
-/// Log gains of channel `c`, with mean 0.
-fn solve_channel(obs: &Observations, c: usize, pairs: &[(usize, usize)], smooth: f64) -> Vec<f64> {
-    let n = obs.images();
-    // The usable observations (image, log colour) of every point with at least 2 of them.
-    let mut starts = vec![0usize];
-    let mut seen: Vec<(usize, f64)> = Vec::new();
-    for j in 0..obs.points() {
-        let start = seen.len();
-        seen.extend(
-            obs.point(j)
+/// The usable observations of one channel: those within [`DARK`] to [`SATURATED`], of the
+/// points with at least 2 of them. Point `j`'s are `starts[j]..starts[j + 1]`; kept as
+/// parallel arrays, 16 bytes per observation.
+struct Seen {
+    /// Camera of every image.
+    cameras: Vec<usize>,
+    starts: Vec<usize>,
+    image: Vec<u32>,
+    theta: Vec<f32>,
+    /// Log colour.
+    log: Vec<f64>,
+}
+
+impl Seen {
+    fn new(obs: &Observations, c: usize) -> Seen {
+        let mut seen = Seen {
+            cameras: obs.cameras.clone(),
+            starts: vec![0],
+            image: Vec::new(),
+            theta: Vec::new(),
+            log: Vec::new(),
+        };
+        for j in 0..obs.points() {
+            let start = seen.log.len();
+            for v in obs
+                .point(j)
                 .iter()
-                .filter(|v| (DARK..=SATURATED).contains(&v.1[c]))
-                .map(|v| (v.0 as usize, f64::from(v.1[c]).ln())),
-        );
-        if seen.len() - start < 2 {
-            seen.truncate(start);
-        } else {
-            starts.push(seen.len());
+                .filter(|v| (DARK..=SATURATED).contains(&v.rgb[c]))
+            {
+                seen.image.push(v.image);
+                seen.theta.push(v.theta);
+                seen.log.push(f64::from(v.rgb[c]).ln());
+            }
+            if seen.log.len() - start < 2 {
+                seen.image.truncate(start);
+                seen.theta.truncate(start);
+                seen.log.truncate(start);
+            } else {
+                seen.starts.push(seen.log.len());
+            }
+        }
+        seen
+    }
+
+    fn images(&self) -> usize {
+        self.cameras.len()
+    }
+
+    fn points(&self) -> usize {
+        self.starts.len() - 1
+    }
+
+    fn range(&self, j: usize) -> std::ops::Range<usize> {
+        self.starts[j]..self.starts[j + 1]
+    }
+
+    fn camera(&self, k: usize) -> usize {
+        self.cameras[self.image[k] as usize]
+    }
+}
+
+/// Log gains of channel `c` (mean 0), alternating with the falloff of every camera, which is
+/// written into `vignetting`.
+fn fit_channel(
+    seen: &Seen,
+    pairs: &[(usize, usize)],
+    smooth: f64,
+    c: usize,
+    vignetting: &mut Vignetting,
+) -> Vec<f64> {
+    let observable: Vec<usize> = (0..vignetting.coeffs.len())
+        .filter(|&cam| observable(seen, cam))
+        .collect();
+    if observable.is_empty() {
+        return fit_gains(seen, &seen.log, pairs, smooth).0;
+    }
+    // Log colours divided by the current falloff.
+    let mut corrected = seen.log.clone();
+    for _ in 0..VIGNETTE_ROUNDS {
+        let (x, w) = fit_gains(seen, &corrected, pairs, smooth);
+        for &cam in &observable {
+            vignetting.coeffs[cam][c] = fit_falloff(seen, &x, &w, cam, &vignetting.coeffs, c);
+        }
+        for (k, l) in corrected.iter_mut().enumerate() {
+            *l = seen.log[k] - vignetting.log_factor(seen.camera(k), c, f64::from(seen.theta[k]));
         }
     }
-    if starts.len() == 1 || n == 0 {
-        return vec![0.0; n];
+    fit_gains(seen, &corrected, pairs, smooth).0
+}
+
+/// Whether the falloff of camera `cam` can be told apart from the gains and the albedo: at
+/// least [`VIGNETTE_MIN_OBSERVATIONS`] observations, the angles of its views spread over
+/// [`VIGNETTE_MIN_SPREAD`] and their deviations from the mean angle of the same point's views
+/// of this camera over [`VIGNETTE_MIN_POINT_SPREAD`] (5 % to 95 % quantile). Only the second shows the falloff: a camera
+/// that sees every point at the same angle in all its images (standing still) cannot.
+fn observable(seen: &Seen, cam: usize) -> bool {
+    let mut theta: Vec<f64> = Vec::new();
+    let mut deviation: Vec<f64> = Vec::new();
+    for j in 0..seen.points() {
+        let start = theta.len();
+        let range = seen.range(j);
+        theta.extend(
+            range
+                .filter(|&k| seen.camera(k) == cam)
+                .map(|k| f64::from(seen.theta[k])),
+        );
+        let mine = &theta[start..];
+        if mine.len() >= 2 {
+            let mean = mine.iter().sum::<f64>() / mine.len() as f64;
+            deviation.extend(mine.iter().map(|t| t - mean));
+        }
     }
+    let spread = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
+        q(0.95) - q(0.05)
+    };
+    theta.len() >= VIGNETTE_MIN_OBSERVATIONS
+        && deviation.len() >= 2
+        && spread(&mut theta) >= VIGNETTE_MIN_SPREAD
+        && spread(&mut deviation) >= VIGNETTE_MIN_POINT_SPREAD
+}
+
+/// New `[b1, b2]` of camera `cam` in channel `c` for the log gains `x` and weights `w`, the
+/// other cameras' falloff (`coeffs`) held: weighted least squares on
+/// `log c − log g_i − log a_j`, with `a_j` eliminated as in the gain fit. Together with them
+/// a constant log offset of the camera's images is fitted and dropped: the gains of (a) take
+/// up the camera's mean falloff, and without the offset (b) would only see the rest, so the
+/// alternation would approach the falloff slowly. Where the offset is not observable (no
+/// point seen by another camera too) only `b1, b2` are fitted. Unchanged if the system is
+/// singular.
+fn fit_falloff(
+    seen: &Seen,
+    x: &[f64],
+    w: &[f64],
+    cam: usize,
+    coeffs: &[[[f64; 2]; 3]],
+    c: usize,
+) -> [f64; 2] {
+    // Basis per view: offset, θ², θ⁴ of this camera (0 for the other cameras' views).
+    let basis = |t: f64| {
+        let t2 = t * t;
+        [1.0, t2, t2 * t2]
+    };
+    let (mut a, mut r) = ([[0.0f64; 3]; 3], [0.0f64; 3]);
+    let mut psi: Vec<[f64; 3]> = Vec::new();
+    let mut rest: Vec<f64> = Vec::new();
+    let mut weight = 0.0;
+    for j in 0..seen.points() {
+        let range = seen.range(j);
+        if !range.clone().any(|k| seen.camera(k) == cam) {
+            continue;
+        }
+        // Per view: the residual of the full model with this camera's falloff left out, and
+        // this camera's basis; both centred on the point's weighted mean (the elimination of
+        // `a_j`).
+        psi.clear();
+        rest.clear();
+        let ws: f64 = w[range.clone()].iter().sum();
+        let (mut mean_rest, mut mean_psi) = (0.0, [0.0; 3]);
+        for k in range.clone() {
+            let theta = f64::from(seen.theta[k]);
+            let (p, model) = if seen.camera(k) == cam {
+                (basis(theta), 0.0)
+            } else {
+                let [b1, b2] = coeffs[seen.camera(k)][c];
+                let b = basis(theta);
+                ([0.0; 3], b1 * b[1] + b2 * b[2])
+            };
+            let e = seen.log[k] - x[seen.image[k] as usize] - model;
+            mean_rest += w[k] * e;
+            for (m, p) in mean_psi.iter_mut().zip(p) {
+                *m += w[k] * p;
+            }
+            psi.push(p);
+            rest.push(e);
+        }
+        mean_rest /= ws;
+        mean_psi = mean_psi.map(|m| m / ws);
+        for ((p, e), &wk) in psi.iter().zip(&rest).zip(&w[range]) {
+            let p: [f64; 3] = std::array::from_fn(|u| p[u] - mean_psi[u]);
+            let e = e - mean_rest;
+            weight += wk;
+            for u in 0..3 {
+                r[u] += wk * p[u] * e;
+                for v in 0..3 {
+                    a[u][v] += wk * p[u] * p[v];
+                }
+            }
+        }
+    }
+    // The offset counts as observable if its centred basis carries at least 1 % of the
+    // weight (views of points shared with another camera).
+    if a[0][0] >= 0.01 * weight {
+        if let Some(b) = solve3(&a, &r) {
+            return [b[1], b[2]];
+        }
+    }
+    let det = a[1][1] * a[2][2] - a[1][2] * a[2][1];
+    if det.is_nan() || det <= 1e-12 * a[1][1] * a[2][2] {
+        return coeffs[cam][c];
+    }
+    [
+        (a[2][2] * r[1] - a[1][2] * r[2]) / det,
+        (a[1][1] * r[2] - a[2][1] * r[1]) / det,
+    ]
+}
+
+/// Solution of the symmetric 3 × 3 system `a x = r` by Cramer's rule; `None` if it is
+/// (nearly) singular.
+fn solve3(a: &[[f64; 3]; 3], r: &[f64; 3]) -> Option<[f64; 3]> {
+    let det3 = |m: &[[f64; 3]; 3]| {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    };
+    let det = det3(a);
+    if det.is_nan() || det <= 1e-12 * a[0][0] * a[1][1] * a[2][2] {
+        return None;
+    }
+    Some(std::array::from_fn(|col| {
+        let mut m = *a;
+        for (row, v) in m.iter_mut().zip(r) {
+            row[col] = *v;
+        }
+        det3(&m) / det
+    }))
+}
+
+/// Log gains (mean 0) for the log colours `log` of the observations of `seen`, and the Huber
+/// weights of the last round.
+fn fit_gains(
+    seen: &Seen,
+    log: &[f64],
+    pairs: &[(usize, usize)],
+    smooth: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let n = seen.images();
+    let mut w = vec![1.0; log.len()];
+    if seen.points() == 0 || n == 0 {
+        return (vec![0.0; n], w);
+    }
+    let (starts, image) = (&seen.starts, &seen.image);
     // Least squares, then re-weighted rounds with Huber weights on the residuals: views that
     // disagree with the fit (misregistered edges, highlights, small occlusion errors) lose
     // influence.
-    let mut w = vec![1.0; seen.len()];
-    let mut x = solve_weighted(n, &starts, &seen, &w, pairs, smooth);
+    let mut x = solve_weighted(n, starts, image, log, &w, pairs, smooth);
     for _ in 0..ROBUST_ROUNDS {
         for j in 0..starts.len() - 1 {
             let r = starts[j]..starts[j + 1];
             let ws: f64 = w[r.clone()].iter().sum();
-            let log_a = seen[r.clone()]
-                .iter()
-                .zip(&w[r.clone()])
-                .map(|(o, w)| w * (o.1 - x[o.0]))
+            let log_a = r
+                .clone()
+                .map(|k| w[k] * (log[k] - x[image[k] as usize]))
                 .sum::<f64>()
                 / ws;
             for k in r {
-                let e = (seen[k].1 - x[seen[k].0] - log_a).abs();
+                let e = (log[k] - x[image[k] as usize] - log_a).abs();
                 w[k] = if e <= HUBER_DELTA {
                     1.0
                 } else {
@@ -206,18 +515,19 @@ fn solve_channel(obs: &Observations, c: usize, pairs: &[(usize, usize)], smooth:
                 };
             }
         }
-        x = solve_weighted(n, &starts, &seen, &w, pairs, smooth);
+        x = solve_weighted(n, starts, image, log, &w, pairs, smooth);
     }
     let mean = x.iter().sum::<f64>() / n as f64;
-    x.iter().map(|x| x - mean).collect()
+    (x.iter().map(|x| x - mean).collect(), w)
 }
 
-/// Solves the weighted problem: point `j`'s observations are `seen[starts[j]..starts[j + 1]]`
-/// with weights `w`.
+/// Solves the weighted problem: point `j`'s observations are `starts[j]..starts[j + 1]`, of
+/// images `image` with log colours `log` and weights `w`.
 fn solve_weighted(
     n: usize,
     starts: &[usize],
-    seen: &[(usize, f64)],
+    image: &[u32],
+    log: &[f64],
     w: &[f64],
     pairs: &[(usize, usize)],
     smooth: f64,
@@ -230,14 +540,10 @@ fn solve_weighted(
     for j in 0..points {
         let r = range(j);
         let ws: f64 = w[r.clone()].iter().sum();
-        let mean = seen[r.clone()]
-            .iter()
-            .zip(&w[r.clone()])
-            .map(|(o, w)| w * o.1)
-            .sum::<f64>()
-            / ws;
-        for (&(i, l), &wk) in seen[r.clone()].iter().zip(&w[r]) {
-            b[i] += wk * (l - mean);
+        let mean = r.clone().map(|k| w[k] * log[k]).sum::<f64>() / ws;
+        for k in r {
+            let (i, wk) = (image[k] as usize, w[k]);
+            b[i] += wk * (log[k] - mean);
             diag[i] += wk * (1.0 - wk / ws);
         }
     }
@@ -252,14 +558,10 @@ fn solve_weighted(
         for j in 0..points {
             let r = range(j);
             let ws: f64 = w[r.clone()].iter().sum();
-            let mean = seen[r.clone()]
-                .iter()
-                .zip(&w[r.clone()])
-                .map(|(o, w)| w * x[o.0])
-                .sum::<f64>()
-                / ws;
-            for (&(i, _), &wk) in seen[r.clone()].iter().zip(&w[r]) {
-                out[i] += wk * (x[i] - mean);
+            let mean = r.clone().map(|k| w[k] * x[image[k] as usize]).sum::<f64>() / ws;
+            for k in r {
+                let i = image[k] as usize;
+                out[i] += w[k] * (x[i] - mean);
             }
         }
         for &(i, k) in pairs {
@@ -327,26 +629,122 @@ pub(crate) fn sample_observations(
             slots[j * k..(j + 1) * k]
                 .iter()
                 .filter(|v| v.weight > 0.0)
-                .map(|v| (v.rank, v.linear())),
+                .map(|v| ViewObs {
+                    image: v.rank,
+                    rgb: v.linear(),
+                    theta: v.theta(),
+                }),
         );
         obs.push_point(&views);
     }
     obs
 }
 
-/// Divides every kept view's colour by its image's gain.
-pub(crate) fn apply_gains(slots: &mut [View], gains: &[[f32; 3]]) {
+/// Colour of view `v` divided by its image's gain and its camera's falloff at the view's
+/// angle; `cameras[rank]` is the camera of each image.
+fn corrected(v: &View, gains: &[[f32; 3]], vignetting: &Vignetting, cameras: &[usize]) -> [f32; 3] {
+    let i = v.rank as usize;
+    let (g, cam, theta) = (&gains[i], cameras[i], v.theta());
+    let c = v.linear();
+    std::array::from_fn(|ch| c[ch] / (g[ch] * vignetting.factor(cam, ch, theta)))
+}
+
+/// Divides every kept view's colour by its image's gain and its camera's falloff.
+pub(crate) fn apply_exposure(
+    slots: &mut [View],
+    gains: &[[f32; 3]],
+    vignetting: &Vignetting,
+    cameras: &[usize],
+) {
     slots
         .par_iter_mut()
         .filter(|v| v.weight > 0.0)
         .for_each(|v| {
-            let g = &gains[v.rank as usize];
-            let mut c = v.linear();
-            for (c, g) in c.iter_mut().zip(g) {
-                *c /= g;
-            }
+            let c = corrected(v, gains, vignetting, cameras);
             v.set_linear(c);
         });
+}
+
+/// Width of the angle classes of [`vignette_residual`] (rad, 10°).
+const RESIDUAL_CLASS: f64 = 10.0 * std::f64::consts::PI / 180.0;
+/// Classes up to 180°.
+const RESIDUAL_CLASSES: usize = 18;
+
+/// Remaining edge falloff after dividing every view by its gain and falloff: per view of a
+/// point with at least 2 usable views (raw colour within [`DARK`] to [`SATURATED`] in every
+/// channel), the log of its luminance (Rec. 709) minus the mean over the point's views; per
+/// camera and 10° class of the view's angle with at least [`VIGNETTE_MIN_OBSERVATIONS`] views
+/// the mean of these, in % (100 × log); per camera the largest absolute class mean, averaged
+/// over the cameras with such a class. 0 without any.
+pub(crate) fn vignette_residual(
+    slots: &[View],
+    k: usize,
+    gains: &[[f32; 3]],
+    vignetting: &Vignetting,
+    cameras: &[usize],
+) -> f64 {
+    let n = cameras.iter().max().map_or(0, |&c| c + 1);
+    let classes = n * RESIDUAL_CLASSES;
+    // Per chunk of points: (summed residual, views) per camera and class; summed in order.
+    let partial: Vec<Vec<(f64, usize)>> = slots
+        .par_chunks(k * SUM_CHUNK)
+        .map(|chunk| {
+            let mut sums = vec![(0.0f64, 0usize); classes];
+            let mut views: Vec<(usize, f64)> = Vec::with_capacity(k);
+            for s in chunk.chunks(k) {
+                views.clear();
+                views.extend(
+                    s.iter()
+                        .filter(|v| {
+                            v.weight > 0.0
+                                && v.linear().iter().all(|c| (DARK..=SATURATED).contains(c))
+                        })
+                        .map(|v| {
+                            let c = corrected(v, gains, vignetting, cameras);
+                            let lum = 0.2126 * f64::from(c[0])
+                                + 0.7152 * f64::from(c[1])
+                                + 0.0722 * f64::from(c[2]);
+                            let class = ((f64::from(v.theta()) / RESIDUAL_CLASS) as usize)
+                                .min(RESIDUAL_CLASSES - 1);
+                            (
+                                cameras[v.rank as usize] * RESIDUAL_CLASSES + class,
+                                lum.ln(),
+                            )
+                        }),
+                );
+                if views.len() < 2 {
+                    continue;
+                }
+                let mean = views.iter().map(|v| v.1).sum::<f64>() / views.len() as f64;
+                for &(class, l) in &views {
+                    sums[class].0 += l - mean;
+                    sums[class].1 += 1;
+                }
+            }
+            sums
+        })
+        .collect();
+    let mut sums = vec![(0.0f64, 0usize); classes];
+    for chunk in &partial {
+        for (t, p) in sums.iter_mut().zip(chunk) {
+            t.0 += p.0;
+            t.1 += p.1;
+        }
+    }
+    let worst: Vec<f64> = sums
+        .chunks(RESIDUAL_CLASSES.max(1))
+        .filter_map(|cam| {
+            cam.iter()
+                .filter(|c| c.1 >= VIGNETTE_MIN_OBSERVATIONS)
+                .map(|c| (100.0 * c.0 / c.1 as f64).abs())
+                .reduce(f64::max)
+        })
+        .collect();
+    if worst.is_empty() {
+        0.0
+    } else {
+        worst.iter().sum::<f64>() / worst.len() as f64
+    }
 }
 
 /// Mean colour spread between the views of a point, over the points with at least 2 views:
@@ -522,6 +920,14 @@ pub(crate) fn image_offset(slots: &[View], k: usize, images: usize) -> f64 {
 mod tests {
     use super::*;
 
+    fn view(image: u32, rgb: [f32; 3]) -> ViewObs {
+        ViewObs {
+            image,
+            rgb,
+            theta: 0.0,
+        }
+    }
+
     #[test]
     fn two_images_split_the_ratio() {
         // Image 1 sees everything twice as bright: gains 1/√2 and √2 (smoothness pulls a
@@ -529,7 +935,7 @@ mod tests {
         let mut obs = Observations::new(vec![0, 0]);
         for j in 0..100 {
             let a = 0.1 + 0.002 * j as f32;
-            obs.push_point(&[(0, [a; 3]), (1, [2.0 * a; 3])]);
+            obs.push_point(&[view(0, [a; 3]), view(1, [2.0 * a; 3])]);
         }
         let free = ExposureConfig {
             smooth: 0.0,
@@ -555,7 +961,7 @@ mod tests {
         let mut obs = Observations::new(vec![0, 1]);
         for j in 0..50 {
             let a = 0.2 + 0.004 * j as f32;
-            obs.push_point(&[(0, [0.6, a, 0.001]), (1, [1.0, 1.5 * a, 0.3])]);
+            obs.push_point(&[view(0, [0.6, a, 0.001]), view(1, [1.0, 1.5 * a, 0.3])]);
         }
         let free = ExposureConfig {
             smooth: 0.0,
@@ -574,7 +980,7 @@ mod tests {
         for j in 0..110 {
             let a = 0.05 + 0.001 * (j % 100) as f32;
             let ratio = if j < 100 { 2.0 } else { 5.0 };
-            obs.push_point(&[(0, [a; 3]), (1, [ratio * a; 3])]);
+            obs.push_point(&[view(0, [a; 3]), view(1, [ratio * a; 3])]);
         }
         let g = estimate_gains(&obs, &ExposureConfig::default());
         let ratio = g[1][0] / g[0][0];
@@ -589,7 +995,7 @@ mod tests {
         let mut obs = Observations::new(vec![0, 0, 0]);
         for j in 0..100 {
             let a = 0.05 + 0.001 * j as f32;
-            obs.push_point(&[(0, [a; 3]), (2, [4.0 * a; 3])]);
+            obs.push_point(&[view(0, [a; 3]), view(2, [4.0 * a; 3])]);
         }
         let g = estimate_gains(&obs, &ExposureConfig::default());
         // In the log midway: gain 1 (the mean of the three logs is 0).

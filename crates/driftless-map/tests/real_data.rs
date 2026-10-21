@@ -474,8 +474,16 @@ fn jmk6_scan_143623_color() {
         stats.images_bad,
     );
     println!(
-        "143623: gains {:.3}…{:.3}; view spread {:.2} → {:.2} (sRGB 0–255)",
-        stats.gain_min, stats.gain_max, stats.spread_before, stats.spread_after,
+        "143623: gains {:.3}…{:.3} ({} at the bound); view spread {:.2} → {:.2} (sRGB 0–255); \
+         edge falloff residual {:.2} → {:.2} %; {:?}",
+        stats.gain_min,
+        stats.gain_max,
+        stats.images_gain_clamped,
+        stats.spread_before,
+        stats.spread_after,
+        stats.vignette_residual_before,
+        stats.vignette_residual_after,
+        stats.vignetting.coeffs,
     );
     match std::env::var_os("DRIFTLESS_COLOR_OUT") {
         Some(dir) => {

@@ -254,12 +254,20 @@ fn color_warnings(s: &ColorStats) -> Vec<String> {
                 .into(),
         );
     }
+    if s.images_gain_clamped > 0 {
+        out.push(format!(
+            "{} Bilder ({:.0} %) stoßen an die Grenze des Belichtungsabgleichs",
+            s.images_gain_clamped,
+            100.0 * s.images_gain_clamped as f64 / s.images_used.max(1) as f64
+        ));
+    }
     out
 }
 
 /// Colour statistics with the gains summarised per camera (count, smallest, largest and mean
-/// gain per channel) instead of one entry per image.
-fn color_json(s: &ColorStats) -> Value {
+/// gain per channel) instead of one entry per image; `cameras` names the cameras in the order
+/// of the edge falloff.
+fn color_json(s: &ColorStats, cameras: &[&str]) -> Value {
     struct Sum {
         n: usize,
         min: [f32; 3],
@@ -291,6 +299,11 @@ fn color_json(s: &ColorStats) -> Value {
             )
         })
         .collect();
+    let vignetting: serde_json::Map<String, Value> = cameras
+        .iter()
+        .zip(&s.vignetting.coeffs)
+        .map(|(name, c)| (name.to_string(), json!(c)))
+        .collect();
     let points = s.points_colored + s.points_uncolored;
     json!({
         "images_used": s.images_used,
@@ -306,7 +319,11 @@ fn color_json(s: &ColorStats) -> Value {
             "min": s.gain_min,
             "max": s.gain_max,
             "per_camera": per_camera,
+            "clamped_images": s.images_gain_clamped,
         },
+        "vignetting": vignetting,
+        "vignette_residual_before": s.vignette_residual_before,
+        "vignette_residual_after": s.vignette_residual_after,
         "spread_before": s.spread_before,
         "spread_after": s.spread_after,
         "camera_difference_before": s.camera_difference_before,
@@ -359,6 +376,7 @@ fn settings_json(
                 "smooth": k.exposure.smooth,
                 "max_gain": k.exposure.max_gain,
                 "samples": k.exposure.samples,
+                "vignetting": k.exposure.vignetting,
             },
         },
     })
@@ -565,11 +583,12 @@ impl MapRun<'_> {
             start.elapsed().as_secs_f64()
         );
         let id = self.ids.color.clone().expect("colour input exists");
+        let names: Vec<&str> = input.cams.iter().map(|c| c.camera.name.as_str()).collect();
         self.record(
             "color",
             &id,
             start,
-            color_json(&stats),
+            color_json(&stats, &names),
             &["color.las", "color.ply"],
         );
         Ok(())
@@ -817,5 +836,19 @@ mod tests {
         let w = color_warnings(&s);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("abgeschnitten"), "{w:?}");
+    }
+
+    #[test]
+    fn warns_about_clamped_gains() {
+        let s = ColorStats {
+            images_used: 200,
+            images_gain_clamped: 26,
+            ..ColorStats::default()
+        };
+        let w = color_warnings(&s);
+        assert_eq!(
+            w,
+            vec!["26 Bilder (13 %) stoßen an die Grenze des Belichtungsabgleichs"]
+        );
     }
 }

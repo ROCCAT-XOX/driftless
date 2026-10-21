@@ -15,14 +15,15 @@
 //!    [`ColorConfig::views_blended`] of them in linear RGB, written as sRGB.
 //!
 //! Before the blend, each view's colour is divided by its image's exposure and white-balance
-//! gain (see [`crate::exposure`]), fitted on the kept views.
+//! gain and by its camera's edge falloff at the view's angle (see [`crate::exposure`]), both
+//! fitted on the kept views.
 //!
 //! Points no image sees get a gray from their intensity and `colored = false`.
 
 use crate::clean::spread_axes;
 use crate::exposure::{
-    apply_gains, camera_difference, estimate_gains, image_offset, sample_observations, view_spread,
-    ExposureConfig, ImageGain,
+    apply_exposure, camera_difference, estimate_exposure, image_offset, sample_observations,
+    view_spread, vignette_residual, ExposureConfig, ImageGain, Vignetting,
 };
 use crate::sharpness::measure;
 use crate::visibility::{visible_points, PointGrid, Seen};
@@ -183,6 +184,16 @@ pub struct ColorStats {
     /// Smallest and largest gain over all used images and channels (1 without images).
     pub gain_min: f32,
     pub gain_max: f32,
+    /// Used images with a gain at `1/max_gain` or `max_gain` in some channel: the fit wanted
+    /// more and these images stay too dark or too bright.
+    pub images_gain_clamped: usize,
+    /// Edge falloff of every camera (numbered as `cams` of [`colorize`]).
+    pub vignetting: Vignetting,
+    /// Remaining edge falloff after the gains alone and after gains and falloff (in %, see
+    /// `exposure::vignette_residual`): per camera the largest mean luminance residual of a 10°
+    /// class of the views' angle from the optical axis, averaged over the cameras.
+    pub vignette_residual_before: f64,
+    pub vignette_residual_after: f64,
     /// Mean colour spread between the views of a point before and after the equalisation:
     /// standard deviation of the blended views' colours per channel, in sRGB units (0–255),
     /// averaged over the channels and over the points with at least 2 views.
@@ -578,7 +589,6 @@ impl View {
     }
 
     /// Angle from the optical axis (rad).
-    #[allow(dead_code)] // read by the edge falloff fit
     pub(crate) fn theta(&self) -> f32 {
         f32::from(self.theta) / 65535.0 * std::f32::consts::PI
     }
@@ -786,13 +796,21 @@ pub fn colorize(
     stats.spread_before = view_spread(&slots, k);
     let before = camera_difference(&slots, k, &cameras);
     stats.image_offset_before = image_offset(&slots, k, used.len());
-    let gains = if cfg.exposure.samples == 0 {
-        vec![[1.0; 3]; used.len()]
+    let (gains, vignetting) = if cfg.exposure.samples == 0 {
+        (
+            vec![[1.0; 3]; used.len()],
+            Vignetting::flat(cams.len(), cfg.exposure.max_gain),
+        )
     } else {
         let obs = sample_observations(&slots, k, cameras.clone(), cfg.exposure.samples);
-        estimate_gains(&obs, &cfg.exposure)
+        let (gains, mut vignetting) = estimate_exposure(&obs, &cfg.exposure);
+        vignetting.coeffs.resize(cams.len(), [[0.0; 2]; 3]);
+        (gains, vignetting)
     };
-    apply_gains(&mut slots, &gains);
+    let flat = Vignetting::flat(cams.len(), cfg.exposure.max_gain);
+    stats.vignette_residual_before = vignette_residual(&slots, k, &gains, &flat, &cameras);
+    stats.vignette_residual_after = vignette_residual(&slots, k, &gains, &vignetting, &cameras);
+    apply_exposure(&mut slots, &gains, &vignetting, &cameras);
     stats.spread_after = view_spread(&slots, k);
     let after = camera_difference(&slots, k, &cameras);
     stats.image_offset_after = image_offset(&slots, k, used.len());
@@ -802,6 +820,15 @@ pub fn colorize(
     let all = gains.iter().flatten();
     stats.gain_min = all.clone().copied().reduce(f32::min).unwrap_or(1.0);
     stats.gain_max = all.copied().reduce(f32::max).unwrap_or(1.0);
+    let (hi, lo) = (
+        cfg.exposure.max_gain as f32,
+        (1.0 / cfg.exposure.max_gain) as f32,
+    );
+    stats.images_gain_clamped = gains
+        .iter()
+        .filter(|g| g.iter().any(|&x| x >= hi || x <= lo))
+        .count();
+    stats.vignetting = vignetting;
     stats.gains = used
         .iter()
         .zip(&gains)

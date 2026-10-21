@@ -5,7 +5,9 @@
 mod common;
 
 use common::*;
-use driftless_map::{colorize, ColorConfig, ColorStats, ImageSource, MapError};
+use driftless_map::{
+    colorize, ColorConfig, ColorStats, ExposureConfig, ImageSource, MapError, Vignetting,
+};
 use driftless_traj::nalgebra::{Isometry3, UnitQuaternion, Vector3};
 
 /// Separable Gaussian blur with standard deviation `sigma` (pixels), edges clamped.
@@ -234,6 +236,7 @@ fn uncolored_points_are_gray_not_black() {
             points_uncolored: cloud.len(),
             gain_min: 1.0,
             gain_max: 1.0,
+            vignetting: Vignetting::flat(cams.len(), ExposureConfig::default().max_gain),
             ..ColorStats::default()
         }
     );
