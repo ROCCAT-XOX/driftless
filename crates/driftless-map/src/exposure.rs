@@ -28,8 +28,9 @@
 //! `log c − log g_i − log a_j`, the `a_j` again eliminated; a last (a) fits the gains to the
 //! final falloff. There is no constant term: `V(0) = 1`, the overall brightness stays fixed by
 //! `mean(log g) = 0`. A camera whose views barely differ in θ (5 % to 95 % quantile closer
-//! than [`VIGNETTE_MIN_SPREAD`] overall, or than [`VIGNETTE_MIN_POINT_SPREAD`] between the views
-//! of the same point), or that has fewer than [`VIGNETTE_MIN_OBSERVATIONS`] keeps `V = 1`. Each view is divided by `g_i · V_cam(θ)` before the blend.
+//! than [`VIGNETTE_MIN_SPREAD`] overall, or than [`VIGNETTE_MIN_POINT_SPREAD`] between the
+//! views of the same point), or that has fewer than [`VIGNETTE_MIN_OBSERVATIONS`] keeps
+//! `V = 1`. Each view is divided by `g_i · V_cam(θ)` before the blend.
 
 use crate::color::{srgb_value, View};
 use crate::MapError;
@@ -338,7 +339,8 @@ fn fit_channel(
     for _ in 0..VIGNETTE_ROUNDS {
         let (x, w) = fit_gains(seen, &corrected, pairs, smooth);
         for &cam in &observable {
-            vignetting.coeffs[cam][c] = fit_falloff(seen, &x, &w, cam, &vignetting.coeffs, c);
+            let fitted = fit_falloff(seen, &x, &w, cam, vignetting, c);
+            vignetting.coeffs[cam][c] = fitted;
         }
         for (k, l) in corrected.iter_mut().enumerate() {
             *l = seen.log[k] - vignetting.log_factor(seen.camera(k), c, f64::from(seen.theta[k]));
@@ -350,8 +352,9 @@ fn fit_channel(
 /// Whether the falloff of camera `cam` can be told apart from the gains and the albedo: at
 /// least [`VIGNETTE_MIN_OBSERVATIONS`] observations, the angles of its views spread over
 /// [`VIGNETTE_MIN_SPREAD`] and their deviations from the mean angle of the same point's views
-/// of this camera over [`VIGNETTE_MIN_POINT_SPREAD`] (5 % to 95 % quantile). Only the second shows the falloff: a camera
-/// that sees every point at the same angle in all its images (standing still) cannot.
+/// of this camera over [`VIGNETTE_MIN_POINT_SPREAD`] (5 % to 95 % quantile). Only the second
+/// shows the falloff: a camera that sees every point at the same angle in all its images
+/// (standing still) cannot.
 fn observable(seen: &Seen, cam: usize) -> bool {
     let views = (0..seen.image.len())
         .filter(|&k| seen.camera(k) == cam)
@@ -384,7 +387,7 @@ fn observable(seen: &Seen, cam: usize) -> bool {
 }
 
 /// New `[b1, b2]` of camera `cam` in channel `c` for the log gains `x` and weights `w`, the
-/// other cameras' falloff (`coeffs`) held: weighted least squares on
+/// other cameras' falloff (`vignetting`, clamped as it is applied) held: weighted least squares on
 /// `log c − log g_i − log a_j`, with `a_j` eliminated as in the gain fit. Together with them
 /// a constant log offset of the camera's images is fitted and dropped: the gains of (a) take
 /// up the camera's mean falloff, and without the offset (b) would only see the rest, so the
@@ -396,7 +399,7 @@ fn fit_falloff(
     x: &[f64],
     w: &[f64],
     cam: usize,
-    coeffs: &[[[f64; 2]; 3]],
+    vignetting: &Vignetting,
     c: usize,
 ) -> [f64; 2] {
     // Basis per view: offset, θ², θ⁴ of this camera (0 for the other cameras' views).
@@ -425,9 +428,7 @@ fn fit_falloff(
             let (p, model) = if seen.camera(k) == cam {
                 (basis(theta), 0.0)
             } else {
-                let [b1, b2] = coeffs[seen.camera(k)][c];
-                let b = basis(theta);
-                ([0.0; 3], b1 * b[1] + b2 * b[2])
+                ([0.0; 3], vignetting.log_factor(seen.camera(k), c, theta))
             };
             let e = seen.log[k] - x[seen.image[k] as usize] - model;
             mean_rest += w[k] * e;
@@ -460,7 +461,7 @@ fn fit_falloff(
     }
     let det = a[1][1] * a[2][2] - a[1][2] * a[2][1];
     if det.is_nan() || det <= 1e-12 * a[1][1] * a[2][2] {
-        return coeffs[cam][c];
+        return vignetting.coeffs[cam][c];
     }
     [
         (a[2][2] * r[1] - a[1][2] * r[2]) / det,

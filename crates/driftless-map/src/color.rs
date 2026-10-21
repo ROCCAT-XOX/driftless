@@ -31,10 +31,10 @@
 //!    `views_kept − 2` highlighted views. Dropping such views outright made neighbouring
 //!    points flip between view sets and raised the seams far more.
 //! 4. Blend: the weighted mean of the best [`ColorConfig::views_blended`] remaining views (by
-//!    down-weighted weight; the reference is always among them) in linear RGB, written as
-//!    sRGB. (A soft blend with weights `w_k − w_(b+1)`, continuous where the last blended and
-//!    the first unblended view swap places, made the seams worse: it gives the main view most
-//!    of the weight, since the kept weights lie close together.)
+//!    down-weighted weight; with `highlights`, the reference is always among them) in linear
+//!    RGB, written as sRGB. (A soft blend with weights `w_k − w_(b+1)`, continuous where the
+//!    last blended and the first unblended view swap places, made the seams worse: it gives
+//!    the main view most of the weight, since the kept weights lie close together.)
 //!
 //! Points no image sees get a gray from their intensity and `colored = false`.
 
@@ -265,7 +265,7 @@ pub struct ColorStats {
     pub vignette_residual_before: f64,
     pub vignette_residual_after: f64,
     /// Mean colour spread between the views of a point before and after the equalisation:
-    /// standard deviation of the blended views' colours per channel, in sRGB units (0–255),
+    /// standard deviation of the kept views' colours per channel, in sRGB units (0–255),
     /// averaged over the channels and over the points with at least 2 views.
     pub spread_before: f64,
     pub spread_after: f64,
@@ -679,7 +679,10 @@ fn view_weight(
 /// One kept view of a point; `weight == 0` marks an empty slot. 16 bytes: the colour and the
 /// angle are stored as `u16`. The colour covers linear 0 to [`RGB_RANGE`] (a view divided by
 /// an exposure gain of at least 1/4 can exceed 1) in steps of about 6e-5, the angle steps by
-/// below 0.003°.
+/// below 0.003°. A view divided by both a gain near 1/4 and an edge falloff factor below 1 can
+/// reach up to `max_gain²`; it is clamped to [`RGB_RANGE`] before blending. That needs a dark
+/// image and a strong falloff at once, which is rare, and widening the range to 16 would cost
+/// a quarter of the resolution of every view.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct View {
     pub(crate) weight: f32,
@@ -1648,6 +1651,7 @@ mod tests {
             ([2.0, -1.0, 0.3], std::f32::consts::PI),
             ([3.9, 1.5, 4.0], 0.5),
             ([9.0, 1.0, 0.0], 0.0),
+            ([5.0, 4.5, 16.0], 0.0),
         ] {
             let v = View::new(0.7, 5, rgb, theta);
             for (a, b) in v.linear().iter().zip(rgb) {
@@ -1656,6 +1660,8 @@ mod tests {
             assert!((v.theta() - theta).abs() < 1e-4, "{} vs {theta}", v.theta());
             assert_eq!((v.weight, v.rank), (0.7, 5));
         }
+        // Gain and falloff together can exceed the range: such a view is clamped to it.
+        assert_eq!(View::new(1.0, 0, [5.0; 3], 0.0).linear(), [RGB_RANGE; 3]);
         // Every sRGB level survives the packing.
         for c in 0..=255u8 {
             let v = View::new(1.0, 0, [lin[c as usize]; 3], 0.0);

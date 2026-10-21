@@ -3,8 +3,8 @@
 //! [`build_dense`] runs the (deterministic) odometry again over the same frames, so every
 //! deskewed sweep comes back in the body frame, and places it with the SLAM-corrected pose of
 //! that frame. One point is kept per voxel: the one seen from closest, since near points are
-//! the most accurate. [`clean`] removes ghosts (things that moved), points measured through windows and
-//! isolated outliers, and projects the kept points of walls onto their local plane;
+//! the most accurate. [`clean`] removes ghosts (things that moved), points measured through
+//! windows and isolated outliers, and projects the kept points of walls onto their local plane;
 //! [`colorize`] colours it from the camera images (visibility by depth buffer, image quality,
 //! exposure, white balance and edge falloff of the images, weighted blend of the best views);
 //! [`write_las`] and [`write_ply`] write the [`Cloud`]; [`save_stage`] and [`load_stage`] keep

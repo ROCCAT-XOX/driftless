@@ -2,7 +2,8 @@
 //! in three steps, each with its own files in the SLAM output folder:
 //!
 //! - **dense**: dense cloud from the corrected `traj.tum` → `dense.las`, `dense.bin`
-//! - **clean**: ghosts, points seen through windows and outliers removed → `clean.las`, `removed.las`, `clean.bin`
+//! - **clean**: ghosts, points seen through windows and outliers removed → `clean.las`,
+//!   `removed.las`, `clean.bin`
 //! - **color**: coloured from the camera images → `color.las`, `color.ply`
 //!
 //! plus `map.json` (settings, statistics and runtimes of the steps, peak memory, and under
@@ -43,6 +44,10 @@ const CLEAN_BIN: &str = "clean.bin";
 /// rebuilt instead of reused. 2: removal reasons in `removed.las`, points seen through
 /// windows. 3: kept points projected onto their local plane (thinner walls).
 const CLEAN_VERSION: u32 = 3;
+/// Part of the color step's input id, raised like [`CLEAN_VERSION`] whenever the colouring
+/// gives another result for the same settings. 2: image sharpness divided by the mean gray
+/// value, not its square.
+const COLOR_VERSION: u32 = 2;
 const REPORT: &str = "map.json";
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -797,7 +802,7 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
     let color_id = color
         .as_ref()
         .ok()
-        .map(|c| format!("{clean_id}{}color {color_cfg:?}\n", c.id));
+        .map(|c| format!("{clean_id}{}color v{COLOR_VERSION} {color_cfg:?}\n", c.id));
     let previous = fs::read_to_string(args.slam.join(REPORT))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())

@@ -449,14 +449,16 @@ fn map_no_smooth_keeps_dense_coordinates() {
     assert!(clean.len() > 1000);
     assert!(clean.iter().all(|p| dense.contains(&key(p))));
 
-    // The switches change the step ids: the smoothed result is not reused.
-    map(&dir, &out, &["--step", "clean"])
+    // The switches change the step ids: the unsmoothed result is not reused by a color run
+    // with the default settings (`--step color` reuses a fitting clean.bin).
+    let unsmoothed_id = json["steps"]["clean"]["input_id"].clone();
+    map(&dir, &out, &["--step", "color"])
         .success()
         .stdout(predicate::str::contains("Wanddicke"));
-    assert_eq!(
-        map_json(&out)["settings"]["clean"]["smooth"]["enabled"],
-        true
-    );
+    let json = map_json(&out);
+    assert_eq!(json["settings"]["clean"]["smooth"]["enabled"], true);
+    assert_eq!(json["steps"]["clean"]["reused"], false);
+    assert_ne!(json["steps"]["clean"]["input_id"], unsmoothed_id);
 }
 
 #[test]
