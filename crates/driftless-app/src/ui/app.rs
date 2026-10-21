@@ -1,6 +1,7 @@
 //! The program: carries out the panels' actions, owns the job runners, the dialogs, the
 //! loaded cloud, the run drawn over it and the 3D view.
 
+use super::compare::{compare_maps, compare_refs, default_refs, TrajRef};
 use super::correct::{Corrected, RunLoaded};
 use super::view3d::{point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
@@ -106,6 +107,10 @@ enum HelperTask {
     LoadRun(PathBuf),
     /// [`Action::AddLoop`] or [`Action::SetLoopEnabled`]: they read `submaps.bin`.
     Correct(Action),
+    /// Two trajectories compared (reads both, well below a second).
+    Compare(TrajRef, TrajRef),
+    /// Two `map.json` side by side.
+    CompareMaps(PathBuf, PathBuf),
 }
 
 pub struct DriftlessApp {
@@ -289,6 +294,7 @@ impl DriftlessApp {
             Ok(mut o) => {
                 o.set_origin(self.cloud.as_ref().map(|c| c.tree.origin));
                 self.overlay = Some(o);
+                self.compare_overlay();
             }
             Err(e) => {
                 self.overlay = None;
@@ -335,6 +341,76 @@ impl DriftlessApp {
         c.busy = true;
         c.message = None;
         self.helper_queue.push_back(HelperTask::Correct(action));
+    }
+
+    /// Follows the run drawn in the view: a new one of the project gets the preset comparison
+    /// ([`default_refs`]); maps of another scan are no longer chosen. A run not (yet) in the
+    /// project, e.g. that of a cloud loaded before, is looked for again on the next frame.
+    fn sync_compare(&mut self) {
+        let wanted = self.state.correct.run.clone();
+        if self.state.compare.run == wanted {
+            return;
+        }
+        let found = wanted.as_deref().and_then(|dir| self.state.run(dir));
+        let Some((scan, run)) = found else {
+            self.state.compare.run = None;
+            return;
+        };
+        let maps: Vec<PathBuf> = scan
+            .runs
+            .iter()
+            .flat_map(|r| &r.maps)
+            .map(|m| m.dir.clone())
+            .collect();
+        let preset = run.has_result.then(|| default_refs(run));
+        let c = &mut self.state.compare;
+        c.run = wanted;
+        if [&c.map_a, &c.map_b]
+            .iter()
+            .any(|m| m.as_ref().is_some_and(|m| !maps.contains(m)))
+        {
+            c.map_a = None;
+            c.map_b = None;
+            c.maps = None;
+        }
+        if let Some((a, b)) = preset {
+            self.start_compare(a, b);
+        }
+    }
+
+    /// Chooses A and B and queues their comparison; the orange line goes until it is ready.
+    fn start_compare(&mut self, a: TrajRef, b: TrajRef) {
+        let c = &mut self.state.compare;
+        c.a = Some(a.clone());
+        c.b = Some(b.clone());
+        c.result = None;
+        self.helper_queue
+            .retain(|t| !matches!(t, HelperTask::Compare(..)));
+        self.helper_queue.push_back(HelperTask::Compare(a, b));
+        self.compare_overlay();
+    }
+
+    fn start_compare_maps(&mut self, a: PathBuf, b: PathBuf) {
+        let c = &mut self.state.compare;
+        c.map_a = Some(a.clone());
+        c.map_b = Some(b.clone());
+        c.maps = None;
+        self.helper_queue
+            .retain(|t| !matches!(t, HelperTask::CompareMaps(..)));
+        self.helper_queue.push_back(HelperTask::CompareMaps(a, b));
+    }
+
+    /// Draws A of the comparison over the run in the view if B belongs to that run.
+    fn compare_overlay(&mut self) {
+        let Some(o) = &mut self.overlay else {
+            return;
+        };
+        let shown = self.state.compare.current().filter(|c| c.b.run() == o.run);
+        if shown.is_none() && o.compare.is_empty() {
+            return;
+        }
+        o.set_comparison(shown);
+        self.overlay_version += 1;
     }
 
     /// True while a cloud is loaded or waits to be.
@@ -580,6 +656,27 @@ impl DriftlessApp {
                     self.run_loaded(*loaded);
                 }
                 (Some(HelperTask::Correct(action)), result) => self.corrected(&action, result),
+                (Some(HelperTask::Compare(a, b)), result) => {
+                    let c = &mut self.state.compare;
+                    if c.a.as_ref() == Some(&a) && c.b.as_ref() == Some(&b) {
+                        c.result = Some(match result {
+                            Ok(JobOutput::Compare(done)) => Ok(*done),
+                            Ok(_) => Err(text::NOT_A_STEP.into()),
+                            Err(e) => Err(e.to_string()),
+                        });
+                        self.compare_overlay();
+                    }
+                }
+                (Some(HelperTask::CompareMaps(a, b)), result) => {
+                    let c = &mut self.state.compare;
+                    if c.map_a.as_ref() == Some(&a) && c.map_b.as_ref() == Some(&b) {
+                        c.maps = Some(match result {
+                            Ok(JobOutput::MapCompare(done)) => Ok(*done),
+                            Ok(_) => Err(text::NOT_A_STEP.into()),
+                            Err(e) => Err(e.to_string()),
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -622,6 +719,18 @@ impl DriftlessApp {
                     Ok(JobOutput::Corrected(Box::new(change_corrections(&action)?)))
                 })
             }
+            HelperTask::Compare(a, b) => {
+                let (a, b) = (a.clone(), b.clone());
+                self.helper.start(text::COMPARE_JOB, move |_| {
+                    Ok(JobOutput::Compare(Box::new(compare_refs(&a, &b)?)))
+                })
+            }
+            HelperTask::CompareMaps(a, b) => {
+                let (a, b) = (a.clone(), b.clone());
+                self.helper.start(text::MAPS_COMPARE_JOB, move |_| {
+                    Ok(JobOutput::MapCompare(Box::new(compare_maps(&a, &b)?)))
+                })
+            }
         };
         match started {
             Ok(()) => {
@@ -636,6 +745,8 @@ impl DriftlessApp {
                 HelperTask::Correct(action) => {
                     self.corrected(action, Err(StepError::Failed(e.to_string())))
                 }
+                HelperTask::Compare(..) => self.state.compare.result = Some(Err(e.to_string())),
+                HelperTask::CompareMaps(..) => self.state.compare.maps = Some(Err(e.to_string())),
                 _ => self.error(e.to_string()),
             },
         }
@@ -652,6 +763,7 @@ impl DriftlessApp {
         self.state.job = self.jobs.status();
         self.tick_loader();
         self.sync_run();
+        self.sync_compare();
         self.tick_helper();
     }
 
@@ -690,6 +802,10 @@ impl DriftlessApp {
                 self.state.selection = Selection::Run(done.run_dir.clone());
                 self.reload_run(&done.run_dir);
                 self.load_run_cloud(&done.run_dir);
+                // its trajectories changed: compare again, as preset (before/after)
+                if self.state.compare.run.as_ref() == Some(&done.run_dir) {
+                    self.state.compare.run = None;
+                }
             }
             (Some(JobOutput::Map(done)), _) => {
                 self.state.selection = Selection::Map(done.dir.clone());
@@ -801,6 +917,7 @@ impl DriftlessApp {
             step @ (Action::Inspect(_)
             | Action::RunSlam(_)
             | Action::Reuse(_)
+            | Action::RestoreHistory { .. }
             | Action::RunMap(_)) => {
                 if let Err(e) = actions::start_step(&mut self.state, &mut self.jobs, &step) {
                     self.error(e);
@@ -809,7 +926,8 @@ impl DriftlessApp {
             change @ (Action::AddLoop { .. } | Action::SetLoopEnabled { .. }) => {
                 self.change_corrections(change)
             }
-            Action::RestoreHistory { .. } => self.info(text::NOT_YET.to_string()),
+            Action::Compare { a, b } => self.start_compare(a, b),
+            Action::CompareMaps { a, b } => self.start_compare_maps(a, b),
         }
     }
 

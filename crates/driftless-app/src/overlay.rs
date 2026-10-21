@@ -1,7 +1,8 @@
 //! A SLAM run drawn over the cloud: the trajectory per submap in the colour of its quality,
 //! the odometry in a colour of its own, the loops between the submap anchors (accepted green,
 //! manual blue; the rejected candidates faint gray on a layer of their own), the anchors and
-//! the picked places as markers. Colours and the
+//! the picked places as markers, and the trajectory A of a comparison (orange, aligned to B).
+//! Colours and the
 //! assignment of poses to submaps are those of the debug viewer
 //! ([`driftless_steps::overlay`]).
 //!
@@ -11,6 +12,7 @@
 use crate::lod::PointVertex;
 use crate::pick::{pick_poses, relative_to};
 use crate::render::LineVertex;
+use crate::ui::compare::Comparison;
 use crate::ui::ViewSettings;
 use driftless_slam::SlamReport;
 use driftless_steps::overlay::{
@@ -18,7 +20,7 @@ use driftless_steps::overlay::{
 };
 use driftless_steps::StepError;
 use driftless_traj::Pose;
-use nalgebra::Matrix4;
+use nalgebra::{Matrix4, Point3};
 use std::path::{Path, PathBuf};
 
 /// Colour of a picked place (apart from white walls and the loop and quality colours), on a
@@ -34,6 +36,10 @@ pub const TRAJECTORY_WIDTH: f32 = 2.5;
 pub const ODOMETRY_WIDTH: f32 = 1.5;
 pub const LOOP_WIDTH: f32 = 1.5;
 pub const REJECTED_WIDTH: f32 = 1.0;
+pub const COMPARE_WIDTH: f32 = 2.0;
+/// Colour of the trajectory A of a comparison (apart from the quality colours and the
+/// odometry).
+pub const COMPARE_COLOR: [u8; 3] = [255, 140, 0];
 /// Opacity of a rejected candidate (of 255).
 pub const REJECTED_ALPHA: u8 = 64;
 
@@ -55,6 +61,10 @@ pub struct RunOverlay {
     /// The same for [`RunOverlay::odometry`].
     pub odometry_positions: Vec<[f32; 3]>,
     pub report: SlamReport,
+    /// The trajectory A of the comparison shown, aligned to B (empty without one).
+    pub compare: Vec<Pose>,
+    /// The same, relative to [`RunOverlay::origin`].
+    pub compare_positions: Vec<[f32; 3]>,
 }
 
 /// The first pose in whole metres: the origin without a cloud.
@@ -86,6 +96,8 @@ impl RunOverlay {
             positions: Vec::new(),
             odometry_positions: Vec::new(),
             report: track.report,
+            compare: Vec::new(),
+            compare_positions: Vec::new(),
         };
         overlay.set_origin(origin);
         Ok(overlay)
@@ -103,6 +115,27 @@ impl RunOverlay {
         };
         self.positions = rel(&self.poses);
         self.odometry_positions = rel(&self.odometry);
+        self.compare_positions = rel(&self.compare);
+    }
+
+    /// Draws the trajectory A of `comparison` moved onto B with its alignment (nothing with
+    /// `None`).
+    pub fn set_comparison(&mut self, comparison: Option<&Comparison>) {
+        self.compare = comparison.map_or_else(Vec::new, |c| {
+            c.a_poses
+                .iter()
+                .map(|p| Pose {
+                    t: p.t,
+                    p: (c.align * Point3::from(p.p)).coords,
+                    q: c.align.rotation * p.q,
+                })
+                .collect()
+        });
+        self.compare_positions = self
+            .compare
+            .iter()
+            .map(|p| relative_to(self.origin, [p.p.x, p.p.y, p.p.z]))
+            .collect();
     }
 
     /// Seconds since the start of the scan of pose `pose` (as `driftless correct` takes them).
@@ -171,9 +204,9 @@ impl RunOverlay {
 
     /// What the view draws of the run with the layers of `settings`: line segments (pairs of
     /// vertices) of the trajectory per submap in its quality colour, of the odometry, of the
-    /// accepted and manual loops and of the rejected candidates (faint); markers of the
-    /// submap anchors, then of the picked poses `picks` (large, on a dark ring, always shown,
-    /// unknown indices skipped).
+    /// trajectory A of the comparison, of the accepted and manual loops and of the rejected
+    /// candidates (faint); markers of the submap anchors, then of the picked poses `picks`
+    /// (large, on a dark ring, always shown, unknown indices skipped).
     pub fn lines(
         &self,
         settings: &ViewSettings,
@@ -205,6 +238,11 @@ impl RunOverlay {
         if settings.show_odometry {
             for w in self.odometry_positions.windows(2) {
                 segment(w[0], w[1], ODOMETRY_COLOR, 0xff, ODOMETRY_WIDTH);
+            }
+        }
+        if settings.show_compare {
+            for w in self.compare_positions.windows(2) {
+                segment(w[0], w[1], COMPARE_COLOR, 0xff, COMPARE_WIDTH);
             }
         }
         for l in &self.report.loops {

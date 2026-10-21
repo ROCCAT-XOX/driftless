@@ -92,7 +92,7 @@ pub struct ViewOverlay<'a> {
 #[derive(Debug, Clone, PartialEq)]
 struct OverlayKey {
     version: Option<u64>,
-    layers: [bool; 5],
+    layers: [bool; 6],
     places: [Option<usize>; 2],
     picked: Option<u32>,
 }
@@ -563,6 +563,7 @@ impl View3d {
                 settings.show_loops,
                 settings.show_rejected,
                 settings.show_submaps,
+                settings.show_compare,
             ],
             places: overlay.map_or([None; 2], |o| o.places),
             picked: self.picked,

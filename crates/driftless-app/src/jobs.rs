@@ -31,12 +31,13 @@ use std::time::Instant;
 
 use crate::cloud::LoadedCloud;
 use crate::project::{MapDone, MapStatus, SlamDone};
+use crate::ui::compare::{Comparison, MapComparison};
 use crate::ui::correct::{Corrected, RunLoaded};
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
 use driftless_steps::inspect;
 use driftless_steps::StepError;
 
-/// What a finished job hands back. Later tasks add variants (a comparison).
+/// What a finished job hands back.
 #[derive(Debug)]
 pub enum JobOutput {
     Inspect(Box<inspect::Report>),
@@ -52,6 +53,10 @@ pub enum JobOutput {
     Run(Box<RunLoaded>),
     /// `corrections.toml` after a change (helper runner).
     Corrected(Box<Corrected>),
+    /// Two trajectories compared (helper runner).
+    Compare(Box<Comparison>),
+    /// Two `map.json` side by side (helper runner).
+    MapCompare(Box<MapComparison>),
     /// Nothing to hand back; the job's effect is on disk.
     Done,
 }

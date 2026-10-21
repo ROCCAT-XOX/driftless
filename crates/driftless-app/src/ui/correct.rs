@@ -166,7 +166,11 @@ pub fn status(enabled: bool) -> &'static str {
 /// Why the corrections of `run` cannot be changed now: a step of this run is running (it
 /// read them at its start, and its state is recorded with those).
 pub fn locked(state: &AppState, run: &Path) -> Option<String> {
-    let of_run = matches!(&state.step, Some(Action::Reuse(d) | Action::RunMap(d)) if d == run);
+    let of_run = matches!(
+        &state.step,
+        Some(Action::Reuse(d) | Action::RunMap(d) | Action::RestoreHistory { run: d, .. })
+            if d == run
+    );
     state
         .job
         .as_ref()

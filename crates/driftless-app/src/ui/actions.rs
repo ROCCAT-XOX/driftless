@@ -6,13 +6,14 @@
 use super::{text, Action, AppState};
 use crate::jobs::{JobOutput, JobRunner};
 use crate::project::{run_map_job, run_slam_job, ScanState, SlamJob};
-use driftless_steps::inspect;
 use driftless_steps::map::MapStep;
+use driftless_steps::{history, inspect};
 
-/// Starts the job of a step action (`Inspect`, `RunSlam`, `Reuse`, `RunMap`) and records it
-/// in [`AppState::step`]. Refused with a German message while a job runs, for a scan that
-/// cannot be read, a run without `submaps.bin` (reuse), invalid map settings, or any other
-/// action.
+/// Starts the job of a step action (`Inspect`, `RunSlam`, `Reuse`, `RestoreHistory`,
+/// `RunMap`) and records it in [`AppState::step`]. Refused with a German message while a job
+/// runs, for a scan that cannot be read, a run without `submaps.bin` (reuse, restore), while
+/// a change of the corrections is being written (reuse, restore), for invalid map settings,
+/// or any other action.
 pub fn start_step(
     state: &mut AppState,
     runner: &mut JobRunner,
@@ -55,6 +56,28 @@ pub fn start_step(
             let writes = state.correct.writes_of(dir);
             state.correct.reuse_writes = Some((dir.clone(), writes));
             runner.start(text::STEP_REUSE, move |p| {
+                let done = run_slam_job(&project, &scan_id, &SlamJob::Reuse(run), p)?;
+                Ok(JobOutput::Slam(Box::new(done)))
+            })
+        }
+        Action::RestoreHistory { run: dir, nr } => {
+            let (scan_id, run) = state
+                .run(dir)
+                .map(|(s, r)| (s.id.clone(), r.clone()))
+                .ok_or_else(|| unknown_run(dir))?;
+            ready_scan(state, &scan_id)?;
+            if !run.has_cache {
+                return Err(text::NO_CACHE.into());
+            }
+            if let Some(why) = super::correct::writing(state) {
+                return Err(why);
+            }
+            let writes = state.correct.writes_of(dir);
+            state.correct.reuse_writes = Some((dir.clone(), writes));
+            let nr = *nr;
+            runner.start(text::STEP_RESTORE, move |p| {
+                // in the job: the recompute reads the switches just written
+                history::restore_flags(&run.dir, nr)?;
                 let done = run_slam_job(&project, &scan_id, &SlamJob::Reuse(run), p)?;
                 Ok(JobOutput::Slam(Box::new(done)))
             })

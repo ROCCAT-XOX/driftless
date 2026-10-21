@@ -7,12 +7,13 @@
 //! locked while a step runs and while the scan cannot be read; selecting and viewing stay
 //! possible.
 //!
-//! A run also shows its manual corrections ([`correct`]). Below them, always: how the 3D
-//! view draws („Ansicht“) and the point clicked in it.
+//! A run also shows its manual corrections ([`correct`]), a selected state of its history and
+//! the comparisons of trajectories and maps of its scan ([`compare`]). Below them, always:
+//! how the 3D view draws („Ansicht“) and the point clicked in it.
 
-use super::correct;
 use super::status::count;
 use super::view3d::{color_modes, effective_color_mode, PointInfo};
+use super::{compare, correct};
 use super::{text, Action, AppState, CloudSummary, ScanNode, Selection, ViewSettings};
 use crate::camera::CameraMode;
 use crate::project::{MapInfo, RunInfo, ScanState};
@@ -86,9 +87,29 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
                 Target::Scan(scan) => scan_steps(ui, state, scan, &mut action),
                 Target::Run { scan, run, map } => {
                     run_steps(ui, state, scan, run, map.as_ref(), &mut action);
+                    if matches!(state.selection, Selection::History { .. }) {
+                        ui.separator();
+                        section(ui, text::HISTORY, |ui| {
+                            if let Some(a) = compare::show_state(ui, state) {
+                                action = Some(a);
+                            }
+                        });
+                    }
                     ui.separator();
                     section(ui, text::CORRECTIONS, |ui| {
                         if let Some(a) = correct::show(ui, state) {
+                            action = Some(a);
+                        }
+                    });
+                    ui.separator();
+                    section(ui, text::COMPARE, |ui| {
+                        if let Some(a) = compare::show(ui, state) {
+                            action = Some(a);
+                        }
+                    });
+                    ui.separator();
+                    section(ui, text::MAPS_COMPARE, |ui| {
+                        if let Some(a) = compare::show_maps(ui, state) {
                             action = Some(a);
                         }
                     });
@@ -201,6 +222,7 @@ fn view_settings_edit(ui: &mut Ui, view: &mut ViewSettings, has_rgb: bool) {
         ui.checkbox(&mut view.show_loops, text::LAYER_LOOPS);
         ui.checkbox(&mut view.show_rejected, text::LAYER_REJECTED);
         ui.checkbox(&mut view.show_submaps, text::LAYER_SUBMAPS);
+        ui.checkbox(&mut view.show_compare, text::LAYER_COMPARE);
     });
 }
 

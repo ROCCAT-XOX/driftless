@@ -4,6 +4,7 @@
 
 pub mod actions;
 mod app;
+pub mod compare;
 pub mod correct;
 pub mod left;
 pub mod right;
@@ -82,9 +83,21 @@ pub enum Action {
         nr: usize,
         enabled: bool,
     },
+    /// Switch the corrections of the run back as in state `nr`, then recompute it (a new
+    /// state; the old ones stay).
     RestoreHistory {
         run: PathBuf,
         nr: u32,
+    },
+    /// Compare trajectory `a` (aligned to `b`) with `b`.
+    Compare {
+        a: compare::TrajRef,
+        b: compare::TrajRef,
+    },
+    /// Put the `map.json` of two map folders side by side.
+    CompareMaps {
+        a: PathBuf,
+        b: PathBuf,
     },
 }
 
@@ -112,6 +125,8 @@ pub struct ViewSettings {
     /// The rejected loop candidates (faint).
     pub show_rejected: bool,
     pub show_submaps: bool,
+    /// The trajectory A of the comparison (orange).
+    pub show_compare: bool,
     /// Height cut: lowest and highest z drawn (relative to the cloud's origin); `None`
     /// draws everything. Reset when another cloud is shown.
     pub cut: Option<[f32; 2]>,
@@ -130,6 +145,7 @@ impl Default for ViewSettings {
             show_loops: true,
             show_rejected: false,
             show_submaps: false,
+            show_compare: true,
             cut: None,
         }
     }
@@ -215,6 +231,8 @@ pub struct AppState {
     pub picked: Option<view3d::PointInfo>,
     /// The manual corrections of the run the view draws.
     pub correct: correct::CorrectState,
+    /// The comparison of two trajectories and of two maps.
+    pub compare: compare::CompareState,
 }
 
 impl AppState {

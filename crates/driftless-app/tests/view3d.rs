@@ -508,6 +508,8 @@ fn trajectory_alone_is_drawn_and_its_poses_clicked() {
         origin: [0.0; 3],
         positions: Vec::new(),
         odometry_positions: Vec::new(),
+        compare: Vec::new(),
+        compare_positions: Vec::new(),
         report: SlamReport {
             scan_start: 100.0,
             submaps: vec![SubmapReport {

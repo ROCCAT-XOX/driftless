@@ -1,4 +1,5 @@
-//! The left panel: the project tree, project → scans → runs („SLAM 001“ …) → maps → clouds.
+//! The left panel: the project tree, project → scans → runs („SLAM 001“ …) → maps → clouds,
+//! and per run its history („Verlauf“: each state with number, kind, time and start↔end gap).
 //! Names too long for the panel end in „…“; the full name and the folder show on hover.
 
 use super::{text, Action, AppState, ScanNode, Selection};
@@ -75,7 +76,7 @@ fn run_node(ui: &mut Ui, state: &AppState, run: &RunInfo, action: &mut Option<Ac
         let hover = format!("{}\n{}", run.label, run.dir.display());
         entry(ui, selected, run.label.clone(), &hover)
     };
-    let header = if run.cloud.is_none() && run.maps.is_empty() {
+    let header = if run.cloud.is_none() && run.maps.is_empty() && run.history.is_empty() {
         leaf(ui, header)
     } else {
         branch(ui, Id::new(("run", &run.dir)), header, |ui| {
@@ -85,11 +86,37 @@ fn run_node(ui: &mut Ui, state: &AppState, run: &RunInfo, action: &mut Option<Ac
             for map in &run.maps {
                 map_node(ui, state, map, action);
             }
+            if !run.history.is_empty() {
+                history_node(ui, state, run, action);
+            }
         })
     };
     if header.clicked() {
         *action = Some(Action::Select(Selection::Run(run.dir.clone())));
     }
+}
+
+/// „Verlauf“ with the states of the run, folded at first; the newest last.
+fn history_node(ui: &mut Ui, state: &AppState, run: &RunInfo, action: &mut Option<Action>) {
+    egui::CollapsingHeader::new(text::HISTORY)
+        .id_salt(("verlauf", &run.dir))
+        .default_open(false)
+        .show(ui, |ui| {
+            for e in &run.history {
+                let selection = Selection::History {
+                    run: run.dir.clone(),
+                    nr: e.nr,
+                };
+                let name = text::history_entry(e, run.history_gaps.get(&e.nr).copied());
+                let hover = format!("{name}\n{}", e.dir.display());
+                let r = leaf(ui, |ui| {
+                    entry(ui, state.selection == selection, name.clone(), &hover)
+                });
+                if r.clicked() {
+                    *action = Some(Action::Select(selection));
+                }
+            }
+        });
 }
 
 fn map_node(ui: &mut Ui, state: &AppState, map: &MapInfo, action: &mut Option<Action>) {

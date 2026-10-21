@@ -193,7 +193,6 @@ pub const DIALOG_ADD_RUN: &str = "SLAM-Ordner wählen (mit slam.json)";
 // Messages
 pub const SWITCH_AFTER_CANCEL: &str =
     "Der laufende Schritt wird abgebrochen; danach wird das andere Projekt geöffnet";
-pub const NOT_YET: &str = "Noch nicht verfügbar";
 pub const LAST_PROJECT_GONE: &str = "Zuletzt geöffnetes Projekt nicht lesbar";
 pub const CLOSE_AFTER_CANCEL: &str =
     "Der laufende Schritt wird abgebrochen; danach schließt das Fenster";
@@ -421,4 +420,90 @@ pub fn cloud_loaded(path: &std::path::Path, points: usize, load_s: f64, build_s:
         decimal(load_s, 1),
         decimal(build_s, 1)
     )
+}
+
+// Comparison and history
+pub const COMPARE: &str = "Vergleichen";
+pub const COMPARE_HINT: &str =
+    "Zwei Laufbahnen des Scans: A wird an B ausgerichtet und orange in der Ansicht gezeigt";
+pub const COMPARE_A: &str = "Laufbahn A";
+pub const COMPARE_B: &str = "Laufbahn B (Bezug)";
+pub const CHOOSE: &str = "wählen …";
+pub const COMPARING: &str = "Wird verglichen …";
+pub const COMPARE_JOB: &str = "Laufbahnen vergleichen";
+pub const COMPARE_ATE: &str = "Abweichung (ATE, RMSE)";
+pub const COMPARE_GAP: &str = "Start↔Ende A/B";
+pub const COMPARE_LENGTH: &str = "Länge A/B";
+pub const COMPARE_MATCHED: &str = "Zugeordnete Posen";
+pub const LAYER_COMPARE: &str = "Vergleich (A)";
+pub const COMPARE_WITH_CURRENT: &str = "Vergleichen mit aktuell";
+pub const RESTORE_STATE: &str = "Diesen Stand wiederherstellen";
+pub const RESTORE_HINT: &str = "Schaltet die Korrekturen wie in diesem Stand und rechnet den Lauf \
+                                neu; das ergibt einen neuen Stand, die alten bleiben";
+pub const STEP_RESTORE: &str = "Stand wiederherstellen";
+pub const HISTORY: &str = "Verlauf";
+pub const MAPS_COMPARE: &str = "Karten vergleichen";
+pub const MAP_A: &str = "Karte A";
+pub const MAP_B: &str = "Karte B";
+pub const MAPS_COMPARING: &str = "Karten werden gelesen …";
+pub const MAPS_COMPARE_JOB: &str = "Karten vergleichen";
+pub const MAPS_NEED_TWO: &str = "Der Scan hat noch keine zwei Karten";
+pub const MAP_COLUMNS: [&str; 3] = ["", "A", "B"];
+pub const MAP_ON: &str = "an";
+pub const MAP_OFF: &str = "aus";
+pub const MAP_POINTS_DENSE: &str = "Punkte dichte Wolke";
+pub const MAP_POINTS_KEPT: &str = "Punkte behalten";
+pub const MAP_REMOVED_GHOSTS: &str = "Entfernt: Geister";
+pub const MAP_REMOVED_OUTLIERS: &str = "Entfernt: Ausreißer";
+pub const MAP_REMOVED_THROUGH: &str = "Entfernt: Durchblick";
+pub const MAP_THICKNESS_BEFORE: &str = "Wanddicke vorher";
+pub const MAP_THICKNESS_AFTER: &str = "Wanddicke nachher";
+pub const MAP_POINTS_COLORED: &str = "Punkte eingefärbt";
+pub const MAP_CAMERA_BEFORE: &str = "Kamera-Unterschied vorher";
+pub const MAP_CAMERA_AFTER: &str = "Kamera-Unterschied nachher";
+pub const MAP_SEAM_BEFORE: &str = "Nahtsprung vorher";
+pub const MAP_SEAM_AFTER: &str = "Nahtsprung nachher";
+pub const MAP_SECONDS_DENSE: &str = "Laufzeit Dichte Wolke";
+pub const MAP_SECONDS_CLEAN: &str = "Laufzeit Bereinigen";
+pub const MAP_SECONDS_COLOR: &str = "Laufzeit Einfärben";
+pub const MAP_SECONDS_TOTAL: &str = "Laufzeit gesamt";
+/// A value that is missing (a step that did not run, an older `map.json`).
+pub const MISSING: &str = "–";
+
+/// „0,123 m“ – a value of the comparison, three decimals as `driftless compare`.
+pub fn compare_metres(x: f64) -> String {
+    format!("{} m", decimal(x, 3))
+}
+
+/// „Stand 003“.
+pub fn state_name(nr: u32) -> String {
+    format!("Stand {nr:03}")
+}
+
+/// The orange line is drawn only in the view of the run of B.
+pub fn compare_not_drawn(run: &str) -> String {
+    format!("Die orange Laufbahn A erscheint in der Ansicht von {run}")
+}
+
+/// „2026-10-21 14:03 UTC“ from an RFC 3339 time in UTC; other text unchanged.
+pub fn stamp(created: &str) -> String {
+    match (created.get(..10), created.get(11..16)) {
+        (Some(day), Some(time)) if created.ends_with('Z') => format!("{day} {time} UTC"),
+        _ => created.to_string(),
+    }
+}
+
+/// A state of the history in the tree: „Stand 003 · neu gerechnet · 2026-10-21 14:03 UTC ·
+/// Start↔Ende 0,123 m“ (without the gap if `slam.json` could not be read).
+pub fn history_entry(e: &driftless_steps::history::HistoryEntry, gap: Option<f64>) -> String {
+    let mut s = format!(
+        "{} · {} · {}",
+        state_name(e.nr),
+        e.kind.label(),
+        stamp(&e.created)
+    );
+    if let Some(g) = gap {
+        s.push_str(&format!(" · Start↔Ende {}", compare_metres(g)));
+    }
+    s
 }

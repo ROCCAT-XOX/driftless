@@ -16,9 +16,11 @@ fn run(dir: &str, label: &str, maps: Vec<MapInfo>) -> RunInfo {
         has_result: true,
         has_cache: true,
         has_previous: false,
+        has_odometry: true,
         cloud: None,
         maps,
         history: Vec::new(),
+        history_gaps: Default::default(),
     }
 }
 

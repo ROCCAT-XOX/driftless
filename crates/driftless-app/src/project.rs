@@ -49,6 +49,7 @@ use driftless_steps::slam::{
 };
 use driftless_steps::StepError;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -130,10 +131,15 @@ pub struct RunInfo {
     pub has_cache: bool,
     /// `traj.vorher.tum` exists.
     pub has_previous: bool,
+    /// `traj_odom.tum` exists.
+    pub has_odometry: bool,
     /// `map.las` of the run.
     pub cloud: Option<PathBuf>,
     pub maps: Vec<MapInfo>,
     pub history: Vec<HistoryEntry>,
+    /// Start↔end gap (m) of each state of [`RunInfo::history`], by number, from its
+    /// `slam.json` (missing where that cannot be read).
+    pub history_gaps: BTreeMap<u32, f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -432,6 +438,7 @@ fn run_info(dir: &Path, label: String) -> RunInfo {
         .and_then(|t| toml::from_str::<RunFile>(&t).ok())
         .map(|r| r.slam)
         .unwrap_or_default();
+    let history = history::list(dir);
     let mut maps = Vec::new();
     if file(REPORT) {
         maps.push(map_info(dir, "Karte (im Lauf-Ordner)".into()));
@@ -446,9 +453,42 @@ fn run_info(dir: &Path, label: String) -> RunInfo {
         has_result: file("slam.json") && file("traj.tum"),
         has_cache: file(CACHE_FILE),
         has_previous: file("traj.vorher.tum"),
+        has_odometry: file("traj_odom.tum"),
         cloud: file("map.las").then(|| dir.join("map.las")),
         maps,
-        history: history::list(dir),
+        history_gaps: history_gaps(&history),
+        history,
+    }
+}
+
+/// The start↔end gap after the optimisation of each state, from its `slam.json`.
+fn history_gaps(history: &[HistoryEntry]) -> BTreeMap<u32, f64> {
+    #[derive(Deserialize)]
+    struct Gap {
+        after: f64,
+    }
+    #[derive(Deserialize)]
+    struct Report {
+        start_end_gap: Gap,
+    }
+    history
+        .iter()
+        .filter_map(|e| {
+            let text = fs::read_to_string(e.dir.join("slam.json")).ok()?;
+            let r: Report = serde_json::from_str(&text).ok()?;
+            Some((e.nr, r.start_end_gap.after))
+        })
+        .collect()
+}
+
+/// The name of the run in folder `dir`: „SLAM 001“ for `slam-001`, else the folder name.
+pub fn run_label(dir: &Path) -> String {
+    let name = dir
+        .file_name()
+        .map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into());
+    match name.strip_prefix(RUN_PREFIX) {
+        Some(d) if !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) => format!("SLAM {d}"),
+        _ => name,
     }
 }
 

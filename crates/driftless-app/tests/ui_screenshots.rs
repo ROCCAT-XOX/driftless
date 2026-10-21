@@ -1,8 +1,9 @@
 //! Pictures of the whole window for looking at by eye (colours, levels of detail, layout):
 //! a synthetic cloud and, if `$DRIFTLESS_TESTDATA` has it, the colour cloud of the
-//! Büro-Scan, with its run drawn over it and two places picked for a loop (nothing is written
-//! into the test data: the project lives in `$DRIFTLESS_SHOTS`). Written as PNG into
-//! `$DRIFTLESS_SHOTS` (skipped without it); never commit them. Run with
+//! Büro-Scan, with its run drawn over it, two places picked for a loop, and the odometry
+//! compared with the corrected trajectory (nothing is written into the test data: the project
+//! lives in `$DRIFTLESS_SHOTS`). Written as PNG into `$DRIFTLESS_SHOTS` (skipped without it);
+//! never commit them. Run with
 //!
 //! ```text
 //! DRIFTLESS_SHOTS=/tmp/shots cargo test -p driftless-app --release \
@@ -12,8 +13,9 @@
 use driftless_app::camera::CameraMode;
 use driftless_app::project::{canonical, Project};
 use driftless_app::render::{headless_device, ColorMode};
-use driftless_app::ui::{Action, DriftlessApp, Selection};
+use driftless_app::ui::{text, Action, DriftlessApp, Selection};
 use eframe::egui;
+use egui_kittest::kittest::Queryable;
 use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
 use egui_kittest::Harness;
 use std::path::{Path, PathBuf};
@@ -195,4 +197,43 @@ fn ui_screenshots() {
     h.state_mut().pose_picked(0);
     h.state_mut().pose_picked(end);
     shot(&mut h, &dir, "buero_korrektur");
+
+    // before and after: the odometry (A, orange, aligned) over the corrected trajectory (B),
+    // with the numbers of the comparison; the sections above folded away
+    let app = h.state_mut();
+    app.state_mut().correct.picking = false;
+    app.state_mut().correct.clear_places();
+    let view = &mut app.state_mut().view;
+    view.show_submaps = false;
+    view.show_odometry = false;
+    view.show_loops = false;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while h.state().state().compare.current().is_none()
+        || h.state().overlay().is_none_or(|o| o.compare.is_empty())
+    {
+        h.step();
+        let c = &h.state().state().compare;
+        assert!(
+            Instant::now() < deadline,
+            "comparison not ready: {:?} {:?} {:?}",
+            c.a,
+            c.b,
+            c.result.as_ref().map(|r| r.as_ref().err())
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let c = h.state().state().compare.current().unwrap();
+    eprintln!(
+        "{} gegen {}:\n{}",
+        c.a.label(),
+        c.b.label(),
+        driftless_steps::compare::render_text(&c.report)
+    );
+    for section in [text::CORRECTIONS, text::VIEW_SETTINGS] {
+        h.get_by_label(section).click();
+        h.step();
+    }
+    let camera = h.state_mut().view_mut().camera_mut();
+    camera.pitch = -89f32.to_radians();
+    shot(&mut h, &dir, "buero_vorher_nachher");
 }
