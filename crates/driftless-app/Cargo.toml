@@ -1,0 +1,27 @@
+[package]
+name = "driftless-app"
+description = "Driftless: die Oberfläche (Projekte, Läufe, Karten, 3D-Ansicht)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+driftless-io = { path = "../driftless-io" }
+driftless-slam = { path = "../driftless-slam" }
+driftless-steps = { path = "../driftless-steps" }
+driftless-traj = { path = "../driftless-traj" }
+bytemuck = { version = "1", features = ["derive"] }
+las = "0.11"
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+rayon = "1.12.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+[dev-dependencies]
+driftless-io = { path = "../driftless-io", features = ["test-util"] }

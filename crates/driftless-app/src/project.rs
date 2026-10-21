@@ -1,0 +1,753 @@
+//! A Driftless project on disk:
+//!
+//! ```text
+//! <projekt>/project.toml
+//! <projekt>/scans/<scan-id>/slam-001/          a SLAM run, the same folder as `driftless slam -o`
+//!                          slam-001/lauf.toml  scan and settings of the run
+//!                          slam-001/verlauf/   states of the run (driftless_steps::history)
+//!                          slam-001/karte-001/ a map of the run, one folder per set of switches
+//! ```
+//!
+//! `project.toml`:
+//!
+//! ```toml
+//! format = 1
+//! name = "Büro"
+//!
+//! [[scan]]
+//! id = "buero"
+//! path = "rohdaten/buero"        # relative to the project folder if inside it, else absolute
+//! name = "Büro, Erdgeschoss"
+//! extra_runs = ["/pfad/zu/cli-lauf"]  # run folders made by the CLI, added by hand
+//! ```
+//!
+//! Relative paths are written with `/` and read with `/` or `\`, so a project works on macOS
+//! and Windows alike. `lauf.toml` holds `scan` (stored the same way), `erstellt` (UTC) and the
+//! [`SlamSettings`] under `[slam]`; `erstellt` is the only value that differs between two equal
+//! runs (like `erstellt`/`sekunden` in `stand.toml` and the runtimes in `map.json`).
+//!
+//! A scan folder that is gone (an unplugged drive) is reported by [`Project::scan_state`];
+//! the project still opens and its runs are still listed.
+//!
+//! Folders for results are only created by the jobs ([`run_slam_job`], [`run_map_job`]), never
+//! on the UI thread, and a job removes a folder it created when it is cancelled or fails. A
+//! full SLAM run always gets a new `slam-NNN` (so no earlier `traj.tum` is replaced), and a map
+//! is written only into a `karte-NNN` whose `map.json` fits the request, or into a new one.
+
+use driftless_io::atomic_write;
+use driftless_io::progress::Progress;
+use driftless_io::project::discover_project;
+use driftless_steps::correct::utc_now;
+use driftless_steps::history::{self, HistoryEntry};
+use driftless_steps::map::{
+    fitting_stages, folder_fits, run_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches,
+    CLEAN_BIN, DENSE_BIN, REPORT,
+};
+use driftless_steps::slam::{run_slam, SlamOutcome, SlamRequest, SlamSettings, CACHE_FILE};
+use driftless_steps::StepError;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+pub const PROJECT_FILE: &str = "project.toml";
+pub const RUN_FILE: &str = "lauf.toml";
+pub const SCANS_DIR: &str = "scans";
+const FORMAT: i64 = 1;
+const RUN_PREFIX: &str = "slam-";
+const MAP_PREFIX: &str = "karte-";
+/// The clouds of a map folder that can be shown, best first.
+const MAP_CLOUDS: [&str; 4] = ["color.las", "clean.las", "dense.las", "removed.las"];
+
+/// Why a project could not be read or changed (German, for display).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectError(pub String);
+
+impl fmt::Display for ProjectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProjectError {}
+
+impl From<String> for ProjectError {
+    fn from(s: String) -> Self {
+        ProjectError(s)
+    }
+}
+
+impl From<ProjectError> for StepError {
+    fn from(e: ProjectError) -> Self {
+        StepError::from(e.0)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Project {
+    /// The project folder (absolute).
+    pub dir: PathBuf,
+    pub name: String,
+    pub scans: Vec<ScanEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScanEntry {
+    /// Folder name under `scans/`, unique in the project.
+    pub id: String,
+    /// The scan folder (absolute).
+    pub path: PathBuf,
+    /// Shown name.
+    pub name: String,
+    /// Run folders made by the CLI and added by hand (absolute).
+    pub extra_runs: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScanState {
+    Ready,
+    /// Why the scan cannot be read (German).
+    Missing(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunInfo {
+    pub dir: PathBuf,
+    /// „SLAM 001“ for a run of the project, the folder name for an added one.
+    pub label: String,
+    /// From `lauf.toml`; the defaults without it.
+    pub settings: SlamSettings,
+    /// `slam.json` and `traj.tum` exist.
+    pub has_result: bool,
+    /// `submaps.bin` exists: the run can be recomputed.
+    pub has_cache: bool,
+    /// `traj.vorher.tum` exists.
+    pub has_previous: bool,
+    /// `map.las` of the run.
+    pub cloud: Option<PathBuf>,
+    pub maps: Vec<MapInfo>,
+    pub history: Vec<HistoryEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MapInfo {
+    pub dir: PathBuf,
+    /// „Karte 001“, or „Karte (im Lauf-Ordner)“ for a map the CLI wrote into the run folder.
+    pub label: String,
+    /// The switches recorded in `map.json`; `None` without a readable one.
+    pub settings: Option<MapSwitches>,
+    /// The existing ones of `color.las`, `clean.las`, `dense.las`, `removed.las`, in this order.
+    pub clouds: Vec<PathBuf>,
+}
+
+/// A folder a job writes into. One the job created ([`StepDir::is_new`]) is removed again
+/// when the guard is dropped without [`StepDir::keep`], i.e. when the job is cancelled or
+/// fails.
+#[must_use]
+#[derive(Debug)]
+pub struct StepDir {
+    path: PathBuf,
+    new: bool,
+}
+
+impl StepDir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Created for this job (else an existing folder that is never removed).
+    pub fn is_new(&self) -> bool {
+        self.new
+    }
+
+    /// Keeps the folder; returns its path.
+    pub fn keep(mut self) -> PathBuf {
+        self.new = false;
+        std::mem::take(&mut self.path)
+    }
+}
+
+impl Drop for StepDir {
+    fn drop(&mut self) {
+        if self.new {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProjectFile {
+    format: i64,
+    name: String,
+    #[serde(default, rename = "scan")]
+    scans: Vec<ScanFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ScanFile {
+    id: String,
+    path: String,
+    name: String,
+    #[serde(default)]
+    extra_runs: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RunFile {
+    scan: String,
+    erstellt: String,
+    #[serde(default)]
+    slam: SlamSettings,
+}
+
+/// The absolute, resolved form of an existing path (without the `\\?\` that Windows adds to
+/// a plain drive path).
+fn canonical(path: &Path) -> io::Result<PathBuf> {
+    let p = fs::canonicalize(path)?;
+    if cfg!(windows) {
+        if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            if rest.as_bytes().get(1) == Some(&b':') {
+                return Ok(PathBuf::from(rest));
+            }
+        }
+    }
+    Ok(p)
+}
+
+/// `path` as written to a project file: relative to `base` with `/` if inside it, else
+/// absolute.
+fn to_stored(base: &Path, path: &Path) -> Result<String, ProjectError> {
+    let text = match path.strip_prefix(base) {
+        Ok(rel) if !rel.as_os_str().is_empty() => rel
+            .components()
+            .map(|c| c.as_os_str().to_str())
+            .collect::<Option<Vec<_>>>()
+            .map(|parts| parts.join("/")),
+        _ => path.to_str().map(str::to_string),
+    };
+    text.ok_or_else(|| ProjectError(format!("Pfad {} ist kein gültiger Text", path.display())))
+}
+
+/// A path from a project file: absolute as written, relative (with `/` or `\`) to `base`.
+fn from_stored(base: &Path, text: &str) -> PathBuf {
+    let p = Path::new(text);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let mut out = base.to_path_buf();
+    for part in text
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != ".")
+    {
+        out.push(part);
+    }
+    out
+}
+
+/// Two paths name the same folder (resolved where they exist).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let resolve = |p: &Path| canonical(p).unwrap_or_else(|_| p.to_path_buf());
+    resolve(a) == resolve(b)
+}
+
+/// Subfolders `<prefix><digits>` of `dir` as (number, digits, path), by number.
+fn numbered(dir: &Path, prefix: &str) -> Vec<(u64, String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_string();
+            let digits = name.strip_prefix(prefix)?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some((digits.parse().ok()?, digits.to_string(), e.path()))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Creates the next free `<prefix>NNN` in `dir` after the numbers present.
+fn create_numbered(dir: &Path, prefix: &str) -> Result<StepDir, ProjectError> {
+    fs::create_dir_all(dir)
+        .map_err(|e| ProjectError(format!("{} nicht anlegbar: {e}", dir.display())))?;
+    let mut n = numbered(dir, prefix).last().map_or(0, |m| m.0) + 1;
+    loop {
+        let path = dir.join(format!("{prefix}{n:03}"));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(StepDir { path, new: true }),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => {
+                return Err(ProjectError(format!(
+                    "{} nicht anlegbar: {e}",
+                    path.display()
+                )))
+            }
+        }
+    }
+}
+
+fn map_info(dir: &Path, label: String) -> MapInfo {
+    let settings = fs::read_to_string(dir.join(REPORT))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .and_then(|v| MapSwitches::from_map_json(&v));
+    MapInfo {
+        dir: dir.to_path_buf(),
+        label,
+        settings,
+        clouds: MAP_CLOUDS
+            .iter()
+            .map(|f| dir.join(f))
+            .filter(|p| p.is_file())
+            .collect(),
+    }
+}
+
+fn run_info(dir: &Path, label: String) -> RunInfo {
+    let file = |name: &str| dir.join(name).is_file();
+    let settings = fs::read_to_string(dir.join(RUN_FILE))
+        .ok()
+        .and_then(|t| toml::from_str::<RunFile>(&t).ok())
+        .map(|r| r.slam)
+        .unwrap_or_default();
+    let mut maps = Vec::new();
+    if file(REPORT) {
+        maps.push(map_info(dir, "Karte (im Lauf-Ordner)".into()));
+    }
+    for (_, digits, path) in numbered(dir, MAP_PREFIX) {
+        maps.push(map_info(&path, format!("Karte {digits}")));
+    }
+    RunInfo {
+        dir: dir.to_path_buf(),
+        label,
+        settings,
+        has_result: file("slam.json") && file("traj.tum"),
+        has_cache: file(CACHE_FILE),
+        has_previous: file("traj.vorher.tum"),
+        cloud: file("map.las").then(|| dir.join("map.las")),
+        maps,
+        history: history::list(dir),
+    }
+}
+
+impl Project {
+    /// A new project in `dir` (created if missing; an existing folder must be empty apart
+    /// from hidden files). `project.toml` is written right away.
+    pub fn create(dir: &Path, name: &str) -> Result<Project, ProjectError> {
+        if dir.join(PROJECT_FILE).exists() {
+            return Err(ProjectError(format!(
+                "Projekt existiert schon: {}",
+                dir.join(PROJECT_FILE).display()
+            )));
+        }
+        if dir.exists() {
+            let entries = fs::read_dir(dir)
+                .map_err(|e| ProjectError(format!("{} nicht lesbar: {e}", dir.display())))?;
+            let busy = entries
+                .filter_map(Result::ok)
+                .any(|e| !e.file_name().to_string_lossy().starts_with('.'));
+            if busy {
+                return Err(ProjectError(format!(
+                    "Ordner {} ist nicht leer; ein neues Projekt braucht einen leeren Ordner",
+                    dir.display()
+                )));
+            }
+        }
+        fs::create_dir_all(dir)
+            .map_err(|e| ProjectError(format!("{} nicht anlegbar: {e}", dir.display())))?;
+        let project = Project {
+            dir: canonical(dir)
+                .map_err(|e| ProjectError(format!("{} nicht lesbar: {e}", dir.display())))?,
+            name: name.to_string(),
+            scans: Vec::new(),
+        };
+        project.save()?;
+        Ok(project)
+    }
+
+    /// Reads `dir/project.toml`.
+    pub fn open(dir: &Path) -> Result<Project, ProjectError> {
+        let file = dir.join(PROJECT_FILE);
+        let text = fs::read_to_string(&file).map_err(|e| {
+            ProjectError(if e.kind() == io::ErrorKind::NotFound {
+                format!("Kein Projekt: {} fehlt", file.display())
+            } else {
+                format!("{} nicht lesbar: {e}", file.display())
+            })
+        })?;
+        let bad = |e: &dyn fmt::Display| ProjectError(format!("{}: {e}", file.display()));
+        let table: toml::Table = toml::from_str(&text).map_err(|e| bad(&e))?;
+        match table.get("format").and_then(toml::Value::as_integer) {
+            Some(FORMAT) => {}
+            Some(n) => {
+                return Err(bad(&format!(
+                    "Projektformat {n} wird von diesem Programm nicht unterstützt"
+                )))
+            }
+            None => return Err(bad(&"`format` fehlt")),
+        }
+        let pf: ProjectFile = table.try_into().map_err(|e| bad(&e))?;
+        let dir = canonical(dir).map_err(|e| bad(&e))?;
+        let scans = pf
+            .scans
+            .into_iter()
+            .map(|s| ScanEntry {
+                path: from_stored(&dir, &s.path),
+                extra_runs: s.extra_runs.iter().map(|r| from_stored(&dir, r)).collect(),
+                id: s.id,
+                name: s.name,
+            })
+            .collect();
+        Ok(Project {
+            dir,
+            name: pf.name,
+            scans,
+        })
+    }
+
+    /// Writes `project.toml` (to a temporary file, then renamed).
+    pub fn save(&self) -> Result<(), ProjectError> {
+        let scans = self
+            .scans
+            .iter()
+            .map(|s| {
+                Ok(ScanFile {
+                    id: s.id.clone(),
+                    path: to_stored(&self.dir, &s.path)?,
+                    name: s.name.clone(),
+                    extra_runs: s
+                        .extra_runs
+                        .iter()
+                        .map(|r| to_stored(&self.dir, r))
+                        .collect::<Result<_, _>>()?,
+                })
+            })
+            .collect::<Result<_, ProjectError>>()?;
+        let pf = ProjectFile {
+            format: FORMAT,
+            name: self.name.clone(),
+            scans,
+        };
+        let file = self.dir.join(PROJECT_FILE);
+        let text =
+            toml::to_string(&pf).map_err(|e| ProjectError(format!("{}: {e}", file.display())))?;
+        atomic_write(&file, text.as_bytes())
+            .map_err(|e| ProjectError(format!("{} nicht schreibbar: {e}", file.display())))
+    }
+
+    pub fn scan(&self, id: &str) -> Option<&ScanEntry> {
+        self.scans.iter().find(|s| s.id == id)
+    }
+
+    fn unknown(id: &str) -> ProjectError {
+        ProjectError(format!("Scan {id} gehört nicht zum Projekt"))
+    }
+
+    /// Adds a scan folder (it must have LiDAR bags); returns its id: the folder name, with
+    /// `-2`, `-3`, … if taken. The same folder twice is refused. Call [`Project::save`]
+    /// afterwards.
+    pub fn add_scan(&mut self, scan_dir: &Path) -> Result<String, ProjectError> {
+        let path = canonical(scan_dir).map_err(|_| {
+            ProjectError(format!("Scan-Ordner {} nicht gefunden", scan_dir.display()))
+        })?;
+        discover_project(&path).map_err(|e| ProjectError(e.to_string()))?;
+        if let Some(s) = self.scans.iter().find(|s| same_dir(&s.path, &path)) {
+            return Err(ProjectError(format!(
+                "Scan {} ist schon im Projekt (als {})",
+                path.display(),
+                s.id
+            )));
+        }
+        let base = path
+            .file_name()
+            .map_or_else(|| "scan".to_string(), |n| n.to_string_lossy().into_owned());
+        let mut id = base.clone();
+        let mut n = 1;
+        while self.scan(&id).is_some() {
+            n += 1;
+            id = format!("{base}-{n}");
+        }
+        self.scans.push(ScanEntry {
+            id: id.clone(),
+            path,
+            name: base,
+            extra_runs: Vec::new(),
+        });
+        Ok(id)
+    }
+
+    /// Adds a run folder made by the CLI (`driftless slam -o`, with `slam.json`) to the scan
+    /// `scan_id`. Call [`Project::save`] afterwards.
+    pub fn add_run(&mut self, scan_id: &str, run_dir: &Path) -> Result<(), ProjectError> {
+        let known: Vec<PathBuf> = self.runs(scan_id).into_iter().map(|r| r.dir).collect();
+        let scan = self
+            .scans
+            .iter_mut()
+            .find(|s| s.id == scan_id)
+            .ok_or_else(|| Self::unknown(scan_id))?;
+        let path = canonical(run_dir).map_err(|_| {
+            ProjectError(format!("Lauf-Ordner {} nicht gefunden", run_dir.display()))
+        })?;
+        if !path.join("slam.json").is_file() {
+            return Err(ProjectError(format!(
+                "{} ist kein SLAM-Lauf: slam.json fehlt",
+                path.display()
+            )));
+        }
+        if known.iter().any(|k| same_dir(k, &path)) {
+            return Err(ProjectError(format!(
+                "Lauf {} ist schon im Projekt",
+                path.display()
+            )));
+        }
+        scan.extra_runs.push(path);
+        Ok(())
+    }
+
+    /// Whether the scan folder can be read.
+    pub fn scan_state(&self, scan_id: &str) -> ScanState {
+        let Some(scan) = self.scan(scan_id) else {
+            return ScanState::Missing(Self::unknown(scan_id).0);
+        };
+        if !scan.path.is_dir() {
+            return ScanState::Missing(format!(
+                "Scan-Ordner {} nicht gefunden",
+                scan.path.display()
+            ));
+        }
+        match discover_project(&scan.path) {
+            Ok(_) => ScanState::Ready,
+            Err(e) => ScanState::Missing(e.to_string()),
+        }
+    }
+
+    fn runs_dir(&self, scan_id: &str) -> PathBuf {
+        self.dir.join(SCANS_DIR).join(scan_id)
+    }
+
+    /// The runs of a scan: `scans/<id>/slam-NNN` by number, then the added ones in the order
+    /// they were added. Empty for an unknown scan.
+    pub fn runs(&self, scan_id: &str) -> Vec<RunInfo> {
+        let Some(scan) = self.scan(scan_id) else {
+            return Vec::new();
+        };
+        let own = numbered(&self.runs_dir(scan_id), RUN_PREFIX)
+            .into_iter()
+            .map(|(_, digits, path)| run_info(&path, format!("SLAM {digits}")));
+        let extra = scan.extra_runs.iter().map(|dir| {
+            let name = dir
+                .file_name()
+                .map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into());
+            run_info(dir, name)
+        });
+        own.chain(extra).collect()
+    }
+
+    /// Creates the next `scans/<id>/slam-NNN` with its `lauf.toml`. For a job: the folder goes
+    /// again when the guard is dropped without [`StepDir::keep`].
+    pub fn new_run_dir(
+        &self,
+        scan_id: &str,
+        settings: &SlamSettings,
+    ) -> Result<StepDir, ProjectError> {
+        let scan = self.scan(scan_id).ok_or_else(|| Self::unknown(scan_id))?;
+        let dir = create_numbered(&self.runs_dir(scan_id), RUN_PREFIX)?;
+        let run = RunFile {
+            scan: to_stored(&self.dir, &scan.path)?,
+            erstellt: utc_now(),
+            slam: settings.clone(),
+        };
+        let file = dir.path().join(RUN_FILE);
+        let text =
+            toml::to_string(&run).map_err(|e| ProjectError(format!("{}: {e}", file.display())))?;
+        atomic_write(&file, text.as_bytes())
+            .map_err(|e| ProjectError(format!("{} nicht schreibbar: {e}", file.display())))?;
+        Ok(dir)
+    }
+}
+
+/// Hard link, or a copy where the file system has none. A stage file is only ever replaced
+/// by a rename (`save_stage`), never written into, so a link never changes the other folder.
+fn link_or_copy(from: &Path, to: &Path) -> io::Result<()> {
+    fs::hard_link(from, to).or_else(|_| fs::copy(from, to).map(|_| ()))
+}
+
+/// The map folder for `input` in the run: the youngest `karte-NNN` that fits it
+/// ([`folder_fits`]), else a new `karte-NNN` after the last. Into a new folder the stages
+/// the step would take over (`dense.bin` for clean, `clean.bin` or else `dense.bin` for
+/// color) are linked from the youngest map folder (or the run folder) where they fit.
+/// The map in the run folder itself is never written into. For a job: reads `traj.tum`,
+/// may copy large files.
+pub fn map_dir_for(
+    run: &RunInfo,
+    input: &MapInput,
+    progress: &Progress,
+) -> Result<StepDir, StepError> {
+    let maps = numbered(&run.dir, MAP_PREFIX);
+    if let Some((_, _, dir)) = maps.iter().rev().find(|(_, _, d)| folder_fits(input, d)) {
+        return Ok(StepDir {
+            path: dir.clone(),
+            new: false,
+        });
+    }
+    let target = create_numbered(&run.dir, MAP_PREFIX)?;
+    let wanted: &[&str] = match input.map.step {
+        MapStep::Dense | MapStep::All => &[],
+        MapStep::Clean => &[DENSE_BIN],
+        MapStep::Color => &[CLEAN_BIN, DENSE_BIN],
+    };
+    if !wanted.is_empty() {
+        // youngest first; the run folder holds a map made by the CLI
+        let sources: Vec<(PathBuf, Vec<&str>)> = maps
+            .iter()
+            .rev()
+            .map(|m| m.2.clone())
+            .chain([run.dir.clone()])
+            .map(|d| {
+                let fits = fitting_stages(input, &d);
+                (d, fits)
+            })
+            .collect();
+        for file in wanted {
+            let Some((src, _)) = sources.iter().find(|(_, fits)| fits.contains(file)) else {
+                continue;
+            };
+            progress.phase("Zwischenstände übernehmen", None);
+            link_or_copy(&src.join(file), &target.path().join(file)).map_err(|e| {
+                format!(
+                    "{} nicht nach {} kopierbar: {e}",
+                    src.join(file).display(),
+                    target.path().display()
+                )
+            })?;
+            let from = src.file_name().unwrap_or_default().to_string_lossy();
+            progress.info(format!("{file} aus {from} übernommen"));
+            // with the cleaned cloud, the dense one is not needed
+            break;
+        }
+        if progress.is_cancelled() {
+            return Err(StepError::Cancelled);
+        }
+    }
+    Ok(target)
+}
+
+/// What a SLAM job computes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SlamJob {
+    /// A full run into a new `slam-NNN`.
+    Full(SlamSettings),
+    /// Recompute this run from its `submaps.bin` (with its settings), in its folder.
+    Reuse(RunInfo),
+}
+
+#[derive(Clone, Debug)]
+pub struct SlamDone {
+    pub run_dir: PathBuf,
+    pub outcome: SlamOutcome,
+}
+
+#[derive(Clone, Debug)]
+pub struct MapDone {
+    pub dir: PathBuf,
+    /// The `map.json` written.
+    pub report: serde_json::Value,
+}
+
+/// Runs SLAM for the scan `scan_id`, with history. A full run always gets a new folder, which
+/// is removed again if the run is cancelled or fails. A reuse of a run without states (e.g.
+/// one made by the CLI) first keeps its result as state „übernommen“ (`run_slam`).
+pub fn run_slam_job(
+    project: &Project,
+    scan_id: &str,
+    job: &SlamJob,
+    progress: &Progress,
+) -> Result<SlamDone, StepError> {
+    let scan = project
+        .scan(scan_id)
+        .ok_or_else(|| Project::unknown(scan_id))?
+        .path
+        .clone();
+    match job {
+        SlamJob::Full(settings) => {
+            let dir = project.new_run_dir(scan_id, settings)?;
+            let req = SlamRequest {
+                scan,
+                out: dir.path().to_path_buf(),
+                settings: settings.clone(),
+                reuse: false,
+                history: true,
+            };
+            let outcome = run_slam(&req, progress)?;
+            Ok(SlamDone {
+                run_dir: dir.keep(),
+                outcome,
+            })
+        }
+        SlamJob::Reuse(run) => {
+            let req = SlamRequest {
+                scan,
+                out: run.dir.clone(),
+                settings: run.settings.clone(),
+                reuse: true,
+                history: true,
+            };
+            let outcome = run_slam(&req, progress)?;
+            Ok(SlamDone {
+                run_dir: run.dir.clone(),
+                outcome,
+            })
+        }
+    }
+}
+
+/// Makes a map of `run` from the scan folder `scan` into the folder [`map_dir_for`] picks; a
+/// new folder is removed again if the map is cancelled or fails.
+pub fn run_map_job(
+    run: &RunInfo,
+    scan: &Path,
+    settings: &MapSettings,
+    progress: &Progress,
+) -> Result<MapDone, StepError> {
+    settings.check()?;
+    let input = MapInput {
+        scan: scan.to_path_buf(),
+        slam_dir: run.dir.clone(),
+        slam: run.settings.clone(),
+        map: settings.clone(),
+    };
+    let dir = map_dir_for(run, &input, progress)?;
+    let req = MapRequest {
+        input,
+        out_dir: dir.path().to_path_buf(),
+    };
+    let report = run_map(&req, progress)?;
+    Ok(MapDone {
+        dir: dir.keep(),
+        report,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Unix paths: `/p` is not absolute on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn stored_paths() {
+        let base = Path::new("/p");
+        assert_eq!(to_stored(base, Path::new("/p/a/b")).unwrap(), "a/b");
+        assert_eq!(to_stored(base, Path::new("/q/a")).unwrap(), "/q/a");
+        assert_eq!(from_stored(base, "a/b"), Path::new("/p/a/b"));
+        assert_eq!(from_stored(base, "a\\b"), Path::new("/p/a/b"));
+        assert_eq!(from_stored(base, "./a//b/"), Path::new("/p/a/b"));
+        assert_eq!(from_stored(base, "/q/a"), Path::new("/q/a"));
+    }
+}

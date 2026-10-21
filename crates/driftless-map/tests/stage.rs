@@ -1,6 +1,6 @@
 //! `dense.bin` / `clean.bin`: the cloud (and rays) between the steps of `driftless map`.
 
-use driftless_map::{load_stage, save_stage, Cloud, RaySource, StageError};
+use driftless_map::{load_stage, save_stage, stage_fits, Cloud, RaySource, StageError};
 use std::fs;
 use std::path::PathBuf;
 
@@ -77,6 +77,24 @@ fn stage_rejects_other_input_and_missing_file() {
         load_stage(&path, "id2"),
         Err(StageError::OtherInput)
     ));
+}
+
+#[test]
+fn stage_fits_reads_only_the_header() {
+    let dir = tmp("fits");
+    let path = dir.join("dense.bin");
+    assert!(!stage_fits(&path, "id"));
+    save_stage(&path, "id", &cloud(), Some(&rays())).unwrap();
+    assert!(stage_fits(&path, "id"));
+    assert!(!stage_fits(&path, "id2"));
+    // the body is not read: a cut-off stage with an intact header still fits
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, &bytes[..16]).unwrap();
+    assert!(stage_fits(&path, "id"));
+    fs::write(&path, &bytes[..15]).unwrap();
+    assert!(!stage_fits(&path, "id"));
+    fs::write(&path, b"nope").unwrap();
+    assert!(!stage_fits(&path, "id"));
 }
 
 #[test]

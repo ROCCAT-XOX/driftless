@@ -26,10 +26,10 @@ use driftless_io::camera::Camera;
 use driftless_io::progress::Progress;
 use driftless_io::project::{discover_project, Project};
 use driftless_map::{
-    build_dense, clean_with, colorize_with, content_hash, load_stage, save_stage, write_las,
-    write_ply, write_removed_las, CleanConfig, CleanStats, Cloud, ColorCamera, ColorConfig,
-    ColorStats, DenseConfig, DenseStats, ExposureConfig, ImageSource, RaySource, SmoothConfig,
-    StageError,
+    build_dense, clean_with, colorize_with, content_hash, load_stage, save_stage, stage_fits,
+    write_las, write_ply, write_removed_las, CleanConfig, CleanStats, Cloud, ColorCamera,
+    ColorConfig, ColorStats, DenseConfig, DenseStats, ExposureConfig, ImageSource, RaySource,
+    SmoothConfig, StageError,
 };
 use driftless_odom::OdomConfig;
 use driftless_traj::{read_tum, Pose};
@@ -42,8 +42,8 @@ use std::time::Instant;
 
 type BoxError = Box<dyn std::error::Error>;
 
-const DENSE_BIN: &str = "dense.bin";
-const CLEAN_BIN: &str = "clean.bin";
+pub const DENSE_BIN: &str = "dense.bin";
+pub const CLEAN_BIN: &str = "clean.bin";
 /// Part of the clean step's input id: raised whenever the cleaning gives another result
 /// (or other files) for the same settings, so an older `clean.bin` / `removed.las` is
 /// rebuilt instead of reused. 2: removal reasons in `removed.las`, points seen through
@@ -315,6 +315,11 @@ fn dense_id(
         content_hash(traj_bytes),
         traj_bytes.len(),
     ))
+}
+
+/// Input id of the clean step: the dense input and the clean settings.
+fn clean_id(dense_id: &str, clean_cfg: &CleanConfig) -> String {
+    format!("{dense_id}clean v{CLEAN_VERSION} {clean_cfg:?}\n")
 }
 
 /// Peak resident memory of this process so far (bytes), if the platform reports it.
@@ -917,6 +922,36 @@ pub fn folder_fits(input: &MapInput, dir: &Path) -> bool {
     fits().unwrap_or(false)
 }
 
+/// The stages in `dir` ([`DENSE_BIN`], [`CLEAN_BIN`], in this order) that a map of `input`
+/// would take over: written for the same LiDAR bags, odometry settings, trajectory and
+/// switches of their step. Reads only their headers.
+pub fn fitting_stages(input: &MapInput, dir: &Path) -> Vec<&'static str> {
+    let ids = || -> Option<(String, String)> {
+        let odom = input.slam.config().ok()?.odom;
+        let project = discover_project(&input.scan).ok()?;
+        let traj_bytes = fs::read(input.slam_dir.join("traj.tum")).ok()?;
+        let switches = &input.map.switches;
+        let dense = dense_id(
+            &project,
+            &input.slam,
+            &odom,
+            &traj_bytes,
+            &switches.dense_config(),
+        )
+        .ok()?;
+        let clean = clean_id(&dense, &switches.clean_config());
+        Some((dense, clean))
+    };
+    let Some((dense, clean)) = ids() else {
+        return Vec::new();
+    };
+    [(DENSE_BIN, dense), (CLEAN_BIN, clean)]
+        .into_iter()
+        .filter(|(file, id)| stage_fits(&dir.join(file), id))
+        .map(|(file, _)| file)
+        .collect()
+}
+
 /// Runs the map as `driftless map` does; every console line goes to `progress` in the same
 /// order. Returns the `map.json` written to [`MapRequest::out_dir`].
 ///
@@ -948,7 +983,7 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
     let clean_cfg = switches.clean_config();
     let color_cfg = switches.color_config();
     let dense_id = dense_id(&project, &input.slam, &odom, &traj_bytes, &dense_cfg)?;
-    let clean_id = format!("{dense_id}clean v{CLEAN_VERSION} {clean_cfg:?}\n");
+    let clean_id = clean_id(&dense_id, &clean_cfg);
     let color_id = color
         .as_ref()
         .ok()

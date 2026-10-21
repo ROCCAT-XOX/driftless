@@ -36,7 +36,7 @@ pub use exposure::{
 };
 pub use sharpness::sharpness;
 pub use smooth::{smooth_surfaces, SmoothConfig, SmoothStats};
-pub use stage::{content_hash, load_stage, save_stage, StageError};
+pub use stage::{content_hash, load_stage, save_stage, stage_fits, StageError};
 pub use through::find_through;
 
 #[derive(Debug, thiserror::Error)]

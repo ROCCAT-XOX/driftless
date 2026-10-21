@@ -2,7 +2,10 @@
 
 use driftless_io::progress::{Progress, ProgressSnapshot};
 use driftless_io::testscan::{room_bag, room_bag_secs, tmp};
-use driftless_steps::map::{folder_fits, run_map, MapInput, MapRequest, MapSettings, MapStep};
+use driftless_steps::map::{
+    fitting_stages, folder_fits, run_map, MapInput, MapRequest, MapSettings, MapStep, CLEAN_BIN,
+    DENSE_BIN,
+};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::{correct, StepError};
 use std::collections::BTreeMap;
@@ -166,6 +169,36 @@ fn folder_fits_detects_new_traj() {
         &input(&dir, &slam_dir, MapStep::All),
         &map_dir
     ));
+}
+
+#[test]
+fn fitting_stages_check_the_input() {
+    let dir = tmp("steps-map-stages");
+    room_bag(&dir, true);
+    let slam_dir = dir.join("slam");
+    slam(&dir, &slam_dir, false);
+    let map_dir = dir.join("karte");
+    let all = input(&dir, &slam_dir, MapStep::All);
+    assert!(fitting_stages(&all, &map_dir).is_empty());
+    run_map(
+        &request(&dir, &slam_dir, &map_dir, MapStep::All),
+        &Progress::new(),
+    )
+    .unwrap();
+    assert_eq!(fitting_stages(&all, &map_dir), [DENSE_BIN, CLEAN_BIN]);
+
+    // other cleaning: only the dense stage fits
+    let mut other = input(&dir, &slam_dir, MapStep::All);
+    other.map.switches.smooth = false;
+    assert_eq!(fitting_stages(&other, &map_dir), [DENSE_BIN]);
+    // other voxel size: neither
+    let mut other = input(&dir, &slam_dir, MapStep::All);
+    other.map.switches.voxel *= 2.0;
+    assert!(fitting_stages(&other, &map_dir).is_empty());
+    // colour switches do not matter for the stages
+    let mut other = input(&dir, &slam_dir, MapStep::All);
+    other.map.switches.downscale = 4;
+    assert_eq!(fitting_stages(&other, &map_dir), [DENSE_BIN, CLEAN_BIN]);
 }
 
 #[test]

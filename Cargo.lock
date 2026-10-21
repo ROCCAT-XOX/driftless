@@ -1063,6 +1063,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "driftless-app"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "driftless-io",
+ "driftless-slam",
+ "driftless-steps",
+ "driftless-traj",
+ "las",
+ "nalgebra",
+ "rayon",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "driftless-cli"
 version = "0.1.0"
 dependencies = [
