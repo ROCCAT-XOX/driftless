@@ -3,7 +3,7 @@
 
 use driftless_app::project::{map_dir_for, run_map_job, run_slam_job, Project, ScanState, SlamJob};
 use driftless_io::progress::{Progress, ProgressSnapshot};
-use driftless_io::testscan::{room_bag_secs, tmp};
+use driftless_io::testscan::{room_bag_at, room_bag_secs, tmp};
 use driftless_steps::correct;
 use driftless_steps::history::HistoryKind;
 use driftless_steps::map::{run_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches};
@@ -23,6 +23,26 @@ fn scan(dir: &Path, name: &str, secs: f64) -> PathBuf {
     fs::create_dir_all(&s).unwrap();
     room_bag_secs(&s, true, secs);
     s
+}
+
+/// A run folder with just a `slam.json` that starts with the scans of [`scan`].
+fn fake_run(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("slam.json"),
+        r#"{"scan_start": 1000.0, "submaps": []}"#,
+    )
+    .unwrap();
+}
+
+/// Writes `dir/project.toml` by hand with the scans `(id, path)` (TOML literal strings).
+fn hand_written(dir: &Path, scans: &[(&str, &str)]) {
+    fs::create_dir_all(dir).unwrap();
+    let mut text = "format = 1\nname = 'P'\n".to_string();
+    for (id, path) in scans {
+        text += &format!("\n[[scan]]\nid = '{id}'\npath = '{path}'\nname = 'S'\n");
+    }
+    fs::write(dir.join("project.toml"), text).unwrap();
 }
 
 /// A run as `driftless slam <scan> -o <out>` makes it (no history, no `lauf.toml`).
@@ -180,7 +200,7 @@ fn runs_are_numbered_and_sorted() {
     // a CLI folder outside the project
     let cli = dir.join("cli-lauf");
     fs::create_dir_all(&cli).unwrap();
-    fs::write(cli.join("slam.json"), "{}").unwrap();
+    fake_run(&cli);
     p.add_run(&id, &cli).unwrap();
 
     let labels: Vec<String> = p.runs(&id).into_iter().map(|r| r.label).collect();
@@ -522,7 +542,7 @@ fn relative_and_windows_style_paths() {
     let b = p.add_scan(&outside).unwrap();
     let cli = pdir.join("cli").join("lauf");
     fs::create_dir_all(&cli).unwrap();
-    fs::write(cli.join("slam.json"), "{}").unwrap();
+    fake_run(&cli);
     p.add_run(&a, &cli).unwrap();
     p.save().unwrap();
 
@@ -554,4 +574,137 @@ fn relative_and_windows_style_paths() {
         canon(&moved).join("rohdaten").join("innen")
     );
     assert_eq!(r.scan_state(&a), ScanState::Ready);
+}
+
+#[test]
+fn bad_scan_ids_are_refused() {
+    let dir = tmp("app-bad-ids");
+    let bad = [
+        "", ".", "..", "../x", "a/b", "a\\b", "/abs", "C:\\x", "c:", "a:b", "x/..",
+    ];
+    for (n, id) in bad.iter().enumerate() {
+        let pdir = dir.join(format!("p{n}"));
+        hand_written(&pdir, &[(id, "rohdaten")]);
+        let err = Project::open(&pdir).unwrap_err().to_string();
+        assert!(
+            err.contains("Scan-Kennung") && err.contains(&format!("„{id}“")),
+            "{id}: {err}"
+        );
+    }
+    hand_written(&dir.join("gut"), &[("scan-1", "rohdaten")]);
+    Project::open(&dir.join("gut")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn add_scan_refuses_a_folder_name_that_is_no_id() {
+    let dir = tmp("app-bad-folder-name");
+    let raw = scan(&dir, "a:b", 0.5);
+    let mut p = Project::create(&dir.join("p"), "P").unwrap();
+    let err = p.add_scan(&raw).unwrap_err().to_string();
+    assert!(
+        err.contains("Scan-Kennung") && err.contains("„a:b“"),
+        "{err}"
+    );
+    assert!(p.scans.is_empty());
+}
+
+#[test]
+fn runs_stay_inside_the_project() {
+    let dir = tmp("app-runs-guard");
+    let raw = scan(&dir, "scan", 0.5);
+    let mut p = Project::create(&dir.join("p"), "P").unwrap();
+    p.add_scan(&raw).unwrap();
+    // `scans/..` would be the project folder itself
+    fs::create_dir_all(dir.join("p/slam-001")).unwrap();
+    p.scans[0].id = "..".into();
+    assert!(p.runs("..").is_empty());
+    let err = p
+        .new_run_dir("..", &SlamSettings::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Scan-Kennung"), "{err}");
+    assert!(!dir.join("p/slam-002").exists());
+    assert!(!dir.join("slam-001").exists());
+    let err = p.save().unwrap_err().to_string();
+    assert!(err.contains("Scan-Kennung"), "{err}");
+}
+
+#[test]
+fn windows_absolute_path_is_not_joined_to_the_project() {
+    let dir = tmp("app-windows-abs");
+    let pdir = dir.join("p");
+    for path in ["C:\\Daten\\Scan", "\\\\server\\freigabe\\scan"] {
+        hand_written(&pdir, &[("scan", path)]);
+        let p = Project::open(&pdir).unwrap();
+        assert_eq!(p.scans[0].path, PathBuf::from(path));
+        assert!(!p.scans[0].path.starts_with(&p.dir), "{path}");
+        assert!(matches!(p.scan_state("scan"), ScanState::Missing(_)));
+    }
+}
+
+#[test]
+fn scan_ids_are_unique_ignoring_case() {
+    let dir = tmp("app-ids-case");
+    let a = scan(&dir.join("x"), "Buero", 0.5);
+    let b = scan(&dir.join("y"), "buero", 0.5);
+    let mut p = Project::create(&dir.join("p"), "P").unwrap();
+    assert_eq!(p.add_scan(&a).unwrap(), "Buero");
+    assert_eq!(p.add_scan(&b).unwrap(), "buero-2");
+
+    hand_written(&dir.join("q"), &[("Scan", "a"), ("scan", "b")]);
+    let err = Project::open(&dir.join("q")).unwrap_err().to_string();
+    assert!(err.contains("„scan“") && err.contains("mehrfach"), "{err}");
+}
+
+#[test]
+fn reuse_of_cli_run_with_other_settings_explains_why() {
+    let dir = tmp("app-cli-other-settings");
+    let raw = scan(&dir, "scan", 1.5);
+    let out = dir.join("cli");
+    let req = SlamRequest {
+        scan: raw.clone(),
+        out: out.clone(),
+        settings: SlamSettings {
+            lidar_topic: Some("/lidar".into()),
+            ..SlamSettings::default()
+        },
+        reuse: false,
+        history: false,
+    };
+    run_slam(&req, &Progress::new()).unwrap();
+    let before = files(&out);
+    let mut p = Project::create(&dir.join("p"), "P").unwrap();
+    let id = p.add_scan(&raw).unwrap();
+    p.add_run(&id, &out).unwrap();
+
+    let run = p.runs(&id).remove(0);
+    let err = run_slam_job(&p, &id, &SlamJob::Reuse(run), &Progress::new())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.starts_with("Lauf wurde mit anderen Einstellungen gerechnet"),
+        "{err}"
+    );
+    assert!(err.contains("--reuse"), "{err}");
+    assert_eq!(files(&out), before);
+    assert!(!out.join("verlauf").exists());
+}
+
+#[test]
+fn add_run_checks_the_scan() {
+    let dir = tmp("app-run-scan");
+    let a = scan(&dir, "a", 1.5);
+    let b = dir.join("b");
+    fs::create_dir_all(&b).unwrap();
+    room_bag_at(&b, true, 5000.0, 1.5);
+    let lauf = dir.join("lauf-a");
+    cli_slam(&a, &lauf, false);
+    let mut p = Project::create(&dir.join("p"), "P").unwrap();
+    let id_a = p.add_scan(&a).unwrap();
+    let id_b = p.add_scan(&b).unwrap();
+    let err = p.add_run(&id_b, &lauf).unwrap_err().to_string();
+    assert!(err.contains("gehört nicht zum Scan"), "{err}");
+    assert!(p.scans[1].extra_runs.is_empty());
+    p.add_run(&id_a, &lauf).unwrap();
 }

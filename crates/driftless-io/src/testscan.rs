@@ -61,13 +61,18 @@ pub fn room_bag(dir: &Path, imu: bool) {
 
 /// Static room scan for `secs` seconds: a LiDAR frame every 0.1 s, IMU at 200 Hz.
 pub fn room_bag_secs(dir: &Path, imu: bool, secs: f64) {
+    room_bag_at(dir, imu, 1000.0, secs);
+}
+
+/// [`room_bag_secs`] starting at bag time `start` (s).
+pub fn room_bag_at(dir: &Path, imu: bool, start: f64, secs: f64) {
     let mut w = BagWriter::new(Compression::None);
     let lc = w.add_connection("/lidar", "sensor_msgs/PointCloud2");
     let ic = w.add_connection("/imu", "sensor_msgs/Imu");
     let scan = room_scan();
     let n = (secs * 200.0).round() as usize;
     for i in 0..=n {
-        let s = 1000.0 + i as f64 * 0.005;
+        let s = start + i as f64 * 0.005;
         if imu {
             let m = ImuSample {
                 stamp: s,

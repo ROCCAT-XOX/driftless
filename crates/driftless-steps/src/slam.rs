@@ -15,8 +15,9 @@ use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_odom::OdomConfig;
 use driftless_slam::{
-    build_submaps, load_cache, match_manual_loops, save_cache, solve, Corrections, LoopVerdict,
-    ManualLoop, SlamConfig, SlamReport, SlamResult, Submap, POSITION_ONLY,
+    build_submaps, cache_fits as cache_header_fits, load_cache, match_manual_loops, save_cache,
+    solve, Corrections, LoopVerdict, ManualLoop, SlamConfig, SlamReport, SlamResult, Submap,
+    POSITION_ONLY,
 };
 use driftless_traj::write_tum;
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,18 @@ fn input_id(bags: &[PathBuf], settings: &SlamSettings, cfg: &SlamConfig) -> Resu
         settings.lidar_topic, settings.imu_topic
     );
     Ok(id)
+}
+
+/// Whether the `submaps.bin` in `req.out` was written for this scan and these settings (so a
+/// reuse can load it); reads only its header.
+pub fn cache_fits(req: &SlamRequest) -> bool {
+    let fits = || -> Option<bool> {
+        let cfg = req.settings.config().ok()?;
+        let project = discover_project(&req.scan).ok()?;
+        let input = input_id(&project.lidar_bags, &req.settings, &cfg).ok()?;
+        Some(cache_header_fits(&req.out.join(CACHE_FILE), &input))
+    };
+    fits().unwrap_or(false)
 }
 
 /// Runs SLAM as `driftless slam` does; every console line goes to `progress` in the same

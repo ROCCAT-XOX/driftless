@@ -223,6 +223,15 @@ fn message_count_from_index() {
 }
 
 #[test]
+fn time_range_from_index() {
+    let mut r = BagReader::new(Cursor::new(counted_bag(true))).unwrap();
+    assert_eq!(r.time_range(), Some((0.0, 9.0)));
+    assert_eq!(r.messages(&["/imu"]).count(), 3);
+    let mut r = BagReader::new(Cursor::new(counted_bag(false))).unwrap();
+    assert_eq!(r.time_range(), None);
+}
+
+#[test]
 fn message_count_unindexed_is_none() {
     let mut r = BagReader::new(Cursor::new(counted_bag(false))).unwrap();
     assert_eq!(r.message_count("/lidar"), None);

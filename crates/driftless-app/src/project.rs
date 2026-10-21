@@ -35,6 +35,7 @@
 //! is written only into a `karte-NNN` whose `map.json` fits the request, or into a new one.
 
 use driftless_io::atomic_write;
+use driftless_io::bag::BagReader;
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_steps::correct::utc_now;
@@ -43,13 +44,15 @@ use driftless_steps::map::{
     fitting_stages, folder_fits, run_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches,
     CLEAN_BIN, DENSE_BIN, REPORT,
 };
-use driftless_steps::slam::{run_slam, SlamOutcome, SlamRequest, SlamSettings, CACHE_FILE};
+use driftless_steps::slam::{
+    cache_fits, run_slam, SlamOutcome, SlamRequest, SlamSettings, CACHE_FILE,
+};
 use driftless_steps::StepError;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub const PROJECT_FILE: &str = "project.toml";
 pub const RUN_FILE: &str = "lauf.toml";
@@ -59,6 +62,9 @@ const RUN_PREFIX: &str = "slam-";
 const MAP_PREFIX: &str = "karte-";
 /// The clouds of a map folder that can be shown, best first.
 const MAP_CLOUDS: [&str; 4] = ["color.las", "clean.las", "dense.las", "removed.las"];
+/// How far (s) a run's frames may lie outside the bag times of its scan: frame stamps come
+/// from the sensor, bag times from the recorder.
+const RUN_TIME_TOLERANCE: f64 = 5.0;
 
 /// Why a project could not be read or changed (German, for display).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -229,10 +235,19 @@ fn to_stored(base: &Path, path: &Path) -> Result<String, ProjectError> {
     text.ok_or_else(|| ProjectError(format!("Pfad {} ist kein gültiger Text", path.display())))
 }
 
+/// Absolute on Windows: `C:\…`, `C:/…` or `\\server\…` (also read on another system, where
+/// such a path is just not found instead of being taken as relative).
+fn windows_absolute(text: &str) -> bool {
+    let b = text.as_bytes();
+    let drive =
+        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\');
+    drive || text.starts_with("\\\\") || text.starts_with("//")
+}
+
 /// A path from a project file: absolute as written, relative (with `/` or `\`) to `base`.
 fn from_stored(base: &Path, text: &str) -> PathBuf {
     let p = Path::new(text);
-    if p.is_absolute() {
+    if p.is_absolute() || windows_absolute(text) {
         return p.to_path_buf();
     }
     let mut out = base.to_path_buf();
@@ -243,6 +258,82 @@ fn from_stored(base: &Path, text: &str) -> PathBuf {
         out.push(part);
     }
     out
+}
+
+/// A scan id names exactly one folder in `scans/`: a single plain name, without `/`, `\`
+/// and `:`, not `.` or `..`.
+fn check_id(id: &str) -> Result<(), ProjectError> {
+    let mut parts = Path::new(id).components();
+    let single = matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(_)), None)
+    );
+    if single && !id.contains(['/', '\\', ':']) && id != "." && id != ".." {
+        Ok(())
+    } else {
+        Err(ProjectError(format!(
+            "ungültige Scan-Kennung „{id}“: erlaubt ist nur ein einfacher Ordnername \
+             (ohne /, \\ und :, nicht . oder ..)"
+        )))
+    }
+}
+
+/// Every id valid and unique, ignoring case (on macOS and Windows `Buero` and `buero` are
+/// the same folder).
+fn check_ids(scans: &[ScanEntry]) -> Result<(), ProjectError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for s in scans {
+        check_id(&s.id)?;
+        if !seen.insert(s.id.to_lowercase()) {
+            return Err(ProjectError(format!(
+                "Scan-Kennung „{}“ kommt mehrfach vor (Groß- und Kleinschreibung zählen nicht)",
+                s.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Checks that the run in `run` (its `slam.json`) was made from the scan folder `scan`: its
+/// frames lie within the times of the scan's LiDAR bags. Without an index in the bags the
+/// times are unknown and the run is taken.
+fn check_run_scan(run: &Path, scan: &Path) -> Result<(), ProjectError> {
+    let file = run.join("slam.json");
+    let report: serde_json::Value = fs::read_to_string(&file)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .ok_or_else(|| ProjectError(format!("{} nicht lesbar", file.display())))?;
+    let start = report["scan_start"]
+        .as_f64()
+        .ok_or_else(|| ProjectError(format!("{}: scan_start fehlt", file.display())))?;
+    let end = start
+        + report["submaps"]
+            .as_array()
+            .and_then(|m| m.last())
+            .and_then(|m| m["t_end"].as_f64())
+            .unwrap_or(0.0);
+    let project =
+        discover_project(scan).map_err(|e| ProjectError(format!("Lauf nicht prüfbar: {e}")))?;
+    let mut range: Option<(f64, f64)> = None;
+    for bag in &project.lidar_bags {
+        let Some((a, b)) = BagReader::open(bag).ok().and_then(|mut r| r.time_range()) else {
+            return Ok(());
+        };
+        range = Some(range.map_or((a, b), |(lo, hi)| (lo.min(a), hi.max(b))));
+    }
+    let Some((lo, hi)) = range else {
+        return Ok(());
+    };
+    if start >= lo - RUN_TIME_TOLERANCE && end <= hi + RUN_TIME_TOLERANCE {
+        Ok(())
+    } else {
+        Err(ProjectError(format!(
+            "Lauf {} gehört nicht zum Scan {}: er umfasst {start:.1}–{end:.1} s, der Scan \
+             {lo:.1}–{hi:.1} s",
+            run.display(),
+            scan.display()
+        )))
+    }
 }
 
 /// Two paths name the same folder (resolved where they exist).
@@ -403,7 +494,8 @@ impl Project {
                 id: s.id,
                 name: s.name,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        check_ids(&scans).map_err(|e| bad(&e))?;
         Ok(Project {
             dir,
             name: pf.name,
@@ -413,6 +505,7 @@ impl Project {
 
     /// Writes `project.toml` (to a temporary file, then renamed).
     pub fn save(&self) -> Result<(), ProjectError> {
+        check_ids(&self.scans)?;
         let scans = self
             .scans
             .iter()
@@ -450,7 +543,7 @@ impl Project {
     }
 
     /// Adds a scan folder (it must have LiDAR bags); returns its id: the folder name, with
-    /// `-2`, `-3`, … if taken. The same folder twice is refused. Call [`Project::save`]
+    /// `-2`, `-3`, … if taken (ignoring case). The same folder twice is refused. Call [`Project::save`]
     /// afterwards.
     pub fn add_scan(&mut self, scan_dir: &Path) -> Result<String, ProjectError> {
         let path = canonical(scan_dir).map_err(|_| {
@@ -467,9 +560,15 @@ impl Project {
         let base = path
             .file_name()
             .map_or_else(|| "scan".to_string(), |n| n.to_string_lossy().into_owned());
+        check_id(&base).map_err(|e| ProjectError(format!("{e}; Ordner umbenennen")))?;
         let mut id = base.clone();
         let mut n = 1;
-        while self.scan(&id).is_some() {
+        let taken = |id: &str| {
+            self.scans
+                .iter()
+                .any(|s| s.id.to_lowercase() == id.to_lowercase())
+        };
+        while taken(&id) {
             n += 1;
             id = format!("{base}-{n}");
         }
@@ -483,7 +582,8 @@ impl Project {
     }
 
     /// Adds a run folder made by the CLI (`driftless slam -o`, with `slam.json`) to the scan
-    /// `scan_id`. Call [`Project::save`] afterwards.
+    /// `scan_id`; its frames must lie within the times of the scan. Call [`Project::save`]
+    /// afterwards.
     pub fn add_run(&mut self, scan_id: &str, run_dir: &Path) -> Result<(), ProjectError> {
         let known: Vec<PathBuf> = self.runs(scan_id).into_iter().map(|r| r.dir).collect();
         let scan = self
@@ -506,6 +606,7 @@ impl Project {
                 path.display()
             )));
         }
+        check_run_scan(&path, &scan.path)?;
         scan.extra_runs.push(path);
         Ok(())
     }
@@ -527,17 +628,28 @@ impl Project {
         }
     }
 
-    fn runs_dir(&self, scan_id: &str) -> PathBuf {
-        self.dir.join(SCANS_DIR).join(scan_id)
+    /// `scans/<id>`, refused unless it is a folder directly in `scans/`.
+    fn runs_dir(&self, scan_id: &str) -> Result<PathBuf, ProjectError> {
+        check_id(scan_id)?;
+        let scans = self.dir.join(SCANS_DIR);
+        let dir = scans.join(scan_id);
+        if dir.parent() != Some(scans.as_path()) {
+            return Err(ProjectError(format!(
+                "ungültige Scan-Kennung „{scan_id}“: {} liegt nicht in {}",
+                dir.display(),
+                scans.display()
+            )));
+        }
+        Ok(dir)
     }
 
     /// The runs of a scan: `scans/<id>/slam-NNN` by number, then the added ones in the order
-    /// they were added. Empty for an unknown scan.
+    /// they were added. Empty for an unknown scan or an invalid id.
     pub fn runs(&self, scan_id: &str) -> Vec<RunInfo> {
-        let Some(scan) = self.scan(scan_id) else {
+        let (Some(scan), Ok(base)) = (self.scan(scan_id), self.runs_dir(scan_id)) else {
             return Vec::new();
         };
-        let own = numbered(&self.runs_dir(scan_id), RUN_PREFIX)
+        let own = numbered(&base, RUN_PREFIX)
             .into_iter()
             .map(|(_, digits, path)| run_info(&path, format!("SLAM {digits}")));
         let extra = scan.extra_runs.iter().map(|dir| {
@@ -557,7 +669,7 @@ impl Project {
         settings: &SlamSettings,
     ) -> Result<StepDir, ProjectError> {
         let scan = self.scan(scan_id).ok_or_else(|| Self::unknown(scan_id))?;
-        let dir = create_numbered(&self.runs_dir(scan_id), RUN_PREFIX)?;
+        let dir = create_numbered(&self.runs_dir(scan_id)?, RUN_PREFIX)?;
         let run = RunFile {
             scan: to_stored(&self.dir, &scan.path)?,
             erstellt: utc_now(),
@@ -581,7 +693,8 @@ fn link_or_copy(from: &Path, to: &Path) -> io::Result<()> {
 /// The map folder for `input` in the run: the youngest `karte-NNN` that fits it
 /// ([`folder_fits`]), else a new `karte-NNN` after the last. Into a new folder the stages
 /// the step would take over (`dense.bin` for clean, `clean.bin` or else `dense.bin` for
-/// color) are linked from the youngest map folder (or the run folder) where they fit.
+/// color) are linked from the youngest map folder (or else the run folder) that has one
+/// that fits.
 /// The map in the run folder itself is never written into. For a job: reads `traj.tum`,
 /// may copy large files.
 pub fn map_dir_for(
@@ -603,19 +716,17 @@ pub fn map_dir_for(
         MapStep::Color => &[CLEAN_BIN, DENSE_BIN],
     };
     if !wanted.is_empty() {
-        // youngest first; the run folder holds a map made by the CLI
-        let sources: Vec<(PathBuf, Vec<&str>)> = maps
+        // youngest first, up to the first that has a fitting stage; the run folder holds a
+        // map made by the CLI
+        let sources = maps
             .iter()
             .rev()
             .map(|m| m.2.clone())
-            .chain([run.dir.clone()])
-            .map(|d| {
-                let fits = fitting_stages(input, &d);
-                (d, fits)
-            })
-            .collect();
-        for file in wanted {
-            let Some((src, _)) = sources.iter().find(|(_, fits)| fits.contains(file)) else {
+            .chain([run.dir.clone()]);
+        for src in sources {
+            let fits = fitting_stages(input, &src);
+            // with the cleaned cloud, the dense one is not needed
+            let Some(file) = wanted.iter().find(|f| fits.contains(f)) else {
                 continue;
             };
             progress.phase("Zwischenstände übernehmen", None);
@@ -628,7 +739,6 @@ pub fn map_dir_for(
             })?;
             let from = src.file_name().unwrap_or_default().to_string_lossy();
             progress.info(format!("{file} aus {from} übernommen"));
-            // with the cleaned cloud, the dense one is not needed
             break;
         }
         if progress.is_cancelled() {
@@ -662,7 +772,9 @@ pub struct MapDone {
 
 /// Runs SLAM for the scan `scan_id`, with history. A full run always gets a new folder, which
 /// is removed again if the run is cancelled or fails. A reuse of a run without states (e.g.
-/// one made by the CLI) first keeps its result as state „übernommen“ (`run_slam`).
+/// one made by the CLI) first keeps its result as state „übernommen“ (`run_slam`); one
+/// without `lauf.toml` whose cache needs other than the default settings is refused with a
+/// message saying so.
 pub fn run_slam_job(
     project: &Project,
     scan_id: &str,
@@ -698,6 +810,18 @@ pub fn run_slam_job(
                 reuse: true,
                 history: true,
             };
+            // An added CLI run has no `lauf.toml`: its settings are only assumed.
+            let assumed = !run.dir.join(RUN_FILE).exists();
+            if assumed && run.dir.join(CACHE_FILE).is_file() && !cache_fits(&req) {
+                return Err(format!(
+                    "Lauf wurde mit anderen Einstellungen gerechnet als den Standardwerten (z. B. \
+                     --lidar-to-imu, --lidar-topic oder --imu-topic) und lässt sich hier nicht \
+                     neu rechnen; mit `driftless slam <scan> -o {} --reuse` und denselben Angaben \
+                     neu rechnen",
+                    run.dir.display()
+                )
+                .into());
+            }
             let outcome = run_slam(&req, progress)?;
             Ok(SlamDone {
                 run_dir: run.dir.clone(),

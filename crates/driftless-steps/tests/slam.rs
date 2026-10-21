@@ -2,7 +2,7 @@
 
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
 use driftless_io::testscan::{room_bag, room_bag_secs, tmp};
-use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
+use driftless_steps::slam::{cache_fits, run_slam, SlamRequest, SlamSettings};
 use driftless_steps::StepError;
 use std::collections::BTreeMap;
 use std::fs;
@@ -194,4 +194,18 @@ fn progress_counts_frames() {
         .expect("phase LiDAR lesen reported");
     assert_eq!(last.total, Some(15));
     assert_eq!(last.done, 15);
+}
+
+#[test]
+fn cache_fits_checks_scan_and_settings() {
+    let dir = tmp("steps-slam-cache-fits");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    let mut req = request(&dir, &out, false);
+    assert!(!cache_fits(&req));
+    run_slam(&req, &Progress::new()).unwrap();
+    req.reuse = true;
+    assert!(cache_fits(&req));
+    req.settings.lidar_topic = Some("/lidar".into());
+    assert!(!cache_fits(&req));
 }
