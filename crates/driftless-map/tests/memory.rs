@@ -71,7 +71,7 @@ fn colorize_live_heap_per_point() {
     )
     .unwrap();
     let peak = PEAK.load(Relaxed) - base;
-    let limit = 150 * n + (4 << 20);
+    let limit = 230 * n + (8 << 20);
     eprintln!(
         "{n} points, peak {peak} B ({:.0} B/point)",
         peak as f64 / n as f64

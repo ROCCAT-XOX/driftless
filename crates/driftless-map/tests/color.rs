@@ -308,6 +308,10 @@ fn colorize_rejects_bad_config_and_cameras() {
             rim_theta: 0.0,
             ..ColorConfig::default()
         },
+        ColorConfig {
+            view_gap: -1.0,
+            ..ColorConfig::default()
+        },
     ];
     for cfg in &bad {
         let r = colorize(&mut cloud, images.clone(), poses, cams, cfg);
@@ -389,8 +393,12 @@ fn rejects_view_dependent_highlights() {
         (floor_match(painted, &cloud), stats)
     };
     let ((n, on), stats) = run(&ColorConfig::default());
+    // Without the rule and with neighbouring images kept (as in Meilenstein 3): the spots
+    // show. (Views 1 s apart alone already avoid many of them here, since every second image
+    // has one; real reflections are not that kind.)
     let ((n_off, off), stats_off) = run(&ColorConfig {
         highlights: false,
+        view_gap: 0.0,
         ..ColorConfig::default()
     });
     println!("on: {n} floor points, {on:.3} good, {stats:?}");
@@ -407,7 +415,7 @@ fn rejects_view_dependent_highlights() {
         stats.floor_highlight_share_after < 0.5 * stats.floor_highlight_share_before,
         "{stats:?}"
     );
-    // Without the rule the share is the same as before: the soft blend alone keeps the spots.
+    // Without the rule the share stays as before: the blend alone keeps the spots.
     assert!(
         stats_off.floor_highlight_share_after > 0.5 * stats_off.floor_highlight_share_before,
         "{stats_off:?}"
@@ -490,8 +498,8 @@ fn seam_stats(name: &str, gain: f64) -> ColorStats {
 
 #[test]
 fn seam_jump_measures_exposure_seams() {
-    // The brief expected the soft blend to lower the jump here; it does not (see the Task 4
-    // report): the jump of differing main images grows as the main view gains weight.
+    // Exposure differences between the images show as jumps between neighbours with
+    // different main images; with equal exposure there are none.
     let flat = seam_stats("seam-flat", 1.0);
     let grouped = seam_stats("seam-grouped", 1.2);
     println!(

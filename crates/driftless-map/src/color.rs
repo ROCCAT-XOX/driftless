@@ -11,7 +11,9 @@
 //!    it sees (see [`crate::visibility`]) get a view with weight
 //!    `w = cos(incidence) / (1 + d²/4) · edge falloff(θ) · sharpness_norm` and the colour
 //!    there (bilinear, in linear RGB). Each point keeps its
-//!    [`ColorConfig::views_kept`] best views.
+//!    [`ColorConfig::views_kept`] best views, those of one camera at least
+//!    [`ColorConfig::view_gap`] apart in time: a lamp's reflection on the floor moves with the
+//!    camera, so neighbouring images all show it and the highlight rule below cannot see it.
 //!
 //! Then, per point:
 //!
@@ -24,10 +26,10 @@
 //!    [`ColorConfig::highlight_ratio`] and [`ColorConfig::highlight_abs`] is left out.
 //!    Highlights are additive and follow the camera over several images; the second darkest
 //!    view survives one too dark outlier and up to `views_kept − 2` highlighted views.
-//! 4. Soft blend: the best [`ColorConfig::views_blended`] remaining views, each weighted by
-//!    its weight minus the next remaining view's (all unchanged if that leaves nothing), in
-//!    linear RGB, written as sRGB. The colour then changes smoothly where two neighbouring
-//!    points' last blended and first unblended views swap places.
+//! 4. Blend: the weighted mean of the best [`ColorConfig::views_blended`] remaining views in
+//!    linear RGB, written as sRGB. (A soft blend with weights `w_k − w_(b+1)`, continuous where
+//!    the last blended and the first unblended view swap places, made the seams worse: it
+//!    gives the main view most of the weight, since the kept weights lie close together.)
 //!
 //! Points no image sees get a gray from their intensity and `colored = false`.
 
@@ -77,8 +79,10 @@ pub const FLOOR_NORMAL_Z: f32 = 0.9;
 pub const FLOOR_BELOW_TRAJECTORY: f64 = 0.8;
 /// Floor cells of the highlight metric (m, in x and y).
 pub const FLOOR_CELL: f64 = 0.5;
-/// A floor point counts as highlighted above this factor of its cell's median luminance.
+/// A floor point counts as highlighted above this factor of its cell's median luminance …
 pub const FLOOR_HIGHLIGHT: f64 = 1.3;
+/// … and this much above it (linear): on dark floors the image noise alone exceeds the factor.
+pub const FLOOR_HIGHLIGHT_ABS: f64 = 0.02;
 
 /// The camera images of a scan: every pass streams them again from the bags.
 #[derive(Debug, Clone, PartialEq)]
@@ -138,6 +142,9 @@ pub struct ColorConfig {
     /// Views blended into a point's colour: the best `views_blended` of the kept ones that
     /// remain after the rim and the highlights are left out.
     pub views_blended: usize,
+    /// Kept views of the same camera lie at least this far apart in capture time (s): a
+    /// reflection moves with the camera, so views from a short stretch of the walk all show it.
+    pub view_gap: f64,
     /// Reject highlights (see the module docs).
     pub highlights: bool,
     /// A view is a highlight if its luminance exceeds the reference by this share …
@@ -162,7 +169,8 @@ impl Default for ColorConfig {
             min_sharpness: 0.4,
             max_angular_rate: 1.0,
             views_kept: 6,
-            views_blended: 3,
+            views_blended: 6,
+            view_gap: 1.0,
             highlights: true,
             highlight_ratio: 0.3,
             highlight_abs: 0.02,
@@ -201,6 +209,9 @@ impl ColorConfig {
         }
         if self.views_blended == 0 || self.views_blended > self.views_kept {
             return bad("gemischte Ansichten müssen zwischen 1 und den behaltenen liegen");
+        }
+        if !(self.view_gap.is_finite() && self.view_gap >= 0.0) {
+            return bad("Zeitabstand der Ansichten darf nicht negativ sein");
         }
         if !(self.highlight_ratio.is_finite() && self.highlight_ratio >= 0.0) {
             return bad("Glanzlicht-Verhältnis darf nicht negativ sein");
@@ -275,7 +286,8 @@ pub struct ColorStats {
     pub views_rim_excluded: usize,
     /// Share of the floor points (normal `|n_z|` > [`FLOOR_NORMAL_Z`], lower than the
     /// trajectory's median height minus [`FLOOR_BELOW_TRAJECTORY`], coloured) whose linear
-    /// luminance exceeds [`FLOOR_HIGHLIGHT`] × the median of their [`FLOOR_CELL`] cell.
+    /// luminance exceeds [`FLOOR_HIGHLIGHT`] × the median of their [`FLOOR_CELL`] cell and that
+    /// median by [`FLOOR_HIGHLIGHT_ABS`].
     /// Before: the best [`ColorConfig::views_blended`] views blended with their weights,
     /// nothing left out (as in Meilenstein 3); after: the final colour. Same views.
     pub floor_highlight_share_before: f64,
@@ -722,6 +734,32 @@ fn keep_best(slots: &mut [View], v: View) {
     }
 }
 
+/// Inserts `v` like [`keep_best`], but keeps the views of one camera at least `gap` seconds
+/// apart: kept views of the same camera within `gap` of `v` compete with it, and `v` is only
+/// kept if it is better than all of them (which then make room). `images[rank]` is the
+/// capture time and camera of each image. With `gap = 0` the same as [`keep_best`].
+fn keep_best_apart(slots: &mut [View], v: View, images: &[(f64, usize)], gap: f64) {
+    let (t, cam) = images[v.rank as usize];
+    let close = |s: &View| {
+        s.weight > 0.0 && {
+            let (ts, cs) = images[s.rank as usize];
+            cs == cam && (ts - t).abs() < gap
+        }
+    };
+    if slots.iter().any(|s| close(s) && !v.better_than(s)) {
+        return;
+    }
+    let mut n = 0;
+    for j in 0..slots.len() {
+        if !close(&slots[j]) {
+            slots[n] = slots[j];
+            n += 1;
+        }
+    }
+    slots[n..].fill(EMPTY);
+    keep_best(slots, v);
+}
+
 /// Linear luminance (Rec. 709).
 fn luminance(c: [f32; 3]) -> f64 {
     0.2126 * f64::from(c[0]) + 0.7152 * f64::from(c[1]) + 0.0722 * f64::from(c[2])
@@ -778,7 +816,7 @@ fn hard_mix(slots: &[View], blended: usize) -> Mix {
 }
 
 /// The colour of a point from its views (sorted best first, exposure applied): rim views
-/// and highlights left out, soft blend (see the module docs).
+/// and highlights left out, blend of the best remaining (see the module docs).
 fn mix(slots: &[View], cfg: &ColorConfig) -> Mix {
     let valid = |v: &View| v.weight > 0.0;
     let inside = |v: &View| valid(v) && f64::from(v.theta()) <= cfg.rim_theta;
@@ -813,12 +851,12 @@ fn mix(slots: &[View], cfg: &ColorConfig) -> Mix {
     };
     let rejected = slots.iter().filter(|v| candidate(v) && bright(v)).count();
     let kept = || slots.iter().filter(|v| candidate(v) && !bright(v));
-    let b = cfg.views_blended;
-    let next = kept().nth(b).map_or(0.0, |v| f64::from(v.weight));
-    let soft = kept().take(b).any(|v| f64::from(v.weight) > next);
-    let weight = |v: &View| f64::from(v.weight) - if soft { next } else { 0.0 };
     Mix {
-        linear: weighted_mean(kept().take(b).map(|v| (weight(v), v.linear()))),
+        linear: weighted_mean(
+            kept()
+                .take(cfg.views_blended)
+                .map(|v| (f64::from(v.weight), v.linear())),
+        ),
         main: kept().next().map_or(u32::MAX, |v| v.rank),
         rejected,
         rim,
@@ -842,7 +880,10 @@ fn highlight_share(entries: &mut [([i64; 2], f32)]) -> f64 {
         };
         bright += cell
             .iter()
-            .filter(|e| f64::from(e.1) > FLOOR_HIGHLIGHT * median)
+            .filter(|e| {
+                let y = f64::from(e.1);
+                y > FLOOR_HIGHLIGHT * median && y - median > FLOOR_HIGHLIGHT_ABS
+            })
             .count();
     }
     bright as f64 / entries.len() as f64
@@ -986,6 +1027,13 @@ pub fn colorize(
     let last_used = records
         .iter()
         .rposition(|r| matches!(r.status, Status::Used { .. }));
+    // Capture time and camera of every used image, by rank.
+    let mut by_rank = vec![(0.0, 0usize); stats.images_used];
+    for r in &records {
+        if let Status::Used { rank, .. } = r.status {
+            by_rank[rank as usize] = (r.stamp, r.camera);
+        }
+    }
     // Allocated after `local_geometry`, whose k-d tree is the memory peak of the setup.
     let mut slots = Vec::new();
     // Per point: whether its normal is nearly vertical (floor or ceiling).
@@ -1070,7 +1118,7 @@ pub fn colorize(
                 .collect();
             for (p, v) in views {
                 let p = p as usize;
-                keep_best(&mut slots[p * k..(p + 1) * k], v);
+                keep_best_apart(&mut slots[p * k..(p + 1) * k], v, &by_rank, cfg.view_gap);
             }
             i < last_used
         })
@@ -1243,7 +1291,7 @@ mod tests {
         assert_eq!(blend(&[EMPTY; 2], 2), None);
         // Only the best `blended` views count.
         assert_eq!(blend(&[view(255), view(0), EMPTY], 1), Some([255; 3]));
-        // Equal weights: the soft blend keeps them.
+        // The same without highlights and rim views.
         let cfg = ColorConfig {
             highlights: false,
             ..ColorConfig::default()
@@ -1316,33 +1364,45 @@ mod tests {
     }
 
     #[test]
-    fn soft_blend_is_continuous() {
-        let cfg = ColorConfig::default();
-        let eps = 1e-4;
-        // The 3rd and 4th view swap places between two neighbouring points.
-        let a = [
-            gray(1.0, 0, 0.3, 0.0),
-            gray(0.9, 1, 0.3, 0.0),
-            View::new(0.5, 2, [0.6, 0.3, 0.3], 0.0),
-            View::new(0.5 - eps, 3, [0.3, 0.3, 0.6], 0.0),
-            EMPTY,
-            EMPTY,
-        ];
-        let mut b = a;
-        b.swap(2, 3);
-        b[2].weight = 0.5;
-        b[3].weight = 0.5 - eps;
-        let (ma, mb) = (mix(&a, &cfg), mix(&b, &cfg));
-        let (ca, cb) = (ma.linear.unwrap(), mb.linear.unwrap());
-        for c in 0..3 {
-            assert!((ca[c] - cb[c]).abs() < 1.0 / 255.0, "{ca:?} vs {cb:?}");
+    fn kept_views_of_a_camera_lie_apart() {
+        // Images every 0.3 s, alternating cameras 0 and 1 by rank parity at the same times.
+        let images: Vec<(f64, usize)> = (0..20).map(|r| (0.3 * (r / 2) as f64, r % 2)).collect();
+        let weight = |r: u32| 1.0 - 0.01 * (f64::from(r) - 9.5).abs() as f32;
+        let views: Vec<View> = (0..20u32)
+            .map(|r| View::new(weight(r), r, [0.1; 3], 0.0))
+            .collect();
+        let run = |gap: f64, order: &mut dyn Iterator<Item = &View>| {
+            let mut slots = [EMPTY; 6];
+            for v in order {
+                keep_best_apart(&mut slots, *v, &images, gap);
+            }
+            slots
+        };
+        // Without a gap: the same as `keep_best`.
+        let mut plain = [EMPTY; 6];
+        for v in &views {
+            keep_best(&mut plain, *v);
         }
-        // The hard cut jumps.
-        let (ha, hb) = (
-            hard_mix(&a, 3).linear.unwrap(),
-            hard_mix(&b, 3).linear.unwrap(),
+        assert_eq!(run(0.0, &mut views.iter()), plain);
+        let apart = run(1.0, &mut views.iter());
+        // 2.7 s per camera hold at most 3 views 1 s apart; the greedy choice keeps 2 each.
+        assert_eq!(
+            apart.iter().filter(|v| v.weight > 0.0).count(),
+            4,
+            "{apart:?}"
         );
-        assert!((ha[0] - hb[0]).abs() > 0.05, "{ha:?} vs {hb:?}");
+        let kept: Vec<&View> = apart.iter().filter(|v| v.weight > 0.0).collect();
+        for a in &kept {
+            for b in &kept {
+                let ((ta, ca), (tb, cb)) = (images[a.rank as usize], images[b.rank as usize]);
+                assert!(
+                    a.rank == b.rank || ca != cb || (ta - tb).abs() >= 1.0,
+                    "{apart:?}"
+                );
+            }
+        }
+        // Still sorted best first.
+        assert!(apart.windows(2).all(|w| !w[1].better_than(&w[0])));
     }
 
     #[test]
