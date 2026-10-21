@@ -324,7 +324,7 @@ fn clean_id(dense_id: &str, clean_cfg: &CleanConfig) -> String {
 
 /// Peak resident memory of this process so far (bytes), if the platform reports it.
 #[cfg(unix)]
-fn peak_rss_bytes() -> Option<u64> {
+pub fn peak_rss_bytes() -> Option<u64> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: getrusage fills the struct for RUSAGE_SELF; an all-zero rusage is valid.
     let usage = unsafe {
@@ -343,7 +343,7 @@ fn peak_rss_bytes() -> Option<u64> {
 }
 
 #[cfg(windows)]
-fn peak_rss_bytes() -> Option<u64> {
+pub fn peak_rss_bytes() -> Option<u64> {
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
@@ -359,7 +359,7 @@ fn peak_rss_bytes() -> Option<u64> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn peak_rss_bytes() -> Option<u64> {
+pub fn peak_rss_bytes() -> Option<u64> {
     None
 }
 

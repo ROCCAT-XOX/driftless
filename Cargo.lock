@@ -1066,8 +1066,13 @@ dependencies = [
 name = "driftless-app"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "driftless-io",
+ "driftless-map",
+ "driftless-slam",
  "driftless-steps",
+ "las",
+ "rayon",
  "serde",
  "serde_json",
  "toml",
