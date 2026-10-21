@@ -1,6 +1,6 @@
 //! The GPU side of the 3D view: the point cloud as instanced quads, one vertex buffer per
-//! block of the octree, plus lines and markers on top, drawn into an offscreen texture that
-//! the interface shows as an image.
+//! block of the octree, plus lines (screen-space quads of a width in points) and markers on
+//! top, drawn into an offscreen texture that the interface shows as an image.
 //!
 //! Depth is reverse-Z (see [`crate::camera`]): cleared to 0, nearer is larger. wgpu is only
 //! used through `egui_wgpu::wgpu`, so that it is always the version egui renders with.
@@ -25,13 +25,25 @@ pub enum ColorMode {
     Quality = 2,
 }
 
-/// A corner of a line, relative to [`Octree::origin`].
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+/// An end of a line segment, relative to [`Octree::origin`]; segments are pairs of them.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LineVertex {
     pub pos: [f32; 3],
     /// `r | g << 8 | b << 16 | a << 24`.
     pub rgba: u32,
+    /// Width in points (times [`FrameParams::line_scale`] on screen); a segment takes that of
+    /// its first end.
+    pub width: f32,
+}
+
+/// One segment as the line shader takes it (an instance of four corners).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct Segment {
+    a: [f32; 3],
+    b: [f32; 3],
+    rgba: u32,
+    width: f32,
 }
 
 /// What a frame is drawn with.
@@ -45,6 +57,8 @@ pub struct FrameParams {
     pub point_px: f32,
     /// Marker diameter in physical pixels.
     pub marker_px: f32,
+    /// Physical pixels per point of a line's width (the window's pixels per point).
+    pub line_scale: f32,
     pub color_mode: ColorMode,
     /// Round points instead of squares.
     pub round: bool,
@@ -282,11 +296,14 @@ pub struct PointRenderer {
     points: wgpu::RenderPipeline,
     markers: wgpu::RenderPipeline,
     lines: wgpu::RenderPipeline,
-    /// Uniforms for the cloud and for the markers (other size, always [`ColorMode::Rgb`]).
+    /// Uniforms for the cloud, for the markers (other size, always [`ColorMode::Rgb`]) and
+    /// for the lines (`point_px` = [`FrameParams::line_scale`]).
     cloud_uniforms: wgpu::Buffer,
     marker_uniforms: wgpu::Buffer,
+    line_uniforms: wgpu::Buffer,
     cloud_bind: wgpu::BindGroup,
     marker_bind: wgpu::BindGroup,
+    line_bind: wgpu::BindGroup,
     blocks: Vec<Block>,
     lines_buffer: Option<(wgpu::Buffer, u32)>,
     markers_buffer: Option<(wgpu::Buffer, u32)>,
@@ -337,6 +354,7 @@ impl PointRenderer {
         };
         let cloud_uniforms = uniforms("Wolke Parameter");
         let marker_uniforms = uniforms("Marker Parameter");
+        let line_uniforms = uniforms("Linien Parameter");
 
         let points_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("points.wgsl"),
@@ -347,7 +365,9 @@ impl PointRenderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("lines.wgsl").into()),
         });
         let point_attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Uint32, 2 => Uint32];
-        let line_attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Uint32];
+        let line_attributes = wgpu::vertex_attr_array![
+            0 => Float32x3, 1 => Float32x3, 2 => Uint32, 3 => Float32
+        ];
         let pipeline = |label,
                         shader: &wgpu::ShaderModule,
                         vertex_entry,
@@ -419,11 +439,11 @@ impl PointRenderer {
             &lines_shader,
             "vs_main",
             wgpu::VertexBufferLayout {
-                array_stride: size_of::<LineVertex>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
+                array_stride: size_of::<Segment>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &line_attributes,
             },
-            wgpu::PrimitiveTopology::LineList,
+            wgpu::PrimitiveTopology::TriangleStrip,
             (false, wgpu::CompareFunction::GreaterEqual),
             wgpu::BlendState::ALPHA_BLENDING,
         );
@@ -433,6 +453,8 @@ impl PointRenderer {
             lines,
             cloud_bind: bind(&cloud_uniforms),
             marker_bind: bind(&marker_uniforms),
+            line_bind: bind(&line_uniforms),
+            line_uniforms,
             cloud_uniforms,
             marker_uniforms,
             blocks: Vec::new(),
@@ -548,9 +570,19 @@ impl PointRenderer {
         lines: &[LineVertex],
         markers: &[PointVertex],
     ) {
-        let lines = &lines[..lines.len() / 2 * 2];
-        self.lines_buffer = filled_buffer(device, "Linien", bytemuck::cast_slice(lines))
-            .map(|b| (b, lines.len() as u32));
+        let segments: Vec<Segment> = lines
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[a, b]| Segment {
+                a: a.pos,
+                b: b.pos,
+                rgba: a.rgba,
+                width: a.width,
+            })
+            .collect();
+        self.lines_buffer = filled_buffer(device, "Linien", bytemuck::cast_slice(&segments))
+            .map(|b| (b, segments.len() as u32));
         self.markers_buffer = filled_buffer(device, "Marker", bytemuck::cast_slice(markers))
             .map(|b| (b, markers.len() as u32));
     }
@@ -588,6 +620,11 @@ impl PointRenderer {
                 frame.marker_px,
                 ColorMode::Rgb,
             )),
+        );
+        queue.write_buffer(
+            &self.line_uniforms,
+            0,
+            bytemuck::bytes_of(&Uniforms::new(frame, frame.line_scale, ColorMode::Rgb)),
         );
         let draws = self.draws(tree, drawn);
         // A free readback for the GPU time; without one this frame is not timed.
@@ -642,9 +679,9 @@ impl PointRenderer {
 
             if let Some((buffer, count)) = &self.lines_buffer {
                 pass.set_pipeline(&self.lines);
-                pass.set_bind_group(0, &self.cloud_bind, &[]);
+                pass.set_bind_group(0, &self.line_bind, &[]);
                 pass.set_vertex_buffer(0, buffer.slice(..));
-                pass.draw(0..*count, 0..1);
+                pass.draw(0..4, 0..*count);
             }
             if let Some((buffer, count)) = &self.markers_buffer {
                 pass.set_pipeline(&self.markers);

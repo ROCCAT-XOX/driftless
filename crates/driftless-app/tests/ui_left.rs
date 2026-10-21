@@ -154,7 +154,8 @@ fn missing_scan_is_marked() {
     let label = format!("buero ({})", text::SCAN_MISSING);
     h.get_by_label(&label).hover();
     h.run();
-    h.get_by_label(&reason);
+    // the tooltip: the full name and the reason
+    h.get_by_label(&format!("{label}\n{reason}"));
     // still selectable: its runs stay viewable
     h.get_by_label(&label).click();
     h.run();

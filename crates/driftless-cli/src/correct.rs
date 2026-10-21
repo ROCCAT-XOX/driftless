@@ -53,17 +53,15 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         Action::Loop { a, b, note } => {
             let nr = correct::add_loop(&args.target, *a, *b, note)?;
-            println!("Eintrag {nr} angehängt: Schleife {a} s ↔ {b} s");
+            println!("{}", correct::added_message(nr, *a, *b));
             print_reuse_hint(&args.target);
         }
         Action::Disable { nr } | Action::Enable { nr } => {
             let enable = matches!(args.action, Action::Enable { .. });
-            let state = if enable { "aktiv" } else { "deaktiviert" };
-            if correct::set_enabled(&args.target, *nr, enable)? {
-                println!("Eintrag {nr} ist jetzt {state}");
+            let changed = correct::set_enabled(&args.target, *nr, enable)?;
+            println!("{}", correct::switched_message(*nr, enable, changed));
+            if changed {
                 print_reuse_hint(&args.target);
-            } else {
-                println!("Eintrag {nr} ist schon {state}; nichts geändert");
             }
         }
     }

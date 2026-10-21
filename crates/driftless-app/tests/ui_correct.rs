@@ -4,11 +4,15 @@
 //! it (`driftless_steps::correct`), refusals of its check appear unchanged, entries are
 //! switched, and the run is recomputed.
 
+use driftless_app::jobs::JobStatus;
 use driftless_app::project::canonical;
 use driftless_app::ui::correct::{parse_time, CorrectState, Place};
-use driftless_app::ui::{text, Action, DriftlessApp, Selection, UiMessage};
+use driftless_app::ui::{right, text, Action, AppState, DriftlessApp, Selection, UiMessage};
+use driftless_io::progress::ProgressSnapshot;
 use driftless_io::testscan::{room_bag_secs, tmp};
+use driftless_slam::Corrections;
 use driftless_steps::correct;
+use driftless_steps::history::{self, HistoryKind};
 use driftless_steps::slam::CORRECTIONS_FILE;
 use eframe::egui;
 use egui::accesskit::{Role, Toggled};
@@ -198,7 +202,7 @@ fn pick_two_places_adds_loop() {
     assert!(row.starts_with("1   aktiv"), "{row}");
     assert!(row.contains(&format!("{ta:.1}")) && row.contains(&format!("{tb:.1}")));
     // in the panel: the message, the entry, the hint to recompute; places cleared
-    h.get_by_label(&text::loop_added(1));
+    h.get_by_label(&correct::added_message(1, ta, tb));
     h.get_by_label(&text::place_time(ta));
     h.get_by_label(&entry.added);
     h.get_by_label(text::CHANGED_RECOMPUTE);
@@ -260,12 +264,13 @@ fn toggle_entry_and_reuse() {
     let mut h = harness(app);
     assert!(h.query_by_label(text::CHANGED_RECOMPUTE).is_none());
 
+    let states_before = history::list(&run).len();
     // switch entry 1 off
-    click(&mut h, "1");
+    click(&mut h, &text::loop_switch(1));
     wait_written(&mut h);
     assert!(!correct::load(&run).unwrap().loops[0].enabled);
-    h.get_by_label(&text::loop_switched(1, false, true));
-    h.get_by_label(text::LOOP_DISABLED);
+    h.get_by_label(&correct::switched_message(1, false, true));
+    h.get_by_label(correct::status_text(false));
     h.get_by_label(text::CHANGED_RECOMPUTE);
 
     // recompute: the reuse of this run starts
@@ -276,11 +281,18 @@ fn toggle_entry_and_reuse() {
     });
     assert_eq!(errors(h.state()), Vec::<String>::new());
     assert!(run.join("traj.vorher.tum").is_file(), "recomputed");
+    // recorded as a state of kind reuse, with the entry switched off
+    let states = history::list(&run);
+    let last = states.last().unwrap();
+    assert_eq!(states.len(), states_before + 1);
+    assert_eq!(last.kind, HistoryKind::Reuse);
+    let then = Corrections::load(&last.dir.join(CORRECTIONS_FILE)).unwrap();
+    assert!(!then.loops[0].enabled);
     // computed with the corrections as they are: no hint any more
     assert!(h.query_by_label(text::CHANGED_RECOMPUTE).is_none());
 
     // and on again: the check passes, the entry is active
-    click(&mut h, "1");
+    click(&mut h, &text::loop_switch(1));
     wait_written(&mut h);
     assert!(correct::load(&run).unwrap().loops[0].enabled);
     h.get_by_label(text::CHANGED_RECOMPUTE);
@@ -319,7 +331,61 @@ fn cli_written_corrections_are_listed() {
         h.get_by_label(&note);
     }
     // the switches show the state of the file
-    let toggled = |label| h.get_by_label(label).accesskit_node().toggled();
-    assert_eq!(toggled("1"), Some(Toggled::False));
-    assert_eq!(toggled("2"), Some(Toggled::True));
+    let toggled = |nr| {
+        h.get_by_label(&text::loop_switch(nr))
+            .accesskit_node()
+            .toggled()
+    };
+    assert_eq!(toggled(1), Some(Toggled::False));
+    assert_eq!(toggled(2), Some(Toggled::True));
+}
+
+/// While a step of the run is going, its corrections cannot be changed: the step read them at
+/// its start and its state is recorded with those.
+#[test]
+fn corrections_locked_while_a_step_of_the_run_runs() {
+    let (app, run) = app_with_run(&tmp("ui-korrektur-gesperrt"));
+    correct::add_loop_at(&run, 1.0, 11.0, "", ADDED).unwrap();
+    let mut app = app;
+    reselect(&mut app, &run);
+    let mut state = harness(app).state().state().clone();
+    state.correct.place(2.0);
+    state.correct.place(11.5);
+    // as the program shows a running reuse of this run
+    state.step = Some(Action::Reuse(run.clone()));
+    state.job = Some(JobStatus {
+        label: text::STEP_REUSE.into(),
+        progress: ProgressSnapshot::default(),
+        seconds: 1.0,
+        cancelling: false,
+    });
+    let mut h = Harness::builder()
+        .with_size([400.0, 1600.0])
+        .build_ui_state(
+            |ui, state: &mut AppState| {
+                right::show(ui, state);
+            },
+            state.clone(),
+        );
+    h.run();
+    let disabled = |h: &Harness<'_, AppState>, label: &str| {
+        h.get_by_label(label).accesskit_node().is_disabled()
+    };
+    assert!(disabled(&h, text::ADD_LOOP));
+    assert!(disabled(&h, &text::loop_switch(1)));
+    h.get_by_label(text::ADD_LOOP).hover();
+    h.run();
+    h.get_by_label(&text::busy(text::STEP_REUSE));
+
+    // a step of another run locks nothing here
+    h.state_mut().step = Some(Action::Reuse(PathBuf::from("/anderer/lauf")));
+    h.run();
+    assert!(!disabled(&h, text::ADD_LOOP));
+    assert!(!disabled(&h, &text::loop_switch(1)));
+
+    // choosing places with the trajectory hidden: the panel says what to do
+    h.state_mut().correct.picking = true;
+    h.state_mut().view.show_trajectory = false;
+    h.run();
+    h.get_by_label(text::PICK_NEEDS_TRAJECTORY);
 }

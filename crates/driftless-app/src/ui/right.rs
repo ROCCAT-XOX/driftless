@@ -71,8 +71,11 @@ fn target(state: &AppState) -> Target {
 
 pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     let mut action = None;
+    // a solid bar that is always there: the panel is longer than the window
+    ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
     egui::ScrollArea::vertical()
         .auto_shrink(false)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .show(ui, |ui| {
             let target = target(state);
             ui.heading(text::PANEL_STEPS);
@@ -84,14 +87,18 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
                 Target::Run { scan, run, map } => {
                     run_steps(ui, state, scan, run, map.as_ref(), &mut action);
                     ui.separator();
-                    if let Some(a) = correct::show(ui, state) {
-                        action = Some(a);
-                    }
+                    section(ui, text::CORRECTIONS, |ui| {
+                        if let Some(a) = correct::show(ui, state) {
+                            action = Some(a);
+                        }
+                    });
                 }
             }
             ui.separator();
-            ui.heading(text::PANEL_PROPERTIES);
-            match &target {
+            // the view first: it is used most while choosing places
+            section(ui, text::VIEW_SETTINGS, |ui| view_section(ui, state));
+            ui.separator();
+            section(ui, text::PANEL_PROPERTIES, |ui| match &target {
                 Target::None => {}
                 Target::Scan(scan) => {
                     slam_settings_edit(ui, &mut state.slam_settings);
@@ -106,35 +113,46 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
                     ui.separator();
                     map_settings_edit(ui, &mut state.map_settings, scan.no_color.as_deref());
                 }
-            }
-            ui.separator();
-            let has_rgb = state.cloud.as_ref().is_none_or(|c| c.has_rgb);
-            view_settings_edit(ui, &mut state.view, has_rgb);
-            if state.cloud.as_ref().is_some_and(|c| !c.quality_known) {
-                ui.weak(text::QUALITY_NONE_HINT);
-            }
-            if let Some(cloud) = &state.cloud {
-                cut_edit(ui, &mut state.view.cut, cloud);
-            }
-            if let Some(stats) = &state.view_stats {
-                ui.label(text::drawn_stats(
-                    stats.drawn,
-                    stats.total,
-                    stats.frame_ms,
-                    stats.gpu,
-                ));
-            }
-            ui.weak(text::FRAME_ALL_HINT);
-            ui.separator();
-            point_shown(ui, state.picked.as_ref());
+            });
         });
     action
+}
+
+/// A section that can be folded away (open at first; egui keeps the choice).
+fn section(ui: &mut Ui, title: &str, body: impl FnOnce(&mut Ui)) {
+    egui::CollapsingHeader::new(RichText::new(title).heading())
+        .id_salt(title)
+        .default_open(true)
+        .show(ui, body);
+}
+
+/// How the 3D view draws, the height cut, the numbers of the last frame and the point
+/// clicked in it.
+fn view_section(ui: &mut Ui, state: &mut AppState) {
+    let has_rgb = state.cloud.as_ref().is_none_or(|c| c.has_rgb);
+    view_settings_edit(ui, &mut state.view, has_rgb);
+    if state.cloud.as_ref().is_some_and(|c| !c.quality_known) {
+        ui.weak(text::QUALITY_NONE_HINT);
+    }
+    if let Some(cloud) = &state.cloud {
+        cut_edit(ui, &mut state.view.cut, cloud);
+    }
+    if let Some(stats) = &state.view_stats {
+        ui.label(text::drawn_stats(
+            stats.drawn,
+            stats.total,
+            stats.frame_ms,
+            stats.gpu,
+        ));
+    }
+    ui.weak(text::FRAME_ALL_HINT);
+    ui.separator();
+    point_shown(ui, state.picked.as_ref());
 }
 
 /// How the 3D view draws. `has_rgb`: whether the loaded cloud has colours (offers the
 /// colour mode „Farbe“).
 fn view_settings_edit(ui: &mut Ui, view: &mut ViewSettings, has_rgb: bool) {
-    ui.strong(text::VIEW_SETTINGS);
     let shown = effective_color_mode(view.color_mode, has_rgb);
     ui.horizontal_wrapped(|ui| {
         ui.label(text::COLOR_MODE);
@@ -181,6 +199,7 @@ fn view_settings_edit(ui: &mut Ui, view: &mut ViewSettings, has_rgb: bool) {
         ui.checkbox(&mut view.show_trajectory, text::LAYER_TRAJECTORY);
         ui.checkbox(&mut view.show_odometry, text::LAYER_ODOMETRY);
         ui.checkbox(&mut view.show_loops, text::LAYER_LOOPS);
+        ui.checkbox(&mut view.show_rejected, text::LAYER_REJECTED);
         ui.checkbox(&mut view.show_submaps, text::LAYER_SUBMAPS);
     });
 }

@@ -9,7 +9,7 @@ pub const DEFAULT_PROJECT_NAME: &str = "Projekt";
 pub const NEW_PROJECT: &str = "Neues Projekt …";
 pub const OPEN_PROJECT: &str = "Projekt öffnen …";
 pub const ADD_SCAN: &str = "Scan hinzufügen …";
-pub const ADD_RUN: &str = "SLAM-Ordner hinzufügen …";
+pub const ADD_RUN: &str = "Lauf hinzufügen …";
 pub const MENU_PROJECT: &str = "Projekt";
 pub const NO_PROJECT: &str = "Kein Projekt geöffnet";
 pub const NO_SCANS: &str = "Noch kein Scan im Projekt";
@@ -136,6 +136,12 @@ pub const PICK_PLACES_HINT: &str =
 pub const PLACE_A: &str = "Stelle A";
 pub const PLACE_B: &str = "Stelle B";
 pub const PLACE_HINT: &str = "Zeit ab Scan-Beginn in s";
+/// The labels of the places in the view.
+pub const PLACE_A_SHORT: &str = "A";
+pub const PLACE_B_SHORT: &str = "B";
+pub const PICK_NEEDS_TRAJECTORY: &str =
+    "Stellen wählen braucht die Ebene „Laufbahn“ – unter Ansicht einschalten";
+pub const LAYER_REJECTED: &str = "Verworfene Kandidaten";
 pub const NEXT_PLACE_A: &str = "Nächster Klick auf die Laufbahn: Stelle A";
 pub const NEXT_PLACE_B: &str = "Nächster Klick auf die Laufbahn: Stelle B";
 pub const NOTE: &str = "Notiz";
@@ -149,8 +155,6 @@ pub const CORRECTION_BUSY: &str = "Korrektur wird gespeichert …";
 /// The columns of the list, as `driftless correct <lauf> list` prints them.
 pub const CORRECTION_COLUMNS: [&str; 6] =
     ["Nr", "Status", "a (s)", "b (s)", "hinzugefügt", "Notiz"];
-pub const LOOP_ACTIVE: &str = "aktiv";
-pub const LOOP_DISABLED: &str = "deaktiviert";
 pub const LOOP_SWITCH_HINT: &str = "Ein- oder ausschalten; gilt beim nächsten Neurechnen";
 /// Labels of the background jobs of the corrections (not shown in the status bar).
 pub const LOAD_RUN_JOB: &str = "Lauf lesen";
@@ -195,17 +199,14 @@ pub const CLOSE_AFTER_CANCEL: &str =
     "Der laufende Schritt wird abgebrochen; danach schließt das Fenster";
 const USAGE: &str = "Aufruf: driftless-app [--synthetic N] [projekt-ordner]";
 
-pub fn loop_added(nr: usize) -> String {
-    format!("Schleife eingetragen (Eintrag {nr})")
+/// The accessible name of the switch of entry `nr`.
+pub fn loop_switch(nr: usize) -> String {
+    format!("Eintrag {nr} aktiv")
 }
 
-pub fn loop_switched(nr: usize, enabled: bool, changed: bool) -> String {
-    match (enabled, changed) {
-        (true, true) => format!("Eintrag {nr} eingeschaltet"),
-        (false, true) => format!("Eintrag {nr} ausgeschaltet"),
-        (true, false) => format!("Eintrag {nr} war schon eingeschaltet"),
-        (false, false) => format!("Eintrag {nr} war schon ausgeschaltet"),
-    }
+/// The pose under the mouse while choosing places.
+pub fn pose_hover(t: f64, submap: usize) -> String {
+    format!("{} s · Teilkarte {submap}", decimal(t, 1))
 }
 
 /// A time of a place in the field: one decimal.

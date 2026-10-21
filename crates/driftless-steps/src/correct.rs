@@ -93,6 +93,31 @@ pub fn set_enabled(run: &Path, nr: usize, enabled: bool) -> Result<bool, StepErr
     Ok(changed)
 }
 
+/// The status of an entry as the list and the messages name it.
+pub fn status_text(enabled: bool) -> &'static str {
+    if enabled {
+        "aktiv"
+    } else {
+        "deaktiviert"
+    }
+}
+
+/// What `driftless correct … loop` answers after [`add_loop`] returned `nr`.
+pub fn added_message(nr: usize, a: f64, b: f64) -> String {
+    format!("Eintrag {nr} angehängt: Schleife {a} s ↔ {b} s")
+}
+
+/// What `driftless correct … enable|disable` answers after [`set_enabled`] (`changed`: its
+/// result).
+pub fn switched_message(nr: usize, enabled: bool, changed: bool) -> String {
+    let state = status_text(enabled);
+    if changed {
+        format!("Eintrag {nr} ist jetzt {state}")
+    } else {
+        format!("Eintrag {nr} ist schon {state}; nichts geändert")
+    }
+}
+
 /// The corrections as `driftless correct <lauf> list` prints them (`path`: their file).
 pub fn render_list(c: &Corrections, path: &Path) -> String {
     if c.loops.is_empty() {
@@ -104,7 +129,7 @@ pub fn render_list(c: &Corrections, path: &Path) -> String {
         s += &format!(
             "{:<3} {:<12} {:<8} {:>6.1} {:>10.1}  {:<21} {}\n",
             i + 1,
-            if l.enabled { "aktiv" } else { "deaktiviert" },
+            status_text(l.enabled),
             "Schleife",
             l.a,
             l.b,
@@ -117,9 +142,12 @@ pub fn render_list(c: &Corrections, path: &Path) -> String {
 
 /// Current time as RFC 3339 in UTC, to the second.
 pub fn utc_now() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    utc(SystemTime::now())
+}
+
+/// `time` as RFC 3339 in UTC, to the second (the format of `added`).
+pub fn utc(time: SystemTime) -> String {
+    let secs = time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let (days, rest) = (secs / 86_400, secs % 86_400);
     // Civil date from days since 1970-01-01 (H. Hinnant's algorithm).
     let z = days as i64 + 719_468;

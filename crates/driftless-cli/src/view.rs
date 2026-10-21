@@ -7,7 +7,9 @@ use driftless_io::bag::{BagError, BagReader};
 use driftless_io::msg::{decode_compressed_image, decode_imu, decode_pointcloud2, LidarFrame};
 use driftless_io::project::discover_project;
 use driftless_slam::SlamReport;
-use driftless_steps::overlay::{load_run, loop_color, quality_color, trajectory_strips};
+use driftless_steps::overlay::{
+    load_run, loop_color, quality_color, trajectory_strips, ODOMETRY_COLOR,
+};
 use driftless_steps::scan::{
     file_name, TopicPicker, CLOUD_TYPE, IMAGE_TYPE as COMPRESSED_IMAGE_TYPE, IMU_TYPE,
 };
@@ -194,7 +196,11 @@ fn log_slam(rec: &rerun::RecordingStream, view: &SlamView) -> Result<(), BoxErro
     rec.log_static(
         "slam/odometry",
         &rerun::LineStrips3D::new([view.odometry.iter().map(xyz).collect::<Vec<_>>()])
-            .with_colors([rerun::Color::from_rgb(130, 130, 130)])
+            .with_colors([rerun::Color::from_rgb(
+                ODOMETRY_COLOR[0],
+                ODOMETRY_COLOR[1],
+                ODOMETRY_COLOR[2],
+            )])
             .with_radii([rerun::Radius::new_ui_points(0.8)]),
     )?;
 

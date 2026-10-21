@@ -3,14 +3,19 @@
 
 use driftless_app::camera::{Camera, CameraMode};
 use driftless_app::lod::PointVertex;
-use driftless_app::overlay::{RunOverlay, ANCHOR_SIZE, ODOMETRY_COLOR, PICK_COLOR, PICK_SIZE};
+use driftless_app::overlay::{
+    RunOverlay, ANCHOR_SIZE, LOOP_WIDTH, ODOMETRY_WIDTH, PICK_COLOR, PICK_RING, PICK_RING_SIZE,
+    PICK_SIZE, REJECTED_ALPHA, TRAJECTORY_WIDTH,
+};
 use driftless_app::pick::pick_pose;
 use driftless_app::render::LineVertex;
 use driftless_app::ui::ViewSettings;
 use driftless_io::testscan::tmp;
 use driftless_slam::report::{BeforeAfter, LoopReport, SubmapReport};
 use driftless_slam::SlamReport;
-use driftless_steps::overlay::{quality_color, LOOP_ACCEPTED, LOOP_MANUAL, LOOP_REJECTED};
+use driftless_steps::overlay::{
+    quality_color, LOOP_ACCEPTED, LOOP_MANUAL, LOOP_REJECTED, ODOMETRY_COLOR,
+};
 use driftless_traj::nalgebra::{UnitQuaternion, Vector3};
 use driftless_traj::{write_tum, Pose};
 use std::fs;
@@ -141,6 +146,7 @@ fn strips_follow_submaps_and_quality() {
     for w in segs.windows(2) {
         assert_eq!(w[0].1, w[1].0);
     }
+    assert!(lines.iter().all(|v| v.width == TRAJECTORY_WIDTH));
     assert_eq!(segs[0].0, [0.0, 0.0, 0.0]);
     assert_eq!(segs[7].1, [8.0, 0.0, 0.0]);
 
@@ -149,6 +155,7 @@ fn strips_follow_submaps_and_quality() {
     let segs = segments(&lines);
     assert_eq!(segs.len(), 8);
     assert!(segs.iter().all(|s| s.2 == ODOMETRY_COLOR));
+    assert!(lines.iter().all(|v| v.width == ODOMETRY_WIDTH));
     assert!((segs[7].1[0] - 8.8).abs() < 1e-5, "{:?}", segs[7]);
     // nothing switched on: nothing drawn
     let (lines, markers) = o.lines(&only(false, false, false, false), &[]);
@@ -161,15 +168,31 @@ fn loops_colored_by_kind() {
     let (lines, markers) = o.lines(&only(false, false, true, false), &[]);
     let segs = segments(&lines);
     let anchor = |x: f32| [x, 0.0, 0.0];
+    // „Schleifen“: the accepted and the manual ones, opaque
     assert_eq!(
         segs,
         [
             (anchor(0.0), anchor(6.0), LOOP_ACCEPTED),
-            (anchor(0.0), anchor(3.0), LOOP_REJECTED),
             (anchor(3.0), anchor(6.0), LOOP_MANUAL),
         ]
     );
+    assert!(lines
+        .iter()
+        .all(|v| v.rgba >> 24 == 0xff && v.width == LOOP_WIDTH));
     assert!(markers.is_empty());
+    // the rejected candidates on their own layer, faint and thin
+    let settings = ViewSettings {
+        show_rejected: true,
+        ..only(false, false, false, false)
+    };
+    assert!(!ViewSettings::default().show_rejected, "off by default");
+    let (lines, _) = o.lines(&settings, &[]);
+    assert_eq!(
+        segments(&lines),
+        [(anchor(0.0), anchor(3.0), LOOP_REJECTED)]
+    );
+    assert_eq!(lines[0].rgba >> 24, u32::from(REJECTED_ALPHA));
+    assert!(lines[0].width < LOOP_WIDTH);
     // the submaps: their anchors as markers in their quality colour
     let (lines, markers) = o.lines(&only(false, false, false, true), &[]);
     assert!(lines.is_empty());
@@ -188,21 +211,33 @@ fn loops_colored_by_kind() {
 }
 
 #[test]
-fn picked_places_are_large_white_markers_on_top() {
+fn picked_places_are_large_ringed_markers_on_top() {
     let o = load(&run_dir("overlay-picks"));
     let (_, markers) = o.lines(&only(true, false, false, true), &[2, 7]);
-    // anchors first, the picked places last (drawn over them)
-    assert_eq!(markers.len(), 5);
+    // anchors first, the picked places last (drawn over them): a dark ring, then the colour
+    assert_eq!(markers.len(), 3 + 4);
     let picks: Vec<&PointVertex> = markers[3..].iter().collect();
-    assert_eq!(picks[0].pos, [2.0, 0.0, 0.0]);
-    assert_eq!(picks[1].pos, [7.0, 0.0, 0.0]);
-    assert!(picks
+    let shown: Vec<([f32; 3], [u8; 3], u32)> = picks
         .iter()
-        .all(|m| rgb(m.rgbi) == PICK_COLOR && m.extra == PICK_SIZE));
-    const { assert!(PICK_SIZE > ANCHOR_SIZE) };
+        .map(|m| (m.pos, rgb(m.rgbi), m.extra))
+        .collect();
+    let at = |x: f32| [x, 0.0, 0.0];
+    assert_eq!(
+        shown,
+        [
+            (at(2.0), PICK_RING, PICK_RING_SIZE),
+            (at(2.0), PICK_COLOR, PICK_SIZE),
+            (at(7.0), PICK_RING, PICK_RING_SIZE),
+            (at(7.0), PICK_COLOR, PICK_SIZE),
+        ]
+    );
+    const { assert!(PICK_RING_SIZE > PICK_SIZE && PICK_SIZE > ANCHOR_SIZE) };
+    // a colour of its own: not white (walls), not the loop or quality colours
+    assert_ne!(PICK_COLOR, [255, 255, 255]);
+    assert!(![LOOP_ACCEPTED, LOOP_MANUAL, LOOP_REJECTED, ODOMETRY_COLOR].contains(&PICK_COLOR));
     // a pick also shows with every layer off; an unknown index is skipped
     let (_, markers) = o.lines(&only(false, false, false, false), &[4, 99]);
-    assert_eq!(markers.len(), 1);
+    assert_eq!(markers.len(), 2);
 }
 
 #[test]
@@ -250,6 +285,30 @@ fn pick_pose_at_large_offset() {
     let vp = cam.view_proj(viewport[0] / viewport[1]);
     let hit = pick_pose(&o.positions, &vp, viewport, [200.0, 150.0], 6.0);
     assert_eq!(hit, Some(4));
+}
+
+/// At a crossing of the trajectory the place B prefers a pose of another submap than A.
+#[test]
+fn pick_at_a_crossing_prefers_another_submap() {
+    let mut o = load(&run_dir("overlay-kreuzung"));
+    // pose 7 (submap 2) lies where pose 1 (submap 0) is
+    o.positions[7] = o.positions[1];
+    assert_eq!((o.submap_of(1), o.submap_of(7)), (0, 2));
+    let cam = Camera {
+        mode: CameraMode::Fly,
+        eye: [1.0, 10.0, 0.0].into(),
+        yaw: -std::f32::consts::FRAC_PI_2,
+        pitch: 0.0,
+        ..Camera::default()
+    };
+    let viewport = [400.0, 300.0];
+    let vp = cam.view_proj(viewport[0] / viewport[1]);
+    let centre = [200.0, 150.0];
+    assert_eq!(o.pick(&vp, viewport, centre, 6.0, None), Some(1));
+    assert_eq!(o.pick(&vp, viewport, centre, 6.0, Some(0)), Some(7));
+    // nothing of another submap within reach: the nearest one all the same
+    assert_eq!(o.pick(&vp, viewport, centre, 6.0, Some(1)), Some(1));
+    assert_eq!(o.pick(&vp, viewport, [5.0, 5.0], 6.0, Some(0)), None);
 }
 
 #[test]

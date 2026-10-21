@@ -1,9 +1,13 @@
 //! Pictures of the whole window for looking at by eye (colours, levels of detail, layout):
 //! a synthetic cloud and, if `$DRIFTLESS_TESTDATA` has it, the colour cloud of the
 //! Büro-Scan, with its run drawn over it and two places picked for a loop (nothing is written
-//! into the test data: the project lives in `$DRIFTLESS_SHOTS`). Written as PNG into `$DRIFTLESS_SHOTS` (skipped without it); never commit
-//! them. Run with
-//! `DRIFTLESS_SHOTS=/tmp/shots cargo test -p driftless-app --release --test ui_screenshots -- --ignored --nocapture`.
+//! into the test data: the project lives in `$DRIFTLESS_SHOTS`). Written as PNG into
+//! `$DRIFTLESS_SHOTS` (skipped without it); never commit them. Run with
+//!
+//! ```text
+//! DRIFTLESS_SHOTS=/tmp/shots cargo test -p driftless-app --release \
+//!     --test ui_screenshots -- --ignored --nocapture
+//! ```
 
 use driftless_app::camera::CameraMode;
 use driftless_app::project::{canonical, Project};

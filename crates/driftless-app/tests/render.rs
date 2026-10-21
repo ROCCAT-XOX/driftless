@@ -50,6 +50,7 @@ fn frame(cam: &Camera, mode: ColorMode) -> FrameParams {
         viewport_px: [SIZE as f32; 2],
         point_px: 8.0,
         marker_px: 16.0,
+        line_scale: 1.0,
         color_mode: mode,
         round: false,
         background: BACKGROUND,
@@ -265,16 +266,19 @@ fn empty_cloud_renders_background() {
 fn lines_draw_over_background() {
     let Some(gpu) = gpu() else { return };
     let tree = tree(&PointSet::default());
-    let green = 0xff00_ff00; // r | g << 8 | b << 16 | a << 24
-                             // A vertical line slightly right of the centre, so that it lies inside one column.
+    // r | g << 8 | b << 16 | a << 24
+    let green = 0xff00_ff00;
+    // A vertical line slightly right of the centre, so that it lies inside one column.
     let lines = [
         LineVertex {
             pos: [2.0, -0.01, -1.0],
             rgba: green,
+            width: 1.0,
         },
         LineVertex {
             pos: [2.0, -0.01, 1.0],
             rgba: green,
+            width: 1.0,
         },
     ];
     let cam = camera([0.0; 3], 0.0);
@@ -283,8 +287,35 @@ fn lines_draw_over_background() {
         .filter(|&x| near(image.at(x, SIZE / 2), [0, 255, 0], 1))
         .collect();
     eprintln!("Linie in Spalte {column:?}");
-    assert_eq!(column.len(), 1, "a 1 px line");
+    assert!((1..=2).contains(&column.len()), "a 1 px line");
     assert!(is_background(image.at(0, 0)));
+}
+
+/// Lines are quads of their width in points times the pixels per point.
+#[test]
+fn line_width_scales_with_pixels_per_point() {
+    let Some(gpu) = gpu() else { return };
+    let tree = tree(&PointSet::default());
+    let line = |width| {
+        [[2.0, 0.0, -1.0], [2.0, 0.0, 1.0]].map(|pos| LineVertex {
+            pos,
+            rgba: 0xff00_ff00,
+            width,
+        })
+    };
+    let cam = camera([0.0; 3], 0.0);
+    let width_px = |scale: f32| {
+        let mut f = frame(&cam, ColorMode::Rgb);
+        f.line_scale = scale;
+        let image = render(&gpu, &tree, &f, &line(2.5), &[]);
+        (0..SIZE)
+            .filter(|&x| near(image.at(x, SIZE / 2), [0, 255, 0], 1))
+            .count()
+    };
+    let (one, two) = (width_px(1.0), width_px(2.0));
+    eprintln!("2,5 pt: {one} px bei 1×, {two} px bei 2×");
+    assert!((2..=3).contains(&one), "{one}");
+    assert!((4..=6).contains(&two), "{two}");
 }
 
 #[test]
@@ -295,10 +326,12 @@ fn lines_are_hidden_behind_nearer_points() {
         LineVertex {
             pos: [4.0, -0.02, -1.0],
             rgba: 0xffff_ffff,
+            width: 1.0,
         },
         LineVertex {
             pos: [4.0, -0.02, 1.0],
             rgba: 0xffff_ffff,
+            width: 1.0,
         },
     ];
     let cam = camera([0.0; 3], 0.0);

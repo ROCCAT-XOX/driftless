@@ -30,6 +30,8 @@ const LOG_LIMIT: usize = 10_000;
 /// Messages kept for the status bar (it shows the last); older ones are dropped.
 const MESSAGE_LIMIT: usize = 100;
 const LEFT_WIDTH: f32 = 280.0;
+/// The project tree never gets narrower than this (names are cut with „…“ instead).
+const LEFT_MIN_WIDTH: f32 = 220.0;
 const RIGHT_WIDTH: f32 = 340.0;
 
 /// Seed of the synthetic cloud of `--synthetic`.
@@ -231,19 +233,21 @@ impl DriftlessApp {
         }
     }
 
-    /// The poses of the places of the corrections, to mark them.
-    fn picks(&self) -> Vec<usize> {
+    /// The poses of the places A and B of the corrections, to mark them, and while B is
+    /// chosen the submap of A (a click at a crossing prefers another one).
+    fn places(&self) -> ([Option<usize>; 2], Option<usize>) {
         let (Some(o), c) = (&self.overlay, &self.state.correct) else {
-            return Vec::new();
+            return ([None; 2], None);
         };
         if c.run.as_ref() != Some(&o.run) {
-            return Vec::new();
+            return ([None; 2], None);
         }
-        [c.a.t, c.b.t]
-            .into_iter()
+        let places = [c.a.t, c.b.t].map(|t| t.and_then(|t| o.pose_at(t)));
+        let avoid = (c.next == super::correct::Place::B)
+            .then_some(places[0])
             .flatten()
-            .filter_map(|t| o.pose_at(t))
-            .collect()
+            .map(|a| o.submap_of(a));
+        (places, avoid)
     }
 
     /// Follows the selection: the run of the selection, else of the cloud, is drawn and its
@@ -909,6 +913,7 @@ impl DriftlessApp {
         });
         egui::Panel::left("projekt")
             .default_size(LEFT_WIDTH)
+            .min_size(LEFT_MIN_WIDTH)
             .show(ui, |ui| {
                 actions.extend(left::show(ui, &self.state));
             });
@@ -918,11 +923,12 @@ impl DriftlessApp {
                 actions.extend(right::show(ui, &mut self.state));
             });
         let mut event = None;
-        let picks = self.picks();
+        let (places, avoid_submap) = self.places();
         let overlay = self.overlay.as_ref().map(|run| ViewOverlay {
             run,
             version: self.overlay_version,
-            picks: &picks,
+            places,
+            avoid_submap,
             pick_places: self.state.correct.picking,
         });
         let shown = self.cloud.is_some() || overlay.is_some();
@@ -939,8 +945,13 @@ impl DriftlessApp {
                 ui.centered_and_justified(|ui| ui.weak(text::VIEW_EMPTY));
             }
         });
-        if let Some(ViewEvent::PickedPose(i)) = event {
-            self.pose_picked(i);
+        match event {
+            Some(ViewEvent::PickedPose(i)) => self.pose_picked(i),
+            Some(ViewEvent::TrajectoryHidden) => {
+                let m = UiMessage::Info(text::PICK_NEEDS_TRAJECTORY.into());
+                self.state.correct.message = Some(m);
+            }
+            _ => {}
         }
         if let Some(cloud) = &self.cloud {
             let stats = Some(ViewStats {
@@ -970,13 +981,13 @@ fn change_corrections(action: &Action) -> Result<Corrected, StepError> {
     let (run, message, changed, added) = match action {
         Action::AddLoop { run, a, b, note } => {
             let nr = correct::add_loop(run, *a, *b, note)?;
-            (run, text::loop_added(nr), true, true)
+            (run, correct::added_message(nr, *a, *b), true, true)
         }
         Action::SetLoopEnabled { run, nr, enabled } => {
             let changed = correct::set_enabled(run, *nr, *enabled)?;
             (
                 run,
-                text::loop_switched(*nr, *enabled, changed),
+                correct::switched_message(*nr, *enabled, changed),
                 changed,
                 false,
             )

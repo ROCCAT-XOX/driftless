@@ -535,30 +535,31 @@ fn trajectory_alone_is_drawn_and_its_poses_clicked() {
         egui_wgpu::RendererOptions::PREDICTABLE,
     );
     let r = rs.clone();
-    type State = (View3d, RunOverlay, Option<ViewEvent>);
+    type State = (View3d, RunOverlay, Option<ViewEvent>, ViewSettings);
     let mut h = Harness::builder()
         .with_size([300.0, 200.0])
         .with_pixels_per_point(1.0)
         .renderer(WgpuTestRenderer::from_render_state(rs))
         .build_ui_state(
-            move |ui, (view, run, event): &mut State| {
+            move |ui, (view, run, event, settings): &mut State| {
                 egui::CentralPanel::no_frame().show(ui, |ui| {
                     let overlay = ViewOverlay {
                         run,
                         version: 1,
-                        picks: &[],
+                        places: [None; 2],
+                        avoid_submap: None,
                         pick_places: true,
                     };
-                    if let Some(e) = view.show(ui, &r, None, Some(overlay), &settings) {
+                    if let Some(e) = view.show(ui, &r, None, Some(overlay), settings) {
                         *event = Some(e);
                     }
                 });
             },
-            (View3d::default(), run, None),
+            (View3d::default(), run, None, settings),
         );
     h.run();
     // pose 5 on the screen
-    let (view, run, _) = h.state();
+    let (view, run, ..) = h.state();
     let vp = view.camera().view_proj(300.0 / 200.0);
     let p = project(&vp, run.positions[5], [300.0, 200.0]).unwrap();
     let pos = egui::pos2(p[0], p[1]);
@@ -571,11 +572,18 @@ fn trajectory_alone_is_drawn_and_its_poses_clicked() {
         pressed,
         modifiers: egui::Modifiers::NONE,
     };
-    h.event(egui::Event::PointerMoved(pos));
+    let click = |h: &mut Harness<'_, State>| {
+        h.event(egui::Event::PointerMoved(pos));
+        h.step();
+        h.event(button(true));
+        h.step();
+        h.event(button(false));
+        h.step();
+        h.state_mut().2.take()
+    };
+    assert_eq!(click(&mut h), Some(ViewEvent::PickedPose(5)));
+    // with the trajectory hidden a click says so instead of picking anything
+    h.state_mut().3.show_trajectory = false;
     h.step();
-    h.event(button(true));
-    h.step();
-    h.event(button(false));
-    h.step();
-    assert_eq!(h.state().2, Some(ViewEvent::PickedPose(5)));
+    assert_eq!(click(&mut h), Some(ViewEvent::TrajectoryHidden));
 }

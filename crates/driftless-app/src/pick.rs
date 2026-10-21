@@ -143,21 +143,35 @@ pub fn pick_pose(
     pixel_px: [f32; 2],
     radius_px: f32,
 ) -> Option<usize> {
+    pick_poses(positions, view_proj, viewport_px, pixel_px, radius_px)
+        .first()
+        .copied()
+}
+
+/// Every pose within `radius_px` of the pixel, best first in the order of [`pick_pose`].
+pub fn pick_poses(
+    positions: &[[f32; 3]],
+    view_proj: &Matrix4<f32>,
+    viewport_px: [f32; 2],
+    pixel_px: [f32; 2],
+    radius_px: f32,
+) -> Vec<usize> {
     if !valid_viewport(viewport_px) {
-        return None;
+        return Vec::new();
     }
-    let mut best: Option<(f32, f32, usize)> = None;
-    for (i, &p) in positions.iter().enumerate() {
-        let Some((d2, z)) = hit(view_proj, p, viewport_px, pixel_px, radius_px) else {
-            continue;
-        };
-        let better = match best {
-            None => true,
-            Some((bd, bz, _)) => d2 < bd || (d2 == bd && z > bz),
-        };
-        if better {
-            best = Some((d2, z, i));
-        }
-    }
-    best.map(|(_, _, i)| i)
+    let mut hits: Vec<(f32, f32, usize)> = positions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &p)| {
+            let (d2, z) = hit(view_proj, p, viewport_px, pixel_px, radius_px)?;
+            Some((d2, z, i))
+        })
+        .collect();
+    // nearer on screen, then in front (larger reverse-Z depth), then the smaller index
+    hits.sort_by(|a, b| {
+        a.0.total_cmp(&b.0)
+            .then(b.1.total_cmp(&a.1))
+            .then(a.2.cmp(&b.2))
+    });
+    hits.into_iter().map(|(_, _, i)| i).collect()
 }

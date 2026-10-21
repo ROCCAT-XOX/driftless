@@ -139,22 +139,30 @@ pub fn parse_time(s: &str) -> Option<f64> {
 
 /// The status column of an entry, as `driftless correct list` writes it.
 pub fn status(enabled: bool) -> &'static str {
-    if enabled {
-        text::LOOP_ACTIVE
-    } else {
-        text::LOOP_DISABLED
-    }
+    driftless_steps::correct::status_text(enabled)
 }
 
-/// The panel of the selected run; nothing without one.
+/// Why the corrections of `run` cannot be changed now: a step of this run is running (it
+/// read them at its start, and its state is recorded with those).
+pub fn locked(state: &AppState, run: &Path) -> Option<String> {
+    let of_run = matches!(&state.step, Some(Action::Reuse(d) | Action::RunMap(d)) if d == run);
+    state
+        .job
+        .as_ref()
+        .filter(|_| of_run)
+        .map(|j| text::busy(&j.label))
+}
+
+/// The panel of the selected run (without its heading); nothing without one.
 pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     let (dir, has_cache) = state
         .selected_run()
         .map(|(_, r)| (r.dir.clone(), r.has_cache))?;
     let mut action = None;
-    ui.heading(text::CORRECTIONS);
     ui.weak(text::CORRECTIONS_HINT);
     let job = state.job.as_ref().map(|j| text::busy(&j.label));
+    let locked = locked(state, &dir);
+    let trajectory_hidden = !state.view.show_trajectory;
     let c = &mut state.correct;
     if c.run.as_deref() != Some(dir.as_path()) {
         ui.weak(text::CORRECTIONS_READING);
@@ -168,7 +176,10 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
         c.picking = !c.picking;
         c.next = Place::A;
     }
-    if c.picking {
+    if c.picking && trajectory_hidden {
+        let warn = ui.visuals().warn_fg_color;
+        ui.label(RichText::new(text::PICK_NEEDS_TRAJECTORY).color(warn));
+    } else if c.picking {
         ui.weak(match c.next {
             Place::A => text::NEXT_PLACE_A,
             Place::B => text::NEXT_PLACE_B,
@@ -193,10 +204,12 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     let loaded = matches!(c.corrections, Some(Ok(_)));
     let places = c.places();
     let add = ui.add_enabled(
-        places.is_some() && loaded && !c.busy,
+        places.is_some() && loaded && !c.busy && locked.is_none(),
         egui::Button::new(text::ADD_LOOP),
     );
-    if places.is_none() {
+    if let Some(why) = &locked {
+        add.clone().on_disabled_hover_text(why);
+    } else if places.is_none() {
         add.clone()
             .on_disabled_hover_text(text::ADD_LOOP_NEEDS_PLACES);
     }
@@ -235,7 +248,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
             button.on_disabled_hover_text(why);
         }
     }
-    let busy = c.busy;
+    let can_switch = !c.busy && locked.is_none();
     match &c.corrections {
         None => {
             ui.weak(text::CORRECTIONS_READING);
@@ -259,17 +272,31 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
                     for (i, l) in list.loops.iter().enumerate() {
                         let nr = i + 1;
                         let mut on = l.enabled;
-                        let switch = ui
-                            .add_enabled(!busy, egui::Checkbox::new(&mut on, nr.to_string()))
-                            .on_hover_text(text::LOOP_SWITCH_HINT);
-                        if switch.changed() {
-                            action = Some(Action::SetLoopEnabled {
-                                run: dir.clone(),
-                                nr,
-                                enabled: on,
+                        ui.label(nr.to_string());
+                        ui.horizontal(|ui| {
+                            let switch =
+                                ui.add_enabled(can_switch, egui::Checkbox::without_text(&mut on));
+                            switch.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::Checkbox,
+                                    can_switch,
+                                    on,
+                                    text::loop_switch(nr),
+                                )
                             });
-                        }
-                        ui.label(status(l.enabled));
+                            if switch.changed() {
+                                action = Some(Action::SetLoopEnabled {
+                                    run: dir.clone(),
+                                    nr,
+                                    enabled: on,
+                                });
+                            }
+                            let switch = switch.on_hover_text(text::LOOP_SWITCH_HINT);
+                            if let Some(why) = &locked {
+                                switch.on_disabled_hover_text(why);
+                            }
+                            ui.label(status(l.enabled));
+                        });
                         ui.label(text::place_time(l.a));
                         ui.label(text::place_time(l.b));
                         ui.label(&l.added);

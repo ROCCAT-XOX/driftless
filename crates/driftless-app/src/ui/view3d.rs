@@ -19,7 +19,8 @@ use crate::camera::{fly_motion, Camera, CameraMode, FlyKeys, ZOOM_FACTOR};
 use crate::cloud::LoadedCloud;
 use crate::lod::{select_nodes, Octree, PointVertex};
 use crate::overlay::RunOverlay;
-use crate::pick::{pick_point_in, pick_pose, to_physical};
+use crate::overlay::PICK_COLOR;
+use crate::pick::{pick_point_in, project, to_physical};
 use crate::render::{ColorMode, FrameParams, PointRenderer, RenderTarget, NO_CUT};
 use eframe::egui::{self, Color32, Key, PointerButton, Rect, Sense, Ui};
 use egui_wgpu::wgpu;
@@ -69,6 +70,8 @@ pub enum ViewEvent {
     PickedPoint(u32),
     /// The index of the clicked pose of the trajectory ([`RunOverlay::poses`]).
     PickedPose(usize),
+    /// A click in the mode „Stellen wählen“ while the trajectory is hidden: nothing picked.
+    TrajectoryHidden,
 }
 
 /// The run drawn over the cloud.
@@ -77,8 +80,10 @@ pub struct ViewOverlay<'a> {
     pub run: &'a RunOverlay,
     /// Raised by the program whenever `run` changed (also its origin).
     pub version: u64,
-    /// Poses marked as picked places.
-    pub picks: &'a [usize],
+    /// The poses of the places A and B, marked and labelled.
+    pub places: [Option<usize>; 2],
+    /// While choosing B: the submap of A, which a click at a crossing avoids.
+    pub avoid_submap: Option<usize>,
     /// A click picks a pose instead of a point („Stellen wählen“).
     pub pick_places: bool,
 }
@@ -87,8 +92,8 @@ pub struct ViewOverlay<'a> {
 #[derive(Debug, Clone, PartialEq)]
 struct OverlayKey {
     version: Option<u64>,
-    layers: [bool; 4],
-    picks: Vec<usize>,
+    layers: [bool; 5],
+    places: [Option<usize>; 2],
     picked: Option<u32>,
 }
 
@@ -420,6 +425,7 @@ impl View3d {
                 viewport_px: viewport,
                 point_px,
                 marker_px: MARKER_PX * ppp,
+                line_scale: ppp,
                 color_mode: key.color_mode,
                 round: key.round,
                 background: BACKGROUND,
@@ -481,7 +487,63 @@ impl View3d {
             font,
             Color32::GRAY,
         );
+        if let Some(o) = overlay {
+            let body = egui::TextStyle::Body.resolve(ui.style());
+            let hover = response.hover_pos();
+            self.paint_places(&painter, rect, ppp, viewport, o, settings, hover, body);
+        }
         event
+    }
+
+    /// The labels „A“ and „B“ next to the places, and in the mode „Stellen wählen“ the time
+    /// and submap of the pose under the mouse.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_places(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        ppp: f32,
+        viewport: [f32; 2],
+        o: ViewOverlay<'_>,
+        settings: &ViewSettings,
+        hover: Option<egui::Pos2>,
+        font: egui::FontId,
+    ) {
+        let vp = self.camera.view_proj(viewport[0] / viewport[1]);
+        let on_screen = |pose: usize| {
+            let p = project(&vp, *o.run.positions.get(pose)?, viewport)?;
+            (p[2] <= 1.0).then(|| rect.min + egui::vec2(p[0], p[1]) / ppp)
+        };
+        let label = |at: egui::Pos2, s: String, color: Color32| {
+            let galley = painter.layout_no_wrap(s, font.clone(), color);
+            let r = Rect::from_min_size(at, galley.size()).expand(2.0);
+            painter.rect_filled(r, 3.0, Color32::from_black_alpha(200));
+            painter.galley(at, galley, color);
+        };
+        let [r, g, b] = PICK_COLOR;
+        let pick = Color32::from_rgb(r, g, b);
+        // A to the upper left, B to the upper right: a loop's places often lie on each other
+        let offsets = [
+            egui::vec2(-MARKER_PX * 1.4, -MARKER_PX * 1.6),
+            egui::vec2(MARKER_PX * 0.6, -MARKER_PX * 1.6),
+        ];
+        let names = [text::PLACE_A_SHORT, text::PLACE_B_SHORT];
+        for ((pose, name), offset) in o.places.iter().zip(names).zip(offsets) {
+            if let Some(at) = pose.and_then(on_screen) {
+                label(at + offset, name.into(), pick);
+            }
+        }
+        let Some(pos) = hover.filter(|_| o.pick_places && settings.show_trajectory) else {
+            return;
+        };
+        let pixel = to_physical([pos.x, pos.y], [rect.min.x, rect.min.y], ppp);
+        if let Some(i) = o
+            .run
+            .pick(&vp, viewport, pixel, PICK_RADIUS * ppp, o.avoid_submap)
+        {
+            let s = text::pose_hover(o.run.time_of(i), o.run.submap_of(i));
+            label(pos + egui::vec2(14.0, 10.0), s, Color32::WHITE);
+        }
     }
 
     /// Puts the run of `overlay` and the marker of the picked point on the GPU when they
@@ -499,16 +561,19 @@ impl View3d {
                 settings.show_trajectory,
                 settings.show_odometry,
                 settings.show_loops,
+                settings.show_rejected,
                 settings.show_submaps,
             ],
-            picks: overlay.map_or_else(Vec::new, |o| o.picks.to_vec()),
+            places: overlay.map_or([None; 2], |o| o.places),
             picked: self.picked,
         };
         if self.overlay_key.as_ref() == Some(&key) {
             return;
         }
-        let (lines, mut markers) =
-            overlay.map_or_else(Default::default, |o| o.run.lines(settings, o.picks));
+        let (lines, mut markers) = overlay.map_or_else(Default::default, |o| {
+            let picks: Vec<usize> = o.places.iter().flatten().copied().collect();
+            o.run.lines(settings, &picks)
+        });
         // the picked point first, so that picked places lie over it
         let point = self
             .picked
@@ -617,11 +682,16 @@ impl View3d {
                 if is_click(p.time, time, p.moved) {
                     let pixel = to_physical([pos.x, pos.y], [rect.min.x, rect.min.y], ppp);
                     // the trajectory is not cut by the height cut, so its poses are not either
-                    let places = overlay.filter(|o| o.pick_places && settings.show_trajectory);
+                    let places = overlay.filter(|o| o.pick_places);
                     event = match (places, cloud) {
+                        (Some(_), _) if !settings.show_trajectory => {
+                            Some(ViewEvent::TrajectoryHidden)
+                        }
                         (Some(o), _) => {
                             let vp = self.camera.view_proj(viewport[0] / viewport[1]);
-                            pick_pose(&o.run.positions, &vp, viewport, pixel, PICK_RADIUS * ppp)
+                            let radius = PICK_RADIUS * ppp;
+                            o.run
+                                .pick(&vp, viewport, pixel, radius, o.avoid_submap)
                                 .map(ViewEvent::PickedPose)
                         }
                         (None, Some(cloud)) => pick_point_in(

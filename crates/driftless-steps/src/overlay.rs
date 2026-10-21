@@ -12,6 +12,14 @@ pub const TIME_TOLERANCE: f64 = 1e-6;
 pub const LOOP_ACCEPTED: [u8; 3] = [0, 200, 0];
 pub const LOOP_REJECTED: [u8; 3] = [140, 140, 140];
 pub const LOOP_MANUAL: [u8; 3] = [40, 120, 255];
+/// The odometry before loop closure: a hue of its own, apart from the quality ramp, the loop
+/// colours and gray.
+pub const ODOMETRY_COLOR: [u8; 3] = [110, 200, 230];
+
+/// Whether a loop is a rejected candidate (not manual, not in the pose graph).
+pub fn is_rejected(l: &LoopReport) -> bool {
+    !l.manual && !l.accepted
+}
 
 /// Colour of a submap quality: red (0) via yellow (0.5) to green (1).
 pub fn quality_color(quality: f32) -> [u8; 3] {

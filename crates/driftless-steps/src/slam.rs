@@ -213,7 +213,13 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
         } else {
             HistoryKind::Full
         };
-        Some(history::record(out, kind, seconds)?)
+        // the corrections read at the start: a change written meanwhile was not applied
+        Some(history::record_with(
+            out,
+            kind,
+            seconds,
+            Some(&corrections),
+        )?)
     } else {
         None
     };
@@ -228,10 +234,16 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
 /// The corrections of `current` with the switches of the run whose `slam.json` lies in
 /// `out`: an entry is on iff its two submaps are joined by a manual loop there. A pair takes
 /// one loop, so only one entry of a pair is on: the first entry that is on now, else the
-/// first one (an entry switched off since the run). Without a readable `slam.json` all are
-/// off.
+/// first one (an entry switched off since the run). An entry added after `slam.json` was
+/// written cannot have been used and stays off. Without a readable `slam.json` all are off.
 fn corrections_of_run(out: &Path, submaps: &[Submap], current: &Corrections) -> Corrections {
-    let pairs: BTreeSet<(usize, usize)> = fs::read_to_string(out.join("slam.json"))
+    let json = out.join("slam.json");
+    // RFC 3339 of the same form as `added`, so the strings compare as times
+    let written = fs::metadata(&json)
+        .and_then(|m| m.modified())
+        .map(crate::correct::utc)
+        .ok();
+    let pairs: BTreeSet<(usize, usize)> = fs::read_to_string(&json)
         .ok()
         .and_then(|t| serde_json::from_str::<SlamReport>(&t).ok())
         .map(|r| {
@@ -254,7 +266,8 @@ fn corrections_of_run(out: &Path, submaps: &[Submap], current: &Corrections) -> 
     for claim_enabled in [true, false] {
         for (l, (pair, on)) in then.loops.iter_mut().zip(&entries) {
             if *on == claim_enabled {
-                l.enabled = pair.is_some_and(|p| pairs.contains(&p) && used.insert(p));
+                let later = written.as_ref().is_some_and(|w| l.added > *w);
+                l.enabled = !later && pair.is_some_and(|p| pairs.contains(&p) && used.insert(p));
             }
         }
     }

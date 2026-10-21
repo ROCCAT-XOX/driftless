@@ -107,7 +107,10 @@ pub struct ViewSettings {
     pub camera_mode: CameraMode,
     pub show_trajectory: bool,
     pub show_odometry: bool,
+    /// Accepted and manual loops.
     pub show_loops: bool,
+    /// The rejected loop candidates (faint).
+    pub show_rejected: bool,
     pub show_submaps: bool,
     /// Height cut: lowest and highest z drawn (relative to the cloud's origin); `None`
     /// draws everything. Reset when another cloud is shown.
@@ -125,6 +128,7 @@ impl Default for ViewSettings {
             show_trajectory: true,
             show_odometry: false,
             show_loops: true,
+            show_rejected: false,
             show_submaps: false,
             cut: None,
         }

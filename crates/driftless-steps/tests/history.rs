@@ -1,6 +1,6 @@
 //! `verlauf/`: one state per SLAM run of the app, and switching corrections back.
 
-use driftless_io::progress::Progress;
+use driftless_io::progress::{LogLine, Progress};
 use driftless_io::testscan::{room_bag, room_bag_secs, tmp};
 use driftless_slam::Corrections;
 use driftless_steps::history::{self, HistoryKind};
@@ -163,6 +163,59 @@ fn imported_state_prefers_the_enabled_entry_of_a_pair() {
     let then = Corrections::load(&first.dir.join(CORRECTIONS_FILE)).unwrap();
     let flags: Vec<bool> = then.loops.iter().map(|l| l.enabled).collect();
     assert_eq!(flags, [false, true]);
+}
+
+/// An entry added after the run cannot have made its loop, also when the entry that did
+/// was switched off since.
+#[test]
+fn imported_state_skips_entries_added_after_the_run() {
+    let dir = tmp("steps-history-import-later");
+    room_bag_secs(&dir, true, 12.0);
+    let out = dir.join("out");
+    slam(&dir, &out, false, false);
+    correct::add_loop(&out, 1.0, 11.0, "alt").unwrap();
+    slam(&dir, &out, true, false);
+    correct::set_enabled(&out, 1, false).unwrap();
+    // the same pair, added after that run (a stamp in the future to be independent of the clock)
+    correct::add_loop_at(&out, 2.0, 11.5, "neu", "2999-01-01T00:00:00Z").unwrap();
+    slam(&dir, &out, true, true);
+    let first = &history::list(&out)[0];
+    assert_eq!(first.kind, HistoryKind::Imported);
+    let then = Corrections::load(&first.dir.join(CORRECTIONS_FILE)).unwrap();
+    let flags: Vec<bool> = then.loops.iter().map(|l| l.enabled).collect();
+    assert_eq!(flags, [true, false]);
+}
+
+/// A state keeps the corrections the run was computed with: a change written while the
+/// run is going (by another program) is not recorded as if it had been applied.
+#[test]
+fn state_has_the_corrections_read_at_the_start() {
+    let dir = tmp("steps-history-edit-during");
+    room_bag_secs(&dir, true, 12.0);
+    let out = dir.join("out");
+    slam(&dir, &out, false, true);
+    correct::add_loop(&out, 1.0, 11.0, "vorher").unwrap();
+    let before = fs::read(out.join(CORRECTIONS_FILE)).unwrap();
+    let target = out.clone();
+    // after the pose graph (a reuse logs the cache line), switch the entry off
+    let progress = Progress::with_log(move |line| {
+        if matches!(line, LogLine::Info(t) if t.starts_with("Zwischenspeicher")) {
+            correct::set_enabled(&target, 1, false).unwrap();
+        }
+    });
+    let req = SlamRequest {
+        scan: dir.clone(),
+        out: out.clone(),
+        settings: SlamSettings::default(),
+        reuse: true,
+        history: true,
+    };
+    let state = run_slam(&req, &progress).unwrap().history.unwrap();
+    assert!(
+        !correct::load(&out).unwrap().loops[0].enabled,
+        "edited meanwhile"
+    );
+    assert_eq!(fs::read(state.join(CORRECTIONS_FILE)).unwrap(), before);
 }
 
 #[test]
