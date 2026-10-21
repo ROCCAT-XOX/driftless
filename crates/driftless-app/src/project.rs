@@ -208,8 +208,8 @@ struct RunFile {
 }
 
 /// The absolute, resolved form of an existing path (without the `\\?\` that Windows adds to
-/// a plain drive path).
-fn canonical(path: &Path) -> io::Result<PathBuf> {
+/// a plain drive path). Paths in a [`Project`] are always in this form.
+pub fn canonical(path: &Path) -> io::Result<PathBuf> {
     let p = fs::canonicalize(path)?;
     if cfg!(windows) {
         if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {

@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn canon(p: &Path) -> PathBuf {
-    fs::canonicalize(p).unwrap()
+    driftless_app::project::canonical(p).unwrap()
 }
 
 /// A scan folder `name` under `dir` with a static room scan of `secs` seconds.
