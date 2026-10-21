@@ -37,6 +37,10 @@ struct Inner {
     cancelled: AtomicBool,
     state: Mutex<State>,
     sink: Option<Sink>,
+    /// Set once an observer is installed, so that [`Progress::phase`] and
+    /// [`Progress::advance`] (called per LiDAR frame) skip the snapshot copy and the lock
+    /// without one.
+    observed: AtomicBool,
     observer: RwLock<Option<Observer>>,
 }
 
@@ -81,6 +85,7 @@ impl Progress {
                     log: Vec::new(),
                 }),
                 sink,
+                observed: AtomicBool::new(false),
                 observer: RwLock::new(None),
             }),
         }
@@ -96,6 +101,7 @@ impl Progress {
             .observer
             .write()
             .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(f));
+        self.inner.observed.store(true, Ordering::Release);
         self
     }
 
@@ -104,6 +110,10 @@ impl Progress {
             .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn observed(&self) -> bool {
+        self.inner.observed.load(Ordering::Acquire)
     }
 
     fn notify(&self, snapshot: ProgressSnapshot) {
@@ -127,9 +137,11 @@ impl Progress {
                 done: 0,
                 total,
             };
-            s.snapshot.clone()
+            self.observed().then(|| s.snapshot.clone())
         };
-        self.notify(snapshot);
+        if let Some(snapshot) = snapshot {
+            self.notify(snapshot);
+        }
     }
 
     /// Counts `n` more items of the current phase as done.
@@ -137,9 +149,11 @@ impl Progress {
         let snapshot = {
             let mut s = self.state();
             s.snapshot.done = s.snapshot.done.saturating_add(n);
-            s.snapshot.clone()
+            self.observed().then(|| s.snapshot.clone())
         };
-        self.notify(snapshot);
+        if let Some(snapshot) = snapshot {
+            self.notify(snapshot);
+        }
     }
 
     fn log(&self, line: LogLine) {

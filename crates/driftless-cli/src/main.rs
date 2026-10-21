@@ -7,12 +7,11 @@ mod export_glim;
 mod inspect;
 mod map;
 mod odom;
-mod scan_input;
 mod slam;
-mod topics;
 mod view;
 
 use clap::{Parser, Subcommand};
+use driftless_io::progress::{LogLine, Progress};
 use std::process::ExitCode;
 
 /// The system allocator keeps the per-image buffers of `map` mapped (peak 9.9 GB on a 10 min
@@ -50,6 +49,14 @@ enum Command {
     /// Karte eines SLAM-Laufs: dichte Wolke (dense.las), bereinigt (clean.las, removed.las),
     /// eingefärbt (color.las, color.ply) und map.json; jeder Schritt einzeln startbar
     Map(map::Args),
+}
+
+/// Progress of a step on the console: messages to stdout, warnings as „Warnung: …“ to stderr.
+fn console() -> Progress {
+    Progress::with_log(|line| match line {
+        LogLine::Info(s) => println!("{s}"),
+        LogLine::Warning(s) => eprintln!("Warnung: {s}"),
+    })
 }
 
 fn main() -> ExitCode {

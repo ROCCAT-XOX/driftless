@@ -12,15 +12,13 @@
 //! on image edges. Writes `calib_check.json`
 //! and overlay images (PNG) of the best and the worst variant.
 
-use crate::scan_input::{parse_extrinsic, with_lidar_frames};
-use crate::topics::file_name;
-use driftless_io::bag::BagReader;
 use driftless_io::calib::{load_calibration_as, CalibReading, ImageRotation, MatrixDirection};
 use driftless_io::camera::Camera;
 use driftless_io::images::{for_each_image, RgbImage};
 use driftless_io::msg::LidarFrame;
 use driftless_io::project::discover_project;
 use driftless_odom::deskew::point_time_base;
+use driftless_steps::scan::{image_topics, parse_extrinsic, with_lidar_frames, IMAGE_TYPE};
 use driftless_traj::nalgebra::{Isometry3, Point3, Vector3};
 use driftless_traj::{interpolate_pose, read_tum};
 use rayon::prelude::*;
@@ -29,7 +27,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const IMAGE_TYPE: &str = "sensor_msgs/CompressedImage";
 /// Time offsets tested: `step / 100` s for every step (−0.20 … +0.20 s).
 pub const OFFSET_STEPS: std::ops::RangeInclusive<i32> = -20..=20;
 /// LiDAR points within this time (s) of an image are projected into it.
@@ -516,22 +513,6 @@ fn summarise(scores: &[Score]) -> (Summary, usize, usize) {
     (summary, best, worst)
 }
 
-/// All `sensor_msgs/CompressedImage` topics of the image bags, sorted.
-pub(crate) fn image_topics(bags: &[PathBuf]) -> Result<Vec<String>, String> {
-    let mut topics = BTreeSet::new();
-    for bag in bags {
-        let reader = BagReader::open(bag).map_err(|e| format!("{}: {e}", file_name(bag)))?;
-        topics.extend(
-            reader
-                .connections()
-                .iter()
-                .filter(|c| c.msg_type == IMAGE_TYPE)
-                .map(|c| c.topic.clone()),
-        );
-    }
-    Ok(topics.into_iter().collect())
-}
-
 pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.images == 0 {
         return Err("--images muss mindestens 1 sein".into());
@@ -649,39 +630,45 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     shots.sort_by(|a, b| a.stamp.total_cmp(&b.stamp).then(a.camera.cmp(&b.camera)));
 
     // LiDAR points of ±POINT_WINDOW around each image, in the world frame.
-    let ((), _) = with_lidar_frames(&project.lidar_bags, args.lidar_topic.as_deref(), |frames| {
-        for frame in frames {
-            let points = scan_points(&frame);
-            let (Some(t0), Some(t1)) = (
-                points.iter().map(|p| p.t).reduce(f64::min),
-                points.iter().map(|p| p.t).reduce(f64::max),
-            ) else {
-                continue;
-            };
-            let near: Vec<usize> = (0..shots.len())
-                .filter(|&k| {
-                    t1 >= shots[k].stamp - POINT_WINDOW && t0 <= shots[k].stamp + POINT_WINDOW
-                })
-                .collect();
-            if near.is_empty() {
-                continue;
-            }
-            for p in &points {
-                let Some(pose) = interpolate_pose(&traj, p.t) else {
+    let progress = crate::console();
+    let ((), _) = with_lidar_frames(
+        &project.lidar_bags,
+        args.lidar_topic.as_deref(),
+        &progress,
+        |frames| {
+            for frame in frames {
+                let points = scan_points(&frame);
+                let (Some(t0), Some(t1)) = (
+                    points.iter().map(|p| p.t).reduce(f64::min),
+                    points.iter().map(|p| p.t).reduce(f64::max),
+                ) else {
                     continue;
                 };
-                let w = pose * lidar_to_imu * Point3::from(p.xyz);
-                for &k in &near {
-                    if (p.t - shots[k].stamp).abs() <= POINT_WINDOW {
-                        shots[k].points.push(WorldPoint {
-                            p: [w.x as f32, w.y as f32, w.z as f32],
-                            edge: p.edge,
-                        });
+                let near: Vec<usize> = (0..shots.len())
+                    .filter(|&k| {
+                        t1 >= shots[k].stamp - POINT_WINDOW && t0 <= shots[k].stamp + POINT_WINDOW
+                    })
+                    .collect();
+                if near.is_empty() {
+                    continue;
+                }
+                for p in &points {
+                    let Some(pose) = interpolate_pose(&traj, p.t) else {
+                        continue;
+                    };
+                    let w = pose * lidar_to_imu * Point3::from(p.xyz);
+                    for &k in &near {
+                        if (p.t - shots[k].stamp).abs() <= POINT_WINDOW {
+                            shots[k].points.push(WorldPoint {
+                                p: [w.x as f32, w.y as f32, w.z as f32],
+                                edge: p.edge,
+                            });
+                        }
                     }
                 }
             }
-        }
-    })?;
+        },
+    )?;
 
     // Score every (image, variant) pair; fixed order, so the result is deterministic.
     let vars = variants(readings.len());

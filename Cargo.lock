@@ -1072,10 +1072,10 @@ dependencies = [
  "driftless-map",
  "driftless-odom",
  "driftless-slam",
+ "driftless-steps",
  "driftless-traj",
  "jpeg-encoder",
  "las",
- "libc",
  "mimalloc",
  "png",
  "predicates",
@@ -1083,7 +1083,6 @@ dependencies = [
  "rerun",
  "serde",
  "serde_json",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1149,6 +1148,23 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "driftless-steps"
+version = "0.1.0"
+dependencies = [
+ "driftless-io",
+ "driftless-map",
+ "driftless-odom",
+ "driftless-slam",
+ "driftless-traj",
+ "las",
+ "libc",
+ "serde",
+ "serde_json",
+ "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

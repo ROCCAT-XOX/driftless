@@ -1,0 +1,1114 @@
+//! The map of a SLAM run in three steps, each with its own files in the output folder:
+//!
+//! - **dense**: dense cloud from the corrected `traj.tum` → `dense.las`, `dense.bin`
+//! - **clean**: ghosts, points seen through windows and outliers removed → `clean.las`,
+//!   `removed.las`, `clean.bin`
+//! - **color**: coloured from the camera images → `color.las`, `color.ply`
+//!
+//! plus `map.json` (settings, statistics and runtimes of the steps, peak memory, and under
+//! `stale` the files of earlier runs that no longer fit; they get a warning, nothing is ever
+//! deleted).
+//!
+//! The requested step always runs; the step before it is taken from its `*.bin` in the folder
+//! if that was written for the same input and settings (input id as in `submaps.bin`), and
+//! rebuilt otherwise. The `*.bin` files hold the cloud at full precision with the frame index
+//! of every point (and, in `dense.bin`, the sensor rays the cleaning needs); LAS rounds
+//! coordinates and intensity and has no frame column, so it is export only.
+//!
+//! The trajectory is read from the SLAM folder; the results go to the output folder (the CLI
+//! uses the SLAM folder for both).
+
+use crate::error::{check_cancel, failed, StepError};
+use crate::scan::{image_topics, read_imu, warn_if_not_static, with_lidar_frames, IMAGE_TYPE};
+use crate::slam::SlamSettings;
+use driftless_io::calib::load_calibration;
+use driftless_io::camera::Camera;
+use driftless_io::progress::Progress;
+use driftless_io::project::{discover_project, Project};
+use driftless_map::{
+    build_dense, clean_with, colorize_with, content_hash, load_stage, save_stage, write_las,
+    write_ply, write_removed_las, CleanConfig, CleanStats, Cloud, ColorCamera, ColorConfig,
+    ColorStats, DenseConfig, DenseStats, ExposureConfig, ImageSource, RaySource, SmoothConfig,
+    StageError,
+};
+use driftless_odom::OdomConfig;
+use driftless_traj::{read_tum, Pose};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+type BoxError = Box<dyn std::error::Error>;
+
+const DENSE_BIN: &str = "dense.bin";
+const CLEAN_BIN: &str = "clean.bin";
+/// Part of the clean step's input id: raised whenever the cleaning gives another result
+/// (or other files) for the same settings, so an older `clean.bin` / `removed.las` is
+/// rebuilt instead of reused. 2: removal reasons in `removed.las`, points seen through
+/// windows. 3: kept points projected onto their local plane (thinner walls).
+const CLEAN_VERSION: u32 = 3;
+/// Part of the color step's input id, raised like [`CLEAN_VERSION`] whenever the colouring
+/// gives another result for the same settings. 2: image sharpness divided by the mean gray
+/// value, not its square.
+const COLOR_VERSION: u32 = 2;
+pub const REPORT: &str = "map.json";
+
+/// Which step to run (the ones before it are taken from the folder if they fit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MapStep {
+    Dense,
+    Clean,
+    Color,
+    All,
+}
+
+/// The settings of a map folder: what `map.json` records under `settings` and the CLI
+/// switches set. `Default` = the defaults of `driftless map`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapSwitches {
+    /// Remove ghosts (moving things).
+    pub ghosts: bool,
+    /// Remove outliers.
+    pub outliers: bool,
+    /// Remove points measured through windows.
+    pub through: bool,
+    /// Flatten walls onto their local plane.
+    pub smooth: bool,
+    /// Devalue highlights when colouring (experimental).
+    pub highlights: bool,
+    /// Estimate the edge falloff of the cameras.
+    pub vignetting: bool,
+    /// Voxel size of the dense cloud (m).
+    pub voxel: f64,
+    /// Decode images downscaled: 1, 2 or 4.
+    pub downscale: u32,
+}
+
+impl Default for MapSwitches {
+    fn default() -> Self {
+        MapSwitches {
+            ghosts: true,
+            outliers: true,
+            through: true,
+            smooth: true,
+            highlights: false,
+            vignetting: true,
+            voxel: DenseConfig::default().voxel,
+            downscale: ColorConfig::default().downscale,
+        }
+    }
+}
+
+impl MapSwitches {
+    /// Fails with the message of the CLI option that is out of range.
+    pub fn check(&self) -> Result<(), StepError> {
+        if !matches!(self.downscale, 1 | 2 | 4) {
+            return Err("--downscale muss 1, 2 oder 4 sein".into());
+        }
+        if !(self.voxel.is_finite() && self.voxel > 0.0) {
+            return Err("--voxel: Voxelgröße muss größer als 0 sein".into());
+        }
+        Ok(())
+    }
+
+    /// The switches recorded in `map.json` (the whole file); `None` if they are missing.
+    pub fn from_map_json(map_json: &Value) -> Option<Self> {
+        let s = &map_json["settings"];
+        Some(MapSwitches {
+            ghosts: s["clean"]["ghosts"].as_bool()?,
+            outliers: s["clean"]["outliers"].as_bool()?,
+            through: s["clean"]["through"].as_bool()?,
+            smooth: s["clean"]["smooth"]["enabled"].as_bool()?,
+            highlights: s["color"]["highlights"].as_bool()?,
+            vignetting: s["color"]["exposure"]["vignetting"].as_bool()?,
+            voxel: s["dense"]["voxel"].as_f64()?,
+            downscale: u32::try_from(s["color"]["downscale"].as_u64()?).ok()?,
+        })
+    }
+
+    fn dense_config(&self) -> DenseConfig {
+        DenseConfig {
+            voxel: self.voxel,
+            ..DenseConfig::default()
+        }
+    }
+
+    fn clean_config(&self) -> CleanConfig {
+        CleanConfig {
+            ghosts: self.ghosts,
+            outliers: self.outliers,
+            through: self.through,
+            smooth: SmoothConfig {
+                enabled: self.smooth,
+                ..SmoothConfig::default()
+            },
+            ..CleanConfig::default()
+        }
+    }
+
+    fn color_config(&self) -> ColorConfig {
+        ColorConfig {
+            downscale: self.downscale,
+            highlights: self.highlights,
+            exposure: ExposureConfig {
+                vignetting: self.vignetting,
+                ..ExposureConfig::default()
+            },
+            ..ColorConfig::default()
+        }
+    }
+}
+
+/// Step and switches of one map run. `Default` = `driftless map` without options.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapSettings {
+    pub step: MapStep,
+    pub switches: MapSwitches,
+}
+
+impl Default for MapSettings {
+    fn default() -> Self {
+        MapSettings {
+            step: MapStep::All,
+            switches: MapSwitches::default(),
+        }
+    }
+}
+
+impl MapSettings {
+    /// Fails with the message of the CLI option that is out of range.
+    pub fn check(&self) -> Result<(), StepError> {
+        self.switches.check()
+    }
+}
+
+/// What a map is made from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MapInput {
+    /// Scan folder (with LIDAR_*.bag; for colouring also IMAGE_*.bag and the calibration).
+    pub scan: PathBuf,
+    /// SLAM folder: `traj.tum` is read from it.
+    pub slam_dir: PathBuf,
+    pub slam: SlamSettings,
+    pub map: MapSettings,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MapRequest {
+    pub input: MapInput,
+    /// Where the results go (and where earlier ones are reused from).
+    pub out_dir: PathBuf,
+}
+
+/// Names and sizes of `bags`, one per line.
+fn bag_list(bags: &[PathBuf]) -> Result<String, String> {
+    let mut s = String::new();
+    for bag in bags {
+        let name = bag
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        let len = fs::metadata(bag)
+            .map_err(|e| format!("{} nicht lesbar: {e}", bag.display()))?
+            .len();
+        s += &format!("{name} {len}\n");
+    }
+    Ok(s)
+}
+
+/// Everything colouring needs besides the cloud and the trajectory.
+struct ColorInput {
+    images: ImageSource,
+    cams: Vec<ColorCamera>,
+    /// Image bags, topics and calibration, for the input id.
+    id: String,
+}
+
+/// The camera images and mounts of the scan, or why the scan cannot be coloured (German).
+fn color_input(
+    scan: &Path,
+    project: &Project,
+    lidar_to_imu: &driftless_traj::nalgebra::Isometry3<f64>,
+    progress: &Progress,
+) -> Result<ColorInput, String> {
+    if project.image_bags.is_empty() {
+        return Err(format!(
+            "keine Kamerabilder: {} enthält keine IMAGE_*.bag",
+            scan.display()
+        ));
+    }
+    let calib_path = project.calibration.as_ref().ok_or_else(|| {
+        format!(
+            "keine Kalibrierung: {} fehlt",
+            scan.join("calibration").join("calib.json").display()
+        )
+    })?;
+    let calib_bytes = fs::read(calib_path)
+        .map_err(|e| format!("Kalibrierung {} nicht lesbar: {e}", calib_path.display()))?;
+    let calib = load_calibration(calib_path)
+        .map_err(|e| format!("Kalibrierung {}: {e}", calib_path.display()))?;
+    let mut cams = Vec::new();
+    for (name, c) in &calib.cameras {
+        let Some(lidar_to_cam) = c.lidar_to_cam else {
+            progress.warn(format!(
+                "Kamera {name} hat keine transform_matrix, übersprungen"
+            ));
+            continue;
+        };
+        let camera = Camera::from_calib(name, c).map_err(|e| format!("Kamera {name}: {e}"))?;
+        cams.push(ColorCamera::new(camera, &lidar_to_cam, lidar_to_imu));
+    }
+    if cams.is_empty() {
+        return Err("keine Kamera mit transform_matrix in calib.json".into());
+    }
+    let topics = image_topics(&project.image_bags)?;
+    if topics.is_empty() {
+        return Err(format!(
+            "keine Kamerabilder ({IMAGE_TYPE}) in den IMAGE_*.bag"
+        ));
+    }
+    let id = format!(
+        "images\n{}topics {topics:?}\ncalib {:016x} {}\n",
+        bag_list(&project.image_bags)?,
+        content_hash(&calib_bytes),
+        calib_bytes.len()
+    );
+    Ok(ColorInput {
+        images: ImageSource {
+            bags: project.image_bags.clone(),
+            topics,
+        },
+        cams,
+        id,
+    })
+}
+
+/// Input ids of the steps: each one includes the one before.
+struct Ids {
+    dense: String,
+    clean: String,
+    /// `None` if the scan cannot be coloured.
+    color: Option<String>,
+}
+
+fn hex(id: &str) -> String {
+    format!("{:016x}", content_hash(id.as_bytes()))
+}
+
+/// Input id of the dense step: LiDAR bags, topics, odometry, trajectory and dense settings.
+fn dense_id(
+    project: &Project,
+    slam: &SlamSettings,
+    odom: &OdomConfig,
+    traj_bytes: &[u8],
+    dense_cfg: &DenseConfig,
+) -> Result<String, String> {
+    Ok(format!(
+        "driftless {} map dense\n{}lidar_topic {:?}\nimu_topic {:?}\n{odom:?}\ntraj {:016x} {}\n\
+         {dense_cfg:?}\n",
+        env!("CARGO_PKG_VERSION"),
+        bag_list(&project.lidar_bags)?,
+        slam.lidar_topic,
+        slam.imu_topic,
+        content_hash(traj_bytes),
+        traj_bytes.len(),
+    ))
+}
+
+/// Peak resident memory of this process so far (bytes), if the platform reports it.
+#[cfg(unix)]
+fn peak_rss_bytes() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage fills the struct for RUSAGE_SELF; an all-zero rusage is valid.
+    let usage = unsafe {
+        if libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) != 0 {
+            return None;
+        }
+        usage.assume_init()
+    };
+    let max = u64::try_from(usage.ru_maxrss).ok()?;
+    // macOS reports bytes, Linux and the BSDs kibibytes.
+    Some(if cfg!(target_os = "macos") {
+        max
+    } else {
+        max * 1024
+    })
+}
+
+#[cfg(windows)]
+fn peak_rss_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: an all-zero PROCESS_MEMORY_COUNTERS is valid; the call writes at most `cb` bytes
+    // into it for the pseudo handle of this process.
+    unsafe {
+        let mut c: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        (GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0)
+            .then_some(c.PeakWorkingSetSize as u64)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn peak_rss_bytes() -> Option<u64> {
+    None
+}
+
+fn dense_json(s: &DenseStats) -> Value {
+    json!({
+        "frames": s.frames,
+        "points_in_range": s.points_in_range,
+        "points": s.points,
+        "rays": s.rays,
+        "odom": {
+            "frames_in": s.odom.frames_in,
+            "frames_used": s.odom.frames_used,
+            "frames_skipped": s.odom.frames_skipped,
+            "icp_failures": s.odom.icp_failures,
+            "static_start": s.odom.static_start,
+        },
+    })
+}
+
+fn clean_json(s: &CleanStats) -> Value {
+    json!({
+        "kept": s.kept,
+        "ghosts": s.ghosts,
+        "through": s.through,
+        "outliers": s.outliers,
+        "smooth": {
+            "moved": s.smooth.moved,
+            "mean_shift": s.smooth.mean_shift,
+            "thickness_before": s.smooth.thickness_before,
+            "thickness_after": s.smooth.thickness_after,
+        },
+    })
+}
+
+/// Warnings about a colour run that the user should see (German, without the "Warnung: ").
+fn color_warnings(s: &ColorStats) -> Vec<String> {
+    let mut out = Vec::new();
+    if s.image_bags_truncated > 0 {
+        out.push(format!(
+            "{} Bilddatei(en) sind abgeschnitten, die Bilder bis dahin wurden genutzt",
+            s.image_bags_truncated
+        ));
+    }
+    let cameras: BTreeSet<&str> = s.gains.iter().map(|g| g.camera.as_str()).collect();
+    if cameras.len() > 1 && s.camera_difference_points == 0 {
+        out.push(
+            "die Kameras sehen keine gemeinsamen Punkte, Belichtung zwischen ihnen nicht \
+             abgeglichen"
+                .into(),
+        );
+    }
+    // More than 1 % of the images.
+    if s.images_gain_clamped * 100 > s.images_used {
+        out.push(format!(
+            "{} Bilder ({:.0} %) stoßen an die Grenze des Belichtungsabgleichs",
+            s.images_gain_clamped,
+            100.0 * s.images_gain_clamped as f64 / s.images_used.max(1) as f64
+        ));
+    }
+    out
+}
+
+/// Colour statistics with the gains summarised per camera (count, smallest, largest and mean
+/// gain per channel) instead of one entry per image; `cameras` names the cameras in the order
+/// of the edge falloff.
+fn color_json(s: &ColorStats, cameras: &[&str]) -> Value {
+    struct Sum {
+        n: usize,
+        min: [f32; 3],
+        max: [f32; 3],
+        sum: [f64; 3],
+    }
+    let mut per: BTreeMap<&str, Sum> = BTreeMap::new();
+    for g in &s.gains {
+        let e = per.entry(&g.camera).or_insert(Sum {
+            n: 0,
+            min: [f32::INFINITY; 3],
+            max: [f32::NEG_INFINITY; 3],
+            sum: [0.0; 3],
+        });
+        e.n += 1;
+        for c in 0..3 {
+            e.min[c] = e.min[c].min(g.gain[c]);
+            e.max[c] = e.max[c].max(g.gain[c]);
+            e.sum[c] += f64::from(g.gain[c]);
+        }
+    }
+    let per_camera: serde_json::Map<String, Value> = per
+        .into_iter()
+        .map(|(name, e)| {
+            let mean = e.sum.map(|v| v / e.n as f64);
+            (
+                name.to_string(),
+                json!({"images": e.n, "min": e.min, "max": e.max, "mean": mean}),
+            )
+        })
+        .collect();
+    let vignetting: serde_json::Map<String, Value> = cameras
+        .iter()
+        .zip(&s.vignetting.coeffs)
+        .map(|(name, c)| (name.to_string(), json!(c)))
+        .collect();
+    let points = s.points_colored + s.points_uncolored;
+    json!({
+        "images_used": s.images_used,
+        "images_blurry": s.images_blurry,
+        "images_outside_trajectory": s.images_outside_trajectory,
+        "images_bad": s.images_bad,
+        "sharpness_brightness_rank_corr": s.sharpness_brightness_rank_corr,
+        "views_rejected": s.views_rejected,
+        "points_with_rejected": s.points_with_rejected,
+        "views_rim_excluded": s.views_rim_excluded,
+        "floor_highlight_share_before": s.floor_highlight_share_before,
+        "floor_highlight_share_after": s.floor_highlight_share_after,
+        "seam_jump_before": s.seam_jump_before,
+        "seam_jump_after": s.seam_jump_after,
+        "image_bags_truncated": s.image_bags_truncated,
+        "points_colored": s.points_colored,
+        "points_uncolored": s.points_uncolored,
+        "colored_share": if points == 0 { 0.0 } else { s.points_colored as f64 / points as f64 },
+        "gains": {
+            "images": s.gains.len(),
+            "min": s.gain_min,
+            "max": s.gain_max,
+            "per_camera": per_camera,
+            "clamped_images": s.images_gain_clamped,
+        },
+        "vignetting": vignetting,
+        "vignette_residual_before": s.vignette_residual_before,
+        "vignette_residual_after": s.vignette_residual_after,
+        "spread_before": s.spread_before,
+        "spread_after": s.spread_after,
+        "camera_difference_before": s.camera_difference_before,
+        "camera_difference_after": s.camera_difference_after,
+        "camera_difference_points": s.camera_difference_points,
+        "image_offset_before": s.image_offset_before,
+        "image_offset_after": s.image_offset_after,
+    })
+}
+
+fn settings_json(
+    slam: &SlamSettings,
+    odom: &OdomConfig,
+    d: &DenseConfig,
+    c: &CleanConfig,
+    k: &ColorConfig,
+) -> Value {
+    let t = odom.lidar_to_imu.translation.vector;
+    let q = odom.lidar_to_imu.rotation.quaternion();
+    json!({
+        "lidar_to_imu": [t.x, t.y, t.z, q.i, q.j, q.k, q.w],
+        "lidar_topic": slam.lidar_topic,
+        "imu_topic": slam.imu_topic,
+        "dense": {
+            "voxel": d.voxel,
+            "min_range": d.min_range,
+            "max_range": d.max_range,
+            "ray_step": d.ray_step,
+        },
+        "clean": {
+            "ghosts": c.ghosts,
+            "outliers": c.outliers,
+            "through": c.through,
+            "ghost_voxel": c.ghost_voxel,
+            "ghost_ratio": c.ghost_ratio,
+            "min_passes": c.min_passes,
+            "outlier_k": c.outlier_k,
+            "outlier_sigma": c.outlier_sigma,
+            "window_reach": c.window_reach,
+            "through_beyond": c.through_beyond,
+            "smooth": {
+                "enabled": c.smooth.enabled,
+                "radius": c.smooth.radius,
+                "max_neighbours": c.smooth.max_neighbours,
+                "min_neighbours": c.smooth.min_neighbours,
+                "planarity": c.smooth.planarity,
+                "max_shift": c.smooth.max_shift,
+            },
+        },
+        "color": {
+            "downscale": k.downscale,
+            "time_offset": k.time_offset,
+            "max_dist": k.max_dist,
+            "depth_tolerance": k.depth_tolerance,
+            "zbuffer_scale": k.zbuffer_scale,
+            "min_sharpness": k.min_sharpness,
+            "max_angular_rate": k.max_angular_rate,
+            "views_kept": k.views_kept,
+            "views_blended": k.views_blended,
+            "view_gap": k.view_gap,
+            "highlights": k.highlights,
+            "highlight_ratio": k.highlight_ratio,
+            "highlight_abs": k.highlight_abs,
+            "rim_theta": k.rim_theta,
+            "exposure": {
+                "smooth": k.exposure.smooth,
+                "max_gain": k.exposure.max_gain,
+                "samples": k.exposure.samples,
+                "vignetting": k.exposure.vignetting,
+            },
+        },
+    })
+}
+
+/// One map run: inputs, settings and the `map.json` entries of the steps.
+struct MapRun<'a> {
+    input: &'a MapInput,
+    progress: &'a Progress,
+    project: Project,
+    out: PathBuf,
+    poses: Vec<Pose>,
+    odom: OdomConfig,
+    dense_cfg: DenseConfig,
+    clean_cfg: CleanConfig,
+    color_cfg: ColorConfig,
+    ids: Ids,
+    /// `map.json` of an earlier run (`Null` if there is none).
+    previous: Value,
+    steps: BTreeMap<&'static str, Value>,
+}
+
+fn seconds(start: Instant) -> f64 {
+    (start.elapsed().as_secs_f64() * 1000.0).round() / 1000.0
+}
+
+impl MapRun<'_> {
+    fn path(&self, file: &str) -> PathBuf {
+        self.out.join(file)
+    }
+
+    /// Last check before a step writes its files; creates the output folder.
+    fn ready_to_write(&self) -> Result<(), StepError> {
+        check_cancel(self.progress)?;
+        fs::create_dir_all(&self.out)
+            .map_err(|e| format!("{} nicht anlegbar: {e}", self.out.display()))?;
+        Ok(())
+    }
+
+    /// Entry of a step that ran now.
+    fn record(
+        &mut self,
+        step: &'static str,
+        id: &str,
+        start: Instant,
+        stats: Value,
+        files: &[&str],
+    ) {
+        self.steps.insert(
+            step,
+            json!({
+                "input_id": hex(id),
+                "reused": false,
+                "seconds": seconds(start),
+                "peak_rss_bytes_after": peak_rss_bytes(),
+                "files": files,
+                "stats": stats,
+            }),
+        );
+    }
+
+    /// The earlier entry of `step` if it was written for input `id`.
+    fn previous_entry(&self, step: &str, id: &str) -> Option<Value> {
+        let e = &self.previous["steps"][step];
+        (e["input_id"].as_str() == Some(hex(id).as_str())).then(|| e.clone())
+    }
+
+    /// Entry of a step whose result was taken from the folder.
+    fn record_reused(&mut self, step: &'static str, id: &str) {
+        let mut e = self
+            .previous_entry(step, id)
+            .unwrap_or_else(|| json!({"input_id": hex(id)}));
+        e["reused"] = json!(true);
+        self.steps.insert(step, e);
+    }
+
+    /// Loads the stage `file` for `id` (with rays if `rays`); `None` (with a message why) if
+    /// it does not fit.
+    fn try_reuse(
+        &self,
+        label: &str,
+        file: &str,
+        id: &str,
+        rays: bool,
+    ) -> Option<(Cloud, Option<RaySource>)> {
+        let info = |m: String| self.progress.info(m);
+        match load_stage(&self.path(file), id) {
+            Ok((_, None)) if rays => {
+                info(format!(
+                    "{label}: {file} hat keine Strahlen, wird neu erzeugt"
+                ));
+                None
+            }
+            Ok(stage) => {
+                info(format!(
+                    "{label}: {file} wiederverwendet ({} Punkte)",
+                    stage.0.len()
+                ));
+                Some(stage)
+            }
+            Err(StageError::Missing(_)) => {
+                info(format!("{label}: {file} fehlt, wird erzeugt"));
+                None
+            }
+            Err(e) => {
+                info(format!("{label}: {file} {e}, wird neu erzeugt"));
+                None
+            }
+        }
+    }
+
+    fn run_dense(&mut self) -> Result<(Cloud, RaySource), StepError> {
+        let start = Instant::now();
+        let bags = &self.project.lidar_bags;
+        let slam = &self.input.slam;
+        let (imu, _) = read_imu(bags, slam.imu_topic.as_deref(), self.progress)?;
+        let (dense, _) =
+            with_lidar_frames(bags, slam.lidar_topic.as_deref(), self.progress, |frames| {
+                build_dense(frames, &imu, &self.odom, &self.poses, &self.dense_cfg)
+            })?;
+        // After a cancel the frames stopped early and the cloud does not fit the poses.
+        check_cancel(self.progress)?;
+        let (cloud, rays, stats) = dense?;
+        drop(imu);
+        warn_if_not_static(&stats.odom, self.progress);
+        self.ready_to_write()?;
+        let write = || -> Result<(), BoxError> {
+            write_las(&self.path("dense.las"), &cloud)?;
+            save_stage(&self.path(DENSE_BIN), &self.ids.dense, &cloud, Some(&rays))
+                .map_err(|e| format!("{DENSE_BIN} nicht schreibbar: {e}"))?;
+            Ok(())
+        };
+        write()?;
+        self.progress.info(format!(
+            "Dicht: {} Punkte aus {} Frames ({} im Messbereich, {} Strahlen), {:.1} s → dense.las",
+            stats.points,
+            stats.frames,
+            stats.points_in_range,
+            stats.rays,
+            start.elapsed().as_secs_f64()
+        ));
+        let id = self.ids.dense.clone();
+        self.record(
+            "dense",
+            &id,
+            start,
+            dense_json(&stats),
+            &["dense.las", DENSE_BIN],
+        );
+        Ok((cloud, rays))
+    }
+
+    /// The dense cloud from `dense.bin` if it fits, else computed.
+    fn dense_input(&mut self) -> Result<(Cloud, RaySource), StepError> {
+        let id = self.ids.dense.clone();
+        if let Some((cloud, Some(rays))) = self.try_reuse("Dicht", DENSE_BIN, &id, true) {
+            self.record_reused("dense", &id);
+            return Ok((cloud, rays));
+        }
+        self.run_dense()
+    }
+
+    fn run_clean(&mut self, cloud: Cloud, rays: RaySource) -> Result<Cloud, StepError> {
+        let start = Instant::now();
+        let (kept, removed, reasons, stats) =
+            clean_with(cloud, &rays, &self.clean_cfg, self.progress)?;
+        drop(rays);
+        self.ready_to_write()?;
+        let write = || -> Result<(), BoxError> {
+            write_las(&self.path("clean.las"), &kept)?;
+            write_removed_las(&self.path("removed.las"), &removed, &reasons)?;
+            Ok(())
+        };
+        write()?;
+        drop(removed);
+        save_stage(&self.path(CLEAN_BIN), &self.ids.clean, &kept, None)
+            .map_err(|e| format!("{CLEAN_BIN} nicht schreibbar: {e}"))?;
+        let smooth = if self.clean_cfg.smooth.enabled {
+            let sm = &stats.smooth;
+            format!(
+                "; Wände geglättet: {} Punkte um im Mittel {:.1} mm verschoben, Wanddicke \
+                 {:.1} → {:.1} mm",
+                sm.moved,
+                1000.0 * sm.mean_shift,
+                1000.0 * sm.thickness_before,
+                1000.0 * sm.thickness_after
+            )
+        } else {
+            String::new()
+        };
+        self.progress.info(format!(
+            "Bereinigt: {} Punkte behalten, entfernt {} Geister, {} Durchblick und {} \
+             Ausreißer{smooth}, {:.1} s → clean.las, removed.las",
+            stats.kept,
+            stats.ghosts,
+            stats.through,
+            stats.outliers,
+            start.elapsed().as_secs_f64()
+        ));
+        let id = self.ids.clean.clone();
+        self.record(
+            "clean",
+            &id,
+            start,
+            clean_json(&stats),
+            &["clean.las", "removed.las", CLEAN_BIN],
+        );
+        Ok(kept)
+    }
+
+    /// The cleaned cloud from `clean.bin` if it fits, else computed (from a fitting
+    /// `dense.bin` or from scratch).
+    fn clean_input(&mut self) -> Result<Cloud, StepError> {
+        let id = self.ids.clean.clone();
+        if let Some((cloud, _)) = self.try_reuse("Bereinigt", CLEAN_BIN, &id, false) {
+            self.record_reused("clean", &id);
+            return Ok(cloud);
+        }
+        let (cloud, rays) = self.dense_input()?;
+        self.run_clean(cloud, rays)
+    }
+
+    fn run_color(&mut self, mut cloud: Cloud, input: ColorInput) -> Result<(), StepError> {
+        let start = Instant::now();
+        let stats = colorize_with(
+            &mut cloud,
+            input.images,
+            &self.poses,
+            &input.cams,
+            &self.color_cfg,
+            self.progress,
+        )?;
+        self.ready_to_write()?;
+        for w in color_warnings(&stats) {
+            self.progress.warn(w);
+        }
+        let write = || -> Result<(), BoxError> {
+            write_las(&self.path("color.las"), &cloud)?;
+            write_ply(&self.path("color.ply"), &cloud)?;
+            Ok(())
+        };
+        write()?;
+        let share = 100.0 * stats.points_colored as f64 / cloud.len().max(1) as f64;
+        self.progress.info(format!(
+            "Eingefärbt: {share:.1} % der {} Punkte; Bilder {} genutzt, {} unscharf, {} außerhalb \
+             der Laufbahn, {} kaputt; Belichtung {:.2}–{:.2}, {:.1} s → color.las, color.ply",
+            cloud.len(),
+            stats.images_used,
+            stats.images_blurry,
+            stats.images_outside_trajectory,
+            stats.images_bad,
+            stats.gain_min,
+            stats.gain_max,
+            start.elapsed().as_secs_f64()
+        ));
+        self.progress.info(format!(
+            "Farbqualität: {} Glanzansichten verworfen ({} Punkte), {} Randansichten ausgelassen; \
+             Bodenglanz {:.1} → {:.1} %, Nahtsprung {:.1} → {:.1}, Randabfall {:.1} → {:.1} %",
+            stats.views_rejected,
+            stats.points_with_rejected,
+            stats.views_rim_excluded,
+            100.0 * stats.floor_highlight_share_before,
+            100.0 * stats.floor_highlight_share_after,
+            stats.seam_jump_before,
+            stats.seam_jump_after,
+            stats.vignette_residual_before,
+            stats.vignette_residual_after
+        ));
+        let id = self.ids.color.clone().expect("colour input exists");
+        let names: Vec<&str> = input.cams.iter().map(|c| c.camera.name.as_str()).collect();
+        self.record(
+            "color",
+            &id,
+            start,
+            color_json(&stats, &names),
+            &["color.las", "color.ply"],
+        );
+        Ok(())
+    }
+}
+
+/// Output files of each step, and the file of the step before it that they are made from.
+const STEP_FILES: [(&str, &[&str], &str); 3] = [
+    ("dense", &["dense.las", DENSE_BIN], "traj.tum"),
+    (
+        "clean",
+        &["clean.las", "removed.las", CLEAN_BIN],
+        "dense.las",
+    ),
+    ("color", &["color.las", "color.ply"], "clean.las"),
+];
+
+/// Output files in `out` of steps that have no current entry in `steps` (not run and no
+/// longer fitting, or skipped): they are from an earlier run. Nothing is deleted; each group
+/// gets a warning. Returns their names, in step order.
+fn warn_stale(
+    out: &Path,
+    steps: &BTreeMap<&'static str, Value>,
+    progress: &Progress,
+) -> Vec<String> {
+    let mut stale = Vec::new();
+    for (step, files, source) in STEP_FILES {
+        let current = steps.get(step).is_some_and(|e| e.get("skipped").is_none());
+        if current {
+            continue;
+        }
+        let found: Vec<&str> = files
+            .iter()
+            .copied()
+            .filter(|f| out.join(f).exists())
+            .collect();
+        if found.is_empty() {
+            continue;
+        }
+        let verb = if found.len() == 1 {
+            "stammt"
+        } else {
+            "stammen"
+        };
+        let fits = if found.len() == 1 { "passt" } else { "passen" };
+        progress.warn(format!(
+            "{} {verb} aus einem früheren Lauf und {fits} nicht mehr zu {source}",
+            found.join(", ")
+        ));
+        stale.extend(found.iter().map(|f| f.to_string()));
+    }
+    stale
+}
+
+/// Reads the trajectory of the SLAM folder: its bytes (for the input id) and its poses.
+fn read_traj(slam_dir: &Path) -> Result<(Vec<u8>, Vec<Pose>), String> {
+    let traj_path = slam_dir.join("traj.tum");
+    let traj_bytes = fs::read(&traj_path).map_err(|e| {
+        format!(
+            "Laufbahn {} nicht lesbar: {e}; zuerst `driftless slam <scan> -o <ziel>` laufen lassen",
+            traj_path.display()
+        )
+    })?;
+    let poses =
+        read_tum(&traj_path).map_err(|e| format!("Laufbahn {}: {e}", traj_path.display()))?;
+    Ok((traj_bytes, poses))
+}
+
+/// Whether `dir` holds a map of `input`: its `map.json` has the same switches (the step does
+/// not matter) and a dense entry for the current LiDAR bags, odometry settings and
+/// trajectory.
+pub fn folder_fits(input: &MapInput, dir: &Path) -> bool {
+    let fits = || -> Option<bool> {
+        let text = fs::read_to_string(dir.join(REPORT)).ok()?;
+        let report: Value = serde_json::from_str(&text).ok()?;
+        if MapSwitches::from_map_json(&report)? != input.map.switches {
+            return Some(false);
+        }
+        let odom = input.slam.config().ok()?.odom;
+        let project = discover_project(&input.scan).ok()?;
+        let traj_bytes = fs::read(input.slam_dir.join("traj.tum")).ok()?;
+        let dense_cfg = input.map.switches.dense_config();
+        let id = dense_id(&project, &input.slam, &odom, &traj_bytes, &dense_cfg).ok()?;
+        Some(report["steps"]["dense"]["input_id"].as_str() == Some(hex(&id).as_str()))
+    };
+    fits().unwrap_or(false)
+}
+
+/// Runs the map as `driftless map` does; every console line goes to `progress` in the same
+/// order. Returns the `map.json` written to [`MapRequest::out_dir`].
+///
+/// A cancel is honoured before each step writes its files: a cancelled step writes nothing,
+/// steps finished before it keep their files, `map.json` is not written.
+pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError> {
+    let start = Instant::now();
+    let input = &req.input;
+    let switches = &input.map.switches;
+    input.map.check()?;
+    // The odometry exactly as `driftless slam` runs it.
+    let odom = input.slam.config()?.odom;
+    let project = discover_project(&input.scan).map_err(failed)?;
+
+    // Colouring is checked first: step color must fail before any work.
+    let step = input.map.step;
+    let wants_color = matches!(step, MapStep::Color | MapStep::All);
+    let color = if wants_color {
+        color_input(&input.scan, &project, &odom.lidar_to_imu, progress)
+    } else {
+        Err(String::new())
+    };
+    if let (MapStep::Color, Err(why)) = (step, &color) {
+        return Err(why.clone().into());
+    }
+
+    let (traj_bytes, poses) = read_traj(&input.slam_dir)?;
+    let dense_cfg = switches.dense_config();
+    let clean_cfg = switches.clean_config();
+    let color_cfg = switches.color_config();
+    let dense_id = dense_id(&project, &input.slam, &odom, &traj_bytes, &dense_cfg)?;
+    let clean_id = format!("{dense_id}clean v{CLEAN_VERSION} {clean_cfg:?}\n");
+    let color_id = color
+        .as_ref()
+        .ok()
+        .map(|c| format!("{clean_id}{}color v{COLOR_VERSION} {color_cfg:?}\n", c.id));
+    let previous = fs::read_to_string(req.out_dir.join(REPORT))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null);
+
+    let settings = settings_json(&input.slam, &odom, &dense_cfg, &clean_cfg, &color_cfg);
+    let mut run = MapRun {
+        input,
+        progress,
+        project,
+        out: req.out_dir.clone(),
+        poses,
+        odom,
+        dense_cfg,
+        clean_cfg,
+        color_cfg,
+        ids: Ids {
+            dense: dense_id,
+            clean: clean_id,
+            color: color_id,
+        },
+        previous,
+        steps: BTreeMap::new(),
+    };
+
+    match step {
+        MapStep::Dense => {
+            run.run_dense()?;
+        }
+        MapStep::Clean => {
+            let (cloud, rays) = run.dense_input()?;
+            run.run_clean(cloud, rays)?;
+        }
+        MapStep::Color => {
+            let cloud = run.clean_input()?;
+            run.run_color(cloud, color.expect("checked above"))?;
+        }
+        MapStep::All => {
+            let (cloud, rays) = run.run_dense()?;
+            let cloud = run.run_clean(cloud, rays)?;
+            match color {
+                Ok(input) => run.run_color(cloud, input)?,
+                Err(why) => {
+                    progress.warn(format!("nicht eingefärbt, {why}"));
+                    run.steps.insert("color", json!({"skipped": why}));
+                }
+            }
+        }
+    }
+
+    // Steps that did not run now stay in map.json while their input still fits.
+    let current = [
+        ("dense", Some(run.ids.dense.clone())),
+        ("clean", Some(run.ids.clean.clone())),
+        ("color", run.ids.color.clone()),
+    ];
+    for (step, id) in current {
+        if run.steps.contains_key(step) {
+            continue;
+        }
+        if let Some(mut e) = id.and_then(|id| run.previous_entry(step, &id)) {
+            e["reused"] = json!(true);
+            run.steps.insert(step, e);
+        }
+    }
+
+    let stale = warn_stale(&run.out, &run.steps, progress);
+
+    let peak = peak_rss_bytes();
+    let report = json!({
+        "settings": settings,
+        "steps": run.steps,
+        "seconds_total": seconds(start),
+        "stale": stale,
+        "peak_rss_bytes": peak,
+    });
+    let report_path = run.path(REPORT);
+    let text = serde_json::to_string_pretty(&report).map_err(failed)? + "\n";
+    fs::write(&report_path, text)
+        .map_err(|e| format!("{} nicht schreibbar: {e}", report_path.display()))?;
+    let ram = peak.map_or_else(
+        || "Spitzen-RAM unbekannt".to_string(),
+        |b| format!("Spitzen-RAM {:.2} GB", b as f64 / 1e9),
+    );
+    progress.info(format!(
+        "Laufzeit {:.1} s, {ram} → {}",
+        start.elapsed().as_secs_f64(),
+        report_path.display()
+    ));
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use driftless_map::ImageGain;
+
+    fn gain(camera: &str) -> ImageGain {
+        ImageGain {
+            camera: camera.into(),
+            stamp: 0.0,
+            gain: [1.0; 3],
+        }
+    }
+
+    #[test]
+    fn warns_when_cameras_share_no_points() {
+        let mut s = ColorStats {
+            gains: vec![gain("left"), gain("right")],
+            ..ColorStats::default()
+        };
+        let w = color_warnings(&s);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("keine gemeinsamen Punkte"), "{w:?}");
+        // Shared points, or only one camera in use: no warning.
+        s.camera_difference_points = 500;
+        assert!(color_warnings(&s).is_empty());
+        s.camera_difference_points = 0;
+        s.gains = vec![gain("left")];
+        assert!(color_warnings(&s).is_empty());
+    }
+
+    #[test]
+    fn warns_about_truncated_image_bags() {
+        let s = ColorStats {
+            image_bags_truncated: 1,
+            ..ColorStats::default()
+        };
+        let w = color_warnings(&s);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("abgeschnitten"), "{w:?}");
+    }
+
+    #[test]
+    fn clamped_gains_warn_above_one_percent_only() {
+        let clamped = |n| ColorStats {
+            images_used: 200,
+            images_gain_clamped: n,
+            ..ColorStats::default()
+        };
+        assert!(color_warnings(&clamped(0)).is_empty());
+        assert!(color_warnings(&clamped(2)).is_empty(), "exactly 1 %");
+        assert_eq!(color_warnings(&clamped(3)).len(), 1);
+    }
+
+    #[test]
+    fn warns_about_clamped_gains() {
+        let s = ColorStats {
+            images_used: 200,
+            images_gain_clamped: 26,
+            ..ColorStats::default()
+        };
+        let w = color_warnings(&s);
+        assert_eq!(
+            w,
+            vec!["26 Bilder (13 %) stoßen an die Grenze des Belichtungsabgleichs"]
+        );
+    }
+}

@@ -1,5 +1,6 @@
 //! File input/output: bags, trajectories, point clouds.
 
+mod atomic;
 pub mod bag;
 pub mod calib;
 pub mod camera;
@@ -10,3 +11,5 @@ pub mod project;
 pub mod testdata;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testscan;
+
+pub use atomic::atomic_write;

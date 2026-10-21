@@ -7,6 +7,7 @@ members = [
     "crates/driftless-slam",
     "crates/driftless-map",
     "crates/driftless-graph",
+    "crates/driftless-steps",
     "crates/driftless-cli",
 ]
 
@@ -40,6 +41,9 @@ opt-level = 2
 [profile.dev.package.jpeg-encoder]
 opt-level = 2
 [profile.dev.package.zune-jpeg]
+opt-level = 2
+# The step tests run whole synthetic scans (odometry, map) through the library.
+[profile.dev.package.driftless-steps]
 opt-level = 2
 # `calib-check` projects every LiDAR point into every image variant; its tests run the binary.
 [profile.dev.package.driftless-cli]
