@@ -23,6 +23,60 @@ pub const PANEL_STEPS: &str = "Schritte";
 pub const PANEL_PROPERTIES: &str = "Eigenschaften";
 pub const VIEW_EMPTY: &str = "Keine Wolke geladen – links eine Karte oder Wolke wählen";
 
+// Steps (right panel); the step names are also the labels of their jobs
+pub const STEP_INSPECT: &str = "Prüfen";
+pub const STEP_SLAM: &str = "SLAM rechnen";
+pub const STEP_REUSE: &str = "Neu rechnen (aus Teilkarten)";
+pub const STEP_MAP: &str = "Karte rechnen";
+pub const NOT_COMPUTED: &str = "nicht gerechnet";
+pub const STALE: &str = "veraltet – Laufbahn neu gerechnet";
+pub const NO_CACHE: &str = "Kein Zwischenspeicher submaps.bin – zuerst SLAM rechnen";
+pub const SELECT_FOR_STEPS: &str = "Links einen Scan oder einen Lauf wählen";
+pub const THIS_MAP: &str = "Diese Karte";
+pub const UNKNOWN_SCAN: &str = "Scan nicht im Projekt";
+pub const UNKNOWN_RUN: &str = "Lauf nicht im Projekt";
+
+// Properties (right panel)
+pub const SLAM_SETTINGS: &str = "SLAM-Einstellungen";
+pub const SLAM_SETTINGS_NEW: &str = "Gelten für den nächsten Lauf";
+pub const SLAM_SETTINGS_OF_RUN: &str = "Mit diesen Einstellungen gerechnet";
+pub const LIDAR_POSE: &str = "LiDAR-Lage im IMU-Rahmen angeben";
+pub const LIDAR_POSE_NONE: &str = "LiDAR-Lage: keine (LiDAR = IMU)";
+/// The seven numbers of the LiDAR pose, in this order.
+pub const LIDAR_POSE_PARTS: [&str; 7] = ["x (m)", "y (m)", "z (m)", "qx", "qy", "qz", "qw"];
+pub const LIDAR_TOPIC: &str = "LiDAR-Topic";
+pub const IMU_TOPIC: &str = "IMU-Topic";
+pub const TOPIC_HINT: &str = "leer: das einzige in den Bags";
+pub const MAP_SETTINGS: &str = "Karten-Einstellungen";
+pub const MAP_STEP: &str = "Schritt";
+pub const STEP_DENSE: &str = "Dichte Wolke";
+pub const STEP_CLEAN: &str = "Bereinigen";
+pub const STEP_COLOR: &str = "Einfärben";
+pub const STEP_ALL: &str = "Alles";
+pub const GHOSTS: &str = "Geister entfernen";
+pub const OUTLIERS: &str = "Ausreißer entfernen";
+pub const THROUGH: &str = "Durchblick (Fenster) entfernen";
+pub const SMOOTH: &str = "Wände glätten";
+pub const HIGHLIGHTS: &str = "Glanzlichter abwerten (experimentell)";
+pub const VIGNETTING: &str = "Randabfall der Kameras schätzen";
+pub const VOXEL: &str = "Voxelgröße (m)";
+pub const DOWNSCALE: &str = "Bilder verkleinern";
+/// The choices of [`DOWNSCALE`] for 1, 2 and 4.
+pub const DOWNSCALE_CHOICES: [(u32, &str); 3] = [(1, "1/1"), (2, "1/2"), (4, "1/4")];
+
+// Check of a scan (right panel)
+pub const INSPECT_RESULT: &str = "Prüfbericht";
+pub const DEVICE: &str = "Gerät";
+pub const DEVICE_UNKNOWN: &str = "unbekannt";
+pub const DURATION: &str = "Dauer";
+pub const TOPICS: &str = "Topics";
+pub const TOPIC: &str = "Topic";
+pub const TOPIC_TYPE: &str = "Typ";
+pub const TOPIC_COUNT: &str = "Anzahl";
+pub const TOPIC_RATE: &str = "Rate";
+pub const PROBLEMS: &str = "Probleme";
+pub const NO_PROBLEMS: &str = "keine";
+
 // Status bar
 pub const CANCEL: &str = "Abbrechen";
 pub const CANCELLING: &str = "Wird abgebrochen …";
@@ -70,6 +124,48 @@ pub fn job_cancelled(label: &str) -> String {
 
 pub fn job_failed(label: &str, error: &str) -> String {
     format!("{label}: {error}")
+}
+
+/// „fertig (12,3 s)“; „fertig“ without a known runtime.
+pub fn step_done(seconds: Option<f64>) -> String {
+    match seconds {
+        Some(s) => format!("{JOB_DONE} ({} s)", decimal(s, 1)),
+        None => JOB_DONE.to_string(),
+    }
+}
+
+/// Why a step button is locked while another step runs.
+pub fn busy(label: &str) -> String {
+    format!("Es läuft schon: {label}")
+}
+
+/// „x (m): 0,1“ – one number of a run's LiDAR pose.
+pub fn pose_part(part: &str, value: f64) -> String {
+    format!("{part}: {}", decimal(value, 4))
+}
+
+/// „LiDAR-Topic: /points“, or the hint without one.
+pub fn topic_of_run(what: &str, topic: Option<&str>) -> String {
+    format!("{what}: {}", topic.unwrap_or(TOPIC_HINT))
+}
+
+/// Model and serial number of the device, as far as known.
+pub fn device(model: Option<&str>, sn: Option<&str>) -> String {
+    match (model, sn) {
+        (Some(m), Some(sn)) => format!("{m} ({sn})"),
+        (Some(x), None) | (None, Some(x)) => x.to_string(),
+        (None, None) => DEVICE_UNKNOWN.to_string(),
+    }
+}
+
+/// „10,0 Hz“, „–“ without a rate.
+pub fn rate(hz: Option<f64>) -> String {
+    hz.map_or_else(|| "–".to_string(), |r| format!("{} Hz", decimal(r, 1)))
+}
+
+/// `x` with `digits` decimals and a decimal comma.
+pub fn decimal(x: f64, digits: usize) -> String {
+    format!("{x:.digits$}").replace('.', ",")
 }
 
 pub fn last_project_gone(error: &str) -> String {

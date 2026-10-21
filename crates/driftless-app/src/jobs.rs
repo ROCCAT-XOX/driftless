@@ -27,17 +27,19 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use crate::project::{MapDone, SlamDone};
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
 use driftless_steps::inspect;
-use driftless_steps::slam::SlamOutcome;
 use driftless_steps::StepError;
 
 /// What a finished job hands back. Later tasks add variants (a loaded cloud, a comparison).
 #[derive(Debug)]
 pub enum JobOutput {
     Inspect(Box<inspect::Report>),
-    Slam(Box<SlamOutcome>),
-    Map(Box<serde_json::Value>),
+    /// With the run folder, so the program can select it.
+    Slam(Box<SlamDone>),
+    /// With the map folder.
+    Map(Box<MapDone>),
     /// Nothing to hand back; the job's effect is on disk.
     Done,
 }

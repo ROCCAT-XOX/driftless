@@ -58,6 +58,8 @@ pub struct HistoryEntry {
     pub kind: HistoryKind,
     /// RFC 3339, UTC.
     pub created: String,
+    /// Runtime of the run (s), rounded to ms.
+    pub seconds: f64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -142,6 +144,7 @@ pub fn list(out: &Path) -> Vec<HistoryEntry> {
                 nr,
                 kind: HistoryKind::from_label(&state.art)?,
                 created: state.erstellt,
+                seconds: state.sekunden,
                 dir,
             })
         })

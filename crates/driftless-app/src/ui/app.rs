@@ -1,6 +1,8 @@
 //! The program: carries out the panels' actions, owns the job runner and the dialogs.
 
-use super::{left, status, text, Action, AppState, Selection, UiMessage};
+use super::{
+    actions, left, right, status, text, Action, AppState, InspectResult, Selection, UiMessage,
+};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
 use crate::project::{canonical, Project};
 use driftless_io::progress::Progress;
@@ -20,6 +22,7 @@ const LOG_LIMIT: usize = 10_000;
 /// Messages kept for the status bar (it shows the last); older ones are dropped.
 const MESSAGE_LIMIT: usize = 100;
 const LEFT_WIDTH: f32 = 280.0;
+const RIGHT_WIDTH: f32 = 340.0;
 
 /// The arguments of `driftless-app`: at most one project folder.
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<PathBuf>, String> {
@@ -136,6 +139,11 @@ impl DriftlessApp {
         &self.state
     }
 
+    /// For tests and the panels' settings.
+    pub fn state_mut(&mut self) -> &mut AppState {
+        &mut self.state
+    }
+
     /// Starts a processing step (refused while one runs).
     pub fn start_job(
         &mut self,
@@ -164,13 +172,39 @@ impl DriftlessApp {
     }
 
     fn finished(&mut self, f: JobFinished) {
-        match f.result {
-            Ok(_) => self.info(text::job_done(&f.label, &text::duration(f.seconds))),
-            Err(StepError::Cancelled) => self.info(text::job_cancelled(&f.label)),
-            Err(StepError::Failed(m)) => self.error(text::job_failed(&f.label, &m)),
-        }
+        let step = self.state.step.take();
+        let output = match f.result {
+            Ok(output) => {
+                self.info(text::job_done(&f.label, &text::duration(f.seconds)));
+                Some(output)
+            }
+            Err(StepError::Cancelled) => {
+                self.info(text::job_cancelled(&f.label));
+                None
+            }
+            Err(StepError::Failed(m)) => {
+                self.error(text::job_failed(&f.label, &m));
+                None
+            }
+        };
         // the step may have added runs or maps
-        self.state.refresh();
+        self.reload_project();
+        match (output, step) {
+            (Some(JobOutput::Slam(done)), _) => {
+                self.state.selection = Selection::Run(done.run_dir);
+            }
+            (Some(JobOutput::Map(done)), _) => {
+                self.state.selection = Selection::Map(done.dir);
+            }
+            (Some(JobOutput::Inspect(report)), Some(Action::Inspect(scan))) => {
+                self.state.inspect = Some(InspectResult {
+                    scan,
+                    report: *report,
+                    seconds: f.seconds,
+                });
+            }
+            _ => {}
+        }
         if let Some(action) = self.pending.take() {
             self.apply(action);
         }
@@ -250,14 +284,32 @@ impl DriftlessApp {
             Action::Select(selection) => self.state.selection = selection,
             Action::Cancel => self.jobs.cancel(),
             Action::DismissMessages => self.state.messages.clear(),
-            Action::LoadCloud { .. }
-            | Action::Inspect(_)
+            step @ (Action::Inspect(_)
             | Action::RunSlam(_)
             | Action::Reuse(_)
-            | Action::RunMap(_)
+            | Action::RunMap(_)) => {
+                if let Err(e) = actions::start_step(&mut self.state, &mut self.jobs, &step) {
+                    self.error(e);
+                }
+            }
+            Action::LoadCloud { .. }
             | Action::AddLoop { .. }
             | Action::SetLoopEnabled { .. }
             | Action::RestoreHistory { .. } => self.info(text::NOT_YET.to_string()),
+        }
+    }
+
+    /// Reads the open project again from disk, keeping the selection.
+    fn reload_project(&mut self) {
+        let Some(dir) = self.state.project.as_ref().map(|p| p.dir.clone()) else {
+            return;
+        };
+        match Project::open(&dir) {
+            Ok(p) => {
+                self.state.project = Some(p);
+                self.state.refresh();
+            }
+            Err(e) => self.error(e.to_string()),
         }
     }
 
@@ -360,6 +412,11 @@ impl DriftlessApp {
             .default_size(LEFT_WIDTH)
             .show(ui, |ui| {
                 actions.extend(left::show(ui, &self.state));
+            });
+        egui::Panel::right("schritte")
+            .default_size(RIGHT_WIDTH)
+            .show(ui, |ui| {
+                actions.extend(right::show(ui, &mut self.state));
             });
         egui::CentralPanel::default_margins().show(ui, |ui| {
             ui.centered_and_justified(|ui| ui.weak(text::VIEW_EMPTY));

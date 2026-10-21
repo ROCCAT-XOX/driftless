@@ -2,8 +2,10 @@
 //! [`Action`]; only [`DriftlessApp`] carries actions out (dialogs, project changes, jobs).
 //! So the panels can be tested without a window (`egui_kittest`).
 
+pub mod actions;
 mod app;
 pub mod left;
+pub mod right;
 pub mod status;
 pub mod text;
 
@@ -11,11 +13,13 @@ pub use app::{parse_args, DriftlessApp};
 
 use crate::camera::CameraMode;
 use crate::jobs::JobStatus;
-use crate::project::{Project, RunInfo, ScanState};
+use crate::project::{map_status, MapStatus, Project, RunInfo, ScanState};
 use crate::render::ColorMode;
 use driftless_io::progress::LogLine;
+use driftless_steps::inspect;
 use driftless_steps::map::MapSettings;
 use driftless_steps::slam::SlamSettings;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// What is selected in the project tree.
@@ -130,6 +134,15 @@ pub struct ScanNode {
     pub runs: Vec<RunInfo>,
 }
 
+/// The last check of a scan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InspectResult {
+    /// Scan id.
+    pub scan: String,
+    pub report: inspect::Report,
+    pub seconds: f64,
+}
+
 /// Everything the panels show. Made without a GPU or window.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
@@ -146,6 +159,12 @@ pub struct AppState {
     pub job: Option<JobStatus>,
     /// Messages of the steps, oldest first.
     pub log: Vec<LogLine>,
+    /// The step action that is running (set by [`actions::start_step`]).
+    pub step: Option<Action>,
+    /// The last check of a scan, shown under „Eigenschaften“ while that scan is selected.
+    pub inspect: Option<InspectResult>,
+    /// Every map folder of the tree, read by [`AppState::refresh`].
+    pub map_status: BTreeMap<PathBuf, MapStatus>,
 }
 
 impl AppState {
@@ -153,6 +172,7 @@ impl AppState {
     pub fn set_project(&mut self, project: Project) {
         self.project = Some(project);
         self.selection = Selection::None;
+        self.inspect = None;
         self.refresh();
     }
 
@@ -169,5 +189,49 @@ impl AppState {
                 })
                 .collect()
         });
+        self.map_status.clear();
+        let Some(project) = &self.project else {
+            return;
+        };
+        for node in &self.scans {
+            let Some(scan) = project.scan(&node.id) else {
+                continue;
+            };
+            for run in &node.runs {
+                for map in &run.maps {
+                    let status = map_status(&scan.path, run, map);
+                    self.map_status.insert(map.dir.clone(), status);
+                }
+            }
+        }
+    }
+
+    /// The scan with this id.
+    pub fn scan_node(&self, id: &str) -> Option<&ScanNode> {
+        self.scans.iter().find(|s| s.id == id)
+    }
+
+    /// The run in folder `dir`, with its scan.
+    pub fn run(&self, dir: &std::path::Path) -> Option<(&ScanNode, &RunInfo)> {
+        self.scans
+            .iter()
+            .find_map(|s| s.runs.iter().find(|r| r.dir == dir).map(|r| (s, r)))
+    }
+
+    /// The run the selection belongs to: the run itself, or the run of a selected map,
+    /// cloud or state.
+    pub fn selected_run(&self) -> Option<(&ScanNode, &RunInfo)> {
+        let owns = |r: &RunInfo| match &self.selection {
+            Selection::Run(d) => r.dir == *d,
+            Selection::Map(d) => r.maps.iter().any(|m| m.dir == *d),
+            Selection::Cloud(c) => {
+                r.cloud.as_ref() == Some(c) || r.maps.iter().any(|m| m.clouds.contains(c))
+            }
+            Selection::History { run, .. } => r.dir == *run,
+            Selection::None | Selection::Scan(_) => false,
+        };
+        self.scans
+            .iter()
+            .find_map(|s| s.runs.iter().find(|r| owns(r)).map(|r| (s, r)))
     }
 }

@@ -147,6 +147,16 @@ pub struct MapInfo {
     pub clouds: Vec<PathBuf>,
 }
 
+/// What a map folder holds, for the step list: read from its `map.json`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MapStatus {
+    /// `seconds_total` of its `map.json`.
+    pub seconds: Option<f64>,
+    /// Its switches are recorded, but it no longer fits the run (the trajectory, the bags or
+    /// the odometry settings changed since): computing a map would make it anew.
+    pub stale: bool,
+}
+
 /// A folder a job writes into. One the job created ([`StepDir::is_new`]) is removed again
 /// when the guard is dropped without [`StepDir::keep`], i.e. when the job is cancelled or
 /// fails.
@@ -761,6 +771,29 @@ pub fn map_dir_for(
         }
     }
     Ok(target)
+}
+
+/// The [`MapStatus`] of `map` of `run`, made from the scan folder `scan`. Reads `map.json`,
+/// `traj.tum` and the list of bags, so call it when the tree is read, not every frame. A map
+/// whose scan cannot be read is never stale (that cannot be told).
+pub fn map_status(scan: &Path, run: &RunInfo, map: &MapInfo) -> MapStatus {
+    let seconds = fs::read_to_string(map.dir.join(REPORT))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v["seconds_total"].as_f64());
+    let stale = map.settings.as_ref().is_some_and(|switches| {
+        let input = MapInput {
+            scan: scan.to_path_buf(),
+            slam_dir: run.dir.clone(),
+            slam: run.settings.clone(),
+            map: MapSettings {
+                step: MapStep::All,
+                switches: switches.clone(),
+            },
+        };
+        discover_project(scan).is_ok() && !folder_fits(&input, &map.dir)
+    });
+    MapStatus { seconds, stale }
 }
 
 /// What a SLAM job computes.
