@@ -285,6 +285,10 @@ Programm wird dort nicht geprüft.
   gilt seit Task 11 nicht mehr.
 - **Export erst in Meilenstein 6** (LAZ, E57, PCD aus dem Programm).
 - **Güte zu streng** (siehe oben): Die Laufbahn ist fast überall rot, auch wo SLAM gut ist.
+- **Karte im Programm über 4 GB:** Das Programm rechnet „Alles“ in einem Prozess wie
+  `driftless map` ohne `--step`; im Büro sind das 4,09 GB Spitze. Das Ziel < 4 GB aus Meilenstein 4
+  gilt für getrennte Schritte (3,49 GB). Für lange Scans im Programm die Schritte einzeln rechnen,
+  oder später die Schritte im Programm in eigenen Prozessen laufen lassen (offen).
 - **Beim Wechseln der Wolke** sind kurz beide im Speicher (Büro +0,7 GB, 50 Mio. geschätzt +3 GB).
 - **Nur auf dem Mac gemessen.** RTX 5080 und der Handtest unter Windows 150 % stehen aus; GPU-Zeit
   unter DX12/Vulkan ungeprüft.
