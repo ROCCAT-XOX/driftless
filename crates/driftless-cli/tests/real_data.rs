@@ -1,4 +1,4 @@
-//! `driftless slam` and `driftless map` on the long Promedia scan in `$DRIFTLESS_TESTDATA`
+//! `driftless slam` and `driftless map` on the long Büro scan in `$DRIFTLESS_TESTDATA`
 //! (see `docs/testdaten.md`): every map step in its own process, so that `peak_rss_bytes` in
 //! `map.json` is the peak of that step alone. Skips when the data is missing.
 //!
@@ -12,10 +12,11 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Peak memory of every map step on Promedia at 1 cm (bytes; measured up to 3.8 GB).
-const PROMEDIA_PEAK_RSS: u64 = 4_000_000_000;
-/// Run time of the three map steps on Promedia together (s; measured ≈ 6 min).
-const PROMEDIA_MAP_SECONDS: f64 = 15.0 * 60.0;
+/// Peak memory of every map step on Büro at 1 cm (bytes): the goal of Meilenstein 4, not a
+/// regression guard (measured up to 3.6 GB).
+const OFFICE_PEAK_RSS: u64 = 4_000_000_000;
+/// Run time of the three map steps on Büro together (s; measured ≈ 7 min).
+const OFFICE_MAP_SECONDS: f64 = 15.0 * 60.0;
 
 /// A temporary output folder that is removed on drop, also when the test panics.
 struct TempDir(PathBuf);
@@ -46,14 +47,13 @@ fn report(dir: &Path) -> Value {
 
 #[test]
 #[ignore = "needs DRIFTLESS_TESTDATA"]
-fn promedia_map_under_4_gb_and_15_min() {
+fn office_map_under_4_gb_and_15_min() {
     let Some(scan) = testdata::path("jmk6-2026-10-20/20261020173822").filter(|p| p.exists()) else {
-        eprintln!("SKIPPED: {} not set or Promedia missing", testdata::ENV_VAR);
+        eprintln!("SKIPPED: {} not set or Büro missing", testdata::ENV_VAR);
         return;
     };
-    let guard = TempDir(
-        std::env::temp_dir().join(format!("driftless-cli-promedia-{}", std::process::id())),
-    );
+    let guard =
+        TempDir(std::env::temp_dir().join(format!("driftless-cli-office-{}", std::process::id())));
     std::fs::create_dir_all(&guard.0).unwrap();
     let (scan, out) = (scan.to_str().unwrap(), guard.0.to_str().unwrap());
     driftless(&["slam", scan, "-o", out]);
@@ -68,11 +68,11 @@ fn promedia_map_under_4_gb_and_15_min() {
         total += seconds;
         let peak = r["peak_rss_bytes"].as_u64().expect("peak memory reported");
         println!(
-            "Promedia {step}: {seconds:.1} s, peak {:.2} GB",
+            "Büro {step}: {seconds:.1} s, peak {:.2} GB",
             peak as f64 / 1e9
         );
-        assert!(peak < PROMEDIA_PEAK_RSS, "{step}: peak {peak} bytes");
+        assert!(peak < OFFICE_PEAK_RSS, "{step}: peak {peak} bytes");
     }
-    println!("Promedia map: {total:.1} s");
-    assert!(total < PROMEDIA_MAP_SECONDS, "map took {total:.0} s");
+    println!("Büro map: {total:.1} s");
+    assert!(total < OFFICE_MAP_SECONDS, "map took {total:.0} s");
 }

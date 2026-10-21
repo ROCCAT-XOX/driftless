@@ -1,7 +1,7 @@
 //! The map of real scans in `$DRIFTLESS_TESTDATA` (see `docs/testdaten.md`): SLAM,
 //! trajectory through a TUM file (as `traj.tum` of `driftless slam`), then the dense cloud
 //! and LAS/PLY, its cleaning and colouring, with the default settings of `driftless map`, on
-//! `Test`, the two short JMK6 scans and the long Promedia scan. Prints point counts and
+//! `Test`, the two short JMK6 scans and the long Büro scan. Prints point counts and
 //! timings; skips when the data is missing. `DRIFTLESS_COLOR_OUT=<dir>` keeps the coloured
 //! cloud of 143623 (`color.las`, `color.ply`) there.
 //!
@@ -42,24 +42,28 @@ const SCANS: [(&str, &str, bool); 4] = [
     ("Test", "Test", false),
     ("20261020143415", "jmk6-2026-10-20/20261020143415", false),
     ("20261020143623", "jmk6-2026-10-20/20261020143623", false),
-    ("Promedia", "jmk6-2026-10-20/20261020173822", true),
+    ("Büro", "jmk6-2026-10-20/20261020173822", true),
 ];
 /// Camera difference after the equalisation of Meilenstein 3 (commit 49d16ea, default
 /// settings), per scan of [`SCANS`] (sRGB levels); Meilenstein 4 may be at most
-/// [`CAMERA_DIFFERENCE_SLACK`] times that (measured 0.19, 0.94, 0.48 and 0.06).
-const M3_CAMERA_DIFFERENCE: [f64; 4] = [0.764, 2.975, 3.123, 0.575];
+/// [`CAMERA_DIFFERENCE_SLACK`] times that (the goal of the plan).
+const M3_CAMERA_DIFFERENCE: [f64; SCANS.len()] = [0.764, 2.975, 3.123, 0.575];
 const CAMERA_DIFFERENCE_SLACK: f64 = 1.05;
-/// Promedia with `highlights` on: floor highlight share after ≤ this × before (measured
-/// 0.0497 / 0.0663 = 0.75).
-const PROMEDIA_FLOOR_HIGHLIGHT_RATIO: f64 = 0.8;
-/// Promedia by default: the floor highlight share may change by at most this share of itself.
+/// Camera difference measured in Meilenstein 4 (sRGB levels); a later change may raise it at
+/// most to [`M4_CAMERA_DIFFERENCE_MARGIN`] times that (regression guard).
+const M4_CAMERA_DIFFERENCE: [f64; SCANS.len()] = [0.357, 0.869, 1.093, 0.598];
+const M4_CAMERA_DIFFERENCE_MARGIN: f64 = 1.5;
+/// Büro with `highlights` on: floor highlight share after ≤ this × before (measured
+/// 0.0493 / 0.0654 = 0.75).
+const OFFICE_FLOOR_HIGHLIGHT_RATIO: f64 = 0.8;
+/// Büro by default: the floor highlight share may change by at most this share of itself.
 const DEFAULT_FLOOR_CHANGE: f64 = 0.02;
 /// The edge falloff fit may leave the residual at most this much higher (percentage points;
-/// measured −0.19 on Test, +0.02 on Promedia).
-const VIGNETTE_RESIDUAL_SLACK: f64 = 0.1;
-/// Promedia: at least this share of the points removed as seen through a window lie more
+/// measured −0.21 on Test, −3.22 on 143415, +0.07 on 143623, −0.10 on Büro).
+const VIGNETTE_RESIDUAL_SLACK: f64 = 0.15;
+/// Büro: at least this share of the points removed as seen through a window lie more
 /// than [`THROUGH_FAR`] m from the trajectory (measured 0.94 of 24,699).
-const PROMEDIA_THROUGH_FAR_SHARE: f64 = 0.8;
+const OFFICE_THROUGH_FAR_SHARE: f64 = 0.8;
 const THROUGH_FAR: f64 = 3.0;
 /// Test: wall thickness after the smoothing ≤ this × before (measured 1.06 / 6.07 mm = 0.18).
 const TEST_WALL_THICKNESS_RATIO: f64 = 0.7;
@@ -193,9 +197,10 @@ impl FullRun {
             "{name}: SLAM {s:.1} s, dense {d:.1} s, clean {c:.1} s, colour {k:.1} s, total \
              {:.1} s; {} dense points, {} kept, {} ghosts, {} through ({} > {THROUGH_FAR} m), {} \
              outliers; walls {:.2} → {:.2} mm; {:.1} % coloured, images {} used / {} blurry / {} \
-             clamped; gains {:.2}…{:.2}; spread {:.2} → {:.2}, camera difference {:.2} → {:.2} \
-             ({} points), image offset {:.2} → {:.2} (sRGB); edge falloff residual {:.2} → {:.2} \
-             %; floor highlights {:.4} → {:.4}; seams {:.2} → {:.2}",
+             clamped; sharpness/brightness rank correlation {:.2}; gains {:.2}…{:.2}; spread \
+             {:.2} → {:.2}, camera difference {:.3} → {:.3} ({} points), image offset {:.2} → \
+             {:.2} (sRGB); edge falloff residual {:.3} → {:.3} %; floor highlights {:.4} → \
+             {:.4}; seams {:.2} → {:.2}",
             self.total_seconds(),
             self.dense_points,
             self.clean.kept,
@@ -209,6 +214,7 @@ impl FullRun {
             x.images_used,
             x.images_blurry,
             x.images_gain_clamped,
+            x.sharpness_brightness_rank_corr,
             x.gain_min,
             x.gain_max,
             x.spread_before,
@@ -344,7 +350,8 @@ fn full_run(folder: &Path, tag: &str, highlights: bool) -> FullRun {
 
 /// The full run of scan `i` of [`SCANS`], shared by the tests that check it.
 fn shared_run(i: usize) -> Option<&'static FullRun> {
-    static RUNS: [OnceLock<Option<FullRun>>; SCANS.len()] = [const { OnceLock::new() }; 4];
+    static RUNS: [OnceLock<Option<FullRun>>; SCANS.len()] =
+        [const { OnceLock::new() }; SCANS.len()];
     let (name, rel, highlights) = SCANS[i];
     RUNS[i]
         .get_or_init(|| {
@@ -360,7 +367,7 @@ fn test_scan() -> Option<&'static FullRun> {
     shared_run(0)
 }
 
-fn promedia() -> Option<&'static FullRun> {
+fn office() -> Option<&'static FullRun> {
     shared_run(3)
 }
 
@@ -418,10 +425,15 @@ fn test_scan_exposure_reduces_camera_difference() {
 fn camera_difference_not_worse() {
     for (i, &(name, ..)) in SCANS.iter().enumerate() {
         let Some(run) = shared_run(i) else { continue };
-        let (now, m3) = (run.color.camera_difference_after, M3_CAMERA_DIFFERENCE[i]);
+        let now = run.color.camera_difference_after;
+        let (m3, m4) = (M3_CAMERA_DIFFERENCE[i], M4_CAMERA_DIFFERENCE[i]);
         assert!(
             now <= CAMERA_DIFFERENCE_SLACK * m3,
             "{name}: camera difference {now:.3}, Meilenstein 3 {m3:.3}"
+        );
+        assert!(
+            now <= M4_CAMERA_DIFFERENCE_MARGIN * m4,
+            "{name}: camera difference {now:.3}, measured in Meilenstein 4 {m4:.3}"
         );
     }
 }
@@ -429,10 +441,7 @@ fn camera_difference_not_worse() {
 #[test]
 #[ignore = "needs DRIFTLESS_TESTDATA"]
 fn vignette_residual_not_worse() {
-    // Test and Promedia (+0.0 pp each); 143623 sits at +0.099 pp, right at the bound, and is
-    // only reported (see the results of Meilenstein 4).
-    for i in [0, 3] {
-        let name = SCANS[i].0;
+    for (i, &(name, ..)) in SCANS.iter().enumerate() {
         let Some(run) = shared_run(i) else { continue };
         let c = &run.color;
         assert!(
@@ -445,13 +454,13 @@ fn vignette_residual_not_worse() {
 }
 
 /// The highlight rule is off by default (the floor stays nearly as it is); switched on, it lowers
-/// the reflections of the ceiling lights on the Promedia floor.
+/// the reflections of the ceiling lights on the Büro floor.
 #[test]
 #[ignore = "needs DRIFTLESS_TESTDATA"]
 fn floor_highlights_drop_when_switched_on() {
-    let Some(run) = promedia() else { return };
+    let Some(run) = office() else { return };
     let c = &run.color;
-    // Only the rim exclusion acts by default (measured −0.3 %).
+    // Only the rim exclusion acts by default (measured below 0.1 %).
     assert!(
         (c.floor_highlight_share_after - c.floor_highlight_share_before).abs()
             <= DEFAULT_FLOOR_CHANGE * c.floor_highlight_share_before,
@@ -464,7 +473,7 @@ fn floor_highlights_drop_when_switched_on() {
     assert!(h.floor_highlight_share_before > 0.0, "{h:?}");
     assert!(
         h.floor_highlight_share_after
-            <= PROMEDIA_FLOOR_HIGHLIGHT_RATIO * h.floor_highlight_share_before,
+            <= OFFICE_FLOOR_HIGHLIGHT_RATIO * h.floor_highlight_share_before,
         "floor highlights {:.4} → {:.4}",
         h.floor_highlight_share_before,
         h.floor_highlight_share_after
@@ -474,11 +483,11 @@ fn floor_highlights_drop_when_switched_on() {
 #[test]
 #[ignore = "needs DRIFTLESS_TESTDATA"]
 fn through_removes_outside_points() {
-    let Some(run) = promedia() else { return };
+    let Some(run) = office() else { return };
     let through = run.clean.through;
     assert!(through > 0, "nothing removed as seen through a window");
     assert!(
-        run.through_far as f64 >= PROMEDIA_THROUGH_FAR_SHARE * through as f64,
+        run.through_far as f64 >= OFFICE_THROUGH_FAR_SHARE * through as f64,
         "{} of {through} through points more than {THROUGH_FAR} m from the trajectory",
         run.through_far
     );

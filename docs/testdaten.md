@@ -53,11 +53,11 @@ Zwei Aufnahmen liegen unter `jmk6-2026-10-20/`: `20261020143415` (63 s, ≈ 15 m
 `20261020143623` (108 s, ≈ 21 m, endet nahe am Start: Start↔Ende schon in der Odometrie 2,6 cm). Ein RayStudio-Ergebnis gibt es dazu nicht.
 
 Eine dritte, lange Aufnahme ist der Größentest für Speicher und Zeit: `20261020173822`
-(Promedia, 582 s, 3.831 Bilder): ein Büro mit Deckenleuchten und Fensterbändern (Spiegelungen
+(„Büro“, 582 s, 3.831 Bilder): ein Büro mit Deckenleuchten und Fensterbändern (Spiegelungen
 und Durchblicke, die Meilenstein 4 behandelt). Der Drift ohne Schleifenschluss beträgt 2,16 m und
 mit automatischem Schleifenschluss 0,13 m. Bei 1 cm Voxelgröße hat die dichte Wolke 15,6 Mio.
 Punkte. Eine Referenz gibt es nicht; die Ergebnisse (`slam`, `map`) liegen lokal unter
-`$DRIFTLESS_TESTDATA/ergebnisse-promedia3/`, nicht im Repo.
+`$DRIFTLESS_TESTDATA/ergebnisse-buero/`, nicht im Repo.
 
 **exp04 (Rundgang):** dieselbe Extrinsik wie exp14. Die Referenz ist keine dichte Laufbahn, sondern
 7 Kontrollpunkte im Abstand von ≈ 20 s, je eine Zeile `t x y z 0 0 0 1` (TUM-Format, Lage nur als
@@ -79,7 +79,7 @@ Die Tests mit echten Daten für SLAM: `cargo test --release -p driftless-slam --
 (Schranken und Messwerte: `docs/ergebnisse/2026-10-20-meilenstein-2.md`).
 
 Für die Karte (dicht, bereinigt, eingefärbt) auf `Test` und beiden JMK6-Aufnahmen:
-`cargo test --release -p driftless-map --test real_data -- --ignored --nocapture` (ohne Promedia ≈ 4 min;
+`cargo test --release -p driftless-map --test real_data -- --ignored --nocapture` (ohne die Büro-Aufnahme ≈ 4 min;
 Schranken und Messwerte: `docs/ergebnisse/2026-10-21-meilenstein-3.md`).
 
 **`Test/shading/smooth.las` hat keine Farben:** LAS 1.3, Punktformat 2, 12,5 Mio. Punkte, aber
@@ -89,9 +89,9 @@ alle mit derselben Farbe (0, 166, 252) und Intensität 0. Vergleichbar sind nur 
 Renderings und Vergleichsbilder liegen nur lokal unter `$DRIFTLESS_TESTDATA/ergebnisse-m3/` und
 `$DRIFTLESS_TESTDATA/ergebnisse-m4/` (nicht im Repo).
 
-Seit Meilenstein 4 laufen die Karten-Tests auch auf Promedia (zwei volle Läufe, bitgleich, dazu ein
-Einfärben mit `--highlights`), zusammen ≈ 22 min. Speicher und Zeit von Promedia prüft die CLI, je
-Schritt ein eigener Prozess (≈ 7 min):
+Seit Meilenstein 4 laufen die Karten-Tests auch auf der Büro-Aufnahme (zwei volle Läufe, bitgleich, dazu ein
+Einfärben mit `--highlights`), zusammen ≈ 27 min. Speicher und Zeit der Büro-Aufnahme prüft die CLI, je
+Schritt ein eigener Prozess (≈ 8 min):
 `cargo test --release -p driftless-cli --test real_data -- --ignored --nocapture`
 (Schranken und Messwerte: `docs/ergebnisse/2026-10-21-meilenstein-4.md`).
 
