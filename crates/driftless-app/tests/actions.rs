@@ -59,6 +59,19 @@ fn run_step(app: &mut DriftlessApp, action: Action) {
     assert!(app.state().step.is_none());
 }
 
+/// Ticks until no step and no background work is left.
+fn settle(app: &mut DriftlessApp) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        app.tick();
+        if !app.wants_repaint_while_busy() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "background work did not end");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn runs_dir(dir: &Path) -> PathBuf {
     canonical(&dir.join("projekt")).unwrap().join("scans/halle")
 }
@@ -182,6 +195,9 @@ fn map_action_with_new_settings_creates_new_map_dir() {
     traj.extend_from_slice(b"\n");
     fs::write(run.join("traj.tum"), traj).unwrap();
     app.apply(Action::OpenProject(dir.join("projekt")));
+    // the reading again leaves the statuses to the background: the old ones stay until then
+    assert!(!app.state().map_status[&first].stale);
+    settle(&mut app);
     let status = &app.state().map_status;
     assert!(status[&first].stale && status[&second].stale);
 
@@ -265,4 +281,44 @@ fn inspect_result_reaches_state() {
     let result = app.state().inspect.clone().expect("inspected");
     assert_eq!(result.scan, "halle");
     assert!(!result.report.topics.is_empty());
+}
+
+#[test]
+fn refresh_leaves_map_status_to_the_background() {
+    let dir = tmp("aktion-status");
+    let mut app = app_with_scan(&dir);
+    run_step(&mut app, Action::RunSlam("halle".into()));
+    let run = runs_dir(&dir).join("slam-001");
+    app.state_mut().map_settings.step = MapStep::Dense;
+    run_step(&mut app, Action::RunMap(run.clone()));
+    let map = run.join("karte-001");
+    assert!(app.state().map_status.contains_key(&map));
+
+    // a fresh state: refresh reads the tree only, no map status
+    let mut state = AppState::default();
+    state.set_project(Project::open(&dir.join("projekt")).unwrap());
+    assert_eq!(state.scans[0].runs[0].maps.len(), 1);
+    assert!(state.map_status.is_empty());
+    let version = state.tree_version;
+    state.refresh();
+    assert_eq!(state.tree_version, version + 1);
+    // the job computes it
+    let status = state.map_status_job()();
+    assert!(!status[&map].stale);
+    assert!(status[&map].seconds.is_some());
+}
+
+#[test]
+fn scan_without_images_cannot_be_coloured() {
+    let dir = tmp("aktion-farbe");
+    let mut app = app_with_scan(&dir);
+    let why = app.state().scans[0].no_color.clone().expect("no images");
+    assert!(why.starts_with("keine Kamerabilder"), "{why}");
+    run_step(&mut app, Action::RunSlam("halle".into()));
+    let run = runs_dir(&dir).join("slam-001");
+    app.state_mut().map_settings.step = MapStep::Color;
+    app.apply(Action::RunMap(run.clone()));
+    assert_eq!(errors(&app), [why]);
+    assert!(app.state().job.is_none());
+    assert!(!run.join("karte-001").exists());
 }

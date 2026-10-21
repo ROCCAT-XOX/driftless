@@ -22,6 +22,8 @@ const IDENTITY_POSE: [f64; 7] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum StepState {
     NotComputed,
+    /// A run that was never recomputed from its submaps.
+    NotReused,
     /// With its runtime (s), if known.
     Done(Option<f64>),
     /// There is a result, but it no longer fits the run.
@@ -84,10 +86,14 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
                     slam_settings_edit(ui, &mut state.slam_settings);
                     inspect_table(ui, state, &scan.id);
                 }
-                Target::Run { run, .. } => {
+                Target::Run { scan, run, map } => {
                     slam_settings_shown(ui, &run.settings);
+                    if let Some(map) = map {
+                        ui.separator();
+                        map_switches_shown(ui, map, &mut state.map_settings);
+                    }
                     ui.separator();
-                    map_settings_edit(ui, &mut state.map_settings);
+                    map_settings_edit(ui, &mut state.map_settings, scan.no_color.as_deref());
                 }
             }
         });
@@ -139,15 +145,25 @@ fn run_steps(
     action: &mut Option<Action>,
 ) {
     let blocked = blocked(state, scan);
-    let reused = match run.history.last() {
-        Some(e) if e.kind == HistoryKind::Reuse => StepState::Done(Some(e.seconds)),
-        _ => StepState::NotComputed,
-    };
+    let reused = run
+        .history
+        .iter()
+        .rev()
+        .find(|e| e.kind == HistoryKind::Reuse)
+        .map_or(StepState::NotReused, |e| StepState::Done(Some(e.seconds)));
     let no_cache = (!run.has_cache).then(|| text::NO_CACHE.to_string());
     if step_row(ui, text::STEP_REUSE, blocked.clone().or(no_cache), reused) {
         *action = Some(Action::Reuse(run.dir.clone()));
     }
-    let invalid = state.map_settings.check().err().map(|e| e.to_string());
+    let no_color = (state.map_settings.step == MapStep::Color)
+        .then(|| scan.no_color.clone())
+        .flatten();
+    let invalid = state
+        .map_settings
+        .check()
+        .err()
+        .map(|e| e.to_string())
+        .or(no_color);
     let mapped = map_state(state, run, &state.map_settings);
     if step_row(ui, text::STEP_MAP, blocked.or(invalid), mapped) {
         *action = Some(Action::RunMap(run.dir.clone()));
@@ -203,6 +219,7 @@ fn step_row(ui: &mut Ui, label: &str, blocked: Option<String>, state: StepState)
 fn state_label(ui: &mut Ui, state: StepState) {
     match state {
         StepState::NotComputed => ui.weak(text::NOT_COMPUTED),
+        StepState::NotReused => ui.weak(text::NOT_REUSED),
         StepState::Done(seconds) => ui.label(text::step_done(seconds)),
         StepState::Stale => {
             let warn = ui.visuals().warn_fg_color;
@@ -276,8 +293,34 @@ fn slam_settings_shown(ui: &mut Ui, settings: &SlamSettings) {
     ));
 }
 
-/// Step and switches of the next map, as `driftless map` takes them.
-fn map_settings_edit(ui: &mut Ui, settings: &mut MapSettings) {
+/// The switches recorded for a selected map, with a button that takes them over for the next
+/// map (the step stays).
+fn map_switches_shown(ui: &mut Ui, map: &MapInfo, settings: &mut MapSettings) {
+    ui.strong(text::MAP_SWITCHES);
+    let Some(s) = &map.settings else {
+        ui.weak(text::MAP_SWITCHES_UNKNOWN);
+        return;
+    };
+    for (label, on) in [
+        (text::GHOSTS, s.ghosts),
+        (text::OUTLIERS, s.outliers),
+        (text::THROUGH, s.through),
+        (text::SMOOTH, s.smooth),
+        (text::HIGHLIGHTS, s.highlights),
+        (text::VIGNETTING, s.vignetting),
+    ] {
+        ui.label(text::switch_value(label, on));
+    }
+    ui.label(text::voxel_value(s.voxel));
+    ui.label(text::downscale_value(s.downscale));
+    if ui.button(text::USE_AS_TEMPLATE).clicked() {
+        settings.switches = s.clone();
+    }
+}
+
+/// Step and switches of the next map, as `driftless map` takes them. `no_color`: why the scan
+/// cannot be coloured (step „Einfärben“ is then locked, „Alles“ skips colouring).
+fn map_settings_edit(ui: &mut Ui, settings: &mut MapSettings, no_color: Option<&str>) {
     ui.strong(text::MAP_SETTINGS);
     ui.horizontal_wrapped(|ui| {
         ui.label(text::MAP_STEP);
@@ -287,9 +330,23 @@ fn map_settings_edit(ui: &mut Ui, settings: &mut MapSettings) {
             (MapStep::Color, text::STEP_COLOR),
             (MapStep::All, text::STEP_ALL),
         ] {
-            ui.selectable_value(&mut settings.step, step, label);
+            let locked = (step == MapStep::Color).then_some(no_color).flatten();
+            let r = ui.add_enabled(
+                locked.is_none(),
+                egui::Button::selectable(settings.step == step, label),
+            );
+            if r.clicked() {
+                settings.step = step;
+            }
+            if let Some(why) = locked {
+                r.on_disabled_hover_text(why);
+            }
         }
     });
+    if let (MapStep::All, Some(why)) = (settings.step, no_color) {
+        let warn = ui.visuals().warn_fg_color;
+        ui.label(RichText::new(text::color_skipped(why)).color(warn));
+    }
     let s = &mut settings.switches;
     ui.checkbox(&mut s.ghosts, text::GHOSTS);
     ui.checkbox(&mut s.outliers, text::OUTLIERS);

@@ -20,14 +20,16 @@
 //! of a write). The price is that closing takes as long as the longest unit of work.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use crate::project::{MapDone, SlamDone};
+use crate::project::{MapDone, MapStatus, SlamDone};
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
 use driftless_steps::inspect;
 use driftless_steps::StepError;
@@ -40,6 +42,8 @@ pub enum JobOutput {
     Slam(Box<SlamDone>),
     /// With the map folder.
     Map(Box<MapDone>),
+    /// The status of every map folder of the tree (helper runner).
+    MapStatus(Box<BTreeMap<PathBuf, MapStatus>>),
     /// Nothing to hand back; the job's effect is on disk.
     Done,
 }

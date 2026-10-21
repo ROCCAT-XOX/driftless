@@ -44,6 +44,12 @@ pub struct DriftlessApp {
     /// The processing steps, one at a time. Dropping it (closing the window) cancels the
     /// running step and waits for it.
     jobs: JobRunner,
+    /// Quick work off the UI thread that is no step: the status of the map folders.
+    helper: JobRunner,
+    /// The [`AppState::tree_version`] the map statuses were last asked for, and the one of
+    /// the job running on [`DriftlessApp::helper`].
+    status_asked: u64,
+    status_running: Option<u64>,
     /// A project switch that waits until the cancelled step has stopped: until then the
     /// step may still write into the old project, which therefore stays shown.
     pending: Option<Action>,
@@ -60,7 +66,10 @@ impl DriftlessApp {
     pub fn new(repaint: Arc<dyn Fn() + Send + Sync>) -> Self {
         DriftlessApp {
             state: AppState::default(),
-            jobs: JobRunner::new(repaint),
+            jobs: JobRunner::new(repaint.clone()),
+            helper: JobRunner::new(repaint),
+            status_asked: 0,
+            status_running: None,
             pending: None,
             title: String::new(),
             closing: false,
@@ -155,9 +164,33 @@ impl DriftlessApp {
         Ok(())
     }
 
-    /// True while a step runs: the window must then keep drawing.
+    /// True while a step or background work runs: the window must then keep drawing.
     pub fn wants_repaint_while_busy(&self) -> bool {
-        self.jobs.is_busy()
+        self.jobs.is_busy() || self.helper.is_busy() || self.status_asked != self.state.tree_version
+    }
+
+    /// Takes finished map statuses and starts computing them again when the tree changed.
+    fn tick_helper(&mut self) {
+        if let Some(f) = self.helper.poll() {
+            let asked = self.status_running.take();
+            if let (Ok(JobOutput::MapStatus(status)), Some(v)) = (f.result, asked) {
+                // an older tree's statuses are dropped; the newer job follows
+                if v == self.state.tree_version {
+                    self.state.map_status = *status;
+                }
+            }
+        }
+        let version = self.state.tree_version;
+        if self.status_asked != version && !self.helper.is_busy() {
+            let job = self.state.map_status_job();
+            let started = self.helper.start(text::MAP_STATUS_JOB, move |_| {
+                Ok(JobOutput::MapStatus(Box::new(job())))
+            });
+            if started.is_ok() {
+                self.status_asked = version;
+                self.status_running = Some(version);
+            }
+        }
     }
 
     /// Once per frame: takes a finished step, the new log lines and the progress.
@@ -169,6 +202,7 @@ impl DriftlessApp {
         let over = self.state.log.len().saturating_sub(LOG_LIMIT);
         self.state.log.drain(..over);
         self.state.job = self.jobs.status();
+        self.tick_helper();
     }
 
     fn finished(&mut self, f: JobFinished) {

@@ -35,6 +35,15 @@ pub const SELECT_FOR_STEPS: &str = "Links einen Scan oder einen Lauf wählen";
 pub const THIS_MAP: &str = "Diese Karte";
 pub const UNKNOWN_SCAN: &str = "Scan nicht im Projekt";
 pub const UNKNOWN_RUN: &str = "Lauf nicht im Projekt";
+pub const NOT_A_STEP: &str = "Diese Aktion ist kein Schritt";
+pub const NOT_REUSED: &str = "noch nicht neu gerechnet";
+/// Label of the background job for the map statuses (not shown in the status bar).
+pub const MAP_STATUS_JOB: &str = "Karten prüfen";
+pub const MAP_SWITCHES: &str = "Einstellungen dieser Karte";
+pub const MAP_SWITCHES_UNKNOWN: &str = "Einstellungen unbekannt (map.json fehlt oder ist unlesbar)";
+pub const USE_AS_TEMPLATE: &str = "Als Vorlage übernehmen";
+pub const YES: &str = "ja";
+pub const NO: &str = "nein";
 
 // Properties (right panel)
 pub const SLAM_SETTINGS: &str = "SLAM-Einstellungen";
@@ -132,6 +141,38 @@ pub fn step_done(seconds: Option<f64>) -> String {
         Some(s) => format!("{JOB_DONE} ({} s)", decimal(s, 1)),
         None => JOB_DONE.to_string(),
     }
+}
+
+pub fn unknown_scan(id: &str) -> String {
+    format!("{UNKNOWN_SCAN}: {id}")
+}
+
+pub fn unknown_run(dir: &std::path::Path) -> String {
+    format!("{UNKNOWN_RUN}: {}", dir.display())
+}
+
+/// „Einfärben wird übersprungen: keine Kamerabilder …“ (step „Alles“ on a scan without them).
+pub fn color_skipped(why: &str) -> String {
+    format!("{STEP_COLOR} wird übersprungen: {why}")
+}
+
+/// „Geister entfernen: ja“ – a recorded switch of a map.
+pub fn switch_value(label: &str, on: bool) -> String {
+    format!("{label}: {}", if on { YES } else { NO })
+}
+
+/// „Voxelgröße (m): 0,050“.
+pub fn voxel_value(voxel: f64) -> String {
+    format!("{VOXEL}: {}", decimal(voxel, 3))
+}
+
+/// „Bilder verkleinern: 1/2“.
+pub fn downscale_value(downscale: u32) -> String {
+    let choice = DOWNSCALE_CHOICES
+        .iter()
+        .find(|(v, _)| *v == downscale)
+        .map_or_else(|| format!("1/{downscale}"), |(_, l)| l.to_string());
+    format!("{DOWNSCALE}: {choice}")
 }
 
 /// Why a step button is locked while another step runs.

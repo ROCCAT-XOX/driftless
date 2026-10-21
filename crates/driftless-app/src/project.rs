@@ -653,6 +653,27 @@ impl Project {
         }
     }
 
+    /// Why the scan cannot be coloured (no `IMAGE_*.bag`, no `calibration/calib.json`), in the
+    /// words of `driftless map`; `None` if it can, or if the scan cannot be read at all (see
+    /// [`Project::scan_state`]). Only lists the folder.
+    pub fn color_missing(&self, scan_id: &str) -> Option<String> {
+        let scan = self.scan(scan_id)?;
+        let found = discover_project(&scan.path).ok()?;
+        if found.image_bags.is_empty() {
+            return Some(format!(
+                "keine Kamerabilder: {} enthält keine IMAGE_*.bag",
+                scan.path.display()
+            ));
+        }
+        if found.calibration.is_none() {
+            return Some(format!(
+                "keine Kalibrierung: {} fehlt",
+                scan.path.join("calibration").join("calib.json").display()
+            ));
+        }
+        None
+    }
+
     /// `scans/<id>`, refused unless it is a folder directly in `scans/`.
     fn runs_dir(&self, scan_id: &str) -> Result<PathBuf, ProjectError> {
         check_id(scan_id)?;

@@ -131,6 +131,8 @@ pub struct ScanNode {
     pub id: String,
     pub name: String,
     pub state: ScanState,
+    /// Why the scan cannot be coloured ([`Project::color_missing`]); `None` if it can.
+    pub no_color: Option<String>,
     pub runs: Vec<RunInfo>,
 }
 
@@ -163,8 +165,12 @@ pub struct AppState {
     pub step: Option<Action>,
     /// The last check of a scan, shown under „Eigenschaften“ while that scan is selected.
     pub inspect: Option<InspectResult>,
-    /// Every map folder of the tree, read by [`AppState::refresh`].
+    /// The map folders of the tree whose status is known. Filled in the background (see
+    /// [`AppState::map_status_job`]), so a map may be missing here for a moment.
     pub map_status: BTreeMap<PathBuf, MapStatus>,
+    /// Raised by every [`AppState::refresh`]: the program recomputes [`AppState::map_status`]
+    /// in the background whenever it changed.
+    pub tree_version: u64,
 }
 
 impl AppState {
@@ -185,24 +191,43 @@ impl AppState {
                     id: s.id.clone(),
                     name: s.name.clone(),
                     state: p.scan_state(&s.id),
+                    no_color: p.color_missing(&s.id),
                     runs: p.runs(&s.id),
                 })
                 .collect()
         });
-        self.map_status.clear();
-        let Some(project) = &self.project else {
-            return;
-        };
-        for node in &self.scans {
-            let Some(scan) = project.scan(&node.id) else {
-                continue;
-            };
-            for run in &node.runs {
-                for map in &run.maps {
-                    let status = map_status(&scan.path, run, map);
-                    self.map_status.insert(map.dir.clone(), status);
+        // Statuses of maps still in the tree stay shown until the background job replaces them.
+        let maps: std::collections::BTreeSet<&PathBuf> = self
+            .scans
+            .iter()
+            .flat_map(|s| &s.runs)
+            .flat_map(|r| &r.maps)
+            .map(|m| &m.dir)
+            .collect();
+        self.map_status.retain(|dir, _| maps.contains(dir));
+        self.tree_version += 1;
+    }
+
+    /// The work of computing [`AppState::map_status`] for the current tree, to run off the
+    /// UI thread: it reads `traj.tum` and the bag list of every map ([`map_status`]).
+    pub fn map_status_job(&self) -> impl FnOnce() -> BTreeMap<PathBuf, MapStatus> + Send + 'static {
+        let mut maps = Vec::new();
+        if let Some(project) = &self.project {
+            for node in &self.scans {
+                let Some(scan) = project.scan(&node.id) else {
+                    continue;
+                };
+                for run in &node.runs {
+                    for map in &run.maps {
+                        maps.push((scan.path.clone(), run.clone(), map.clone()));
+                    }
                 }
             }
+        }
+        move || {
+            maps.into_iter()
+                .map(|(scan, run, map)| (map.dir.clone(), map_status(&scan, &run, &map)))
+                .collect()
         }
     }
 

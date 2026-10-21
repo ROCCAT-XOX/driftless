@@ -46,6 +46,7 @@ fn state() -> AppState {
             id: "buero".into(),
             name: "buero".into(),
             state: ScanState::Ready,
+            no_color: None,
             runs: vec![
                 run("/p/scans/buero/slam-001", "SLAM 001", vec![map]),
                 run("/p/scans/buero/slam-002", "SLAM 002", Vec::new()),

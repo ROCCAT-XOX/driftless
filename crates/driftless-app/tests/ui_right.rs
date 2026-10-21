@@ -5,6 +5,7 @@ use driftless_app::jobs::JobStatus;
 use driftless_app::project::{MapInfo, MapStatus, Project, RunInfo, ScanEntry, ScanState};
 use driftless_app::ui::{right, text, Action, AppState, InspectResult, ScanNode, Selection};
 use driftless_io::progress::ProgressSnapshot;
+use driftless_steps::history::{HistoryEntry, HistoryKind};
 use driftless_steps::inspect::{Device, Report, TopicReport};
 use driftless_steps::map::{MapSettings, MapStep, MapSwitches};
 use driftless_steps::slam::SlamSettings;
@@ -56,6 +57,7 @@ fn state(run: RunInfo, selection: Selection) -> AppState {
             id: "buero".into(),
             name: "buero".into(),
             state: ScanState::Ready,
+            no_color: None,
             runs: vec![run],
         }],
         selection,
@@ -333,8 +335,7 @@ fn stale_map_is_marked() {
         ..MapSwitches::default()
     };
     let h = harness(with_map(stale.clone(), other));
-    // (reuse and map)
-    assert_eq!(h.query_all_by_label(text::NOT_COMPUTED).count(), 2);
+    h.get_by_label(text::NOT_COMPUTED);
     assert!(h.query_by_label(text::STALE).is_none());
     // the map itself selected: its own state, whatever the settings
     let mut s = with_map(stale, other_switches());
@@ -399,4 +400,80 @@ fn nothing_selected_asks_for_a_selection() {
     let h = harness(state(run(true, Vec::new()), Selection::None));
     h.get_by_label(text::SELECT_FOR_STEPS);
     assert!(h.query_by_label(text::STEP_SLAM).is_none());
+}
+
+#[test]
+fn reuse_row_shows_last_reuse() {
+    let h = harness(run_selected(true));
+    h.get_by_label(text::NOT_REUSED);
+    let entry = |nr, kind, seconds| HistoryEntry {
+        nr,
+        dir: PathBuf::from(format!("{RUN}/verlauf/{nr:03}")),
+        kind,
+        created: "2026-10-21T10:00:00Z".into(),
+        seconds,
+    };
+    let mut s = run_selected(true);
+    s.scans[0].runs[0].history = vec![
+        entry(1, HistoryKind::Full, 30.0),
+        entry(2, HistoryKind::Reuse, 1.26),
+    ];
+    let h = harness(s);
+    h.get_by_label("fertig (1,3 s)");
+    assert!(h.query_by_label(text::NOT_REUSED).is_none());
+}
+
+#[test]
+fn scan_without_images_locks_color_step() {
+    let why = "keine Kamerabilder: /daten/buero enthält keine IMAGE_*.bag";
+    let mut s = run_selected(true);
+    s.scans[0].no_color = Some(why.into());
+    let mut h = harness(s);
+    // „Alles“ (the default) stays possible and says that colouring is skipped
+    h.get_by_label(&text::color_skipped(why));
+    assert!(!is_disabled(&h, text::STEP_MAP));
+    // „Einfärben“ is locked with the reason
+    assert!(is_disabled(&h, text::STEP_COLOR));
+    click(&mut h, text::STEP_COLOR);
+    assert_eq!(h.state().0.map_settings.step, MapStep::All);
+    tooltip(&mut h, text::STEP_COLOR, why);
+    // dense and clean need no images
+    click(&mut h, text::STEP_CLEAN);
+    assert_eq!(h.state().0.map_settings.step, MapStep::Clean);
+    assert!(h.query_by_label(&text::color_skipped(why)).is_none());
+    // a step „Einfärben“ chosen before: the map button is locked
+    h.state_mut().0.map_settings.step = MapStep::Color;
+    h.run();
+    assert!(is_disabled(&h, text::STEP_MAP));
+    tooltip(&mut h, text::STEP_MAP, why);
+}
+
+#[test]
+fn selected_map_shows_its_switches_as_template() {
+    let recorded = MapSwitches {
+        ghosts: false,
+        voxel: 0.2,
+        downscale: 4,
+        ..MapSwitches::default()
+    };
+    let mut s = state(
+        run(true, vec![map(Some(recorded.clone()))]),
+        Selection::Map(MAP.into()),
+    );
+    s.map_settings.step = MapStep::Clean;
+    let mut h = harness(s);
+    h.get_by_label(text::MAP_SWITCHES);
+    h.get_by_label(&text::switch_value(text::GHOSTS, false));
+    h.get_by_label(&text::switch_value(text::OUTLIERS, true));
+    h.get_by_label("Voxelgröße (m): 0,200");
+    h.get_by_label("Bilder verkleinern: 1/4");
+    assert_eq!(h.state().0.map_settings.switches, MapSwitches::default());
+    click(&mut h, text::USE_AS_TEMPLATE);
+    assert_eq!(h.state().0.map_settings.switches, recorded);
+    assert_eq!(h.state().0.map_settings.step, MapStep::Clean, "step stays");
+    // a map without readable map.json
+    let s = state(run(true, vec![map(None)]), Selection::Map(MAP.into()));
+    let h = harness(s);
+    h.get_by_label(text::MAP_SWITCHES_UNKNOWN);
+    assert!(h.query_by_label(text::USE_AS_TEMPLATE).is_none());
 }

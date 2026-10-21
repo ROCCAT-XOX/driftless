@@ -7,6 +7,7 @@ use super::{text, Action, AppState};
 use crate::jobs::{JobOutput, JobRunner};
 use crate::project::{run_map_job, run_slam_job, ScanState, SlamJob};
 use driftless_steps::inspect;
+use driftless_steps::map::MapStep;
 
 /// Starts the job of a step action (`Inspect`, `RunSlam`, `Reuse`, `RunMap`) and records it
 /// in [`AppState::step`]. Refused with a German message while a job runs, for a scan that
@@ -61,12 +62,18 @@ pub fn start_step(
             let scan = ready_scan(state, &scan_id)?;
             let settings = state.map_settings.clone();
             settings.check().map_err(|e| e.to_string())?;
+            // `Alles` skips colouring with a warning, as `driftless map` does
+            if settings.step == MapStep::Color {
+                if let Some(why) = state.scan_node(&scan_id).and_then(|s| s.no_color.clone()) {
+                    return Err(why);
+                }
+            }
             runner.start(text::STEP_MAP, move |p| {
                 let done = run_map_job(&run, &scan, &settings, p)?;
                 Ok(JobOutput::Map(Box::new(done)))
             })
         }
-        other => return Err(format!("kein Schritt: {other:?}")),
+        _ => return Err(text::NOT_A_STEP.into()),
     };
     started.map_err(|e| e.to_string())?;
     state.step = Some(action.clone());
@@ -80,7 +87,7 @@ fn ready_scan(state: &AppState, id: &str) -> Result<std::path::PathBuf, String> 
         .project
         .as_ref()
         .and_then(|p| p.scan(id))
-        .ok_or_else(|| format!("{}: {id}", text::UNKNOWN_SCAN))?;
+        .ok_or_else(|| text::unknown_scan(id))?;
     match state.scan_node(id).map(|n| &n.state) {
         Some(ScanState::Missing(why)) => Err(why.clone()),
         _ => Ok(entry.path.clone()),
@@ -88,5 +95,5 @@ fn ready_scan(state: &AppState, id: &str) -> Result<std::path::PathBuf, String> 
 }
 
 fn unknown_run(dir: &std::path::Path) -> String {
-    format!("{}: {}", text::UNKNOWN_RUN, dir.display())
+    text::unknown_run(dir)
 }
