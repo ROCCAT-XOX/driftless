@@ -105,6 +105,20 @@ pub fn fly_motion(keys: FlyKeys, shift: bool) -> ([f32; 3], f32) {
     (v.into(), if shift { FAST_FACTOR } else { 1.0 })
 }
 
+/// Whether both sides are finite and positive (an egui panel can be 0 × 0, e.g. collapsed).
+pub fn valid_viewport(viewport_px: [f32; 2]) -> bool {
+    viewport_px.iter().all(|v| v.is_finite() && *v > 0.0)
+}
+
+/// The aspect ratio, or 1 when it is not finite and positive.
+fn safe_aspect(aspect: f32) -> f32 {
+    if aspect.is_finite() && aspect > 0.0 {
+        aspect
+    } else {
+        1.0
+    }
+}
+
 fn clamp_pitch(pitch: f32) -> f32 {
     let limit = PITCH_LIMIT_DEG.to_radians();
     pitch.clamp(-limit, limit)
@@ -146,7 +160,9 @@ impl Camera {
     }
 
     /// Infinite reverse-Z perspective for a depth range 0..1: depth 1 at `near`, → 0 far.
+    /// An aspect ratio that is not finite and positive is taken as 1.
     pub fn proj(&self, aspect: f32) -> Matrix4<f32> {
+        let aspect = safe_aspect(aspect);
         let f = 1.0 / (self.fov_y / 2.0).tan();
         #[rustfmt::skip]
         let m = Matrix4::new(
@@ -175,12 +191,23 @@ impl Camera {
         Frustum { planes }
     }
 
+    /// For a degenerate viewport (see [`valid_viewport`]) the frustum is that of a square
+    /// view and the pixels per radian are 0.
     pub fn view_info(&self, viewport_px: [f32; 2], min_spacing_px: f32) -> ViewInfo {
+        let valid = valid_viewport(viewport_px);
         ViewInfo {
-            frustum: self.frustum(viewport_px[0] / viewport_px[1]),
+            frustum: self.frustum(if valid {
+                viewport_px[0] / viewport_px[1]
+            } else {
+                1.0
+            }),
             eye: self.eye_position().into(),
             near: self.near,
-            pixels_per_radian: viewport_px[1] / self.fov_y,
+            pixels_per_radian: if valid {
+                viewport_px[1] / self.fov_y
+            } else {
+                0.0
+            },
             min_spacing_px,
         }
     }
@@ -208,7 +235,11 @@ impl Camera {
     }
 
     /// Moves eye and target sideways so that the point at the target stays under the mouse.
+    /// Does nothing for a degenerate viewport (see [`valid_viewport`]).
     pub fn pan(&mut self, dx_px: f32, dy_px: f32, viewport_px: [f32; 2]) {
+        if !valid_viewport(viewport_px) {
+            return;
+        }
         let metres_per_px = 2.0 * self.distance * (self.fov_y / 2.0).tan() / viewport_px[1];
         let (r, u) = self.right_up();
         let delta = (u * dy_px - r * dx_px) * metres_per_px;
@@ -248,20 +279,35 @@ impl Camera {
     }
 
     /// Looks at the box from above at an angle (keeping the yaw), far enough that all of it
-    /// is in the image for viewports at least as wide as high.
-    pub fn frame_bounds(&mut self, min: [f32; 3], max: [f32; 3]) {
+    /// is in an image of this aspect ratio (width / height; not finite and positive: 1).
+    /// Bounds that are not finite or inverted (an empty cloud) leave the camera as it is.
+    pub fn frame_bounds(&mut self, min: [f32; 3], max: [f32; 3], aspect: f32) {
+        let finite = min.iter().chain(&max).all(|v| v.is_finite());
+        if !finite || (0..3).any(|k| min[k] > max[k]) {
+            return;
+        }
         let min = Vector3::from(min);
         let max = Vector3::from(max);
         let radius = ((max - min).norm() / 2.0).max(MIN_DISTANCE);
+        // A sphere of this radius fits in the narrower of the two fields of view.
+        let half_y = self.fov_y / 2.0;
+        let half_x = (half_y.tan() * safe_aspect(aspect)).atan();
+        let half = half_y.min(half_x);
         self.target = (min + max) / 2.0;
         self.pitch = FRAME_PITCH_DEG.to_radians();
-        // A sphere of this radius fits in the vertical field of view.
-        self.distance = (radius / (self.fov_y / 2.0).sin() * FRAME_MARGIN).max(MIN_DISTANCE);
+        self.distance = (radius / half.sin() * FRAME_MARGIN).max(MIN_DISTANCE);
         self.eye = self.target - self.dir() * self.distance;
     }
 
-    /// The ray from the eye through a pixel of the view.
+    /// The ray from the eye through a pixel of the view; for a degenerate viewport (see
+    /// [`valid_viewport`]) the view direction.
     pub fn ray(&self, pixel_px: [f32; 2], viewport_px: [f32; 2]) -> Ray {
+        if !valid_viewport(viewport_px) {
+            return Ray {
+                origin: self.eye_position(),
+                dir: self.dir(),
+            };
+        }
         let t = (self.fov_y / 2.0).tan();
         let aspect = viewport_px[0] / viewport_px[1];
         let x = 2.0 * pixel_px[0] / viewport_px[0] - 1.0;

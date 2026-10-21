@@ -50,7 +50,7 @@ fn orbit_keeps_target_in_centre() {
             (p[0] - VIEWPORT[0] / 2.0).abs() <= 0.5 && (p[1] - VIEWPORT[1] / 2.0).abs() <= 0.5,
             "after orbit({dx}, {dy}): {p:?}"
         );
-        assert!((cam.eye_position() - cam.target).norm() - 25.0 < 1e-3);
+        assert!(((cam.eye_position() - cam.target).norm() - 25.0).abs() < 1e-3);
     }
 }
 
@@ -258,28 +258,84 @@ fn fly_keys_map_to_motion() {
 
 #[test]
 fn frame_bounds_shows_all_corners() {
+    // Landscape, portrait and square viewports.
+    for viewport in [VIEWPORT, [600.0, 1200.0], [300.0, 1500.0], [900.0, 900.0]] {
+        let aspect = viewport[0] / viewport[1];
+        for (min, max) in [
+            ([0.0, 0.0, 0.0], [50.0, 20.0, 3.0]),
+            ([-500.0, 100.0, -2.0], [-480.0, 400.0, 30.0]),
+            ([1.0, 1.0, 1.0], [1.0, 1.0, 1.0]),
+        ] {
+            for mode in [CameraMode::Orbit, CameraMode::Fly] {
+                let mut cam = Camera::default();
+                cam.set_mode(mode);
+                cam.frame_bounds(min, max, aspect);
+                assert!(cam.pitch < -10f32.to_radians(), "from above");
+                let vp = cam.view_proj(aspect);
+                for c in 0..8 {
+                    let p = [0, 1, 2].map(|k| if c >> k & 1 == 1 { max[k] } else { min[k] });
+                    let q = project(&vp, p, viewport).expect("in front");
+                    assert!(
+                        (0.0..=viewport[0]).contains(&q[0])
+                            && (0.0..=viewport[1]).contains(&q[1])
+                            && q[2] > 0.0
+                            && q[2] <= 1.0,
+                        "{viewport:?} {mode:?} corner {p:?} at {q:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn frame_bounds_ignores_empty_bounds() {
+    let mut cam = Camera::default();
+    cam.orbit(40.0, 10.0);
+    let before = cam.clone();
+    // The bounds of an empty cloud, NaN, an inverted box, and a bad aspect ratio.
     for (min, max) in [
-        ([0.0, 0.0, 0.0], [50.0, 20.0, 3.0]),
-        ([-500.0, 100.0, -2.0], [-480.0, 400.0, 30.0]),
-        ([1.0, 1.0, 1.0], [1.0, 1.0, 1.0]),
+        ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]),
+        ([f32::NAN, 0.0, 0.0], [1.0; 3]),
+        ([0.0; 3], [1.0, -1.0, 1.0]),
+    ] {
+        cam.frame_bounds(min, max, ASPECT);
+        assert_eq!(cam, before, "{min:?} {max:?}");
+    }
+    // A bad aspect ratio is taken as 1.
+    cam.frame_bounds([0.0; 3], [10.0; 3], f32::NAN);
+    assert!(cam.distance.is_finite() && cam.target.iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn degenerate_viewport_keeps_camera_finite() {
+    for viewport in [
+        [800.0, 0.0],
+        [0.0, 0.0],
+        [0.0, 600.0],
+        [f32::NAN, 600.0],
+        [800.0, f32::INFINITY],
     ] {
         for mode in [CameraMode::Orbit, CameraMode::Fly] {
             let mut cam = Camera::default();
             cam.set_mode(mode);
-            cam.frame_bounds(min, max);
-            assert!(cam.pitch < -10f32.to_radians(), "from above");
-            let vp = cam.view_proj(ASPECT);
-            for c in 0..8 {
-                let p = [0, 1, 2].map(|k| if c >> k & 1 == 1 { max[k] } else { min[k] });
-                let q = project(&vp, p, VIEWPORT).expect("in front");
-                assert!(
-                    (0.0..=VIEWPORT[0]).contains(&q[0])
-                        && (0.0..=VIEWPORT[1]).contains(&q[1])
-                        && q[2] > 0.0
-                        && q[2] <= 1.0,
-                    "{mode:?} corner {p:?} at {q:?}"
-                );
-            }
+            let before = cam.clone();
+            cam.pan(30.0, -20.0, viewport);
+            assert_eq!(cam, before, "pan in {viewport:?}");
+            let ray = cam.ray([10.0, 10.0], viewport);
+            assert!(ray
+                .dir
+                .iter()
+                .chain(ray.origin.iter())
+                .all(|v| v.is_finite()));
+            let info = cam.view_info(viewport, 1.0);
+            assert!(info.frustum.planes.iter().flatten().all(|v| v.is_finite()));
+            assert!(info.pixels_per_radian.is_finite());
+            let aspect = viewport[0] / viewport[1];
+            assert!(cam.view_proj(aspect).iter().all(|v| v.is_finite()));
+            // Afterwards the camera still works.
+            cam.pan(30.0, -20.0, VIEWPORT);
+            assert!(cam.eye_position().iter().all(|v| v.is_finite()));
         }
     }
 }
@@ -330,4 +386,62 @@ fn pitch_is_clamped() {
     assert!(cam.pitch.abs() <= limit);
     // Even straight from above the view matrix stays finite.
     assert!(cam.view_proj(ASPECT).iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn ray_at_the_pole_is_finite() {
+    for pitch in [89f32.to_radians(), -89f32.to_radians()] {
+        for mode in [CameraMode::Orbit, CameraMode::Fly] {
+            let mut cam = Camera {
+                pitch,
+                ..Camera::default()
+            };
+            cam.set_mode(mode);
+            cam.orbit(0.0, 0.0);
+            assert!((cam.pitch - pitch).abs() < 1e-6);
+            let vp = cam.view_proj(ASPECT);
+            assert!(vp.iter().all(|v| v.is_finite()));
+            for pixel in [
+                [0.0, 0.0],
+                [VIEWPORT[0], VIEWPORT[1]],
+                [800.0, 600.0],
+                [1600.0, 0.0],
+            ] {
+                let ray = cam.ray(pixel, VIEWPORT);
+                assert!(ray.dir.iter().all(|v| v.is_finite()), "{pixel:?}");
+                assert!((ray.dir.norm() - 1.0).abs() < 1e-5);
+                // The ray goes back through its pixel.
+                let q = project(&vp, (ray.origin + ray.dir * 10.0).into(), VIEWPORT).unwrap();
+                assert!((q[0] - pixel[0]).abs() < 0.5 && (q[1] - pixel[1]).abs() < 0.5);
+            }
+            let p = px(&cam, cam.target);
+            assert!((p[0] - 800.0).abs() <= 0.5 && (p[1] - 600.0).abs() <= 0.5);
+        }
+    }
+}
+
+#[test]
+fn zoom_in_fly_mode_moves_forward() {
+    let mut cam = Camera {
+        distance: 10.0,
+        ..Camera::default()
+    };
+    cam.set_mode(CameraMode::Fly);
+    let (eye, dir) = (cam.eye_position(), view_dir(&cam));
+    cam.zoom(1.0);
+    assert!(close(cam.eye_position(), eye + dir * 1.5, 1e-4));
+    assert!((cam.distance - 10.0).abs() < 1e-6, "distance unchanged");
+    assert!(close(view_dir(&cam), dir, 1e-6));
+    assert!(close(cam.target, cam.eye_position() + dir * 10.0, 1e-4));
+    cam.zoom(-1.0);
+    assert!(close(
+        cam.eye_position(),
+        eye + dir * (1.5 - 10.0 * (1.0 / 0.85 - 1.0)),
+        1e-4
+    ));
+    // Unlike orbiting, flying is not stopped by a target.
+    for _ in 0..50 {
+        cam.zoom(3.0);
+    }
+    assert!((cam.eye_position() - eye).dot(&dir) > 20.0);
 }

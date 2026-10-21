@@ -3,7 +3,7 @@
 use driftless_app::camera::Camera;
 use driftless_app::cloud::PointSet;
 use driftless_app::lod::{build_octree, build_octree_with, Octree};
-use driftless_app::pick::{pick_point, pick_pose, project, to_physical};
+use driftless_app::pick::{pick_point, pick_pose, project, relative_to, to_physical};
 use driftless_app::synthetic::Rng;
 use driftless_io::progress::Progress;
 use nalgebra::Vector3;
@@ -241,4 +241,60 @@ fn pick_uses_physical_pixels() {
         pick_point(&tree, &drawn, &cam, viewport_px, mouse, 4.0),
         None
     );
+}
+
+/// Scans far from the origin (UTM): poses are given absolutely in f64 and enter the view in
+/// the octree's origin-relative frame, like the cloud.
+#[test]
+fn pick_pose_with_large_origin() {
+    let origin = [512_000.25, 5_400_000.5, 312.0];
+    let points = PointSet::from_xyz(origin, vec![[0.0; 3], [30.0, 20.0, 2.0]]);
+    let tree = build_octree(&points, &Progress::new()).unwrap();
+    assert_eq!(tree.origin, origin);
+    let mut cam = Camera::default();
+    cam.frame_bounds([0.0; 3], [30.0, 20.0, 2.0], ASPECT);
+    let vp = cam.view_proj(ASPECT);
+    // Poses 1 mm apart at 512 km: distinguishable only relative to the origin.
+    let absolute = [
+        [512_010.0, 5_400_010.0, 313.0],
+        [512_010.001, 5_400_010.0, 313.0],
+        [512_015.0, 5_400_012.0, 313.0],
+    ];
+    let positions: Vec<[f32; 3]> = absolute
+        .iter()
+        .map(|&p| relative_to(tree.origin, p))
+        .collect();
+    assert_eq!(positions[0], [9.75, 9.5, 1.0]);
+    assert!((positions[1][0] - 9.751).abs() < 1e-5);
+    let q0 = project(&vp, positions[0], VIEWPORT).unwrap();
+    assert_eq!(
+        pick_pose(&positions[..1], &vp, VIEWPORT, [q0[0], q0[1]], 3.0),
+        Some(0)
+    );
+    let q = project(&vp, positions[2], VIEWPORT).unwrap();
+    assert_eq!(
+        pick_pose(&positions, &vp, VIEWPORT, [q[0], q[1]], 3.0),
+        Some(2)
+    );
+    // Absolute coordinates cast to f32 are in another frame: nothing is hit.
+    let wrong: Vec<[f32; 3]> = absolute.iter().map(|p| p.map(|v| v as f32)).collect();
+    assert_eq!(wrong[0], wrong[1], "f32 loses the millimetre at 512 km");
+    assert_eq!(pick_pose(&wrong, &vp, VIEWPORT, [q[0], q[1]], 3.0), None);
+}
+
+#[test]
+fn degenerate_viewport_picks_nothing() {
+    let cam = along_x();
+    let tree = tree_of(vec![[10.0, 0.0, 0.0]]);
+    let vp = cam.view_proj(ASPECT);
+    for viewport in [[0.0, 0.0], [1600.0, 0.0], [f32::NAN, 1200.0]] {
+        assert_eq!(
+            pick_point(&tree, &all_nodes(&tree), &cam, viewport, [0.0, 0.0], 5.0),
+            None
+        );
+        assert_eq!(
+            pick_pose(&[[10.0, 0.0, 0.0]], &vp, viewport, [0.0, 0.0], 5.0),
+            None
+        );
+    }
 }

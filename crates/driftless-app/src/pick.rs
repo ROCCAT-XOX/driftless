@@ -3,7 +3,7 @@
 //! are in the frame the view-projection matrix expects (for the cloud: relative to
 //! [`Octree::origin`]).
 
-use crate::camera::Camera;
+use crate::camera::{valid_viewport, Camera};
 use crate::lod::Octree;
 use nalgebra::{Matrix4, Vector4};
 
@@ -14,6 +14,13 @@ pub fn to_physical(pos_points: [f32; 2], rect_min_points: [f32; 2], ppp: f32) ->
         (pos_points[0] - rect_min_points[0]) * ppp,
         (pos_points[1] - rect_min_points[1]) * ppp,
     ]
+}
+
+/// An absolute position (e.g. a pose of the trajectory) in the origin-relative frame of
+/// the cloud and the camera: the origin is subtracted in f64 before the cast to f32, so
+/// that millimetres survive at UTM coordinates.
+pub fn relative_to(origin: [f64; 3], p: [f64; 3]) -> [f32; 3] {
+    [0, 1, 2].map(|k| (p[k] - origin[k]) as f32)
 }
 
 /// Pixel x, y and reverse-Z depth of `p`; `None` behind the camera. A depth above 1 lies
@@ -48,6 +55,7 @@ fn hit(
 /// The vertex index of the front-most drawn point (largest depth) within `radius_px` of
 /// the pixel; on a tie the smallest index. Drawn nodes whose bounding sphere misses the
 /// cone around the ray through the pixel are skipped without looking at their points.
+/// `None` for a degenerate viewport.
 pub fn pick_point(
     tree: &Octree,
     drawn: &[u32],
@@ -56,6 +64,9 @@ pub fn pick_point(
     pixel_px: [f32; 2],
     radius_px: f32,
 ) -> Option<u32> {
+    if !valid_viewport(viewport_px) {
+        return None;
+    }
     let view_proj = cam.view_proj(viewport_px[0] / viewport_px[1]);
     let ray = cam.ray(pixel_px, viewport_px);
     // Two rays through pixels `radius_px` apart differ by at most radius / focal length
@@ -93,7 +104,10 @@ pub fn pick_point(
 }
 
 /// The index of the pose nearest to the pixel on screen within `radius_px`; on a tie the
-/// front-most, then the smallest index.
+/// front-most, then the smallest index. `positions` must be in the frame of `view_proj`,
+/// i.e. relative to the cloud's origin ([`Octree::origin`]) like the camera: convert
+/// absolute poses with [`relative_to`] (subtract in f64, then cast), never by casting the
+/// absolute values. `None` for a degenerate viewport.
 pub fn pick_pose(
     positions: &[[f32; 3]],
     view_proj: &Matrix4<f32>,
@@ -101,6 +115,9 @@ pub fn pick_pose(
     pixel_px: [f32; 2],
     radius_px: f32,
 ) -> Option<usize> {
+    if !valid_viewport(viewport_px) {
+        return None;
+    }
     let mut best: Option<(f32, f32, usize)> = None;
     for (i, &p) in positions.iter().enumerate() {
         let Some((d2, z)) = hit(view_proj, p, viewport_px, pixel_px, radius_px) else {
