@@ -14,10 +14,10 @@
 //! result does not depend on the order the points run in; the step is a pure function per
 //! point.
 
-use crate::clean::{spread_axes, vec3};
+use crate::clean::{block_moments, spread_axes, vec3, Moments};
 use driftless_odom::voxel_map::{voxel_key, FixedState, VoxelKey};
 use kiddo::{ImmutableKdTree, SquaredEuclidean};
-use nalgebra::{Matrix3, Vector3};
+use nalgebra::Vector3;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
@@ -109,44 +109,6 @@ pub struct SmoothStats {
     /// and its 26 neighbours. The cells and their points are taken from the input.
     pub thickness_before: f64,
     pub thickness_after: f64,
-}
-
-/// Mean and covariance of points given relative to some origin.
-#[derive(Clone, Copy)]
-struct Moments {
-    n: u32,
-    sum: Vector3<f64>,
-    outer: Matrix3<f64>,
-}
-
-impl Moments {
-    const ZERO: Moments = Moments {
-        n: 0,
-        sum: Vector3::new(0.0, 0.0, 0.0),
-        outer: Matrix3::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-    };
-
-    fn add(&mut self, d: &Vector3<f64>) {
-        self.n += 1;
-        self.sum += d;
-        self.outer += d * d.transpose();
-    }
-
-    /// Adds `b`, whose points are relative to an origin `off` away from this one.
-    fn add_shifted(&mut self, b: &Moments, off: &Vector3<f64>) {
-        let n = f64::from(b.n);
-        self.n += b.n;
-        self.sum += b.sum + off * n;
-        self.outer +=
-            b.outer + b.sum * off.transpose() + off * b.sum.transpose() + off * off.transpose() * n;
-    }
-
-    /// Mean and covariance.
-    fn mean_cov(&self) -> (Vector3<f64>, Matrix3<f64>) {
-        let c = f64::from(self.n);
-        let mean = self.sum / c;
-        (mean, self.outer / c - mean * mean.transpose())
-    }
 }
 
 /// Plane through the mean of `pts` along their least spread: (mean, normal, least spread,
@@ -303,19 +265,7 @@ fn thickness(before: &[[f32; 3]], after: &[[f32; 3]]) -> (f64, f64) {
     let (own_b, own_a) = (moments(before), moments(after));
     drop(point_slot);
     // Moments of a cell and its 26 neighbours, relative to the cell's corner.
-    let block = |own: &[Moments], k: &VoxelKey| {
-        let mut all = Moments::ZERO;
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
-                    if let Some(&o) = slot.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) {
-                        all.add_shifted(&own[o as usize], &corner(&[dx, dy, dz]));
-                    }
-                }
-            }
-        }
-        all
-    };
+    let block = |own: &[Moments], k: &VoxelKey| block_moments(&slot, own, k, THICKNESS_CELL);
     let (tb, ta): (Vec<f64>, Vec<f64>) = keys
         .par_iter()
         .enumerate()

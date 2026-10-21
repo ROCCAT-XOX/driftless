@@ -210,28 +210,43 @@ pub(crate) fn spread_axes(cov: &Matrix3<f64>) -> [(f64, Vector3<f64>); 3] {
     spread
 }
 
-/// Point moments of a voxel, relative to its lowest corner.
+/// Point moments (count, sum, sum of outer products) of points given relative to some
+/// origin, e.g. a voxel's lowest corner.
 #[derive(Clone, Copy)]
-struct Moments {
-    n: u32,
-    sum: Vector3<f64>,
-    outer: Matrix3<f64>,
+pub(crate) struct Moments {
+    pub(crate) n: u32,
+    pub(crate) sum: Vector3<f64>,
+    pub(crate) outer: Matrix3<f64>,
 }
 
 impl Moments {
-    const ZERO: Moments = Moments {
+    pub(crate) const ZERO: Moments = Moments {
         n: 0,
         sum: Vector3::new(0.0, 0.0, 0.0),
         outer: Matrix3::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     };
 
-    /// Adds `b`, whose points are relative to a corner `off` away from this one.
-    fn add_shifted(&mut self, b: &Moments, off: &Vector3<f64>) {
+    /// Adds the point `d` (relative to this origin).
+    pub(crate) fn add(&mut self, d: &Vector3<f64>) {
+        self.n += 1;
+        self.sum += d;
+        self.outer += d * d.transpose();
+    }
+
+    /// Adds `b`, whose points are relative to an origin `off` away from this one.
+    pub(crate) fn add_shifted(&mut self, b: &Moments, off: &Vector3<f64>) {
         let n = f64::from(b.n);
         self.n += b.n;
         self.sum += b.sum + off * n;
         self.outer +=
             b.outer + b.sum * off.transpose() + off * b.sum.transpose() + off * off.transpose() * n;
+    }
+
+    /// Mean and covariance (relative to this origin); needs at least one point.
+    pub(crate) fn mean_cov(&self) -> (Vector3<f64>, Matrix3<f64>) {
+        let c = f64::from(self.n);
+        let mean = self.sum / c;
+        (mean, self.outer / c - mean * mean.transpose())
     }
 
     /// Axis of least spread, if there are at least 3 points and they lie on a plane (least
@@ -240,13 +255,32 @@ impl Moments {
         if self.n < 3 {
             return None;
         }
-        let c = f64::from(self.n);
-        let mean = self.sum / c;
-        let cov = self.outer / c - mean * mean.transpose();
-        let spread = spread_axes(&cov);
+        let spread = spread_axes(&self.mean_cov().1);
         let (least, middle) = (spread[0].0, spread[1].0);
         (least < 0.1 * middle).then_some(spread[0].1)
     }
+}
+
+/// Moments of the voxel `k` and its 26 neighbours, relative to the lowest corner of `k`;
+/// `own` holds the moments of every slot of `slot`, relative to its voxel's lowest corner.
+pub(crate) fn block_moments(
+    slot: &HashMap<VoxelKey, u32, FixedState>,
+    own: &[Moments],
+    k: &VoxelKey,
+    voxel: f64,
+) -> Moments {
+    let mut all = Moments::ZERO;
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                if let Some(&o) = slot.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) {
+                    let off = Vector3::from([dx, dy, dz].map(|c| f64::from(c) * voxel));
+                    all.add_shifted(&own[o as usize], &off);
+                }
+            }
+        }
+    }
+    all
 }
 
 /// The voxels that hold cloud points.
@@ -280,28 +314,11 @@ impl Occupied {
         let corner = |k: &VoxelKey| Vector3::from(k.map(|c| f64::from(c) * voxel));
         let mut own = vec![Moments::ZERO; keys.len()];
         for (p, &s) in xyz.iter().zip(&point_slot) {
-            let m = &mut own[s as usize];
-            let d = vec3(p) - corner(&keys[s as usize]);
-            m.n += 1;
-            m.sum += d;
-            m.outer += d * d.transpose();
+            own[s as usize].add(&(vec3(p) - corner(&keys[s as usize])));
         }
         let normal = keys
             .par_iter()
-            .map(|k| {
-                let mut all = Moments::ZERO;
-                for dx in -1..=1 {
-                    for dy in -1..=1 {
-                        for dz in -1..=1 {
-                            if let Some(&o) = slot.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) {
-                                let off = corner(&[dx, dy, dz]);
-                                all.add_shifted(&own[o as usize], &off);
-                            }
-                        }
-                    }
-                }
-                all.plane_normal()
-            })
+            .map(|k| block_moments(&slot, &own, k, voxel).plane_normal())
             .collect();
         Occupied {
             voxel,
