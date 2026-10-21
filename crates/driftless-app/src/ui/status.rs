@@ -1,5 +1,6 @@
-//! The status bar at the bottom: the running step (phase, progress bar or spinner without a
-//! total, runtime, „Abbrechen“) or the last message, and the log, which opens on a click.
+//! The status bar at the bottom: the running step or, without one, the cloud being loaded
+//! (phase, progress bar or spinner without a total, runtime, „Abbrechen“) or the last
+//! message, and the log, which opens on a click.
 
 use super::{text, Action, AppState, UiMessage};
 use crate::jobs::JobStatus;
@@ -14,7 +15,8 @@ const ERROR_COLOR: Color32 = Color32::from_rgb(0xe0, 0x4b, 0x4b);
 
 pub fn show(ui: &mut Ui, state: &AppState) -> Option<Action> {
     let mut action = None;
-    ui.horizontal(|ui| match &state.job {
+    // A step comes first; loading a cloud runs beside it and is shown when no step runs.
+    ui.horizontal(|ui| match state.job.as_ref().or(state.loading.as_ref()) {
         Some(job) => job_line(ui, job, &mut action),
         None => message_line(ui, state.messages.last(), &mut action),
     });

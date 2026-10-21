@@ -73,6 +73,45 @@ pub const DOWNSCALE: &str = "Bilder verkleinern";
 /// The choices of [`DOWNSCALE`] for 1, 2 and 4.
 pub const DOWNSCALE_CHOICES: [(u32, &str); 3] = [(1, "1/1"), (2, "1/2"), (4, "1/4")];
 
+// The 3D view and its properties (right panel)
+pub const VIEW_NO_GPU: &str = "3D-Ansicht nicht verfügbar: keine wgpu-Grafik";
+pub const VIEW_SETTINGS: &str = "Ansicht";
+pub const COLOR_MODE: &str = "Farbe";
+pub const MODE_RGB: &str = "Farbe";
+pub const MODE_INTENSITY: &str = "Intensität";
+pub const MODE_QUALITY: &str = "Güte";
+pub const POINT_SIZE: &str = "Punktgröße (px)";
+pub const ROUND_POINTS: &str = "rund";
+pub const BUDGET: &str = "Punktbudget";
+/// Range of the point budget.
+pub const BUDGET_RANGE: std::ops::RangeInclusive<usize> = 1_000_000..=30_000_000;
+pub const CAMERA_MODE: &str = "Bedienung";
+pub const ORBIT: &str = "Umkreisen";
+pub const FLY: &str = "Fliegen";
+pub const LAYERS: &str = "Ebenen";
+pub const LAYER_TRAJECTORY: &str = "Laufbahn";
+pub const LAYER_ODOMETRY: &str = "Odometrie";
+pub const LAYER_LOOPS: &str = "Schleifen";
+pub const LAYER_SUBMAPS: &str = "Teilkarten";
+pub const VIEW_HELP_ORBIT: &str =
+    "Linke Taste: umkreisen · rechte/mittlere Taste oder Shift: verschieben · Rad: Zoom · F oder Doppelklick ins Leere: alles zeigen · Klick: Punkt";
+pub const VIEW_HELP_FLY: &str =
+    "W/A/S/D, Q/E: fliegen (Shift schneller) · rechte Taste: umsehen · Rad: vor/zurück · F: alles zeigen · Klick: Punkt";
+pub const LOAD_CLOUD: &str = "Wolke laden";
+pub const SYNTHETIC_CLOUD: &str = "Testwolke";
+pub const PHASE_SYNTHETIC: &str = "Testwolke erzeugen";
+pub const POINT: &str = "Punkt";
+pub const POINT_X: &str = "x";
+pub const POINT_Y: &str = "y";
+pub const POINT_Z: &str = "z";
+pub const POINT_TIME: &str = "Zeit ab Scan-Beginn";
+pub const POINT_INTENSITY: &str = "Intensität";
+pub const POINT_COLOR: &str = "Farbe";
+pub const POINT_QUALITY: &str = "Güte der Teilkarte";
+pub const POINT_REMOVED: &str = "Entfernt als";
+pub const NO_COLOR: &str = "ohne Farbe";
+pub const NO_POINT: &str = "Kein Punkt angeklickt";
+
 // Check of a scan (right panel)
 pub const INSPECT_RESULT: &str = "Prüfbericht";
 pub const DEVICE: &str = "Gerät";
@@ -109,7 +148,7 @@ pub const NOT_YET: &str = "Noch nicht verfügbar";
 pub const LAST_PROJECT_GONE: &str = "Zuletzt geöffnetes Projekt nicht lesbar";
 pub const CLOSE_AFTER_CANCEL: &str =
     "Der laufende Schritt wird abgebrochen; danach schließt das Fenster";
-const USAGE: &str = "Aufruf: driftless-app [projekt-ordner]";
+const USAGE: &str = "Aufruf: driftless-app [--synthetic N] [projekt-ordner]";
 
 pub fn project_opened(name: &str) -> String {
     format!("Projekt {name} geöffnet")
@@ -239,4 +278,71 @@ pub fn duration(seconds: f64) -> String {
     } else {
         format!("{}:{:02} min", s / 60, s % 60)
     }
+}
+
+/// Why `removed.las` holds a point (its `user_data`): 1 ghost, 2 outlier, 3 seen through a
+/// window (as `driftless_map::clean::RemovalReason`).
+pub fn removal_reason(code: u8) -> Option<&'static str> {
+    match code {
+        1 => Some("Geist"),
+        2 => Some("Ausreißer"),
+        3 => Some("Durchblick"),
+        _ => None,
+    }
+}
+
+/// `512345.678` → „512.345,678 m“: millimetres, thousands separated by dots.
+pub fn metres(x: f64) -> String {
+    let fixed = format!("{:.3}", x.abs());
+    let (whole, frac) = fixed.split_once('.').unwrap_or((&fixed, "000"));
+    let whole = super::status::count(whole.parse().unwrap_or(0));
+    // −0,000 is shown as 0,000
+    let sign = if x < 0.0 && fixed != "0.000" { "-" } else { "" };
+    format!("{sign}{whole},{frac} m")
+}
+
+/// „5,9 Mio.“ from a million on, else „300.000“.
+pub fn point_count(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{} Mio.", decimal(n as f64 / 1e6, 1))
+    } else {
+        super::status::count(n as u64)
+    }
+}
+
+/// „gezeichnet 5,9 Mio. von 15,6 Mio. Punkten · 8,4 ms“.
+pub fn drawn_stats(drawn: usize, total: usize, frame_ms: f32) -> String {
+    format!(
+        "gezeichnet {} von {} Punkten · {} ms",
+        point_count(drawn),
+        point_count(total),
+        decimal(f64::from(frame_ms), 1)
+    )
+}
+
+/// The name of the synthetic cloud of `n` points.
+pub fn synthetic_name(n: usize) -> String {
+    format!("{SYNTHETIC_CLOUD} ({} Punkte)", point_count(n))
+}
+
+/// „--synthetic braucht eine Punktzahl“ and similar.
+pub fn bad_synthetic(value: Option<&str>) -> String {
+    match value {
+        None => format!("--synthetic braucht eine Punktzahl; {USAGE}"),
+        Some(v) => format!("--synthetic {v}: keine gültige Punktzahl; {USAGE}"),
+    }
+}
+
+/// „color.las geladen: 15,6 Mio. Punkte (Laden 4,1 s, Detailstufen 2,3 s)“.
+pub fn cloud_loaded(path: &std::path::Path, points: usize, load_s: f64, build_s: f64) -> String {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    format!(
+        "{name} geladen: {} Punkte (Laden {} s, Detailstufen {} s)",
+        point_count(points),
+        decimal(load_s, 1),
+        decimal(build_s, 1)
+    )
 }

@@ -168,10 +168,14 @@ fn map_action_with_new_settings_creates_new_map_dir() {
     let mut app = app_with_scan(&dir);
     run_step(&mut app, Action::RunSlam("halle".into()));
     let run = runs_dir(&dir).join("slam-001");
+    // after a run its cloud is shown, after a map the map's best cloud
+    let shown = |app: &DriftlessApp| app.cloud().map(|c| c.path.clone());
+    assert_eq!(shown(&app), Some(run.join("map.las")));
     app.state_mut().map_settings.step = MapStep::Dense;
     run_step(&mut app, Action::RunMap(run.clone()));
     let first = run.join("karte-001");
     assert_eq!(app.state().selection, Selection::Map(first.clone()));
+    assert_eq!(shown(&app), Some(first.join("dense.las")));
     assert!(first.join("dense.las").is_file());
     assert!(first.join("map.json").is_file());
     // the same settings again: the same folder

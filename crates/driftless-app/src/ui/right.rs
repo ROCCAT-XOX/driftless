@@ -6,10 +6,15 @@
 //! rechnen“ (with the map settings, every switch of `driftless map`). Every step button is
 //! locked while a step runs and while the scan cannot be read; selecting and viewing stay
 //! possible.
+//!
+//! Below them, always: how the 3D view draws („Ansicht“) and the point clicked in it.
 
 use super::status::count;
-use super::{text, Action, AppState, ScanNode, Selection};
+use super::view3d::{color_modes, effective_color_mode, PointInfo};
+use super::{text, Action, AppState, ScanNode, Selection, ViewSettings};
+use crate::camera::CameraMode;
 use crate::project::{MapInfo, RunInfo, ScanState};
+use crate::render::ColorMode;
 use driftless_steps::history::HistoryKind;
 use driftless_steps::map::{MapSettings, MapStep};
 use driftless_steps::slam::SlamSettings;
@@ -96,8 +101,122 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
                     map_settings_edit(ui, &mut state.map_settings, scan.no_color.as_deref());
                 }
             }
+            ui.separator();
+            let has_rgb = state.cloud.as_ref().is_none_or(|c| c.has_rgb);
+            view_settings_edit(ui, &mut state.view, has_rgb);
+            if let Some(stats) = &state.view_stats {
+                ui.label(text::drawn_stats(stats.drawn, stats.total, stats.frame_ms));
+            }
+            ui.separator();
+            point_shown(ui, state.picked.as_ref());
         });
     action
+}
+
+/// How the 3D view draws. `has_rgb`: whether the loaded cloud has colours (offers the
+/// colour mode „Farbe“).
+fn view_settings_edit(ui: &mut Ui, view: &mut ViewSettings, has_rgb: bool) {
+    ui.strong(text::VIEW_SETTINGS);
+    let shown = effective_color_mode(view.color_mode, has_rgb);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(text::COLOR_MODE);
+        for mode in color_modes(has_rgb) {
+            let label = match mode {
+                ColorMode::Rgb => text::MODE_RGB,
+                ColorMode::Intensity => text::MODE_INTENSITY,
+                ColorMode::Quality => text::MODE_QUALITY,
+            };
+            if ui.selectable_label(shown == mode, label).clicked() {
+                view.color_mode = mode;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(text::POINT_SIZE);
+        ui.add(
+            egui::Slider::new(&mut view.point_px, 1.0..=10.0)
+                .step_by(0.5)
+                .custom_formatter(|v, _| text::decimal(v, 1))
+                .custom_parser(parse_decimal),
+        );
+        ui.checkbox(&mut view.round, text::ROUND_POINTS);
+    });
+    ui.horizontal(|ui| {
+        ui.label(text::BUDGET);
+        let (lo, hi) = (*text::BUDGET_RANGE.start(), *text::BUDGET_RANGE.end());
+        let mut millions = view.budget as f64 / 1e6;
+        let slider = egui::Slider::new(&mut millions, lo as f64 / 1e6..=hi as f64 / 1e6)
+            .step_by(0.5)
+            .custom_formatter(|v, _| format!("{} Mio.", text::decimal(v, 1)))
+            .custom_parser(|s| parse_decimal(s.trim_end_matches("Mio.").trim()));
+        if ui.add(slider).changed() {
+            view.budget = ((millions * 1e6).round() as usize).clamp(lo, hi);
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(text::CAMERA_MODE);
+        ui.selectable_value(&mut view.camera_mode, CameraMode::Orbit, text::ORBIT);
+        ui.selectable_value(&mut view.camera_mode, CameraMode::Fly, text::FLY);
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label(text::LAYERS);
+        ui.checkbox(&mut view.show_trajectory, text::LAYER_TRAJECTORY);
+        ui.checkbox(&mut view.show_odometry, text::LAYER_ODOMETRY);
+        ui.checkbox(&mut view.show_loops, text::LAYER_LOOPS);
+        ui.checkbox(&mut view.show_submaps, text::LAYER_SUBMAPS);
+    });
+}
+
+/// A number with a decimal comma or point.
+fn parse_decimal(s: &str) -> Option<f64> {
+    s.trim().replace(',', ".").parse().ok()
+}
+
+/// The point clicked in the 3D view.
+fn point_shown(ui: &mut Ui, picked: Option<&PointInfo>) {
+    ui.strong(text::POINT);
+    let Some(info) = picked else {
+        ui.weak(text::NO_POINT);
+        return;
+    };
+    egui::Grid::new("punkt").num_columns(2).show(ui, |ui| {
+        for (label, value) in point_lines(info) {
+            ui.label(label);
+            ui.label(value);
+            ui.end_row();
+        }
+    });
+}
+
+/// The rows of the point info: label and value.
+pub fn point_lines(info: &PointInfo) -> Vec<(&'static str, String)> {
+    let [x, y, z] = info.position;
+    let mut lines = vec![
+        (text::POINT_X, text::metres(x)),
+        (text::POINT_Y, text::metres(y)),
+        (text::POINT_Z, text::metres(z)),
+        (
+            text::POINT_TIME,
+            format!("{} s", text::decimal(f64::from(info.t), 2)),
+        ),
+        (text::POINT_INTENSITY, info.intensity.to_string()),
+        (
+            text::POINT_COLOR,
+            info.rgb.map_or_else(
+                || text::NO_COLOR.to_string(),
+                |[r, g, b]| format!("{r} / {g} / {b}"),
+            ),
+        ),
+        (
+            text::POINT_QUALITY,
+            text::decimal(f64::from(info.quality) / 255.0, 2),
+        ),
+    ];
+    if let Some(code) = info.removed {
+        let reason = text::removal_reason(code).map_or_else(|| code.to_string(), str::to_string);
+        lines.push((text::POINT_REMOVED, reason));
+    }
+    lines
 }
 
 /// Why no step can start now: another step runs, or the scan cannot be read.

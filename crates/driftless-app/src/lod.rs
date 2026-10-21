@@ -124,8 +124,9 @@ struct Temp {
 /// The root is the smallest cube at the minimum of the bounds (edge ≥ 1 mm); a point's
 /// position on its 2²¹ grid is `floor((p − min) / size · 2²¹)` per axis, computed in `f64`.
 /// The points are sorted by (Morton code, index). A node with at most [`LEAF_MAX`] points
-/// or at [`MAX_DEPTH`] keeps all of them; otherwise it keeps the first point of every cell
-/// of its 64³ grid and hands the rest, still sorted, to its eight octants.
+/// or at [`MAX_DEPTH`] keeps all of them; otherwise it keeps one point of every cell of its
+/// 64³ grid (the one with the smallest hash of its index) and hands the
+/// rest, still sorted, to its eight octants.
 #[doc(hidden)]
 pub fn build_octree_with(
     points: &PointSet,
@@ -261,19 +262,31 @@ fn build_node(
             children: Vec::new(),
         });
     }
-    // Sample: the first point of each run of equal 3·(depth + 6)-bit prefix. Walk backwards,
-    // moving the rest to the back in order; reads stay ahead of writes.
+    // Sample: one point of each run of equal 3·(depth + 6)-bit prefix (a cell), the one
+    // with the smallest hash of its index. Not the first in Morton order: that one lies
+    // near the low corner of its cell, so coarse levels would look like a lattice. Runs are
+    // walked backwards, moving the rest to the back in order; writes never pass reads.
     let shift = 3 * (MORTON_BITS - depth - NODE_GRID_BITS);
     let mut sample = Vec::new();
     let mut w = n;
-    for r in (0..n).rev() {
-        let key = keys[r];
-        if r == 0 || keys[r - 1].0 >> shift != key.0 >> shift {
-            sample.push(key.1);
-        } else {
-            w -= 1;
-            keys[w] = key;
+    let mut end = n;
+    while end > 0 {
+        let cell = keys[end - 1].0 >> shift;
+        let mut start = end - 1;
+        while start > 0 && keys[start - 1].0 >> shift == cell {
+            start -= 1;
         }
+        let pick = (start..end)
+            .min_by_key(|&j| (sample_hash(keys[j].1), keys[j].1))
+            .unwrap_or(start);
+        sample.push(keys[pick].1);
+        for r in (start..end).rev() {
+            if r != pick {
+                w -= 1;
+                keys[w] = keys[r];
+            }
+        }
+        end = start;
     }
     let own = sample.len();
     debug_assert_eq!(w, own);
@@ -311,6 +324,17 @@ fn build_node(
         own,
         children,
     })
+}
+
+/// Which point of a cell an inner node keeps: a fixed mix of the point index (the same on
+/// every platform and for any thread count).
+fn sample_hash(index: u32) -> u32 {
+    let mut x = index.wrapping_mul(0x9E37_79B9);
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x85EB_CA6B);
+    x ^= x >> 13;
+    x = x.wrapping_mul(0xC2B2_AE35);
+    x ^ (x >> 16)
 }
 
 /// Blocks of at most `limit` vertices: nodes are added while they fit; a node larger than
@@ -373,11 +397,12 @@ pub struct ViewInfo {
     pub min_spacing_px: f32,
 }
 
-/// Point spacing of `node` on screen (pixels).
+/// Point spacing of `node` on screen (pixels), at the nearest point of its cube: a large
+/// node next to or around the eye counts as near, not as far as its centre.
 fn screen_spacing(node: &Node, view: &ViewInfo) -> f32 {
-    let c = node.centre();
+    let max = node.max();
     let d = (0..3)
-        .map(|k| (c[k] - view.eye[k]).powi(2))
+        .map(|k| (view.eye[k].clamp(node.min[k], max[k]) - view.eye[k]).powi(2))
         .sum::<f32>()
         .sqrt();
     node.spacing * view.pixels_per_radian / d.max(view.near)

@@ -3,7 +3,7 @@
 
 use driftless_app::jobs::JobOutput;
 use driftless_app::project::{canonical, Project};
-use driftless_app::ui::{parse_args, Action, DriftlessApp, Selection, UiMessage};
+use driftless_app::ui::{parse_args, Action, Args, DriftlessApp, Selection, UiMessage};
 use driftless_io::progress::LogLine;
 use driftless_io::testscan::{room_bag_secs, tmp};
 use driftless_steps::StepError;
@@ -300,8 +300,98 @@ fn messages_are_capped() {
 #[test]
 fn args_take_one_project_folder() {
     let args = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
-    assert_eq!(args(&[]), Ok(None));
-    assert_eq!(args(&["/p"]), Ok(Some(PathBuf::from("/p"))));
+    let project = |p: &str| Args {
+        project: Some(PathBuf::from(p)),
+        synthetic: None,
+    };
+    assert_eq!(args(&[]), Ok(Args::default()));
+    assert_eq!(args(&["/p"]), Ok(project("/p")));
     assert!(args(&["/p", "/q"]).is_err());
-    assert!(args(&["--synthetic", "5"]).is_err());
+    assert!(args(&["--other"]).is_err());
+}
+
+#[test]
+fn args_take_synthetic_count() {
+    let args = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
+    let synthetic = |n| Args {
+        project: None,
+        synthetic: Some(n),
+    };
+    assert_eq!(args(&["--synthetic", "5"]), Ok(synthetic(5)));
+    assert_eq!(
+        args(&["--synthetic", "50.000.000"]),
+        Ok(synthetic(50_000_000))
+    );
+    assert_eq!(
+        args(&["/p", "--synthetic", "1000"]),
+        Ok(Args {
+            project: Some(PathBuf::from("/p")),
+            synthetic: Some(1000),
+        })
+    );
+    for bad in [
+        &["--synthetic"][..],
+        &["--synthetic", "0"],
+        &["--synthetic", "viele"],
+    ] {
+        assert!(args(bad).is_err(), "{bad:?}");
+    }
+}
+
+/// `--synthetic` generates the cloud in the background; the window stays usable and the
+/// cloud appears when ready, with its levels of detail.
+#[test]
+fn synthetic_cloud_loads_in_background() {
+    let mut app = app();
+    app.load_synthetic(200_000);
+    assert!(app.is_loading());
+    assert!(app.cloud().is_none());
+    tick_until(&mut app, |a| a.cloud().is_some());
+    let cloud = app.cloud().unwrap();
+    assert_eq!(cloud.points.len(), 200_000);
+    assert_eq!(cloud.tree.vertices.len(), 200_000);
+    let summary = app.state().cloud.clone().unwrap();
+    assert_eq!(summary.points, 200_000);
+    assert!(summary.has_rgb);
+    assert!(app.state().loading.is_none());
+    assert_eq!(errors(&app), Vec::<String>::new());
+}
+
+/// A cloud selected in the tree is loaded with the quality of its run; a second selection
+/// while the first loads replaces it.
+#[test]
+fn selecting_a_cloud_loads_it() {
+    let dir = tmp("ui-wolke");
+    let write = |name: &str, n: usize| {
+        let path = dir.join(name);
+        let mut builder = las::Builder::from((1, 2));
+        builder.point_format = las::point::Format::new(1).unwrap();
+        let mut w = las::Writer::from_path(&path, builder.into_header().unwrap()).unwrap();
+        for i in 0..n {
+            w.write_point(las::Point {
+                x: i as f64 * 0.01,
+                y: 1.0,
+                z: 2.0,
+                intensity: 1000,
+                gps_time: Some(i as f64),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        w.close().unwrap();
+        path
+    };
+    let (a, b) = (write("a.las", 300_000), write("b.las", 1_000));
+    let mut app = app();
+    app.apply(Action::Select(Selection::Cloud(a)));
+    assert!(app.is_loading());
+    app.apply(Action::Select(Selection::Cloud(b.clone())));
+    tick_until(&mut app, |a| !a.is_loading());
+    assert_eq!(errors(&app), Vec::<String>::new());
+    let cloud = app.cloud().unwrap();
+    assert_eq!(cloud.path, b);
+    assert_eq!(cloud.points.len(), 1_000);
+    // selecting the shown cloud again does not load it again
+    app.apply(Action::Select(Selection::Cloud(b)));
+    assert!(!app.is_loading());
 }

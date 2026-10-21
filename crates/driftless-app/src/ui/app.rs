@@ -1,10 +1,15 @@
-//! The program: carries out the panels' actions, owns the job runner and the dialogs.
+//! The program: carries out the panels' actions, owns the job runners, the dialogs, the
+//! loaded cloud and the 3D view.
 
+use super::view3d::{point_info, View3d, ViewEvent};
 use super::{
-    actions, left, right, status, text, Action, AppState, InspectResult, Selection, UiMessage,
+    actions, left, right, status, text, Action, AppState, CloudSummary, InspectResult, Selection,
+    UiMessage, ViewStats,
 };
+use crate::cloud::{load_cloud, LoadedCloud};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
 use crate::project::{canonical, Project};
+use crate::synthetic::synthetic_cloud;
 use driftless_io::progress::Progress;
 use driftless_steps::StepError;
 use eframe::egui;
@@ -24,19 +29,61 @@ const MESSAGE_LIMIT: usize = 100;
 const LEFT_WIDTH: f32 = 280.0;
 const RIGHT_WIDTH: f32 = 340.0;
 
-/// The arguments of `driftless-app`: at most one project folder.
-pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<PathBuf>, String> {
-    let mut project = None;
-    for arg in args {
+/// Seed of the synthetic cloud of `--synthetic`.
+const SYNTHETIC_SEED: u64 = 1;
+
+/// The arguments of `driftless-app [--synthetic N] [projekt-ordner]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Args {
+    pub project: Option<PathBuf>,
+    /// Show a synthetic cloud of this many points (to try the view without a scan).
+    pub synthetic: Option<usize>,
+}
+
+/// Reads the arguments: at most one project folder, `--synthetic N` with 1 ≤ N < 2³².
+pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    let mut out = Args::default();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--synthetic" {
+            let value = args.next();
+            let n = value
+                .as_deref()
+                .and_then(|v| v.replace(['.', '_'], "").parse::<u32>().ok())
+                .filter(|&n| n > 0)
+                .ok_or_else(|| text::bad_synthetic(value.as_deref()))?;
+            out.synthetic = Some(n as usize);
+            continue;
+        }
         if arg.starts_with('-') {
             return Err(text::unknown_option(&arg));
         }
-        if project.is_some() {
+        if out.project.is_some() {
             return Err(text::one_project_only());
         }
-        project = Some(PathBuf::from(arg));
+        out.project = Some(PathBuf::from(arg));
     }
-    Ok(project)
+    Ok(out)
+}
+
+/// Where a cloud comes from.
+#[derive(Debug, Clone, PartialEq)]
+enum CloudSource {
+    /// A LAS file, with the run folder whose `slam.json` gives the quality.
+    File {
+        path: PathBuf,
+        run: Option<PathBuf>,
+    },
+    Synthetic(usize),
+}
+
+impl CloudSource {
+    fn path(&self) -> PathBuf {
+        match self {
+            CloudSource::File { path, .. } => path.clone(),
+            CloudSource::Synthetic(n) => PathBuf::from(text::synthetic_name(*n)),
+        }
+    }
 }
 
 pub struct DriftlessApp {
@@ -46,6 +93,16 @@ pub struct DriftlessApp {
     jobs: JobRunner,
     /// Quick work off the UI thread that is no step: the status of the map folders.
     helper: JobRunner,
+    /// Loads clouds and builds their levels of detail, beside a running step.
+    loader: JobRunner,
+    /// What the loader is loading, and what to load once it has stopped.
+    loading: Option<CloudSource>,
+    next_load: Option<CloudSource>,
+    /// The cloud shown; a new one replaces it only when it is ready.
+    cloud: Option<LoadedCloud>,
+    view: View3d,
+    /// The GPU of the window; `None` without wgpu (tests): then there is no 3D view.
+    render_state: Option<egui_wgpu::RenderState>,
     /// The [`AppState::tree_version`] the map statuses were last asked for, and the one of
     /// the job running on [`DriftlessApp::helper`].
     status_asked: u64,
@@ -67,7 +124,13 @@ impl DriftlessApp {
         DriftlessApp {
             state: AppState::default(),
             jobs: JobRunner::new(repaint.clone()),
-            helper: JobRunner::new(repaint),
+            helper: JobRunner::new(repaint.clone()),
+            loader: JobRunner::new(repaint),
+            loading: None,
+            next_load: None,
+            cloud: None,
+            view: View3d::default(),
+            render_state: None,
             status_asked: 0,
             status_running: None,
             pending: None,
@@ -77,20 +140,161 @@ impl DriftlessApp {
         }
     }
 
-    /// For eframe: opens `project`, else the project opened last.
-    pub fn from_creation_context(
-        cc: &eframe::CreationContext<'_>,
-        project: Option<PathBuf>,
-    ) -> Self {
+    /// For eframe: opens the project of `args`, else the project opened last, and starts
+    /// generating the synthetic cloud if asked for.
+    pub fn from_creation_context(cc: &eframe::CreationContext<'_>, args: Args) -> Self {
         let ctx = cc.egui_ctx.clone();
         let mut app = DriftlessApp::new(Arc::new(move || ctx.request_repaint()));
-        if let Some(dir) = project {
+        app.render_state = cc.wgpu_render_state.clone();
+        if let Some(dir) = args.project {
             app.apply(Action::OpenProject(dir));
         } else {
             let last = cc.storage.and_then(|s| s.get_string(LAST_PROJECT_KEY));
             app.restore_last(last.as_deref());
         }
+        if let Some(n) = args.synthetic {
+            app.load_synthetic(n);
+        }
         app
+    }
+
+    /// With the GPU of a window (or of a test renderer): the 3D view draws with it.
+    pub fn with_render_state(mut self, render_state: egui_wgpu::RenderState) -> Self {
+        self.render_state = Some(render_state);
+        self
+    }
+
+    /// Starts generating a synthetic cloud of `n` points in the background.
+    pub fn load_synthetic(&mut self, n: usize) {
+        self.load(CloudSource::Synthetic(n));
+    }
+
+    /// The cloud shown in the 3D view.
+    pub fn cloud(&self) -> Option<&LoadedCloud> {
+        self.cloud.as_ref()
+    }
+
+    /// True while a cloud is loaded or waits to be.
+    pub fn is_loading(&self) -> bool {
+        self.loader.is_busy() || self.next_load.is_some()
+    }
+
+    /// Loads `source` in the background; a load that runs is cancelled first. The cloud
+    /// shown stays until the new one is ready. The cloud shown or being loaded is not
+    /// loaded again.
+    fn load(&mut self, source: CloudSource) {
+        let path = source.path();
+        let shown = self.cloud.as_ref().is_some_and(|c| c.path == path);
+        if self.loading.as_ref().map(CloudSource::path) == Some(path.clone())
+            || (shown && self.loading.is_none())
+        {
+            self.next_load = None;
+            return;
+        }
+        if self.loader.is_busy() {
+            self.loader.cancel();
+            self.next_load = Some(source);
+            return;
+        }
+        self.next_load = None;
+        let label = match &source {
+            CloudSource::File { .. } => text::LOAD_CLOUD,
+            CloudSource::Synthetic(_) => text::SYNTHETIC_CLOUD,
+        };
+        let job = source.clone();
+        let started = self.loader.start(label, move |p| {
+            let cloud = match job {
+                CloudSource::File { path, run } => load_cloud(&path, run.as_deref(), p)?,
+                CloudSource::Synthetic(n) => {
+                    p.phase(text::PHASE_SYNTHETIC, None);
+                    let t = std::time::Instant::now();
+                    let points = synthetic_cloud(n, SYNTHETIC_SEED);
+                    let seconds = t.elapsed().as_secs_f64();
+                    LoadedCloud::build(PathBuf::from(text::synthetic_name(n)), points, seconds, p)?
+                }
+            };
+            Ok(JobOutput::Cloud(Box::new(cloud)))
+        });
+        match started {
+            Ok(()) => self.loading = Some(source),
+            Err(e) => self.error(e.to_string()),
+        }
+        self.state.loading = self.loader.status();
+    }
+
+    /// Takes a loaded cloud and starts the load that waited.
+    fn tick_loader(&mut self) {
+        if let Some(f) = self.loader.poll() {
+            self.loading = None;
+            match f.result {
+                Ok(JobOutput::Cloud(cloud)) => {
+                    self.info(text::cloud_loaded(
+                        &cloud.path,
+                        cloud.points.len(),
+                        cloud.load_seconds,
+                        cloud.build_seconds,
+                    ));
+                    self.state.cloud = Some(CloudSummary {
+                        path: cloud.path.clone(),
+                        points: cloud.points.len(),
+                        has_rgb: cloud.points.rgb.is_some(),
+                    });
+                    self.state.picked = None;
+                    self.state.view_stats = None;
+                    self.cloud = Some(*cloud);
+                    self.view.cloud_replaced();
+                }
+                Ok(_) => {}
+                // a cancel for the next load needs no message
+                Err(StepError::Cancelled) if self.next_load.is_some() => {}
+                Err(StepError::Cancelled) => self.info(text::job_cancelled(&f.label)),
+                Err(StepError::Failed(m)) => self.error(text::job_failed(&f.label, &m)),
+            }
+        }
+        if !self.loader.is_busy() {
+            if let Some(next) = self.next_load.take() {
+                self.load(next);
+            }
+        }
+        self.state.loading = self.loader.status();
+    }
+
+    /// Loads the cloud of `selection` if it is one, with the quality of its run.
+    fn load_selected(&mut self) {
+        if let Selection::Cloud(path) = &self.state.selection {
+            let run = self.state.selected_run().map(|(_, r)| r.dir.clone());
+            let path = path.clone();
+            self.load(CloudSource::File { path, run });
+        }
+    }
+
+    /// Loads the best cloud of the map in `dir` (colour, else clean, else dense), with the
+    /// quality of its run; the map stays selected.
+    fn load_best_of_map(&mut self, dir: &Path) {
+        let best = self.state.scans.iter().flat_map(|s| &s.runs).find_map(|r| {
+            let map = r.maps.iter().find(|m| m.dir == dir)?;
+            map.clouds
+                .iter()
+                .find(|c| c.file_name().is_none_or(|n| n != "removed.las"))
+                .map(|c| (c.clone(), r.dir.clone()))
+        });
+        if let Some((path, run)) = best {
+            self.load(CloudSource::File {
+                path,
+                run: Some(run),
+            });
+        }
+    }
+
+    /// Loads the `map.las` of the run in `dir`, if there is one.
+    fn load_run_cloud(&mut self, dir: &Path) {
+        let cloud = self.state.run(dir).and_then(|(_, r)| r.cloud.clone());
+        if let Some(path) = cloud {
+            self.load(CloudSource::File {
+                path,
+                run: Some(dir.to_path_buf()),
+            });
+        }
     }
 
     /// Opens the stored last project (an empty value is none). If it cannot be opened, the
@@ -166,7 +370,10 @@ impl DriftlessApp {
 
     /// True while a step or background work runs: the window must then keep drawing.
     pub fn wants_repaint_while_busy(&self) -> bool {
-        self.jobs.is_busy() || self.helper.is_busy() || self.status_asked != self.state.tree_version
+        self.jobs.is_busy()
+            || self.helper.is_busy()
+            || self.is_loading()
+            || self.status_asked != self.state.tree_version
     }
 
     /// Takes finished map statuses and starts computing them again when the tree changed.
@@ -203,6 +410,7 @@ impl DriftlessApp {
         self.state.log.drain(..over);
         self.state.job = self.jobs.status();
         self.tick_helper();
+        self.tick_loader();
     }
 
     fn finished(&mut self, f: JobFinished) {
@@ -225,10 +433,12 @@ impl DriftlessApp {
         self.reload_project();
         match (output, step) {
             (Some(JobOutput::Slam(done)), _) => {
-                self.state.selection = Selection::Run(done.run_dir);
+                self.state.selection = Selection::Run(done.run_dir.clone());
+                self.load_run_cloud(&done.run_dir);
             }
             (Some(JobOutput::Map(done)), _) => {
-                self.state.selection = Selection::Map(done.dir);
+                self.state.selection = Selection::Map(done.dir.clone());
+                self.load_best_of_map(&done.dir);
             }
             (Some(JobOutput::Inspect(report)), Some(Action::Inspect(scan))) => {
                 self.state.inspect = Some(InspectResult {
@@ -315,8 +525,17 @@ impl DriftlessApp {
                     }
                 }
             }
-            Action::Select(selection) => self.state.selection = selection,
-            Action::Cancel => self.jobs.cancel(),
+            Action::Select(selection) => {
+                self.state.selection = selection;
+                self.load_selected();
+            }
+            Action::LoadCloud { path, run } => self.load(CloudSource::File { path, run }),
+            // the status bar shows the step if one runs, else the load
+            Action::Cancel if self.jobs.is_busy() => self.jobs.cancel(),
+            Action::Cancel => {
+                self.next_load = None;
+                self.loader.cancel();
+            }
             Action::DismissMessages => self.state.messages.clear(),
             step @ (Action::Inspect(_)
             | Action::RunSlam(_)
@@ -326,8 +545,7 @@ impl DriftlessApp {
                     self.error(e);
                 }
             }
-            Action::LoadCloud { .. }
-            | Action::AddLoop { .. }
+            Action::AddLoop { .. }
             | Action::SetLoopEnabled { .. }
             | Action::RestoreHistory { .. } => self.info(text::NOT_YET.to_string()),
         }
@@ -452,9 +670,33 @@ impl DriftlessApp {
             .show(ui, |ui| {
                 actions.extend(right::show(ui, &mut self.state));
             });
-        egui::CentralPanel::default_margins().show(ui, |ui| {
-            ui.centered_and_justified(|ui| ui.weak(text::VIEW_EMPTY));
+        let mut event = None;
+        egui::CentralPanel::no_frame().show(ui, |ui| match (&self.render_state, &self.cloud) {
+            (Some(rs), Some(cloud)) => {
+                event = self.view.show(ui, rs, Some(cloud), &self.state.view);
+            }
+            (None, Some(_)) => {
+                ui.centered_and_justified(|ui| ui.weak(text::VIEW_NO_GPU));
+            }
+            (_, None) => {
+                ui.centered_and_justified(|ui| ui.weak(text::VIEW_EMPTY));
+            }
         });
+        if let Some(cloud) = &self.cloud {
+            let stats = Some(ViewStats {
+                drawn: self.view.drawn_points(),
+                total: cloud.points.len(),
+                frame_ms: self.view.frame_ms(),
+            });
+            // the right panel was drawn before the view: show the new numbers next frame
+            if stats != self.state.view_stats {
+                self.state.view_stats = stats;
+                ctx.request_repaint();
+            }
+            if let Some(ViewEvent::PickedPoint(i)) = event {
+                self.state.picked = Some(point_info(cloud, i));
+            }
+        }
         for action in actions {
             self.apply(action);
         }

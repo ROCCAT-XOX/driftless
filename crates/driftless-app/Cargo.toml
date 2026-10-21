@@ -35,4 +35,4 @@ toml = "1"
 [dev-dependencies]
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
 driftless-map = { path = "../driftless-map" }
-egui_kittest = "0.36"
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }

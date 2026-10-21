@@ -8,8 +8,9 @@ pub mod left;
 pub mod right;
 pub mod status;
 pub mod text;
+pub mod view3d;
 
-pub use app::{parse_args, DriftlessApp};
+pub use app::{parse_args, Args, DriftlessApp};
 
 use crate::camera::CameraMode;
 use crate::jobs::JobStatus;
@@ -93,7 +94,7 @@ pub enum UiMessage {
     Error(String),
 }
 
-/// How the 3D view draws (used from the 3D view on).
+/// How the 3D view draws.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewSettings {
     pub color_mode: ColorMode,
@@ -123,6 +124,22 @@ impl Default for ViewSettings {
             show_submaps: false,
         }
     }
+}
+
+/// The loaded cloud, as the panels need it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CloudSummary {
+    pub path: PathBuf,
+    pub points: usize,
+    pub has_rgb: bool,
+}
+
+/// The last frame of the 3D view.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewStats {
+    pub drawn: usize,
+    pub total: usize,
+    pub frame_ms: f32,
 }
 
 /// A scan as the tree shows it. Read from disk by [`AppState::refresh`], not every frame.
@@ -171,6 +188,14 @@ pub struct AppState {
     /// Raised by every [`AppState::refresh`]: the program recomputes [`AppState::map_status`]
     /// in the background whenever it changed.
     pub tree_version: u64,
+    /// The cloud in the 3D view.
+    pub cloud: Option<CloudSummary>,
+    /// A cloud being loaded, as of this frame (the loader runs next to the steps).
+    pub loading: Option<JobStatus>,
+    /// The last frame of the 3D view.
+    pub view_stats: Option<ViewStats>,
+    /// The point clicked in the 3D view.
+    pub picked: Option<view3d::PointInfo>,
 }
 
 impl AppState {

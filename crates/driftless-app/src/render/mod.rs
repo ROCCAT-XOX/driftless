@@ -68,7 +68,8 @@ impl Uniforms {
     fn new(frame: &FrameParams, point_px: f32, color_mode: ColorMode) -> Self {
         Uniforms {
             view_proj: frame.view_proj,
-            viewport_px: frame.viewport_px,
+            // A 0 here would divide by zero in the shader; a zero-size view is not drawn.
+            viewport_px: frame.viewport_px.map(|v| v.max(1.0)),
             point_px,
             color_mode: color_mode as u32,
             round: u32::from(frame.round),
@@ -318,7 +319,12 @@ impl PointRenderer {
 
     /// Clears the target and draws the nodes `drawn` of `tree` (the tree last uploaded),
     /// then the lines and the markers. Each node is drawn with one call per block it lies
-    /// in; unknown node indices are ignored.
+    /// in; unknown node indices are ignored. A viewport side below 1 is taken as 1.
+    ///
+    /// Contract: both uniform buffers are shared by every frame and are written with
+    /// `queue.write_buffer`, which takes effect at the next submit. So each call records
+    /// and submits its own work (returned here) before the next call writes them again;
+    /// two frames must never be recorded into one submission.
     pub fn render(
         &self,
         device: &wgpu::Device,
@@ -327,7 +333,7 @@ impl PointRenderer {
         frame: &FrameParams,
         tree: &Octree,
         drawn: &[u32],
-    ) {
+    ) -> wgpu::SubmissionIndex {
         queue.write_buffer(
             &self.cloud_uniforms,
             0,
@@ -393,7 +399,7 @@ impl PointRenderer {
                 pass.draw(0..4, 0..*count);
             }
         }
-        queue.submit([encoder.finish()]);
+        queue.submit([encoder.finish()])
     }
 
     /// (block, instances relative to the block) for every slice of a drawn node, sorted by

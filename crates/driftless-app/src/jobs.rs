@@ -29,12 +29,13 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use crate::cloud::LoadedCloud;
 use crate::project::{MapDone, MapStatus, SlamDone};
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
 use driftless_steps::inspect;
 use driftless_steps::StepError;
 
-/// What a finished job hands back. Later tasks add variants (a loaded cloud, a comparison).
+/// What a finished job hands back. Later tasks add variants (a comparison).
 #[derive(Debug)]
 pub enum JobOutput {
     Inspect(Box<inspect::Report>),
@@ -42,6 +43,8 @@ pub enum JobOutput {
     Slam(Box<SlamDone>),
     /// With the map folder.
     Map(Box<MapDone>),
+    /// A cloud with its levels of detail (loader runner).
+    Cloud(Box<LoadedCloud>),
     /// The status of every map folder of the tree (helper runner).
     MapStatus(Box<BTreeMap<PathBuf, MapStatus>>),
     /// Nothing to hand back; the job's effect is on disk.

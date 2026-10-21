@@ -271,6 +271,31 @@ fn chunks_respect_limit_and_node_boundaries() {
     check_chunks(&tree, 10_000);
 }
 
+/// The sample of an inner node is spread over its cells, not pulled to their low corner
+/// (the first point in Morton order would be): coarse levels must not look like a lattice.
+#[test]
+fn inner_samples_not_at_cell_corners() {
+    // A floor: ~100 points per cell of the root, so the first in Morton order would sit
+    // close to the cell's low corner.
+    let points = random_points(400_000, 21, [10.0, 10.0, 0.0]);
+    let tree = build(&points);
+    let root = &tree.nodes[0];
+    assert!(!is_leaf(&tree, 0));
+    let shift = MORTON_BITS - NODE_GRID_BITS;
+    let cell = (1u64 << shift) as f64;
+    let mut sum = [0.0f64; 2];
+    for v in root.first..root.first + root.count {
+        let g = grid(&tree, tree.vertices[v as usize].pos);
+        for k in 0..2 {
+            sum[k] += (g[k] & ((1 << shift) - 1)) as f64 / cell;
+        }
+    }
+    for s in sum {
+        let mean = s / f64::from(root.count);
+        assert!((mean - 0.5).abs() < 0.05, "mean offset in the cell {mean}");
+    }
+}
+
 fn same_tree(a: &Octree, b: &Octree) {
     assert_eq!(a.origin, b.origin);
     assert_eq!(a.nodes, b.nodes);
@@ -523,11 +548,13 @@ fn refinement_stops_at_min_spacing() {
         select_nodes(&tree, &view(eye, centre, 1e9), points.len()),
         vec![0]
     );
-    let v = view(eye, centre, 2.0);
+    let min_spacing = 6.0;
+    let v = view(eye, centre, min_spacing);
     let ids = select_nodes(&tree, &v, points.len());
+    // Spacing at the point of the node's cube nearest to the eye.
     let on_screen = |i: u32| {
         let n = &tree.nodes[i as usize];
-        let c = [0, 1, 2].map(|k| n.min[k] + n.size / 2.0);
+        let c = [0, 1, 2].map(|k| eye[k].clamp(n.min[k], n.min[k] + n.size));
         let d = dot(
             [0, 1, 2].map(|k| c[k] - eye[k]),
             [0, 1, 2].map(|k| c[k] - eye[k]),
@@ -537,7 +564,7 @@ fn refinement_stops_at_min_spacing() {
     };
     assert!(ids.len() > 1 && ids.len() < tree.nodes.len());
     for &i in &ids[1..] {
-        assert!(on_screen(parent[i as usize]) > 2.0, "node {i}");
+        assert!(on_screen(parent[i as usize]) > min_spacing, "node {i}");
     }
 }
 

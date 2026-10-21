@@ -1,4 +1,4 @@
-//! `driftless-app [projekt-ordner]`: the Driftless window.
+//! `driftless-app [--synthetic N] [projekt-ordner]`: the Driftless window.
 
 // No console window next to the program on Windows (debug builds keep it for messages).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -11,7 +11,7 @@ use std::process::ExitCode;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
-    let project = match parse_args(std::env::args().skip(1)) {
+    let args = match parse_args(std::env::args().skip(1)) {
         Ok(p) => p,
         Err(e) => {
             report(&text::start_error(&e));
@@ -28,7 +28,7 @@ fn main() -> ExitCode {
     let result = eframe::run_native(
         text::APP_TITLE,
         options,
-        Box::new(move |cc| Ok(Box::new(DriftlessApp::from_creation_context(cc, project)))),
+        Box::new(move |cc| Ok(Box::new(DriftlessApp::from_creation_context(cc, args)))),
     );
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -1,11 +1,13 @@
 //! A point cloud loaded from LAS for the 3D view: columns relative to an origin in whole
 //! metres, so that `f32` keeps millimetres even for coordinates of ~10⁶ m.
 
+use crate::lod::{build_octree, Octree};
 use driftless_io::progress::Progress;
 use driftless_slam::report::SlamReport;
 use driftless_steps::overlay::submap_at;
 use driftless_steps::StepError;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Points read per batch (one cancel check and one progress step each).
 const BATCH: usize = 1 << 20;
@@ -210,4 +212,66 @@ pub fn load_las(
         out.intensity.fill(MID_GRAY);
     }
     Ok(out)
+}
+
+/// A cloud ready for the 3D view: its points and their levels of detail.
+///
+/// The [`PointSet`] stays in memory next to the octree: the point info reads its columns
+/// (time, colour, flags) through [`Octree::source`], and picking reads the positions of the
+/// octree's vertices. That costs 22 B per point for the columns (19 B without colours) on
+/// top of 24 B for the octree (vertex + source index), ≈ 2,3 GB for 50 million points; the
+/// GPU holds another 20 B per point.
+#[derive(Debug, Clone)]
+pub struct LoadedCloud {
+    pub path: PathBuf,
+    pub points: PointSet,
+    pub tree: Octree,
+    pub load_seconds: f64,
+    pub build_seconds: f64,
+}
+
+impl LoadedCloud {
+    /// Builds the levels of detail of `points` (phase [`crate::lod::PHASE_BUILD`]).
+    pub fn build(
+        path: PathBuf,
+        points: PointSet,
+        load_seconds: f64,
+        progress: &Progress,
+    ) -> Result<Self, StepError> {
+        let t = Instant::now();
+        let tree = build_octree(&points, progress)?;
+        Ok(LoadedCloud {
+            path,
+            points,
+            tree,
+            load_seconds,
+            build_seconds: t.elapsed().as_secs_f64(),
+        })
+    }
+
+    /// Whether the file is the `removed.las` of a map, whose flags are removal reasons.
+    pub fn is_removed(&self) -> bool {
+        self.path.file_name().is_some_and(|n| n == "removed.las")
+    }
+}
+
+/// Reads `path` and builds its levels of detail: phase [`PHASE_LOAD`], then
+/// [`crate::lod::PHASE_BUILD`]. With `run`, the `slam.json` of that run folder gives each
+/// point the quality of its submap; without it (or unreadable) the quality is 255.
+pub fn load_cloud(
+    path: &Path,
+    run: Option<&Path>,
+    progress: &Progress,
+) -> Result<LoadedCloud, StepError> {
+    let report: Option<SlamReport> = run
+        .and_then(|dir| std::fs::read_to_string(dir.join("slam.json")).ok())
+        .and_then(|t| serde_json::from_str(&t).ok());
+    let t = Instant::now();
+    let points = load_las(path, report.as_ref(), progress)?;
+    LoadedCloud::build(
+        path.to_path_buf(),
+        points,
+        t.elapsed().as_secs_f64(),
+        progress,
+    )
 }
