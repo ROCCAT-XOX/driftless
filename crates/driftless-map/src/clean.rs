@@ -1,5 +1,6 @@
 //! Cleaning of the dense cloud: ghosts (people and things that moved), points measured
-//! through windows (see [`crate::through`]) and isolated outliers.
+//! through windows (see [`crate::through`]) and isolated outliers are removed, then the
+//! walls of the kept points are made thinner (see [`crate::smooth`]).
 //!
 //! Ghosts are found by free-space counting: every sensor ray of the [`RaySource`] is walked
 //! through a coarse voxel grid (3D DDA). A voxel that rays keep passing through, much more
@@ -24,6 +25,7 @@
 //! that does not depend on the order (integer counters) or runs in point order, so every run
 //! gives the same result.
 
+use crate::smooth::{smooth_surfaces, SmoothConfig, SmoothStats};
 use crate::{Cloud, MapError, RaySource};
 use driftless_odom::voxel_map::{voxel_key, FixedState, VoxelKey};
 use kiddo::{ImmutableKdTree, SquaredEuclidean};
@@ -69,6 +71,8 @@ pub struct CleanConfig {
     pub window_reach: f64,
     /// A ray goes through a window only if it runs on at least this far behind it (m).
     pub through_beyond: f64,
+    /// Projection of the kept points onto their local plane, last in [`clean`].
+    pub smooth: SmoothConfig,
 }
 
 impl Default for CleanConfig {
@@ -84,6 +88,7 @@ impl Default for CleanConfig {
             through: true,
             window_reach: 1.5,
             through_beyond: 0.5,
+            smooth: SmoothConfig::default(),
         }
     }
 }
@@ -113,7 +118,7 @@ impl CleanConfig {
         if !(self.through_beyond.is_finite() && self.through_beyond >= 0.0) {
             return bad("Mindestweg hinter dem Fenster darf nicht negativ sein");
         }
-        Ok(())
+        self.smooth.check().map_err(MapError::Config)
     }
 }
 
@@ -128,13 +133,14 @@ pub enum RemovalReason {
 }
 
 /// Point counts of [`clean`]: removed by reason (each point counts once, in the order ghost,
-/// through a window, outlier) and kept.
+/// through a window, outlier) and kept; and what the smoothing of the kept points did.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CleanStats {
     pub ghosts: usize,
     pub through: usize,
     pub outliers: usize,
     pub kept: usize,
+    pub smooth: SmoothStats,
 }
 
 pub(crate) fn vec3(p: &[f32; 3]) -> Vector3<f64> {
@@ -435,7 +441,9 @@ pub fn find_outliers(cloud: &Cloud, cfg: &CleanConfig) -> Vec<bool> {
 /// outliers among the remaining points (see [`find_outliers`]): isolated scraps a ghost left
 /// behind count as outliers. Ghosts and windows are found on the whole cloud, on the same
 /// occupied voxels; a point that is both counts as a ghost. Both parts keep the point order
-/// and all columns.
+/// and all columns. Last, with [`SmoothConfig::enabled`], the kept points are projected onto
+/// their local plane (see [`crate::smooth_surfaces`], on the kept points only); the removed
+/// points keep their coordinates.
 ///
 /// Fails if `cfg` is invalid.
 ///
@@ -485,12 +493,21 @@ pub fn clean(
     let keep: Vec<bool> = reason.iter().map(Option::is_none).collect();
     let reasons: Vec<RemovalReason> = reason.iter().flatten().copied().collect();
     let count = |why| reasons.iter().filter(|&&r| r == why).count();
-    let (kept, removed) = cloud.select(&keep);
+    let (mut kept, removed) = cloud.select(&keep);
+    drop(cloud);
+    let smooth = if cfg.smooth.enabled {
+        let (xyz, s) = smooth_surfaces(&kept.xyz, &cfg.smooth);
+        kept.xyz = xyz;
+        s
+    } else {
+        SmoothStats::default()
+    };
     let stats = CleanStats {
         ghosts: count(RemovalReason::Ghost),
         through: count(RemovalReason::Through),
         outliers: count(RemovalReason::Outlier),
         kept: kept.len(),
+        smooth,
     };
     Ok((kept, removed, reasons, stats))
 }

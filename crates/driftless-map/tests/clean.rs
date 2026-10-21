@@ -1,7 +1,7 @@
 use driftless_io::msg::{ImuSample, LidarFrame, LidarPoint};
 use driftless_map::{
     build_dense, clean, find_ghosts, find_outliers, write_removed_las, CleanConfig, CleanStats,
-    Cloud, DenseConfig, MapError, RaySource, RemovalReason,
+    Cloud, DenseConfig, MapError, RaySource, RemovalReason, SmoothConfig, SmoothStats,
 };
 use driftless_odom::testutil::{aabb, imu_samples, room_scene, Aabb, Scene, Trajectory, Walk};
 use driftless_odom::{run_odometry, OdomConfig};
@@ -346,8 +346,15 @@ fn removed_plus_kept_equals_input() {
     let (mut cloud, rays) = moving_scan();
     cloud.rgb = Some((0..cloud.len()).map(|i| [i as u8, 0, 0]).collect());
     cloud.colored = Some((0..cloud.len()).map(|i| i % 3 == 0).collect());
-    let (kept, removed, reasons, stats) =
-        clean(cloud.clone(), &rays, &CleanConfig::default()).unwrap();
+    // Without the smoothing, which moves the kept points.
+    let unsmoothed = CleanConfig {
+        smooth: SmoothConfig {
+            enabled: false,
+            ..SmoothConfig::default()
+        },
+        ..CleanConfig::default()
+    };
+    let (kept, removed, reasons, stats) = clean(cloud.clone(), &rays, &unsmoothed).unwrap();
     assert_eq!(kept.len() + removed.len(), cloud.len());
     assert_eq!(
         stats,
@@ -356,6 +363,7 @@ fn removed_plus_kept_equals_input() {
             through: stats.through,
             outliers: stats.outliers,
             kept: kept.len(),
+            smooth: SmoothStats::default(),
         }
     );
     assert_eq!(stats.ghosts + stats.through + stats.outliers, removed.len());
@@ -381,12 +389,20 @@ fn removed_plus_kept_equals_input() {
         assert_eq!(c.colored.as_ref().unwrap().len(), c.len());
     }
 
+    // With the smoothing the same points go, as they were; the kept ones only move.
+    let (kept_s, removed_s, reasons_s, stats_s) =
+        clean(cloud.clone(), &rays, &CleanConfig::default()).unwrap();
+    assert_eq!((removed_s, reasons_s), (removed, reasons));
+    assert_eq!(kept_s.len(), kept.len());
+    assert_eq!(kept_s.frame, kept.frame);
+    assert!(stats_s.smooth.moved > 0);
+
     // Both filters off: everything stays.
     let off = CleanConfig {
         ghosts: false,
         outliers: false,
         through: false,
-        ..CleanConfig::default()
+        ..unsmoothed.clone()
     };
     let (kept, removed, reasons, stats) = clean(cloud.clone(), &rays, &off).unwrap();
     assert_eq!(kept, cloud);

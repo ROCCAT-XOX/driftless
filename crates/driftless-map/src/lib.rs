@@ -4,7 +4,7 @@
 //! deskewed sweep comes back in the body frame, and places it with the SLAM-corrected pose of
 //! that frame. One point is kept per voxel: the one seen from closest, since near points are
 //! the most accurate. [`clean`] removes ghosts (things that moved), points measured through windows and
-//! isolated outliers;
+//! isolated outliers, and projects the kept points of walls onto their local plane;
 //! [`colorize`] colours it from the camera images (visibility by depth buffer, image quality,
 //! exposure, white balance and edge falloff of the images, weighted blend of the best views);
 //! [`write_las`] and [`write_ply`] write the [`Cloud`]; [`save_stage`] and [`load_stage`] keep
@@ -17,6 +17,7 @@ mod dense;
 mod export;
 mod exposure;
 mod sharpness;
+mod smooth;
 mod stage;
 mod through;
 pub mod visibility;
@@ -32,6 +33,7 @@ pub use exposure::{
     VIGNETTE_MIN_SPREAD, VIGNETTE_ROUNDS,
 };
 pub use sharpness::sharpness;
+pub use smooth::{smooth_surfaces, SmoothConfig, SmoothStats};
 pub use stage::{content_hash, load_stage, save_stage, StageError};
 pub use through::find_through;
 

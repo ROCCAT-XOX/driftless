@@ -42,7 +42,7 @@ const CLEAN_BIN: &str = "clean.bin";
 /// (or other files) for the same settings, so an older `clean.bin` / `removed.las` is
 /// rebuilt instead of reused. 2: removal reasons in `removed.las`, points seen through
 /// windows.
-const CLEAN_VERSION: u32 = 2;
+const CLEAN_VERSION: u32 = 3;
 const REPORT: &str = "map.json";
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -239,7 +239,18 @@ fn dense_json(s: &DenseStats) -> Value {
 }
 
 fn clean_json(s: &CleanStats) -> Value {
-    json!({"kept": s.kept, "ghosts": s.ghosts, "through": s.through, "outliers": s.outliers})
+    json!({
+        "kept": s.kept,
+        "ghosts": s.ghosts,
+        "through": s.through,
+        "outliers": s.outliers,
+        "smooth": {
+            "moved": s.smooth.moved,
+            "mean_shift": s.smooth.mean_shift,
+            "thickness_before": s.smooth.thickness_before,
+            "thickness_after": s.smooth.thickness_after,
+        },
+    })
 }
 
 /// Warnings about a colour run that the user should see (German, without the "Warnung: ").
@@ -369,6 +380,14 @@ fn settings_json(
             "outlier_sigma": c.outlier_sigma,
             "window_reach": c.window_reach,
             "through_beyond": c.through_beyond,
+            "smooth": {
+                "enabled": c.smooth.enabled,
+                "radius": c.smooth.radius,
+                "max_neighbours": c.smooth.max_neighbours,
+                "min_neighbours": c.smooth.min_neighbours,
+                "planarity": c.smooth.planarity,
+                "max_shift": c.smooth.max_shift,
+            },
         },
         "color": {
             "downscale": k.downscale,
@@ -533,9 +552,22 @@ impl MapRun<'_> {
         let id = self.ids.clean.clone();
         save_stage(&self.path(CLEAN_BIN), &id, &kept, None)
             .map_err(|e| format!("{CLEAN_BIN} nicht schreibbar: {e}"))?;
+        let smooth = if self.clean_cfg.smooth.enabled {
+            let sm = &stats.smooth;
+            format!(
+                "; Wände geglättet: {} Punkte um im Mittel {:.1} mm verschoben, Wanddicke \
+                 {:.1} → {:.1} mm",
+                sm.moved,
+                1000.0 * sm.mean_shift,
+                1000.0 * sm.thickness_before,
+                1000.0 * sm.thickness_after
+            )
+        } else {
+            String::new()
+        };
         println!(
             "Bereinigt: {} Punkte behalten, entfernt {} Geister, {} Durchblick und {} \
-             Ausreißer, {:.1} s → clean.las, removed.las",
+             Ausreißer{smooth}, {:.1} s → clean.las, removed.las",
             stats.kept,
             stats.ghosts,
             stats.through,
