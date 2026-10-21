@@ -3,9 +3,10 @@
 //! [`build_dense`] runs the (deterministic) odometry again over the same frames, so every
 //! deskewed sweep comes back in the body frame, and places it with the SLAM-corrected pose of
 //! that frame. One point is kept per voxel: the one seen from closest, since near points are
-//! the most accurate. [`clean`] removes ghosts (things that moved) and isolated outliers;
+//! the most accurate. [`clean`] removes ghosts (things that moved), points measured through
+//! windows and isolated outliers, and projects the kept points of walls onto their local plane;
 //! [`colorize`] colours it from the camera images (visibility by depth buffer, image quality,
-//! exposure and white balance between the images, weighted blend of the best views);
+//! exposure, white balance and edge falloff of the images, weighted blend of the best views);
 //! [`write_las`] and [`write_ply`] write the [`Cloud`]; [`save_stage`] and [`load_stage`] keep
 //! it between the steps at full precision.
 
@@ -16,17 +17,25 @@ mod dense;
 mod export;
 mod exposure;
 mod sharpness;
+mod smooth;
 mod stage;
+mod through;
 pub mod visibility;
 
-pub use clean::{clean, find_ghosts, find_outliers, CleanConfig, CleanStats};
+pub use clean::{clean, find_ghosts, find_outliers, CleanConfig, CleanStats, RemovalReason};
 pub use cloud::Cloud;
 pub use color::{colorize, ColorCamera, ColorConfig, ColorStats, ImageSource};
 pub use dense::{build_dense, DenseConfig, DenseStats, RaySource};
-pub use export::{write_las, write_ply, LAS_SCALE};
-pub use exposure::{estimate_gains, ExposureConfig, ImageGain, Observations, DARK, SATURATED};
+pub use export::{write_las, write_ply, write_removed_las, LAS_SCALE};
+pub use exposure::{
+    estimate_exposure, estimate_gains, ExposureConfig, ImageGain, Observations, ViewObs,
+    Vignetting, DARK, SATURATED, VIGNETTE_MIN_OBSERVATIONS, VIGNETTE_MIN_POINT_SPREAD,
+    VIGNETTE_MIN_SPREAD, VIGNETTE_ROUNDS,
+};
 pub use sharpness::sharpness;
+pub use smooth::{smooth_surfaces, SmoothConfig, SmoothStats};
 pub use stage::{content_hash, load_stage, save_stage, StageError};
+pub use through::find_through;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MapError {

@@ -1,7 +1,7 @@
 //! Writing a [`Cloud`] as LAS or binary PLY. Both files are byte-identical for the same cloud
 //! (no creation date or random id in the header).
 
-use crate::{Cloud, MapError};
+use crate::{Cloud, MapError, RemovalReason};
 use std::io::Write;
 use std::path::Path;
 
@@ -30,7 +30,34 @@ fn las_offset(cloud: &Cloud) -> [f64; 3] {
 /// LAS 1.2: point format 3 (XYZ, intensity, GPS time, RGB) if the cloud has colours,
 /// otherwise format 1 (without RGB). GPS time holds the capture time as raw Unix seconds
 /// (not GPS week or adjusted standard GPS time).
+///
+/// `user_data` is 1 for points that got no measured colour (`colored == Some(false)`), else 0;
+/// CloudCompare shows it as the scalar field "User Data".
 pub fn write_las(path: &Path, cloud: &Cloud) -> Result<(), MapError> {
+    write_las_with(path, cloud, |i| {
+        u8::from(cloud.colored.as_ref().is_some_and(|c| !c[i]))
+    })
+}
+
+/// Like [`write_las`] for the removed points: `user_data` holds the [`RemovalReason`] code
+/// (1 ghost, 2 outlier, 3 seen through a window).
+///
+/// # Panics
+/// If `reasons` does not have one entry per point.
+pub fn write_removed_las(
+    path: &Path,
+    cloud: &Cloud,
+    reasons: &[RemovalReason],
+) -> Result<(), MapError> {
+    assert_eq!(reasons.len(), cloud.len(), "one reason per removed point");
+    write_las_with(path, cloud, |i| reasons[i] as u8)
+}
+
+fn write_las_with(
+    path: &Path,
+    cloud: &Cloud,
+    user_data: impl Fn(usize) -> u8,
+) -> Result<(), MapError> {
     let err = |source| MapError::Las {
         path: path.display().to_string(),
         source,
@@ -70,6 +97,7 @@ pub fn write_las(path: &Path, cloud: &Cloud) -> Result<(), MapError> {
             intensity: las_intensity(cloud.intensity[i]),
             gps_time: Some(cloud.t[i]),
             color,
+            user_data: user_data(i),
             ..Default::default()
         })
         .map_err(err)?;
@@ -78,7 +106,8 @@ pub fn write_las(path: &Path, cloud: &Cloud) -> Result<(), MapError> {
 }
 
 /// Binary little-endian PLY: `x y z intensity` as float, `red green blue` as uchar if the
-/// cloud has colours.
+/// cloud has colours, then `colored` (uchar, 1 = measured colour, 0 = none) if the cloud
+/// knows which points were coloured.
 pub fn write_ply(path: &Path, cloud: &Cloud) -> Result<(), MapError> {
     let err = |source| MapError::Io {
         path: path.display().to_string(),
@@ -94,10 +123,13 @@ pub fn write_ply(path: &Path, cloud: &Cloud) -> Result<(), MapError> {
     if cloud.rgb.is_some() {
         header += "property uchar red\nproperty uchar green\nproperty uchar blue\n";
     }
+    if cloud.colored.is_some() {
+        header += "property uchar colored\n";
+    }
     header += "end_header\n";
     w.write_all(header.as_bytes()).map_err(err)?;
     for i in 0..cloud.len() {
-        let mut v = [0u8; 19];
+        let mut v = [0u8; 20];
         for (k, c) in cloud.xyz[i].iter().chain([&cloud.intensity[i]]).enumerate() {
             v[4 * k..4 * k + 4].copy_from_slice(&c.to_le_bytes());
         }
@@ -107,6 +139,13 @@ pub fn write_ply(path: &Path, cloud: &Cloud) -> Result<(), MapError> {
                 19
             }
             None => 16,
+        };
+        let n = match &cloud.colored {
+            Some(c) => {
+                v[n] = u8::from(c[i]);
+                n + 1
+            }
+            None => n,
         };
         w.write_all(&v[..n]).map_err(err)?;
     }

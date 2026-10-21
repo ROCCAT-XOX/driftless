@@ -2,7 +2,8 @@
 //! in three steps, each with its own files in the SLAM output folder:
 //!
 //! - **dense**: dense cloud from the corrected `traj.tum` → `dense.las`, `dense.bin`
-//! - **clean**: ghosts and outliers removed → `clean.las`, `removed.las`, `clean.bin`
+//! - **clean**: ghosts, points seen through windows and outliers removed → `clean.las`,
+//!   `removed.las`, `clean.bin`
 //! - **color**: coloured from the camera images → `color.las`, `color.ply`
 //!
 //! plus `map.json` (settings, statistics and runtimes of the steps, peak memory, and under
@@ -22,8 +23,8 @@ use driftless_io::camera::Camera;
 use driftless_io::project::{discover_project, Project};
 use driftless_map::{
     build_dense, clean, colorize, content_hash, load_stage, save_stage, write_las, write_ply,
-    CleanConfig, CleanStats, Cloud, ColorCamera, ColorConfig, ColorStats, DenseConfig, DenseStats,
-    ImageSource, RaySource, StageError,
+    write_removed_las, CleanConfig, CleanStats, Cloud, ColorCamera, ColorConfig, ColorStats,
+    DenseConfig, DenseStats, ExposureConfig, ImageSource, RaySource, SmoothConfig, StageError,
 };
 use driftless_odom::OdomConfig;
 use driftless_slam::SlamConfig;
@@ -38,6 +39,15 @@ type BoxError = Box<dyn std::error::Error>;
 
 const DENSE_BIN: &str = "dense.bin";
 const CLEAN_BIN: &str = "clean.bin";
+/// Part of the clean step's input id: raised whenever the cleaning gives another result
+/// (or other files) for the same settings, so an older `clean.bin` / `removed.las` is
+/// rebuilt instead of reused. 2: removal reasons in `removed.las`, points seen through
+/// windows. 3: kept points projected onto their local plane (thinner walls).
+const CLEAN_VERSION: u32 = 3;
+/// Part of the color step's input id, raised like [`CLEAN_VERSION`] whenever the colouring
+/// gives another result for the same settings. 2: image sharpness divided by the mean gray
+/// value, not its square.
+const COLOR_VERSION: u32 = 2;
 const REPORT: &str = "map.json";
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -66,6 +76,19 @@ pub struct Args {
     /// Ausreißer nicht entfernen
     #[arg(long)]
     no_outliers: bool,
+    /// Durchblick-Punkte (hinter Fenstern gemessen) nicht entfernen
+    #[arg(long)]
+    no_through: bool,
+    /// Wände nicht auf ihre lokale Ebene glätten
+    #[arg(long)]
+    no_smooth: bool,
+    /// Glanzlichter beim Einfärben abwerten (experimentell: senkt Spiegelungen auf Böden, macht
+    /// aber die Übergänge zwischen Bildern sichtbarer)
+    #[arg(long)]
+    highlights: bool,
+    /// Randabfall der Kameras nicht mitschätzen
+    #[arg(long)]
+    no_vignetting: bool,
     /// Voxelgröße der dichten Wolke in m (ein Punkt je Voxel)
     #[arg(long, value_name = "M", default_value_t = DenseConfig::default().voxel)]
     voxel: f64,
@@ -234,7 +257,18 @@ fn dense_json(s: &DenseStats) -> Value {
 }
 
 fn clean_json(s: &CleanStats) -> Value {
-    json!({"kept": s.kept, "ghosts": s.ghosts, "outliers": s.outliers})
+    json!({
+        "kept": s.kept,
+        "ghosts": s.ghosts,
+        "through": s.through,
+        "outliers": s.outliers,
+        "smooth": {
+            "moved": s.smooth.moved,
+            "mean_shift": s.smooth.mean_shift,
+            "thickness_before": s.smooth.thickness_before,
+            "thickness_after": s.smooth.thickness_after,
+        },
+    })
 }
 
 /// Warnings about a colour run that the user should see (German, without the "Warnung: ").
@@ -254,12 +288,21 @@ fn color_warnings(s: &ColorStats) -> Vec<String> {
                 .into(),
         );
     }
+    // More than 1 % of the images.
+    if s.images_gain_clamped * 100 > s.images_used {
+        out.push(format!(
+            "{} Bilder ({:.0} %) stoßen an die Grenze des Belichtungsabgleichs",
+            s.images_gain_clamped,
+            100.0 * s.images_gain_clamped as f64 / s.images_used.max(1) as f64
+        ));
+    }
     out
 }
 
 /// Colour statistics with the gains summarised per camera (count, smallest, largest and mean
-/// gain per channel) instead of one entry per image.
-fn color_json(s: &ColorStats) -> Value {
+/// gain per channel) instead of one entry per image; `cameras` names the cameras in the order
+/// of the edge falloff.
+fn color_json(s: &ColorStats, cameras: &[&str]) -> Value {
     struct Sum {
         n: usize,
         min: [f32; 3],
@@ -291,12 +334,25 @@ fn color_json(s: &ColorStats) -> Value {
             )
         })
         .collect();
+    let vignetting: serde_json::Map<String, Value> = cameras
+        .iter()
+        .zip(&s.vignetting.coeffs)
+        .map(|(name, c)| (name.to_string(), json!(c)))
+        .collect();
     let points = s.points_colored + s.points_uncolored;
     json!({
         "images_used": s.images_used,
         "images_blurry": s.images_blurry,
         "images_outside_trajectory": s.images_outside_trajectory,
         "images_bad": s.images_bad,
+        "sharpness_brightness_rank_corr": s.sharpness_brightness_rank_corr,
+        "views_rejected": s.views_rejected,
+        "points_with_rejected": s.points_with_rejected,
+        "views_rim_excluded": s.views_rim_excluded,
+        "floor_highlight_share_before": s.floor_highlight_share_before,
+        "floor_highlight_share_after": s.floor_highlight_share_after,
+        "seam_jump_before": s.seam_jump_before,
+        "seam_jump_after": s.seam_jump_after,
         "image_bags_truncated": s.image_bags_truncated,
         "points_colored": s.points_colored,
         "points_uncolored": s.points_uncolored,
@@ -306,7 +362,11 @@ fn color_json(s: &ColorStats) -> Value {
             "min": s.gain_min,
             "max": s.gain_max,
             "per_camera": per_camera,
+            "clamped_images": s.images_gain_clamped,
         },
+        "vignetting": vignetting,
+        "vignette_residual_before": s.vignette_residual_before,
+        "vignette_residual_after": s.vignette_residual_after,
         "spread_before": s.spread_before,
         "spread_after": s.spread_after,
         "camera_difference_before": s.camera_difference_before,
@@ -339,11 +399,22 @@ fn settings_json(
         "clean": {
             "ghosts": c.ghosts,
             "outliers": c.outliers,
+            "through": c.through,
             "ghost_voxel": c.ghost_voxel,
             "ghost_ratio": c.ghost_ratio,
             "min_passes": c.min_passes,
             "outlier_k": c.outlier_k,
             "outlier_sigma": c.outlier_sigma,
+            "window_reach": c.window_reach,
+            "through_beyond": c.through_beyond,
+            "smooth": {
+                "enabled": c.smooth.enabled,
+                "radius": c.smooth.radius,
+                "max_neighbours": c.smooth.max_neighbours,
+                "min_neighbours": c.smooth.min_neighbours,
+                "planarity": c.smooth.planarity,
+                "max_shift": c.smooth.max_shift,
+            },
         },
         "color": {
             "downscale": k.downscale,
@@ -353,11 +424,18 @@ fn settings_json(
             "zbuffer_scale": k.zbuffer_scale,
             "min_sharpness": k.min_sharpness,
             "max_angular_rate": k.max_angular_rate,
-            "views_per_point": k.views_per_point,
+            "views_kept": k.views_kept,
+            "views_blended": k.views_blended,
+            "view_gap": k.view_gap,
+            "highlights": k.highlights,
+            "highlight_ratio": k.highlight_ratio,
+            "highlight_abs": k.highlight_abs,
+            "rim_theta": k.rim_theta,
             "exposure": {
                 "smooth": k.exposure.smooth,
                 "max_gain": k.exposure.max_gain,
                 "samples": k.exposure.samples,
+                "vignetting": k.exposure.vignetting,
             },
         },
     })
@@ -498,19 +576,33 @@ impl MapRun<'_> {
 
     fn run_clean(&mut self, cloud: Cloud, rays: RaySource) -> Result<Cloud, BoxError> {
         let start = Instant::now();
-        let (kept, removed, stats) = clean(cloud, &rays, &self.clean_cfg)?;
+        let (kept, removed, reasons, stats) = clean(cloud, &rays, &self.clean_cfg)?;
         drop(rays);
         write_las(&self.path("clean.las"), &kept)?;
-        write_las(&self.path("removed.las"), &removed)?;
+        write_removed_las(&self.path("removed.las"), &removed, &reasons)?;
         drop(removed);
         let id = self.ids.clean.clone();
         save_stage(&self.path(CLEAN_BIN), &id, &kept, None)
             .map_err(|e| format!("{CLEAN_BIN} nicht schreibbar: {e}"))?;
+        let smooth = if self.clean_cfg.smooth.enabled {
+            let sm = &stats.smooth;
+            format!(
+                "; Wände geglättet: {} Punkte um im Mittel {:.1} mm verschoben, Wanddicke \
+                 {:.1} → {:.1} mm",
+                sm.moved,
+                1000.0 * sm.mean_shift,
+                1000.0 * sm.thickness_before,
+                1000.0 * sm.thickness_after
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "Bereinigt: {} Punkte behalten, entfernt {} Geister und {} Ausreißer, {:.1} s → \
-             clean.las, removed.las",
+            "Bereinigt: {} Punkte behalten, entfernt {} Geister, {} Durchblick und {} \
+             Ausreißer{smooth}, {:.1} s → clean.las, removed.las",
             stats.kept,
             stats.ghosts,
+            stats.through,
             stats.outliers,
             start.elapsed().as_secs_f64()
         );
@@ -563,12 +655,26 @@ impl MapRun<'_> {
             stats.gain_max,
             start.elapsed().as_secs_f64()
         );
+        println!(
+            "Farbqualität: {} Glanzansichten verworfen ({} Punkte), {} Randansichten ausgelassen; \
+             Bodenglanz {:.1} → {:.1} %, Nahtsprung {:.1} → {:.1}, Randabfall {:.1} → {:.1} %",
+            stats.views_rejected,
+            stats.points_with_rejected,
+            stats.views_rim_excluded,
+            100.0 * stats.floor_highlight_share_before,
+            100.0 * stats.floor_highlight_share_after,
+            stats.seam_jump_before,
+            stats.seam_jump_after,
+            stats.vignette_residual_before,
+            stats.vignette_residual_after
+        );
         let id = self.ids.color.clone().expect("colour input exists");
+        let names: Vec<&str> = input.cams.iter().map(|c| c.camera.name.as_str()).collect();
         self.record(
             "color",
             &id,
             start,
-            color_json(&stats),
+            color_json(&stats, &names),
             &["color.las", "color.ply"],
         );
         Ok(())
@@ -666,10 +772,20 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
     let clean_cfg = CleanConfig {
         ghosts: !args.no_ghosts,
         outliers: !args.no_outliers,
+        through: !args.no_through,
+        smooth: SmoothConfig {
+            enabled: !args.no_smooth,
+            ..SmoothConfig::default()
+        },
         ..CleanConfig::default()
     };
     let color_cfg = ColorConfig {
         downscale: args.downscale,
+        highlights: args.highlights,
+        exposure: ExposureConfig {
+            vignetting: !args.no_vignetting,
+            ..ExposureConfig::default()
+        },
         ..ColorConfig::default()
     };
     let dense_id = format!(
@@ -682,11 +798,11 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
         content_hash(&traj_bytes),
         traj_bytes.len(),
     );
-    let clean_id = format!("{dense_id}clean {clean_cfg:?}\n");
+    let clean_id = format!("{dense_id}clean v{CLEAN_VERSION} {clean_cfg:?}\n");
     let color_id = color
         .as_ref()
         .ok()
-        .map(|c| format!("{clean_id}{}color {color_cfg:?}\n", c.id));
+        .map(|c| format!("{clean_id}{}color v{COLOR_VERSION} {color_cfg:?}\n", c.id));
     let previous = fs::read_to_string(args.slam.join(REPORT))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -816,5 +932,31 @@ mod tests {
         let w = color_warnings(&s);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("abgeschnitten"), "{w:?}");
+    }
+
+    #[test]
+    fn clamped_gains_warn_above_one_percent_only() {
+        let clamped = |n| ColorStats {
+            images_used: 200,
+            images_gain_clamped: n,
+            ..ColorStats::default()
+        };
+        assert!(color_warnings(&clamped(0)).is_empty());
+        assert!(color_warnings(&clamped(2)).is_empty(), "exactly 1 %");
+        assert_eq!(color_warnings(&clamped(3)).len(), 1);
+    }
+
+    #[test]
+    fn warns_about_clamped_gains() {
+        let s = ColorStats {
+            images_used: 200,
+            images_gain_clamped: 26,
+            ..ColorStats::default()
+        };
+        let w = color_warnings(&s);
+        assert_eq!(
+            w,
+            vec!["26 Bilder (13 %) stoßen an die Grenze des Belichtungsabgleichs"]
+        );
     }
 }

@@ -1,4 +1,6 @@
-//! Cleaning of the dense cloud: ghosts (people and things that moved) and isolated outliers.
+//! Cleaning of the dense cloud: ghosts (people and things that moved), points measured
+//! through windows (see [`crate::through`]) and isolated outliers are removed, then the
+//! walls of the kept points are made thinner (see [`crate::smooth`]).
 //!
 //! Ghosts are found by free-space counting: every sensor ray of the [`RaySource`] is walked
 //! through a coarse voxel grid (3D DDA). A voxel that rays keep passing through, much more
@@ -16,10 +18,14 @@
 //! Outliers are points whose mean distance to their nearest neighbours is far above that of
 //! the cloud (statistical outlier removal).
 //!
-//! Both are a pure per-element step (one ray, one point; run in parallel) and a reduction
+//! Ghosts and points seen through windows share one grid of occupied voxels with a surface
+//! normal each ([`Occupied`]).
+//!
+//! All are a pure per-element step (one ray, one point; run in parallel) and a reduction
 //! that does not depend on the order (integer counters) or runs in point order, so every run
 //! gives the same result.
 
+use crate::smooth::{smooth_surfaces, SmoothConfig, SmoothStats};
 use crate::{Cloud, MapError, RaySource};
 use driftless_odom::voxel_map::{voxel_key, FixedState, VoxelKey};
 use kiddo::{ImmutableKdTree, SquaredEuclidean};
@@ -58,6 +64,15 @@ pub struct CleanConfig {
     pub ghosts: bool,
     /// Remove outliers in [`clean`].
     pub outliers: bool,
+    /// Remove points measured through windows in [`clean`] (see [`crate::find_through`]).
+    pub through: bool,
+    /// A gap in a wall is a window if the wall continues within this distance above and
+    /// below it (m).
+    pub window_reach: f64,
+    /// A ray goes through a window only if it runs on at least this far behind it (m).
+    pub through_beyond: f64,
+    /// Projection of the kept points onto their local plane, last in [`clean`].
+    pub smooth: SmoothConfig,
 }
 
 impl Default for CleanConfig {
@@ -70,12 +85,16 @@ impl Default for CleanConfig {
             outlier_sigma: 2.5,
             ghosts: true,
             outliers: true,
+            through: true,
+            window_reach: 1.5,
+            through_beyond: 0.5,
+            smooth: SmoothConfig::default(),
         }
     }
 }
 
 impl CleanConfig {
-    fn check(&self) -> Result<(), MapError> {
+    pub(crate) fn check(&self) -> Result<(), MapError> {
         let bad = |msg: &str| Err(MapError::Config(msg.into()));
         if !(self.ghost_voxel.is_finite() && self.ghost_voxel > 0.0) {
             return bad("Voxelgröße der Geistersuche muss größer als 0 sein");
@@ -93,24 +112,42 @@ impl CleanConfig {
         if !(self.outlier_sigma.is_finite() && self.outlier_sigma >= 0.0) {
             return bad("Schwelle des Ausreißerfilters darf nicht negativ sein");
         }
-        Ok(())
+        if !(self.window_reach.is_finite() && self.window_reach > 0.0) {
+            return bad("Reichweite der Fenstersuche muss größer als 0 sein");
+        }
+        if !(self.through_beyond.is_finite() && self.through_beyond >= 0.0) {
+            return bad("Mindestweg hinter dem Fenster darf nicht negativ sein");
+        }
+        self.smooth.check().map_err(MapError::Config)
     }
 }
 
-/// Point counts of [`clean`]: removed by reason (each point counts once, ghost before
-/// outlier) and kept.
+/// Why [`clean`] removed a point; the value is written to `removed.las` as `user_data`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RemovalReason {
+    Ghost = 1,
+    Outlier = 2,
+    /// Measured through a window.
+    Through = 3,
+}
+
+/// Point counts of [`clean`]: removed by reason (each point counts once, in the order ghost,
+/// through a window, outlier) and kept; and what the smoothing of the kept points did.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CleanStats {
     pub ghosts: usize,
+    pub through: usize,
     pub outliers: usize,
     pub kept: usize,
+    pub smooth: SmoothStats,
 }
 
-fn vec3(p: &[f32; 3]) -> Vector3<f64> {
+pub(crate) fn vec3(p: &[f32; 3]) -> Vector3<f64> {
     Vector3::from(p.map(f64::from))
 }
 
-fn key(p: &[f32; 3], voxel: f64) -> VoxelKey {
+pub(crate) fn key(p: &[f32; 3], voxel: f64) -> VoxelKey {
     voxel_key(&vec3(p), voxel)
 }
 
@@ -120,7 +157,12 @@ fn key(p: &[f32; 3], voxel: f64) -> VoxelKey {
 ///
 /// The walk takes exactly as many steps as the end voxel is away (sum over the axes), each
 /// on an axis that still has steps left, so it always stops in the end voxel.
-fn walk_ray(from: &[f32; 3], to: &[f32; 3], voxel: f64, mut visit: impl FnMut(VoxelKey, bool)) {
+pub(crate) fn walk_ray(
+    from: &[f32; 3],
+    to: &[f32; 3],
+    voxel: f64,
+    mut visit: impl FnMut(VoxelKey, bool),
+) {
     let (start, end) = (key(from, voxel), key(to, voxel));
     let mut cur = start;
     let mut left = [0u32; 3];
@@ -168,28 +210,43 @@ pub(crate) fn spread_axes(cov: &Matrix3<f64>) -> [(f64, Vector3<f64>); 3] {
     spread
 }
 
-/// Point moments of a voxel, relative to its lowest corner.
+/// Point moments (count, sum, sum of outer products) of points given relative to some
+/// origin, e.g. a voxel's lowest corner.
 #[derive(Clone, Copy)]
-struct Moments {
-    n: u32,
-    sum: Vector3<f64>,
-    outer: Matrix3<f64>,
+pub(crate) struct Moments {
+    pub(crate) n: u32,
+    pub(crate) sum: Vector3<f64>,
+    pub(crate) outer: Matrix3<f64>,
 }
 
 impl Moments {
-    const ZERO: Moments = Moments {
+    pub(crate) const ZERO: Moments = Moments {
         n: 0,
         sum: Vector3::new(0.0, 0.0, 0.0),
         outer: Matrix3::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     };
 
-    /// Adds `b`, whose points are relative to a corner `off` away from this one.
-    fn add_shifted(&mut self, b: &Moments, off: &Vector3<f64>) {
+    /// Adds the point `d` (relative to this origin).
+    pub(crate) fn add(&mut self, d: &Vector3<f64>) {
+        self.n += 1;
+        self.sum += d;
+        self.outer += d * d.transpose();
+    }
+
+    /// Adds `b`, whose points are relative to an origin `off` away from this one.
+    pub(crate) fn add_shifted(&mut self, b: &Moments, off: &Vector3<f64>) {
         let n = f64::from(b.n);
         self.n += b.n;
         self.sum += b.sum + off * n;
         self.outer +=
             b.outer + b.sum * off.transpose() + off * b.sum.transpose() + off * off.transpose() * n;
+    }
+
+    /// Mean and covariance (relative to this origin); needs at least one point.
+    pub(crate) fn mean_cov(&self) -> (Vector3<f64>, Matrix3<f64>) {
+        let c = f64::from(self.n);
+        let mean = self.sum / c;
+        (mean, self.outer / c - mean * mean.transpose())
     }
 
     /// Axis of least spread, if there are at least 3 points and they lie on a plane (least
@@ -198,29 +255,50 @@ impl Moments {
         if self.n < 3 {
             return None;
         }
-        let c = f64::from(self.n);
-        let mean = self.sum / c;
-        let cov = self.outer / c - mean * mean.transpose();
-        let spread = spread_axes(&cov);
+        let spread = spread_axes(&self.mean_cov().1);
         let (least, middle) = (spread[0].0, spread[1].0);
         (least < 0.1 * middle).then_some(spread[0].1)
     }
 }
 
-/// The voxels that hold cloud points.
-struct Occupied {
+/// Moments of the voxel `k` and its 26 neighbours, relative to the lowest corner of `k`;
+/// `own` holds the moments of every slot of `slot`, relative to its voxel's lowest corner.
+pub(crate) fn block_moments(
+    slot: &HashMap<VoxelKey, u32, FixedState>,
+    own: &[Moments],
+    k: &VoxelKey,
     voxel: f64,
+) -> Moments {
+    let mut all = Moments::ZERO;
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                if let Some(&o) = slot.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) {
+                    let off = Vector3::from([dx, dy, dz].map(|c| f64::from(c) * voxel));
+                    all.add_shifted(&own[o as usize], &off);
+                }
+            }
+        }
+    }
+    all
+}
+
+/// The voxels that hold cloud points.
+pub(crate) struct Occupied {
+    pub(crate) voxel: f64,
     /// Voxel → slot, numbered in point order.
-    slot: HashMap<VoxelKey, u32, FixedState>,
+    pub(crate) slot: HashMap<VoxelKey, u32, FixedState>,
+    /// Voxel of every slot.
+    pub(crate) keys: Vec<VoxelKey>,
     /// Slot of every point.
-    point_slot: Vec<u32>,
+    pub(crate) point_slot: Vec<u32>,
     /// Surface normal per slot, from the points of the voxel and its 26 neighbours (so that
     /// a voxel holding only a few points of a surface along its face gets one too).
-    normal: Vec<Option<Vector3<f64>>>,
+    pub(crate) normal: Vec<Option<Vector3<f64>>>,
 }
 
 impl Occupied {
-    fn new(xyz: &[[f32; 3]], voxel: f64) -> Self {
+    pub(crate) fn new(xyz: &[[f32; 3]], voxel: f64) -> Self {
         let mut slot: HashMap<VoxelKey, u32, FixedState> = HashMap::default();
         let mut keys = Vec::new();
         let point_slot: Vec<u32> = xyz
@@ -236,32 +314,16 @@ impl Occupied {
         let corner = |k: &VoxelKey| Vector3::from(k.map(|c| f64::from(c) * voxel));
         let mut own = vec![Moments::ZERO; keys.len()];
         for (p, &s) in xyz.iter().zip(&point_slot) {
-            let m = &mut own[s as usize];
-            let d = vec3(p) - corner(&keys[s as usize]);
-            m.n += 1;
-            m.sum += d;
-            m.outer += d * d.transpose();
+            own[s as usize].add(&(vec3(p) - corner(&keys[s as usize])));
         }
         let normal = keys
             .par_iter()
-            .map(|k| {
-                let mut all = Moments::ZERO;
-                for dx in -1..=1 {
-                    for dy in -1..=1 {
-                        for dz in -1..=1 {
-                            if let Some(&o) = slot.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) {
-                                let off = corner(&[dx, dy, dz]);
-                                all.add_shifted(&own[o as usize], &off);
-                            }
-                        }
-                    }
-                }
-                all.plane_normal()
-            })
+            .map(|k| block_moments(&slot, &own, k, voxel).plane_normal())
             .collect();
         Occupied {
             voxel,
             slot,
+            keys,
             point_slot,
             normal,
         }
@@ -302,6 +364,13 @@ fn count_ray(sensor: &[f32; 3], end: &[f32; 3], grid: &Occupied, counts: &Counts
 /// entry more than `sensor`, rise, and end at `ends.len()`).
 pub fn find_ghosts(cloud: &Cloud, rays: &RaySource, cfg: &CleanConfig) -> Vec<bool> {
     cfg.check().expect("valid CleanConfig");
+    check_rays(rays);
+    ghost_flags(&Occupied::new(&cloud.xyz, cfg.ghost_voxel), rays, cfg)
+}
+
+/// # Panics
+/// If `rays` is inconsistent (see [`find_ghosts`]).
+pub(crate) fn check_rays(rays: &RaySource) {
     let fs = &rays.frame_start;
     assert_eq!(
         fs.len(),
@@ -314,8 +383,11 @@ pub fn find_ghosts(cloud: &Cloud, rays: &RaySource, cfg: &CleanConfig) -> Vec<bo
         rays.ends.len(),
         "last start = rays"
     );
+}
 
-    let grid = Occupied::new(&cloud.xyz, cfg.ghost_voxel);
+/// [`find_ghosts`] on the occupied voxels of the cloud.
+fn ghost_flags(grid: &Occupied, rays: &RaySource, cfg: &CleanConfig) -> Vec<bool> {
+    let fs = &rays.frame_start;
     let counter = || (0..grid.normal.len()).map(|_| AtomicU32::new(0)).collect();
     let counts = Counts {
         passes: counter(),
@@ -324,7 +396,7 @@ pub fn find_ghosts(cloud: &Cloud, rays: &RaySource, cfg: &CleanConfig) -> Vec<bo
     (0..rays.sensor.len()).into_par_iter().for_each(|f| {
         let sensor = &rays.sensor[f];
         for end in &rays.ends[fs[f] as usize..fs[f + 1] as usize] {
-            count_ray(sensor, end, &grid, &counts);
+            count_ray(sensor, end, grid, &counts);
         }
     });
 
@@ -379,48 +451,82 @@ pub fn find_outliers(cloud: &Cloud, cfg: &CleanConfig) -> Vec<bool> {
     outlier_flags(&cloud.xyz, cfg.outlier_k, cfg.outlier_sigma)
 }
 
-/// Splits `cloud` into (kept, removed). With [`CleanConfig::ghosts`] the ghosts go (see
-/// [`find_ghosts`], rays from [`crate::build_dense`]), then with [`CleanConfig::outliers`]
-/// the outliers among the remaining points (see [`find_outliers`]): isolated scraps a ghost
-/// left behind count as outliers. Both parts keep the point order and all columns.
+/// Splits `cloud` into (kept, removed, reasons); `reasons` has one entry per removed point,
+/// in the same order. With [`CleanConfig::ghosts`] the ghosts go (see [`find_ghosts`], rays
+/// from [`crate::build_dense`]), then with [`CleanConfig::through`] the points measured
+/// through windows (see [`crate::find_through`]), then with [`CleanConfig::outliers`] the
+/// outliers among the remaining points (see [`find_outliers`]): isolated scraps a ghost left
+/// behind count as outliers. Ghosts and windows are found on the whole cloud, on the same
+/// occupied voxels; a point that is both counts as a ghost. Both parts keep the point order
+/// and all columns. Last, with [`SmoothConfig::enabled`], the kept points are projected onto
+/// their local plane (see [`crate::smooth_surfaces`], on the kept points only); the removed
+/// points keep their coordinates.
 ///
 /// Fails if `cfg` is invalid.
 ///
 /// # Panics
-/// If `rays` is inconsistent (see [`find_ghosts`]).
+/// If `rays` is inconsistent (see [`find_ghosts`]) or a point's frame has no sensor
+/// position in `rays`.
 pub fn clean(
     cloud: Cloud,
     rays: &RaySource,
     cfg: &CleanConfig,
-) -> Result<(Cloud, Cloud, CleanStats), MapError> {
+) -> Result<(Cloud, Cloud, Vec<RemovalReason>, CleanStats), MapError> {
     cfg.check()?;
-    let mut keep = if cfg.ghosts {
-        find_ghosts(&cloud, rays, cfg).iter().map(|&g| !g).collect()
-    } else {
-        vec![true; cloud.len()]
-    };
-    let ghosts = keep.iter().filter(|&&k| !k).count();
-    let mut outliers = 0;
+    let n = cloud.len();
+    let mut reason: Vec<Option<RemovalReason>> = vec![None; n];
+    if cfg.ghosts || cfg.through {
+        check_rays(rays);
+        let grid = Occupied::new(&cloud.xyz, cfg.ghost_voxel);
+        let mut mark = |flags: Vec<bool>, why: RemovalReason| {
+            for (r, f) in reason.iter_mut().zip(flags) {
+                if f && r.is_none() {
+                    *r = Some(why);
+                }
+            }
+        };
+        if cfg.ghosts {
+            mark(ghost_flags(&grid, rays, cfg), RemovalReason::Ghost);
+        }
+        if cfg.through {
+            mark(
+                crate::through::through_flags(&grid, &cloud, rays, cfg),
+                RemovalReason::Through,
+            );
+        }
+    }
     if cfg.outliers {
-        let rest: Vec<usize> = (0..cloud.len()).filter(|&i| keep[i]).collect();
+        let rest: Vec<usize> = (0..n).filter(|&i| reason[i].is_none()).collect();
         let xyz: Vec<[f32; 3]> = rest.iter().map(|&i| cloud.xyz[i]).collect();
         for (&i, out) in rest
             .iter()
             .zip(outlier_flags(&xyz, cfg.outlier_k, cfg.outlier_sigma))
         {
             if out {
-                keep[i] = false;
-                outliers += 1;
+                reason[i] = Some(RemovalReason::Outlier);
             }
         }
     }
-    let (kept, removed) = cloud.select(&keep);
-    let stats = CleanStats {
-        ghosts,
-        outliers,
-        kept: kept.len(),
+    let keep: Vec<bool> = reason.iter().map(Option::is_none).collect();
+    let reasons: Vec<RemovalReason> = reason.iter().flatten().copied().collect();
+    let count = |why| reasons.iter().filter(|&&r| r == why).count();
+    let (mut kept, removed) = cloud.select(&keep);
+    drop(cloud);
+    let smooth = if cfg.smooth.enabled {
+        let (xyz, s) = smooth_surfaces(&kept.xyz, &cfg.smooth);
+        kept.xyz = xyz;
+        s
+    } else {
+        SmoothStats::default()
     };
-    Ok((kept, removed, stats))
+    let stats = CleanStats {
+        ghosts: count(RemovalReason::Ghost),
+        through: count(RemovalReason::Through),
+        outliers: count(RemovalReason::Outlier),
+        kept: kept.len(),
+        smooth,
+    };
+    Ok((kept, removed, reasons, stats))
 }
 
 #[cfg(test)]

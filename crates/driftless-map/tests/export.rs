@@ -99,10 +99,11 @@ fn ply_header_and_size() {
         );
         if rgb {
             want += "property uchar red\nproperty uchar green\nproperty uchar blue\n";
+            want += "property uchar colored\n";
         }
         want += "end_header\n";
         assert_eq!(header, want);
-        let stride = if rgb { 19 } else { 16 };
+        let stride = if rgb { 20 } else { 16 };
         assert_eq!(bytes.len(), header_len + 3 * stride);
         // Second vertex: x, then intensity, then colour.
         let v = &bytes[header_len + stride..header_len + 2 * stride];
@@ -110,6 +111,9 @@ fn ply_header_and_size() {
         assert_eq!(f32::from_le_bytes(v[12..16].try_into().unwrap()), 10.5);
         if rgb {
             assert_eq!(&v[16..19], &[0, 128, 255]);
+            assert_eq!(v[19], 1);
+            let last = &bytes[header_len + 2 * stride..];
+            assert_eq!(last[19], 0, "third point has no measured colour");
         }
     }
     std::fs::remove_dir_all(&dir).unwrap();
@@ -128,4 +132,27 @@ fn select_splits_kept_and_removed() {
     let (kept, removed) = cloud(false).select(&[false, false, false]);
     assert!(kept.is_empty() && kept.rgb.is_none());
     assert_eq!(removed.len(), 3);
+}
+
+#[test]
+fn las_user_data_marks_uncolored() {
+    let dir = temp_dir("las-ud");
+    let path = dir.join("color.las");
+    write_las(&path, &cloud(true)).unwrap();
+    let mut r = Reader::from_path(&path).unwrap();
+    let ud: Vec<u8> = r
+        .read_all()
+        .unwrap()
+        .points()
+        .map(|p| p.unwrap().user_data)
+        .collect();
+    assert_eq!(ud, vec![0, 0, 1]);
+    write_las(&path, &cloud(false)).unwrap();
+    let mut r = Reader::from_path(&path).unwrap();
+    assert!(r
+        .read_all()
+        .unwrap()
+        .points()
+        .all(|p| p.unwrap().user_data == 0));
+    std::fs::remove_dir_all(&dir).unwrap();
 }

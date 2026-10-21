@@ -5,7 +5,10 @@
 mod common;
 
 use common::*;
-use driftless_map::{colorize, ColorConfig, ColorStats, ImageSource, MapError};
+use driftless_map::{
+    colorize, ColorCamera, ColorConfig, ColorStats, ExposureConfig, ImageSource, MapError,
+    Vignetting,
+};
 use driftless_traj::nalgebra::{Isometry3, UnitQuaternion, Vector3};
 
 /// Separable Gaussian blur with standard deviation `sigma` (pixels), edges clamped.
@@ -234,6 +237,7 @@ fn uncolored_points_are_gray_not_black() {
             points_uncolored: cloud.len(),
             gain_min: 1.0,
             gain_max: 1.0,
+            vignetting: Vignetting::flat(cams.len(), ExposureConfig::default().max_gain),
             ..ColorStats::default()
         }
     );
@@ -277,7 +281,7 @@ fn colorize_rejects_bad_config_and_cameras() {
             ..ColorConfig::default()
         },
         ColorConfig {
-            views_per_point: 0,
+            views_kept: 0,
             ..ColorConfig::default()
         },
         ColorConfig {
@@ -290,6 +294,26 @@ fn colorize_rejects_bad_config_and_cameras() {
         },
         ColorConfig {
             max_angular_rate: f64::NAN,
+            ..ColorConfig::default()
+        },
+        ColorConfig {
+            highlight_ratio: -0.1,
+            ..ColorConfig::default()
+        },
+        ColorConfig {
+            highlight_abs: f64::NAN,
+            ..ColorConfig::default()
+        },
+        ColorConfig {
+            highlight_abs: 0.0,
+            ..ColorConfig::default()
+        },
+        ColorConfig {
+            rim_theta: 0.0,
+            ..ColorConfig::default()
+        },
+        ColorConfig {
+            view_gap: -1.0,
             ..ColorConfig::default()
         },
     ];
@@ -312,4 +336,201 @@ fn colorize_rejects_bad_config_and_cameras() {
     };
     let r = colorize(&mut cloud, missing, poses, cams, &ColorConfig::default());
     assert!(matches!(r, Err(MapError::Images(_))));
+}
+
+/// The walk with a highlight in every second image of each camera.
+fn highlight_data() -> &'static (
+    Painted,
+    ImageSource,
+    Vec<driftless_traj::Pose>,
+    Vec<ColorCamera>,
+) {
+    static DATA: std::sync::OnceLock<(
+        Painted,
+        ImageSource,
+        Vec<driftless_traj::Pose>,
+        Vec<ColorCamera>,
+    )> = std::sync::OnceLock::new();
+    DATA.get_or_init(|| {
+        let painted = walk_scene();
+        let cams = cameras();
+        let traj = walk();
+        let shots: Vec<Shot> = (1..=11)
+            .flat_map(|i| {
+                [0, 1].map(|c| Shot {
+                    camera: c,
+                    stamp: T0 + 0.5 * f64::from(i),
+                    edit: if i % 2 == 0 {
+                        Box::new(with_highlight)
+                    } else {
+                        Box::new(|rgb| rgb)
+                    },
+                })
+            })
+            .collect();
+        let images = write_bag("highlight", &painted, &traj, &cams, &shots);
+        (painted, images, poses(&traj, 6.0), cams)
+    })
+}
+
+/// Coloured floor points at least 10 cm from another colour (see [`Match`]) and the share of
+/// them within [`TOL`] of the floor colour.
+fn floor_match(painted: &Painted, cloud: &driftless_map::Cloud) -> (usize, f64) {
+    let rgb = cloud.rgb.as_ref().unwrap();
+    let colored = cloud.colored.as_ref().unwrap();
+    let floor: Vec<usize> = (0..cloud.len())
+        .filter(|&i| {
+            let p = Vector3::from(cloud.xyz[i].map(f64::from));
+            colored[i] && on_floor(painted, &p) && !near_boundary(painted, &p, 0.1)
+        })
+        .collect();
+    let good = floor.iter().filter(|&&i| close(rgb[i], FLOOR, TOL)).count();
+    (floor.len(), good as f64 / floor.len().max(1) as f64)
+}
+
+#[test]
+fn rejects_view_dependent_highlights() {
+    let (painted, images, poses, cams) = highlight_data();
+    let run = |cfg: &ColorConfig| {
+        let mut cloud = surface_cloud(painted);
+        let stats = colorize(&mut cloud, images.clone(), poses, cams, cfg).unwrap();
+        (floor_match(painted, &cloud), stats)
+    };
+    // The rule is off by default (experimental).
+    assert!(!ColorConfig::default().highlights);
+    let ((n, on), stats) = run(&ColorConfig {
+        highlights: true,
+        ..ColorConfig::default()
+    });
+    // Without the rule and with neighbouring images kept (as in Meilenstein 3): the spots
+    // show. (Views 1 s apart alone already avoid many of them here, since every second image
+    // has one; real reflections are not that kind.)
+    let ((n_off, off), stats_off) = run(&ColorConfig {
+        highlights: false,
+        view_gap: 0.0,
+        ..ColorConfig::default()
+    });
+    println!("on: {n} floor points, {on:.3} good, {stats:?}");
+    println!("off: {n_off} floor points, {off:.3} good");
+    assert!(n > 1000, "{n}");
+    assert!(on > 0.95, "{on}");
+    assert!(off < 0.85, "{off}");
+    assert!(
+        stats.views_rejected > 0 && stats.points_with_rejected > 0,
+        "{stats:?}"
+    );
+    assert_eq!(stats_off.views_rejected, 0);
+    // Measured 0.53: the spots add contrast, so the images with them count as sharper and
+    // their views weigh more (0.41 while sharpness was divided by the squared mean).
+    assert!(
+        stats.floor_highlight_share_after < 0.6 * stats.floor_highlight_share_before,
+        "{stats:?}"
+    );
+    // Without the rule the share stays as before: the blend alone keeps the spots.
+    assert!(
+        stats_off.floor_highlight_share_after > 0.5 * stats_off.floor_highlight_share_before,
+        "{stats_off:?}"
+    );
+}
+
+#[test]
+fn few_views_are_never_all_rejected() {
+    let painted = walk_scene();
+    let cams = cameras();
+    let traj = walk();
+    let one = [Shot {
+        camera: 0,
+        stamp: T0 + 2.0,
+        edit: Box::new(with_highlight),
+    }];
+    // More than `view_gap` apart, so a point keeps both views.
+    let two = [
+        shot(0, T0 + 2.0),
+        Shot {
+            camera: 0,
+            stamp: T0 + 3.1,
+            edit: Box::new(with_highlight),
+        },
+    ];
+    let poses = poses(&traj, 6.0);
+    for (name, shots) in [("one-view", &one[..]), ("two-views", &two[..])] {
+        let images = write_bag(name, &painted, &traj, &cams, shots);
+        let mut colored = Vec::new();
+        for highlights in [true, false] {
+            let cfg = ColorConfig {
+                highlights,
+                ..ColorConfig::default()
+            };
+            let mut cloud = surface_cloud(&painted);
+            let stats = colorize(&mut cloud, images.clone(), &poses, &cams, &cfg).unwrap();
+            assert_eq!(stats.images_used, shots.len(), "{stats:?}");
+            // With two views the bright one is down-weighted on the points under the spot.
+            let lowered = highlights && shots.len() == 2;
+            assert_eq!(stats.views_rejected > 1000, lowered, "{name}: {stats:?}");
+            colored.push(cloud.colored.unwrap());
+        }
+        // Every point seen keeps a colour, however bright its views.
+        assert_eq!(colored[0], colored[1], "{name}");
+        assert!(colored[0].iter().filter(|&&c| c).count() > 1000, "{name}");
+    }
+}
+
+/// The walk with every second stamp `gain` times brighter (linear), no exposure fit: the
+/// difference stays and shows wherever a point's views change.
+fn seam_stats(name: &str, gain: f64) -> ColorStats {
+    let painted = walk_scene();
+    let cams = cameras();
+    let traj = walk();
+    let shots: Vec<Shot> = (1..=11)
+        .flat_map(|i| {
+            let g = if i % 2 == 0 { gain } else { 1.0 };
+            [0, 1].map(move |c| Shot {
+                camera: c,
+                stamp: T0 + 0.5 * f64::from(i),
+                edit: Box::new(move |rgb: Vec<u8>| {
+                    rgb.into_iter()
+                        .map(|v| {
+                            let l = (f64::from(v) / 255.0).powf(2.2) * g;
+                            (l.min(1.0).powf(1.0 / 2.2) * 255.0).round() as u8
+                        })
+                        .collect()
+                }),
+            })
+        })
+        .collect();
+    let images = write_bag(name, &painted, &traj, &cams, &shots);
+    let poses = poses(&traj, 6.0);
+    let cfg = ColorConfig {
+        exposure: ExposureConfig {
+            samples: 0,
+            ..ExposureConfig::default()
+        },
+        ..ColorConfig::default()
+    };
+    let mut cloud = surface_cloud(&painted);
+    colorize(&mut cloud, images, &poses, &cams, &cfg).unwrap()
+}
+
+#[test]
+fn seam_jump_measures_exposure_seams() {
+    // Exposure differences between the images show as jumps between neighbours with
+    // different main images; with equal exposure there are none.
+    let flat = seam_stats("seam-flat", 1.0);
+    let grouped = seam_stats("seam-grouped", 1.2);
+    println!(
+        "seam jump: equal exposure {:.2} -> {:.2}, two groups {:.2} -> {:.2}",
+        flat.seam_jump_before,
+        flat.seam_jump_after,
+        grouped.seam_jump_before,
+        grouped.seam_jump_after
+    );
+    for s in [&flat, &grouped] {
+        assert!(s.seam_jump_before.is_finite() && s.seam_jump_after.is_finite());
+    }
+    assert!(
+        flat.seam_jump_before < 0.5 && flat.seam_jump_after < 0.5,
+        "{flat:?}"
+    );
+    assert!(grouped.seam_jump_before > 1.0, "{grouped:?}");
+    assert!(grouped.seam_jump_after > 1.0, "{grouped:?}");
 }

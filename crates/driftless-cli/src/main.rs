@@ -15,6 +15,11 @@ mod view;
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
+/// The system allocator keeps the per-image buffers of `map` mapped (peak 9.9 GB on a 10 min
+/// scan); mimalloc returns them (3 GB).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "driftless", version, about = "Driftless: Handheld-LiDAR-Scans")]
 struct Cli {
