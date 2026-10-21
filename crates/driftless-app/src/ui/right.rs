@@ -355,7 +355,13 @@ fn run_steps(
         .find(|e| e.kind == HistoryKind::Reuse)
         .map_or(StepState::NotReused, |e| StepState::Done(Some(e.seconds)));
     let no_cache = (!run.has_cache).then(|| text::NO_CACHE.to_string());
-    if step_row(ui, text::STEP_REUSE, blocked.clone().or(no_cache), reused) {
+    let writing = correct::writing(state);
+    if step_row(
+        ui,
+        text::STEP_REUSE,
+        blocked.clone().or(writing).or(no_cache),
+        reused,
+    ) {
         *action = Some(Action::Reuse(run.dir.clone()));
     }
     let no_color = (state.map_settings.step == MapStep::Color)

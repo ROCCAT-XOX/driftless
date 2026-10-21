@@ -238,11 +238,12 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
 /// written cannot have been used and stays off. Without a readable `slam.json` all are off.
 fn corrections_of_run(out: &Path, submaps: &[Submap], current: &Corrections) -> Corrections {
     let json = out.join("slam.json");
-    // RFC 3339 of the same form as `added`, so the strings compare as times
+    // as seconds since 1970, like a parsed `added`
     let written = fs::metadata(&json)
         .and_then(|m| m.modified())
-        .map(crate::correct::utc)
-        .ok();
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64());
     let pairs: BTreeSet<(usize, usize)> = fs::read_to_string(&json)
         .ok()
         .and_then(|t| serde_json::from_str::<SlamReport>(&t).ok())
@@ -266,7 +267,9 @@ fn corrections_of_run(out: &Path, submaps: &[Submap], current: &Corrections) -> 
     for claim_enabled in [true, false] {
         for (l, (pair, on)) in then.loops.iter_mut().zip(&entries) {
             if *on == claim_enabled {
-                let later = written.as_ref().is_some_and(|w| l.added > *w);
+                // an unreadable `added` (a hand edit) does not rule the entry out
+                let added = crate::correct::parse_stamp(&l.added);
+                let later = matches!((added, written), (Some(a), Some(w)) if a > w.floor());
                 l.enabled = !later && pair.is_some_and(|p| pairs.contains(&p) && used.insert(p));
             }
         }

@@ -4,6 +4,7 @@
 use driftless_app::camera::{Camera, CameraMode};
 use driftless_app::cloud::PointSet;
 use driftless_app::lod::{build_octree, build_octree_with, Octree, PointVertex, LEAF_MAX};
+use driftless_app::pick::project;
 use driftless_app::render::{
     headless_device, ColorMode, FrameParams, LineVertex, PointRenderer, RenderTarget, NO_CUT,
 };
@@ -289,6 +290,42 @@ fn lines_draw_over_background() {
     eprintln!("Linie in Spalte {column:?}");
     assert!((1..=2).contains(&column.len()), "a 1 px line");
     assert!(is_background(image.at(0, 0)));
+}
+
+/// A segment with one end behind the camera is cut at the eye: only the visible part is
+/// drawn, along its true direction on screen, no smeared triangles.
+#[test]
+fn line_through_the_eye_is_clipped() {
+    let Some(gpu) = gpu() else { return };
+    let tree = tree(&PointSet::default());
+    // below the eye, from 4 m ahead to 4 m behind: on screen from below the centre down
+    let line = [[4.0, 0.0, -0.5], [-4.0, 0.0, -0.5]].map(|pos| LineVertex {
+        pos,
+        rgba: 0xff00_ff00,
+        width: 2.0,
+    });
+    let cam = camera([0.0; 3], 0.0);
+    let f = frame(&cam, ColorMode::Rgb);
+    let image = render(&gpu, &tree, &f, &line, &[]);
+    let far = project(
+        &nalgebra::Matrix4::from(f.view_proj),
+        line[0].pos,
+        [SIZE as f32; 2],
+    )
+    .unwrap();
+    let green: Vec<(u32, u32)> = (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| near(image.at(x, y), [0, 255, 0], 1))
+        .collect();
+    eprintln!("ferne Ende {far:?}, {} Pixel", green.len());
+    assert!(!green.is_empty(), "the visible part is drawn");
+    let centre = SIZE as f32 / 2.0;
+    for &(x, y) in &green {
+        assert!((x as f32 + 0.5 - centre).abs() <= 2.0, "column {x}");
+        assert!(y as f32 + 0.5 >= far[1] - 2.0, "row {y} above the far end");
+    }
+    // it reaches the bottom edge (the part next to the eye)
+    assert!(green.iter().any(|&(_, y)| y == SIZE - 1));
 }
 
 /// Lines are quads of their width in points times the pixels per point.

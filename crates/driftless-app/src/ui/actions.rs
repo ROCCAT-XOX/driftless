@@ -49,6 +49,11 @@ pub fn start_step(
             if !run.has_cache {
                 return Err(text::NO_CACHE.into());
             }
+            if let Some(why) = super::correct::writing(state) {
+                return Err(why);
+            }
+            let writes = state.correct.writes_of(dir);
+            state.correct.reuse_writes = Some((dir.clone(), writes));
             runner.start(text::STEP_REUSE, move |p| {
                 let done = run_slam_job(&project, &scan_id, &SlamJob::Reuse(run), p)?;
                 Ok(JobOutput::Slam(Box::new(done)))

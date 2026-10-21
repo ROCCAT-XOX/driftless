@@ -310,6 +310,7 @@ impl DriftlessApp {
             Ok(JobOutput::Corrected(done)) => {
                 if done.changed {
                     c.changed.insert(done.run.clone());
+                    *c.writes.entry(done.run.clone()).or_default() += 1;
                 }
                 if shown {
                     if done.added {
@@ -672,10 +673,20 @@ impl DriftlessApp {
         };
         // the step may have added runs or maps
         self.reload_project();
+        // a reuse started with the count of written changes (taken also if it failed)
+        let current = match &output {
+            Some(JobOutput::Slam(done)) => self.state.correct.computed_current(&done.run_dir),
+            _ => {
+                self.state.correct.reuse_writes = None;
+                true
+            }
+        };
         match (output, step) {
             (Some(JobOutput::Slam(done)), _) => {
-                // computed with the corrections as they are now
-                self.state.correct.changed.remove(&done.run_dir);
+                // computed with the corrections as they are now, unless one was written since
+                if current {
+                    self.state.correct.changed.remove(&done.run_dir);
+                }
                 self.state.selection = Selection::Run(done.run_dir.clone());
                 self.reload_run(&done.run_dir);
                 self.load_run_cloud(&done.run_dir);

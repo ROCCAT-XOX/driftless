@@ -389,3 +389,77 @@ fn corrections_locked_while_a_step_of_the_run_runs() {
     h.run();
     h.get_by_label(text::PICK_NEEDS_TRAJECTORY);
 }
+
+/// A change still being written blocks recomputing (the reuse would read the file before
+/// it); a change written after a reuse started keeps the hint, it was not applied.
+#[test]
+fn recompute_waits_for_writes_and_later_writes_keep_the_hint() {
+    let (app, run) = app_with_run(&tmp("ui-korrektur-wettlauf"));
+    correct::add_loop_at(&run, 1.0, 11.0, "", ADDED).unwrap();
+    let mut app = app;
+    reselect(&mut app, &run);
+    let mut h = harness(app);
+
+    // a write queued: both recompute buttons locked, a reuse refused
+    h.state_mut().apply(Action::SetLoopEnabled {
+        run: run.clone(),
+        nr: 1,
+        enabled: false,
+    });
+    assert!(h.state().state().correct.busy);
+    h.state_mut().apply(Action::Reuse(run.clone()));
+    assert_eq!(h.state().state().step, None, "reuse refused");
+    assert_eq!(
+        errors(h.state()).last().map(String::as_str),
+        Some(text::CORRECTION_BUSY)
+    );
+    h.step();
+    if h.state().state().correct.busy {
+        let disabled = h
+            .get_by_label(text::STEP_REUSE)
+            .accesskit_node()
+            .is_disabled();
+        assert!(disabled, "„Neu rechnen“ locked while writing");
+    }
+    wait_written(&mut h);
+    h.get_by_label(text::CHANGED_RECOMPUTE);
+
+    // a reuse starts, then a change lands (as from a write that was under way)
+    h.state_mut().apply(Action::Reuse(run.clone()));
+    assert_eq!(h.state().state().step, Some(Action::Reuse(run.clone())));
+    h.state_mut().apply(Action::SetLoopEnabled {
+        run: run.clone(),
+        nr: 1,
+        enabled: true,
+    });
+    frames_until(&mut h, |app| {
+        app.state().job.is_none() && !app.wants_repaint_while_busy()
+    });
+    assert!(correct::load(&run).unwrap().loops[0].enabled);
+    // not applied by that reuse: the hint stays
+    assert!(h.state().state().correct.changed.contains(&run));
+    h.get_by_label(text::CHANGED_RECOMPUTE);
+
+    // a reuse without a later write clears it
+    h.state_mut().apply(Action::Reuse(run.clone()));
+    frames_until(&mut h, |app| {
+        app.state().job.is_none() && !app.wants_repaint_while_busy()
+    });
+    assert!(h.query_by_label(text::CHANGED_RECOMPUTE).is_none());
+}
+
+/// The count taken at the start of a reuse decides whether it ran with the corrections as
+/// they are now (a write landing while it ran, before it ended, keeps the hint).
+#[test]
+fn reuse_with_a_write_since_its_start_is_not_current() {
+    let run = PathBuf::from("/lauf");
+    let mut c = CorrectState::default();
+    c.reuse_writes = Some((run.clone(), c.writes_of(&run)));
+    *c.writes.entry(run.clone()).or_default() += 1;
+    assert!(!c.computed_current(&run));
+    assert!(c.reuse_writes.is_none(), "taken");
+    c.reuse_writes = Some((run.clone(), c.writes_of(&run)));
+    assert!(c.computed_current(&run));
+    // no reuse recorded (a full run): current
+    assert!(c.computed_current(&run));
+}

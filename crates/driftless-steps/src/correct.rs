@@ -145,6 +145,68 @@ pub fn utc_now() -> String {
     utc(SystemTime::now())
 }
 
+/// Seconds since 1970 of an RFC 3339 time such as `added` (`2026-10-21T14:03:12Z`, also with
+/// fractional seconds or an offset like `+02:00`); `None` if it is not one.
+pub fn parse_stamp(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let part = s.get(r)?;
+        part.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    let sep = |i: usize, c: u8| s.as_bytes().get(i) == Some(&c);
+    if !(sep(4, b'-')
+        && sep(7, b'-')
+        && matches!(s.as_bytes().get(10), Some(b'T' | b't' | b' '))
+        && sep(13, b':')
+        && sep(16, b':'))
+    {
+        return None;
+    }
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return None;
+    }
+    let mut rest = &s[19..];
+    let mut frac = 0.0;
+    if let Some(r) = rest.strip_prefix('.') {
+        let digits = r.bytes().take_while(u8::is_ascii_digit).count();
+        frac = format!("0.{}", r.get(..digits).filter(|d| !d.is_empty())?)
+            .parse()
+            .ok()?;
+        rest = &r[digits..];
+    }
+    let offset = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.as_bytes().first()? {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let off = rest.get(1..)?;
+            if off.len() != 5 || off.as_bytes()[2] != b':' {
+                return None;
+            }
+            let h: i64 = off[..2].parse().ok()?;
+            let m: i64 = off[3..].parse().ok()?;
+            sign * (h * 3600 + m * 60)
+        }
+    };
+    // days since 1970-01-01 of a civil date (H. Hinnant's algorithm)
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hour * 3600 + minute * 60 + second - offset;
+    Some(secs as f64 + frac)
+}
+
 /// `time` as RFC 3339 in UTC, to the second (the format of `added`).
 pub fn utc(time: SystemTime) -> String {
     let secs = time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -165,4 +227,31 @@ pub fn utc(time: SystemTime) -> String {
         rest % 3600 / 60,
         rest % 60
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn stamps_parse_as_times() {
+        let z = parse_stamp("2026-10-21T12:00:00Z").unwrap();
+        assert_eq!(parse_stamp("2026-10-21T14:00:00+02:00"), Some(z));
+        assert_eq!(parse_stamp("2026-10-21T07:30:00-04:30"), Some(z));
+        assert_eq!(parse_stamp("2026-10-21T12:00:00.25Z"), Some(z + 0.25));
+        // round trip with the format written
+        let t = UNIX_EPOCH + Duration::from_secs(1_792_000_000);
+        assert_eq!(parse_stamp(&utc(t)), Some(1_792_000_000.0));
+        assert_eq!(parse_stamp("1970-01-01T00:00:00Z"), Some(0.0));
+        for bad in [
+            "",
+            "gestern",
+            "2026-10-21",
+            "2026-13-01T00:00:00Z",
+            "2026-10-21T12:00:00",
+        ] {
+            assert_eq!(parse_stamp(bad), None, "{bad}");
+        }
+    }
 }

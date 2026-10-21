@@ -12,7 +12,7 @@ use super::{text, Action, AppState, UiMessage};
 use crate::overlay::RunOverlay;
 use driftless_slam::Corrections;
 use eframe::egui::{self, RichText, Ui};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// One of the two places of a loop.
@@ -58,6 +58,11 @@ pub struct CorrectState {
     pub busy: bool,
     /// Runs whose corrections changed since they were last computed (in this session).
     pub changed: BTreeSet<PathBuf>,
+    /// How many changes were written per run (in this session).
+    pub writes: BTreeMap<PathBuf, u64>,
+    /// The run of the reuse that runs, with its count of [`CorrectState::writes`] at the start:
+    /// a change written later was not applied.
+    pub reuse_writes: Option<(PathBuf, u64)>,
 }
 
 impl CorrectState {
@@ -70,6 +75,8 @@ impl CorrectState {
         *self = CorrectState {
             run: run.map(Path::to_path_buf),
             changed: std::mem::take(&mut self.changed),
+            writes: std::mem::take(&mut self.writes),
+            reuse_writes: self.reuse_writes.take(),
             ..CorrectState::default()
         };
         true
@@ -94,6 +101,20 @@ impl CorrectState {
     /// The times of both places, once both are set.
     pub fn places(&self) -> Option<(f64, f64)> {
         Some((self.a.t?, self.b.t?))
+    }
+
+    /// The changes written for `run` so far.
+    pub fn writes_of(&self, run: &Path) -> u64 {
+        self.writes.get(run).copied().unwrap_or(0)
+    }
+
+    /// A step on `run` ended: whether it was computed with the corrections as they are now
+    /// (no change written since a reuse of it started).
+    pub fn computed_current(&mut self, run: &Path) -> bool {
+        match self.reuse_writes.take() {
+            Some((r, n)) if r == run => n == self.writes_of(run),
+            _ => true,
+        }
     }
 
     /// After a loop was written: the places and the note start empty again.
@@ -153,6 +174,15 @@ pub fn locked(state: &AppState, run: &Path) -> Option<String> {
         .map(|j| text::busy(&j.label))
 }
 
+/// Why the run cannot be recomputed now: a change of the corrections is still being written
+/// (the recompute would read the file before it).
+pub fn writing(state: &AppState) -> Option<String> {
+    state
+        .correct
+        .busy
+        .then(|| text::CORRECTION_BUSY.to_string())
+}
+
 /// The panel of the selected run (without its heading); nothing without one.
 pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     let (dir, has_cache) = state
@@ -162,6 +192,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     ui.weak(text::CORRECTIONS_HINT);
     let job = state.job.as_ref().map(|j| text::busy(&j.label));
     let locked = locked(state, &dir);
+    let writing = writing(state);
     let trajectory_hidden = !state.view.show_trajectory;
     let c = &mut state.correct;
     if c.run.as_deref() != Some(dir.as_path()) {
@@ -239,7 +270,9 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     if c.changed.contains(&dir) {
         let warn = ui.visuals().warn_fg_color;
         ui.label(RichText::new(text::CHANGED_RECOMPUTE).color(warn));
-        let blocked = job.or((!has_cache).then(|| text::NO_CACHE.to_string()));
+        let blocked = job
+            .or(writing)
+            .or((!has_cache).then(|| text::NO_CACHE.to_string()));
         let button = ui.add_enabled(blocked.is_none(), egui::Button::new(text::RECOMPUTE_NOW));
         if button.clicked() {
             action = Some(Action::Reuse(dir.clone()));

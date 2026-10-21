@@ -186,6 +186,32 @@ fn imported_state_skips_entries_added_after_the_run() {
     assert_eq!(flags, [true, false]);
 }
 
+/// `added` with an offset is compared as a time: an hour before the run, written in +09:00
+/// (so that as text it sorts after the run's time), the entry still claims its pair.
+#[test]
+fn imported_state_compares_added_as_time() {
+    use std::time::{Duration, SystemTime};
+    let dir = tmp("steps-history-import-offset");
+    room_bag_secs(&dir, true, 12.0);
+    let out = dir.join("out");
+    slam(&dir, &out, false, false);
+    let hour_ago = SystemTime::now() - Duration::from_secs(3600);
+    // the same moment in +09:00
+    let local = correct::utc(hour_ago + Duration::from_secs(9 * 3600));
+    let added = local.replace('Z', "+09:00");
+    assert!(
+        added > correct::utc_now(),
+        "{added} sorts after now as text"
+    );
+    correct::add_loop_at(&out, 1.0, 11.0, "", &added).unwrap();
+    slam(&dir, &out, true, false);
+    slam(&dir, &out, true, true);
+    let first = &history::list(&out)[0];
+    assert_eq!(first.kind, HistoryKind::Imported);
+    let then = Corrections::load(&first.dir.join(CORRECTIONS_FILE)).unwrap();
+    assert!(then.loops[0].enabled, "made the run's loop");
+}
+
 /// A state keeps the corrections the run was computed with: a change written while the
 /// run is going (by another program) is not recorded as if it had been applied.
 #[test]
