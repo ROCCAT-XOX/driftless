@@ -107,12 +107,15 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
                             action = Some(a);
                         }
                     });
-                    ui.separator();
-                    section(ui, text::MAPS_COMPARE, |ui| {
-                        if let Some(a) = compare::show_maps(ui, state) {
-                            action = Some(a);
-                        }
-                    });
+                    // only with something to compare
+                    if compare::maps_of_scan(scan).len() >= 2 {
+                        ui.separator();
+                        section(ui, text::MAPS_COMPARE, |ui| {
+                            if let Some(a) = compare::show_maps(ui, state) {
+                                action = Some(a);
+                            }
+                        });
+                    }
                 }
             }
             ui.separator();

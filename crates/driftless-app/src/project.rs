@@ -45,11 +45,10 @@ use driftless_steps::map::{
     CLEAN_BIN, DENSE_BIN, REPORT,
 };
 use driftless_steps::slam::{
-    cache_fits, run_slam, SlamOutcome, SlamRequest, SlamSettings, CACHE_FILE,
+    cache_fits, run_slam, SlamOutcome, SlamRequest, SlamSettings, CACHE_FILE, CORRECTIONS_FILE,
 };
 use driftless_steps::StepError;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -137,9 +136,6 @@ pub struct RunInfo {
     pub cloud: Option<PathBuf>,
     pub maps: Vec<MapInfo>,
     pub history: Vec<HistoryEntry>,
-    /// Start↔end gap (m) of each state of [`RunInfo::history`], by number, from its
-    /// `slam.json` (missing where that cannot be read).
-    pub history_gaps: BTreeMap<u32, f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -456,13 +452,13 @@ fn run_info(dir: &Path, label: String) -> RunInfo {
         has_odometry: file("traj_odom.tum"),
         cloud: file("map.las").then(|| dir.join("map.las")),
         maps,
-        history_gaps: history_gaps(&history),
         history,
     }
 }
 
-/// The start↔end gap after the optimisation of each state, from its `slam.json`.
-fn history_gaps(history: &[HistoryEntry]) -> BTreeMap<u32, f64> {
+/// The start↔end gap after the optimisation of the state in folder `dir`, from its
+/// `slam.json`; `None` if that cannot be read. Reads the whole file: call it off the UI thread.
+pub fn state_gap(dir: &Path) -> Option<f64> {
     #[derive(Deserialize)]
     struct Gap {
         after: f64,
@@ -471,14 +467,9 @@ fn history_gaps(history: &[HistoryEntry]) -> BTreeMap<u32, f64> {
     struct Report {
         start_end_gap: Gap,
     }
-    history
-        .iter()
-        .filter_map(|e| {
-            let text = fs::read_to_string(e.dir.join("slam.json")).ok()?;
-            let r: Report = serde_json::from_str(&text).ok()?;
-            Some((e.nr, r.start_end_gap.after))
-        })
-        .collect()
+    let text = fs::read_to_string(dir.join("slam.json")).ok()?;
+    let r: Report = serde_json::from_str(&text).ok()?;
+    Some(r.start_end_gap.after)
 }
 
 /// The name of the run in folder `dir`: „SLAM 001“ for `slam-001`, else the folder name.
@@ -919,18 +910,7 @@ pub fn run_slam_job(
                 reuse: true,
                 history: true,
             };
-            // An added CLI run has no `lauf.toml`: its settings are only assumed.
-            let assumed = !run.dir.join(RUN_FILE).exists();
-            if assumed && run.dir.join(CACHE_FILE).is_file() && !cache_fits(&req) {
-                return Err(format!(
-                    "Lauf wurde mit anderen Einstellungen gerechnet als den Standardwerten (z. B. \
-                     --lidar-to-imu, --lidar-topic oder --imu-topic) und lässt sich hier nicht \
-                     neu rechnen; mit `driftless slam <scan> -o {} --reuse` und denselben Angaben \
-                     neu rechnen",
-                    run.dir.display()
-                )
-                .into());
-            }
+            reuse_refusal(&req)?;
             let outcome = run_slam(&req, progress)?;
             Ok(SlamDone {
                 run_dir: run.dir.clone(),
@@ -938,6 +918,70 @@ pub fn run_slam_job(
             })
         }
     }
+}
+
+/// Why a reuse of a run cannot be computed here: an added CLI run has no `lauf.toml`, its
+/// settings are only assumed, and its cache needs others.
+fn reuse_refusal(req: &SlamRequest) -> Result<(), StepError> {
+    let assumed = !req.out.join(RUN_FILE).exists();
+    if assumed && req.out.join(CACHE_FILE).is_file() && !cache_fits(req) {
+        return Err(format!(
+            "Lauf wurde mit anderen Einstellungen gerechnet als den Standardwerten (z. B. \
+             --lidar-to-imu, --lidar-topic oder --imu-topic) und lässt sich hier nicht neu \
+             rechnen; mit `driftless slam <scan> -o {} --reuse` und denselben Angaben neu rechnen",
+            req.out.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Restores the switches of the corrections of `run` as in its state `nr`, then recomputes it
+/// like [`SlamJob::Reuse`] (a new state; the old ones stay). Checked first whether the run can
+/// be recomputed here; if the recompute fails or is cancelled, `corrections.toml` is written
+/// back as it was, so the file always fits `traj.tum`.
+pub fn restore_job(
+    project: &Project,
+    scan_id: &str,
+    run: &RunInfo,
+    nr: u32,
+    progress: &Progress,
+) -> Result<SlamDone, StepError> {
+    let scan = project
+        .scan(scan_id)
+        .ok_or_else(|| Project::unknown(scan_id))?
+        .path
+        .clone();
+    reuse_refusal(&SlamRequest {
+        scan,
+        out: run.dir.clone(),
+        settings: run.settings.clone(),
+        reuse: true,
+        history: true,
+    })?;
+    let path = run.dir.join(CORRECTIONS_FILE);
+    let before = match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{} nicht lesbar: {e}", path.display()).into()),
+    };
+    history::restore_flags(&run.dir, nr)?;
+    let done = run_slam_job(project, scan_id, &SlamJob::Reuse(run.clone()), progress);
+    if done.is_err() {
+        let back = match &before {
+            Some(bytes) => atomic_write(&path, bytes),
+            None if path.exists() => fs::remove_file(&path),
+            None => Ok(()),
+        };
+        if let Err(e) = back {
+            return Err(format!(
+                "Neu rechnen fehlgeschlagen und {} nicht zurückgeschrieben: {e}",
+                path.display()
+            )
+            .into());
+        }
+    }
+    done
 }
 
 /// Makes a map of `run` from the scan folder `scan` into the folder [`map_dir_for`] picks; a

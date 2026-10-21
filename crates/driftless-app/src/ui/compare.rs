@@ -82,6 +82,8 @@ pub struct Comparison {
     pub align: Isometry3<f64>,
     /// The poses of A as read (for drawing them moved by [`Comparison::align`]).
     pub a_poses: Vec<Pose>,
+    /// The poses of B as read.
+    pub b_poses: Vec<Pose>,
 }
 
 fn read(r: &TrajRef) -> Result<Vec<Pose>, StepError> {
@@ -99,6 +101,7 @@ pub fn compare_refs(a: &TrajRef, b: &TrajRef) -> Result<Comparison, StepError> {
         report,
         align,
         a_poses: pa,
+        b_poses: pb,
     })
 }
 
@@ -127,15 +130,39 @@ pub fn refs_of_scan(scan: &ScanNode) -> Vec<TrajRef> {
     scan.runs.iter().flat_map(refs_of_run).collect()
 }
 
-/// What a run is compared with first: after a recompute the trajectory before it with the
-/// current one, else the odometry with the current one.
-pub fn default_refs(run: &RunInfo) -> (TrajRef, TrajRef) {
+/// What a run is compared with first, always with its current trajectory: after a recompute
+/// the trajectory before it, else the odometry, without one the state before the last; `None`
+/// without a current trajectory or anything to compare it with.
+pub fn default_refs(run: &RunInfo) -> Option<(TrajRef, TrajRef)> {
+    if !run.has_result {
+        return None;
+    }
+    let dir = run.dir.clone();
     let a = if run.has_previous {
-        TrajRef::Previous(run.dir.clone())
+        TrajRef::Previous(dir.clone())
+    } else if run.has_odometry {
+        TrajRef::Odometry(dir.clone())
     } else {
-        TrajRef::Odometry(run.dir.clone())
+        let before_last = run.history.iter().rev().nth(1)?;
+        TrajRef::History {
+            run: dir.clone(),
+            nr: before_last.nr,
+        }
     };
-    (a, TrajRef::Current(run.dir.clone()))
+    Some((a, TrajRef::Current(dir)))
+}
+
+/// Whether a row of the map comparison is highlighted: its values differ, and it is no
+/// runtime (those differ on every run).
+pub fn highlighted(label: &str, a: &str, b: &str) -> bool {
+    a != b
+        && ![
+            text::MAP_SECONDS_DENSE,
+            text::MAP_SECONDS_CLEAN,
+            text::MAP_SECONDS_COLOR,
+            text::MAP_SECONDS_TOTAL,
+        ]
+        .contains(&label)
 }
 
 /// The rows of the comparison table: label and value, as `driftless compare` prints them.
@@ -461,7 +488,7 @@ pub fn show(ui: &mut Ui, state: &AppState) -> Option<Action> {
 }
 
 /// The map folders of the scan with their names („SLAM 001 · Karte 002“).
-fn maps_of_scan(scan: &ScanNode) -> Vec<(PathBuf, String)> {
+pub fn maps_of_scan(scan: &ScanNode) -> Vec<(PathBuf, String)> {
     scan.runs
         .iter()
         .flat_map(|r| {
@@ -504,7 +531,7 @@ pub fn show_maps(ui: &mut Ui, state: &AppState) -> Option<Action> {
                     }
                     ui.end_row();
                     for (label, va, vb) in &m.rows {
-                        let differs = va != vb;
+                        let differs = highlighted(label, va, vb);
                         let cell = |s: &str| {
                             let t = RichText::new(s);
                             if differs {
@@ -552,7 +579,7 @@ pub fn show_state(ui: &mut Ui, state: &AppState) -> Option<Action> {
     ui.strong(text::state_name(*nr));
     ui.label(text::history_entry(
         entry,
-        run.history_gaps.get(nr).copied(),
+        state.history_gaps.get(&entry.dir).copied(),
     ));
     if ui.button(text::COMPARE_WITH_CURRENT).clicked() {
         action = Some(Action::Compare {

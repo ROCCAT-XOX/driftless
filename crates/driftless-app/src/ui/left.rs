@@ -107,7 +107,7 @@ fn history_node(ui: &mut Ui, state: &AppState, run: &RunInfo, action: &mut Optio
                     run: run.dir.clone(),
                     nr: e.nr,
                 };
-                let name = text::history_entry(e, run.history_gaps.get(&e.nr).copied());
+                let name = text::history_entry(e, state.history_gaps.get(&e.dir).copied());
                 let hover = format!("{name}\n{}", e.dir.display());
                 let r = leaf(ui, |ui| {
                     entry(ui, state.selection == selection, name.clone(), &hover)

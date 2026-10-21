@@ -16,6 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
+# Times of the history in local time.
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 driftless-io = { path = "../driftless-io" }
 driftless-slam = { path = "../driftless-slam" }
 driftless-steps = { path = "../driftless-steps" }

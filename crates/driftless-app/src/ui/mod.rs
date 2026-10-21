@@ -16,7 +16,7 @@ pub use app::{parse_args, Args, DriftlessApp};
 
 use crate::camera::CameraMode;
 use crate::jobs::JobStatus;
-use crate::project::{map_status, MapStatus, Project, RunInfo, ScanState};
+use crate::project::{map_status, state_gap, MapStatus, Project, RunInfo, ScanState};
 use crate::render::ColorMode;
 use driftless_io::progress::LogLine;
 use driftless_steps::inspect;
@@ -221,6 +221,9 @@ pub struct AppState {
     /// Raised by every [`AppState::refresh`]: the program recomputes [`AppState::map_status`]
     /// in the background whenever it changed.
     pub tree_version: u64,
+    /// The start↔end gap of each history state of the tree, by state folder; read in the
+    /// background like [`AppState::map_status`].
+    pub history_gaps: BTreeMap<PathBuf, f64>,
     /// The cloud in the 3D view.
     pub cloud: Option<CloudSummary>,
     /// A cloud being loaded, as of this frame (the loader runs next to the steps).
@@ -289,6 +292,24 @@ impl AppState {
         move || {
             maps.into_iter()
                 .map(|(scan, run, map)| (map.dir.clone(), map_status(&scan, &run, &map)))
+                .collect()
+        }
+    }
+
+    /// The work of reading the gaps of the history states not known yet
+    /// ([`AppState::history_gaps`]), to run off the UI thread.
+    pub fn history_gaps_job(&self) -> impl FnOnce() -> BTreeMap<PathBuf, f64> + Send + 'static {
+        let dirs: Vec<PathBuf> = self
+            .scans
+            .iter()
+            .flat_map(|s| &s.runs)
+            .flat_map(|r| &r.history)
+            .map(|e| e.dir.clone())
+            .filter(|d| !self.history_gaps.contains_key(d))
+            .collect();
+        move || {
+            dirs.into_iter()
+                .filter_map(|d| state_gap(&d).map(|g| (d, g)))
                 .collect()
         }
     }

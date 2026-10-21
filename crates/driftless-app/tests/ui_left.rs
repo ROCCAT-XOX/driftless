@@ -20,7 +20,6 @@ fn run(dir: &str, label: &str, maps: Vec<MapInfo>) -> RunInfo {
         cloud: None,
         maps,
         history: Vec::new(),
-        history_gaps: Default::default(),
     }
 }
 

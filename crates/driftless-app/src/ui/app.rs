@@ -103,6 +103,8 @@ impl CloudSource {
 enum HelperTask {
     /// The statuses of the map folders of this tree version.
     MapStatus(u64),
+    /// The start↔end gaps of the history states of this tree version.
+    HistoryGaps(u64),
     /// The overlay and the corrections of a run folder.
     LoadRun(PathBuf),
     /// [`Action::AddLoop`] or [`Action::SetLoopEnabled`]: they read `submaps.bin`.
@@ -141,6 +143,8 @@ pub struct DriftlessApp {
     render_state: Option<egui_wgpu::RenderState>,
     /// The [`AppState::tree_version`] the map statuses were last asked for.
     status_asked: u64,
+    /// The same for the gaps of the history states.
+    gaps_asked: u64,
     /// A project switch that waits until the cancelled step has stopped: until then the
     /// step may still write into the old project, which therefore stays shown.
     pending: Option<Action>,
@@ -171,6 +175,7 @@ impl DriftlessApp {
             view: View3d::default(),
             render_state: None,
             status_asked: 0,
+            gaps_asked: 0,
             pending: None,
             title: String::new(),
             closing: false,
@@ -362,7 +367,7 @@ impl DriftlessApp {
             .flat_map(|r| &r.maps)
             .map(|m| m.dir.clone())
             .collect();
-        let preset = run.has_result.then(|| default_refs(run));
+        let preset = default_refs(run);
         let c = &mut self.state.compare;
         c.run = wanted;
         if [&c.map_a, &c.map_b]
@@ -639,6 +644,7 @@ impl DriftlessApp {
             || !self.helper_queue.is_empty()
             || self.is_loading()
             || self.status_asked != self.state.tree_version
+            || self.gaps_asked != self.state.tree_version
     }
 
     /// Takes what the helper finished and starts its next task: queued ones first, then the
@@ -651,6 +657,10 @@ impl DriftlessApp {
                     if v == self.state.tree_version {
                         self.state.map_status = *status;
                     }
+                }
+                (Some(HelperTask::HistoryGaps(_)), Ok(JobOutput::HistoryGaps(gaps))) => {
+                    // states never change: gaps of an older tree stay valid
+                    self.state.history_gaps.extend(*gaps);
                 }
                 (Some(HelperTask::LoadRun(_)), Ok(JobOutput::Run(loaded))) => {
                     self.run_loaded(*loaded);
@@ -687,7 +697,8 @@ impl DriftlessApp {
         let task = self
             .helper_queue
             .pop_front()
-            .or_else(|| (self.status_asked != version).then_some(HelperTask::MapStatus(version)));
+            .or_else(|| (self.status_asked != version).then_some(HelperTask::MapStatus(version)))
+            .or_else(|| (self.gaps_asked != version).then_some(HelperTask::HistoryGaps(version)));
         if let Some(task) = task {
             self.start_helper(task);
         }
@@ -699,6 +710,12 @@ impl DriftlessApp {
                 let job = self.state.map_status_job();
                 self.helper.start(text::MAP_STATUS_JOB, move |_| {
                     Ok(JobOutput::MapStatus(Box::new(job())))
+                })
+            }
+            HelperTask::HistoryGaps(_) => {
+                let job = self.state.history_gaps_job();
+                self.helper.start(text::HISTORY_GAPS_JOB, move |_| {
+                    Ok(JobOutput::HistoryGaps(Box::new(job())))
                 })
             }
             HelperTask::LoadRun(run) => {
@@ -734,13 +751,15 @@ impl DriftlessApp {
         };
         match started {
             Ok(()) => {
-                if let HelperTask::MapStatus(v) = task {
-                    self.status_asked = v;
+                match task {
+                    HelperTask::MapStatus(v) => self.status_asked = v,
+                    HelperTask::HistoryGaps(v) => self.gaps_asked = v,
+                    _ => {}
                 }
                 self.helper_running = Some(task);
             }
             // the map statuses are asked again at the next frame
-            Err(_) if matches!(task, HelperTask::MapStatus(_)) => {}
+            Err(_) if matches!(task, HelperTask::MapStatus(_) | HelperTask::HistoryGaps(_)) => {}
             Err(e) => match &task {
                 HelperTask::Correct(action) => {
                     self.corrected(action, Err(StepError::Failed(e.to_string())))
@@ -802,11 +821,19 @@ impl DriftlessApp {
                 self.state.selection = Selection::Run(done.run_dir.clone());
                 self.reload_run(&done.run_dir);
                 self.load_run_cloud(&done.run_dir);
-                // its trajectories changed: compare again, as preset (before/after)
-                if self.state.compare.run.as_ref() == Some(&done.run_dir) {
+                // its trajectories changed: compare again, as preset (before/after) for the
+                // run drawn, else the same pair if one of them is of this run
+                let c = &self.state.compare;
+                if c.run.as_ref() == Some(&done.run_dir) {
                     self.state.compare.run = None;
+                } else if let (Some(a), Some(b)) = (c.a.clone(), c.b.clone()) {
+                    if a.run() == done.run_dir || b.run() == done.run_dir {
+                        self.start_compare(a, b);
+                    }
                 }
             }
+            // a failed or cancelled restore wrote its corrections back: show them again
+            (None, Some(Action::RestoreHistory { run, .. })) => self.reload_run(&run),
             (Some(JobOutput::Map(done)), _) => {
                 self.state.selection = Selection::Map(done.dir.clone());
                 self.load_best_of_map(&done.dir);

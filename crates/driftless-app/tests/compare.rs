@@ -3,18 +3,20 @@
 //! history in the tree, restoring a state (a new state, the old ones stay), the error of
 //! trajectories without common times, and two `map.json` side by side.
 
-use driftless_app::overlay::{RunOverlay, COMPARE_COLOR};
-use driftless_app::project::canonical;
+use driftless_app::overlay::{RunOverlay, COMPARE_B_COLOR, COMPARE_COLOR};
+use driftless_app::project::{canonical, Project, RunInfo};
 use driftless_app::ui::compare::{
-    compare_maps, compare_refs, default_refs, map_rows, refs_of_scan, report_rows, TrajRef,
+    compare_maps, compare_refs, default_refs, highlighted, map_rows, refs_of_scan, report_rows,
+    TrajRef,
 };
 use driftless_app::ui::{actions, text, Action, DriftlessApp, Selection, UiMessage, ViewSettings};
+use driftless_io::progress::Progress;
 use driftless_io::testscan::{room_bag_secs, tmp};
 use driftless_slam::Corrections;
 use driftless_steps::compare::compare;
 use driftless_steps::correct;
 use driftless_steps::history::{self, HistoryKind};
-use driftless_steps::slam::CORRECTIONS_FILE;
+use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings, CORRECTIONS_FILE};
 use driftless_traj::nalgebra::Vector3;
 use driftless_traj::{read_tum, write_tum};
 use eframe::egui::accesskit::Role;
@@ -195,6 +197,19 @@ fn odometry_vs_current_default_without_previous() {
         .filter(|v| v.rgba & 0xff_ffff == rgb(COMPARE_COLOR))
         .count();
     assert_eq!(orange, 2 * (report.poses.a - 1));
+    // B in one neutral colour instead of the quality colours, with the legend
+    let neutral = lines
+        .iter()
+        .filter(|v| v.rgba & 0xff_ffff == rgb(COMPARE_B_COLOR))
+        .count();
+    assert_eq!(neutral, 2 * (report.poses.b - 1));
+    assert_eq!(
+        o.compare_legend,
+        Some([
+            text::legend("A", "SLAM 001 Odometrie"),
+            text::legend("B", "SLAM 001 aktuell")
+        ])
+    );
     let off = ViewSettings {
         show_compare: false,
         ..ViewSettings::default()
@@ -203,7 +218,8 @@ fn odometry_vs_current_default_without_previous() {
         .lines(&off, &[])
         .0
         .iter()
-        .all(|v| v.rgba & 0xff_ffff != rgb(COMPARE_COLOR)));
+        .all(|v| v.rgba & 0xff_ffff != rgb(COMPARE_COLOR)
+            && v.rgba & 0xff_ffff != rgb(COMPARE_B_COLOR)));
 }
 
 fn rgb(c: [u8; 3]) -> u32 {
@@ -276,11 +292,37 @@ fn history_refs_resolve() {
     let info = &scan.runs[0];
     assert_eq!(
         default_refs(info),
-        (
+        Some((
             TrajRef::Previous(run.clone()),
             TrajRef::Current(run.clone())
-        )
+        ))
     );
+    // without traj.vorher.tum and traj_odom.tum: the state before the last
+    let bare = RunInfo {
+        has_previous: false,
+        has_odometry: false,
+        ..info.clone()
+    };
+    assert_eq!(
+        default_refs(&bare),
+        Some((
+            TrajRef::History {
+                run: run.clone(),
+                nr: 1
+            },
+            TrajRef::Current(run.clone())
+        ))
+    );
+    let single = RunInfo {
+        history: info.history[..1].to_vec(),
+        ..bare.clone()
+    };
+    assert_eq!(default_refs(&single), None);
+    let none = RunInfo {
+        has_result: false,
+        ..info.clone()
+    };
+    assert_eq!(default_refs(&none), None);
 
     // the states in the tree, with kind and start↔end gap of their slam.json
     let mut h = harness(app);
@@ -289,7 +331,7 @@ fn history_refs_resolve() {
     h.step();
     h.step();
     for e in history::list(&run) {
-        let gap = info.history_gaps.get(&e.nr).copied();
+        let gap = h.state().state().history_gaps.get(&e.dir).copied();
         assert!(gap.is_some(), "Start↔Ende of state {}", e.nr);
         h.get_by_label(&text::history_entry(&e, gap));
     }
@@ -478,6 +520,11 @@ fn map_rows_side_by_side() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("nicht lesbar"), "{err}");
+    // runtimes always differ: not highlighted; real differences are
+    assert!(highlighted(text::SMOOTH, "an", "aus"));
+    assert!(!highlighted(text::GHOSTS, "an", "an"));
+    let total = row(text::MAP_SECONDS_TOTAL);
+    assert!(!highlighted(&total.0, "338,0 s", "12,0 s"));
     // nothing at all: every value „–“
     let empty = map_rows(&json!({}), &json!(null));
     assert_eq!(empty.len(), rows.len());
@@ -502,4 +549,177 @@ fn overlay_compare_follows_origin() {
     assert!((f64::from(rel[2]) - (p.z - 3.0)).abs() < 1e-4);
     o.set_comparison(None);
     assert!(o.compare.is_empty() && o.compare_positions.is_empty());
+}
+
+/// The files of `dir` and their bytes (`verlauf/` included).
+fn files(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                todo.push(p);
+            } else {
+                out.insert(p.clone(), fs::read(&p).unwrap());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn failed_restore_writes_the_corrections_back() {
+    let (mut app, run) = app_with_run(&tmp("vergleich-rueckschreiben"));
+    correct::add_loop_at(&run, 1.0, 11.0, "Treppe", ADDED).unwrap();
+    app.apply(Action::Reuse(run.clone()));
+    settle(&mut app);
+    let before = fs::read(run.join(CORRECTIONS_FILE)).unwrap();
+    // the recompute after the switches were restored fails: a broken submaps.bin
+    fs::write(run.join("submaps.bin"), b"kaputt").unwrap();
+    app.apply(Action::RestoreHistory {
+        run: run.clone(),
+        nr: 1,
+    });
+    settle(&mut app);
+    let errors = errors(&app);
+    assert!(
+        errors.iter().any(|e| e.starts_with(text::STEP_RESTORE)),
+        "{errors:?}"
+    );
+    assert_eq!(fs::read(run.join(CORRECTIONS_FILE)).unwrap(), before);
+    assert_eq!(history::list(&run).len(), 2, "no new state");
+    // the panel shows the file as it is on disk again
+    let shown = app.state().correct.corrections.clone().unwrap().unwrap();
+    assert_eq!(shown, correct::load(&run).unwrap());
+    assert!(shown.loops[0].enabled);
+}
+
+/// A project with the scan `halle` and a run made by `driftless slam` (no history) with
+/// `settings`, added to the scan.
+fn app_with_cli_run(dir: &Path, settings: SlamSettings) -> (DriftlessApp, PathBuf) {
+    let scan = dir.join("halle");
+    fs::create_dir_all(&scan).unwrap();
+    room_bag_secs(&scan, true, 12.0);
+    let out = dir.join("cli-lauf");
+    let req = SlamRequest {
+        scan: scan.clone(),
+        out: out.clone(),
+        settings,
+        reuse: false,
+        history: false,
+    };
+    run_slam(&req, &Progress::new()).unwrap();
+    let mut p = Project::create(&dir.join("projekt"), "Halle").unwrap();
+    let id = p.add_scan(&scan).unwrap();
+    p.add_run(&id, &out).unwrap();
+    p.save().unwrap();
+    let mut app = DriftlessApp::new(Arc::new(|| {}));
+    app.apply(Action::OpenProject(dir.join("projekt")));
+    let out = canonical(&out).unwrap();
+    app.apply(Action::Select(Selection::Run(out.clone())));
+    settle(&mut app);
+    (app, out)
+}
+
+#[test]
+fn restore_imported_state_of_a_cli_run() {
+    let (mut app, run) = app_with_cli_run(&tmp("vergleich-cli"), SlamSettings::default());
+    let cli_traj = fs::read(run.join("traj.tum")).unwrap();
+    // added after the run was computed: not part of the state kept as „übernommen“
+    correct::add_loop_at(&run, 1.0, 11.0, "", "2099-01-01T00:00:00Z").unwrap();
+    app.apply(Action::Reuse(run.clone()));
+    settle(&mut app);
+    assert_eq!(errors(&app), Vec::<String>::new());
+    let states = history::list(&run);
+    assert_eq!(
+        states.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        vec![HistoryKind::Imported, HistoryKind::Reuse]
+    );
+    assert_eq!(
+        fs::read(run.join("verlauf/001/traj.tum")).unwrap(),
+        cli_traj
+    );
+
+    app.apply(Action::RestoreHistory {
+        run: run.clone(),
+        nr: 1,
+    });
+    settle(&mut app);
+    assert_eq!(errors(&app), Vec::<String>::new());
+    assert!(!correct::load(&run).unwrap().loops[0].enabled);
+    assert_eq!(history::list(&run).len(), 3);
+    assert_eq!(
+        fs::read(run.join("verlauf/003/traj.tum")).unwrap(),
+        cli_traj
+    );
+    assert_eq!(fs::read(run.join("traj.tum")).unwrap(), cli_traj);
+}
+
+#[test]
+fn restore_of_a_cli_run_with_other_settings_changes_nothing() {
+    let settings = SlamSettings {
+        lidar_topic: Some("/lidar".into()),
+        ..SlamSettings::default()
+    };
+    let (mut app, run) = app_with_cli_run(&tmp("vergleich-cli-andere"), settings);
+    correct::add_loop_at(&run, 1.0, 11.0, "", ADDED).unwrap();
+    // a state kept earlier (as a reuse with these settings on the command line would)
+    history::record(&run, HistoryKind::Imported, 0.0).unwrap();
+    correct::set_enabled(&run, 1, false).unwrap();
+    app.state_mut().refresh();
+    let before = files(&run);
+    app.apply(Action::RestoreHistory {
+        run: run.clone(),
+        nr: 1,
+    });
+    settle(&mut app);
+    let errors = errors(&app);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("Lauf wurde mit anderen Einstellungen gerechnet")),
+        "{errors:?}"
+    );
+    assert_eq!(files(&run), before, "nothing changed on disk");
+}
+
+#[test]
+fn comparison_follows_a_recomputed_run() {
+    let (mut app, one) = app_with_run(&tmp("vergleich-zwei-laeufe"));
+    app.apply(Action::RunSlam("halle".into()));
+    settle(&mut app);
+    let two = one.with_file_name("slam-002");
+    assert_eq!(app.state().selection, Selection::Run(two.clone()));
+    app.apply(Action::Compare {
+        a: TrajRef::Current(one.clone()),
+        b: TrajRef::Current(two.clone()),
+    });
+    settle(&mut app);
+    assert!(app.state().compare.current().is_some());
+    // recompute the other run: the numbers shown are of the files as they are now
+    correct::add_loop_at(&one, 1.0, 11.0, "", ADDED).unwrap();
+    app.apply(Action::Reuse(one.clone()));
+    settle(&mut app);
+    let c = app.state().compare.current().expect("compared again");
+    assert_eq!(
+        c.report,
+        cli_report(&c.a.path(), &c.b.path()),
+        "{} / {}",
+        c.a.label(),
+        c.b.label()
+    );
+    assert!(c.a.run() == one || c.b.run() == one);
+}
+
+#[test]
+fn history_times_are_local() {
+    let created = "2026-10-21T14:03:12Z";
+    let local = chrono::DateTime::parse_from_rfc3339(created)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%d.%m.%Y %H:%M")
+        .to_string();
+    assert_eq!(text::stamp(created), local);
+    assert_eq!(text::stamp("kaputt"), "kaputt");
 }

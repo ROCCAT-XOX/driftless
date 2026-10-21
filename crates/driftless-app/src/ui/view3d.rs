@@ -19,7 +19,7 @@ use crate::camera::{fly_motion, Camera, CameraMode, FlyKeys, ZOOM_FACTOR};
 use crate::cloud::LoadedCloud;
 use crate::lod::{select_nodes, Octree, PointVertex};
 use crate::overlay::RunOverlay;
-use crate::overlay::PICK_COLOR;
+use crate::overlay::{COMPARE_B_COLOR, COMPARE_COLOR, PICK_COLOR};
 use crate::pick::{pick_point_in, project, to_physical};
 use crate::render::{ColorMode, FrameParams, PointRenderer, RenderTarget, NO_CUT};
 use eframe::egui::{self, Color32, Key, PointerButton, Rect, Sense, Ui};
@@ -95,6 +95,28 @@ struct OverlayKey {
     layers: [bool; 6],
     places: [Option<usize>; 2],
     picked: Option<u32>,
+}
+
+/// The legend of a comparison drawn over the run, in the upper right corner: „A: …“ in the
+/// colour of A, „B: …“ in that of B.
+fn paint_legend(painter: &egui::Painter, rect: Rect, run: &RunOverlay, font: egui::FontId) {
+    let Some(names) = run
+        .compare_legend
+        .as_ref()
+        .filter(|_| !run.compare.is_empty())
+    else {
+        return;
+    };
+    let mut y = rect.top() + 6.0;
+    for (name, [r, g, b]) in names.iter().zip([COMPARE_COLOR, COMPARE_B_COLOR]) {
+        let color = Color32::from_rgb(r, g, b);
+        let galley = painter.layout_no_wrap(name.clone(), font.clone(), color);
+        let at = egui::pos2(rect.right() - 8.0 - galley.size().x, y);
+        let back = Rect::from_min_size(at, galley.size()).expand(3.0);
+        painter.rect_filled(back, 3.0, Color32::from_black_alpha(200));
+        y = back.bottom() + 4.0;
+        painter.galley(at, galley, color);
+    }
 }
 
 /// The size of the offscreen image for a panel of `panel_points` at `ppp` pixels per
@@ -489,6 +511,9 @@ impl View3d {
         );
         if let Some(o) = overlay {
             let body = egui::TextStyle::Body.resolve(ui.style());
+            if settings.show_compare {
+                paint_legend(&painter, rect, o.run, body.clone());
+            }
             let hover = response.hover_pos();
             self.paint_places(&painter, rect, ppp, viewport, o, settings, hover, body);
         }

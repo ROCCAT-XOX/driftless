@@ -485,15 +485,20 @@ pub fn compare_not_drawn(run: &str) -> String {
     format!("Die orange Laufbahn A erscheint in der Ansicht von {run}")
 }
 
-/// „2026-10-21 14:03 UTC“ from an RFC 3339 time in UTC; other text unchanged.
+/// „21.10.2026 16:03“: an RFC 3339 time in the local time of this computer; other text
+/// unchanged.
 pub fn stamp(created: &str) -> String {
-    match (created.get(..10), created.get(11..16)) {
-        (Some(day), Some(time)) if created.ends_with('Z') => format!("{day} {time} UTC"),
-        _ => created.to_string(),
-    }
+    chrono::DateTime::parse_from_rfc3339(created.trim()).map_or_else(
+        |_| created.to_string(),
+        |t| {
+            t.with_timezone(&chrono::Local)
+                .format("%d.%m.%Y %H:%M")
+                .to_string()
+        },
+    )
 }
 
-/// A state of the history in the tree: „Stand 003 · neu gerechnet · 2026-10-21 14:03 UTC ·
+/// A state of the history in the tree: „Stand 003 · neu gerechnet · 21.10.2026 16:03 ·
 /// Start↔Ende 0,123 m“ (without the gap if `slam.json` could not be read).
 pub fn history_entry(e: &driftless_steps::history::HistoryEntry, gap: Option<f64>) -> String {
     let mut s = format!(
@@ -506,4 +511,10 @@ pub fn history_entry(e: &driftless_steps::history::HistoryEntry, gap: Option<f64
         s.push_str(&format!(" · Start↔Ende {}", compare_metres(g)));
     }
     s
+}
+pub const HISTORY_GAPS_JOB: &str = "Verlauf lesen";
+
+/// The legend of a comparison in the view: „A: SLAM 001 Odometrie“.
+pub fn legend(which: &str, name: &str) -> String {
+    format!("{which}: {name}")
 }

@@ -28,7 +28,6 @@ fn run(has_cache: bool, maps: Vec<MapInfo>) -> RunInfo {
         cloud: None,
         maps,
         history: Vec::new(),
-        history_gaps: Default::default(),
     }
 }
 

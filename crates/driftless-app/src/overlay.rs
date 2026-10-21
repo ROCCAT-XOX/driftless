@@ -13,6 +13,7 @@ use crate::lod::PointVertex;
 use crate::pick::{pick_poses, relative_to};
 use crate::render::LineVertex;
 use crate::ui::compare::Comparison;
+use crate::ui::text;
 use crate::ui::ViewSettings;
 use driftless_slam::SlamReport;
 use driftless_steps::overlay::{
@@ -40,6 +41,9 @@ pub const COMPARE_WIDTH: f32 = 2.0;
 /// Colour of the trajectory A of a comparison (apart from the quality colours and the
 /// odometry).
 pub const COMPARE_COLOR: [u8; 3] = [255, 140, 0];
+/// Colour of the trajectory B (this run's) while a comparison is drawn: one neutral blue-grey
+/// instead of the quality colours, apart from the orange A and the cyan odometry.
+pub const COMPARE_B_COLOR: [u8; 3] = [165, 175, 240];
 /// Opacity of a rejected candidate (of 255).
 pub const REJECTED_ALPHA: u8 = 64;
 
@@ -65,6 +69,11 @@ pub struct RunOverlay {
     pub compare: Vec<Pose>,
     /// The same, relative to [`RunOverlay::origin`].
     pub compare_positions: Vec<[f32; 3]>,
+    /// The trajectory B of that comparison (one of this run's) and its positions.
+    pub compare_b: Vec<Pose>,
+    pub compare_b_positions: Vec<[f32; 3]>,
+    /// The legend of the comparison drawn: „A: …“ and „B: …“.
+    pub compare_legend: Option<[String; 2]>,
 }
 
 /// The first pose in whole metres: the origin without a cloud.
@@ -98,6 +107,9 @@ impl RunOverlay {
             report: track.report,
             compare: Vec::new(),
             compare_positions: Vec::new(),
+            compare_b: Vec::new(),
+            compare_b_positions: Vec::new(),
+            compare_legend: None,
         };
         overlay.set_origin(origin);
         Ok(overlay)
@@ -116,11 +128,18 @@ impl RunOverlay {
         self.positions = rel(&self.poses);
         self.odometry_positions = rel(&self.odometry);
         self.compare_positions = rel(&self.compare);
+        self.compare_b_positions = rel(&self.compare_b);
     }
 
-    /// Draws the trajectory A of `comparison` moved onto B with its alignment (nothing with
-    /// `None`).
+    /// Draws the trajectory A of `comparison` moved onto B with its alignment, and B (one of
+    /// this run's) in [`COMPARE_B_COLOR`] instead of the quality colours (nothing with `None`).
     pub fn set_comparison(&mut self, comparison: Option<&Comparison>) {
+        self.compare_legend = comparison.map(|c| {
+            [
+                text::legend(text::PLACE_A_SHORT, &c.a.label()),
+                text::legend(text::PLACE_B_SHORT, &c.b.label()),
+            ]
+        });
         self.compare = comparison.map_or_else(Vec::new, |c| {
             c.a_poses
                 .iter()
@@ -131,11 +150,8 @@ impl RunOverlay {
                 })
                 .collect()
         });
-        self.compare_positions = self
-            .compare
-            .iter()
-            .map(|p| relative_to(self.origin, [p.p.x, p.p.y, p.p.z]))
-            .collect();
+        self.compare_b = comparison.map_or_else(Vec::new, |c| c.b_poses.clone());
+        self.set_origin(Some(self.origin));
     }
 
     /// Seconds since the start of the scan of pose `pose` (as `driftless correct` takes them).
@@ -203,7 +219,8 @@ impl RunOverlay {
     }
 
     /// What the view draws of the run with the layers of `settings`: line segments (pairs of
-    /// vertices) of the trajectory per submap in its quality colour, of the odometry, of the
+    /// vertices) of the trajectory per submap in its quality colour (while a comparison is
+    /// drawn instead its B in one neutral colour), of the odometry, of the
     /// trajectory A of the comparison, of the accepted and manual loops and of the rejected
     /// candidates (faint); markers of the submap anchors, then of the picked poses `picks`
     /// (large, on a dark ring, always shown, unknown indices skipped).
@@ -226,7 +243,12 @@ impl RunOverlay {
                 width,
             });
         };
-        if settings.show_trajectory {
+        let comparing = settings.show_compare && !self.compare.is_empty();
+        if settings.show_trajectory && comparing {
+            for w in self.compare_b_positions.windows(2) {
+                segment(w[0], w[1], COMPARE_B_COLOR, 0xff, TRAJECTORY_WIDTH);
+            }
+        } else if settings.show_trajectory {
             for (group, submap) in trajectory_groups(&self.report, &self.poses) {
                 let c = quality_color(self.report.submaps[submap].quality);
                 for w in group.windows(2) {

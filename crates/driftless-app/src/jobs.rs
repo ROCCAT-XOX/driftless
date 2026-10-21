@@ -49,6 +49,8 @@ pub enum JobOutput {
     Cloud(Box<LoadedCloud>),
     /// The status of every map folder of the tree (helper runner).
     MapStatus(Box<BTreeMap<PathBuf, MapStatus>>),
+    /// The start↔end gaps of history states, by state folder (helper runner).
+    HistoryGaps(Box<BTreeMap<PathBuf, f64>>),
     /// The overlay and the corrections of a run (helper runner).
     Run(Box<RunLoaded>),
     /// `corrections.toml` after a change (helper runner).

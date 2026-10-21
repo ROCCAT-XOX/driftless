@@ -5,9 +5,9 @@
 
 use super::{text, Action, AppState};
 use crate::jobs::{JobOutput, JobRunner};
-use crate::project::{run_map_job, run_slam_job, ScanState, SlamJob};
+use crate::project::{restore_job, run_map_job, run_slam_job, ScanState, SlamJob};
+use driftless_steps::inspect;
 use driftless_steps::map::MapStep;
-use driftless_steps::{history, inspect};
 
 /// Starts the job of a step action (`Inspect`, `RunSlam`, `Reuse`, `RestoreHistory`,
 /// `RunMap`) and records it in [`AppState::step`]. Refused with a German message while a job
@@ -77,8 +77,7 @@ pub fn start_step(
             let nr = *nr;
             runner.start(text::STEP_RESTORE, move |p| {
                 // in the job: the recompute reads the switches just written
-                history::restore_flags(&run.dir, nr)?;
-                let done = run_slam_job(&project, &scan_id, &SlamJob::Reuse(run), p)?;
+                let done = restore_job(&project, &scan_id, &run, nr, p)?;
                 Ok(JobOutput::Slam(Box::new(done)))
             })
         }
