@@ -4,7 +4,7 @@ Open-source desktop software for processing handheld LiDAR scans — drift-corre
 correctable by hand. Runs natively on **macOS (Apple Silicon)** and **Windows**.
 
 > Status: early development, command line only. Milestone 4 done: a 9.7-minute scan with 3,831 images
-> maps in about 6 minutes with under 4 GB peak memory (was 9.9 GB); thinner walls, points seen through
+> maps in about 7 minutes with under 4 GB peak memory (was 9.9 GB); thinner walls, points seen through
 > windows removed, fewer colour seams, image sharpness no longer favours dark images. Lamp reflections on
 > floors are only reduced with the experimental `--highlights`. Earlier: dense, cleaned and coloured map
 > (milestone 3), LiDAR-IMU odometry and SLAM with loop closure and manual corrections (milestone 2).
