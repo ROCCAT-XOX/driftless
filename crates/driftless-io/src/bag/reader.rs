@@ -244,6 +244,51 @@ impl<R: Read + Seek> BagReader<R> {
         Ok(())
     }
 
+    /// Number of messages on `topic`, from the chunk infos of the index (no chunk is read).
+    /// `Some(0)` for a topic the bag does not have; `None` if the bag has no index or the
+    /// index is damaged.
+    pub fn message_count(&mut self, topic: &str) -> Option<u64> {
+        if self.index_pos == 0 || self.index_pos >= self.file_len {
+            return None;
+        }
+        let ids: Vec<u32> = self
+            .conns
+            .iter()
+            .filter(|c| c.topic == topic)
+            .map(|c| c.id)
+            .collect();
+        self.count_from_index(&ids).ok()
+    }
+
+    fn count_from_index(&mut self, ids: &[u32]) -> Result<u64, BagError> {
+        let damaged = || BagError::Malformed("chunk info exceeds record".into());
+        let mut pos = self.index_pos;
+        let mut total = 0u64;
+        self.r.seek(SeekFrom::Start(pos))?;
+        while let Next::Record(head) = read_head(&mut self.r, pos, self.file_len)? {
+            let next = head.data_pos + head.data_len;
+            if head.fields.op()? == OP_CHUNK_INFO {
+                let entries = head.fields.u32("count")? as usize;
+                let mut data = vec![0u8; head.data_len as usize];
+                self.r.read_exact(&mut data)?;
+                if entries.checked_mul(8).is_none_or(|n| n > data.len()) {
+                    return Err(damaged());
+                }
+                for e in 0..entries {
+                    let conn = read_u32(&data, e * 8).ok_or_else(damaged)?;
+                    let count = read_u32(&data, e * 8 + 4).ok_or_else(damaged)?;
+                    if ids.contains(&conn) {
+                        total += u64::from(count);
+                    }
+                }
+            } else {
+                self.r.seek(SeekFrom::Start(next))?;
+            }
+            pos = next;
+        }
+        Ok(total)
+    }
+
     /// Fallback for unindexed/damaged bags: collect connections by walking all chunks.
     fn scan_connections(&mut self) {
         let mut it = Messages::new(self, None);

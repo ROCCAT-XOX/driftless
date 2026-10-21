@@ -5,9 +5,10 @@
 mod common;
 
 use common::*;
+use driftless_io::progress::Progress;
 use driftless_map::{
-    colorize, ColorCamera, ColorConfig, ColorStats, ExposureConfig, ImageSource, MapError,
-    Vignetting,
+    colorize, colorize_with, ColorCamera, ColorConfig, ColorStats, ExposureConfig, ImageSource,
+    MapError, Vignetting,
 };
 use driftless_traj::nalgebra::{Isometry3, UnitQuaternion, Vector3};
 
@@ -269,6 +270,90 @@ fn colorize_is_deterministic() {
     assert_eq!(sa, sb);
     assert_eq!(a.rgb, b.rgb);
     assert_eq!(a.colored, b.colored);
+}
+
+#[test]
+fn colorize_with_matches_colorize() {
+    let (painted, images, poses, cams) = walk_data();
+    let cfg = ColorConfig::default();
+    let mut a = surface_cloud(painted);
+    let sa = colorize(&mut a, images.clone(), poses, cams, &cfg).unwrap();
+    let mut b = surface_cloud(painted);
+    let sb = colorize_with(&mut b, images.clone(), poses, cams, &cfg, &Progress::new()).unwrap();
+    assert_eq!(sa, sb);
+    assert_eq!(a.rgb, b.rgb);
+    assert_eq!(a.colored, b.colored);
+}
+
+#[test]
+fn colorize_cancelled_returns_cancelled() {
+    let (painted, images, poses, cams) = walk_data();
+    let cfg = ColorConfig::default();
+    let before = surface_cloud(painted);
+
+    let p = Progress::new();
+    p.cancel();
+    let mut cloud = before.clone();
+    let r = colorize_with(&mut cloud, images.clone(), poses, cams, &cfg, &p);
+    assert!(matches!(r, Err(MapError::Cancelled)), "{r:?}");
+    assert_eq!(cloud, before);
+
+    // Cancelled in the middle of the colouring pass.
+    for phase in ["Bilder prüfen", "Einfärben"] {
+        let p = Progress::new();
+        let q = p.clone();
+        let p = p.with_observer(move |s| {
+            if s.phase == phase && s.done == 3 {
+                q.cancel();
+            }
+        });
+        let mut cloud = before.clone();
+        let r = colorize_with(&mut cloud, images.clone(), poses, cams, &cfg, &p);
+        assert!(matches!(r, Err(MapError::Cancelled)), "{phase}: {r:?}");
+        assert_eq!(cloud, before, "{phase}");
+        assert_eq!(p.snapshot().phase, phase);
+        assert_eq!(p.snapshot().done, 3, "{phase}: stops at the next image");
+    }
+    assert_eq!(MapError::Cancelled.to_string(), "abgebrochen");
+}
+
+#[test]
+fn colorize_reports_images() {
+    let (painted, images, poses, cams) = walk_data();
+    let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = phases.clone();
+    let p = Progress::new().with_observer(move |s| {
+        let mut v = seen.lock().unwrap();
+        if v.last().is_none_or(|(name, _)| *name != s.phase) {
+            v.push((s.phase.clone(), s.total));
+        }
+    });
+    let mut cloud = surface_cloud(painted);
+    let stats = colorize_with(
+        &mut cloud,
+        images.clone(),
+        poses,
+        cams,
+        &ColorConfig::default(),
+        &p,
+    )
+    .unwrap();
+    let images_total = (stats.images_used
+        + stats.images_blurry
+        + stats.images_outside_trajectory
+        + stats.images_bad) as u64;
+    let phases = phases.lock().unwrap().clone();
+    assert_eq!(
+        phases,
+        vec![
+            ("Bilder prüfen".to_string(), Some(images_total)),
+            ("Einfärben".to_string(), phases[1].1),
+        ]
+    );
+    let end = p.snapshot();
+    assert_eq!(end.phase, "Einfärben");
+    assert!(end.done > 0);
+    assert_eq!(Some(end.done), end.total);
 }
 
 #[test]

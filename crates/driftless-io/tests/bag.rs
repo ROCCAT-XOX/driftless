@@ -197,3 +197,38 @@ fn cut_at_chunk_boundary_before_index_is_truncated() {
         );
     }
 }
+
+/// Bag with 7 messages on `/lidar` and 3 on `/imu`, 2 messages per chunk.
+fn counted_bag(indexed: bool) -> Vec<u8> {
+    let mut w = BagWriter::new(Compression::Lz4)
+        .indexed(indexed)
+        .messages_per_chunk(2);
+    let lidar = w.add_connection("/lidar", "sensor_msgs/PointCloud2");
+    let imu = w.add_connection("/imu", "sensor_msgs/Imu");
+    for i in 0..10u32 {
+        let conn = if i % 3 == 1 { imu } else { lidar };
+        w.write_message(conn, Time { sec: i, nsec: 0 }, &payload(i));
+    }
+    w.finish()
+}
+
+#[test]
+fn message_count_from_index() {
+    let mut r = BagReader::new(Cursor::new(counted_bag(true))).unwrap();
+    assert_eq!(r.message_count("/lidar"), Some(7));
+    assert_eq!(r.message_count("/imu"), Some(3));
+    assert_eq!(r.message_count("/kamera"), Some(0));
+    // Counting leaves the reader usable.
+    assert_eq!(r.messages(&["/imu"]).count(), 3);
+}
+
+#[test]
+fn message_count_unindexed_is_none() {
+    let mut r = BagReader::new(Cursor::new(counted_bag(false))).unwrap();
+    assert_eq!(r.message_count("/lidar"), None);
+    // Cut inside the index: the header points into it, the chunk infos are incomplete.
+    let mut bytes = counted_bag(true);
+    bytes.truncate(bytes.len() - 10);
+    let mut r = BagReader::new(Cursor::new(bytes)).unwrap();
+    assert_eq!(r.message_count("/lidar"), None);
+}

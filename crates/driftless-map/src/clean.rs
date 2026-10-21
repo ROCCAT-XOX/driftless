@@ -27,6 +27,7 @@
 
 use crate::smooth::{smooth_surfaces, SmoothConfig, SmoothStats};
 use crate::{Cloud, MapError, RaySource};
+use driftless_io::progress::Progress;
 use driftless_odom::voxel_map::{voxel_key, FixedState, VoxelKey};
 use kiddo::{ImmutableKdTree, SquaredEuclidean};
 use nalgebra::{Matrix3, Vector3};
@@ -472,6 +473,29 @@ pub fn clean(
     rays: &RaySource,
     cfg: &CleanConfig,
 ) -> Result<(Cloud, Cloud, Vec<RemovalReason>, CleanStats), MapError> {
+    clean_with(cloud, rays, cfg, &Progress::new())
+}
+
+/// [`clean`] with progress: one phase per enabled part („Geister“, „Durchblick“,
+/// „Ausreißer“, „Glätten“). Checks `progress` for a cancel before and after every part and
+/// returns [`MapError::Cancelled`].
+///
+/// # Panics
+/// As [`clean`].
+pub fn clean_with(
+    cloud: Cloud,
+    rays: &RaySource,
+    cfg: &CleanConfig,
+    progress: &Progress,
+) -> Result<(Cloud, Cloud, Vec<RemovalReason>, CleanStats), MapError> {
+    let check = || {
+        if progress.is_cancelled() {
+            Err(MapError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
     cfg.check()?;
     let n = cloud.len();
     let mut reason: Vec<Option<RemovalReason>> = vec![None; n];
@@ -486,16 +510,21 @@ pub fn clean(
             }
         };
         if cfg.ghosts {
+            progress.phase("Geister", None);
             mark(ghost_flags(&grid, rays, cfg), RemovalReason::Ghost);
+            check()?;
         }
         if cfg.through {
+            progress.phase("Durchblick", None);
             mark(
                 crate::through::through_flags(&grid, &cloud, rays, cfg),
                 RemovalReason::Through,
             );
+            check()?;
         }
     }
     if cfg.outliers {
+        progress.phase("Ausreißer", None);
         let rest: Vec<usize> = (0..n).filter(|&i| reason[i].is_none()).collect();
         let xyz: Vec<[f32; 3]> = rest.iter().map(|&i| cloud.xyz[i]).collect();
         for (&i, out) in rest
@@ -506,6 +535,7 @@ pub fn clean(
                 reason[i] = Some(RemovalReason::Outlier);
             }
         }
+        check()?;
     }
     let keep: Vec<bool> = reason.iter().map(Option::is_none).collect();
     let reasons: Vec<RemovalReason> = reason.iter().flatten().copied().collect();
@@ -513,7 +543,9 @@ pub fn clean(
     let (mut kept, removed) = cloud.select(&keep);
     drop(cloud);
     let smooth = if cfg.smooth.enabled {
+        progress.phase("Glätten", None);
         let (xyz, s) = smooth_surfaces(&kept.xyz, &cfg.smooth);
+        check()?;
         kept.xyz = xyz;
         s
     } else {
