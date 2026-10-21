@@ -154,13 +154,14 @@ impl FullRun {
         let x = &self.color;
         println!(
             "{name}: SLAM {s:.1} s, dense {d:.1} s, clean {c:.1} s, colour {k:.1} s, total \
-             {:.1} s; {} dense points, {} kept, {} ghosts, {} outliers; {:.1} % coloured, \
+             {:.1} s; {} dense points, {} kept, {} ghosts, {} through, {} outliers; {:.1} % coloured, \
              images {} used / {} blurry; gains {:.2}…{:.2}; spread {:.2} → {:.2}, camera \
              difference {:.2} → {:.2} ({} points), image offset {:.2} → {:.2} (sRGB)",
             self.total_seconds(),
             self.dense_points,
             self.clean.kept,
             self.clean.ghosts,
+            self.clean.through,
             self.clean.outliers,
             100.0 * self.colored_share(),
             x.images_used,
@@ -421,10 +422,11 @@ fn jmk6_scan_143623_clean() {
     let clean_s = start.elapsed().as_secs_f64();
     println!(
         "143623: clean {clean_s:.1} s; {points} points, {} rays -> {} kept, {} ghosts, {} \
-         outliers",
+         through, {} outliers",
         rays.ends.len(),
         stats.kept,
         stats.ghosts,
+        stats.through,
         stats.outliers,
     );
     let out = std::env::temp_dir().join(format!("driftless-map-clean-{}", std::process::id()));

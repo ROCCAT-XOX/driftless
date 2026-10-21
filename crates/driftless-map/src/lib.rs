@@ -3,7 +3,8 @@
 //! [`build_dense`] runs the (deterministic) odometry again over the same frames, so every
 //! deskewed sweep comes back in the body frame, and places it with the SLAM-corrected pose of
 //! that frame. One point is kept per voxel: the one seen from closest, since near points are
-//! the most accurate. [`clean`] removes ghosts (things that moved) and isolated outliers;
+//! the most accurate. [`clean`] removes ghosts (things that moved), points measured through windows and
+//! isolated outliers;
 //! [`colorize`] colours it from the camera images (visibility by depth buffer, image quality,
 //! exposure, white balance and edge falloff of the images, weighted blend of the best views);
 //! [`write_las`] and [`write_ply`] write the [`Cloud`]; [`save_stage`] and [`load_stage`] keep
@@ -17,6 +18,7 @@ mod export;
 mod exposure;
 mod sharpness;
 mod stage;
+mod through;
 pub mod visibility;
 
 pub use clean::{clean, find_ghosts, find_outliers, CleanConfig, CleanStats, RemovalReason};
@@ -31,6 +33,7 @@ pub use exposure::{
 };
 pub use sharpness::sharpness;
 pub use stage::{content_hash, load_stage, save_stage, StageError};
+pub use through::find_through;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MapError {

@@ -2,7 +2,7 @@
 //! in three steps, each with its own files in the SLAM output folder:
 //!
 //! - **dense**: dense cloud from the corrected `traj.tum` → `dense.las`, `dense.bin`
-//! - **clean**: ghosts and outliers removed → `clean.las`, `removed.las`, `clean.bin`
+//! - **clean**: ghosts, points seen through windows and outliers removed → `clean.las`, `removed.las`, `clean.bin`
 //! - **color**: coloured from the camera images → `color.las`, `color.ply`
 //!
 //! plus `map.json` (settings, statistics and runtimes of the steps, peak memory, and under
@@ -38,6 +38,11 @@ type BoxError = Box<dyn std::error::Error>;
 
 const DENSE_BIN: &str = "dense.bin";
 const CLEAN_BIN: &str = "clean.bin";
+/// Part of the clean step's input id: raised whenever the cleaning gives another result
+/// (or other files) for the same settings, so an older `clean.bin` / `removed.las` is
+/// rebuilt instead of reused. 2: removal reasons in `removed.las`, points seen through
+/// windows.
+const CLEAN_VERSION: u32 = 2;
 const REPORT: &str = "map.json";
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -234,7 +239,7 @@ fn dense_json(s: &DenseStats) -> Value {
 }
 
 fn clean_json(s: &CleanStats) -> Value {
-    json!({"kept": s.kept, "ghosts": s.ghosts, "outliers": s.outliers})
+    json!({"kept": s.kept, "ghosts": s.ghosts, "through": s.through, "outliers": s.outliers})
 }
 
 /// Warnings about a colour run that the user should see (German, without the "Warnung: ").
@@ -356,11 +361,14 @@ fn settings_json(
         "clean": {
             "ghosts": c.ghosts,
             "outliers": c.outliers,
+            "through": c.through,
             "ghost_voxel": c.ghost_voxel,
             "ghost_ratio": c.ghost_ratio,
             "min_passes": c.min_passes,
             "outlier_k": c.outlier_k,
             "outlier_sigma": c.outlier_sigma,
+            "window_reach": c.window_reach,
+            "through_beyond": c.through_beyond,
         },
         "color": {
             "downscale": k.downscale,
@@ -526,10 +534,11 @@ impl MapRun<'_> {
         save_stage(&self.path(CLEAN_BIN), &id, &kept, None)
             .map_err(|e| format!("{CLEAN_BIN} nicht schreibbar: {e}"))?;
         println!(
-            "Bereinigt: {} Punkte behalten, entfernt {} Geister und {} Ausreißer, {:.1} s → \
-             clean.las, removed.las",
+            "Bereinigt: {} Punkte behalten, entfernt {} Geister, {} Durchblick und {} \
+             Ausreißer, {:.1} s → clean.las, removed.las",
             stats.kept,
             stats.ghosts,
+            stats.through,
             stats.outliers,
             start.elapsed().as_secs_f64()
         );
@@ -702,7 +711,7 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
         content_hash(&traj_bytes),
         traj_bytes.len(),
     );
-    let clean_id = format!("{dense_id}clean {clean_cfg:?}\n");
+    let clean_id = format!("{dense_id}clean v{CLEAN_VERSION} {clean_cfg:?}\n");
     let color_id = color
         .as_ref()
         .ok()

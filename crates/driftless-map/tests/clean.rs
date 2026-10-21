@@ -150,6 +150,7 @@ fn moving_scan() -> (Cloud, RaySource) {
 fn only_ghosts() -> CleanConfig {
     CleanConfig {
         outliers: false,
+        through: false,
         ..CleanConfig::default()
     }
 }
@@ -352,11 +353,12 @@ fn removed_plus_kept_equals_input() {
         stats,
         CleanStats {
             ghosts: stats.ghosts,
+            through: stats.through,
             outliers: stats.outliers,
             kept: kept.len(),
         }
     );
-    assert_eq!(stats.ghosts + stats.outliers, removed.len());
+    assert_eq!(stats.ghosts + stats.through + stats.outliers, removed.len());
     assert_eq!(reasons.len(), removed.len());
     assert_eq!(
         reasons
@@ -383,14 +385,15 @@ fn removed_plus_kept_equals_input() {
     let off = CleanConfig {
         ghosts: false,
         outliers: false,
+        through: false,
         ..CleanConfig::default()
     };
     let (kept, removed, reasons, stats) = clean(cloud.clone(), &rays, &off).unwrap();
     assert_eq!(kept, cloud);
     assert!(removed.is_empty() && reasons.is_empty());
     assert_eq!(
-        (stats.ghosts, stats.outliers, stats.kept),
-        (0, 0, cloud.len())
+        (stats.ghosts, stats.through, stats.outliers, stats.kept),
+        (0, 0, 0, cloud.len())
     );
 
     // Ghosts only: the same ghosts as `find_ghosts`.

@@ -194,9 +194,10 @@ fn map_all_writes_outputs() {
     let dense = steps["dense"]["stats"]["points"].as_u64().unwrap();
     let kept = steps["clean"]["stats"]["kept"].as_u64().unwrap();
     let ghosts = steps["clean"]["stats"]["ghosts"].as_u64().unwrap();
+    let through = steps["clean"]["stats"]["through"].as_u64().unwrap();
     let outliers = steps["clean"]["stats"]["outliers"].as_u64().unwrap();
     assert!(dense > 1000, "{dense}");
-    assert_eq!(kept + ghosts + outliers, dense);
+    assert_eq!(kept + ghosts + through + outliers, dense);
     let color = &steps["color"]["stats"];
     assert_eq!(color["images_used"], IMAGES);
     assert!(color["points_colored"].as_u64().unwrap() > 100, "{color}");
@@ -206,6 +207,7 @@ fn map_all_writes_outputs() {
         assert_eq!(steps[s]["reused"], false, "{s}");
     }
     assert_eq!(json["settings"]["clean"]["ghosts"], true);
+    assert_eq!(json["settings"]["clean"]["through"], true);
     assert_eq!(json["settings"]["color"]["downscale"], 2);
     if cfg!(any(unix, windows)) {
         assert!(json["peak_rss_bytes"].as_u64().unwrap() > 1_000_000);
@@ -213,7 +215,7 @@ fn map_all_writes_outputs() {
 
     assert_eq!(las_points(&out.join("dense.las")).len() as u64, dense);
     let removed = las_points(&out.join("removed.las")).len() as u64;
-    assert_eq!(removed, ghosts + outliers);
+    assert_eq!(removed, ghosts + through + outliers);
     let points = las_points(&out.join("color.las"));
     assert_eq!(points.len() as u64, kept);
     // The plain +x wall in front of the camera has its colour.
