@@ -166,6 +166,7 @@ pub fn run_odometry_with(
             .unwrap_or_else(|| ImuState::at_rest(fp.t_start, start_rot));
         let motion = propagate(&start, &imu, &model, fp.t_end);
         let pred = motion[motion.len() - 1].clone();
+        let intensity: Vec<f32> = fp.points.iter().map(|tp| tp.intensity).collect();
         let body = if cfg.deskew {
             deskew(&fp.points, &motion, fp.t_end)
         } else {
@@ -222,6 +223,7 @@ pub fn run_odometry_with(
             pose: out_pose.clone(),
             quality: frame_quality,
             body_points: &body,
+            intensity: &intensity,
         });
         poses.push(out_pose);
         quality.push(frame_quality);

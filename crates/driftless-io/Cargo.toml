@@ -17,10 +17,13 @@ test-util = []
 [dependencies]
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+zune-jpeg = "0.5.15"
 
 [dev-dependencies]
 # Self dev-dependency: enables `test-util` for the integration tests in tests/.
 driftless-io = { path = ".", features = ["test-util"] }
+jpeg-encoder = "0.7.1"

@@ -12,6 +12,8 @@ pub const ABSOLUTE_TIME_THRESHOLD: f64 = 1.0;
 pub struct TimedPoint {
     pub p: Vector3<f64>,
     pub t: f64,
+    /// Intensity of the LiDAR return.
+    pub intensity: f32,
 }
 
 /// One sweep in the body frame with normalised point times.
@@ -75,6 +77,7 @@ pub fn frame_points(frame: &LidarFrame, lidar_to_imu: &Isometry3<f64>) -> FrameP
         points.push(TimedPoint {
             p: (lidar_to_imu * raw).coords,
             t,
+            intensity: lp.intensity,
         });
     }
     if points.is_empty() {

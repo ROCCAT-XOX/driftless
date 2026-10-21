@@ -70,4 +70,6 @@ pub struct FrameOutput<'a> {
     pub quality: FrameQuality,
     /// Deskewed points in the body frame at the frame end, before downsampling.
     pub body_points: &'a [Vector3<f64>],
+    /// Intensity of each entry of `body_points`.
+    pub intensity: &'a [f32],
 }

@@ -1069,14 +1069,20 @@ dependencies = [
  "assert_cmd",
  "clap",
  "driftless-io",
+ "driftless-map",
  "driftless-odom",
  "driftless-slam",
  "driftless-traj",
+ "jpeg-encoder",
  "las",
+ "libc",
+ "png",
  "predicates",
+ "rayon",
  "rerun",
  "serde",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1092,10 +1098,29 @@ name = "driftless-io"
 version = "0.1.0"
 dependencies = [
  "driftless-io",
+ "jpeg-encoder",
  "lz4_flex 0.11.6",
  "nalgebra",
+ "rayon",
  "serde",
  "serde_json",
+ "thiserror",
+ "zune-jpeg",
+]
+
+[[package]]
+name = "driftless-map"
+version = "0.1.0"
+dependencies = [
+ "driftless-io",
+ "driftless-odom",
+ "driftless-slam",
+ "driftless-traj",
+ "jpeg-encoder",
+ "kiddo",
+ "las",
+ "nalgebra",
+ "rayon",
  "thiserror",
 ]
 
@@ -1925,6 +1950,12 @@ checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
 dependencies = [
  "jiff-tzdb",
 ]
+
+[[package]]
+name = "jpeg-encoder"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0370574b86f7eca156b9f298392b5e69a23f8c86f3f865add60bbc2e79467a6"
 
 [[package]]
 name = "js-sys"
@@ -4114,9 +4145,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",

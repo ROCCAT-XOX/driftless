@@ -3,9 +3,13 @@
 Open-source desktop software for processing handheld LiDAR scans — drift-corrected, cleanly colourised,
 correctable by hand. Runs natively on **macOS (Apple Silicon)** and **Windows**.
 
-> Status: early development, command line only. Milestone 2 done: LiDAR-IMU odometry, SLAM with automatic
-> loop closure and manual corrections (`slam`, `correct`), debug viewer. Results on real scans:
-> [docs/ergebnisse/2026-10-20-meilenstein-2.md](docs/ergebnisse/2026-10-20-meilenstein-2.md) (German).
+> Status: early development, command line only. Milestone 3 done: dense point cloud from the corrected
+> trajectory (1 cm voxels), cleaned of ghosts and outliers, coloured from the camera images with exposure
+> and white balance across cameras and time (`map`). A 4.4-minute scan with 1,741 images takes about
+> 2.5 minutes and 4 GB on an M4 Pro. Milestone 2: LiDAR-IMU odometry, SLAM with automatic loop closure and
+> manual corrections (`slam`, `correct`), debug viewer. Results on real scans (German):
+> [milestone 3](docs/ergebnisse/2026-10-21-meilenstein-3.md),
+> [milestone 2](docs/ergebnisse/2026-10-20-meilenstein-2.md).
 
 ## Why
 
@@ -39,6 +43,8 @@ Build with `cargo build --release`; the binary is `driftless`. Folder arguments 
 | `driftless slam <folder> -o <dir> [--lidar-to-imu x y z qx qy qz qw] [--lidar-topic T] [--imu-topic T]` | SLAM with automatic loop closure and the manual loops of `<dir>/corrections.toml`; writes `traj.tum` (corrected), `traj_odom.tum` (before), `map.las`, `slam.json` (absolute `scan_start`, submaps, loop checks, graph) and `submaps.bin` (cache for `--reuse`) |
 | `driftless slam <folder> -o <dir> --reuse` | Recomputes only the pose graph from `submaps.bin` with the current corrections (seconds instead of a full run) and rewrites all outputs; the previous `traj.tum` is kept as `traj.vorher.tum` (an older one is replaced) |
 | `driftless correct <dir> list` · `loop <a_s> <b_s> [--note TEXT]` · `disable <nr>` · `enable <nr>` | Manual corrections in `<dir>/corrections.toml`: list them, add a loop (the places at two times, seconds since scan start as in `slam.json`, are the same), switch entries off and on; entries are never removed |
+| `driftless map <folder> --slam <slam-out> [--step dense\|clean\|color\|all] [--no-ghosts] [--no-outliers] [--voxel M] [--downscale 1\|2\|4]` | Map of a SLAM run, written into `<slam-out>`: dense cloud from the corrected `traj.tum` (`dense.las`), cleaned of ghosts and outliers (`clean.las`, the removed points in `removed.las`), coloured from the camera images (`color.las`, `color.ply`), and `map.json` (settings, statistics, runtime per step, peak memory). The requested step always runs; the step before it is taken from `dense.bin` / `clean.bin` (full-precision intermediate results; LAS is export only) if they were written for the same input and settings, otherwise rebuilt. Outputs of earlier runs that no longer fit are never deleted, but warned about and listed under `stale` in `map.json`. Without `IMAGE_*.bag` or `calibration/calib.json`, `--step color` fails and `all` skips colouring with a warning |
+| `driftless view <folder> --cloud <file.las>` | Shows a point cloud (e.g. `color.las`) in the viewer, with its colours or gray by intensity, evenly thinned to at most 5 million points |
 | `driftless export-glim <folder> -o <dir>` | Writes `imu.bin` and `lidar.bin` for the GLIM spike (`spikes/glim/`) |
 | `driftless compare <a.tum> <b.tum> [--json]` | Trajectory yardstick: ATE after alignment, path length, start-to-end gap |
 
@@ -49,6 +55,15 @@ driftless slam <scan> -o out                 # full run, minutes at most
 driftless view <scan> --slam out             # check quality, loops, start-to-end gap
 driftless correct out loop 3.5 250.0         # the places at 3.5 s and 250.0 s are the same
 driftless slam <scan> -o out --reuse         # recompute from submaps.bin in seconds
+```
+
+Then the map:
+
+```sh
+driftless map <scan> --slam out              # dense, clean, colour → out/color.las
+driftless map <scan> --slam out --step color --downscale 1   # recolour only, reuses clean.bin
+driftless map <scan> --slam out --voxel 0.02 # coarser cloud: about 1/3 of the memory, for long scans
+driftless view <scan> --cloud out/color.las
 ```
 
 Read the times for `correct loop` in the viewer on the timeline `ab_scan_beginn`, not on `stamp`:

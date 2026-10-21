@@ -1,5 +1,10 @@
-use driftless_io::calib::{load_calibration, CalibError, CameraModel};
+use driftless_io::calib::{
+    load_calibration, load_calibration_as, CalibError, CalibReading, CameraModel, ImageRotation,
+    MatrixDirection, CALIB_READING,
+};
+use driftless_io::camera::Camera;
 use driftless_io::project::{discover_project, ProjectError};
+use nalgebra::Point3;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -21,9 +26,15 @@ fn touch(root: &Path, rel: &str) {
     fs::write(p, b"x").unwrap();
 }
 
+/// `K` and `transform_matrix` exactly as written in the file.
+const AS_WRITTEN: CalibReading = CalibReading {
+    rotation: ImageRotation::None,
+    direction: MatrixDirection::LidarToCam,
+};
+
 #[test]
 fn parses_two_fisheye_cameras() {
-    let c = load_calibration(&fixture()).unwrap();
+    let c = load_calibration_as(&fixture(), AS_WRITTEN).unwrap();
     assert_eq!(c.device_sn.as_deref(), Some("TEST0000001"));
     assert_eq!(c.device_model.as_deref(), Some("TESTMODEL"));
     let names: Vec<_> = c.cameras.keys().cloned().collect();
@@ -40,12 +51,101 @@ fn parses_two_fisheye_cameras() {
     assert_eq!(left.k[(0, 2)], 320.25);
     assert_eq!(left.k[(1, 1)], 401.5);
     assert_eq!(left.k[(2, 2)], 1.0);
-    let m = left.lidar_to_cam_raw.unwrap();
-    assert_eq!(m[(0, 3)], 4.0);
-    assert_eq!(m[(1, 0)], 5.0);
+    let m = left.lidar_to_cam.unwrap().to_homogeneous();
+    assert!((m[(0, 3)] - 0.1).abs() < 1e-12);
+    assert!((m[(1, 2)] + 1.0).abs() < 1e-12);
+    assert!((m[(2, 0)] - 1.0).abs() < 1e-12);
     assert_eq!(m[(3, 3)], 1.0);
     // camera without out_put entry
-    assert!(c.cameras["right"].lidar_to_cam_raw.is_none());
+    assert!(c.cameras["right"].lidar_to_cam.is_none());
+}
+
+/// Every reading must give the projection of the image `K` refers to, turned back into the
+/// stored image; the measured reading is what `load_calibration` returns.
+#[test]
+fn readings_turn_k_and_matrix_into_the_stored_image() {
+    let raw = load_calibration_as(&fixture(), AS_WRITTEN).unwrap();
+    let raw = &raw.cameras["left"];
+    let (w1, h1) = (f64::from(raw.width) - 1.0, f64::from(raw.height) - 1.0);
+    for rotation in [
+        ImageRotation::None,
+        ImageRotation::Cw90,
+        ImageRotation::Ccw90,
+        ImageRotation::R180,
+    ] {
+        for direction in [MatrixDirection::LidarToCam, MatrixDirection::CamToLidar] {
+            let reading = CalibReading {
+                rotation,
+                direction,
+            };
+            let c = load_calibration_as(&fixture(), reading).unwrap();
+            let c = &c.cameras["left"];
+            assert_eq!((c.width, c.height), (raw.width, raw.height));
+            let stored = Camera::from_calib("s", c).unwrap();
+            // The turned image: `K` as written, axes swapped for 90° turns.
+            let mut turned = raw.clone();
+            if matches!(rotation, ImageRotation::Cw90 | ImageRotation::Ccw90) {
+                std::mem::swap(&mut turned.width, &mut turned.height);
+            }
+            let turned = Camera::from_calib("t", &turned).unwrap();
+            let m = raw.lidar_to_cam.unwrap();
+            let m = match direction {
+                MatrixDirection::LidarToCam => m,
+                MatrixDirection::CamToLidar => m.inverse(),
+            };
+            let mut checked = 0;
+            for i in 0..1000 {
+                // Spread over the sphere (golden angle), 3 m away.
+                let f = f64::from(i);
+                let z = 1.0 - 2.0 * (f + 0.5) / 1000.0;
+                let (r, phi) = ((1.0 - z * z).sqrt(), f * 2.399963);
+                let p = Point3::new(3.0 * r * phi.cos(), 3.0 * r * phi.sin(), 3.0 * z);
+                let Some([x, y]) = turned.project(&(m * p).coords) else {
+                    continue;
+                };
+                let expected = match rotation {
+                    ImageRotation::None => [x, y],
+                    ImageRotation::Cw90 => [y, h1 - x],
+                    ImageRotation::Ccw90 => [w1 - y, x],
+                    ImageRotation::R180 => [w1 - x, h1 - y],
+                };
+                let Some(got) = stored.project(&(c.lidar_to_cam.unwrap() * p).coords) else {
+                    // Turning moves the half-open pixel bounds by up to one pixel.
+                    let near_border = expected[0] < 0.0
+                        || expected[1] < 0.0
+                        || expected[0] > w1
+                        || expected[1] > h1;
+                    assert!(near_border, "{reading:?}: {expected:?} not projected");
+                    continue;
+                };
+                assert!(
+                    (got[0] - expected[0]).abs() < 1e-9 && (got[1] - expected[1]).abs() < 1e-9,
+                    "{reading:?}: {got:?} vs {expected:?}"
+                );
+                checked += 1;
+            }
+            assert!(checked > 20, "{reading:?}: only {checked} points inside");
+        }
+    }
+    assert_eq!(
+        load_calibration(&fixture()).unwrap(),
+        load_calibration_as(&fixture(), CALIB_READING).unwrap()
+    );
+}
+
+#[test]
+fn non_rigid_transform_matrix_is_error() {
+    let dir = tmp("nonrigid");
+    let text = fs::read_to_string(fixture()).unwrap().replacen(
+        "[0.0, -1.0, 0.0, 0.1]",
+        "[0.0, -2.0, 0.0, 0.1]",
+        1,
+    );
+    fs::write(dir.join("calib.json"), text).unwrap();
+    assert!(matches!(
+        load_calibration(&dir.join("calib.json")),
+        Err(CalibError::Malformed(m)) if m.contains("not rigid")
+    ));
 }
 
 #[test]

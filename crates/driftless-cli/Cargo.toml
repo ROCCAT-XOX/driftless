@@ -17,15 +17,26 @@ workspace = true
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 driftless-io = { path = "../driftless-io" }
+driftless-map = { path = "../driftless-map" }
 driftless-odom = { path = "../driftless-odom" }
 driftless-slam = { path = "../driftless-slam" }
 driftless-traj = { path = "../driftless-traj" }
 las = "0.11"
+png = "0.18"
+rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rerun = { version = "0.38.1", default-features = false, features = ["sdk", "rrd", "server"] }
 
+# Peak memory for `map.json`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
 [dev-dependencies]
 assert_cmd = "2"
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
+jpeg-encoder = "0.7.1"
 predicates = "3"

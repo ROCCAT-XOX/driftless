@@ -319,3 +319,48 @@ fn view_dry_run_real_project() {
     assert!(fs::metadata(&rrd).unwrap().len() > 0);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn view_cloud_dry_run() {
+    use driftless_map::{write_las, Cloud};
+    let dir = synthetic_project("cloud");
+    let cloud = |rgb: bool| Cloud {
+        xyz: (0..10).map(|i| [i as f32, 1.0, 2.0]).collect(),
+        intensity: (0..10).map(|i| 20.0 * i as f32).collect(),
+        t: vec![100.0; 10],
+        frame: vec![0; 10],
+        rgb: rgb.then(|| vec![[255, 0, 0]; 10]),
+        colored: rgb.then(|| vec![true; 10]),
+    };
+    write_las(&dir.join("color.las"), &cloud(true)).unwrap();
+    write_las(&dir.join("dense.las"), &cloud(false)).unwrap();
+    for (file, kind) in [("color.las", "Farbe"), ("dense.las", "Intensität")] {
+        let rrd = dir.join(format!("{file}.rrd"));
+        Command::cargo_bin("driftless")
+            .unwrap()
+            .arg("view")
+            .arg(&dir)
+            .arg("--cloud")
+            .arg(dir.join(file))
+            .arg("--dry-run")
+            .arg(&rrd)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!(
+                "Wolke {file}: 10 von 10 Punkten ({kind})"
+            )));
+        assert!(fs::metadata(&rrd).unwrap().len() > 0);
+    }
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .arg("view")
+        .arg(&dir)
+        .arg("--cloud")
+        .arg(dir.join("missing.las"))
+        .arg("--dry-run")
+        .arg(dir.join("missing.rrd"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("missing.las"));
+    assert!(!dir.join("missing.rrd").exists());
+}

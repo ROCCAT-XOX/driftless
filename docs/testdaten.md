@@ -38,6 +38,7 @@ $DRIFTLESS_TESTDATA/
     exp04_construction_upper_level.txt   Referenz: 7 Kontrollpunkte, nur Position (s. u.)
     projekt-exp04/LIDAR_exp04.bag   harter Link auf die Bag (`ln ../exp04_construction_upper_level.bag LIDAR_exp04.bag`)
     calibration/lidar_calibration.yaml   LiDAR-IMU-Extrinsik (von Hugging Face)
+  ergebnisse-m3/                    lokale Renderings Meilenstein 3 (PNG), nicht im Repo
   jmk6-2026-10-20/
     <JJJJMMTThhmmss>/               eigene JMK6-Aufnahmen, Rohdaten von der MicroSD-Karte, ohne Referenz
       LIDAR_<JJJJMMTThhmmss>.bag    LiDAR + IMU
@@ -69,6 +70,17 @@ driftless slam $DRIFTLESS_TESTDATA/hilti2022/projekt-exp04 -o <ziel> \
 
 Die Tests mit echten Daten für SLAM: `cargo test --release -p driftless-slam -- --ignored --nocapture`
 (Schranken und Messwerte: `docs/ergebnisse/2026-10-20-meilenstein-2.md`).
+
+Für die Karte (dicht, bereinigt, eingefärbt) auf `Test` und beiden JMK6-Aufnahmen:
+`cargo test --release -p driftless-map --test real_data -- --ignored --nocapture` (≈ 3 min;
+Schranken und Messwerte: `docs/ergebnisse/2026-10-21-meilenstein-3.md`).
+
+**`Test/shading/smooth.las` hat keine Farben:** LAS 1.3, Punktformat 2, 12,5 Mio. Punkte, aber
+alle mit derselben Farbe (0, 166, 252) und Intensität 0. Vergleichbar sind nur Lage und Dichte.
+`trj.txt` liegt im selben Rahmen wie unsere `traj.tum` (Ausrichtung dreht 0,4°, verschiebt 2 cm).
+
+Renderings und Vergleichsbilder liegen nur lokal unter `$DRIFTLESS_TESTDATA/ergebnisse-m3/`
+(nicht im Repo).
 
 Die Dateien unter `Test/` stammen aus einem Testscan mit dem 3DMakerPro-Scanner. Die
 Referenzdateien (`trj.txt`, `smooth.las`) dienen nur zum Vergleich; Software
