@@ -460,3 +460,67 @@ pub(crate) fn blur(rgb: &[u8], sigma: f64) -> Vec<u8> {
         .map(|v| v.round() as u8)
         .collect()
 }
+
+// ---- Textured fixtures (for writing and the preview) ------------------------------------
+
+use super::TexturePage;
+use driftless_io::images::RgbImage;
+
+/// A page of one quad `corners` (counter-clockwise seen from the front), uv `(0,0)`, `(1,0)`,
+/// `(1,1)`, `(0,1)` at the corners in that order. Its `size²` image is `top` in the upper
+/// half (rows with `v < ½`) and `bottom` in the lower half.
+pub(crate) fn quad_page(
+    corners: [[f32; 3]; 4],
+    top: [u8; 3],
+    bottom: [u8; 3],
+    size: u32,
+) -> TexturePage {
+    let mut data = Vec::with_capacity((size * size * 3) as usize);
+    for y in 0..size {
+        let c = if y < size / 2 { top } else { bottom };
+        for _ in 0..size {
+            data.extend(c);
+        }
+    }
+    TexturePage {
+        positions: corners.to_vec(),
+        uvs: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        indices: vec![[0, 1, 2], [0, 2, 3]],
+        image: RgbImage {
+            width: size,
+            height: size,
+            data,
+        },
+    }
+}
+
+/// A room of 4 × 3 m, floor at `z = 0` (page 0, red over green) and ceiling at `z = 2.5`
+/// (page 1, blue over white).
+pub(crate) fn floor_and_ceiling() -> super::TexturedMesh {
+    let floor = quad_page(
+        [
+            [0.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 3.0, 0.0],
+            [0.0, 3.0, 0.0],
+        ],
+        [220, 20, 20],
+        [20, 200, 20],
+        32,
+    );
+    let ceiling = quad_page(
+        [
+            [0.0, 0.0, 2.5],
+            [0.0, 3.0, 2.5],
+            [4.0, 3.0, 2.5],
+            [4.0, 0.0, 2.5],
+        ],
+        [20, 20, 220],
+        [250, 250, 250],
+        16,
+    );
+    super::TexturedMesh {
+        pages: vec![floor, ceiling],
+        ..Default::default()
+    }
+}

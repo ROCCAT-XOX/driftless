@@ -14,6 +14,8 @@ workspace = true
 driftless-io = { path = "../driftless-io" }
 driftless-odom = { path = "../driftless-odom" }
 driftless-traj = { path = "../driftless-traj" }
+gltf-json = { version = "1.4.1", features = ["KHR_materials_unlit"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 kiddo = { version = "6", default-features = false }
 las = "0.11"
 meshopt = "0.7"
@@ -23,6 +25,7 @@ thiserror = "2"
 
 [dev-dependencies]
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
-jpeg-encoder = "0.7.1"
 driftless-odom = { path = "../driftless-odom", features = ["test-util"] }
 driftless-slam = { path = "../driftless-slam" }
+gltf = { version = "1.4.1", default-features = false, features = ["KHR_materials_unlit", "utils"] }
+jpeg-encoder = "0.7.1"
