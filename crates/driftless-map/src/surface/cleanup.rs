@@ -20,6 +20,11 @@ use std::collections::{BTreeMap, BTreeSet};
 /// open (unseen areas and open objects are not invented).
 const MIN_CAP_ALIGNMENT: f32 = 0.5;
 
+/// A corner of another boundary loop counts as an island of a hole if it lies inside the hole
+/// and within this distance of the hole's plane (m): about a voxel. A loop on the far side of
+/// a wall (a hole through it) is further away and does not block.
+pub const ISLAND_PLANE_TOLERANCE: f64 = 0.03;
+
 /// Twice the area times the normal of the triangle `a b c`.
 fn cross3(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     let u = [0, 1, 2].map(|k| b[k] - a[k]);
@@ -31,14 +36,6 @@ fn cross3(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn len3(a: [f32; 3]) -> f32 {
-    dot3(a, a).sqrt()
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CleanupStats {
     /// Components removed for having fewer than `min_component_faces` faces.
@@ -47,9 +44,26 @@ pub struct CleanupStats {
     pub faces_removed: usize,
     /// Boundary loops closed.
     pub holes_filled: usize,
-    /// Boundary loops left open (too large, or not a clean loop).
-    pub holes_left: usize,
+    /// Boundary loops left open: rim longer than [`SurfaceConfig::max_hole_perimeter`].
+    pub holes_too_large: usize,
+    /// Left open: the cap would not lean like the faces around it (rim of an open piece,
+    /// end of a pipe; see [`MIN_CAP_ALIGNMENT`]).
+    pub holes_rim: usize,
+    /// Left open: not a clean loop, more than [`MAX_CAP_VERTICES`] corners, no flat
+    /// triangulation, another boundary loop inside it (an island), or a cap edge exists
+    /// already.
+    pub holes_untriangulable: usize,
 }
+
+impl CleanupStats {
+    /// All boundary loops left open.
+    pub fn holes_left(&self) -> usize {
+        self.holes_too_large + self.holes_rim + self.holes_untriangulable
+    }
+}
+
+/// Loops with more corners are left open (ear clipping is cubic in the corners).
+pub const MAX_CAP_VERTICES: usize = 400;
 
 pub fn cleanup(mesh: &mut Mesh, cfg: &SurfaceConfig) -> CleanupStats {
     let mut stats = CleanupStats::default();
@@ -141,6 +155,13 @@ fn perimeter(positions: &[[f32; 3]], lp: &[u32]) -> f64 {
         .sum()
 }
 
+/// Why a boundary loop stays open (see [`CleanupStats`]).
+enum Open {
+    TooLarge,
+    Rim,
+    Untriangulable,
+}
+
 /// Closes boundary loops of at most `max_perimeter` (m) that are holes in a surface (see
 /// [`MIN_CAP_ALIGNMENT`]) with [`cap_faces`]; loops it cannot triangulate stay open.
 fn fill_holes(mesh: &mut Mesh, max_perimeter: f64, stats: &mut CleanupStats) {
@@ -160,7 +181,10 @@ fn fill_holes(mesh: &mut Mesh, max_perimeter: f64, stats: &mut CleanupStats) {
             out.entry(a).or_default().push(b);
         }
     }
-    drop(directed);
+    // Whether the mesh has an edge between a and b (either direction).
+    let has_edge = |a: u32, b: u32| {
+        directed.binary_search(&(a, b)).is_ok() || directed.binary_search(&(b, a)).is_ok()
+    };
     let mut face_of: BTreeMap<(u32, u32), usize> = BTreeMap::new();
     for (f, t) in mesh.indices.iter().enumerate() {
         for k in 0..3 {
@@ -189,7 +213,7 @@ fn fill_holes(mesh: &mut Mesh, max_perimeter: f64, stats: &mut CleanupStats) {
                 .and_then(|bs| bs.iter().copied().find(|&b| !used.contains(&(cur, b))));
             let Some(next) = next else {
                 if path.len() > 1 {
-                    stats.holes_left += 1; // dead end: not a clean loop
+                    stats.holes_untriangulable += 1; // dead end: not a clean loop
                 }
                 break;
             };
@@ -204,44 +228,111 @@ fn fill_holes(mesh: &mut Mesh, max_perimeter: f64, stats: &mut CleanupStats) {
         }
     }
     let pos = |v: u32| mesh.positions[v as usize];
-    let caps: Vec<Option<Vec<[u32; 3]>>> = loops
+    // Every loop corner by x, for the island test.
+    let mut corners: Vec<(f32, u32, u32)> = loops
+        .iter()
+        .enumerate()
+        .flat_map(|(l, lp)| lp.iter().map(move |&v| (0.0, l as u32, v)))
+        .collect();
+    for c in &mut corners {
+        c.0 = mesh.positions[c.2 as usize][0];
+    }
+    corners.par_sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then((a.1, a.2).cmp(&(b.1, b.2))));
+    let caps: Vec<Result<Vec<[u32; 3]>, Open>> = loops
         .par_iter()
-        .map(|lp| {
+        .enumerate()
+        .map(|(l, lp)| {
             let n = lp.len();
-            if n < 3 || perimeter(&mesh.positions, lp) > max_perimeter {
-                return None;
+            if perimeter(&mesh.positions, lp) > max_perimeter {
+                return Err(Open::TooLarge);
             }
-            // The cap runs against the loop: its area vector (Newell) from the reversed loop.
-            let mut cap = [0.0f32; 3];
+            if !(3..=MAX_CAP_VERTICES).contains(&n) {
+                return Err(Open::Untriangulable);
+            }
+            // The cap runs against the loop: its area vector (Newell) from the reversed loop,
+            // in f64 and relative to the first corner (far from the origin, absolute f32
+            // coordinates would drown a small hole in rounding).
+            let o = pos(lp[0]).map(f64::from);
+            let rel = |v: u32| {
+                let p = pos(v);
+                [0, 1, 2].map(|k| f64::from(p[k]) - o[k])
+            };
+            let mut cap = [0.0f64; 3];
             for i in 0..n {
-                let x = cross3([0.0; 3], pos(lp[(i + 1) % n]), pos(lp[i]));
+                let (a, b) = (rel(lp[(i + 1) % n]), rel(lp[i]));
+                let x = [
+                    a[1] * b[2] - a[2] * b[1],
+                    a[2] * b[0] - a[0] * b[2],
+                    a[0] * b[1] - a[1] * b[0],
+                ];
                 cap = [0, 1, 2].map(|k| cap[k] + x[k]);
             }
-            let cap_len = len3(cap);
+            let cap_len = (cap[0] * cap[0] + cap[1] * cap[1] + cap[2] * cap[2]).sqrt();
             // Area-weighted mean of cos(cap, adjacent face).
-            let (mut align, mut area) = (0.0f32, 0.0f32);
+            let (mut align, mut area) = (0.0f64, 0.0f64);
             for i in 0..n {
                 if let Some(&f) = face_of.get(&(lp[i], lp[(i + 1) % n])) {
                     let [a, b, d] = mesh.indices[f].map(pos);
-                    let x = cross3(a, b, d);
-                    align += dot3(cap, x) / cap_len.max(f32::MIN_POSITIVE);
-                    area += len3(x);
+                    let x = cross3(a, b, d).map(f64::from);
+                    align += (cap[0] * x[0] + cap[1] * x[1] + cap[2] * x[2])
+                        / cap_len.max(f64::MIN_POSITIVE);
+                    area += (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt();
                 }
             }
-            if !(cap_len > 0.0 && area > 0.0 && align / area > MIN_CAP_ALIGNMENT) {
-                return None;
+            if !(cap_len > 0.0 && area > 0.0 && align / area > f64::from(MIN_CAP_ALIGNMENT)) {
+                return Err(Open::Rim);
             }
+            // Corners of other loops within the loop's box: candidates for an island.
+            let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+            for &v in lp {
+                let p = pos(v);
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            let margin = ISLAND_PLANE_TOLERANCE as f32;
+            let start = corners.partition_point(|c| c.0 < lo[0] - margin);
+            let others: Vec<u32> = corners[start..]
+                .iter()
+                .take_while(|c| c.0 <= hi[0] + margin)
+                .filter(|c| c.1 != l as u32 && !lp.contains(&c.2))
+                .map(|c| c.2)
+                .filter(|&v| {
+                    let p = pos(v);
+                    (1..3).all(|k| p[k] >= lo[k] - margin && p[k] <= hi[k] + margin)
+                })
+                .collect();
             let rev: Vec<u32> = lp.iter().rev().copied().collect();
-            cap_faces(&mesh.positions, &rev)
+            cap_faces(&mesh.positions, &rev, &others, &has_edge).ok_or(Open::Untriangulable)
         })
         .collect();
+    // Diagonals of the caps taken so far: two caps must not share one either.
+    let mut taken: BTreeSet<(u32, u32)> = BTreeSet::new();
     for cap in caps {
+        let cap = cap.and_then(|faces| {
+            let mut diagonals: Vec<(u32, u32)> = faces
+                .iter()
+                .flat_map(|f| (0..3).map(move |k| (f[k], f[(k + 1) % 3])))
+                .filter(|&(a, b)| directed.binary_search(&(b, a)).is_err())
+                .map(|(a, b)| (a.min(b), a.max(b)))
+                .collect();
+            diagonals.sort_unstable();
+            diagonals.dedup();
+            if diagonals.iter().any(|d| taken.contains(d)) {
+                return Err(Open::Untriangulable);
+            }
+            taken.extend(diagonals);
+            Ok(faces)
+        });
         match cap {
-            Some(faces) => {
+            Ok(faces) => {
                 stats.holes_filled += 1;
                 mesh.indices.extend(faces);
             }
-            None => stats.holes_left += 1,
+            Err(Open::TooLarge) => stats.holes_too_large += 1,
+            Err(Open::Rim) => stats.holes_rim += 1,
+            Err(Open::Untriangulable) => stats.holes_untriangulable += 1,
         }
     }
 }
@@ -250,17 +341,28 @@ fn fill_holes(mesh: &mut Mesh, max_perimeter: f64, stats: &mut CleanupStats) {
 /// without new vertices: the polygon is projected onto its plane (normal from Newell's
 /// area vector, the best plane through a closed loop) and cut by ear clipping, always taking
 /// the ear with the largest smallest angle. A flat hole is closed flat. `None` if the
-/// projection has no ear left (it overlaps itself) or a face would turn against the plane
-/// normal.
-pub(crate) fn cap_faces(positions: &[[f32; 3]], poly: &[u32]) -> Option<Vec<[u32; 3]>> {
+/// projection has no ear left (it overlaps itself), a face would turn against the plane
+/// normal, a corner of `others` (other boundary loops) lies inside the polygon within
+/// [`ISLAND_PLANE_TOLERANCE`] of its plane (an island: the cap would cover it twice), or every
+/// remaining ear would need a diagonal for which `has_edge` is true (the edge exists already;
+/// a third face on it would make the mesh non-manifold).
+pub(crate) fn cap_faces(
+    positions: &[[f32; 3]],
+    poly: &[u32],
+    others: &[u32],
+    has_edge: &dyn Fn(u32, u32) -> bool,
+) -> Option<Vec<[u32; 3]>> {
     let n = poly.len();
-    if n < 3 {
+    if !(3..=MAX_CAP_VERTICES).contains(&n) {
         return None;
     }
-    let p: Vec<[f64; 3]> = poly
-        .iter()
-        .map(|&v| positions[v as usize].map(f64::from))
-        .collect();
+    // Relative to the first corner: no cancellation far from the origin.
+    let o = positions[poly[0] as usize].map(f64::from);
+    let at = |v: u32| {
+        let p = positions[v as usize];
+        [0, 1, 2].map(|k| f64::from(p[k]) - o[k])
+    };
+    let p: Vec<[f64; 3]> = poly.iter().map(|&v| at(v)).collect();
     let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
     let cross = |a: [f64; 3], b: [f64; 3]| {
         [
@@ -302,6 +404,26 @@ pub(crate) fn cap_faces(positions: &[[f32; 3]], poly: &[u32]) -> Option<Vec<[u32
     }
     let extent = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1e-9);
     let eps = 1e-12 * extent * extent;
+    // An island: a corner of another loop inside the polygon, near its plane.
+    for &w in others {
+        let x = at(w);
+        if dot(x, nrm).abs() > ISLAND_PLANE_TOLERANCE {
+            continue;
+        }
+        let x = [dot(x, u), dot(x, v)];
+        let mut inside = false;
+        for i in 0..n {
+            let (a, b) = (q[i], q[(i + 1) % n]);
+            if (a[1] > x[1]) != (b[1] > x[1])
+                && x[0] < a[0] + (x[1] - a[1]) * (b[0] - a[0]) / (b[1] - a[1])
+            {
+                inside = !inside;
+            }
+        }
+        if inside {
+            return None;
+        }
+    }
     let min_angle = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
         let ang = |o: [f64; 2], x: [f64; 2], y: [f64; 2]| {
             let (dx, dy) = ([x[0] - o[0], x[1] - o[1]], [y[0] - o[0], y[1] - o[1]]);
@@ -321,6 +443,9 @@ pub(crate) fn cap_faces(positions: &[[f32; 3]], poly: &[u32]) -> Option<Vec<[u32
             let (a, b, c) = (q[ia], q[ib], q[ic]);
             if orient(a, b, c) <= eps {
                 continue; // reflex or straight
+            }
+            if m > 3 && has_edge(poly[ia], poly[ic]) {
+                continue; // the diagonal exists already
             }
             // No other corner inside or on the ear (corners at the ear's own points excepted).
             let blocked = rem.iter().any(|&j| {
@@ -425,7 +550,7 @@ mod tests {
         assert_eq!(edge_report(&mesh), (0, 40));
         let faces = mesh.indices.len();
         let stats = cleanup(&mut mesh, &cfg());
-        assert_eq!((stats.holes_filled, stats.holes_left), (1, 0));
+        assert_eq!((stats.holes_filled, stats.holes_left()), (1, 0));
         assert_eq!(mesh.indices.len(), faces + 38);
         assert_flat_fill(&mesh, faces, 0.01);
     }
@@ -461,7 +586,7 @@ mod tests {
         assert_eq!(edge_report(&mesh), (0, 80));
         let (faces, vertices) = (mesh.indices.len(), mesh.positions.len());
         let stats = cleanup(&mut mesh, &cfg());
-        assert_eq!((stats.holes_filled, stats.holes_left), (1, 0));
+        assert_eq!((stats.holes_filled, stats.holes_left()), (1, 0));
         assert_flat_fill(&mesh, faces, 0.02);
         // Triangulated from the rim alone: no new vertices, n - 2 faces.
         assert_eq!(mesh.positions.len(), vertices);
@@ -478,7 +603,7 @@ mod tests {
         assert_eq!(edge_report(&mesh), (0, 86));
         let faces = mesh.indices.len();
         let stats = cleanup(&mut mesh, &cfg());
-        assert_eq!((stats.holes_filled, stats.holes_left), (1, 0));
+        assert_eq!((stats.holes_filled, stats.holes_left()), (1, 0));
         assert_flat_fill(&mesh, faces, 0.02);
     }
 
@@ -488,7 +613,7 @@ mod tests {
         let mut mesh = wall_with_hole(50, 0.02, Some((10, 26)));
         let before = mesh.clone();
         let stats = cleanup(&mut mesh, &cfg());
-        assert_eq!((stats.holes_filled, stats.holes_left), (0, 1));
+        assert_eq!((stats.holes_filled, stats.holes_left()), (0, 1));
         assert_eq!(mesh, before);
     }
 
@@ -498,8 +623,112 @@ mod tests {
         let mut mesh = open_wall(19, 0.02);
         let before = mesh.clone();
         let stats = cleanup(&mut mesh, &cfg());
-        assert_eq!((stats.holes_filled, stats.holes_left), (0, 1));
+        assert_eq!((stats.holes_filled, stats.holes_left()), (0, 1));
         assert_eq!(mesh, before);
+    }
+
+    /// `mesh` moved by `d` (m).
+    fn moved(mut mesh: Mesh, d: [f32; 3]) -> Mesh {
+        for p in &mut mesh.positions {
+            *p = [0, 1, 2].map(|k| p[k] + d[k]);
+        }
+        mesh
+    }
+
+    const FAR: [f32; 3] = [25.0, -30.0, 3.0];
+
+    #[test]
+    fn far_from_origin_hole_fills_and_rim_stays_open() {
+        let mut mesh = moved(wall_with_hole(40, 0.02, Some((10, 20))), FAR);
+        let faces = mesh.indices.len();
+        let stats = cleanup(&mut mesh, &cfg());
+        assert_eq!(
+            (stats.holes_filled, stats.holes_left()),
+            (1, 0),
+            "{stats:?}"
+        );
+        assert_eq!(edge_report(&mesh), (0, 0));
+        for f in faces..mesh.indices.len() {
+            assert!(mesh.face_normal(f)[0] > 0.99);
+        }
+        let mut rim = moved(open_wall(19, 0.02), FAR);
+        let before = rim.clone();
+        let stats = cleanup(&mut rim, &cfg());
+        assert_eq!((stats.holes_filled, stats.holes_rim), (0, 1), "{stats:?}");
+        assert_eq!(rim, before);
+    }
+
+    /// A 2 cm open wall with the two faces of one cell removed (a 4-edge hole a b c d) and a
+    /// closed two-sided fin on the cell diagonal `diag` (an edge that exists already).
+    fn wall_with_fin(diag: usize) -> Mesh {
+        let n = 10;
+        let mut mesh = open_wall(n, 0.02);
+        let id = |iy: usize, iz: usize| (iy * (n + 1) + iz) as u32;
+        let cell = [id(4, 4), id(5, 4), id(5, 5), id(4, 5)];
+        mesh.indices.retain(|f| !f.iter().all(|v| cell.contains(v)));
+        let (a, c) = (cell[diag], cell[diag + 2]);
+        mesh.positions.push([0.05, 0.09, 0.09]);
+        let x = (mesh.positions.len() - 1) as u32;
+        mesh.indices.push([a, c, x]);
+        mesh.indices.push([c, a, x]);
+        mesh
+    }
+
+    #[test]
+    fn cap_does_not_reuse_existing_edge() {
+        let c = SurfaceConfig {
+            min_component_faces: 1,
+            ..cfg()
+        };
+        for diag in 0..2 {
+            let mut mesh = wall_with_fin(diag);
+            assert_eq!(edge_report(&mesh).0, 0);
+            let stats = cleanup(&mut mesh, &c);
+            assert_eq!(stats.holes_filled, 1, "{diag}: {stats:?}");
+            assert_eq!(stats.holes_rim, 1, "{diag}: outer rim");
+            assert_eq!(edge_report(&mesh).0, 0, "{diag}: Kante doppelt");
+            // No edge carries more than two faces.
+            let mut count: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+            for f in &mesh.indices {
+                for k in 0..3 {
+                    let (a, b) = (f[k], f[(k + 1) % 3]);
+                    *count.entry((a.min(b), a.max(b))).or_default() += 1;
+                }
+            }
+            assert!(count.values().all(|&c| c <= 2), "{diag}");
+        }
+    }
+
+    #[test]
+    fn hole_around_island_stays_open() {
+        // A 16 × 16 hole of 2 cm squares (1.28 m rim) with a 6 × 6 island left in its middle:
+        // capping the outer loop would lay a second layer over the island.
+        let mut mesh = wall_with_shaped_hole(30, 0.02, |a, b| {
+            (6..22).contains(&a)
+                && (6..22).contains(&b)
+                && !((11..17).contains(&a) && (11..17).contains(&b))
+        });
+        let c = SurfaceConfig {
+            min_component_faces: 1,
+            ..cfg()
+        };
+        let before = mesh.clone();
+        let stats = cleanup(&mut mesh, &c);
+        assert_eq!(stats.holes_filled, 0, "{stats:?}");
+        assert_eq!(stats.holes_rim, 1, "island rim: {stats:?}");
+        assert_eq!(stats.holes_untriangulable, 1, "outer loop: {stats:?}");
+        assert_eq!(mesh.indices.len(), before.indices.len());
+    }
+
+    #[test]
+    fn counts_why_holes_stay_open() {
+        let mut mesh = wall_with_hole(50, 0.02, Some((10, 26)));
+        let stats = cleanup(&mut mesh, &cfg());
+        assert_eq!((stats.holes_too_large, stats.holes_rim), (1, 0));
+        let mut mesh = open_wall(19, 0.02);
+        let stats = cleanup(&mut mesh, &cfg());
+        assert_eq!((stats.holes_too_large, stats.holes_rim), (0, 1));
+        assert_eq!(stats.holes_left(), 1);
     }
 
     #[test]
@@ -507,7 +736,7 @@ mod tests {
         let mut mesh = wall_with_hole(150, 0.01, Some((25, 100))); // 1 m hole
         let before = mesh.clone();
         let stats = cleanup(&mut mesh, &cfg());
-        assert_eq!((stats.holes_filled, stats.holes_left), (0, 1));
+        assert_eq!((stats.holes_filled, stats.holes_left()), (0, 1));
         assert_eq!(mesh.indices.len(), before.indices.len());
         assert_eq!(edge_report(&mesh), (0, 400));
     }
@@ -518,7 +747,7 @@ mod tests {
         assert!(mesh.indices.len() >= cfg().min_component_faces);
         let before = mesh.clone();
         let stats = cleanup(&mut mesh, &cfg());
-        assert_eq!((stats.holes_filled, stats.holes_left), (0, 1));
+        assert_eq!((stats.holes_filled, stats.holes_left()), (0, 1));
         assert_eq!(mesh, before);
     }
 
@@ -528,7 +757,7 @@ mod tests {
         assert!(mesh.indices.len() >= cfg().min_component_faces);
         let before = mesh.clone();
         let stats = cleanup(&mut mesh, &cfg());
-        assert_eq!((stats.holes_filled, stats.holes_left), (0, 2));
+        assert_eq!((stats.holes_filled, stats.holes_left()), (0, 2));
         assert_eq!(mesh, before);
     }
 
@@ -541,7 +770,7 @@ mod tests {
             ..cfg()
         };
         let stats = cleanup(&mut mesh, &c);
-        assert_eq!((stats.holes_filled, stats.holes_left), (1, 0));
+        assert_eq!((stats.holes_filled, stats.holes_left()), (1, 0));
         assert_eq!(mesh.indices.len(), 20);
         assert_eq!(mesh.positions.len(), 12);
         assert_eq!(edge_report(&mesh), (0, 0));

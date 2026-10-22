@@ -27,7 +27,7 @@ use std::time::Instant;
 pub const SURFACE_REPORT: &str = "oberflaeche.json";
 /// Part of the input id: raised whenever the surface gives another result for the same
 /// settings, so an older folder counts as stale.
-const SURFACE_VERSION: u32 = 2;
+const SURFACE_VERSION: u32 = 3;
 /// File stem of the glb and the obj.
 const STEM: &str = "oberflaeche";
 const AXES: &str = "glb: Y oben; obj: Z oben";
@@ -148,7 +148,10 @@ fn stats_json(s: &SurfaceStats) -> Value {
             "components_removed": s.cleanup.components_removed,
             "faces_removed": s.cleanup.faces_removed,
             "holes_filled": s.cleanup.holes_filled,
-            "holes_left": s.cleanup.holes_left,
+            "holes_left": s.cleanup.holes_left(),
+            "holes_too_large": s.cleanup.holes_too_large,
+            "holes_rim": s.cleanup.holes_rim,
+            "holes_untriangulable": s.cleanup.holes_untriangulable,
         },
         "texture": {
             "faces_textured": s.texture.faces_textured,

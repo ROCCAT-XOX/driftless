@@ -96,10 +96,12 @@ fn surface_real_report_meets_targets() {
     assert!(seconds < 600.0, "{seconds} s");
     assert!(rss < 4e9, "{rss} B");
     // Vorschlag, wartet auf Yannick: 4.5 mm on the flat walls instead of the plan's 3 mm.
-    // The measure is the distance to the nearest point, so even a perfect plane through the
-    // points scores the point spacing: 3.2–3.6 mm median on flat patches of both scans (1.7–
-    // 2.1 points per cm², noise 1 mm); 4.5 mm leaves about 1 mm for the surface. Corners and
-    // edges of the 2 cm grid are reported, not checked.
+    // The measure is the distance of each mesh vertex to the nearest point, so even a
+    // perfect plane through the points scores the point spacing: 3.4 mm (black room) and
+    // 3.5 mm (Büro) median on 40 flat 30 × 30 cm patches each (1.90 / 1.74 points per cm²,
+    // noise 1 mm); 4.5 mm leaves about 1 mm for the surface. The black room has 4.09 mm;
+    // the Büro (6.06 mm) would fail it. Vertices at corners and edges are reported, not
+    // checked.
     let walls = acc("walls", "median_mm");
     assert!(walls <= 4.5, "{walls} mm");
 }

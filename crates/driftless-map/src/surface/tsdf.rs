@@ -174,6 +174,16 @@ impl Tsdf {
         if progress.is_cancelled() {
             return Err(MapError::Cancelled);
         }
+        // A vote is at most ±VOTE_STEPS: the i32 sum is exact up to this many votes.
+        let max_votes = (f64::from(i32::MAX) / VOTE_STEPS) as u32;
+        if weights
+            .par_iter()
+            .any(|w| w.load(Ordering::Relaxed) > max_votes)
+        {
+            return Err(MapError::Config(format!(
+                "ein Voxel der Oberfläche hat mehr als {max_votes} Messungen: Voxel größer wählen"
+            )));
+        }
         // Same size and alignment: the collects reuse the allocations.
         let sum: Vec<i32> = sums.into_iter().map(AtomicI32::into_inner).collect();
         let weight: Vec<u32> = weights.into_iter().map(AtomicU32::into_inner).collect();

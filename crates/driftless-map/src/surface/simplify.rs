@@ -96,11 +96,22 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 /// result is deterministic. Returns the number of flips.
 pub(crate) fn improve_triangles(mesh: &mut Mesh, max_dev: f64, max_edge: f64) -> usize {
     let mut face_of: HashMap<(u32, u32), u32> = HashMap::with_capacity(mesh.indices.len() * 3);
+    // Directed edges used by more than one face (non-manifold input): never flipped.
+    let mut repeated: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
     for (f, t) in mesh.indices.iter().enumerate() {
         for k in 0..3 {
-            face_of.insert((t[k], t[(k + 1) % 3]), f as u32);
+            let e = (t[k], t[(k + 1) % 3]);
+            if face_of.insert(e, f as u32).is_some() {
+                repeated.insert(e);
+            }
         }
     }
+    let touches_repeated = |t: [u32; 3]| {
+        (0..3).any(|k| {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            repeated.contains(&(a, b)) || repeated.contains(&(b, a))
+        })
+    };
     let at = |m: &Mesh, v: u32| m.positions[v as usize].map(f64::from);
     let unit = |n: [f64; 3]| {
         let l = dot(n, n).sqrt();
@@ -117,6 +128,12 @@ pub(crate) fn improve_triangles(mesh: &mut Mesh, max_dev: f64, max_edge: f64) ->
                     continue;
                 };
                 let g = g as usize;
+                if g == f
+                    || (!repeated.is_empty()
+                        && (touches_repeated(mesh.indices[f]) || touches_repeated(mesh.indices[g])))
+                {
+                    continue;
+                }
                 let Some(&d) = mesh.indices[g].iter().find(|&&v| v != a && v != b) else {
                     continue;
                 };
@@ -563,6 +580,17 @@ mod tests {
         let before = fold.clone();
         assert_eq!(improve_triangles(&mut fold, 0.001, 0.3), 0);
         assert_eq!(fold, before);
+    }
+
+    #[test]
+    fn non_manifold_pair_is_not_flipped() {
+        // The sliver pair of a sheared cell plus a copy of its first face: the edge a -> b is
+        // used twice, so the map of edges is ambiguous there.
+        let mut mesh = sheared_wall(1);
+        mesh.indices.push(mesh.indices[0]);
+        let before = mesh.clone();
+        assert_eq!(improve_triangles(&mut mesh, 0.001, 0.3), 0);
+        assert_eq!(mesh, before);
     }
 
     #[test]
