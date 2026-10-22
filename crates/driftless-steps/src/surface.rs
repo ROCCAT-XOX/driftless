@@ -15,7 +15,7 @@ use crate::map::{
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_map::surface::{
-    build_surface, sensors_for_frames, write_glb, write_obj, SurfaceConfig, SurfaceInput,
+    build_surface, sensors_for_frames, write_glb, write_obj, Accuracy, SurfaceConfig, SurfaceInput,
     SurfaceStats, TextureSource,
 };
 use driftless_map::{load_stage, stage_fits};
@@ -128,6 +128,15 @@ fn settings_json(c: &SurfaceConfig, texture: bool) -> Value {
     })
 }
 
+fn accuracy_json(a: &Accuracy) -> Value {
+    json!({
+        "vertices": a.vertices,
+        "median_mm": a.median_mm,
+        "mean_mm": a.mean_mm,
+        "p95_mm": a.p95_mm,
+    })
+}
+
 fn stats_json(s: &SurfaceStats) -> Value {
     json!({
         "tsdf_blocks": s.tsdf_blocks,
@@ -153,8 +162,13 @@ fn stats_json(s: &SurfaceStats) -> Value {
             "seam_jump_before": s.seams.seam_jump_before,
             "seam_jump_after": s.seams.seam_jump_after,
         },
-        "accuracy_mean_mm": s.accuracy_mean_mm,
-        "accuracy_p95_mm": s.accuracy_p95_mm,
+        "accuracy_mean_mm": s.accuracy.all.mean_mm,
+        "accuracy_p95_mm": s.accuracy.all.p95_mm,
+        "accuracy": {
+            "all": accuracy_json(&s.accuracy.all),
+            "walls": accuracy_json(&s.accuracy.walls),
+            "edges": accuracy_json(&s.accuracy.edges),
+        },
         "seconds": s.seconds,
     })
 }
@@ -259,15 +273,17 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
         })?;
 
     let t = &stats.texture;
+    let (all, walls) = (&stats.accuracy.all, &stats.accuracy.walls);
     progress.info(format!(
         "Oberfläche: {} Flächen ({} mit Bild, {} grau) auf {} Seite(n), Abweichung zu den \
-         Punkten im Mittel {:.1} mm (95 % unter {:.1} mm)",
+         Punkten im Mittel {:.1} mm (95 % unter {:.1} mm), auf ebenen Wänden Median {:.1} mm",
         stats.faces_final,
         t.faces_textured,
         t.faces_untextured,
         t.pages,
-        stats.accuracy_mean_mm,
-        stats.accuracy_p95_mm
+        all.mean_mm,
+        all.p95_mm,
+        walls.median_mm
     ));
     let ram = peak.map_or_else(
         || "Spitzen-RAM unbekannt".to_string(),

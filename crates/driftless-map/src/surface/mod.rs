@@ -174,10 +174,9 @@ pub struct SurfaceStats {
     pub cleanup: CleanupStats,
     pub texture: TextureStats,
     pub seams: SeamStats,
-    /// Mean distance of the final vertices to their nearest input point (mm).
-    pub accuracy_mean_mm: f64,
-    /// 95th percentile of that distance (mm).
-    pub accuracy_p95_mm: f64,
+    /// Distance of the final vertices to their nearest input point, all of them and split
+    /// into walls and edges (see [`FLAT_VERTEX_ANGLE`]).
+    pub accuracy: AccuracySplit,
     /// Wall-clock seconds per phase (not deterministic; never written into the mesh files).
     pub seconds: BTreeMap<&'static str, f64>,
 }
@@ -265,7 +264,7 @@ pub fn build_surface(
     check()?;
 
     progress.phase("Oberfläche: Genauigkeit", None);
-    (stats.accuracy_mean_mm, stats.accuracy_p95_mm) = accuracy(&mesh.positions, input.xyz);
+    stats.accuracy = accuracy(&mesh, input.xyz);
     clock.lap(&mut stats, "accuracy");
     Ok((tex, stats))
 }
@@ -299,13 +298,93 @@ fn gray_only(
     atlas::bake(mesh, &labels, &views, &none, &cfg, progress)
 }
 
-/// Mean and 95th percentile (mm) of the distance of every vertex to its nearest point of
-/// `xyz` (k-d tree); zero without vertices or points.
-fn accuracy(vertices: &[[f32; 3]], xyz: &[[f32; 3]]) -> (f64, f64) {
+/// A vertex counts as wall (flat) if the normals of all its faces lie within this angle
+/// (rad, 15°) of their area-weighted mean; otherwise as edge (corners, edges, small details).
+pub const FLAT_VERTEX_ANGLE: f64 = 0.262;
+
+/// Distance of vertices to their nearest input point (mm).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Accuracy {
+    pub vertices: usize,
+    pub median_mm: f64,
+    pub mean_mm: f64,
+    pub p95_mm: f64,
+}
+
+impl Accuracy {
+    fn of(mut mm: Vec<f64>) -> Accuracy {
+        use rayon::prelude::*;
+        if mm.is_empty() {
+            return Accuracy::default();
+        }
+        mm.par_sort_unstable_by(f64::total_cmp);
+        let at = |q: f64| mm[((mm.len() - 1) as f64 * q).round() as usize];
+        Accuracy {
+            vertices: mm.len(),
+            median_mm: at(0.5),
+            mean_mm: mm.iter().sum::<f64>() / mm.len() as f64,
+            p95_mm: at(0.95),
+        }
+    }
+}
+
+/// [`Accuracy`] of all vertices, of the wall vertices and of the edge vertices (see
+/// [`FLAT_VERTEX_ANGLE`]).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AccuracySplit {
+    pub all: Accuracy,
+    pub walls: Accuracy,
+    pub edges: Accuracy,
+}
+
+/// Whether each vertex of `mesh` is a wall vertex (see [`FLAT_VERTEX_ANGLE`]); vertices
+/// without a face are not.
+fn flat_vertices(mesh: &Mesh) -> Vec<bool> {
+    let n = mesh.positions.len();
+    let mut sum = vec![[0.0f64; 3]; n];
+    let normals: Vec<([f64; 3], f64)> = (0..mesh.indices.len())
+        .map(|f| {
+            let a = f64::from(mesh.face_area(f));
+            (mesh.face_normal(f).map(f64::from), a)
+        })
+        .collect();
+    for (f, t) in mesh.indices.iter().enumerate() {
+        let (nf, a) = normals[f];
+        for &v in t {
+            let s = &mut sum[v as usize];
+            *s = [0, 1, 2].map(|k| s[k] + nf[k] * a);
+        }
+    }
+    let mean: Vec<Option<[f64; 3]>> = sum
+        .iter()
+        .map(|s| {
+            let l = (s[0] * s[0] + s[1] * s[1] + s[2] * s[2]).sqrt();
+            (l > 0.0).then(|| s.map(|x| x / l))
+        })
+        .collect();
+    let mut flat: Vec<bool> = mean.iter().map(Option::is_some).collect();
+    let cos = FLAT_VERTEX_ANGLE.cos();
+    for (f, t) in mesh.indices.iter().enumerate() {
+        let (nf, _) = normals[f];
+        for &v in t {
+            if let Some(m) = mean[v as usize] {
+                if nf[0] * m[0] + nf[1] * m[1] + nf[2] * m[2] < cos {
+                    flat[v as usize] = false;
+                }
+            }
+        }
+    }
+    flat
+}
+
+/// Distance (mm) of every vertex of `mesh` to its nearest point of `xyz` (k-d tree), for all
+/// vertices and split into walls and edges; zero without vertices or points.
+fn accuracy(mesh: &Mesh, xyz: &[[f32; 3]]) -> AccuracySplit {
     use kiddo::{ImmutableKdTree, SquaredEuclidean};
     use rayon::prelude::*;
+    let vertices = &mesh.positions;
     if vertices.is_empty() || xyz.is_empty() {
-        return (0.0, 0.0);
+        return AccuracySplit::default();
     }
     let dist = |a: &[f32; 3], b: &[f32; 3]| -> f64 {
         (0..3)
@@ -313,7 +392,7 @@ fn accuracy(vertices: &[[f32; 3]], xyz: &[[f32; 3]]) -> (f64, f64) {
             .sum::<f64>()
             .sqrt()
     };
-    let mut mm: Vec<f64> = if xyz.len() < 2 {
+    let mm: Vec<f64> = if xyz.len() < 2 {
         vertices.iter().map(|v| dist(v, &xyz[0]) * 1000.0).collect()
     } else {
         let tree: ImmutableKdTree<f32, 3> =
@@ -330,10 +409,19 @@ fn accuracy(vertices: &[[f32; 3]], xyz: &[[f32; 3]]) -> (f64, f64) {
             })
             .collect()
     };
-    let mean = mm.iter().sum::<f64>() / mm.len() as f64;
-    mm.par_sort_unstable_by(f64::total_cmp);
-    let p95 = mm[((mm.len() - 1) as f64 * 0.95).round() as usize];
-    (mean, p95)
+    let flat = flat_vertices(mesh);
+    let pick = |want: bool| -> Vec<f64> {
+        mm.iter()
+            .zip(&flat)
+            .filter(|&(_, &f)| f == want)
+            .map(|(&d, _)| d)
+            .collect()
+    };
+    AccuracySplit {
+        walls: Accuracy::of(pick(true)),
+        edges: Accuracy::of(pick(false)),
+        all: Accuracy::of(mm),
+    }
 }
 
 /// Wall-clock time per phase.
@@ -391,12 +479,10 @@ mod tests {
         assert_eq!(page.image.width, MIN_PAGE_SIZE);
         assert!(page.image.data.iter().all(|&v| v == atlas::UNSEEN_GRAY));
         // Vertices lie on the walls: within a few mm of the 4 mm grid of points.
-        assert!(
-            stats.accuracy_mean_mm > 0.0 && stats.accuracy_mean_mm < 3.0,
-            "{stats:?}"
-        );
-        assert!(stats.accuracy_p95_mm >= stats.accuracy_mean_mm);
-        assert!(stats.accuracy_p95_mm < 5.0, "{stats:?}");
+        let a = stats.accuracy.all;
+        assert!(a.mean_mm > 0.0 && a.mean_mm < 3.0, "{stats:?}");
+        assert!(a.p95_mm >= a.mean_mm);
+        assert!(a.p95_mm < 5.0, "{stats:?}");
         for phase in ["tsdf", "extract", "cleanup", "simplify", "accuracy"] {
             assert!(stats.seconds.contains_key(phase), "{phase}");
         }
@@ -479,7 +565,7 @@ mod tests {
             "{stats:?}"
         );
         // Mostly the 2 cm spacing of the points (a vertex between points is up to 14 mm away).
-        assert!(stats.accuracy_mean_mm < 25.0, "{stats:?}");
+        assert!(stats.accuracy.all.mean_mm < 25.0, "{stats:?}");
         for phase in ["views", "labels", "bake", "seams"] {
             assert!(stats.seconds.contains_key(phase), "{phase}");
         }
@@ -496,6 +582,32 @@ mod tests {
         let two = [src.clone(), src];
         let r = build_surface(&scan.input(), &two, &cfg, &Progress::new());
         assert!(matches!(r, Err(MapError::Config(_))), "{r:?}");
+    }
+
+    #[test]
+    fn accuracy_split_walls_and_edges() {
+        // A closed slab of 1 cm squares: vertices inside a side are wall, those on the
+        // slab's edges and corners are edge. One point per vertex, 1 mm off on walls, 4 mm off
+        // on edges.
+        let mesh = testutil::wall_with_hole(10, 0.01, None);
+        let flat = flat_vertices(&mesh);
+        let walls = flat.iter().filter(|&&f| f).count();
+        assert!(walls > 0 && walls < mesh.positions.len());
+        let xyz: Vec<[f32; 3]> = mesh
+            .positions
+            .iter()
+            .zip(&flat)
+            .map(|(p, &f)| [p[0], p[1], p[2] + if f { 0.001 } else { 0.004 }])
+            .collect();
+        let a = accuracy(&mesh, &xyz);
+        assert_eq!(a.walls.vertices, walls);
+        assert_eq!(a.walls.vertices + a.edges.vertices, mesh.positions.len());
+        assert!((a.walls.median_mm - 1.0).abs() < 0.01, "{a:?}");
+        assert!((a.walls.mean_mm - 1.0).abs() < 0.01, "{a:?}");
+        assert!((a.edges.median_mm - 4.0).abs() < 0.01, "{a:?}");
+        assert!((a.edges.p95_mm - 4.0).abs() < 0.01, "{a:?}");
+        assert!(a.all.mean_mm > 1.0 && a.all.mean_mm < 4.0, "{a:?}");
+        assert_eq!(a.all.vertices, mesh.positions.len());
     }
 
     #[test]
