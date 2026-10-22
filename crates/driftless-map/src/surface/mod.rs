@@ -280,10 +280,13 @@ pub fn texture_mesh(
     check_cancel(progress)?;
     let tex = match sources.first() {
         Some(src) => {
-            let views = views::collect_views(mesh, src, cfg, progress)?;
+            let mut views = views::collect_views(mesh, src, cfg, progress)?;
             clock.lap(stats, "views");
             check_cancel(progress)?;
             let labels = atlas::choose_labels(mesh, &views, cfg);
+            // Baking needs the images and the exposure, not the views per face (12 bytes per
+            // view, `views_per_face` per face): free them before the pages are allocated.
+            views.per_face = Vec::new();
             clock.lap(stats, "labels");
             check_cancel(progress)?;
             let (mut tex, texture) = atlas::bake(mesh, &labels, &views, src, cfg, progress)?;

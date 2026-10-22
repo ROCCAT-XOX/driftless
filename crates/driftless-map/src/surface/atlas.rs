@@ -1808,6 +1808,20 @@ mod tests {
     }
 
     #[test]
+    fn bake_needs_no_views_per_face() {
+        // `texture_mesh` frees the views per face before the pages are allocated.
+        let (mesh, src, _) = fixture("atlas-noviews", &[-0.15, 0.15], false);
+        let cfg = SurfaceConfig::default();
+        let progress = Progress::new();
+        let mut views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let labels = choose_labels(&mesh, &views, &cfg);
+        let with = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        views.per_face = Vec::new();
+        let without = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        assert_eq!(with, without);
+    }
+
+    #[test]
     fn bake_cancellable_and_checked() {
         let (mesh, src, _) = fixture("atlas-cancel", &[0.0], false);
         let cfg = SurfaceConfig::default();
