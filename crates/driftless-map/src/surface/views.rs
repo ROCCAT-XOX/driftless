@@ -25,25 +25,40 @@
 //!    Each face keeps its [`SurfaceConfig::views_per_face`] best views (higher score first;
 //!    equal scores: the earlier image).
 //!
-//! **The carrier** of the device stands next to it and below the camera: a view from a camera
-//! less than [`CARRIER_RADIUS`] away horizontally (world Z up) of a face's centroid that lies
+//! **The carrier** of the device stands next to it and below the camera: a view looking
+//! steeply down (horizontal distance below both [`CARRIER_RADIUS`] and the height below the
+//! camera, world Z up) at a face that faces up (normal `z` above [`CARRIER_NORMAL_Z`]) and lies
 //! more than [`CARRIER_BELOW`] below the camera may show the carrier's legs or shoes instead of
-//! the floor. Such a view is tagged ([`FaceView::carrier`]) and ranks behind every untagged
-//! view of the face; after the pass ([`filter_views`]) it is dropped if the face has an
-//! untagged one, so the floor along the walking path is textured from farther away.
+//! the floor. Such a view is tagged ([`FaceView::carrier`]) and ranks as if its score were
+//! [`CARRIER_ALTERNATIVE`] of its own. After the pass ([`filter_views`]) the tagged views of a
+//! face are dropped if its best untagged view scores at least [`CARRIER_ALTERNATIVE`] of its
+//! best tagged one, so the floor along the walking path is textured from farther away where
+//! there is a decent view; otherwise they stay. (If the tagged views were pushed out of the
+//! slots by untagged ones, each of those scores above that share: the same decision.) Walls,
+//! desk edges and steps' risers near the path are not tagged.
 //!
 //! **Photo consistency**: every view also keeps the mean colour of its face in the image
 //! ([`FaceView::colour`]: the centroid and the three points halfway to the corners, bilinear
 //! in the image at 1/[`SHARPNESS_DOWNSCALE`], linear mean, as sRGB) and the centroid's angle
 //! from the optical axis. After the exposure fit, a face with at least
 //! [`CONSISTENCY_MIN_VIEWS`] views compares their colours divided by gain and edge falloff
-//! (sRGB): a view further than [`PHOTO_TOLERANCE`] in any channel from the per-channel median
-//! shows something the mesh does not have (a person walking by, the carrier, a reflection) and
-//! is dropped. If every view is that far, the one nearest the median stays.
+//! (sRGB). The median is taken over votes, not views: per camera and stretch of
+//! [`VOTE_GAP`] of capture time (`⌊stamp / VOTE_GAP⌋`) only the best view votes, since a
+//! person standing still for a few frames would otherwise outvote the bare wall. A view further
+//! than [`PHOTO_TOLERANCE`] in any channel from the median shows something the mesh does not
+//! have (a person walking by, the carrier, a reflection) and is dropped, but only if the votes
+//! within the tolerance are a strict majority: with a 2/2 split (or no vote near the median)
+//! nothing says which side is right, and all views stay. The views' order is kept; at most
+//! [`MAX_VIEWS_PER_FACE`] per face. The exposure fit runs before this check (it needs the
+//! gains), so its sample still contains the dropped views.
 //!
 //! For a port of the pass (GPU): it has to fill [`ViewTable::per_face`] as
-//! [`keep_best_view`] does, with all three fields of [`FaceView`]; [`filter_views`] then
-//! runs on the result as it stands.
+//! [`keep_best_view`] does: [`FaceView`] has four fields (`image`, `score`, `colour`, `tag`;
+//! 12 bytes), `tag` holds the carrier bit (7) and the centroid's angle from the optical axis
+//! quantised to steps of π/127 (bits 0–6, rounded, at most 127); the slot order is
+//! [`FaceView::better_than`]: a view before an empty slot, then the higher score with a tagged
+//! view's score counted at [`CARRIER_ALTERNATIVE`], then the earlier image; a view goes in
+//! only if it beats the last slot. [`filter_views`] then runs on the result as it stands.
 //!
 //! Exposure and white balance: every `k`-th face (at most [`EXPOSURE_FACES`]) also keeps the
 //! colour (bilinear, linear RGB, at its centroid) and the angle from the optical axis of its
@@ -77,8 +92,18 @@ pub const MAX_SUBDIVISIONS: usize = 32;
 /// A view of a face whose centroid lies within this horizontal distance (m) of the camera …
 pub const CARRIER_RADIUS: f64 = 1.2;
 /// … and more than this far below it (m) may show the carrier of the device (see the module
-/// docs).
+/// docs) …
 pub const CARRIER_BELOW: f64 = 0.5;
+/// … if the face faces up: its unit normal's `z` is above this (45°: floor, not wall).
+pub const CARRIER_NORMAL_Z: f32 = 0.7;
+/// A tagged view counts as this share of its score in the slot order, and the tagged views of
+/// a face are dropped only if its best untagged view reaches this share of the best tagged one.
+pub const CARRIER_ALTERNATIVE: f32 = 0.25;
+/// Photo consistency: per camera, one vote per stretch of this much capture time (s).
+pub const VOTE_GAP: f64 = 1.0;
+/// Most views per face (`SurfaceConfig::views_per_face`); the consistency check works on
+/// fixed arrays of this size.
+pub const MAX_VIEWS_PER_FACE: usize = 32;
 /// [`FaceView::tag`] bit of a view that may show the carrier.
 const TAG_CARRIER: u8 = 0x80;
 /// [`FaceView::tag`] bits 0–6: the angle from the optical axis in steps of this (rad).
@@ -135,16 +160,24 @@ impl FaceView {
         f32::from(self.tag & !TAG_CARRIER) * ANGLE_STEP
     }
 
-    /// A view before an empty slot; an untagged view before a [`FaceView::carrier`] one; then
-    /// the higher score; equal scores: the earlier image.
-    fn better_than(&self, other: &FaceView) -> bool {
+    /// Its score in the slot order: a [`FaceView::carrier`] view's counts at
+    /// [`CARRIER_ALTERNATIVE`].
+    fn rank_score(&self) -> f32 {
+        if self.carrier() {
+            self.score * CARRIER_ALTERNATIVE
+        } else {
+            self.score
+        }
+    }
+
+    /// A view before an empty slot; then the higher [`FaceView::rank_score`]; equal: the
+    /// earlier image.
+    pub(crate) fn better_than(&self, other: &FaceView) -> bool {
         if (self.score > 0.0) != (other.score > 0.0) {
             return self.score > 0.0;
         }
-        if self.carrier() != other.carrier() {
-            return !self.carrier();
-        }
-        self.score > other.score || (self.score == other.score && self.image < other.image)
+        let (a, b) = (self.rank_score(), other.rank_score());
+        a > b || (a == b && self.image < other.image)
     }
 }
 
@@ -354,8 +387,11 @@ fn image_views(
             if score.is_nan() || score <= 0.0 {
                 return None;
             }
-            let below = to_cam.z;
-            let carrier = to_cam.x.hypot(to_cam.y) < CARRIER_RADIUS && below > CARRIER_BELOW;
+            let (below, across) = (to_cam.z, to_cam.x.hypot(to_cam.y));
+            let carrier = faces.normal[f][2] > CARRIER_NORMAL_Z
+                && below > CARRIER_BELOW
+                && across < CARRIER_RADIUS
+                && across < below;
             let to_px = |p: [f32; 2]| p.map(|x| ((f64::from(x) + 0.5) * to_colour - 0.5) as f32);
             let centre_rgb = sample_linear(shot.rgb, to_px(proj.uv), lin);
             // Mean colour: the centroid and the points halfway to the corners (in the image).
@@ -383,61 +419,100 @@ fn image_views(
         .collect()
 }
 
-/// Drops the views of a face that may show the carrier if it has another, then the views
-/// that do not fit the others' colours (see the module docs). `per_face` holds `k` slots per
-/// face, as [`keep_best_view`] fills them; `cameras` is the camera of every image (by rank),
-/// `gains` and `vignetting` the exposure. The kept views stay in their order.
+/// Drops the views of a face that may show the carrier if it has a decent other one, then the
+/// views that do not fit the others' colours (see the module docs). `per_face` holds `k`
+/// slots per face (at most [`MAX_VIEWS_PER_FACE`]), as [`keep_best_view`] fills them;
+/// `images`, `gains` and `vignetting` are the used images and their exposure. The kept views
+/// are ordered by score (then image).
 pub(crate) fn filter_views(
     per_face: &mut [FaceView],
     k: usize,
-    cameras: &[usize],
+    images: &[UsedImage],
     gains: &[[f32; 3]],
     vignetting: &Vignetting,
 ) {
+    assert!(k <= MAX_VIEWS_PER_FACE, "too many views per face");
     let lin = linear_table();
     per_face.par_chunks_mut(k).for_each(|slots| {
-        // Tagged views rank behind every untagged one.
-        if slots[0].score > 0.0 && !slots[0].carrier() {
+        let best = |carrier: bool| {
+            slots
+                .iter()
+                .filter(|s| s.score > 0.0 && s.carrier() == carrier)
+                .map(|s| s.score)
+                .fold(0.0f32, f32::max)
+        };
+        let (tagged, untagged) = (best(true), best(false));
+        if tagged > 0.0 && untagged >= CARRIER_ALTERNATIVE * tagged {
             for s in slots.iter_mut().filter(|s| s.carrier()) {
                 *s = FaceView::EMPTY;
             }
         }
+        // By score, empty slots last.
+        slots.sort_by(|a, b| {
+            (b.score > 0.0)
+                .cmp(&(a.score > 0.0))
+                .then(b.score.total_cmp(&a.score))
+                .then(a.image.cmp(&b.image))
+        });
         let n = slots.iter().take_while(|s| s.score > 0.0).count();
         if n < CONSISTENCY_MIN_VIEWS {
             return;
         }
-        // Exposure-corrected colours (sRGB levels) and their per-channel median.
-        let colours: Vec<[f64; 3]> = slots[..n]
-            .iter()
-            .map(|v| {
-                let r = v.image as usize;
-                std::array::from_fn(|c| {
-                    let l = lin[v.colour[c] as usize]
-                        / (gains[r][c] * vignetting.factor(cameras[r], c, v.theta()));
-                    srgb_value(l)
-                })
-            })
-            .collect();
-        let median: [f64; 3] = std::array::from_fn(|c| {
-            let mut x: Vec<f64> = colours.iter().map(|v| v[c]).collect();
-            x.sort_by(f64::total_cmp);
-            (x[(n - 1) / 2] + x[n / 2]) / 2.0
-        });
-        let off: Vec<f64> = colours
-            .iter()
-            .map(|v| (0..3).map(|c| (v[c] - median[c]).abs()).fold(0.0, f64::max))
-            .collect();
-        let mut keep: Vec<bool> = off.iter().map(|&d| d <= PHOTO_TOLERANCE).collect();
-        if !keep.contains(&true) {
-            // The nearest one stays (the earlier, better view on a tie).
-            let best = (0..n)
-                .min_by(|&a, &b| off[a].total_cmp(&off[b]).then(a.cmp(&b)))
-                .expect("at least one view");
-            keep[best] = true;
+        // Exposure-corrected colours (sRGB levels).
+        let mut colours = [[0.0f64; 3]; MAX_VIEWS_PER_FACE];
+        for (c, v) in colours.iter_mut().zip(&slots[..n]) {
+            let r = v.image as usize;
+            let cam = images[r].camera;
+            *c = std::array::from_fn(|ch| {
+                srgb_value(
+                    lin[v.colour[ch] as usize]
+                        / (gains[r][ch] * vignetting.factor(cam, ch, v.theta())),
+                )
+            });
         }
-        let kept: Vec<FaceView> = (0..n).filter(|&i| keep[i]).map(|i| slots[i]).collect();
-        for (i, s) in slots.iter_mut().enumerate() {
-            *s = kept.get(i).copied().unwrap_or(FaceView::EMPTY);
+        // Votes: the first (best) view per camera and stretch of VOTE_GAP.
+        let stretch = |i: usize| {
+            let u = &images[slots[i].image as usize];
+            (u.camera, (u.stamp / VOTE_GAP).floor() as i64)
+        };
+        let mut voter = [false; MAX_VIEWS_PER_FACE];
+        for (i, v) in voter[..n].iter_mut().enumerate() {
+            *v = (0..i).all(|j| stretch(j) != stretch(i));
+        }
+        let votes = voter[..n].iter().filter(|&&v| v).count();
+        if votes < CONSISTENCY_MIN_VIEWS {
+            return;
+        }
+        let median: [f64; 3] = std::array::from_fn(|ch| {
+            let mut x = [0.0f64; MAX_VIEWS_PER_FACE];
+            let mut m = 0;
+            for i in (0..n).filter(|&i| voter[i]) {
+                x[m] = colours[i][ch];
+                m += 1;
+            }
+            x[..m].sort_by(f64::total_cmp);
+            (x[(m - 1) / 2] + x[m / 2]) / 2.0
+        });
+        let near = |i: usize| {
+            (0..3)
+                .map(|ch| (colours[i][ch] - median[ch]).abs())
+                .fold(0.0, f64::max)
+                <= PHOTO_TOLERANCE
+        };
+        let agree = (0..n).filter(|&i| voter[i] && near(i)).count();
+        // Only a strict majority of the votes decides; otherwise all views stay.
+        if 2 * agree <= votes {
+            return;
+        }
+        let mut kept = 0;
+        for i in 0..n {
+            if near(i) {
+                slots[kept] = slots[i];
+                kept += 1;
+            }
+        }
+        for s in &mut slots[kept..] {
+            *s = FaceView::EMPTY;
         }
     });
 }
@@ -609,7 +684,7 @@ pub(crate) fn collect_views(
         vignetting.coeffs.resize(cams.len(), [[0.0; 2]; 3]);
         (gains, vignetting)
     };
-    filter_views(&mut per_face, k, &cameras, &gains, &vignetting);
+    filter_views(&mut per_face, k, &images, &gains, &vignetting);
     Ok(ViewTable {
         images,
         per_face,
@@ -857,15 +932,18 @@ mod tests {
     #[test]
     fn carrier_views_left_out() {
         // The carrier's shoes stand on the floor 0.6–1.0 m in front of the camera, which
-        // looks down at them from 0.75 m (near and steep: the best view by far). A second image
-        // 2.3–2.7 m away sees the same floor without them (the carrier has walked on).
+        // looks down at them from 1.2 m (near and steep: the best view by far). A second image
+        // 1.5–1.9 m away sees the same floor without them (the carrier has walked on).
         let painted = Painted::new(vec![]);
         let cams = cameras();
         let mesh = painted_mesh(&painted, STEP);
         let shoes = aabb([-0.25, 0.65, -1.2], [0.25, 1.15, -1.17]);
-        let near = Isometry3::translation(0.0, 0.0, -0.5);
+        let near = Isometry3::from_parts(
+            nalgebra::Translation3::new(0.0, 0.0, 0.0),
+            UnitQuaternion::from_euler_angles(-0.5, 0.0, 0.0),
+        );
         let far = Isometry3::from_parts(
-            nalgebra::Translation3::new(0.0, -0.6, 0.5),
+            nalgebra::Translation3::new(0.0, -0.8, 0.5),
             UnitQuaternion::from_euler_angles(-0.6, 0.0, 0.0),
         );
         let traj = Steps(vec![(0.0, near), (T0 + 1.5, far)]);
@@ -982,6 +1060,158 @@ mod tests {
         let v = views(&table, k, clear);
         assert_eq!(v[0].image, 0, "{v:?}");
         assert_eq!(v.iter().filter(|x| x.score > 0.0).count(), 3, "{v:?}");
+    }
+
+    #[test]
+    fn low_wall_near_path_keeps_near_view() {
+        // A wall face 0.3 m above the floor, 0.8 m in front of a camera looking down at it
+        // (0.9 m below): near the path, but no floor. A second image sees it from 3 m.
+        let painted = Painted::new(vec![]);
+        let cams = cameras();
+        let mesh = painted_mesh(&painted, STEP);
+        let cam_y = cams[0].cam_in_body.translation.vector.y;
+        let near = Isometry3::from_parts(
+            nalgebra::Translation3::new(0.0, 4.2 - cam_y, 0.0),
+            UnitQuaternion::from_euler_angles(-0.6, 0.0, 0.0),
+        );
+        let far = Isometry3::translation(0.0, 2.0 - cam_y, 0.0);
+        let traj = Steps(vec![(0.0, near), (T0 + 1.5, far)]);
+        let shots = [shot(0, T0 + 1.0), shot(0, T0 + 2.0)];
+        let images = write_bag("views-lowwall", &painted, &traj, &cams, &shots);
+        let src = source(&images, &poses(&traj, 3.0), &cams);
+        let cfg = SurfaceConfig::default();
+        let table = collect_views(&mesh, &src, &cfg, &Progress::new()).unwrap();
+        assert_eq!(table.images.len(), 2, "{:?}", table.images);
+        let f = face_near(&mesh, [0.0, 5.0, -0.9]);
+        let v = views(&table, cfg.views_per_face, f);
+        assert!(v.iter().any(|x| x.image == 0), "{v:?}");
+        assert!(v.iter().any(|x| x.image == 1), "{v:?}");
+        assert!(v.iter().all(|x| !x.carrier()), "{v:?}");
+    }
+
+    #[test]
+    fn carrier_drop_needs_decent_alternative() {
+        // A floor face's near view (tagged) and a poor grazing one: the near view stays; with
+        // a decent alternative it goes.
+        let view = |image: u32, score: f32, tag: u8| FaceView {
+            image,
+            score,
+            colour: [80; 3],
+            tag,
+        };
+        let images: Vec<UsedImage> = (0..3)
+            .map(|i| UsedImage {
+                camera: 0,
+                stamp: f64::from(i),
+                world_from_cam: Isometry3::identity(),
+            })
+            .collect();
+        let gains = vec![[1.0f32; 3]; 3];
+        let flat = Vignetting::flat(1, 4.0);
+        let k = 8;
+        let mut slots = vec![FaceView::EMPTY; k];
+        keep_best_view(&mut slots, view(0, 100.0, TAG_CARRIER));
+        keep_best_view(&mut slots, view(1, 10.0, 0));
+        filter_views(&mut slots, k, &images, &gains, &flat);
+        let kept: Vec<u32> = slots
+            .iter()
+            .filter(|v| v.score > 0.0)
+            .map(|v| v.image)
+            .collect();
+        assert_eq!(kept, [0, 1], "{slots:?}");
+        let mut slots = vec![FaceView::EMPTY; k];
+        keep_best_view(&mut slots, view(0, 100.0, TAG_CARRIER));
+        keep_best_view(&mut slots, view(1, 10.0, 0));
+        keep_best_view(&mut slots, view(2, 40.0, 0));
+        filter_views(&mut slots, k, &images, &gains, &flat);
+        let kept: Vec<u32> = slots
+            .iter()
+            .filter(|v| v.score > 0.0)
+            .map(|v| v.image)
+            .collect();
+        assert_eq!(kept, [2, 1], "{slots:?}");
+    }
+
+    #[test]
+    fn still_person_in_several_frames_is_outvoted() {
+        // Somebody stands 0.5 m in front of the +y wall for four frames within a second; three
+        // frames from other times show the bare wall. Per frame the person is the majority
+        // (4 of 7); per stretch of VOTE_GAP it is one vote of four.
+        let painted = Painted::new(vec![]);
+        let cams = cameras();
+        let mesh = painted_mesh(&painted, STEP);
+        let cam_y = cams[0].cam_in_body.translation.vector.y;
+        let body = move |x: f64| Isometry3::translation(x, 3.5 - cam_y, 0.0);
+        let person_xs = [0.0, 0.1, 0.2, 0.3];
+        let wall_xs = [(3.0, -1.0), (5.0, 1.0), (7.0, -0.6)];
+        let mut stamps: Vec<(f64, f64)> = person_xs
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| (1.0 + 0.25 * i as f64, x))
+            .collect();
+        stamps.extend(wall_xs);
+        // Each pose holds from halfway to the previous frame (poses are sampled at 10 Hz).
+        let traj = Steps(
+            stamps
+                .iter()
+                .enumerate()
+                .map(|(i, &(t, x))| {
+                    let from = if i == 0 {
+                        0.0
+                    } else {
+                        T0 + (t + stamps[i - 1].0) / 2.0
+                    };
+                    (from, body(x))
+                })
+                .collect(),
+        );
+        let person = aabb([-0.3, 4.4, -0.4], [0.3, 4.6, 0.5]);
+        let shots: Vec<Shot> = stamps
+            .iter()
+            .enumerate()
+            .map(|(i, &(t, x))| {
+                if i < person_xs.len() {
+                    let cam = cams[0].clone();
+                    Shot {
+                        camera: 0,
+                        stamp: T0 + t,
+                        edit: Box::new(move |_| {
+                            let scene = Painted::new(vec![(person, [40, 50, 90])]);
+                            render(&scene, &cam.camera, &(body(x) * cam.cam_in_body))
+                        }),
+                    }
+                } else {
+                    shot(0, T0 + t)
+                }
+            })
+            .collect();
+        let images = write_bag("views-still-person", &painted, &traj, &cams, &shots);
+        let src = source(&images, &poses(&traj, 8.0), &cams);
+        let mut cfg = SurfaceConfig::default();
+        // The bare wall is far less sharp than the frames with the person in front.
+        cfg.color.min_sharpness = 0.0;
+        let k = cfg.views_per_face;
+        let table = collect_views(&mesh, &src, &cfg, &Progress::new()).unwrap();
+        assert_eq!(table.images.len(), 7, "{:?}", table.images);
+        let behind: Vec<usize> = (0..mesh.indices.len())
+            .filter(|&f| {
+                let c = centroid(&mesh, f);
+                c[1] > 4.99 && c[0].abs() < 0.2 && c[2] > -0.45 && c[2] < 0.6
+            })
+            .collect();
+        assert!(behind.len() > 10, "{}", behind.len());
+        for &f in &behind {
+            let v = views(&table, k, f);
+            // Ranks 0–3 are the frames with the person.
+            assert!(
+                v.iter().all(|x| x.score == 0.0 || x.image >= 4),
+                "face {f}: {v:?}"
+            );
+            assert!(
+                v.iter().filter(|x| x.score > 0.0).count() >= 2,
+                "face {f}: {v:?}"
+            );
+        }
     }
 
     #[test]

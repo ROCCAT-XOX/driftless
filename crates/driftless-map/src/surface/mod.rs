@@ -146,8 +146,11 @@ impl SurfaceConfig {
                 "Texturseite muss mindestens {MIN_PAGE_SIZE} Pixel breit sein"
             )));
         }
-        if self.views_per_face == 0 {
-            return bad("Ansichten je Fläche müssen mindestens 1 sein");
+        if self.views_per_face == 0 || self.views_per_face > views::MAX_VIEWS_PER_FACE {
+            return Err(MapError::Config(format!(
+                "Ansichten je Fläche müssen zwischen 1 und {} liegen",
+                views::MAX_VIEWS_PER_FACE
+            )));
         }
         if !(0.0..=1.0).contains(&self.smooth_weight) {
             return bad("Glättungsgewicht muss zwischen 0 und 1 liegen");
