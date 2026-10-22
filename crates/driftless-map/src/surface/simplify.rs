@@ -1,6 +1,7 @@
 //! Triangle reduction: flat walls become a few big triangles, the shape stays within a tight error.
 //! Then edges longer than [`SurfaceConfig::max_edge`] are split, so that every face fits into
-//! a camera image for the texture.
+//! a camera image for the texture, and slivers on flat parts are turned into rounder faces by
+//! edge flips ([`improve_triangles`]).
 
 use super::{Mesh, SurfaceConfig};
 use meshopt::{SimplifyOptions, VertexDataAdapter};
@@ -39,7 +40,144 @@ pub fn simplify(mesh: &Mesh, cfg: &SurfaceConfig) -> Mesh {
     };
     drop_unused(&mut out);
     split_long_edges(&mut out, cfg.max_edge);
+    improve_triangles(
+        &mut out,
+        MAX_FLIP_DEVIATION * cfg.simplify_error,
+        cfg.max_edge,
+    );
     out
+}
+
+/// A flip may move the surface by at most this share of [`SurfaceConfig::simplify_error`].
+const MAX_FLIP_DEVIATION: f64 = 0.5;
+/// Two faces are flipped only if their normals differ by less than this (rad, 20°).
+const MAX_FLIP_BEND: f64 = 0.349;
+/// Rounds of flipping at most.
+const MAX_FLIP_ROUNDS: usize = 8;
+/// A flip must raise the smallest angle of the pair by more than this (rad).
+const MIN_FLIP_GAIN: f64 = 1e-3;
+
+/// Smallest angle (rad) of the triangle `t`; zero if it is degenerate.
+pub(crate) fn min_angle(t: [[f64; 3]; 3]) -> f64 {
+    let angle = |o: [f64; 3], a: [f64; 3], b: [f64; 3]| {
+        let u = sub(a, o);
+        let v = sub(b, o);
+        let c = cross(u, v);
+        dot(c, c).sqrt().atan2(dot(u, v))
+    };
+    angle(t[0], t[1], t[2])
+        .min(angle(t[1], t[2], t[0]))
+        .min(angle(t[2], t[0], t[1]))
+}
+
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// Replaces the shared edge of two neighbouring faces by the other diagonal of their quad
+/// wherever that raises the smallest angle of the pair: slivers left by the reduction (thin
+/// faces that later take their colour from another image than their neighbours) become
+/// rounder. Only nearly flat pairs are flipped (normals within [`MAX_FLIP_BEND`], the fourth
+/// corner within `max_dev` (m) of the plane of the other three), the new edge is at most
+/// `max_edge` long and must not exist yet, and both new faces keep the winding. The vertices,
+/// the boundary and the orientation stay as they were. Faces are visited in order, so the
+/// result is deterministic. Returns the number of flips.
+pub(crate) fn improve_triangles(mesh: &mut Mesh, max_dev: f64, max_edge: f64) -> usize {
+    let mut face_of: HashMap<(u32, u32), u32> = HashMap::with_capacity(mesh.indices.len() * 3);
+    for (f, t) in mesh.indices.iter().enumerate() {
+        for k in 0..3 {
+            face_of.insert((t[k], t[(k + 1) % 3]), f as u32);
+        }
+    }
+    let at = |m: &Mesh, v: u32| m.positions[v as usize].map(f64::from);
+    let unit = |n: [f64; 3]| {
+        let l = dot(n, n).sqrt();
+        (l > 0.0).then(|| n.map(|x| x / l))
+    };
+    let mut flips = 0;
+    for _ in 0..MAX_FLIP_ROUNDS {
+        let mut round = 0;
+        for f in 0..mesh.indices.len() {
+            for k in 0..3 {
+                let t = mesh.indices[f];
+                let (a, b, c) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
+                let Some(&g) = face_of.get(&(b, a)) else {
+                    continue;
+                };
+                let g = g as usize;
+                let Some(&d) = mesh.indices[g].iter().find(|&&v| v != a && v != b) else {
+                    continue;
+                };
+                if d == c || face_of.contains_key(&(c, d)) || face_of.contains_key(&(d, c)) {
+                    continue;
+                }
+                let (pa, pb, pc, pd) = (at(mesh, a), at(mesh, b), at(mesh, c), at(mesh, d));
+                let (Some(nf), Some(ng)) = (
+                    unit(cross(sub(pb, pa), sub(pc, pa))),
+                    unit(cross(sub(pa, pb), sub(pd, pb))),
+                ) else {
+                    continue;
+                };
+                if dot(nf, ng) < MAX_FLIP_BEND.cos() || dot(sub(pd, pa), nf).abs() > max_dev {
+                    continue;
+                }
+                let diag = sub(pd, pc);
+                if dot(diag, diag).sqrt() > max_edge {
+                    continue;
+                }
+                // New faces a d c and d b c (the quad runs a -> d -> b -> c).
+                let (Some(n1), Some(n2)) = (
+                    unit(cross(sub(pd, pa), sub(pc, pa))),
+                    unit(cross(sub(pb, pd), sub(pc, pd))),
+                ) else {
+                    continue;
+                };
+                let mean = [0, 1, 2].map(|i| nf[i] + ng[i]);
+                if dot(n1, mean) <= 0.0 || dot(n2, mean) <= 0.0 || dot(n1, n2) < MAX_FLIP_BEND.cos()
+                {
+                    continue;
+                }
+                let old = min_angle([pa, pb, pc]).min(min_angle([pb, pa, pd]));
+                let new = min_angle([pa, pd, pc]).min(min_angle([pd, pb, pc]));
+                if new <= old + MIN_FLIP_GAIN {
+                    continue;
+                }
+                mesh.indices[f] = [a, d, c];
+                mesh.indices[g] = [d, b, c];
+                face_of.remove(&(a, b));
+                face_of.remove(&(b, a));
+                for (e, h) in [
+                    ((a, d), f),
+                    ((d, c), f),
+                    ((c, a), f),
+                    ((d, b), g),
+                    ((b, c), g),
+                    ((c, d), g),
+                ] {
+                    face_of.insert(e, h as u32);
+                }
+                round += 1;
+                break; // face f changed: its other edges are looked at in the next round
+            }
+        }
+        flips += round;
+        if round == 0 {
+            break;
+        }
+    }
+    flips
 }
 
 /// Splits every edge longer than `max_edge` (m) until none is left. Per round every long edge
@@ -351,6 +489,80 @@ mod tests {
         assert!(longest_edge(&slab) <= 0.3);
         // Deterministic.
         assert_eq!(simplify(&mesh, &cfg()), out);
+    }
+
+    /// Smallest angle of any face of `mesh` (rad).
+    fn min_angle_of(mesh: &Mesh) -> f64 {
+        mesh.indices
+            .iter()
+            .map(|f| min_angle(f.map(|i| mesh.positions[i as usize].map(f64::from))))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// A flat wall `x = 0.5` of parallelograms (sides 10 cm along y and (8, 2) cm), each cut
+    /// along its long diagonal: slivers.
+    fn sheared_wall(n: usize) -> Mesh {
+        let mut mesh = Mesh::default();
+        for j in 0..=n {
+            for i in 0..=n {
+                let (y, z) = (i as f32 * 0.1 + j as f32 * 0.08, j as f32 * 0.02);
+                mesh.positions.push([0.5, y, z]);
+            }
+        }
+        let id = |i: usize, j: usize| (j * (n + 1) + i) as u32;
+        for j in 0..n {
+            for i in 0..n {
+                mesh.indices
+                    .push([id(i, j), id(i + 1, j), id(i + 1, j + 1)]);
+                mesh.indices
+                    .push([id(i, j), id(i + 1, j + 1), id(i, j + 1)]);
+            }
+        }
+        mesh
+    }
+
+    #[test]
+    fn slivers_on_flat_wall_are_flipped() {
+        let mut mesh = sheared_wall(10);
+        let before = mesh.clone();
+        let worst = min_angle_of(&mesh);
+        assert!(worst.to_degrees() < 7.0, "{}", worst.to_degrees());
+        let flips = improve_triangles(&mut mesh, 0.001, 0.3);
+        assert!(flips >= 100, "{flips}");
+        // Every long diagonal is replaced by the short one: no angle under 10°.
+        assert!(
+            min_angle_of(&mesh).to_degrees() > 10.0,
+            "{}",
+            min_angle_of(&mesh).to_degrees()
+        );
+        assert_eq!(mesh.positions, before.positions);
+        assert_eq!(edge_report(&mesh), edge_report(&before));
+        assert!((0..mesh.indices.len()).all(|f| mesh.face_normal(f)[0] > 0.99));
+        let area = |m: &Mesh| {
+            (0..m.indices.len())
+                .map(|f| f64::from(m.face_area(f)))
+                .sum::<f64>()
+        };
+        assert!((area(&mesh) - area(&before)).abs() < 1e-6);
+        // Deterministic.
+        let mut again = before.clone();
+        improve_triangles(&mut again, 0.001, 0.3);
+        assert_eq!(again, mesh);
+    }
+
+    #[test]
+    fn edges_and_folds_are_not_flipped() {
+        // A closed slab: square cells (no better diagonal) and 90° edges.
+        let mut slab = wall_with_hole(6, 0.1, None);
+        let before = slab.clone();
+        assert_eq!(improve_triangles(&mut slab, 0.001, 0.3), 0);
+        assert_eq!(slab, before);
+        // A sliver pair folded by 1 cm: flipping would move the surface by more than 1 mm.
+        let mut fold = sheared_wall(1);
+        fold.positions[2][0] += 0.01;
+        let before = fold.clone();
+        assert_eq!(improve_triangles(&mut fold, 0.001, 0.3), 0);
+        assert_eq!(fold, before);
     }
 
     #[test]
