@@ -39,3 +39,29 @@ pub(crate) fn plane_x(origin: [f32; 3], x0: f32, half: f32, step: f32) -> Scan {
         sensors: vec![origin],
     }
 }
+
+/// A closed box room `[-hx, hx] × [-hy, hy] × [-hz, hz]` around `origin` (the sensor), every
+/// wall sampled on a regular grid of `step` (m).
+pub(crate) fn box_room(origin: [f32; 3], half: [f32; 3], step: f32) -> Scan {
+    let mut xyz = Vec::new();
+    let count = |h: f32| (h / step).round() as i32;
+    for axis in 0..3 {
+        let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
+        for sign in [-1.0f32, 1.0] {
+            for ia in -count(half[a])..=count(half[a]) {
+                for ib in -count(half[b])..=count(half[b]) {
+                    let mut p = origin;
+                    p[axis] += sign * half[axis];
+                    p[a] += ia as f32 * step;
+                    p[b] += ib as f32 * step;
+                    xyz.push(p);
+                }
+            }
+        }
+    }
+    Scan {
+        sensor_of_point: vec![0; xyz.len()],
+        xyz,
+        sensors: vec![origin],
+    }
+}
