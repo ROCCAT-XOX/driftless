@@ -6,6 +6,7 @@
 mod cleanup;
 mod extract;
 mod mc_tables;
+mod simplify;
 mod tsdf;
 
 #[cfg(test)]
@@ -13,6 +14,7 @@ pub(crate) mod testutil;
 
 pub use cleanup::{cleanup, CleanupStats};
 pub use extract::{extract, Mesh};
+pub use simplify::simplify;
 pub use tsdf::Tsdf;
 
 use crate::{ColorConfig, MapError};

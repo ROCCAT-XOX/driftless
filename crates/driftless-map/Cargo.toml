@@ -16,6 +16,7 @@ driftless-odom = { path = "../driftless-odom" }
 driftless-traj = { path = "../driftless-traj" }
 kiddo = { version = "6", default-features = false }
 las = "0.11"
+meshopt = "0.7"
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }
 rayon = "1.12.0"
 thiserror = "2"
