@@ -106,7 +106,7 @@ impl Default for SurfaceConfig {
             max_edge: 0.3,
             min_texel: 0.002,
             page_size: 4096,
-            views_per_face: 4,
+            views_per_face: 8,
             smooth_weight: 0.5,
             jpeg_quality: 90,
             color: ColorConfig {

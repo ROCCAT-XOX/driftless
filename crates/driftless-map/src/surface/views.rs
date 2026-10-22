@@ -19,7 +19,9 @@
 //!    towards the camera and its corners lie in the image within [`ColorConfig::rim_theta`] of
 //!    the optical axis. Seen at a grazing angle (beyond about 75°), a face is often hidden by
 //!    the nearer part of its own wall in the same depth cell, as in colouring. Its score is
-//!    `projected area (pixels at full size) × sharpness_norm × cos(angle to the normal)`.
+//!    `projected area (pixels at full size) × sharpness_norm × cos(angle to the normal)`,
+//!    the area capped at `face area / min_texel²` ([`SurfaceConfig::min_texel`]): the texture
+//!    is never finer than that, so a nearer image is no better.
 //!    Each face keeps its [`SurfaceConfig::views_per_face`] best views (higher score first;
 //!    equal scores: the earlier image).
 //!
@@ -148,6 +150,10 @@ impl FaceView {
 
 /// Inserts `v` into a face's views (best first) if it is among the best.
 fn keep_best_view(slots: &mut [FaceView], v: FaceView) {
+    // Most views are not among the best: one comparison with the last slot.
+    if !slots.last().is_some_and(|s| v.better_than(s)) {
+        return;
+    }
     if let Some(j) = slots.iter().position(|s| v.better_than(s)) {
         slots[j..].rotate_right(1);
         slots[j] = v;
@@ -249,6 +255,8 @@ struct Shot<'a> {
     sharpness_norm: f32,
     /// The image at 1/[`SHARPNESS_DOWNSCALE`].
     rgb: &'a RgbImage,
+    /// [`SurfaceConfig::min_texel`].
+    min_texel: f64,
 }
 
 /// The faces `shot` sees, in face order.
@@ -338,7 +346,11 @@ fn image_views(
                 * ((uv[1][0] - uv[0][0]) * (uv[2][1] - uv[0][1])
                     - (uv[2][0] - uv[0][0]) * (uv[1][1] - uv[0][1]))
                     .abs();
-            let score = (area * cos) as f32 * shot.sharpness_norm;
+            // Finer than `min_texel` is of no use (see the module docs).
+            let [a, b, c] =
+                mesh.indices[f].map(|i| Vector3::from(mesh.positions[i as usize]).cast::<f64>());
+            let cap = 0.5 * (b - a).cross(&(c - a)).norm() / (shot.min_texel * shot.min_texel);
+            let score = (area.min(cap) * cos) as f32 * shot.sharpness_norm;
             if score.is_nan() || score <= 0.0 {
                 return None;
             }
@@ -547,6 +559,7 @@ pub(crate) fn collect_views(
                 rank,
                 sharpness_norm,
                 rgb: &frame.rgb,
+                min_texel: cfg.min_texel,
             };
             for (f, view, colour) in image_views(mesh, &faces, &grid, &shot, ccfg, sampled, &lin) {
                 let f = f as usize;

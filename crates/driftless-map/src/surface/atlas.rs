@@ -2,17 +2,24 @@
 //!
 //! 1. **Labels** ([`choose_labels`]): every face starts with its best view; then
 //!    [`ICM_ROUNDS`] rounds of ICM visit the faces in index order and give each the candidate
-//!    image (one of its kept views) of least cost `−score / best score of the face +
+//!    image (one of its kept views) of least cost `−sqrt(score / best score of the face) +
 //!    smooth_weight · (edge neighbours with another image)`, so that neighbours share an image
-//!    where the images are about equally good. Faces without a view keep no label.
+//!    where the images are about equally good (the square root: the ratio of the linear
+//!    resolutions, as the score grows with the projected area). Faces without a view keep no
+//!    label. Then small charts are merged ([`merge_small_charts`]): a chart of fewer than
+//!    [`MERGE_FACES`] faces takes the image of a neighbouring chart (the one with the most
+//!    shared edges first) if that image sees all its faces with at least [`MERGE_MIN_SCORE`] of
+//!    their best score. ICM alone cannot do this: inside a small chart every face agrees with
+//!    its neighbours. Each chart costs a border on the page and a seam around it.
 //! 2. **Charts** ([`bake`]): connected faces (over shared edges) with the same label. A chart is
-//!    the image region its faces project to (full resolution, [`Camera::project`]): its
-//!    bounding rectangle, scaled by `s ≤ 1` where the image is finer than
+//!    the image region its faces project to (full resolution, [`Camera::project`]): the
+//!    smallest rectangle around it ([`best_axis`]: one side along an edge of the region's convex
+//!    hull, the long side first), scaled by `s ≤ 1` where the image is finer than
 //!    [`SurfaceConfig::min_texel`] on the surface (`s = texel / min_texel`, texel =
 //!    `sqrt(surface area / image area)` of the chart) or the rectangle would not fit a page,
-//!    plus a border of [`MARGIN`] texels on every side. A chart of several faces that fills
-//!    less than [`MIN_CHART_FILL`] of its rectangle is split at median face centroids until
-//!    every part does (or is one face); [`TextureStats::fill_ratio`] and
+//!    plus a border of [`MARGIN`] texels on every side. A chart that fills less than
+//!    [`MIN_CHART_FILL`] of its rectangle is split at median face centroids where the parts
+//!    need fewer texels than the whole ([`split_chart`]); [`TextureStats::fill_ratio`] and
 //!    [`TextureStats::texels_total`] show how well the rectangles are used.
 //! 3. **Packing** ([`pack`]): shelves on pages of `page_size²`, charts sorted by height (then
 //!    width, then index). The gray block of the unseen faces ([`GRAY_BLOCK`]², filled with
@@ -33,7 +40,8 @@
 //! Texture coordinates: `uv` in 0…1 with `v` pointing down (row 0 of the page image at
 //! `v = 0`); texel `(i, j)` covers `[i, i+1) × [j, j+1)` in `uv · page_size` and has its
 //! centre at `(i + ½, j + ½)`. Within a chart the map from texel to image coordinates is
-//! affine (`image = min + (texel centre − MARGIN − ½) / s`).
+//! affine: a rotation onto the rectangle's sides (`axis`), then `min + (texel centre − MARGIN −
+//! ½) / s` along them.
 //!
 //! For later steps (seam levelling): `TexturedMesh::face_ref[f]` is face `f`'s triangle
 //! (page, index in `pages[page].indices`); `TexturedMesh::textured[f]` says whether an image
@@ -48,7 +56,7 @@
 //!
 //! [`ColorConfig::downscale`]: crate::ColorConfig::downscale
 
-use super::views::{TextureSource, ViewTable};
+use super::views::{FaceView, TextureSource, ViewTable};
 use super::{Mesh, SurfaceConfig};
 use crate::color::{frame_camera, image_count, linear_table, sample_linear, srgb_value, GRAY_MIN};
 use crate::exposure::Vignetting;
@@ -62,6 +70,12 @@ use rayon::prelude::*;
 
 /// Rounds of ICM over the face labels.
 pub const ICM_ROUNDS: usize = 5;
+/// Charts of fewer faces are merged into a neighbouring chart where its image sees them all.
+pub const MERGE_FACES: usize = 64;
+/// … with a view of at least this share of each face's best score.
+pub const MERGE_MIN_SCORE: f32 = 0.25;
+/// Rounds of merging.
+pub const MERGE_ROUNDS: usize = 4;
 /// Border around every chart (texels), filled by dilation.
 pub const MARGIN: u32 = 2;
 /// Edge of the gray block of the unseen faces (texels), at the origin of page 0.
@@ -71,10 +85,11 @@ pub const UNSEEN_GRAY: u8 = GRAY_MIN + (255 - GRAY_MIN) / 2;
 /// A texel of a scaled-down chart averages at most this many samples per axis.
 pub const MAX_SUPERSAMPLE: u32 = 4;
 /// A chart of several faces whose triangles cover less than this share of its rectangle
-/// (border left out) is split in two at the median face centroid along the rectangle's
-/// longer side, again and again until every part reaches it or is a single face: an L-shaped
-/// or patchy chart would otherwise take its whole bounding box on the page.
-pub const MIN_CHART_FILL: f64 = 0.5;
+/// (border left out) is halved at the median face centroid along the rectangle's longer side,
+/// and so on (see [`split_chart`]); a split is kept where the parts together need fewer texels
+/// than the whole, borders included. An L-shaped or patchy chart would otherwise take its
+/// whole bounding box on the page, while splitting a small chart only adds borders.
+pub const MIN_CHART_FILL: f64 = 0.7;
 /// "No chart" / "not yet assigned".
 const NONE: u32 = u32::MAX;
 
@@ -224,7 +239,7 @@ pub(crate) fn choose_labels(
                     .iter()
                     .filter(|&&g| labels[g as usize] != Some(v.image))
                     .count();
-                let cost = -(v.score / best) + cfg.smooth_weight * differ as f32;
+                let cost = -(v.score / best).sqrt() + cfg.smooth_weight * differ as f32;
                 if cost < pick.0 {
                     pick = (cost, Some(v.image));
                 }
@@ -238,7 +253,108 @@ pub(crate) fn choose_labels(
             break;
         }
     }
+    merge_small_charts(&mut labels, &nb, slots);
     labels
+}
+
+/// Connected faces (over edges) with the same label: per face its chart (`NONE` without a
+/// label) and the faces of every chart (CSR: `start`, `faces`; ascending within a chart),
+/// the charts in the order of their first face.
+fn connected(
+    nb: &Neighbours,
+    n: usize,
+    label: impl Fn(usize) -> Option<u32>,
+) -> (Vec<u32>, Vec<usize>, Vec<u32>) {
+    let mut chart_of = vec![NONE; n];
+    let mut faces: Vec<u32> = Vec::new();
+    let mut start: Vec<usize> = vec![0];
+    let mut stack: Vec<u32> = Vec::new();
+    for f in 0..n {
+        let Some(l) = label(f) else {
+            continue;
+        };
+        if chart_of[f] != NONE {
+            continue;
+        }
+        let c = (start.len() - 1) as u32;
+        chart_of[f] = c;
+        stack.push(f as u32);
+        let first = faces.len();
+        while let Some(g) = stack.pop() {
+            faces.push(g);
+            for &h in nb.of(g as usize) {
+                let h_ = h as usize;
+                if chart_of[h_] == NONE && label(h_) == Some(l) {
+                    chart_of[h_] = c;
+                    stack.push(h);
+                }
+            }
+        }
+        faces[first..].sort_unstable();
+        start.push(faces.len());
+    }
+    (chart_of, start, faces)
+}
+
+/// Merges charts of fewer than [`MERGE_FACES`] faces into a neighbouring chart (see the
+/// module docs): smallest first (then in face order), into the neighbouring image with the
+/// most shared edges whose views of all the chart's faces score at least [`MERGE_MIN_SCORE`]
+/// of their best; up to [`MERGE_ROUNDS`] rounds.
+fn merge_small_charts<'a>(
+    labels: &mut [Option<u32>],
+    nb: &Neighbours,
+    slots: impl Fn(usize) -> &'a [FaceView],
+) {
+    let n = labels.len();
+    let mut around: Vec<u32> = Vec::new();
+    for _ in 0..MERGE_ROUNDS {
+        let (chart_of, start, faces) = connected(nb, n, |f| labels[f]);
+        let size = |c: usize| start[c + 1] - start[c];
+        let mut small: Vec<usize> = (0..start.len() - 1)
+            .filter(|&c| size(c) < MERGE_FACES)
+            .collect();
+        small.sort_by_key(|&c| (size(c), c));
+        let mut changed = false;
+        for c in small {
+            let own = &faces[start[c]..start[c + 1]];
+            let label = labels[own[0] as usize];
+            // The neighbouring images, by shared edges (most first, then the lower rank).
+            around.clear();
+            for &f in own {
+                for &g in nb.of(f as usize) {
+                    if chart_of[g as usize] != c as u32 {
+                        if let Some(l) = labels[g as usize].filter(|&l| Some(l) != label) {
+                            around.push(l);
+                        }
+                    }
+                }
+            }
+            around.sort_unstable();
+            let mut counted: Vec<(usize, u32)> = around
+                .chunk_by(|a, b| a == b)
+                .map(|run| (run.len(), run[0]))
+                .collect();
+            counted.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            let sees = |f: u32, l: u32| {
+                let s = slots(f as usize);
+                s.iter().any(|v| {
+                    v.score > 0.0 && v.image == l && v.score >= MERGE_MIN_SCORE * s[0].score
+                })
+            };
+            if let Some(&(_, l)) = counted
+                .iter()
+                .find(|&&(_, l)| own.iter().all(|&f| sees(f, l)))
+            {
+                for &f in own {
+                    labels[f as usize] = Some(l);
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 /// Places rectangles `sizes` (`[w, h]`, each at most `page` on a side) on pages of `page²`:
@@ -356,7 +472,9 @@ struct Projected {
 #[derive(Debug, Clone)]
 struct Chart {
     rank: u32,
-    /// Smallest image coordinates of its corners (pixels, full size).
+    /// The rectangle's first side in the image (unit vector, see [`turn`]).
+    axis: [f64; 2],
+    /// Smallest coordinates of its corners along the rectangle's sides (pixels, full size).
     min: [f64; 2],
     /// Texels per image pixel (≤ 1).
     scale: f64,
@@ -370,7 +488,14 @@ impl Chart {
     /// Image coordinates → texel coordinates within the chart's rectangle.
     fn to_texel(&self, uv: [f32; 2]) -> [f64; 2] {
         let m = f64::from(MARGIN) + 0.5;
-        [0, 1].map(|k| m + (f64::from(uv[k]) - self.min[k]) * self.scale)
+        let q = turn(self.axis, uv.map(f64::from));
+        [0, 1].map(|k| m + (q[k] - self.min[k]) * self.scale)
+    }
+
+    /// Coordinates along the rectangle's sides (pixels) → image coordinates.
+    fn to_image(&self, q: [f64; 2]) -> [f64; 2] {
+        let u = self.axis;
+        [u[0] * q[0] - u[1] * q[1], u[1] * q[0] + u[0] * q[1]]
     }
 }
 
@@ -427,41 +552,18 @@ pub(crate) fn bake(
         })
         .collect();
 
-    // Charts: flood fill over edge neighbours with the same label, in face order.
+    // Charts: connected faces with the same label, in face order.
     let nb = Neighbours::new(mesh);
-    let mut chart_of = vec![NONE; n];
-    let mut chart_faces: Vec<u32> = Vec::new();
-    let mut chart_start: Vec<usize> = vec![0];
-    let mut chart_rank: Vec<u32> = Vec::new();
-    let mut stack: Vec<u32> = Vec::new();
-    for f in 0..n {
-        if proj[f].is_none() || chart_of[f] != NONE {
-            continue;
-        }
-        let c = chart_rank.len() as u32;
-        let label = labels[f];
-        chart_rank.push(label.expect("projected faces have a label"));
-        chart_of[f] = c;
-        stack.push(f as u32);
-        let first = chart_faces.len();
-        while let Some(g) = stack.pop() {
-            chart_faces.push(g);
-            for &h in nb.of(g as usize) {
-                let h_ = h as usize;
-                if chart_of[h_] == NONE && proj[h_].is_some() && labels[h_] == label {
-                    chart_of[h_] = c;
-                    stack.push(h);
-                }
-            }
-        }
-        chart_faces[first..].sort_unstable();
-        chart_start.push(chart_faces.len());
-    }
-    drop(nb);
+    let (chart_of, chart_start, chart_faces) = connected(&nb, n, |f| proj[f].and(labels[f]));
+    drop((nb, chart_of));
+    let chart_rank: Vec<u32> = chart_start[..chart_start.len() - 1]
+        .iter()
+        .map(|&i| labels[chart_faces[i] as usize].expect("projected faces have a label"))
+        .collect();
 
     // Texel scale of every connected chart (`min_texel`), then poorly filled charts split
     // into parts; the parts are the charts from here on.
-    let groups: Vec<(u32, f64, Vec<Vec<u32>>)> = (0..chart_rank.len())
+    let groups: Vec<(u32, f64, Vec<Part>)> = (0..chart_rank.len())
         .into_par_iter()
         .map(|c| {
             let faces = &chart_faces[chart_start[c]..chart_start[c + 1]];
@@ -490,12 +592,12 @@ pub(crate) fn bake(
     drop(chart_faces);
     let mut part_faces: Vec<u32> = Vec::new();
     let mut part_start: Vec<usize> = vec![0];
-    let mut part_of: Vec<(u32, f64)> = Vec::new();
+    let mut part_of: Vec<(u32, f64, [f64; 2])> = Vec::new();
     for (rank, scale, parts) in groups {
-        for part in parts {
+        for (part, axis) in parts {
             part_faces.extend(part);
             part_start.push(part_faces.len());
-            part_of.push((rank, scale));
+            part_of.push((rank, scale, axis));
         }
     }
     let charts_n = part_of.len();
@@ -506,9 +608,9 @@ pub(crate) fn bake(
     let mut charts: Vec<Chart> = (0..charts_n)
         .into_par_iter()
         .map(|c| {
-            let (lo, hi) = bounds(faces_of(c), &proj);
+            let (rank, mut scale, axis) = part_of[c];
+            let (lo, hi) = bounds(faces_of(c), &proj, axis);
             let extent = (hi[0] - lo[0]).max(hi[1] - lo[1]);
-            let (rank, mut scale) = part_of[c];
             if extent * scale > room {
                 scale = room / extent;
             }
@@ -518,6 +620,7 @@ pub(crate) fn bake(
             };
             Chart {
                 rank,
+                axis,
                 min: lo,
                 scale,
                 size: [core(0) + 2 * MARGIN, core(1) + 2 * MARGIN],
@@ -744,58 +847,164 @@ pub(crate) fn bake(
     ))
 }
 
-/// Smallest and largest image coordinates of the corners of `faces`.
-fn bounds(faces: &[u32], proj: &[Option<Projected>]) -> ([f64; 2], [f64; 2]) {
+/// Image point `p` in the frame of a rectangle whose first side runs along `axis` (unit
+/// vector): `(axis · p, axis × p)`.
+fn turn(axis: [f64; 2], p: [f64; 2]) -> [f64; 2] {
+    [
+        axis[0] * p[0] + axis[1] * p[1],
+        axis[0] * p[1] - axis[1] * p[0],
+    ]
+}
+
+/// Smallest and largest coordinates of the corners of `faces` along the sides of a rectangle
+/// whose first side runs along `axis` (see [`turn`]).
+fn bounds(faces: &[u32], proj: &[Option<Projected>], axis: [f64; 2]) -> ([f64; 2], [f64; 2]) {
     let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
     for &f in faces {
         for uv in proj[f as usize].expect("chart faces are projected").uv {
+            let q = turn(axis, uv.map(f64::from));
             for k in 0..2 {
-                lo[k] = lo[k].min(f64::from(uv[k]));
-                hi[k] = hi[k].max(f64::from(uv[k]));
+                lo[k] = lo[k].min(q[k]);
+                hi[k] = hi[k].max(q[k]);
             }
         }
     }
     (lo, hi)
 }
 
-/// Splits a chart (`faces` ascending, texel scale `scale`) into parts that each fill at least
-/// [`MIN_CHART_FILL`] of their rectangle without the border, or are a single face (see
-/// [`MIN_CHART_FILL`]). Equal centroids are ordered by face index; the parts come in a fixed
+/// The image corners of `faces`.
+fn corners(faces: &[u32], proj: &[Option<Projected>]) -> Vec<[f64; 2]> {
+    faces
+        .iter()
+        .flat_map(|&f| proj[f as usize].expect("chart faces are projected").uv)
+        .map(|uv| uv.map(f64::from))
+        .collect()
+}
+
+/// A part of a chart: its faces (ascending) and the first side of its rectangle.
+type Part = (Vec<u32>, [f64; 2]);
+
+/// Splits a chart (`faces` ascending, texel scale `scale`) into the parts that need the
+/// fewest texels, borders included (see [`MIN_CHART_FILL`]). Each part's rectangle is the
+/// smallest one around its corners in the image ([`best_axis`]); a part that fills less than
+/// [`MIN_CHART_FILL`] of it is halved at the median face centroid along its long side, each
+/// half again, down to single faces, and a split is kept where its parts together need fewer
+/// texels than the whole. Equal centroids are ordered by face index; the parts come in a fixed
 /// order, each ascending.
-fn split_chart(faces: Vec<u32>, proj: &[Option<Projected>], scale: f64) -> Vec<Vec<u32>> {
-    let mut out = Vec::new();
-    let mut stack = vec![faces];
-    while let Some(part) = stack.pop() {
-        let (lo, hi) = bounds(&part, proj);
-        let area: f64 = part
-            .iter()
-            .map(|&f| pixel_area(&proj[f as usize].expect("projected").uv))
-            .sum();
-        let rect = ((hi[0] - lo[0]) * scale + 1.0) * ((hi[1] - lo[1]) * scale + 1.0);
-        if part.len() <= 1 || area * scale * scale >= MIN_CHART_FILL * rect {
-            out.push(part);
+fn split_chart(faces: Vec<u32>, proj: &[Option<Projected>], scale: f64) -> Vec<Part> {
+    split_best(faces, proj, scale).1
+}
+
+/// [`split_chart`]: the texels of the best split of `faces` and its parts.
+fn split_best(faces: Vec<u32>, proj: &[Option<Projected>], scale: f64) -> (f64, Vec<Part>) {
+    let axis = best_axis(corners(&faces, proj));
+    let (lo, hi) = bounds(&faces, proj, axis);
+    let core = [0, 1].map(|k| ((hi[k] - lo[k]) * scale + 1.0).ceil());
+    let whole = (core[0] + 2.0 * f64::from(MARGIN)) * (core[1] + 2.0 * f64::from(MARGIN));
+    let area: f64 = faces
+        .iter()
+        .map(|&f| pixel_area(&proj[f as usize].expect("projected").uv))
+        .sum();
+    if faces.len() <= 1 || area * scale * scale >= MIN_CHART_FILL * core[0] * core[1] {
+        return (whole, vec![(faces, axis)]);
+    }
+    // Along the long side (the rectangle's first one).
+    let mut keyed: Vec<(f64, u32)> = faces
+        .iter()
+        .map(|&f| {
+            let uv = proj[f as usize].expect("projected").uv;
+            let c = [0, 1].map(|k| f64::from(uv[0][k] + uv[1][k] + uv[2][k]) / 3.0);
+            (turn(axis, c)[0], f)
+        })
+        .collect();
+    keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mid = keyed.len() / 2;
+    let half = |s: &[(f64, u32)]| {
+        let mut v: Vec<u32> = s.iter().map(|k| k.1).collect();
+        v.sort_unstable();
+        v
+    };
+    let (low, high) = (half(&keyed[..mid]), half(&keyed[mid..]));
+    drop(keyed);
+    let (a, mut parts) = split_best(low, proj, scale);
+    let (b, rest) = split_best(high, proj, scale);
+    if a + b < whole {
+        parts.extend(rest);
+        (a + b, parts)
+    } else {
+        // Undo: the whole chart, ascending again.
+        let mut all: Vec<u32> = parts.into_iter().chain(rest).flat_map(|(f, _)| f).collect();
+        all.sort_unstable();
+        (whole, vec![(all, axis)])
+    }
+}
+
+/// Convex hull (counter-clockwise, no collinear points) of `pts` (Andrew's monotone chain).
+fn convex_hull(mut pts: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
+    pts.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    pts.dedup();
+    if pts.len() < 3 {
+        return pts;
+    }
+    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| {
+        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    };
+    let mut hull: Vec<[f64; 2]> = Vec::with_capacity(pts.len() + 1);
+    for pass in 0..2 {
+        let start = hull.len();
+        let iter: Box<dyn Iterator<Item = &[f64; 2]>> = if pass == 0 {
+            Box::new(pts.iter())
+        } else {
+            Box::new(pts.iter().rev())
+        };
+        for &p in iter {
+            while hull.len() >= start + 2
+                && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0
+            {
+                hull.pop();
+            }
+            hull.push(p);
+        }
+        hull.pop();
+    }
+    hull
+}
+
+/// Direction (unit vector) of the long side of the smallest rectangle around `pts`: one side of
+/// it lies on an edge of their convex hull. `[1, 0]` (the image axes) if nothing is smaller.
+fn best_axis(pts: Vec<[f64; 2]>) -> [f64; 2] {
+    let hull = convex_hull(pts);
+    let extent = |u: [f64; 2]| {
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for p in &hull {
+            let q = [u[0] * p[0] + u[1] * p[1], u[0] * p[1] - u[1] * p[0]];
+            for k in 0..2 {
+                lo[k] = lo[k].min(q[k]);
+                hi[k] = hi[k].max(q[k]);
+            }
+        }
+        [hi[0] - lo[0], hi[1] - lo[1]]
+    };
+    // Texels of the core rectangle, as `rect_texels` counts them.
+    let cost = |e: [f64; 2]| (e[0] + 1.0) * (e[1] + 1.0);
+    let mut best = ([1.0, 0.0], cost(extent([1.0, 0.0])));
+    for i in 0..hull.len() {
+        let (a, b) = (hull[i], hull[(i + 1) % hull.len()]);
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let l = d[0].hypot(d[1]);
+        if l == 0.0 {
             continue;
         }
-        let axis = usize::from(hi[1] - lo[1] > hi[0] - lo[0]);
-        let mut keyed: Vec<(f32, u32)> = part
-            .iter()
-            .map(|&f| {
-                let uv = proj[f as usize].expect("projected").uv;
-                ((uv[0][axis] + uv[1][axis] + uv[2][axis]) / 3.0, f)
-            })
-            .collect();
-        keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        let mid = keyed.len() / 2;
-        let half = |s: &[(f32, u32)]| {
-            let mut v: Vec<u32> = s.iter().map(|k| k.1).collect();
-            v.sort_unstable();
-            v
-        };
-        // The lower half is handled first.
-        stack.push(half(&keyed[mid..]));
-        stack.push(half(&keyed[..mid]));
+        let u = [d[0] / l, d[1] / l];
+        let e = extent(u);
+        // The long side along the first axis.
+        let u = if e[1] > e[0] { [-u[1], u[0]] } else { u };
+        let c = cost(e);
+        if c < best.1 * (1.0 - 1e-9) {
+            best = (u, c);
+        }
     }
-    out
+    best.0
 }
 
 /// Area of a triangle in image pixels.
@@ -835,7 +1044,7 @@ fn fill_chart(
         let p = proj[f as usize].expect("chart faces are projected");
         let corners = p.uv.map(|uv| chart.to_texel(uv));
         for_each_texel(corners, w, h, |i, j, bary| {
-            // Image coordinates (full size) of the texel centre, then in the decoded image.
+            // The texel centre along the rectangle's sides (image pixels, full size).
             let full = [
                 chart.min[0] + (f64::from(i) - m) / chart.scale,
                 chart.min[1] + (f64::from(j) - m) / chart.scale,
@@ -845,8 +1054,8 @@ fn fill_chart(
             for a in 0..grid {
                 for b in 0..grid {
                     let off = [a, b].map(|t| (f64::from(t) + 0.5) / f64::from(grid) - 0.5);
-                    let uv =
-                        [0, 1].map(|k| ((full[k] + off[k] / chart.scale + 0.5) / d - 0.5) as f32);
+                    let at = chart.to_image([0, 1].map(|k| full[k] + off[k] / chart.scale));
+                    let uv = at.map(|x| ((x + 0.5) / d - 0.5) as f32);
                     let s = sample_linear(shot.rgb, uv, shot.lin);
                     for c in 0..3 {
                         rgb[c] += s[c];
@@ -1458,6 +1667,143 @@ mod tests {
                 assert_ne!(&image.data[o..o + 3], &[UNSEEN_GRAY; 3], "texel ({i}, {j})");
             }
         }
+        assert!(check_fields(&mesh, &tm, faces) >= 40);
+    }
+
+    /// The views of a wall with one image everywhere and `patch` (cells 8–11 in both
+    /// directions of `open_wall(20, 0.1)`, 32 faces) best seen by image 1 and by image 0 at
+    /// `second` of that.
+    fn patch_views(mesh: &Mesh, k: usize, second: f32) -> ViewTable {
+        let n = mesh.indices.len();
+        let mut per_face = vec![FaceView::EMPTY; n * k];
+        let view = |image: u32, score: f32| FaceView {
+            image,
+            score,
+            colour: [0; 3],
+            tag: 0,
+        };
+        for f in 0..n {
+            let c = super::super::testutil::centroid(mesh, f);
+            let inside = |x: f32| (0.8..1.2).contains(&x);
+            per_face[f * k] = view(0, 1.0);
+            if inside(c[1]) && inside(c[2]) {
+                per_face[f * k] = view(1, 1.0);
+                per_face[f * k + 1] = view(0, second);
+            }
+        }
+        let image = |stamp: f64| UsedImage {
+            camera: 0,
+            stamp,
+            world_from_cam: Isometry3::identity(),
+        };
+        ViewTable {
+            images: vec![image(1.0), image(2.0)],
+            per_face,
+            gains: vec![[1.0; 3]; 2],
+            vignetting: Vignetting::flat(1, 4.0),
+        }
+    }
+
+    #[test]
+    fn small_chart_merges_into_neighbour() {
+        // A patch of 32 faces with its own best image inside a wall of image 0: every patch
+        // face agrees with its neighbours, so ICM keeps it; image 0 sees it at half the score,
+        // so it is merged.
+        let mesh = open_wall(20, 0.1);
+        let cfg = SurfaceConfig::default();
+        let k = cfg.views_per_face;
+        let in_patch = |f: usize| {
+            let c = super::super::testutil::centroid(&mesh, f);
+            (0.8..1.2).contains(&c[1]) && (0.8..1.2).contains(&c[2])
+        };
+        let patch = (0..mesh.indices.len()).filter(|&f| in_patch(f)).count();
+        assert_eq!(patch, 32);
+        let labels = choose_labels(&mesh, &patch_views(&mesh, k, 0.5), &cfg);
+        assert!(labels.iter().all(|&l| l == Some(0)), "{labels:?}");
+        // Seen by image 0 at a tenth only (below MERGE_MIN_SCORE): the patch keeps image 1.
+        let labels = choose_labels(&mesh, &patch_views(&mesh, k, 0.1), &cfg);
+        for (f, &l) in labels.iter().enumerate() {
+            assert_eq!(l, Some(u32::from(in_patch(f))), "face {f}");
+        }
+    }
+
+    #[test]
+    fn labels_form_large_charts() {
+        // The walk through the painted room with an image every 0.1 s from both cameras (110),
+        // the room as 0.1 m squares with corners moved by up to ±4 mm (noisy normals): before
+        // this round 0.28 charts per textured face filling 0.35 of their rectangles.
+        use super::super::testutil::scene::{shot, walk, walk_scene};
+        let painted = walk_scene();
+        let cams = cameras();
+        let shots: Vec<Shot> = (1..=55)
+            .flat_map(|i| [0, 1].map(|c| shot(c, T0 + 0.1 * f64::from(i))))
+            .collect();
+        let images = write_bag("atlas-walk", &painted, &walk(), &cams, &shots);
+        let src = TextureSource {
+            images,
+            poses: poses(&walk(), 6.0),
+            cams,
+        };
+        let mut mesh = super::super::testutil::painted_mesh(&painted, 0.1);
+        for (i, p) in mesh.positions.iter_mut().enumerate() {
+            for (k, x) in p.iter_mut().enumerate() {
+                let mut h = (i as u64 * 3 + k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                h ^= h >> 29;
+                *x += ((h >> 11) as f64 / (1u64 << 53) as f64 - 0.5) as f32 * 0.008;
+            }
+        }
+        let cfg = SurfaceConfig {
+            page_size: 1024,
+            ..SurfaceConfig::default()
+        };
+        let progress = Progress::new();
+        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let labels = choose_labels(&mesh, &views, &cfg);
+        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        println!("{} faces: {stats:?}", mesh.indices.len());
+        assert_charts(&tm, cfg.page_size);
+        assert_pages_sane(&tm, cfg.page_size, mesh.indices.len());
+        let per_face = stats.charts as f64 / stats.faces_textured as f64;
+        assert!(per_face < 0.12, "{per_face} charts per face: {stats:?}");
+        assert!(stats.fill_ratio > 0.45, "{stats:?}");
+    }
+
+    #[test]
+    fn turned_chart_is_tight() {
+        // The front patch seen with the camera rolled by 30°: its image is a turned rectangle,
+        // whose axis-aligned box it would fill to about half.
+        let mesh = patch(FRONT_Y, [-1.0, 1.0], [-0.5, 1.0], 0.1, -1.0);
+        let faces = mesh.indices.len();
+        let cams = cameras();
+        let cam_y = cams[0].cam_in_body.translation.vector.y;
+        let body = Isometry3::from_parts(
+            nalgebra::Translation3::new(0.0, 3.5 - cam_y, 0.0),
+            nalgebra::UnitQuaternion::from_euler_angles(0.0, 30f64.to_radians(), 0.0),
+        );
+        let traj = Steps(vec![(0.0, body)]);
+        let cam: ColorCamera = cams[0].clone();
+        let world_cam = body * cam.cam_in_body;
+        let shots = [Shot {
+            camera: 0,
+            stamp: T0 + 1.0,
+            edit: Box::new(move |_| render_checker(&cam.camera, &world_cam)),
+        }];
+        let images = write_bag("atlas-turned", &Painted::new(vec![]), &traj, &cams, &shots);
+        let src = TextureSource {
+            images,
+            poses: poses(&traj, 2.0),
+            cams,
+        };
+        let cfg = SurfaceConfig::default();
+        let progress = Progress::new();
+        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let labels = choose_labels(&mesh, &views, &cfg);
+        assert!(labels.iter().all(|&l| l == Some(0)));
+        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        println!("{stats:?}");
+        assert_eq!(stats.charts, 1, "{stats:?}");
+        assert!(stats.fill_ratio > 0.75, "{stats:?}");
+        assert_charts(&tm, cfg.page_size);
         assert!(check_fields(&mesh, &tm, faces) >= 40);
     }
 
