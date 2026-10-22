@@ -30,6 +30,19 @@
 //! view of the face; after the pass ([`filter_views`]) it is dropped if the face has an
 //! untagged one, so the floor along the walking path is textured from farther away.
 //!
+//! **Photo consistency**: every view also keeps the mean colour of its face in the image
+//! ([`FaceView::colour`]: the centroid and the three points halfway to the corners, bilinear
+//! in the image at 1/[`SHARPNESS_DOWNSCALE`], linear mean, as sRGB) and the centroid's angle
+//! from the optical axis. After the exposure fit, a face with at least
+//! [`CONSISTENCY_MIN_VIEWS`] views compares their colours divided by gain and edge falloff
+//! (sRGB): a view further than [`PHOTO_TOLERANCE`] in any channel from the per-channel median
+//! shows something the mesh does not have (a person walking by, the carrier, a reflection) and
+//! is dropped. If every view is that far, the one nearest the median stays.
+//!
+//! For a port of the pass (GPU): it has to fill [`ViewTable::per_face`] as
+//! [`keep_best_view`] does, with all three fields of [`FaceView`]; [`filter_views`] then
+//! runs on the result as it stands.
+//!
 //! Exposure and white balance: every `k`-th face (at most [`EXPOSURE_FACES`]) also keeps the
 //! colour (bilinear, linear RGB, at its centroid) and the angle from the optical axis of its
 //! kept views; from these, [`crate::exposure::estimate_exposure`] fits the gains and the edge
@@ -39,8 +52,8 @@
 
 use super::{Mesh, SurfaceConfig};
 use crate::color::{
-    frame_camera, keep_best, linear_table, quality_pass, sample_linear, ColorCamera, ColorConfig,
-    ImageSource, Status, View, SHARPNESS_DOWNSCALE,
+    frame_camera, keep_best, linear_table, quality_pass, sample_linear, srgb_value, ColorCamera,
+    ColorConfig, ImageSource, Status, View, SHARPNESS_DOWNSCALE,
 };
 use crate::exposure::{estimate_exposure, sample_observations, Vignetting};
 use crate::visibility::{project_point, DepthBuffer, PointGrid};
@@ -66,6 +79,17 @@ pub const CARRIER_RADIUS: f64 = 1.2;
 pub const CARRIER_BELOW: f64 = 0.5;
 /// [`FaceView::tag`] bit of a view that may show the carrier.
 const TAG_CARRIER: u8 = 0x80;
+/// [`FaceView::tag`] bits 0–6: the angle from the optical axis in steps of this (rad).
+const ANGLE_STEP: f32 = std::f32::consts::PI / 127.0;
+/// Faces with at least this many views are checked for photo consistency (see the module
+/// docs): with fewer the median is no majority.
+pub const CONSISTENCY_MIN_VIEWS: usize = 3;
+/// A view whose colour differs from the median of its face's views by more than this in any
+/// channel (sRGB levels, after the exposure correction) is dropped. The views of a point
+/// spread by 10.6 (black room) and 13.5 (Büro) sRGB levels (standard deviation per channel
+/// after the exposure correction, `spread_after` of the colour step): 30 is about 2.5 of
+/// those; a person or a shoe differs by 40 and more.
+pub const PHOTO_TOLERANCE: f64 = 30.0;
 
 /// The camera images of one scan with its trajectory and cameras.
 #[derive(Debug, Clone, PartialEq)]
@@ -83,7 +107,11 @@ pub(crate) struct FaceView {
     /// Rank of the image: index into [`ViewTable::images`].
     pub image: u32,
     pub score: f32,
-    /// Bit 7 ([`FaceView::carrier`]): the view may show the carrier of the device.
+    /// Mean colour of the face in the image (sRGB, before the exposure correction; see the
+    /// module docs).
+    pub colour: [u8; 3],
+    /// Bit 7 ([`FaceView::carrier`]): the view may show the carrier of the device. Bits 0–6:
+    /// the centroid's angle from the optical axis in steps of [`ANGLE_STEP`] (π/127, up to π).
     pub tag: u8,
 }
 
@@ -91,12 +119,18 @@ impl FaceView {
     pub(crate) const EMPTY: FaceView = FaceView {
         image: u32::MAX,
         score: 0.0,
+        colour: [0; 3],
         tag: 0,
     };
 
     /// Whether the view may show the carrier of the device (see the module docs).
     pub(crate) fn carrier(&self) -> bool {
         self.tag & TAG_CARRIER != 0
+    }
+
+    /// The centroid's angle from the optical axis (rad, in steps of [`ANGLE_STEP`]).
+    pub(crate) fn theta(&self) -> f32 {
+        f32::from(self.tag & !TAG_CARRIER) * ANGLE_STEP
     }
 
     /// A view before an empty slot; an untagged view before a [`FaceView::carrier`] one; then
@@ -279,7 +313,9 @@ fn image_views(
                 return None;
             }
             let mut uv = [[0.0f64; 2]; 3];
-            for (uv, &i) in uv.iter_mut().zip(&mesh.indices[f]) {
+            // The corners in the depth buffer's image (1/`downscale`).
+            let mut at = [[0.0f32; 2]; 3];
+            for ((uv, at), &i) in uv.iter_mut().zip(&mut at).zip(&mesh.indices[f]) {
                 let p = Vector3::from(mesh.positions[i as usize]).cast::<f64>();
                 let pc = world_to_cam * Point3::from(p);
                 if pc.x.hypot(pc.y).atan2(pc.z) >= cfg.rim_theta {
@@ -296,6 +332,7 @@ fn image_views(
                 if !buffer.is_visible(&corner, cfg.depth_tolerance) {
                     return None;
                 }
+                *at = corner.uv;
             }
             let area = 0.5
                 * ((uv[1][0] - uv[0][0]) * (uv[2][1] - uv[0][1])
@@ -307,37 +344,88 @@ fn image_views(
             }
             let below = to_cam.z;
             let carrier = to_cam.x.hypot(to_cam.y) < CARRIER_RADIUS && below > CARRIER_BELOW;
+            let to_px = |p: [f32; 2]| p.map(|x| ((f64::from(x) + 0.5) * to_colour - 0.5) as f32);
+            let centre_rgb = sample_linear(shot.rgb, to_px(proj.uv), lin);
+            // Mean colour: the centroid and the points halfway to the corners (in the image).
+            let mut mean = centre_rgb;
+            for corner in at {
+                let half = [0, 1].map(|k| (proj.uv[k] + corner[k]) / 2.0);
+                let rgb = sample_linear(shot.rgb, to_px(half), lin);
+                for c in 0..3 {
+                    mean[c] += rgb[c];
+                }
+            }
+            let colour = mean.map(|v| srgb_value(v / 4.0).round().clamp(0.0, 255.0) as u8);
             // The carrier does not belong in the exposure fit either.
-            let colour = (sampled(f) && !carrier).then(|| {
-                let at = proj
-                    .uv
-                    .map(|x| ((f64::from(x) + 0.5) * to_colour - 0.5) as f32);
-                View::new(
-                    score,
-                    shot.rank,
-                    sample_linear(shot.rgb, at, lin),
-                    proj.theta,
-                )
-            });
+            let sample = (sampled(f) && !carrier)
+                .then(|| View::new(score, shot.rank, centre_rgb, proj.theta));
+            let angle = ((proj.theta / ANGLE_STEP).round() as u32).min(0x7f) as u8;
             let view = FaceView {
                 image: shot.rank,
                 score,
-                tag: if carrier { TAG_CARRIER } else { 0 },
+                colour,
+                tag: angle | if carrier { TAG_CARRIER } else { 0 },
             };
-            Some((f as u32, view, colour))
+            Some((f as u32, view, sample))
         })
         .collect()
 }
 
-/// Drops the views of a face that may show the carrier (see the module docs) if it has
-/// another; `per_face` holds `k` slots per face, as [`keep_best_view`] fills them.
-pub(crate) fn filter_views(per_face: &mut [FaceView], k: usize) {
+/// Drops the views of a face that may show the carrier if it has another, then the views
+/// that do not fit the others' colours (see the module docs). `per_face` holds `k` slots per
+/// face, as [`keep_best_view`] fills them; `cameras` is the camera of every image (by rank),
+/// `gains` and `vignetting` the exposure. The kept views stay in their order.
+pub(crate) fn filter_views(
+    per_face: &mut [FaceView],
+    k: usize,
+    cameras: &[usize],
+    gains: &[[f32; 3]],
+    vignetting: &Vignetting,
+) {
+    let lin = linear_table();
     per_face.par_chunks_mut(k).for_each(|slots| {
         // Tagged views rank behind every untagged one.
         if slots[0].score > 0.0 && !slots[0].carrier() {
             for s in slots.iter_mut().filter(|s| s.carrier()) {
                 *s = FaceView::EMPTY;
             }
+        }
+        let n = slots.iter().take_while(|s| s.score > 0.0).count();
+        if n < CONSISTENCY_MIN_VIEWS {
+            return;
+        }
+        // Exposure-corrected colours (sRGB levels) and their per-channel median.
+        let colours: Vec<[f64; 3]> = slots[..n]
+            .iter()
+            .map(|v| {
+                let r = v.image as usize;
+                std::array::from_fn(|c| {
+                    let l = lin[v.colour[c] as usize]
+                        / (gains[r][c] * vignetting.factor(cameras[r], c, v.theta()));
+                    srgb_value(l)
+                })
+            })
+            .collect();
+        let median: [f64; 3] = std::array::from_fn(|c| {
+            let mut x: Vec<f64> = colours.iter().map(|v| v[c]).collect();
+            x.sort_by(f64::total_cmp);
+            (x[(n - 1) / 2] + x[n / 2]) / 2.0
+        });
+        let off: Vec<f64> = colours
+            .iter()
+            .map(|v| (0..3).map(|c| (v[c] - median[c]).abs()).fold(0.0, f64::max))
+            .collect();
+        let mut keep: Vec<bool> = off.iter().map(|&d| d <= PHOTO_TOLERANCE).collect();
+        if !keep.contains(&true) {
+            // The nearest one stays (the earlier, better view on a tie).
+            let best = (0..n)
+                .min_by(|&a, &b| off[a].total_cmp(&off[b]).then(a.cmp(&b)))
+                .expect("at least one view");
+            keep[best] = true;
+        }
+        let kept: Vec<FaceView> = (0..n).filter(|&i| keep[i]).map(|i| slots[i]).collect();
+        for (i, s) in slots.iter_mut().enumerate() {
+            *s = kept.get(i).copied().unwrap_or(FaceView::EMPTY);
         }
     });
 }
@@ -494,8 +582,6 @@ pub(crate) fn collect_views(
         }
     }
 
-    filter_views(&mut per_face, k);
-
     // Exposure and white balance, fitted on the sample faces' kept views (as `colorize`).
     let cameras: Vec<usize> = images.iter().map(|i| i.camera).collect();
     let (gains, vignetting) = if ccfg.exposure.samples == 0 {
@@ -504,12 +590,13 @@ pub(crate) fn collect_views(
             Vignetting::flat(cams.len(), ccfg.exposure.max_gain),
         )
     } else {
-        let obs = sample_observations(&samples, k, cameras, ccfg.exposure.samples);
+        let obs = sample_observations(&samples, k, cameras.clone(), ccfg.exposure.samples);
         drop(samples);
         let (gains, mut vignetting) = estimate_exposure(&obs, &ccfg.exposure);
         vignetting.coeffs.resize(cams.len(), [[0.0; 2]; 3]);
         (gains, vignetting)
     };
+    filter_views(&mut per_face, k, &cameras, &gains, &vignetting);
     Ok(ViewTable {
         images,
         per_face,
@@ -824,6 +911,67 @@ mod tests {
     }
 
     #[test]
+    fn inconsistent_view_left_out() {
+        // Three images of the +y wall from 1.5 m: head-on at x = 0 (the best view) and from
+        // x = ±1 m. In the head-on one somebody stands 0.5 m in front of the wall (a box the
+        // mesh does not have): there the wall has another colour than in the other two.
+        let painted = Painted::new(vec![]);
+        let cams = cameras();
+        let mesh = painted_mesh(&painted, STEP);
+        let cam_y = cams[0].cam_in_body.translation.vector.y;
+        let body = move |x: f64| Isometry3::translation(x, 3.5 - cam_y, 0.0);
+        let traj = Steps(vec![
+            (0.0, body(0.0)),
+            (T0 + 1.5, body(-1.0)),
+            (T0 + 2.5, body(1.0)),
+        ]);
+        let cam = cams[0].clone();
+        let person = aabb([-0.3, 4.4, -0.4], [0.3, 4.6, 0.5]);
+        let shots = [
+            Shot {
+                camera: 0,
+                stamp: T0 + 1.0,
+                edit: Box::new(move |_| {
+                    let scene = Painted::new(vec![(person, [40, 50, 90])]);
+                    render(&scene, &cam.camera, &(body(0.0) * cam.cam_in_body))
+                }),
+            },
+            shot(0, T0 + 2.0),
+            shot(0, T0 + 3.0),
+        ];
+        let images = write_bag("views-person", &painted, &traj, &cams, &shots);
+        let src = source(&images, &poses(&traj, 4.0), &cams);
+        let cfg = SurfaceConfig::default();
+        let k = cfg.views_per_face;
+        let table = collect_views(&mesh, &src, &cfg, &Progress::new()).unwrap();
+        assert_eq!(table.images.len(), 3, "{:?}", table.images);
+        let labels = crate::surface::atlas::choose_labels(&mesh, &table, &cfg);
+        // The wall behind the person as the head-on camera sees it (its shadow there is 1.5
+        // times the box: x within ±0.45 m, z from −0.55 to 0.8 m).
+        let behind: Vec<usize> = (0..mesh.indices.len())
+            .filter(|&f| {
+                let c = centroid(&mesh, f);
+                c[1] > 4.99 && c[0].abs() < 0.35 && c[2] > -0.45 && c[2] < 0.65
+            })
+            .collect();
+        assert!(behind.len() > 20, "{}", behind.len());
+        for &f in &behind {
+            let v = views(&table, k, f);
+            assert!(v.iter().all(|x| x.image != 0), "face {f}: {v:?}");
+            assert!(
+                v.iter().filter(|x| x.score > 0.0).count() >= 2,
+                "face {f}: {v:?}"
+            );
+            assert_ne!(labels[f], Some(0), "face {f}");
+        }
+        // Above the person all three agree: the head-on view stays the best.
+        let clear = face_near(&mesh, [0.0, 5.0, 1.2]);
+        let v = views(&table, k, clear);
+        assert_eq!(v[0].image, 0, "{v:?}");
+        assert_eq!(v.iter().filter(|x| x.score > 0.0).count(), 3, "{v:?}");
+    }
+
+    #[test]
     fn blurry_image_never_chosen() {
         let painted = walk_scene();
         let cams = cameras();
@@ -915,7 +1063,15 @@ mod tests {
         };
         let flat = collect_views(&mesh, &src, &off, &Progress::new()).unwrap();
         assert!(flat.gains.iter().all(|g| *g == [1.0; 3]));
-        assert_eq!(flat.per_face, table.per_face);
+        // The same views, except where the photo-consistency check sees the uncorrected
+        // brightness steps.
+        let k = cfg.views_per_face;
+        let faces = mesh.indices.len();
+        let same = (0..faces)
+            .filter(|&f| views(&flat, k, f) == views(&table, k, f))
+            .count();
+        println!("same views without equalisation: {same} of {faces}");
+        assert!(same as f64 > 0.95 * faces as f64, "{same} of {faces}");
     }
 
     #[test]

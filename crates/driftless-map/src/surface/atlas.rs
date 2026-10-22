@@ -1205,11 +1205,13 @@ mod tests {
                 FaceView {
                     image: 0,
                     score: 1.0,
+                    colour: [0; 3],
                     tag: 0,
                 },
                 FaceView {
                     image: 1,
                     score: one,
+                    colour: [0; 3],
                     tag: 0,
                 },
             ];
