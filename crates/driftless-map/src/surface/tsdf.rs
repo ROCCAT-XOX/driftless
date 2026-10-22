@@ -222,8 +222,13 @@ mod tests {
     use super::super::testutil::plane_x;
     use super::*;
 
+    /// At 1 cm, the voxel size the expectations below are written for.
     fn integrate(scan: &super::super::testutil::Scan) -> Tsdf {
-        Tsdf::integrate(&scan.input(), &SurfaceConfig::default(), &Progress::new()).unwrap()
+        let cfg = SurfaceConfig {
+            voxel: 0.01,
+            ..SurfaceConfig::default()
+        };
+        Tsdf::integrate(&scan.input(), &cfg, &Progress::new()).unwrap()
     }
 
     #[test]

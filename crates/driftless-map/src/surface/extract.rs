@@ -185,7 +185,9 @@ mod tests {
             let n = m.face_normal(i);
             let c = f.map(|v| m.positions[v as usize]);
             let cen = [0, 1, 2].map(|a| (c[0][a] + c[1][a] + c[2][a]) / 3.0);
-            if n[0] * cen[0] + n[1] * cen[1] + n[2] * cen[2] >= 0.0 {
+            // Zero-area faces (a wall exactly on the voxel centres) have no direction;
+            // cleanup drops them.
+            if n != [0.0; 3] && n[0] * cen[0] + n[1] * cen[1] + n[2] * cen[2] >= 0.0 {
                 outward += 1;
             }
         }

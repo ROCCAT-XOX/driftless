@@ -27,7 +27,7 @@ use std::time::Instant;
 pub const SURFACE_REPORT: &str = "oberflaeche.json";
 /// Part of the input id: raised whenever the surface gives another result for the same
 /// settings, so an older folder counts as stale.
-const SURFACE_VERSION: u32 = 1;
+const SURFACE_VERSION: u32 = 2;
 /// File stem of the glb and the obj.
 const STEM: &str = "oberflaeche";
 const AXES: &str = "glb: Y oben; obj: Z oben";
@@ -109,7 +109,7 @@ fn settings_json(c: &SurfaceConfig, texture: bool) -> Value {
         "truncation_voxels": c.truncation_voxels,
         "min_weight": c.min_weight,
         "min_component_faces": c.min_component_faces,
-        "max_hole_edges": c.max_hole_edges,
+        "max_hole_perimeter": c.max_hole_perimeter,
         "simplify_error": c.simplify_error,
         "max_edge": c.max_edge,
         "min_texel": c.min_texel,

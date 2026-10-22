@@ -76,6 +76,17 @@ use std::collections::{BTreeMap, HashMap};
 /// left out of the front face, which makes one hole of `4 · hole.1` boundary edges. Closed on
 /// all other sides, so the hole is the only boundary loop.
 pub(crate) fn wall_with_hole(n: usize, step: f32, hole: Option<(usize, usize)>) -> Mesh {
+    wall_with_shaped_hole(n, step, |ia, ib| {
+        hole.is_some_and(|(h0, hn)| (h0..h0 + hn).contains(&ia) && (h0..h0 + hn).contains(&ib))
+    })
+}
+
+/// [`wall_with_hole`] with the front squares `(ia, ib)` for which `hole` is true left out.
+pub(crate) fn wall_with_shaped_hole(
+    n: usize,
+    step: f32,
+    hole: impl Fn(usize, usize) -> bool,
+) -> Mesh {
     let depth = 2usize;
     let size = [depth, n, n];
     let mut mesh = Mesh::default();
@@ -92,12 +103,8 @@ pub(crate) fn wall_with_hole(n: usize, step: f32, hole: Option<(usize, usize)>) 
         for high in [false, true] {
             for ia in 0..size[a] {
                 for ib in 0..size[b] {
-                    if axis == 0 && high {
-                        if let Some((h0, hn)) = hole {
-                            if (h0..h0 + hn).contains(&ia) && (h0..h0 + hn).contains(&ib) {
-                                continue;
-                            }
-                        }
+                    if axis == 0 && high && hole(ia, ib) {
+                        continue;
                     }
                     let corner = |da: usize, db: usize| {
                         let mut p = [0usize; 3];

@@ -72,8 +72,9 @@ pub struct SurfaceConfig {
     pub min_weight: u32,
     /// Mesh components with fewer faces are dropped.
     pub min_component_faces: usize,
-    /// Holes with at most this many boundary edges are filled.
-    pub max_hole_edges: usize,
+    /// Holes in a surface with a rim of at most this length are closed (m). The rims of open
+    /// pieces and the ends of pipes stay open at any length.
+    pub max_hole_perimeter: f64,
     /// Largest distance simplification may move the surface (m).
     pub simplify_error: f64,
     /// After simplification, edges longer than this are split (m): a face must fit into one
@@ -96,11 +97,11 @@ pub struct SurfaceConfig {
 impl Default for SurfaceConfig {
     fn default() -> Self {
         SurfaceConfig {
-            voxel: 0.01,
+            voxel: 0.02,
             truncation_voxels: 4.0,
             min_weight: 2,
             min_component_faces: 200,
-            max_hole_edges: 64,
+            max_hole_perimeter: 2.0,
             simplify_error: 0.002,
             max_edge: 0.3,
             min_texel: 0.002,
@@ -127,6 +128,9 @@ impl SurfaceConfig {
         }
         if self.min_weight == 0 {
             return bad("Mindestgewicht eines Voxels muss mindestens 1 sein");
+        }
+        if !(self.max_hole_perimeter.is_finite() && self.max_hole_perimeter >= 0.0) {
+            return bad("Lochumfang darf nicht negativ sein");
         }
         if !(self.simplify_error.is_finite() && self.simplify_error >= 0.0) {
             return bad("Vereinfachungsfehler darf nicht negativ sein");
@@ -358,6 +362,16 @@ mod tests {
             min_component_faces: 50,
             ..SurfaceConfig::default()
         }
+    }
+
+    /// 2 cm voxels close the dark walls of real scans (1 cm left 45 % open); the band stays
+    /// 4 voxels (8 cm): the run with these values is the one that was approved.
+    #[test]
+    fn default_voxel_is_2cm() {
+        let c = SurfaceConfig::default();
+        assert_eq!(c.voxel, 0.02);
+        let band = f64::from(c.truncation_voxels) * c.voxel;
+        assert!((band - 0.08).abs() < 1e-9, "{band}");
     }
 
     #[test]
