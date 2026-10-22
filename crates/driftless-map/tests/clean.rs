@@ -1,7 +1,8 @@
 use driftless_io::msg::{ImuSample, LidarFrame, LidarPoint};
+use driftless_io::progress::Progress;
 use driftless_map::{
-    build_dense, clean, find_ghosts, find_outliers, write_removed_las, CleanConfig, CleanStats,
-    Cloud, DenseConfig, MapError, RaySource, RemovalReason, SmoothConfig, SmoothStats,
+    build_dense, clean, clean_with, find_ghosts, find_outliers, write_removed_las, CleanConfig,
+    CleanStats, Cloud, DenseConfig, MapError, RaySource, RemovalReason, SmoothConfig, SmoothStats,
 };
 use driftless_odom::testutil::{aabb, imu_samples, room_scene, Aabb, Scene, Trajectory, Walk};
 use driftless_odom::{run_odometry, OdomConfig};
@@ -323,6 +324,42 @@ fn clean_is_deterministic() {
     let b = clean(cloud, &rays, &CleanConfig::default()).unwrap();
     assert!(a.3.ghosts > 0 && a.3.kept > 0);
     assert_eq!(a, b);
+}
+
+#[test]
+fn clean_cancelled_returns_cancelled() {
+    let (cloud, rays) = moving_scan();
+    let cfg = CleanConfig::default();
+    let p = Progress::new();
+    p.cancel();
+    let r = clean_with(cloud.clone(), &rays, &cfg, &p);
+    assert!(matches!(r, Err(MapError::Cancelled)), "{r:?}");
+
+    // Cancelled during a part: stops before the next one.
+    let p = Progress::new();
+    let q = p.clone();
+    let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = phases.clone();
+    let p = p.with_observer(move |s| {
+        seen.lock().unwrap().push(s.phase.clone());
+        if s.phase == "Durchblick" {
+            q.cancel();
+        }
+    });
+    let r = clean_with(cloud.clone(), &rays, &cfg, &p);
+    assert!(matches!(r, Err(MapError::Cancelled)), "{r:?}");
+    assert_eq!(*phases.lock().unwrap(), ["Geister", "Durchblick"]);
+
+    // Not cancelled: every part in order, same result as `clean`.
+    let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = phases.clone();
+    let p = Progress::new().with_observer(move |s| seen.lock().unwrap().push(s.phase.clone()));
+    let with = clean_with(cloud.clone(), &rays, &cfg, &p).unwrap();
+    assert_eq!(
+        *phases.lock().unwrap(),
+        ["Geister", "Durchblick", "Ausreißer", "Glätten"]
+    );
+    assert_eq!(with, clean(cloud, &rays, &cfg).unwrap());
 }
 
 /// Points as sortable bit patterns, to compare clouds as sets.

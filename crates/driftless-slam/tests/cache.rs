@@ -1,7 +1,9 @@
 //! `submaps.bin`: round trip and every way a damaged or foreign file must fail.
 
 use driftless_odom::FrameQuality;
-use driftless_slam::{load_cache, read_cache, save_cache, CacheError, Submap, SubmapFrame};
+use driftless_slam::{
+    cache_fits, load_cache, read_cache, save_cache, CacheError, Submap, SubmapFrame,
+};
 use driftless_traj::nalgebra::{Isometry3, Translation3, UnitQuaternion};
 use std::fs;
 use std::path::PathBuf;
@@ -200,4 +202,19 @@ fn cache_rejects_huge_coordinates() {
         assert!(matches!(e, CacheError::Invalid(_)), "{k}: {e:?}");
         assert!(e.to_string().contains("beschädigt"), "{k}: {e}");
     }
+}
+
+#[test]
+fn cache_fits_reads_only_the_header() {
+    let path = tmp("fits");
+    assert!(!cache_fits(&path, "id"));
+    let (s, odom) = submaps();
+    save_cache(&path, &s, &odom, "id").unwrap();
+    assert!(cache_fits(&path, "id"));
+    assert!(!cache_fits(&path, "id2"));
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, &bytes[..16]).unwrap();
+    assert!(cache_fits(&path, "id"));
+    fs::write(&path, &bytes[..15]).unwrap();
+    assert!(!cache_fits(&path, "id"));
 }

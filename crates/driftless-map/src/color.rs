@@ -46,9 +46,11 @@ use crate::exposure::{
 use crate::sharpness::measure;
 use crate::visibility::{visible_points, PointGrid, Seen};
 use crate::{Cloud, MapError};
+use driftless_io::bag::BagReader;
 use driftless_io::calib::CAMERA_TIME_OFFSET_S;
 use driftless_io::camera::Camera;
-use driftless_io::images::{for_each_image, Frame, RgbImage};
+use driftless_io::images::{for_each_image, Frame, ImageError, RgbImage};
+use driftless_io::progress::Progress;
 use driftless_traj::{interpolate_pose, Pose};
 use kiddo::{ImmutableKdTree, SquaredEuclidean};
 use nalgebra::{Isometry3, Matrix3, Vector3};
@@ -423,15 +425,34 @@ struct Measured {
     quality: Option<(f64, f64, f64)>,
 }
 
+/// Number of images in the streams, from the bag indexes; `None` if a bag has none.
+fn image_count(images: &ImageSource) -> Option<u64> {
+    let mut total = 0;
+    for bag in &images.bags {
+        let mut r = BagReader::open(bag).ok()?;
+        for topic in &images.topics {
+            total += r.message_count(topic)?;
+        }
+    }
+    Some(total)
+}
+
 /// Pass 1: status of every image of the stream, in stream order.
 fn quality_pass(
     images: &ImageSource,
     poses: &[Pose],
     cams: &[ColorCamera],
     cfg: &ColorConfig,
+    progress: &Progress,
 ) -> Result<(Vec<ImageRecord>, usize, f64), MapError> {
+    progress.phase("Bilder prüfen", image_count(images));
     let mut found: Vec<Measured> = Vec::new();
+    let mut cancelled = false;
     let read = for_each_image(&images.bags, &images.topics, SHARPNESS_DOWNSCALE, |frame| {
+        if progress.is_cancelled() {
+            cancelled = true;
+            return false;
+        }
         let (camera, stamp, quality) = match frame {
             Err(_) => (None, f64::NAN, None),
             Ok(frame) => match frame_camera(&frame, cams, SHARPNESS_DOWNSCALE) {
@@ -451,10 +472,13 @@ fn quality_pass(
             stamp,
             quality,
         });
+        progress.advance(1);
         true
-    })
-    .map_err(|e| MapError::Images(e.to_string()))?;
-    let truncated = read.truncated;
+    });
+    if cancelled {
+        return Err(MapError::Cancelled);
+    }
+    let truncated = read.map_err(|e| MapError::Images(e.to_string()))?.truncated;
 
     let on_traj: Vec<f64> = found
         .iter()
@@ -1081,6 +1105,23 @@ pub fn colorize(
     cams: &[ColorCamera],
     cfg: &ColorConfig,
 ) -> Result<ColorStats, MapError> {
+    colorize_with(cloud, images, poses, cams, cfg, &Progress::new())
+}
+
+/// [`colorize`] with progress: phase „Bilder prüfen“ (the quality pass) and „Einfärben“,
+/// one step per image of the stream. Checks `progress` for a cancel at every image and
+/// returns [`MapError::Cancelled`] with `cloud` unchanged.
+pub fn colorize_with(
+    cloud: &mut Cloud,
+    images: ImageSource,
+    poses: &[Pose],
+    cams: &[ColorCamera],
+    cfg: &ColorConfig,
+    progress: &Progress,
+) -> Result<ColorStats, MapError> {
+    if progress.is_cancelled() {
+        return Err(MapError::Cancelled);
+    }
     cfg.check()?;
     for (i, c) in cams.iter().enumerate() {
         if cams[..i].iter().any(|o| o.camera.name == c.camera.name) {
@@ -1090,7 +1131,7 @@ pub fn colorize(
             )));
         }
     }
-    let (records, bags_truncated, rank_corr) = quality_pass(&images, poses, cams, cfg)?;
+    let (records, bags_truncated, rank_corr) = quality_pass(&images, poses, cams, cfg, progress)?;
     let count = |f: fn(&Status) -> bool| records.iter().filter(|r| f(&r.status)).count();
     let mut stats = ColorStats {
         images_used: count(|s| matches!(s, Status::Used { .. })),
@@ -1118,6 +1159,11 @@ pub fn colorize(
     // Per point: whether its normal is nearly vertical (floor or ceiling).
     let mut horizontal: Vec<bool> = Vec::new();
     let mut seam: Vec<SeamSample> = Vec::new();
+    let walked = match (last_used, cloud.is_empty()) {
+        (Some(last_used), false) => last_used as u64 + 1,
+        _ => 0,
+    };
+    progress.phase("Einfärben", Some(walked));
     if let (Some(last_used), false) = (last_used, cloud.is_empty()) {
         let (normals, spacing, samples) = local_geometry(&cloud.xyz);
         seam = samples;
@@ -1130,7 +1176,7 @@ pub fn colorize(
             .collect();
         let mut index = 0usize;
         let mut failure: Option<MapError> = None;
-        for_each_image(&images.bags, &images.topics, cfg.downscale, |frame| {
+        let mut one = |frame: Result<Frame, ImageError>| {
             let i = index;
             index += 1;
             let rec = records.get(i).copied();
@@ -1200,8 +1246,21 @@ pub fn colorize(
                 keep_best_apart(&mut slots[p * k..(p + 1) * k], v, &by_rank, cfg.view_gap);
             }
             i < last_used
-        })
-        .map_err(|e| MapError::Images(e.to_string()))?;
+        };
+        let mut cancelled = false;
+        let read = for_each_image(&images.bags, &images.topics, cfg.downscale, |frame| {
+            if progress.is_cancelled() {
+                cancelled = true;
+                return false;
+            }
+            let go = one(frame);
+            progress.advance(1);
+            go
+        });
+        if cancelled {
+            return Err(MapError::Cancelled);
+        }
+        read.map_err(|e| MapError::Images(e.to_string()))?;
         if let Some(e) = failure {
             return Err(e);
         }

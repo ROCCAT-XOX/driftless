@@ -8,7 +8,7 @@ pub mod pipeline;
 pub mod report;
 pub mod submap;
 
-pub use cache::{load_cache, read_cache, save_cache, CacheContents, CacheError};
+pub use cache::{cache_fits, load_cache, read_cache, save_cache, CacheContents, CacheError};
 pub use corrections::{Corrections, LoopEntry};
 pub use loops::{
     find_candidates, match_manual_loops, position_only_relative, verify, verify_manual,

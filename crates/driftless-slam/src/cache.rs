@@ -165,6 +165,18 @@ pub fn load_cache(
     Ok((c.submaps, c.odom_anchors))
 }
 
+/// Whether `path` is a cache written for `input_id`; reads only the header, so it says
+/// nothing about damage further on (that is [`load_cache`]'s check).
+pub fn cache_fits(path: &Path, input_id: &str) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 16];
+    let read = fs::File::open(path).and_then(|mut f| f.read_exact(&mut head));
+    read.is_ok()
+        && &head[..4] == MAGIC
+        && head[4..8] == VERSION.to_le_bytes()
+        && head[8..16] == input_hash(input_id).to_le_bytes()
+}
+
 /// Reads and validates the cache without checking which input it belongs to (for looking
 /// up times, e.g. by `driftless correct`).
 pub fn read_cache(path: &Path) -> Result<CacheContents, CacheError> {

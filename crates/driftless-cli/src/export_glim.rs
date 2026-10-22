@@ -17,7 +17,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
-use crate::topics::{bag_read_error, file_name, TopicPicker};
+use driftless_steps::scan::{bag_read_error, file_name, TopicPicker};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -54,6 +54,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         TopicPicker::new("sensor_msgs/Imu", args.imu_topic.as_deref(), "--imu-topic");
     let (mut frames, mut samples, mut points, mut dropped, mut errors) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
+    let progress = crate::console();
     for bag in &project.lidar_bags {
         let mut reader = BagReader::open(bag).map_err(|e| format!("{}: {e}", file_name(bag)))?;
         let lidar_topic = lidar_picker.pick(&reader)?;
@@ -71,7 +72,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(m) => m,
                 Err(e) => {
                     // Truncated copy: keep everything read so far; anything else fails.
-                    bag_read_error(bag, e)?;
+                    bag_read_error(bag, e, &progress)?;
                     break;
                 }
             };

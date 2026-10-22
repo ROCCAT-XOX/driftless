@@ -3,22 +3,22 @@
 //! Die Bags werden Nachricht für Nachricht gelesen, geloggt und verworfen;
 //! der Speicher bleibt unabhängig von der Aufnahmelänge klein.
 
-use crate::topics::{file_name, TopicPicker};
 use driftless_io::bag::{BagError, BagReader};
 use driftless_io::msg::{decode_compressed_image, decode_imu, decode_pointcloud2, LidarFrame};
 use driftless_io::project::discover_project;
 use driftless_slam::SlamReport;
+use driftless_steps::overlay::{
+    load_run, loop_color, quality_color, trajectory_strips, ODOMETRY_COLOR,
+};
+use driftless_steps::scan::{
+    file_name, TopicPicker, CLOUD_TYPE, IMAGE_TYPE as COMPRESSED_IMAGE_TYPE, IMU_TYPE,
+};
 use driftless_traj::read_tum;
 use std::path::PathBuf;
 
 const TIMELINE: &str = "stamp";
 /// With `--slam`: seconds since the start of the scan, the times `driftless correct` expects.
 const SCAN_TIMELINE: &str = "ab_scan_beginn";
-/// Slack when comparing times read from `traj.tum` (9 decimals) with `slam.json`.
-const TIME_TOLERANCE: f64 = 1e-6;
-const CLOUD_TYPE: &str = "sensor_msgs/PointCloud2";
-const IMU_TYPE: &str = "sensor_msgs/Imu";
-const COMPRESSED_IMAGE_TYPE: &str = "sensor_msgs/CompressedImage";
 const RAW_IMAGE_TYPE: &str = "sensor_msgs/Image";
 
 #[derive(clap::Args)]
@@ -157,25 +157,6 @@ fn camera_entity(topic: &str) -> String {
     format!("camera/{}", parts.join("/"))
 }
 
-/// Colour of a submap quality: red (0) via yellow (0.5) to green (1).
-fn quality_color(quality: f32) -> [u8; 3] {
-    let q = if quality.is_finite() {
-        quality.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let ramp = |x: f32| (x * 255.0).round() as u8;
-    if q < 0.5 {
-        [255, ramp(q * 2.0), 0]
-    } else {
-        [ramp(2.0 - q * 2.0), 255, 0]
-    }
-}
-
-const LOOP_ACCEPTED: [u8; 3] = [0, 200, 0];
-const LOOP_REJECTED: [u8; 3] = [140, 140, 140];
-const LOOP_MANUAL: [u8; 3] = [40, 120, 255];
-
 /// Everything of a `driftless slam` output the viewer shows, read and checked up front.
 struct SlamView {
     report: SlamReport,
@@ -184,19 +165,11 @@ struct SlamView {
 }
 
 fn load_slam(dir: &std::path::Path) -> Result<SlamView, BoxError> {
-    let json_path = dir.join("slam.json");
-    let text = std::fs::read_to_string(&json_path)
-        .map_err(|e| format!("{} nicht lesbar: {e}", json_path.display()))?;
-    let report: SlamReport = serde_json::from_str(&text).map_err(|e| {
-        format!(
-            "{} ist kein gültiger SLAM-Bericht: {e}; mit `driftless slam` neu erzeugen",
-            json_path.display()
-        )
-    })?;
+    let track = load_run(dir)?;
     Ok(SlamView {
-        report,
-        corrected: read_tum(&dir.join("traj.tum"))?,
-        odometry: read_tum(&dir.join("traj_odom.tum"))?,
+        report: track.report,
+        corrected: track.corrected,
+        odometry: track.odometry,
     })
 }
 
@@ -208,41 +181,8 @@ fn xyz64(p: [f64; 3]) -> [f32; 3] {
     [p[0] as f32, p[1] as f32, p[2] as f32]
 }
 
-/// One line strip per submap: a pose belongs to the last submap that started at or before
-/// it (within [`TIME_TOLERANCE`]). Each strip also ends on the first point of the next one,
-/// so the coloured line has no gaps. Submaps without poses are skipped.
-fn trajectory_strips(view: &SlamView) -> (Vec<Vec<[f32; 3]>>, Vec<[u8; 3]>) {
-    let submaps = &view.report.submaps;
-    let t0 = view.report.scan_start;
-    let mut groups: Vec<Vec<[f32; 3]>> = vec![Vec::new(); submaps.len()];
-    for pose in &view.corrected {
-        let t = pose.t - t0;
-        let idx = submaps
-            .partition_point(|m| m.t_start <= t + TIME_TOLERANCE)
-            .saturating_sub(1);
-        if let Some(g) = groups.get_mut(idx) {
-            g.push(xyz(pose));
-        }
-    }
-    let mut strips: Vec<Vec<[f32; 3]>> = Vec::new();
-    let mut colors = Vec::new();
-    let mut last: Option<usize> = None;
-    for (i, g) in groups.iter().enumerate() {
-        if g.is_empty() {
-            continue;
-        }
-        if let Some(prev) = last {
-            strips[prev].push(g[0]);
-        }
-        strips.push(g.clone());
-        colors.push(quality_color(submaps[i].quality));
-        last = Some(strips.len() - 1);
-    }
-    (strips, colors)
-}
-
 fn log_slam(rec: &rerun::RecordingStream, view: &SlamView) -> Result<(), BoxError> {
-    let (strips, colors) = trajectory_strips(view);
+    let (strips, colors) = trajectory_strips(&view.report, &view.corrected);
     rec.log_static(
         "slam/trajectory",
         &rerun::LineStrips3D::new(strips)
@@ -256,7 +196,11 @@ fn log_slam(rec: &rerun::RecordingStream, view: &SlamView) -> Result<(), BoxErro
     rec.log_static(
         "slam/odometry",
         &rerun::LineStrips3D::new([view.odometry.iter().map(xyz).collect::<Vec<_>>()])
-            .with_colors([rerun::Color::from_rgb(130, 130, 130)])
+            .with_colors([rerun::Color::from_rgb(
+                ODOMETRY_COLOR[0],
+                ODOMETRY_COLOR[1],
+                ODOMETRY_COLOR[2],
+            )])
             .with_radii([rerun::Radius::new_ui_points(0.8)]),
     )?;
 
@@ -269,13 +213,7 @@ fn log_slam(rec: &rerun::RecordingStream, view: &SlamView) -> Result<(), BoxErro
             continue;
         };
         strips.push(vec![xyz64(a.anchor), xyz64(b.anchor)]);
-        let c = if l.manual {
-            LOOP_MANUAL
-        } else if l.accepted {
-            LOOP_ACCEPTED
-        } else {
-            LOOP_REJECTED
-        };
+        let c = loop_color(l);
         colors.push(rerun::Color::from_rgb(c[0], c[1], c[2]));
         labels.push(match &l.reason {
             Some(why) => format!("{}↔{} ({why})", l.a, l.b),
@@ -567,58 +505,7 @@ pub fn run(args: &Args) -> Result<(), BoxError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        camera_entity, cloud_stride, quality_color, trajectory_strips, SlamView, MAX_CLOUD_POINTS,
-    };
-    use driftless_slam::report::{BeforeAfter, SlamReport, SubmapReport};
-    use driftless_traj::nalgebra::{UnitQuaternion, Vector3};
-    use driftless_traj::Pose;
-
-    /// A pose on a submap start, rounded below it by the 9 decimals of `traj.tum`, belongs
-    /// to that submap.
-    #[test]
-    fn trajectory_strips_tolerate_rounded_times() {
-        let sm = |id: usize, t_start: f64, quality: f32| SubmapReport {
-            id,
-            t_start,
-            t_end: t_start + 0.5,
-            quality,
-            anchor: [0.0; 3],
-            odom_anchor: [0.0; 3],
-        };
-        let none = BeforeAfter {
-            before: 0.0,
-            after: 0.0,
-        };
-        let scan_start = 1000.25;
-        let pose = |t: f64, x: f64| Pose {
-            t,
-            p: Vector3::new(x, 0.0, 0.0),
-            q: UnitQuaternion::identity(),
-        };
-        let view = SlamView {
-            report: SlamReport {
-                scan_start,
-                submaps: vec![sm(0, 0.0, 1.0), sm(1, 0.6, 0.0)],
-                loops: Vec::new(),
-                graph: None,
-                start_end_gap: none.clone(),
-                path_length: none,
-            },
-            // the second pose is the first frame of submap 1, written 0.4 ns early
-            corrected: vec![
-                pose(scan_start, 0.0),
-                pose(scan_start + 0.6 - 4e-10, 1.0),
-                pose(scan_start + 1.0, 2.0),
-            ],
-            odometry: Vec::new(),
-        };
-        let (strips, colors) = trajectory_strips(&view);
-        assert_eq!(colors, [quality_color(1.0), quality_color(0.0)]);
-        assert_eq!(strips[0].len(), 2, "{strips:?}");
-        assert_eq!(strips[1].len(), 2, "{strips:?}");
-        assert_eq!(strips[1][0], [1.0, 0.0, 0.0]);
-    }
+    use super::{camera_entity, cloud_stride, MAX_CLOUD_POINTS};
 
     #[test]
     fn cloud_stride_keeps_at_most_the_limit() {
@@ -635,15 +522,6 @@ mod tests {
         }
         assert_eq!(cloud_stride(MAX_CLOUD_POINTS), 1);
         assert_eq!(cloud_stride(MAX_CLOUD_POINTS + 1), 2);
-    }
-
-    #[test]
-    fn quality_color_endpoints() {
-        assert_eq!(quality_color(0.0), [255, 0, 0]);
-        assert_eq!(quality_color(0.5), [255, 255, 0]);
-        assert_eq!(quality_color(1.0), [0, 255, 0]);
-        assert_eq!(quality_color(-3.0), [255, 0, 0]);
-        assert_eq!(quality_color(f32::NAN), [255, 0, 0]);
     }
 
     #[test]

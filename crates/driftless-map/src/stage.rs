@@ -214,6 +214,17 @@ fn xyz_at(b: &[u8], at: usize, what: &'static str) -> Result<[f32; 3], StageErro
     }
 }
 
+/// Whether `path` is a stage written for `input_id`; reads only the header, so it is cheap
+/// for a large file but says nothing about damage further on (that is [`load_stage`]'s check).
+pub fn stage_fits(path: &Path, input_id: &str) -> bool {
+    let mut head = [0u8; 16];
+    let read = File::open(path).and_then(|mut f| f.read_exact(&mut head));
+    read.is_ok()
+        && &head[..4] == MAGIC
+        && head[4..8] == VERSION.to_le_bytes()
+        && head[8..16] == content_hash(input_id.as_bytes()).to_le_bytes()
+}
+
 /// Reads a stage and checks that it belongs to `input_id`. Returns the cloud (without
 /// colours) and the rays, if the stage has them.
 pub fn load_stage(path: &Path, input_id: &str) -> Result<(Cloud, Option<RaySource>), StageError> {

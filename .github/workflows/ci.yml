@@ -25,6 +25,18 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # Release-only code paths of the app (no console window on Windows).
+      - run: cargo clippy --release -p driftless-app --bins -- -D warnings
+      # The Windows program for hand tests on other machines (e.g. the frame time on an RTX
+      # card), as an artifact of every pull request.
+      - if: runner.os == 'Windows' && github.event_name == 'pull_request'
+        run: cargo build --release -p driftless-app
+      - if: runner.os == 'Windows' && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: driftless-app-windows
+          path: target/release/driftless-app.exe
+          retention-days: 14
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny

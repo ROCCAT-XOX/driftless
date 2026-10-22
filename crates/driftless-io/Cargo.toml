@@ -11,7 +11,8 @@ repository.workspace = true
 workspace = true
 
 [features]
-# Exposes `bag::writer::BagWriter` (test helper) to other crates' tests.
+# Exposes `bag::writer::BagWriter`, `msg::encode` and `testscan` (test helpers) to other
+# crates' tests.
 test-util = []
 
 [dependencies]

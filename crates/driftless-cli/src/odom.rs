@@ -1,11 +1,11 @@
 //! `driftless odom <ordner> -o <out_dir>`: LiDAR-IMU odometry (Rust baseline, no loop closure).
 //! Writes `traj.tum` (body poses) and `map.las` (deskewed points, 10 cm grid).
 
-use crate::scan_input::{
-    parse_extrinsic, read_imu, require_frames, warn_if_not_static, with_lidar_frames, write_las,
-};
 use driftless_io::project::discover_project;
 use driftless_odom::{run_odometry, OdomConfig};
+use driftless_steps::scan::{
+    parse_extrinsic, read_imu, require_frames, warn_if_not_static, with_lidar_frames, write_las,
+};
 use driftless_traj::{path_length, start_end_gap, write_tum};
 use std::fs;
 use std::path::PathBuf;
@@ -42,11 +42,14 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let project = discover_project(&args.folder)?;
     fs::create_dir_all(&args.out)?;
 
-    let (imu, mut bad) = read_imu(&project.lidar_bags, args.imu_topic.as_deref())?;
-    let (result, read) =
-        with_lidar_frames(&project.lidar_bags, args.lidar_topic.as_deref(), |frames| {
-            run_odometry(frames, &imu, &cfg)
-        })?;
+    let progress = crate::console();
+    let (imu, mut bad) = read_imu(&project.lidar_bags, args.imu_topic.as_deref(), &progress)?;
+    let (result, read) = with_lidar_frames(
+        &project.lidar_bags,
+        args.lidar_topic.as_deref(),
+        &progress,
+        |frames| run_odometry(frames, &imu, &cfg),
+    )?;
     bad += read.bad;
     let dropped = read.dropped;
 
@@ -55,7 +58,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     write_las(&args.out.join("map.las"), &result.map_points)?;
 
     let s = &result.stats;
-    warn_if_not_static(s);
+    warn_if_not_static(s, &progress);
     println!(
         "{} Posen aus {} LiDAR-Frames ({} übersprungen), {} IMU-Messungen, {} Kartenpunkte",
         result.poses.len(),

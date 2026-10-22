@@ -22,9 +22,11 @@ mod stage;
 mod through;
 pub mod visibility;
 
-pub use clean::{clean, find_ghosts, find_outliers, CleanConfig, CleanStats, RemovalReason};
+pub use clean::{
+    clean, clean_with, find_ghosts, find_outliers, CleanConfig, CleanStats, RemovalReason,
+};
 pub use cloud::Cloud;
-pub use color::{colorize, ColorCamera, ColorConfig, ColorStats, ImageSource};
+pub use color::{colorize, colorize_with, ColorCamera, ColorConfig, ColorStats, ImageSource};
 pub use dense::{build_dense, DenseConfig, DenseStats, RaySource};
 pub use export::{write_las, write_ply, write_removed_las, LAS_SCALE};
 pub use exposure::{
@@ -34,7 +36,7 @@ pub use exposure::{
 };
 pub use sharpness::sharpness;
 pub use smooth::{smooth_surfaces, SmoothConfig, SmoothStats};
-pub use stage::{content_hash, load_stage, save_stage, StageError};
+pub use stage::{content_hash, load_stage, save_stage, stage_fits, StageError};
 pub use through::find_through;
 
 #[derive(Debug, thiserror::Error)]
@@ -64,4 +66,7 @@ pub enum MapError {
     },
     #[error("{path}: {source}")]
     Las { path: String, source: las::Error },
+    /// The step was cancelled through its [`driftless_io::progress::Progress`].
+    #[error("abgebrochen")]
+    Cancelled,
 }

@@ -61,9 +61,7 @@ impl Corrections {
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let fail = |e: &dyn std::fmt::Display| format!("{} nicht schreibbar: {e}", path.display());
         let body = toml::to_string(self).map_err(|e| fail(&e))?;
-        let tmp = path.with_extension("toml.tmp");
-        fs::write(&tmp, format!("{HEADER}{body}")).map_err(|e| fail(&e))?;
-        fs::rename(&tmp, path).map_err(|e| fail(&e))
+        driftless_io::atomic_write(path, format!("{HEADER}{body}").as_bytes()).map_err(|e| fail(&e))
     }
 
     /// Appends an active loop and returns its number (1-based, as `driftless correct list`

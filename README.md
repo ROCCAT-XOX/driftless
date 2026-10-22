@@ -3,12 +3,14 @@
 Open-source desktop software for processing handheld LiDAR scans — drift-corrected, cleanly colourised,
 correctable by hand. Runs natively on **macOS (Apple Silicon)** and **Windows**.
 
-> Status: early development, command line only. Milestone 4 done: a 9.7-minute scan with 3,831 images
-> maps in about 7 minutes with under 4 GB peak memory (was 9.9 GB); thinner walls, points seen through
-> windows removed, fewer colour seams, image sharpness no longer favours dark images. Lamp reflections on
-> floors are only reduced with the experimental `--highlights`. Earlier: dense, cleaned and coloured map
+> Status: early development. Milestone 5 done: a desktop program (`driftless-app`) with projects, the
+> steps of the command line, a 3D view with levels of detail (the 14.96-million-point office scan loads in
+> under 2 s), the trajectory coloured by quality, loops marked by two clicks and recomputed in seconds,
+> before/after comparison and a history of states. Earlier: map in about 7 minutes with under 4 GB for a
+> 9.7-minute scan, thinner walls, window views removed (milestone 4), dense, cleaned and coloured map
 > (milestone 3), LiDAR-IMU odometry and SLAM with loop closure and manual corrections (milestone 2).
-> Results on real scans (German): [milestone 4](docs/ergebnisse/2026-10-21-meilenstein-4.md),
+> Results on real scans (German): [milestone 5](docs/ergebnisse/2026-10-22-meilenstein-5.md),
+> [milestone 4](docs/ergebnisse/2026-10-21-meilenstein-4.md),
 > [milestone 3](docs/ergebnisse/2026-10-21-meilenstein-3.md),
 > [milestone 2](docs/ergebnisse/2026-10-20-meilenstein-2.md).
 
@@ -32,12 +34,14 @@ Design: [docs/superpowers/specs/2026-10-20-driftless-design.md](docs/superpowers
 
 ## Commands
 
-Build with `cargo build --release`; the binary is `driftless`. Folder arguments are a scan folder with
+Build with `cargo build --release`; the binaries are `driftless` (command line) and `driftless-app`
+(desktop program, see below). Folder arguments are a scan folder with
 `LIDAR_*.bag` (and optionally `IMAGE_*.bag`, `calibration/calib.json`). Test data and how to set it up:
 [docs/testdaten.md](docs/testdaten.md).
 
 | Command | What it does |
 |---|---|
+| `driftless-app [project-folder]` · `driftless-app --synthetic N` | The desktop program (see [Desktop program](#desktop-program)); opens the given project or the last one; `--synthetic N` shows a generated test cloud of N points |
 | `driftless inspect <folder> [--json]` | Report on a scan: device, duration, topics with counts and rates, problems |
 | `driftless view <folder> [--traj t.tum] [--slam <slam-out>] [--lidar-topic T] [--imu-topic T]` | Debug viewer (rerun): point clouds, IMU, camera images, optional trajectory; `--slam` adds quality-coloured trajectory, odometry, loops and submap anchors, and the timeline `ab_scan_beginn` (seconds since scan start, the times `driftless correct` takes) next to the bag timeline `stamp` |
 | `driftless odom <folder> -o <dir> [--lidar-to-imu x y z qx qy qz qw]` | LiDAR-IMU odometry (Rust baseline); writes `traj.tum` and `map.las` |
@@ -70,6 +74,43 @@ driftless view <scan> --cloud out/color.las
 
 Read the times for `correct loop` in the viewer on the timeline `ab_scan_beginn`, not on `stamp`:
 `stamp` is the raw bag clock, `ab_scan_beginn` is `stamp` minus `scan_start` from `slam.json`.
+
+## Desktop program
+
+`cargo build --release -p driftless-app`, then `target/release/driftless-app` (Windows:
+`driftless-app.exe`; every pull request also builds it as the CI artifact `driftless-app-windows`). The
+interface is German. It runs the same steps as the command line (`inspect`, `slam`, `slam --reuse`,
+`correct`, `map`, `compare`) through the shared crate `driftless-steps`, and writes the same files.
+
+- **Project:** „Projekt → Neues Projekt …“ in an empty folder, then „Scan hinzufügen …“ (a scan folder
+  as above). Runs made with the command line can be added with „Lauf hinzufügen …“.
+- **Steps** (right panel, for the selected scan, run or map): „Prüfen“, „SLAM rechnen“, „Neu rechnen
+  (aus Teilkarten)“, „Karte rechnen“ with the switches of `driftless map`. One step runs at a time, with
+  progress in the status bar; „Abbrechen“ leaves no half-written files.
+- **3D view:** a map or cloud from the tree; colour, intensity or quality of the submap; orbit (left
+  drag, wheel, F = show all) or fly (W/A/S/D, Q/E); click a point for its time, colour and quality; a
+  height cut („Decke ausblenden“) to look into the rooms from above. A point budget (default 6 million)
+  bounds the points drawn per frame; the view shows the points drawn and the frame time.
+- **Corrections:** with a run selected, the trajectory is drawn by quality with its loops; „Stellen
+  wählen“ and two clicks on the trajectory mark a loop, „Schleife eintragen“ writes it to
+  `corrections.toml`, „Jetzt neu rechnen“ recomputes the run from `submaps.bin`. Entries can be switched
+  off and on.
+- **Before/after and history:** every computation of a run keeps a state under `verlauf/`; „Vergleichen“
+  shows two states or the odometry against the corrected trajectory, with the numbers of
+  `driftless compare`, and „Diesen Stand wiederherstellen“ brings back the switches of an earlier state.
+
+Project folder:
+
+```text
+<project>/project.toml                           name and scans (paths relative if inside the project)
+<project>/scans/<scan-id>/slam-001/              a SLAM run, the same files as `driftless slam -o`
+                          slam-001/lauf.toml     scan and settings of the run
+                          slam-001/verlauf/      states of the run
+                          slam-001/karte-001/    a map of the run, one folder per set of switches
+```
+
+Not yet: export (milestone 6), a cache for the levels of detail (they are rebuilt on every load), more
+than one step at a time.
 
 ## Legal
 

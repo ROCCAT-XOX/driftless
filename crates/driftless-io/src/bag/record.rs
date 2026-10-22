@@ -7,6 +7,8 @@ pub const MAGIC: &[u8] = b"#ROSBAG V2.0\n";
 
 pub const OP_MESSAGE: u8 = 0x02;
 pub const OP_BAG_HEADER: u8 = 0x03;
+/// Only the test writer emits index records; the reader skips them.
+#[cfg(any(test, feature = "test-util"))]
 pub const OP_INDEX: u8 = 0x04;
 pub const OP_CHUNK: u8 = 0x05;
 pub const OP_CHUNK_INFO: u8 = 0x06;
