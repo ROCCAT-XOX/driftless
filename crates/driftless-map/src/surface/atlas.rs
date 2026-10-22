@@ -1205,10 +1205,12 @@ mod tests {
                 FaceView {
                     image: 0,
                     score: 1.0,
+                    tag: 0,
                 },
                 FaceView {
                     image: 1,
                     score: one,
+                    tag: 0,
                 },
             ];
             if one > 1.0 {

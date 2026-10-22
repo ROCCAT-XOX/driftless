@@ -23,6 +23,13 @@
 //!    Each face keeps its [`SurfaceConfig::views_per_face`] best views (higher score first;
 //!    equal scores: the earlier image).
 //!
+//! **The carrier** of the device stands next to it and below the camera: a view from a camera
+//! less than [`CARRIER_RADIUS`] away horizontally (world Z up) of a face's centroid that lies
+//! more than [`CARRIER_BELOW`] below the camera may show the carrier's legs or shoes instead of
+//! the floor. Such a view is tagged ([`FaceView::carrier`]) and ranks behind every untagged
+//! view of the face; after the pass ([`filter_views`]) it is dropped if the face has an
+//! untagged one, so the floor along the walking path is textured from farther away.
+//!
 //! Exposure and white balance: every `k`-th face (at most [`EXPOSURE_FACES`]) also keeps the
 //! colour (bilinear, linear RGB, at its centroid) and the angle from the optical axis of its
 //! kept views; from these, [`crate::exposure::estimate_exposure`] fits the gains and the edge
@@ -52,6 +59,13 @@ pub const EXPOSURE_FACES: usize = 200_000;
 pub const SAMPLE_GAP_CELLS: f64 = 2.0;
 /// A face is split into at most this many sample rows for the depth buffer.
 pub const MAX_SUBDIVISIONS: usize = 32;
+/// A view of a face whose centroid lies within this horizontal distance (m) of the camera …
+pub const CARRIER_RADIUS: f64 = 1.2;
+/// … and more than this far below it (m) may show the carrier of the device (see the module
+/// docs).
+pub const CARRIER_BELOW: f64 = 0.5;
+/// [`FaceView::tag`] bit of a view that may show the carrier.
+const TAG_CARRIER: u8 = 0x80;
 
 /// The camera images of one scan with its trajectory and cameras.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,16 +83,31 @@ pub(crate) struct FaceView {
     /// Rank of the image: index into [`ViewTable::images`].
     pub image: u32,
     pub score: f32,
+    /// Bit 7 ([`FaceView::carrier`]): the view may show the carrier of the device.
+    pub tag: u8,
 }
 
 impl FaceView {
     pub(crate) const EMPTY: FaceView = FaceView {
         image: u32::MAX,
         score: 0.0,
+        tag: 0,
     };
 
-    /// Higher score first; equal scores: the earlier image.
+    /// Whether the view may show the carrier of the device (see the module docs).
+    pub(crate) fn carrier(&self) -> bool {
+        self.tag & TAG_CARRIER != 0
+    }
+
+    /// A view before an empty slot; an untagged view before a [`FaceView::carrier`] one; then
+    /// the higher score; equal scores: the earlier image.
     fn better_than(&self, other: &FaceView) -> bool {
+        if (self.score > 0.0) != (other.score > 0.0) {
+            return self.score > 0.0;
+        }
+        if self.carrier() != other.carrier() {
+            return !self.carrier();
+        }
         self.score > other.score || (self.score == other.score && self.image < other.image)
     }
 }
@@ -276,7 +305,10 @@ fn image_views(
             if score.is_nan() || score <= 0.0 {
                 return None;
             }
-            let colour = sampled(f).then(|| {
+            let below = to_cam.z;
+            let carrier = to_cam.x.hypot(to_cam.y) < CARRIER_RADIUS && below > CARRIER_BELOW;
+            // The carrier does not belong in the exposure fit either.
+            let colour = (sampled(f) && !carrier).then(|| {
                 let at = proj
                     .uv
                     .map(|x| ((f64::from(x) + 0.5) * to_colour - 0.5) as f32);
@@ -290,10 +322,24 @@ fn image_views(
             let view = FaceView {
                 image: shot.rank,
                 score,
+                tag: if carrier { TAG_CARRIER } else { 0 },
             };
             Some((f as u32, view, colour))
         })
         .collect()
+}
+
+/// Drops the views of a face that may show the carrier (see the module docs) if it has
+/// another; `per_face` holds `k` slots per face, as [`keep_best_view`] fills them.
+pub(crate) fn filter_views(per_face: &mut [FaceView], k: usize) {
+    per_face.par_chunks_mut(k).for_each(|slots| {
+        // Tagged views rank behind every untagged one.
+        if slots[0].score > 0.0 && !slots[0].carrier() {
+            for s in slots.iter_mut().filter(|s| s.carrier()) {
+                *s = FaceView::EMPTY;
+            }
+        }
+    });
 }
 
 /// The views of every face of `mesh` in the images of `src`, and the exposure of the images
@@ -448,6 +494,8 @@ pub(crate) fn collect_views(
         }
     }
 
+    filter_views(&mut per_face, k);
+
     // Exposure and white balance, fitted on the sample faces' kept views (as `colorize`).
     let cameras: Vec<usize> = images.iter().map(|i| i.camera).collect();
     let (gains, vignetting) = if ccfg.exposure.samples == 0 {
@@ -473,8 +521,8 @@ pub(crate) fn collect_views(
 #[cfg(test)]
 mod tests {
     use super::super::testutil::scene::{
-        aabb, cameras, poses, shot, surface_cloud, walk, walk_data, walk_scene, write_bag, Painted,
-        Shot, Trajectory, T0,
+        aabb, cameras, poses, render, shot, surface_cloud, walk, walk_data, walk_scene, write_bag,
+        Painted, Shot, Trajectory, T0,
     };
     use super::super::testutil::{blur, centroid, face_near, painted_mesh, Steps};
     use super::*;
@@ -693,6 +741,86 @@ mod tests {
         let split = super::super::simplify(&wall, &cfg);
         assert!(split.indices.len() > 100, "{}", split.indices.len());
         assert_eq!(seen(&split), split.indices.len());
+    }
+
+    /// The floor faces under "shoes" (a box the mesh does not have) 0.6–1.0 m in front of the
+    /// left camera at the origin, 0.75 m above the floor.
+    fn under_shoes(mesh: &Mesh) -> Vec<usize> {
+        (0..mesh.indices.len())
+            .filter(|&f| {
+                let c = centroid(mesh, f);
+                c[2] < -1.19 && c[0].abs() < 0.15 && c[1] > 0.75 && c[1] < 1.05
+            })
+            .collect()
+    }
+
+    #[test]
+    fn carrier_views_left_out() {
+        // The carrier's shoes stand on the floor 0.6–1.0 m in front of the camera, which
+        // looks down at them from 0.75 m (near and steep: the best view by far). A second image
+        // 2.3–2.7 m away sees the same floor without them (the carrier has walked on).
+        let painted = Painted::new(vec![]);
+        let cams = cameras();
+        let mesh = painted_mesh(&painted, STEP);
+        let shoes = aabb([-0.25, 0.65, -1.2], [0.25, 1.15, -1.17]);
+        let near = Isometry3::translation(0.0, 0.0, -0.5);
+        let far = Isometry3::from_parts(
+            nalgebra::Translation3::new(0.0, -0.6, 0.5),
+            UnitQuaternion::from_euler_angles(-0.6, 0.0, 0.0),
+        );
+        let traj = Steps(vec![(0.0, near), (T0 + 1.5, far)]);
+        let cam = cams[0].clone();
+        let with_shoes = move |_| {
+            let scene = Painted::new(vec![(shoes, [150, 90, 40])]);
+            render(&scene, &cam.camera, &(near * cam.cam_in_body))
+        };
+        let shots = [
+            Shot {
+                camera: 0,
+                stamp: T0 + 1.0,
+                edit: Box::new(with_shoes.clone()),
+            },
+            shot(0, T0 + 2.0),
+        ];
+        let images = write_bag("views-carrier", &painted, &traj, &cams, &shots);
+        let src = source(&images, &poses(&traj, 3.0), &cams);
+        let cfg = SurfaceConfig::default();
+        let k = cfg.views_per_face;
+        let floor = under_shoes(&mesh);
+        assert!(floor.len() > 10, "{}", floor.len());
+        let table = collect_views(&mesh, &src, &cfg, &Progress::new()).unwrap();
+        assert_eq!(table.images.len(), 2, "{:?}", table.images);
+        let labels = crate::surface::atlas::choose_labels(&mesh, &table, &cfg);
+        for &f in &floor {
+            let v = views(&table, k, f);
+            assert!(v.iter().all(|x| x.image != 0), "face {f}: {v:?}");
+            assert!(v.iter().any(|x| x.image == 1), "face {f}: {v:?}");
+            assert_eq!(labels[f], Some(1), "face {f}");
+        }
+        // The wall ahead is far from the carrier: both images keep it.
+        let wall = face_near(&mesh, [0.0, 5.0, -0.5]);
+        let v = views(&table, k, wall);
+        assert!(
+            v.iter().any(|x| x.image == 0) && v.iter().any(|x| x.image == 1),
+            "{v:?}"
+        );
+        // Seen from near only, the floor keeps that view: better than none.
+        let only = write_bag(
+            "views-carrier-only",
+            &painted,
+            &traj,
+            &cams,
+            &[Shot {
+                camera: 0,
+                stamp: T0 + 1.0,
+                edit: Box::new(with_shoes),
+            }],
+        );
+        let src = source(&only, &poses(&traj, 3.0), &cams);
+        let table = collect_views(&mesh, &src, &cfg, &Progress::new()).unwrap();
+        for &f in &floor {
+            assert_eq!(views(&table, k, f)[0].image, 0, "face {f}");
+        }
     }
 
     #[test]
