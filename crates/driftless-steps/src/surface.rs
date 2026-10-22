@@ -15,8 +15,8 @@ use crate::map::{
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_map::surface::{
-    build_surface, sensors_for_frames, write_glb, write_obj, Accuracy, SurfaceConfig, SurfaceInput,
-    SurfaceStats, TextureSource,
+    build_mesh, sensors_for_frames, texture_mesh, write_glb, write_obj, Accuracy, SurfaceConfig,
+    SurfaceInput, SurfaceStats, TextureSource,
 };
 use driftless_map::{load_stage, stage_fits};
 use serde_json::{json, Value};
@@ -140,6 +140,7 @@ fn accuracy_json(a: &Accuracy) -> Value {
 fn stats_json(s: &SurfaceStats) -> Value {
     json!({
         "tsdf_blocks": s.tsdf_blocks,
+        "tsdf_bytes": s.tsdf_bytes,
         "faces_raw": s.faces_raw,
         "faces_final": s.faces_final,
         "vertices": s.vertices,
@@ -225,9 +226,11 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
         })
         .into_iter()
         .collect();
-    let (tex, stats) = build_surface(&input, &sources, &req.config, progress)?;
-    drop(sources);
+    let (mesh, mut stats) = build_mesh(&input, &req.config, progress)?;
+    // The points are not needed for the texture: free them before the pages are made.
     drop(cloud);
+    let tex = texture_mesh(&mesh, &sources, &req.config, progress, &mut stats)?;
+    drop((sources, mesh));
 
     // Last chance to stop: from here on files are written.
     check_cancel(progress)?;

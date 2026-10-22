@@ -1,6 +1,6 @@
 //! Photo-like surface (baustein 2): a TSDF from the cleaned points, then mesh, texture, glb/obj.
 //!
-//! [`build_surface`] runs the chain: [`Tsdf`] (the cleaned points and the positions they were
+//! [`build_surface`] runs the chain ([`build_mesh`] and [`texture_mesh`] are its two halves): [`Tsdf`] (the cleaned points and the positions they were
 //! measured from fused into a truncated signed distance field) → [`extract`] → [`cleanup`] →
 //! [`simplify`] → camera views per face → one image per face → texture pages → seam
 //! levelling. [`write_glb`] and [`write_obj`] write the result, [`render_preview`] draws it.
@@ -164,6 +164,8 @@ impl SurfaceConfig {
 pub struct SurfaceStats {
     /// Allocated TSDF blocks.
     pub tsdf_blocks: usize,
+    /// Bytes of the TSDF voxels (8 per voxel).
+    pub tsdf_bytes: usize,
     /// Faces of the extracted mesh, before cleanup.
     pub faces_raw: usize,
     /// Faces of the final mesh.
@@ -181,10 +183,10 @@ pub struct SurfaceStats {
     pub seconds: BTreeMap<&'static str, f64>,
 }
 
-/// The textured surface of `input`: [`Tsdf::integrate`] → [`extract`] → [`cleanup`] →
-/// [`simplify`] → views, labels, baking and seam levelling from `sources`. Without `sources`
-/// (a scan without images) every face is gray, on one page of [`MIN_PAGE_SIZE`]². Only one
-/// source is supported for now (one scan); several scans come later.
+/// The textured surface of `input`: [`build_mesh`], then [`texture_mesh`] from `sources`.
+/// Without `sources` (a scan without images) every face is gray, on one page of
+/// [`MIN_PAGE_SIZE`]². Only one source is supported for now (one scan); several scans come
+/// later.
 ///
 /// Progress: the phases of the parts; a cancel is checked between them and returns
 /// [`MapError::Cancelled`]. Same input, same mesh and pages (only `seconds` varies).
@@ -196,77 +198,113 @@ pub fn build_surface(
     cfg: &SurfaceConfig,
     progress: &Progress,
 ) -> Result<(TexturedMesh, SurfaceStats), MapError> {
-    cfg.check()?;
+    check_sources(sources)?;
+    let (mesh, mut stats) = build_mesh(input, cfg, progress)?;
+    let tex = texture_mesh(&mesh, sources, cfg, progress, &mut stats)?;
+    Ok((tex, stats))
+}
+
+fn check_sources(sources: &[TextureSource]) -> Result<(), MapError> {
     if sources.len() > 1 {
         return Err(MapError::Config(
             "mehrere Bildquellen für eine Oberfläche werden noch nicht unterstützt".into(),
         ));
     }
+    Ok(())
+}
+
+fn check_cancel(progress: &Progress) -> Result<(), MapError> {
+    if progress.is_cancelled() {
+        Err(MapError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+/// The untextured surface of `input`: [`Tsdf::integrate`] → [`extract`] → [`cleanup`] →
+/// [`simplify`], and its accuracy against the points. After this the points are no longer
+/// needed: a caller that owns them can free them before [`texture_mesh`].
+pub fn build_mesh(
+    input: &SurfaceInput,
+    cfg: &SurfaceConfig,
+    progress: &Progress,
+) -> Result<(Mesh, SurfaceStats), MapError> {
+    cfg.check()?;
     let mut stats = SurfaceStats::default();
     let mut clock = Clock::new();
-    let check = || {
-        if progress.is_cancelled() {
-            Err(MapError::Cancelled)
-        } else {
-            Ok(())
-        }
-    };
-    check()?;
+    check_cancel(progress)?;
 
     let tsdf = Tsdf::integrate(input, cfg, progress)?;
     stats.tsdf_blocks = tsdf.blocks().count();
+    stats.tsdf_bytes = tsdf.voxel_bytes();
     clock.lap(&mut stats, "tsdf");
-    check()?;
+    check_cancel(progress)?;
 
     progress.phase("Oberfläche: Netz", None);
     let mut raw = extract(&tsdf, cfg);
     drop(tsdf);
     stats.faces_raw = raw.indices.len();
     clock.lap(&mut stats, "extract");
-    check()?;
+    check_cancel(progress)?;
 
     stats.cleanup = cleanup(&mut raw, cfg);
     clock.lap(&mut stats, "cleanup");
-    check()?;
+    check_cancel(progress)?;
 
     let mesh = simplify(&raw, cfg);
     drop(raw);
     stats.faces_final = mesh.indices.len();
     stats.vertices = mesh.positions.len();
     clock.lap(&mut stats, "simplify");
-    check()?;
-
-    let tex = match sources.first() {
-        Some(src) => {
-            let views = views::collect_views(&mesh, src, cfg, progress)?;
-            clock.lap(&mut stats, "views");
-            check()?;
-            let labels = atlas::choose_labels(&mesh, &views, cfg);
-            clock.lap(&mut stats, "labels");
-            check()?;
-            let (mut tex, texture) = atlas::bake(&mesh, &labels, &views, src, cfg, progress)?;
-            drop(views);
-            stats.texture = texture;
-            clock.lap(&mut stats, "bake");
-            check()?;
-            progress.phase("Oberfläche: Nähte", None);
-            stats.seams = level::level_seams(&mesh, &labels, &mut tex);
-            clock.lap(&mut stats, "seams");
-            tex
-        }
-        None => {
-            let (tex, texture) = gray_only(&mesh, cfg, progress)?;
-            stats.texture = texture;
-            clock.lap(&mut stats, "bake");
-            tex
-        }
-    };
-    check()?;
+    check_cancel(progress)?;
 
     progress.phase("Oberfläche: Genauigkeit", None);
     stats.accuracy = accuracy(&mesh, input.xyz);
     clock.lap(&mut stats, "accuracy");
-    Ok((tex, stats))
+    check_cancel(progress)?;
+    Ok((mesh, stats))
+}
+
+/// `mesh` (from [`build_mesh`]) textured from `sources`: views, labels, baking and seam
+/// levelling; gray without sources. Adds its figures and phases to `stats`.
+pub fn texture_mesh(
+    mesh: &Mesh,
+    sources: &[TextureSource],
+    cfg: &SurfaceConfig,
+    progress: &Progress,
+    stats: &mut SurfaceStats,
+) -> Result<TexturedMesh, MapError> {
+    cfg.check()?;
+    check_sources(sources)?;
+    let mut clock = Clock::new();
+    check_cancel(progress)?;
+    let tex = match sources.first() {
+        Some(src) => {
+            let views = views::collect_views(mesh, src, cfg, progress)?;
+            clock.lap(stats, "views");
+            check_cancel(progress)?;
+            let labels = atlas::choose_labels(mesh, &views, cfg);
+            clock.lap(stats, "labels");
+            check_cancel(progress)?;
+            let (mut tex, texture) = atlas::bake(mesh, &labels, &views, src, cfg, progress)?;
+            drop(views);
+            stats.texture = texture;
+            clock.lap(stats, "bake");
+            check_cancel(progress)?;
+            progress.phase("Oberfläche: Nähte", None);
+            stats.seams = level::level_seams(mesh, &labels, &mut tex);
+            clock.lap(stats, "seams");
+            tex
+        }
+        None => {
+            let (tex, texture) = gray_only(mesh, cfg, progress)?;
+            stats.texture = texture;
+            clock.lap(stats, "bake");
+            tex
+        }
+    };
+    check_cancel(progress)?;
+    Ok(tex)
 }
 
 /// Every face of `mesh` gray: [`atlas::bake`] without labels and images, on a page of

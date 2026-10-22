@@ -145,15 +145,18 @@ fn perimeter(positions: &[[f32; 3]], lp: &[u32]) -> f64 {
 /// [`MIN_CAP_ALIGNMENT`]) with [`cap_faces`]; loops it cannot triangulate stay open.
 fn fill_holes(mesh: &mut Mesh, max_perimeter: f64, stats: &mut CleanupStats) {
     use rayon::prelude::*;
-    let directed: BTreeSet<(u32, u32)> = mesh
+    // One sorted array rather than a tree: a single allocation, given back when dropped.
+    let mut directed: Vec<(u32, u32)> = mesh
         .indices
         .iter()
         .flat_map(|t| (0..3).map(move |k| (t[k], t[(k + 1) % 3])))
         .collect();
+    directed.par_sort_unstable();
+    directed.dedup();
     // Boundary edges a -> b of the existing faces, grouped by their start vertex.
     let mut out: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for &(a, b) in &directed {
-        if !directed.contains(&(b, a)) {
+        if directed.binary_search(&(b, a)).is_err() {
             out.entry(a).or_default().push(b);
         }
     }

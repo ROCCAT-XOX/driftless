@@ -3,8 +3,10 @@
 //! Sparse blocks of 8³ voxels. Every point votes, for each voxel its measurement ray crosses
 //! within ±`truncation_voxels · voxel` of the point, with the signed distance of the voxel
 //! centre to the point along the ray (positive in front of the surface, on the sensor side)
-//! and weight 1. The votes are summed as integers (0.1 mm and counts), so the result does not
-//! depend on the order the parallel workers add them in.
+//! and weight 1. The votes are summed as integers (in [`VOTE_STEPS`] steps per band, and
+//! counts), so the result does not depend on the order the parallel workers add them in. All
+//! voxels sit in two flat arrays (sum i32, weight u32: 8 bytes per voxel), filled as atomics
+//! and taken over in place.
 
 use super::{SurfaceConfig, SurfaceInput};
 use crate::MapError;
@@ -12,32 +14,31 @@ use driftless_io::progress::Progress;
 use driftless_odom::voxel_map::FixedState;
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 /// Edge of a block in voxels.
 const BLOCK: i32 = 8;
 const BLOCK_VOXELS: usize = (BLOCK * BLOCK * BLOCK) as usize;
-/// The sdf sums are kept in units of 0.1 mm.
-const SDF_UNIT: f64 = 1e4;
+/// A vote is the sdf in steps of band / `VOTE_STEPS` (at 2 cm and 4 voxels: 0.08 mm), at most
+/// ±`VOTE_STEPS`; an i32 sum holds two million votes of one voxel.
+const VOTE_STEPS: f64 = 1000.0;
 /// Points per parallel work item (and per progress step).
 const CHUNK: usize = 4096;
-
-#[derive(Debug)]
-struct Block {
-    /// Sum of the sdf votes (0.1 mm).
-    sum: Vec<i64>,
-    weight: Vec<u32>,
-}
 
 /// Fused signed distances; see the module docs.
 #[derive(Debug)]
 pub struct Tsdf {
     voxel: f64,
     min_weight: u32,
+    /// The band (m): a vote step is `band / VOTE_STEPS`.
+    band: f64,
     /// Block keys, sorted.
     keys: Vec<[i32; 3]>,
     index: HashMap<[i32; 3], u32, FixedState>,
-    blocks: Vec<Block>,
+    /// Sum of the sdf votes of voxel `l` of block `b` at `b · BLOCK_VOXELS + l`.
+    sum: Vec<i32>,
+    /// Number of votes, same layout.
+    weight: Vec<u32>,
 }
 
 fn block_of(key: [i32; 3]) -> ([i32; 3], usize) {
@@ -152,14 +153,10 @@ impl Tsdf {
 
         // Pass 2: the votes.
         progress.phase("Oberfläche: Voxel", Some(total));
-        let sums: Vec<Vec<AtomicI64>> = keys
-            .iter()
-            .map(|_| (0..BLOCK_VOXELS).map(|_| AtomicI64::new(0)).collect())
-            .collect();
-        let weights: Vec<Vec<AtomicU32>> = keys
-            .iter()
-            .map(|_| (0..BLOCK_VOXELS).map(|_| AtomicU32::new(0)).collect())
-            .collect();
+        let voxels = keys.len() * BLOCK_VOXELS;
+        let sums: Vec<AtomicI32> = (0..voxels).map(|_| AtomicI32::new(0)).collect();
+        let weights: Vec<AtomicU32> = (0..voxels).map(|_| AtomicU32::new(0)).collect();
+        let per_metre = VOTE_STEPS / band;
         ranges.par_iter().for_each(|r| {
             if progress.is_cancelled() {
                 return;
@@ -167,9 +164,9 @@ impl Tsdf {
             for i in r.clone() {
                 ray(i, &mut |k, sdf| {
                     let (b, l) = block_of(k);
-                    let bi = index[&b] as usize;
-                    sums[bi][l].fetch_add((sdf * SDF_UNIT).round() as i64, Ordering::Relaxed);
-                    weights[bi][l].fetch_add(1, Ordering::Relaxed);
+                    let v = index[&b] as usize * BLOCK_VOXELS + l;
+                    sums[v].fetch_add((sdf * per_metre).round() as i32, Ordering::Relaxed);
+                    weights[v].fetch_add(1, Ordering::Relaxed);
                 });
             }
             progress.advance(r.len() as u64);
@@ -177,20 +174,17 @@ impl Tsdf {
         if progress.is_cancelled() {
             return Err(MapError::Cancelled);
         }
-        let blocks = sums
-            .into_iter()
-            .zip(weights)
-            .map(|(s, w)| Block {
-                sum: s.into_iter().map(AtomicI64::into_inner).collect(),
-                weight: w.into_iter().map(AtomicU32::into_inner).collect(),
-            })
-            .collect();
+        // Same size and alignment: the collects reuse the allocations.
+        let sum: Vec<i32> = sums.into_iter().map(AtomicI32::into_inner).collect();
+        let weight: Vec<u32> = weights.into_iter().map(AtomicU32::into_inner).collect();
         Ok(Tsdf {
             voxel,
             min_weight: cfg.min_weight,
+            band,
             keys,
             index,
-            blocks,
+            sum,
+            weight,
         })
     }
 
@@ -198,12 +192,20 @@ impl Tsdf {
     /// fewer than `min_weight` measurements.
     pub fn sample(&self, key: [i32; 3]) -> Option<(f32, u32)> {
         let (b, l) = block_of(key);
-        let block = &self.blocks[*self.index.get(&b)? as usize];
-        let w = block.weight[l];
+        let v = *self.index.get(&b)? as usize * BLOCK_VOXELS + l;
+        let w = self.weight[v];
         if w < self.min_weight {
             return None;
         }
-        Some(((block.sum[l] as f64 / (f64::from(w) * SDF_UNIT)) as f32, w))
+        Some((
+            (f64::from(self.sum[v]) * self.band / (f64::from(w) * VOTE_STEPS)) as f32,
+            w,
+        ))
+    }
+
+    /// Bytes of the voxel arrays (sum and weight).
+    pub fn voxel_bytes(&self) -> usize {
+        std::mem::size_of_val(self.sum.as_slice()) + std::mem::size_of_val(self.weight.as_slice())
     }
 
     /// Edge length of a voxel (m); voxel `k` spans `[k·voxel, (k+1)·voxel)`.
@@ -253,6 +255,13 @@ mod tests {
             assert_eq!(v > 0.0, x < 200, "sign at {x}");
             last = v;
         }
+    }
+
+    #[test]
+    fn eight_bytes_per_voxel() {
+        let scan = plane_x([0.0; 3], 2.0, 0.3, 0.01);
+        let t = integrate(&scan);
+        assert_eq!(t.voxel_bytes(), t.blocks().count() * 512 * 8);
     }
 
     #[test]
