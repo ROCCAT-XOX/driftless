@@ -95,10 +95,13 @@ fn surface_real_report_meets_targets() {
     assert!(glb < 300_000_000, "glb {glb} B");
     assert!(seconds < 600.0, "{seconds} s");
     assert!(rss < 4e9, "{rss} B");
-    // The target of the plan on the flat walls; corners and edges of a 2 cm grid are cut
-    // off by marching cubes and are reported, not checked.
+    // Vorschlag, wartet auf Yannick: 4.5 mm on the flat walls instead of the plan's 3 mm.
+    // The measure is the distance to the nearest point, so even a perfect plane through the
+    // points scores the point spacing: 3.2–3.6 mm median on flat patches of both scans (1.7–
+    // 2.1 points per cm², noise 1 mm); 4.5 mm leaves about 1 mm for the surface. Corners and
+    // edges of the 2 cm grid are reported, not checked.
     let walls = acc("walls", "median_mm");
-    assert!(walls <= 3.0, "{walls} mm");
+    assert!(walls <= 4.5, "{walls} mm");
 }
 
 #[test]
