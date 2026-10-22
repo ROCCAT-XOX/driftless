@@ -3,6 +3,7 @@
 //! This step holds the shared types and the [`Tsdf`], a truncated signed distance field that
 //! the cleaned points and the positions they were measured from are fused into.
 
+mod cleanup;
 mod extract;
 mod mc_tables;
 mod tsdf;
@@ -10,6 +11,7 @@ mod tsdf;
 #[cfg(test)]
 pub(crate) mod testutil;
 
+pub use cleanup::{cleanup, CleanupStats};
 pub use extract::{extract, Mesh};
 pub use tsdf::Tsdf;
 
