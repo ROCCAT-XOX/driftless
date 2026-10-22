@@ -318,7 +318,7 @@ pub struct ColorStats {
 
 /// What the quality pass found for one image of the stream.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Status {
+pub(crate) enum Status {
     Bad,
     Outside,
     Blurry,
@@ -331,15 +331,15 @@ enum Status {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ImageRecord {
-    camera: usize,
-    stamp: f64,
-    status: Status,
+pub(crate) struct ImageRecord {
+    pub(crate) camera: usize,
+    pub(crate) stamp: f64,
+    pub(crate) status: Status,
 }
 
 /// Body rotation rate around `t` (rad/s): rotation angle between the poses at
 /// `t ± RATE_HALF_WINDOW` (clamped to the trajectory) over the time between them.
-fn angular_rate(poses: &[Pose], t: f64) -> f64 {
+pub(crate) fn angular_rate(poses: &[Pose], t: f64) -> f64 {
     let (Some(first), Some(last)) = (poses.first(), poses.last()) else {
         return 0.0;
     };
@@ -408,7 +408,7 @@ fn spearman(a: &[f64], b: &[f64]) -> f64 {
 }
 
 /// Camera index of a frame and whether its size fits the camera decoded at `downscale`.
-fn frame_camera(frame: &Frame, cams: &[ColorCamera], downscale: u32) -> Option<usize> {
+pub(crate) fn frame_camera(frame: &Frame, cams: &[ColorCamera], downscale: u32) -> Option<usize> {
     let c = cams.iter().position(|c| c.camera.name == frame.camera)?;
     let cam = &cams[c].camera;
     ((frame.rgb.width, frame.rgb.height) == (cam.width / downscale, cam.height / downscale))
@@ -438,7 +438,7 @@ fn image_count(images: &ImageSource) -> Option<u64> {
 }
 
 /// Pass 1: status of every image of the stream, in stream order.
-fn quality_pass(
+pub(crate) fn quality_pass(
     images: &ImageSource,
     poses: &[Pose],
     cams: &[ColorCamera],
@@ -631,7 +631,7 @@ fn local_geometry(xyz: &[[f32; 3]]) -> Geometry {
 }
 
 /// sRGB value → linear, for all 256 values.
-fn linear_table() -> [f32; 256] {
+pub(crate) fn linear_table() -> [f32; 256] {
     std::array::from_fn(|i| {
         let c = i as f64 / 255.0;
         let l = if c <= 0.04045 {
@@ -660,7 +660,7 @@ fn to_srgb(l: f32) -> u8 {
 }
 
 /// Bilinear sample of `img` at pixel `uv` (pixel centres at integers), in linear RGB.
-fn sample_linear(img: &RgbImage, uv: [f32; 2], lin: &[f32; 256]) -> [f32; 3] {
+pub(crate) fn sample_linear(img: &RgbImage, uv: [f32; 2], lin: &[f32; 256]) -> [f32; 3] {
     let (w, h) = (img.width as usize, img.height as usize);
     let x = uv[0].clamp(0.0, (w - 1) as f32);
     let y = uv[1].clamp(0.0, (h - 1) as f32);
@@ -767,7 +767,7 @@ impl View {
 }
 
 /// Inserts `v` into the point's views (best first) if it is among the best.
-fn keep_best(slots: &mut [View], v: View) {
+pub(crate) fn keep_best(slots: &mut [View], v: View) {
     if let Some(j) = slots.iter().position(|s| v.better_than(s)) {
         slots[j..].rotate_right(1);
         slots[j] = v;

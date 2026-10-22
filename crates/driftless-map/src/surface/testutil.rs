@@ -327,3 +327,136 @@ pub(crate) fn edge_report(mesh: &Mesh) -> (usize, usize) {
         .count();
     (repeated, boundary)
 }
+
+// ---- Scenes with camera images ----------------------------------------------------------
+
+/// The colouring tests' synthetic scenes (painted room, fisheye cameras, rendered image bags).
+#[path = "../../tests/common/mod.rs"]
+pub(crate) mod scene;
+
+use driftless_traj::nalgebra::Isometry3;
+use scene::{Aabb, Painted, Trajectory};
+
+/// Adds the six sides of `b` as grids of squares of about `step` (m); normals point out of
+/// the box, or into it with `inward` (a room seen from inside).
+fn add_box(mesh: &mut Mesh, b: &Aabb, step: f64, inward: bool) {
+    for axis in 0..3 {
+        let (a, c) = ((axis + 1) % 3, (axis + 2) % 3);
+        let (na, nc) = (
+            ((b.max[a] - b.min[a]) / step).ceil().max(1.0) as usize,
+            ((b.max[c] - b.min[c]) / step).ceil().max(1.0) as usize,
+        );
+        for high in [false, true] {
+            let base = mesh.positions.len() as u32;
+            for ia in 0..=na {
+                for ic in 0..=nc {
+                    let mut p = [0.0f32; 3];
+                    p[axis] = if high { b.max[axis] } else { b.min[axis] } as f32;
+                    p[a] = (b.min[a] + (b.max[a] - b.min[a]) * ia as f64 / na as f64) as f32;
+                    p[c] = (b.min[c] + (b.max[c] - b.min[c]) * ic as f64 / nc as f64) as f32;
+                    mesh.positions.push(p);
+                }
+            }
+            let id = |ia: usize, ic: usize| base + (ia * (nc + 1) + ic) as u32;
+            // Outward on the high side is +axis; flipped on the low side and for a room.
+            let want = if high != inward { 1.0 } else { -1.0 };
+            for ia in 0..na {
+                for ic in 0..nc {
+                    let q = [
+                        id(ia, ic),
+                        id(ia + 1, ic),
+                        id(ia + 1, ic + 1),
+                        id(ia, ic + 1),
+                    ];
+                    for tri in [[q[0], q[1], q[2]], [q[0], q[2], q[3]]] {
+                        let f = mesh.indices.len();
+                        mesh.indices.push(tri);
+                        if mesh.face_normal(f)[axis] * want < 0.0 {
+                            mesh.indices[f] = [tri[0], tri[2], tri[1]];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The surfaces of `painted` as a mesh of squares of about `step` (m), each split into two
+/// triangles; normals towards the inside of the room and out of the boxes.
+pub(crate) fn painted_mesh(painted: &Painted, step: f64) -> Mesh {
+    let mut mesh = Mesh::default();
+    add_box(&mut mesh, &painted.scene.room, step, true);
+    for b in &painted.scene.boxes {
+        add_box(&mut mesh, b, step, false);
+    }
+    mesh
+}
+
+/// Index of the face whose centroid lies nearest to `p`.
+pub(crate) fn face_near(mesh: &Mesh, p: [f32; 3]) -> usize {
+    let d2 = |f: usize| {
+        let c = centroid(mesh, f);
+        (0..3).map(|k| (c[k] - p[k]).powi(2)).sum::<f32>()
+    };
+    (0..mesh.indices.len())
+        .min_by(|&a, &b| d2(a).total_cmp(&d2(b)))
+        .expect("Netz ohne Dreiecke")
+}
+
+/// Centroid of face `f`.
+pub(crate) fn centroid(mesh: &Mesh, f: usize) -> [f32; 3] {
+    let c = mesh.indices[f].map(|i| mesh.positions[i as usize]);
+    [0, 1, 2].map(|k| (c[0][k] + c[1][k] + c[2][k]) / 3.0)
+}
+
+/// Holds the pose of the last step that has begun: `(from, pose)` sorted by `from`; before the
+/// first step its pose.
+pub(crate) struct Steps(pub Vec<(f64, Isometry3<f64>)>);
+
+impl Trajectory for Steps {
+    fn pose(&self, t: f64) -> Isometry3<f64> {
+        self.0
+            .iter()
+            .rev()
+            .find(|s| t >= s.0)
+            .unwrap_or(&self.0[0])
+            .1
+    }
+}
+
+/// Separable Gaussian blur of a [`scene::W`] × [`scene::H`] RGB image with standard deviation
+/// `sigma` (pixels), edges clamped.
+pub(crate) fn blur(rgb: &[u8], sigma: f64) -> Vec<u8> {
+    let r = (3.0 * sigma).ceil() as i64;
+    let kernel: Vec<f64> = (-r..=r)
+        .map(|i| (-(i * i) as f64 / (2.0 * sigma * sigma)).exp())
+        .collect();
+    let norm: f64 = kernel.iter().sum();
+    let (w, h) = (i64::from(scene::W), i64::from(scene::H));
+    let pass = |src: &[f64], horizontal: bool| -> Vec<f64> {
+        let mut out = vec![0.0; src.len()];
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..3 {
+                    let mut s = 0.0;
+                    for (k, kv) in kernel.iter().enumerate() {
+                        let o = k as i64 - r;
+                        let (sx, sy) = if horizontal {
+                            ((x + o).clamp(0, w - 1), y)
+                        } else {
+                            (x, (y + o).clamp(0, h - 1))
+                        };
+                        s += kv * src[((sy * w + sx) * 3 + c) as usize];
+                    }
+                    out[((y * w + x) * 3 + c) as usize] = s / norm;
+                }
+            }
+        }
+        out
+    };
+    let src: Vec<f64> = rgb.iter().map(|&v| f64::from(v)).collect();
+    pass(&pass(&src, true), false)
+        .iter()
+        .map(|v| v.round() as u8)
+        .collect()
+}

@@ -8,6 +8,9 @@ mod extract;
 mod mc_tables;
 mod simplify;
 mod tsdf;
+// Wired into the surface step by the texture baking.
+#[allow(dead_code)]
+mod views;
 
 #[cfg(test)]
 pub(crate) mod testutil;
@@ -16,6 +19,7 @@ pub use cleanup::{cleanup, CleanupStats};
 pub use extract::{extract, Mesh};
 pub use simplify::simplify;
 pub use tsdf::Tsdf;
+pub use views::TextureSource;
 
 use crate::{ColorConfig, MapError};
 use driftless_traj::Pose;
