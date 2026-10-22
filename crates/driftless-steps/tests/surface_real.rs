@@ -28,11 +28,13 @@ const BLACK_ROOM: &str = "jmk6-2026-10-22/20261022133554";
 /// Output folder of the surface inside the scan folder; `DRIFTLESS_B2_SURFACE` picks another
 /// one (e.g. `oberflaeche-b2-2cm` for a run with `--voxel 0.02`), whose images then get its
 /// name as prefix.
+/// `DRIFTLESS_B2_PREFIX` sets the image prefix outright (e.g. `fixA_`).
 fn surface_dir() -> (String, String) {
-    match std::env::var("DRIFTLESS_B2_SURFACE") {
+    let (dir, prefix) = match std::env::var("DRIFTLESS_B2_SURFACE") {
         Ok(name) => (format!("driftless/{name}"), format!("b2_{name}_")),
         Err(_) => ("driftless/oberflaeche-b2".into(), "b2_".into()),
-    }
+    };
+    (dir, std::env::var("DRIFTLESS_B2_PREFIX").unwrap_or(prefix))
 }
 /// Background of the point images, as in `render_preview`.
 const BACKGROUND: [u8; 3] = [40, 40, 40];
