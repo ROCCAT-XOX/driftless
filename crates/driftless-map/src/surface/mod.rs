@@ -3,6 +3,7 @@
 //! This step holds the shared types and the [`Tsdf`], a truncated signed distance field that
 //! the cleaned points and the positions they were measured from are fused into.
 
+// Wired into the surface step together with the glb/obj writing.
 #[allow(dead_code)]
 mod atlas;
 mod cleanup;
@@ -131,7 +132,9 @@ impl SurfaceConfig {
             return bad("kleinste Texelgröße muss größer als 0 sein");
         }
         if self.page_size < MIN_PAGE_SIZE {
-            return bad("Texturseite muss mindestens 16 Pixel breit sein");
+            return Err(MapError::Config(format!(
+                "Texturseite muss mindestens {MIN_PAGE_SIZE} Pixel breit sein"
+            )));
         }
         if self.views_per_face == 0 {
             return bad("Ansichten je Fläche müssen mindestens 1 sein");
