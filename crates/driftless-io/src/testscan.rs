@@ -184,12 +184,12 @@ pub fn scan_with_images(dir: &Path) {
     room_bag(dir, true);
     write_calib(dir);
     let mut jpeg = Vec::new();
-    jpeg_encoder::Encoder::new(&mut jpeg, 95)
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
         .encode(
             &render_from(dir),
-            IMAGE_W,
-            IMAGE_H,
-            jpeg_encoder::ColorType::Rgb,
+            u32::from(IMAGE_W),
+            u32::from(IMAGE_H),
+            image::ExtendedColorType::Rgb8,
         )
         .unwrap();
     let mut w = BagWriter::new(Compression::None);

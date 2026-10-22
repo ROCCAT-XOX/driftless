@@ -220,3 +220,25 @@ fn surface_fits_after_run() {
     fs::write(out.join("traj.tum"), format!("{traj}# changed\n")).unwrap();
     assert!(!surface_fits(&req), "other trajectory");
 }
+
+#[test]
+fn old_pages_are_listed_as_stale_not_deleted() {
+    let (dir, out) = prepared("steps-surface-stale-pages", false);
+    let dest = out.join("oberflaeche");
+    let req = request(&dir, &out, &dest);
+    let first = run_surface(&req, &Progress::new()).unwrap();
+    assert_eq!(first["stale"], serde_json::json!([]));
+    fs::write(dest.join("oberflaeche_seite_07.jpg"), b"old").unwrap();
+    let p = Progress::new();
+    let report = run_surface(&req, &p).unwrap();
+    assert_eq!(
+        report["stale"],
+        serde_json::json!(["oberflaeche_seite_07.jpg"])
+    );
+    assert!(
+        dest.join("oberflaeche_seite_07.jpg").is_file(),
+        "not deleted"
+    );
+    assert!(warnings(&p).iter().any(|w| w.contains("früheren Lauf")));
+    assert!(!dest.join("oberflaeche.json.tmp").exists());
+}

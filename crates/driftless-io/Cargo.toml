@@ -13,7 +13,7 @@ workspace = true
 [features]
 # Exposes `bag::writer::BagWriter`, `msg::encode` and `testscan` (test helpers) to other
 # crates' tests.
-test-util = ["dep:jpeg-encoder"]
+test-util = ["dep:image"]
 
 [dependencies]
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
@@ -23,7 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 zune-jpeg = "0.5.15"
-jpeg-encoder = { version = "0.7.1", optional = true }
+image = { version = "0.25.10", default-features = false, features = ["jpeg"], optional = true }
 
 [dev-dependencies]
 # Self dev-dependency: enables `test-util` for the integration tests in tests/.

@@ -68,7 +68,7 @@ fn images_part(
         Ok(c) => Ok((c.id.clone(), Some(c))),
         Err(why) => {
             progress.warn(format!("Oberfläche ohne Textur, {why}"));
-            Ok((format!("no images: {why}\n"), None))
+            Ok(("no images\n".into(), None))
         }
     }
 }
@@ -159,18 +159,20 @@ fn stats_json(s: &SurfaceStats) -> Value {
     })
 }
 
-/// Removes the texture pages of an earlier run (it may have had more pages).
-fn remove_old_pages(dir: &Path) {
+/// Page JPEGs of an earlier run in `dir` that the files of this run (`keep`) do not include.
+/// Nothing is deleted: they are warned about and listed as stale in the report.
+fn stale_pages(dir: &Path, keep: &[String]) -> Vec<String> {
     let prefix = format!("{STEM}_seite_");
     let Ok(entries) = fs::read_dir(dir) else {
-        return;
+        return Vec::new();
     };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) && name.ends_with(".jpg") {
-            let _ = fs::remove_file(e.path());
-        }
-    }
+    let mut stale: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(&prefix) && n.ends_with(".jpg") && !keep.contains(n))
+        .collect();
+    stale.sort();
+    stale
 }
 
 /// Runs the surface as `driftless surface` does; every console line goes to `progress`.
@@ -204,7 +206,7 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
     let sources: Vec<TextureSource> = color
         .map(|c| TextureSource {
             images: c.images,
-            poses: poses.clone(),
+            poses,
             cams: c.cams,
         })
         .into_iter()
@@ -217,13 +219,7 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
     check_cancel(progress)?;
     let out = &req.out_dir;
     fs::create_dir_all(out).map_err(|e| format!("{} nicht anlegbar: {e}", out.display()))?;
-    // A report only ever belongs to a complete set of files.
     let report_path = out.join(SURFACE_REPORT);
-    if report_path.exists() {
-        fs::remove_file(&report_path)
-            .map_err(|e| format!("{} nicht löschbar: {e}", report_path.display()))?;
-    }
-    remove_old_pages(out);
     let quality = req.config.jpeg_quality;
     write_glb(&out.join(format!("{STEM}.glb")), &tex, quality)?;
     write_obj(out, STEM, &tex, quality)?;
@@ -234,6 +230,13 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
     ];
     files.extend((0..tex.pages.len()).map(|p| format!("{STEM}_seite_{p:02}.jpg")));
     files.push(SURFACE_REPORT.to_string());
+    let stale = stale_pages(out, &files);
+    if !stale.is_empty() {
+        progress.warn(format!(
+            "{} stammen aus einem früheren Lauf und gehören nicht mehr zur Oberfläche",
+            stale.join(", ")
+        ));
+    }
 
     let peak = peak_rss_bytes();
     let report = json!({
@@ -244,10 +247,16 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
         "peak_rss_bytes": peak,
         "axes": AXES,
         "files": files,
+        "stale": stale,
     });
     let text = serde_json::to_string_pretty(&report).map_err(failed)? + "\n";
-    fs::write(&report_path, &text)
-        .map_err(|e| format!("{} nicht schreibbar: {e}", report_path.display()))?;
+    let tmp = out.join(format!("{SURFACE_REPORT}.tmp"));
+    fs::write(&tmp, &text)
+        .and_then(|()| fs::rename(&tmp, &report_path))
+        .map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("{} nicht schreibbar: {e}", report_path.display())
+        })?;
 
     let t = &stats.texture;
     progress.info(format!(
