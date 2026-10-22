@@ -192,7 +192,7 @@ impl Default for ColorConfig {
 }
 
 impl ColorConfig {
-    fn check(&self) -> Result<(), MapError> {
+    pub(crate) fn check(&self) -> Result<(), MapError> {
         let bad = |msg: &str| Err(MapError::Config(msg.into()));
         if !matches!(self.downscale, 1 | 2 | 4) {
             return bad("Verkleinerung der Bilder muss 1, 2 oder 4 sein");

@@ -19,6 +19,7 @@ mod exposure;
 mod sharpness;
 mod smooth;
 mod stage;
+pub mod surface;
 mod through;
 pub mod visibility;
 
