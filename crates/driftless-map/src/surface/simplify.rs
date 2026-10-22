@@ -1,13 +1,21 @@
 //! Triangle reduction: flat walls become a few big triangles, the shape stays within a tight error.
+//! Then edges longer than [`SurfaceConfig::max_edge`] are split, so that every face fits into
+//! a camera image for the texture.
 
 use super::{Mesh, SurfaceConfig};
 use meshopt::{SimplifyOptions, VertexDataAdapter};
+use std::collections::HashMap;
+
+/// Rounds of edge splitting at most; each round halves every long edge, so 40 rounds reach
+/// from kilometres to below a millimetre.
+const MAX_SPLIT_ROUNDS: usize = 40;
 
 /// Reduces the triangles of `mesh` with meshoptimizer.
 ///
 /// No vertex moves further than `cfg.simplify_error` (m) from the surface, and the vertices on
 /// the border of the mesh stay where they are, so open edges keep their length. Vertices no face
-/// uses after the reduction are dropped; the order of the rest is kept.
+/// uses after the reduction are dropped; the order of the rest is kept. Finally every edge
+/// longer than `cfg.max_edge` is split at its midpoint (see [`split_long_edges`]).
 pub fn simplify(mesh: &Mesh, cfg: &SurfaceConfig) -> Mesh {
     if mesh.indices.is_empty() {
         return Mesh::default();
@@ -30,7 +38,83 @@ pub fn simplify(mesh: &Mesh, cfg: &SurfaceConfig) -> Mesh {
         indices: reduced.as_chunks::<3>().0.to_vec(),
     };
     drop_unused(&mut out);
+    split_long_edges(&mut out, cfg.max_edge);
     out
+}
+
+/// Splits every edge longer than `max_edge` (m) until none is left. Per round every long edge
+/// gets one midpoint, shared by all faces on it, and each face is cut by the template for its
+/// number of split edges (1: two faces through the opposite corner; 2: the corner triangle and
+/// the rest cut along its shorter diagonal; 3: four faces). Faces keep their winding, the
+/// midpoints lie on the old edges, so the surface, its boundary and its orientation stay as
+/// they were. New vertices are appended in face order: deterministic.
+pub(crate) fn split_long_edges(mesh: &mut Mesh, max_edge: f64) {
+    let key = |a: u32, b: u32| (a.min(b), a.max(b));
+    for _ in 0..MAX_SPLIT_ROUNDS {
+        let len = |m: &Mesh, a: u32, b: u32| {
+            let (p, q) = (m.positions[a as usize], m.positions[b as usize]);
+            (0..3)
+                .map(|k| (f64::from(p[k]) - f64::from(q[k])).powi(2))
+                .sum::<f64>()
+                .sqrt()
+        };
+        // Midpoint of every long edge, created in face order.
+        let mut mid: HashMap<(u32, u32), u32> = HashMap::new();
+        for fi in 0..mesh.indices.len() {
+            let f = mesh.indices[fi];
+            for k in 0..3 {
+                let (a, b) = (f[k], f[(k + 1) % 3]);
+                if len(mesh, a, b) > max_edge && !mid.contains_key(&key(a, b)) {
+                    let (p, q) = (mesh.positions[a as usize], mesh.positions[b as usize]);
+                    let m = [0, 1, 2].map(|k| ((f64::from(p[k]) + f64::from(q[k])) / 2.0) as f32);
+                    mesh.positions.push(m);
+                    let id = u32::try_from(mesh.positions.len() - 1).expect("fewer than 2^32");
+                    mid.insert(key(a, b), id);
+                }
+            }
+        }
+        if mid.is_empty() {
+            return;
+        }
+        let mut out = Vec::with_capacity(mesh.indices.len() * 2);
+        for &f in &mesh.indices {
+            let m = [0, 1, 2].map(|k| mid.get(&key(f[k], f[(k + 1) % 3])).copied());
+            match m.iter().filter(|x| x.is_some()).count() {
+                0 => out.push(f),
+                1 => {
+                    // Rotate so that edge 0 (v0 → v1) is the split one.
+                    let r = m.iter().position(Option::is_some).expect("one split edge");
+                    let v = [f[r], f[(r + 1) % 3], f[(r + 2) % 3]];
+                    let m0 = m[r].expect("split");
+                    out.push([v[0], m0, v[2]]);
+                    out.push([m0, v[1], v[2]]);
+                }
+                2 => {
+                    // Rotate so that edge 2 (v2 → v0) is the whole one.
+                    let r = (m.iter().position(Option::is_none).expect("one whole edge") + 1) % 3;
+                    let v = [f[r], f[(r + 1) % 3], f[(r + 2) % 3]];
+                    let (m0, m1) = (m[r].expect("split"), m[(r + 1) % 3].expect("split"));
+                    out.push([m0, v[1], m1]);
+                    // The rest is the quad v0, m0, m1, v2: cut along its shorter diagonal.
+                    if len(mesh, v[0], m1) <= len(mesh, m0, v[2]) {
+                        out.push([v[0], m0, m1]);
+                        out.push([v[0], m1, v[2]]);
+                    } else {
+                        out.push([v[0], m0, v[2]]);
+                        out.push([m0, m1, v[2]]);
+                    }
+                }
+                _ => {
+                    let [m0, m1, m2] = m.map(|x| x.expect("split"));
+                    out.push([f[0], m0, m2]);
+                    out.push([m0, f[1], m1]);
+                    out.push([m2, m1, f[2]]);
+                    out.push([m0, m1, m2]);
+                }
+            }
+        }
+        mesh.indices = out;
+    }
 }
 
 fn positions_as_bytes(p: &[[f32; 3]]) -> &[u8] {
@@ -161,7 +245,14 @@ mod tests {
     #[test]
     fn flat_wall_gets_few_triangles() {
         let mesh = grid_wall(300, 250, 0.01); // 3 × 2.5 m
-        let out = simplify(&mesh, &cfg());
+                                              // The reduction alone; the split of long edges is checked in `long_edges_are_split`.
+        let out = simplify(
+            &mesh,
+            &SurfaceConfig {
+                max_edge: 100.0,
+                ..cfg()
+            },
+        );
         assert!(
             out.indices.len() * 100 < mesh.indices.len(),
             "{} von {} Dreiecken übrig",
@@ -199,6 +290,67 @@ mod tests {
         let out = simplify(&mesh, &cfg());
         assert_eq!(edge_report(&out), before);
         assert!(out.indices.len() < mesh.indices.len());
+    }
+
+    /// Longest edge of `mesh` (m).
+    fn longest_edge(mesh: &Mesh) -> f64 {
+        mesh.indices
+            .iter()
+            .flat_map(|f| {
+                (0..3).map(move |k| {
+                    let (p, q) = (
+                        mesh.positions[f[k] as usize],
+                        mesh.positions[f[(k + 1) % 3] as usize],
+                    );
+                    (0..3)
+                        .map(|i| (f64::from(p[i]) - f64::from(q[i])).powi(2))
+                        .sum::<f64>()
+                        .sqrt()
+                })
+            })
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn long_edges_are_split() {
+        let mesh = grid_wall(300, 250, 0.01); // 3 × 2.5 m
+        let unsplit = simplify(
+            &mesh,
+            &SurfaceConfig {
+                max_edge: 100.0,
+                ..cfg()
+            },
+        );
+        assert!(longest_edge(&unsplit) > 1.0, "{}", longest_edge(&unsplit));
+        let out = simplify(&mesh, &cfg());
+        let max_edge = cfg().max_edge;
+        assert!(longest_edge(&out) <= max_edge, "{}", longest_edge(&out));
+        assert!(out.indices.len() > unsplit.indices.len());
+        // The fans from the locked 1-cm border to the inside are split too, which costs most
+        // of the faces; still far fewer than before the reduction.
+        println!("{} -> {} faces", unsplit.indices.len(), out.indices.len());
+        assert!(out.indices.len() * 4 < mesh.indices.len());
+        // Still closed where it was, open where it was, consistently wound, on the plane.
+        assert_eq!(edge_report(&out), edge_report(&unsplit));
+        assert_eq!(edge_report(&out).0, 0);
+        assert!(out.positions.iter().all(|p| (p[0] - 0.5).abs() <= 0.001));
+        assert!((0..out.indices.len()).all(|f| out.face_normal(f)[0] > 0.99));
+        // The area is unchanged.
+        let area = |m: &Mesh| {
+            (0..m.indices.len())
+                .map(|f| f64::from(m.face_area(f)))
+                .sum::<f64>()
+        };
+        assert!((area(&out) - area(&unsplit)).abs() < 1e-4, "{}", area(&out));
+        // A closed slab with long edges stays closed.
+        let mut slab = wall_with_hole(4, 1.0, None);
+        let before = edge_report(&slab);
+        split_long_edges(&mut slab, 0.3);
+        assert_eq!(edge_report(&slab), before);
+        assert_eq!(before, (0, 0));
+        assert!(longest_edge(&slab) <= 0.3);
+        // Deterministic.
+        assert_eq!(simplify(&mesh, &cfg()), out);
     }
 
     #[test]

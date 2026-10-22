@@ -7,11 +7,18 @@
 //!    which images are used; the used ones are ranked in (capture time, camera name) order.
 //! 2. **Views**: per used image a depth buffer of the faces near the camera (cells of
 //!    [`ColorConfig::zbuffer_scale`] pixels of the image at 1/[`ColorConfig::downscale`]),
-//!    splatted from the centroid and the corners of every face; a large face gets a grid of
-//!    samples instead, at most [`SAMPLE_GAP_CELLS`] cells apart, so that nothing behind it
-//!    shows through. A face is seen if its centroid lies within [`ColorConfig::max_dist`]
-//!    and passes the depth buffer, its normal points towards the camera and its corners lie
-//!    in the image within [`ColorConfig::rim_theta`] of the optical axis. Its score is
+//!    splatted from the centroid and the corners of every face. A face that would cover more
+//!    than [`SAMPLE_GAP_CELLS`] cells between its samples gets a barycentric grid of up to
+//!    [`MAX_SUBDIVISIONS`] rows instead, so that nothing behind it shows through. The samples
+//!    then lie at most [`SAMPLE_GAP_CELLS`] cells apart as long as the face's nearest point is
+//!    at least `longest edge · focal / (SAMPLE_GAP_CELLS · MAX_SUBDIVISIONS)` away (`focal` in
+//!    cells per radian; with [`SurfaceConfig::max_edge`] 0.3 m, a lens of about 600 px/rad and
+//!    `zbuffer_scale` 4: about 0.7 m); nearer, the grid is capped and gaps can open. A face is
+//!    seen if its centroid lies within [`ColorConfig::max_dist`], its centroid and all three
+//!    corners pass the depth buffer (a partly hidden face is not seen), its normal points
+//!    towards the camera and its corners lie in the image within [`ColorConfig::rim_theta`] of
+//!    the optical axis. Seen at a grazing angle (beyond about 75°), a face is often hidden by
+//!    the nearer part of its own wall in the same depth cell, as in colouring. Its score is
 //!    `projected area (pixels at full size) × sharpness_norm × cos(angle to the normal)`.
 //!    Each face keeps its [`SurfaceConfig::views_per_face`] best views (higher score first;
 //!    equal scores: the earlier image).
@@ -19,7 +26,9 @@
 //! Exposure and white balance: every `k`-th face (at most [`EXPOSURE_FACES`]) also keeps the
 //! colour (bilinear, linear RGB, at its centroid) and the angle from the optical axis of its
 //! kept views; from these, [`crate::exposure::estimate_exposure`] fits the gains and the edge
-//! falloff as in colouring.
+//! falloff as in colouring. Unlike colouring (which fits on [`ColorConfig::views_kept`] views
+//! per point, at most one per camera and [`ColorConfig::view_gap`]), the fit sees the
+//! [`SurfaceConfig::views_per_face`] best views by score.
 
 use super::{Mesh, SurfaceConfig};
 use crate::color::{
@@ -38,7 +47,8 @@ use rayon::prelude::*;
 
 /// At most this many faces (every `k`-th) keep the colours of their views for the exposure fit.
 pub const EXPOSURE_FACES: usize = 200_000;
-/// The depth-buffer samples of a face lie at most this many cells apart in the image.
+/// The depth-buffer samples of a face are meant to lie at most this many cells apart in the
+/// image (see the module docs for when the cap [`MAX_SUBDIVISIONS`] prevents it).
 pub const SAMPLE_GAP_CELLS: f64 = 2.0;
 /// A face is split into at most this many sample rows for the depth buffer.
 pub const MAX_SUBDIVISIONS: usize = 32;
@@ -247,6 +257,16 @@ fn image_views(
                     return None;
                 }
                 *uv = shot.full.project(&pc.coords)?;
+                // The corner must not be hidden either (same tolerance as the centroid).
+                let corner = project_point(
+                    &mesh.positions[i as usize],
+                    cam,
+                    &world_to_cam,
+                    f64::INFINITY,
+                )?;
+                if !buffer.is_visible(&corner, cfg.depth_tolerance) {
+                    return None;
+                }
             }
             let area = 0.5
                 * ((uv[1][0] - uv[0][0]) * (uv[2][1] - uv[0][1])
@@ -570,6 +590,109 @@ mod tests {
         // The pillar's front is seen from the origin.
         let pillar = face_near(&mesh, [0.0, 2.0, 0.05]);
         assert!(views(&table, k, pillar).iter().any(|x| x.image == 0));
+    }
+
+    /// Adds triangle `t` to `mesh`, wound so that its normal points along `normal`; returns
+    /// its face index.
+    fn add_triangle(mesh: &mut Mesh, t: [[f32; 3]; 3], normal: [f32; 3]) -> usize {
+        let base = mesh.positions.len() as u32;
+        mesh.positions.extend_from_slice(&t);
+        let f = mesh.indices.len();
+        mesh.indices.push([base, base + 1, base + 2]);
+        let n = mesh.face_normal(f);
+        if (0..3).map(|k| n[k] * normal[k]).sum::<f32>() < 0.0 {
+            mesh.indices[f] = [base, base + 2, base + 1];
+        }
+        f
+    }
+
+    #[test]
+    fn partly_hidden_face_rejected() {
+        // A pillar between the left camera at the origin and the +y wall hides the wall for
+        // x within about −0.29 … 0.22 m; the depth buffer widens that by its splats and the
+        // silhouette rule to about ±0.5 m. One extra wall face has a corner deep in the shadow
+        // and its centroid in view (x = 0.7); a second one lies wholly in view.
+        let painted = Painted::new(vec![(
+            aabb([-0.1, 2.0, -1.2], [0.1, 2.2, 1.8]),
+            [240, 140, 20],
+        )]);
+        let cams = cameras();
+        let mut mesh = painted_mesh(&painted, STEP);
+        let wall = [0.0, -1.0, 0.0];
+        let partly = add_triangle(
+            &mut mesh,
+            [[0.1, 5.0, 0.0], [1.0, 5.0, 0.0], [1.0, 5.0, 0.4]],
+            wall,
+        );
+        let clear = add_triangle(
+            &mut mesh,
+            [[0.7, 5.0, 0.0], [1.3, 5.0, 0.0], [1.3, 5.0, 0.4]],
+            wall,
+        );
+        let traj = Steps(vec![(0.0, Isometry3::identity())]);
+        let images = write_bag("views-partly", &painted, &traj, &cams, &[shot(0, T0 + 1.0)]);
+        let src = source(&images, &poses(&traj, 2.0), &cams);
+        let cfg = SurfaceConfig::default();
+        let table = collect_views(&mesh, &src, &cfg, &Progress::new()).unwrap();
+        assert_eq!(table.images.len(), 1);
+        let k = cfg.views_per_face;
+        // The centroid alone is in view: the grid face around it is seen …
+        let around = face_near(&painted_mesh(&painted, STEP), centroid(&mesh, partly));
+        assert!(views(&table, k, around).iter().any(|v| v.image == 0));
+        assert!(views(&table, k, clear).iter().any(|v| v.image == 0));
+        // … but not the face with the hidden corner.
+        let v = views(&table, k, partly);
+        assert!(v.iter().all(|x| x.image != 0), "{v:?}");
+    }
+
+    #[test]
+    fn simplified_wall_gets_views() {
+        // A 10 × 2 m stretch of the +y wall as 2 triangles, and the left camera walking along
+        // it 1.5 m away. Only views within 50° of the optical axis count (a stand-in for a wall
+        // too long for one image): the big triangles fit into no image, their split pieces do.
+        let painted = Painted::new(vec![]);
+        let cams = cameras();
+        let mut wall = Mesh::default();
+        let n = [0.0, -1.0, 0.0];
+        add_triangle(
+            &mut wall,
+            [[-4.0, 5.0, -0.8], [6.0, 5.0, -0.8], [6.0, 5.0, 1.2]],
+            n,
+        );
+        add_triangle(
+            &mut wall,
+            [[-4.0, 5.0, -0.8], [6.0, 5.0, 1.2], [-4.0, 5.0, 1.2]],
+            n,
+        );
+        let cam_y = cams[0].cam_in_body.translation.vector.y;
+        let xs: Vec<f64> = (0..8).map(|i| -3.5 + 1.4 * f64::from(i)).collect();
+        let traj = Steps(
+            xs.iter()
+                .enumerate()
+                .map(|(i, &x)| {
+                    let from = if i == 0 { 0.0 } else { T0 + 0.5 + i as f64 };
+                    (from, Isometry3::translation(x, 3.5 - cam_y, 0.0))
+                })
+                .collect(),
+        );
+        let shots: Vec<Shot> = (0..xs.len())
+            .map(|i| shot(0, T0 + 1.0 + i as f64))
+            .collect();
+        let images = write_bag("views-split", &painted, &traj, &cams, &shots);
+        let src = source(&images, &poses(&traj, xs.len() as f64 + 1.0), &cams);
+        let mut cfg = SurfaceConfig::default();
+        cfg.color.rim_theta = 50f64.to_radians();
+        let seen = |mesh: &Mesh| {
+            let table = collect_views(mesh, &src, &cfg, &Progress::new()).unwrap();
+            assert_eq!(table.images.len(), xs.len());
+            (0..mesh.indices.len())
+                .filter(|&f| views(&table, cfg.views_per_face, f)[0].score > 0.0)
+                .count()
+        };
+        assert_eq!(seen(&wall), 0);
+        let split = super::super::simplify(&wall, &cfg);
+        assert!(split.indices.len() > 100, "{}", split.indices.len());
+        assert_eq!(seen(&split), split.indices.len());
     }
 
     #[test]

@@ -63,6 +63,9 @@ pub struct SurfaceConfig {
     pub max_hole_edges: usize,
     /// Largest distance simplification may move the surface (m).
     pub simplify_error: f64,
+    /// After simplification, edges longer than this are split (m): a face must fit into one
+    /// camera image to get a texture.
+    pub max_edge: f64,
     /// Smallest texel size on the surface (m).
     pub min_texel: f64,
     /// Edge of a texture page (pixels).
@@ -86,6 +89,7 @@ impl Default for SurfaceConfig {
             min_component_faces: 200,
             max_hole_edges: 64,
             simplify_error: 0.002,
+            max_edge: 0.3,
             min_texel: 0.002,
             page_size: 4096,
             views_per_face: 4,
@@ -113,6 +117,9 @@ impl SurfaceConfig {
         }
         if !(self.simplify_error.is_finite() && self.simplify_error >= 0.0) {
             return bad("Vereinfachungsfehler darf nicht negativ sein");
+        }
+        if !(self.max_edge.is_finite() && self.max_edge > 0.0) {
+            return bad("längste Kante der Oberfläche muss größer als 0 sein");
         }
         if !(self.min_texel.is_finite() && self.min_texel > 0.0) {
             return bad("kleinste Texelgröße muss größer als 0 sein");
