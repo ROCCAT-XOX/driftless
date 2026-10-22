@@ -805,7 +805,7 @@ fn keep_best_apart(slots: &mut [View], v: View, images: &[(f64, usize)], gap: f6
 }
 
 /// Linear luminance (Rec. 709).
-fn luminance(c: [f32; 3]) -> f64 {
+pub(crate) fn luminance(c: [f32; 3]) -> f64 {
     0.2126 * f64::from(c[0]) + 0.7152 * f64::from(c[1]) + 0.0722 * f64::from(c[2])
 }
 

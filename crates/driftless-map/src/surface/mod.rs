@@ -8,6 +8,9 @@
 mod atlas;
 mod cleanup;
 mod extract;
+// Wired into the surface step together with the glb/obj writing.
+#[allow(dead_code)]
+mod level;
 mod mc_tables;
 mod simplify;
 mod tsdf;
@@ -21,6 +24,7 @@ pub(crate) mod testutil;
 pub use atlas::{TexturePage, TextureStats, TexturedMesh};
 pub use cleanup::{cleanup, CleanupStats};
 pub use extract::{extract, Mesh};
+pub use level::SeamStats;
 pub use simplify::simplify;
 pub use tsdf::Tsdf;
 pub use views::TextureSource;
