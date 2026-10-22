@@ -223,6 +223,39 @@ pub(crate) fn rod_on_wall(n: usize, step: f32, len: usize) -> (Mesh, usize) {
     (mesh, rod)
 }
 
+/// An open square tube along +x (2 × 2 `step` squares, `len` segments), both ends open,
+/// outward normals.
+pub(crate) fn open_tube(len: usize, step: f32) -> Mesh {
+    let ring_yz = [
+        (0, 0),
+        (1, 0),
+        (2, 0),
+        (2, 1),
+        (2, 2),
+        (1, 2),
+        (0, 2),
+        (0, 1),
+    ];
+    let mut mesh = Mesh::default();
+    for level in 0..=len {
+        for (y, z) in ring_yz {
+            mesh.positions
+                .push([level as f32 * step, y as f32 * step, z as f32 * step]);
+        }
+    }
+    for level in 0..len {
+        for i in 0..8 {
+            let j = (i + 1) % 8;
+            let (b, t) = ((level * 8) as u32, ((level + 1) * 8) as u32);
+            mesh.indices
+                .push([b + i as u32, b + j as u32, t + i as u32]);
+            mesh.indices
+                .push([b + j as u32, t + j as u32, t + i as u32]);
+        }
+    }
+    mesh
+}
+
 /// A closed icosahedron (20 faces, outward normals) of radius `r` around `centre`.
 pub(crate) fn speck(centre: [f32; 3], r: f32) -> Mesh {
     let t = (1.0 + 5f32.sqrt()) / 2.0;

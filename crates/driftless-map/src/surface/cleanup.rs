@@ -4,10 +4,37 @@
 //! stays, while a speck that floats free is removed. A hole is a loop of boundary edges
 //! (directed edges without an opposite partner); it is closed by a fan from its centroid
 //! whose faces run against the boundary edges, which keeps the winding consistent with the
-//! neighbourhood. All iteration is over sorted containers, so the output is deterministic.
+//! neighbourhood, but only if the cap leans like the faces around the loop (a hole in a
+//! surface, not the rim of an open object). All iteration is over sorted containers, so the output is deterministic.
 
 use super::{Mesh, SurfaceConfig};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// A boundary loop is a hole in a surface (and gets filled) only if the cap it would get
+/// leans the same way as the faces around it: the area-weighted mean of cos(angle between cap
+/// normal and adjacent face normal) must exceed this. A hole in a wall gives about 1, the outer
+/// rim of a flat open patch about -1 and the end of a pipe about 0, so the latter two stay
+/// open (unseen areas and open objects are not invented).
+const MIN_CAP_ALIGNMENT: f32 = 0.5;
+
+/// Twice the area times the normal of the triangle `a b c`.
+fn cross3(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
+    let u = [0, 1, 2].map(|k| b[k] - a[k]);
+    let v = [0, 1, 2].map(|k| c[k] - a[k]);
+    [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ]
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn len3(a: [f32; 3]) -> f32 {
+    dot3(a, a).sqrt()
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CleanupStats {
@@ -109,6 +136,12 @@ fn fill_holes(mesh: &mut Mesh, max_edges: usize, stats: &mut CleanupStats) {
             out.entry(a).or_default().push(b);
         }
     }
+    let mut face_of: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+    for (f, t) in mesh.indices.iter().enumerate() {
+        for k in 0..3 {
+            face_of.entry((t[k], t[(k + 1) % 3])).or_insert(f);
+        }
+    }
     let mut used: BTreeSet<(u32, u32)> = BTreeSet::new();
     let mut loops: Vec<Vec<u32>> = Vec::new();
     let starts: Vec<(u32, u32)> = out
@@ -147,17 +180,39 @@ fn fill_holes(mesh: &mut Mesh, max_edges: usize, stats: &mut CleanupStats) {
             stats.holes_left += 1;
             continue;
         }
-        stats.holes_filled += 1;
         let n = lp.len();
-        if n == 3 {
-            // The existing faces run lp[0] -> lp[1] -> lp[2]; close against them.
-            mesh.indices.push([lp[0], lp[2], lp[1]]);
-            continue;
-        }
         let mut c = [0.0f32; 3];
         for &v in &lp {
             let p = mesh.positions[v as usize];
             c = [0, 1, 2].map(|k| c[k] + p[k] / n as f32);
+        }
+        let pos = |v: u32| mesh.positions[v as usize];
+        // Cap normal from the fan winding (area-weighted sum), against the loop's own edges.
+        let mut cap = [0.0f32; 3];
+        for i in 0..n {
+            let x = cross3(pos(lp[(i + 1) % n]), pos(lp[i]), c);
+            cap = [0, 1, 2].map(|k| cap[k] + x[k]);
+        }
+        let cap_len = len3(cap);
+        // Area-weighted mean of cos(cap, adjacent face).
+        let (mut align, mut area) = (0.0f32, 0.0f32);
+        for i in 0..n {
+            if let Some(&f) = face_of.get(&(lp[i], lp[(i + 1) % n])) {
+                let [a, b, d] = mesh.indices[f].map(pos);
+                let x = cross3(a, b, d);
+                align += dot3(cap, x) / cap_len.max(f32::MIN_POSITIVE);
+                area += len3(x);
+            }
+        }
+        if !(cap_len > 0.0 && area > 0.0 && align / area > MIN_CAP_ALIGNMENT) {
+            stats.holes_left += 1;
+            continue;
+        }
+        stats.holes_filled += 1;
+        if n == 3 {
+            // The existing faces run lp[0] -> lp[1] -> lp[2]; close against them.
+            mesh.indices.push([lp[0], lp[2], lp[1]]);
+            continue;
         }
         mesh.positions.push(c);
         let centre = (mesh.positions.len() - 1) as u32;
@@ -249,6 +304,41 @@ mod tests {
         assert_eq!((stats.holes_filled, stats.holes_left), (0, 1));
         assert_eq!(mesh.indices.len(), before.indices.len());
         assert_eq!(edge_report(&mesh), (0, 400));
+    }
+
+    #[test]
+    fn open_patch_rim_stays_open() {
+        let mut mesh = open_wall(12, 0.01); // 288 faces, 48-edge rim
+        assert!(mesh.indices.len() >= cfg().min_component_faces);
+        let before = mesh.clone();
+        let stats = cleanup(&mut mesh, &cfg());
+        assert_eq!((stats.holes_filled, stats.holes_left), (0, 1));
+        assert_eq!(mesh, before);
+    }
+
+    #[test]
+    fn pipe_end_stays_open() {
+        let mut mesh = open_tube(13, 0.01); // 208 faces, two 8-edge ends
+        assert!(mesh.indices.len() >= cfg().min_component_faces);
+        let before = mesh.clone();
+        let stats = cleanup(&mut mesh, &cfg());
+        assert_eq!((stats.holes_filled, stats.holes_left), (0, 2));
+        assert_eq!(mesh, before);
+    }
+
+    #[test]
+    fn fills_triangular_hole() {
+        let mut mesh = speck([0.0; 3], 0.05);
+        mesh.indices.remove(0);
+        let c = SurfaceConfig {
+            min_component_faces: 1,
+            ..cfg()
+        };
+        let stats = cleanup(&mut mesh, &c);
+        assert_eq!((stats.holes_filled, stats.holes_left), (1, 0));
+        assert_eq!(mesh.indices.len(), 20);
+        assert_eq!(mesh.positions.len(), 12);
+        assert_eq!(edge_report(&mesh), (0, 0));
     }
 
     #[test]
