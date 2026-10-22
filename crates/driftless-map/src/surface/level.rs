@@ -1,79 +1,101 @@
 //! Seam levelling: evens out the brightness jumps where charts of different images meet.
 //!
-//! Every chart gets an additive correction in linear RGB per mesh vertex:
+//! Every chart gets a gain per mesh vertex and channel (linear RGB, solved as its logarithm):
 //!
-//! 1. **Border vertices** are vertices of several charts. A chart's colour at such a vertex is
-//!    the texel of median luminance among the texels of its rectangle within
-//!    [`VERTEX_SAMPLE_RADIUS`] of the vertex's texture coordinate (linear RGB; the chart owns
-//!    its rectangle, so no other chart's texels are read). The median ignores a speck or an
-//!    edge that covers less than half of the window. If the charts' luminances there differ by
-//!    more than [`MAX_SEAM_RATIO`], the difference is content rather than exposure and the
-//!    vertex is treated as interior. Otherwise each of those charts is pulled to their
-//!    mean colour there (for two charts, half of the difference each, in opposite directions),
-//!    clamped to ±[`MAX_CORRECTION`] per channel, so that a wrong colour sample cannot paint a
-//!    large patch.
-//! 2. **Interior vertices** take the harmonic interpolation of the border corrections over the
+//! 1. **Border vertices** are vertices where charts meet along an edge. Both charts are
+//!    sampled at the same spots of every such edge next to the vertex: on the edge itself, at
+//!    [`SEAM_SAMPLES`] of its length from the vertex (bilinear; a chart's texels reach half a
+//!    texel beyond its triangles, so on the edge both charts show the same spot of the
+//!    surface). Per pair of charts at the vertex: the mean colour of each. If their
+//!    luminances differ by more than [`MAX_SEAM_RATIO`] (a side darker than
+//!    [`MIN_SEAM_LUMINANCE`] counts as that dark), the difference is content (a highlight, an
+//!    occlusion) rather than exposure and the pair is left out. Each chart at the vertex is
+//!    then pulled towards the others: its log gain is minus the sum of its log ratios
+//!    `ln((own + GAIN_FLOOR) / (other + GAIN_FLOOR))` to the charts it shares an edge with
+//!    there, divided by the number of charts at the vertex (two charts meet halfway), clamped
+//!    to [`MAX_GAIN`] either way. A vertex without such a pair is treated as interior.
+//! 2. **Interior vertices** take the harmonic interpolation of the border log gains over the
 //!    chart's edge graph (every free vertex the mean of its edge neighbours, border vertices
 //!    fixed), solved per channel with conjugate gradients until the largest per-vertex
 //!    residual (the change one Jacobi step would still make) is below [`SOLVE_TOLERANCE`], at
 //!    most [`SOLVE_ROUNDS_PER_VERTEX`] rounds per free vertex. A chart bordering another on
-//!    one side only is thus shifted as a whole, without a halo; it stays within the bound of
-//!    its border corrections (maximum principle). Parts of a chart without a border vertex keep
-//!    0.
+//!    one side only is thus scaled as a whole, without a halo; it stays within the bound of
+//!    its border gains (maximum principle). Parts of a chart without a border vertex keep 1.
 //! 3. **Texels.** Every texel of a chart triangle ([`for_each_texel`], first face in face order
-//!    wins on shared edges) gets the barycentric mix of its corners' corrections; a texel whose
-//!    correction is exactly 0 keeps its bytes. Then the rest of the chart's rectangle is filled
-//!    anew with [`fill_rest`] (mask: the triangle texels), so no old colour stays in the
-//!    border. A chart without any correction is left alone.
+//!    wins on shared edges) is multiplied by the barycentric mix of its corners' log gains,
+//!    exponentiated; a texel whose log gain is exactly 0 keeps its bytes. Then the rest of the
+//!    chart's rectangle is filled anew with [`fill_rest`] (mask: the triangle texels), so no
+//!    old colour stays in the border. A chart without any correction is left alone.
 //!
-//! The correction is additive rather than a gain: near a seam both sides have about the same
-//! brightness, so offset and gain agree there, and an offset neither amplifies the noise of dark texels nor
-//! blows up with a near-black sample (a gain from a black vertex sample would be unbounded).
-//! Its cost: a texel darker than a negative correction (or brighter than 1 − a positive one)
-//! clamps at black (white), which [`MAX_CORRECTION`] keeps rare and small.
+//! Why a gain (Task 7 used an offset): exposures differ by a factor, and a chart's interior
+//! has other colours than its seam. An offset measured on a light spot of the seam darkens a
+//! dark stripe next to it far more than its share: on stripes across a seam with a 30 % step,
+//! the offset raised the largest step along the seam from 19 to 51 sRGB levels (the old
+//! window median at the vertex: it compared different spots of the surface), the gain lowers
+//! it to 1. [`MAX_GAIN`] bounds how much a dark texel's noise can grow; black stays black and
+//! white clips at white.
 //!
 //! Unseen (gray) faces belong to no chart: they neither give nor take a correction.
 //!
-//! The seam measure ([`SeamStats`]) follows `seam_jumps` of the point colouring: every mesh
-//! edge between two textured faces is sampled in both faces just inside the edge
-//! ([`EDGE_SAMPLE`]); the mean absolute luminance difference (sRGB levels) of the pairs from
-//! different charts, minus that of the pairs within one chart. 0 if either kind is missing.
+//! Two seam measures ([`SeamStats`]), sRGB luminance levels: **jump** follows `seam_jumps` of
+//! the point colouring: every mesh edge between two textured faces is sampled in both faces
+//! just inside the edge ([`EDGE_SAMPLE`]); the mean absolute difference of the pairs from
+//! different charts, minus that of the pairs within one chart (0 if either kind is missing).
+//! Content next to the edge enters it (a stripe ending at the seam). **Step**: the mean absolute
+//! difference of both sides on the edge itself (at [`SEAM_SAMPLES`] from either end), over the
+//! edges between faces of different images: what levelling aims at; what remains is
+//! misregistration and noise.
 //!
 //! Memory: per chart its vertices with their corrections (≈ 32 bytes per vertex and chart, and
 //! the solver's vectors for one chart at a time per thread), per mesh edge between textured
-//! faces 16 bytes, and per corrected chart one copy of its rectangle while it is being written.
+//! faces 16 bytes, per seam edge two paired samples (≈ 120 bytes, freed after step 1), and per
+//! corrected chart one copy of its rectangle while it is being written.
 
 use super::atlas::{fill_rest, for_each_texel, TexturePage};
 use super::{Mesh, TexturedMesh};
 use crate::color::{linear_table, luminance, sample_linear, srgb_value};
 use rayon::prelude::*;
 
-/// The solver stops once no free vertex would change by more than this (linear RGB).
+/// The solver stops once no free vertex's log gain would change by more than this.
 pub const SOLVE_TOLERANCE: f64 = 1e-5;
 /// At most this many solver rounds per free vertex of a chart (conjugate gradients reach the
 /// exact solution within one round per vertex, in exact arithmetic).
 pub const SOLVE_ROUNDS_PER_VERTEX: usize = 2;
-/// A chart's colour at a border vertex: the median of the texels within this many texels (per
-/// axis), i.e. of up to 5 × 5.
-pub const VERTEX_SAMPLE_RADIUS: i64 = 2;
-/// Largest correction of a border vertex (linear RGB, per channel).
-pub const MAX_CORRECTION: f64 = 0.15;
-/// A border vertex whose charts differ in luminance by more than this factor is left free:
-/// exposures differ by less, so the difference is content (a highlight, an occlusion).
+/// Two charts at a border vertex whose luminances differ by more than this factor are not
+/// levelled against each other: exposures differ by less, so the difference is content (a
+/// highlight, an occlusion).
 pub const MAX_SEAM_RATIO: f64 = 2.0;
+/// Largest gain of a border vertex either way (per channel): √[`MAX_SEAM_RATIO`], so that two
+/// charts just within it meet halfway.
+pub const MAX_GAIN: f64 = std::f64::consts::SQRT_2;
+/// Added to both colours of a ratio (linear), so that a near-black sample gives no wild gain.
+pub const GAIN_FLOOR: f64 = 0.0005;
 /// Luminance (linear) below which a side counts as this dark for [`MAX_SEAM_RATIO`].
 pub const MIN_SEAM_LUMINANCE: f64 = 0.01;
 /// Where the seam measure samples a face next to one of its edges: barycentric weights of the
 /// edge's two corners and of the opposite corner.
 pub const EDGE_SAMPLE: [f64; 3] = [0.45, 0.45, 0.1];
+/// Where a seam is sampled for the correction of its end vertices: these shares of the way
+/// from the vertex along the edge, on the edge itself in both charts.
+pub const SEAM_SAMPLES: [f64; 3] = [0.125, 0.25, 0.375];
 /// "No chart".
 const NONE: u32 = u32::MAX;
 
-/// Mean sRGB jump along chart borders before and after levelling (see the module docs).
+/// The seams before and after levelling (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SeamStats {
+    /// Jump (sRGB levels).
     pub seam_jump_before: f64,
     pub seam_jump_after: f64,
+    /// Step on the edges between images (sRGB levels).
+    pub seam_step_before: f64,
+    pub seam_step_after: f64,
+    /// Border vertex corrections (vertex and chart) …
+    pub corrections: usize,
+    /// … of them clamped to [`MAX_GAIN`] in a channel …
+    pub clamped: usize,
+    /// … and pairs of charts at a vertex left out as content ([`MAX_SEAM_RATIO`]).
+    pub content_pairs: usize,
 }
 
 /// A mesh edge between two textured faces: the faces and the edge's two vertices.
@@ -102,75 +124,25 @@ pub(crate) fn level_seams(
     }
     let edges = edge_pairs(mesh, &chart_of);
     let seam_jump_before = seam_jump(mesh, tex, &chart_of, &edges, &lin);
+    let seam_step_before = seam_step(mesh, tex, labels, &edges, &lin);
 
-    // 1. Every chart's vertices, then the border vertices: (mesh vertex, chart, local index),
-    //    grouped by mesh vertex.
+    // 1. Every chart's vertices; the corrections of the border vertices from paired samples
+    //    on the seams.
     let verts: Vec<ChartVertices> = tex
         .charts
         .par_iter()
         .map(|chart| chart_vertices(mesh, tex, &chart.faces))
         .collect();
-    let mut entries: Vec<(u32, u32, u32)> = verts
-        .iter()
-        .enumerate()
-        .flat_map(|(c, vs)| {
-            vs.iter()
-                .enumerate()
-                .map(move |(l, &(v, _))| (v, c as u32, l as u32))
-        })
-        .collect();
-    entries.par_sort_unstable();
-    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut i = 0;
-    while i < entries.len() {
-        let mut j = i + 1;
-        while j < entries.len() && entries[j].0 == entries[i].0 {
-            j += 1;
-        }
-        if j - i >= 2 {
-            groups.push(i..j);
-        }
-        i = j;
-    }
-    // Their colours, in entry order.
-    let colours: Vec<Vec<[f64; 3]>> = groups
-        .par_iter()
-        .map(|g| {
-            entries[g.clone()]
-                .iter()
-                .map(|&(_, c, l)| {
-                    let chart = &tex.charts[c as usize];
-                    let page = &tex.pages[chart.page as usize];
-                    let pv = verts[c as usize][l as usize].1;
-                    vertex_colour(page, chart.rect, page.uvs[pv as usize], &lin)
-                })
-                .collect()
-        })
-        .collect();
     let mut fixed: Vec<Vec<(u32, [f64; 3])>> = vec![Vec::new(); tex.charts.len()];
-    for (g, cols) in groups.iter().zip(&colours) {
-        // Sides that differ by more than an exposure can are content (a highlight, an
-        // occlusion) rather than a seam: the vertex is left free.
-        let lums = cols.iter().map(|c| luminance(c.map(|v| v as f32)));
-        let (lo, hi) = lums.fold((f64::INFINITY, 0.0f64), |(lo, hi), l| {
-            (lo.min(l), hi.max(l))
-        });
-        if hi > MAX_SEAM_RATIO * lo.max(MIN_SEAM_LUMINANCE) {
-            continue;
-        }
-        let mut mean = [0.0; 3];
-        for col in cols {
-            for k in 0..3 {
-                mean[k] += col[k];
-            }
-        }
-        let mean = mean.map(|v| v / cols.len() as f64);
-        for (&(_, c, l), col) in entries[g.clone()].iter().zip(cols) {
-            let d = [0, 1, 2].map(|k| (mean[k] - col[k]).clamp(-MAX_CORRECTION, MAX_CORRECTION));
-            fixed[c as usize].push((l, d));
-        }
+    let (border, content_pairs) = border_corrections(mesh, tex, &chart_of, &edges, &lin);
+    let border_count = border.len();
+    let clamped = border
+        .iter()
+        .filter(|b| b.2.iter().any(|d| d.abs() >= MAX_GAIN.ln()))
+        .count();
+    for (c, v, d) in border {
+        fixed[c as usize].push((local(&verts[c as usize], v) as u32, d));
     }
-    drop((entries, groups, colours));
 
     // 2. Corrections per chart vertex; `None` for a chart without any.
     let corrections: Vec<Option<Vec<[f64; 3]>>> = tex
@@ -214,6 +186,11 @@ pub(crate) fn level_seams(
     SeamStats {
         seam_jump_before,
         seam_jump_after,
+        seam_step_before,
+        seam_step_after: seam_step(mesh, tex, labels, &edges, &lin),
+        corrections: border_count,
+        clamped,
+        content_pairs,
     }
 }
 
@@ -319,6 +296,184 @@ fn edge_luminance(
     srgb_value(luminance(sample_linear(&page.image, px, lin)) as f32)
 }
 
+/// The log gain of every border vertex of every chart that borders another one there:
+/// (chart, mesh vertex, log gain per channel), from paired samples on the seams (see the module
+/// docs); and how many chart pairs at a vertex were left out as content.
+fn border_corrections(
+    mesh: &Mesh,
+    tex: &TexturedMesh,
+    chart_of: &[u32],
+    edges: &[EdgePair],
+    lin: &[f32; 256],
+) -> (Vec<(u32, u32, [f64; 3])>, usize) {
+    // Per seam edge and end vertex: (vertex, lower chart, higher chart, mean colour of each
+    // at SEAM_SAMPLES), in edge order.
+    type Paired = (u32, u32, u32, [f64; 3], [f64; 3]);
+    let paired: Vec<Paired> = edges
+        .par_iter()
+        .filter(|e| chart_of[e[0] as usize] != chart_of[e[1] as usize])
+        .flat_map_iter(|&[f, g, a, b]| {
+            let (f, g) = if chart_of[f as usize] < chart_of[g as usize] {
+                (f, g)
+            } else {
+                (g, f)
+            };
+            [(a, b), (b, a)].map(|(v, w)| {
+                let mean = |face: u32| {
+                    let mut sum = [0.0f64; 3];
+                    for &t in &SEAM_SAMPLES {
+                        let c = edge_colour(mesh, tex, face, v, w, t, lin);
+                        for k in 0..3 {
+                            sum[k] += f64::from(c[k]);
+                        }
+                    }
+                    sum.map(|x| x / SEAM_SAMPLES.len() as f64)
+                };
+                (
+                    v,
+                    chart_of[f as usize],
+                    chart_of[g as usize],
+                    mean(f),
+                    mean(g),
+                )
+            })
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..paired.len()).collect();
+    order.par_sort_by_key(|&i| (paired[i].0, paired[i].1, paired[i].2));
+    let mut out = Vec::new();
+    let mut content = 0usize;
+    // Per vertex: the chart pairs there (charts, mean colours), then per chart the sum of its
+    // differences to the others.
+    let mut at_vertex: Vec<(u32, u32, [f64; 3], [f64; 3])> = Vec::new();
+    let mut sums: Vec<(u32, [f64; 3])> = Vec::new();
+    let mut i = 0;
+    while i < order.len() {
+        let v = paired[order[i]].0;
+        at_vertex.clear();
+        while i < order.len() && paired[order[i]].0 == v {
+            let (_, ca, cb, _, _) = paired[order[i]];
+            let (mut sa, mut sb, mut n) = ([0.0f64; 3], [0.0f64; 3], 0.0);
+            while i < order.len() && {
+                let p = &paired[order[i]];
+                p.0 == v && p.1 == ca && p.2 == cb
+            } {
+                let p = &paired[order[i]];
+                for k in 0..3 {
+                    sa[k] += p.3[k];
+                    sb[k] += p.4[k];
+                }
+                n += 1.0;
+                i += 1;
+            }
+            let (sa, sb) = (sa.map(|x| x / n), sb.map(|x| x / n));
+            // Sides that differ by more than an exposure can are content (a highlight, an
+            // occlusion) rather than a seam.
+            let (la, lb) = (
+                luminance(sa.map(|x| x as f32)),
+                luminance(sb.map(|x| x as f32)),
+            );
+            if la.max(lb) > MAX_SEAM_RATIO * la.min(lb).max(MIN_SEAM_LUMINANCE) {
+                content += 1;
+                continue;
+            }
+            at_vertex.push((ca, cb, sa, sb));
+        }
+        sums.clear();
+        for &(ca, cb, sa, sb) in &at_vertex {
+            let ratio = |x: [f64; 3], y: [f64; 3]| {
+                [0, 1, 2].map(|k| ((x[k] + GAIN_FLOOR) / (y[k] + GAIN_FLOOR)).ln())
+            };
+            for (c, d) in [(ca, ratio(sa, sb)), (cb, ratio(sb, sa))] {
+                match sums.iter_mut().find(|s| s.0 == c) {
+                    Some(s) => {
+                        for (sum, x) in s.1.iter_mut().zip(d) {
+                            *sum += x;
+                        }
+                    }
+                    None => sums.push((c, d)),
+                }
+            }
+        }
+        let charts = sums.len() as f64;
+        sums.sort_by_key(|s| s.0);
+        for &(c, d) in &sums {
+            let lim = MAX_GAIN.ln();
+            let delta = d.map(|x| (-x / charts).clamp(-lim, lim));
+            out.push((c, v, delta));
+        }
+    }
+    (out, content)
+}
+
+/// The step measure over `edges` (see the module docs): sRGB luminance levels.
+fn seam_step(
+    mesh: &Mesh,
+    tex: &TexturedMesh,
+    labels: &[Option<u32>],
+    edges: &[EdgePair],
+    lin: &[f32; 256],
+) -> f64 {
+    let steps: Vec<(f64, usize)> = edges
+        .par_iter()
+        .filter(|e| labels[e[0] as usize] != labels[e[1] as usize])
+        .map(|&[f, g, a, b]| {
+            let mut sum = 0.0;
+            for (v, w) in [(a, b), (b, a)] {
+                for &t in &SEAM_SAMPLES {
+                    let y = |face: u32| {
+                        srgb_value(luminance(edge_colour(mesh, tex, face, v, w, t, lin)) as f32)
+                    };
+                    sum += (y(f) - y(g)).abs();
+                }
+            }
+            (sum, 2 * SEAM_SAMPLES.len())
+        })
+        .collect();
+    let (sum, count) = steps
+        .iter()
+        .fold((0.0, 0usize), |(s, n), &(a, b)| (s + a, n + b));
+    if count == 0 {
+        0.0
+    } else {
+        sum / count as f64
+    }
+}
+
+/// Linear colour of face `f`'s texture at the point `t` of the way from its corner `v` to its
+/// corner `w` (bilinear).
+fn edge_colour(
+    mesh: &Mesh,
+    tex: &TexturedMesh,
+    f: u32,
+    v: u32,
+    w: u32,
+    t: f64,
+    lin: &[f32; 256],
+) -> [f32; 3] {
+    let (p, i) = tex.face_ref[f as usize];
+    let page = &tex.pages[p as usize];
+    let tri = page.indices[i as usize];
+    let corners = mesh.indices[f as usize];
+    let uv_of = |m: u32| {
+        let k = corners
+            .iter()
+            .position(|&c| c == m)
+            .expect("corner of the face");
+        page.uvs[tri[k] as usize]
+    };
+    let (a, b) = (uv_of(v), uv_of(w));
+    let px = [0, 1].map(|k| {
+        let size = f64::from(if k == 0 {
+            page.image.width
+        } else {
+            page.image.height
+        });
+        ((f64::from(a[k]) * (1.0 - t) + f64::from(b[k]) * t) * size - 0.5) as f32
+    });
+    sample_linear(&page.image, px, lin)
+}
+
 /// A chart's vertices (see [`ChartVertices`]).
 fn chart_vertices(mesh: &Mesh, tex: &TexturedMesh, faces: &[u32]) -> ChartVertices {
     let mut vs: ChartVertices = faces
@@ -339,31 +494,6 @@ fn chart_vertices(mesh: &Mesh, tex: &TexturedMesh, faces: &[u32]) -> ChartVertic
 fn local(vs: &ChartVertices, v: u32) -> usize {
     vs.binary_search_by_key(&v, |x| x.0)
         .expect("vertex of a chart face")
-}
-
-/// The linear colour of median luminance among the texels of `rect` within
-/// [`VERTEX_SAMPLE_RADIUS`] of `uv` (ties: the earlier texel in row order).
-fn vertex_colour(page: &TexturePage, rect: [u32; 4], uv: [f32; 2], lin: &[f32; 256]) -> [f64; 3] {
-    let width = page.image.width;
-    let centre = [
-        (f64::from(uv[0]) * f64::from(width)).floor() as i64,
-        (f64::from(uv[1]) * f64::from(page.image.height)).floor() as i64,
-    ];
-    let [x, y, w, h] = rect.map(i64::from);
-    let r = VERTEX_SAMPLE_RADIUS;
-    let mut window: Vec<(f64, [f64; 3])> = Vec::with_capacity(((2 * r + 1) * (2 * r + 1)) as usize);
-    for j in (centre[1] - r).max(y)..=(centre[1] + r).min(y + h - 1) {
-        for i in (centre[0] - r).max(x)..=(centre[0] + r).min(x + w - 1) {
-            let o = ((j as usize) * width as usize + i as usize) * 3;
-            let rgb: [f32; 3] = std::array::from_fn(|c| lin[page.image.data[o + c] as usize]);
-            window.push((luminance(rgb), rgb.map(f64::from)));
-        }
-    }
-    if window.is_empty() {
-        return [0.0; 3];
-    }
-    window.sort_by(|a, b| a.0.total_cmp(&b.0));
-    window[window.len() / 2].1
 }
 
 /// The corrections of a chart's vertices: `fixed` at border vertices, the harmonic
@@ -523,7 +653,7 @@ fn apply(
                 if add == 0.0 {
                     continue;
                 }
-                let l = f64::from(lin[buf[at * 3 + c] as usize]) + add;
+                let l = f64::from(lin[buf[at * 3 + c] as usize]) * add.exp();
                 buf[at * 3 + c] = srgb_value(l as f32).round().clamp(0.0, 255.0) as u8;
             }
         });
@@ -800,9 +930,9 @@ mod tests {
     fn outlier_corner_is_bounded() {
         let colour = [100, 100, 100];
         let seam = (SMALL.cells[0] / 2, SMALL.cells[1] / 2);
-        // The small speck is only somewhat brighter (within MAX_SEAM_RATIO), so only the median
-        // keeps it out; the large one is white.
-        for (radius, speck, label) in [(1u32, 140u8, "kleiner Fleck"), (4, 255, "großer Fleck")] {
+        // The small speck covers the seam samples next to the vertex, the large one is white:
+        // both differ from the other side by more than an exposure can.
+        for (radius, speck, label) in [(1u32, 150u8, "kleiner Fleck"), (4, 255, "großer Fleck")] {
             let (mesh, labels, mut tex) = SMALL.build(colour, colour);
             // A bright speck in chart 1 around a seam vertex.
             let [cx, cy] = SMALL.texel_of(&tex, 1, seam.0, seam.1);
@@ -815,15 +945,7 @@ mod tests {
             level_seams(&mesh, &labels, &mut tex);
             for [x, y] in rect_texels(&tex, 0) {
                 let (old, new) = (texel(&before, x, y), texel(&tex, x, y));
-                for k in 0..3 {
-                    let change = lin(new[k]) - lin(old[k]);
-                    assert!(
-                        change.abs() <= MAX_CORRECTION + 0.005,
-                        "{label}: Texel ({x}, {y}) um {change}"
-                    );
-                }
-                // No gradient spreads: the small speck loses the median, the large one
-                // differs from the other side by more than an exposure can.
+                // No gradient spreads.
                 assert!(
                     (0..3).all(|k| new[k].abs_diff(old[k]) <= 1),
                     "{label}: Texel ({x}, {y}) {old:?} -> {new:?}"
@@ -867,29 +989,67 @@ mod tests {
             }
         }
 
-        // Half the difference is 0.24 here: both sides move by MAX_CORRECTION, no further.
+        // Nearly twice as bright (1.94 in linear light): both sides meet halfway, each scaled
+        // by at most MAX_GAIN.
         let (dark, bright) = ([190; 3], [255; 3]);
         let (mesh, labels, mut tex) = SMALL.build(dark, bright);
         let before = tex.clone();
         level_seams(&mesh, &labels, &mut tex);
         for c in 0..2 {
             for [x, y] in rect_texels(&tex, c) {
-                let change = lin(texel(&tex, x, y)[0]) - lin(texel(&before, x, y)[0]);
+                let gain = lin(texel(&tex, x, y)[0]) / lin(texel(&before, x, y)[0]);
                 assert!(
-                    change.abs() <= MAX_CORRECTION + 0.005,
-                    "Karte {c}, Texel ({x}, {y}): {change}"
+                    (1.0 / MAX_GAIN - 0.01..=MAX_GAIN + 0.01).contains(&gain),
+                    "Karte {c}, Texel ({x}, {y}): {gain}"
                 );
             }
         }
-        let [sx, sy] = SMALL.texel_of(&tex, 0, 6, 6);
-        let change = lin(texel(&tex, sx, sy)[0]) - lin(190);
-        assert!((change - MAX_CORRECTION).abs() < 0.01, "{change}");
+        let [lx, ly] = SMALL.texel_of(&tex, 0, 6, 6);
+        let [rx, ry] = SMALL.texel_of(&tex, 1, 6, 6);
+        let (l, r) = (texel(&tex, lx, ly)[0], texel(&tex, rx, ry)[0]);
+        assert!(l.abs_diff(r) <= 2, "{l} / {r}");
 
         // Sides differing by more than MAX_SEAM_RATIO are content: nothing changes.
         let (mesh, labels, mut tex) = SMALL.build([40; 3], [200; 3]);
         let before = tex.clone();
         level_seams(&mesh, &labels, &mut tex);
         assert_eq!(tex, before);
+    }
+
+    #[test]
+    fn exposure_step_on_texture_levels() {
+        // Stripes across the seam (dark and light, 3 texels each), the right chart 30 % brighter
+        // in linear light: an exposure step on textured content.
+        let (dark, light) = ([40, 45, 50], [150, 140, 120]);
+        let (mesh, labels, mut tex) = SMALL.build(dark, dark);
+        for c in 0..2 {
+            for [x, y] in rect_texels(&tex, c) {
+                let base = if (y / 3) % 2 == 0 { dark } else { light };
+                let rgb = if c == 1 { brighter(base, 1.3) } else { base };
+                set_texel(&mut tex, x, y, rgb);
+            }
+        }
+        // Both sides of the seam texel by texel along it (the same spot of the wall).
+        let half = SMALL.cells[0] / 2;
+        let step = |tex: &TexturedMesh| {
+            let [_, y0] = SMALL.texel_of(tex, 0, half, 0);
+            let [x0, _] = SMALL.texel_of(tex, 0, half, 0);
+            let [x1, _] = SMALL.texel_of(tex, 1, half, 0);
+            let rows = SMALL.cells[1] as u32 * SMALL.texels;
+            (y0..y0 + rows)
+                .map(|y| {
+                    let (a, b) = (texel(tex, x0, y), texel(tex, x1, y));
+                    (0..3).map(|k| a[k].abs_diff(b[k])).max().unwrap()
+                })
+                .max()
+                .unwrap()
+        };
+        let before = step(&tex);
+        let stats = level_seams(&mesh, &labels, &mut tex);
+        let after = step(&tex);
+        println!("largest step along the seam {before} → {after} sRGB levels; {stats:?}");
+        assert!(before > 15, "{before}");
+        assert!(after <= 3, "{before} → {after}");
     }
 
     #[test]

@@ -165,6 +165,11 @@ fn stats_json(s: &SurfaceStats) -> Value {
         "seams": {
             "seam_jump_before": s.seams.seam_jump_before,
             "seam_jump_after": s.seams.seam_jump_after,
+            "seam_step_before": s.seams.seam_step_before,
+            "seam_step_after": s.seams.seam_step_after,
+            "corrections": s.seams.corrections,
+            "clamped": s.seams.clamped,
+            "content_pairs": s.seams.content_pairs,
         },
         "accuracy_mean_mm": s.accuracy.all.mean_mm,
         "accuracy_p95_mm": s.accuracy.all.p95_mm,
