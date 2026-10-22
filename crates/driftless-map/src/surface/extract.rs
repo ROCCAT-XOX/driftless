@@ -52,7 +52,7 @@ impl Mesh {
 }
 
 /// The mesh of the zero crossing of `tsdf`, normals towards the side with positive sdf (the
-/// sensor side).
+/// sensor side). `Tsdf::sample` already applies `min_weight`, so `cfg` is not read here.
 pub fn extract(tsdf: &Tsdf, cfg: &SurfaceConfig) -> Mesh {
     let _ = cfg;
     let voxel = tsdf.voxel();
@@ -139,6 +139,10 @@ fn edge_point(
             let along = f64::from(cb[i] - ca[i]);
             ((at + t * along) * voxel) as f32
         });
+        debug_assert!(
+            mesh.positions.len() < u32::MAX as usize,
+            "too many vertices"
+        );
         mesh.positions.push(p);
         (mesh.positions.len() - 1) as u32
     })

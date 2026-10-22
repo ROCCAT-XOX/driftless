@@ -297,3 +297,174 @@ pub(super) const TRIANGLES: [[i8; 16]; 256] = [
     [0, 8, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
     [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    type Segment = ([i32; 3], [i32; 3]);
+    type Counts = HashMap<(usize, usize), u32>;
+
+    /// Directed triangle edges of `case` as pairs of cube edge numbers.
+    fn directed_edges(case: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for t in TRIANGLES[case].chunks(3).take_while(|t| t[0] >= 0) {
+            assert!(t[1] >= 0 && t[2] >= 0, "case {case}: incomplete triangle");
+            let v = [t[0] as usize, t[1] as usize, t[2] as usize];
+            for i in 0..3 {
+                out.push((v[i], v[(i + 1) % 3]));
+            }
+        }
+        out
+    }
+
+    /// Edges whose both corners lie on the face `corner[axis] == side`.
+    fn face_edges(axis: usize, side: i32) -> HashSet<usize> {
+        (0..12)
+            .filter(|&e| EDGE_CORNERS[e].iter().all(|&c| CORNERS[c][axis] == side))
+            .collect()
+    }
+
+    /// Edge midpoint in doubled cube coordinates.
+    fn mid(e: usize) -> [i32; 3] {
+        let [a, b] = EDGE_CORNERS[e];
+        [0, 1, 2].map(|i| CORNERS[a][i] + CORNERS[b][i])
+    }
+
+    /// The boundary segments of `case` that lie on a face (directed, as edge midpoints), and
+    /// the boundary segments that lie on no face.
+    fn boundary(case: usize) -> (Vec<(usize, usize)>, Counts) {
+        let mut count: Counts = HashMap::new();
+        for d in directed_edges(case) {
+            *count.entry(d).or_default() += 1;
+        }
+        let edges = count.keys().copied().collect::<Vec<_>>();
+        let b = edges
+            .into_iter()
+            .filter(|&(a, b)| !count.contains_key(&(b, a)))
+            .collect();
+        (b, count)
+    }
+
+    fn negative(case: usize, c: usize) -> bool {
+        (case >> c) & 1 == 1
+    }
+
+    #[test]
+    fn tables_are_consistent_for_all_256_cases() {
+        for case in 0..256 {
+            let (bnd, count) = boundary(case);
+            // (a) a directed edge is used once, and every boundary edge lies on a cube face.
+            assert!(
+                count.values().all(|&n| n == 1),
+                "case {case}: edge used twice"
+            );
+            for &(a, b) in &bnd {
+                let on_face = (0..3).any(|ax| {
+                    (0..2).any(|s| {
+                        let f = face_edges(ax, s);
+                        f.contains(&a) && f.contains(&b)
+                    })
+                });
+                assert!(on_face, "case {case}: open edge {a}-{b} inside the cube");
+            }
+            // Edges that appear in triangles are exactly those with a sign change.
+            let used: HashSet<usize> = count.keys().flat_map(|&(a, b)| [a, b]).collect();
+            let crossing: HashSet<usize> = (0..12)
+                .filter(|&e| {
+                    let [a, b] = EDGE_CORNERS[e];
+                    negative(case, a) != negative(case, b)
+                })
+                .collect();
+            assert_eq!(used, crossing, "case {case}: crossings differ");
+            // (b) the boundary on each face joins exactly that face's crossings, each once.
+            for ax in 0..3 {
+                for s in 0..2 {
+                    let f = face_edges(ax, s);
+                    let segs: Vec<_> = bnd
+                        .iter()
+                        .filter(|(a, b)| f.contains(a) && f.contains(b))
+                        .collect();
+                    let want: HashSet<_> = f.intersection(&crossing).copied().collect();
+                    assert_eq!(segs.len(), want.len() / 2, "case {case} face {ax}{s}");
+                    let outs: HashSet<_> = segs.iter().map(|s| s.0).collect();
+                    let ins: HashSet<_> = segs.iter().map(|s| s.1).collect();
+                    assert!(outs.is_disjoint(&ins), "case {case} face {ax}{s}");
+                    assert_eq!(
+                        outs.union(&ins).copied().collect::<HashSet<_>>(),
+                        want,
+                        "case {case} face {ax}{s}: crossings"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The boundary of `case` on a face as directed midpoint pairs, moved by `shift` (doubled
+    /// units) along `axis`.
+    fn face_segments(case: usize, axis: usize, side: i32, shift: i32) -> HashSet<Segment> {
+        let f = face_edges(axis, side);
+        let (bnd, _) = boundary(case);
+        bnd.into_iter()
+            .filter(|(a, b)| f.contains(a) && f.contains(b))
+            .map(|(a, b)| {
+                let (mut p, mut q) = (mid(a), mid(b));
+                p[axis] += shift;
+                q[axis] += shift;
+                (p, q)
+            })
+            .collect()
+    }
+
+    /// Signs of the four corners of a face, keyed by their position in the face plane.
+    fn face_signs(case: usize, axis: usize, side: i32) -> Vec<([i32; 3], bool)> {
+        let mut v: Vec<_> = (0..8)
+            .filter(|&c| CORNERS[c][axis] == side)
+            .map(|c| {
+                let mut p = CORNERS[c];
+                p[axis] = 0;
+                (p, negative(case, c))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn neighbouring_cubes_match_on_shared_faces() {
+        for axis in 0..3 {
+            // Cube B sits behind the high face (side 1) of cube A: B's low face (side 0).
+            let a_faces: Vec<_> = (0..256).map(|c| face_signs(c, axis, 1)).collect();
+            let b_faces: Vec<_> = (0..256).map(|c| face_signs(c, axis, 0)).collect();
+            let a_segs: Vec<_> = (0..256).map(|c| face_segments(c, axis, 1, 0)).collect();
+            // B's segments, moved into A's frame (one cube further along the axis, so its
+            // low face lies at A's high face), then reversed.
+            let b_segs: Vec<HashSet<Segment>> = (0..256)
+                .map(|c| {
+                    face_segments(c, axis, 0, 2)
+                        .into_iter()
+                        .map(|(p, q)| (q, p))
+                        .collect()
+                })
+                .collect();
+            let mut pairs = 0;
+            for a in 0..256 {
+                for b in 0..256 {
+                    if a_faces[a] != b_faces[b] {
+                        continue;
+                    }
+                    pairs += 1;
+                    // Both lie on the shared plane, so compare in A's frame: A's face is
+                    // at doubled coordinate 2 on `axis`, as is B's after the shift.
+                    assert_eq!(
+                        a_segs[a], b_segs[b],
+                        "axis {axis}: cases {a} and {b} do not match on their shared face"
+                    );
+                }
+            }
+            // 16 face patterns, each seen by 16 cases on either side.
+            assert_eq!(pairs, 16 * 16 * 16, "axis {axis}");
+        }
+    }
+}
