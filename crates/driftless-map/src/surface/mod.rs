@@ -3,6 +3,8 @@
 //! This step holds the shared types and the [`Tsdf`], a truncated signed distance field that
 //! the cleaned points and the positions they were measured from are fused into.
 
+#[allow(dead_code)]
+mod atlas;
 mod cleanup;
 mod extract;
 mod mc_tables;
@@ -15,6 +17,7 @@ mod views;
 #[cfg(test)]
 pub(crate) mod testutil;
 
+pub use atlas::{TexturePage, TextureStats, TexturedMesh};
 pub use cleanup::{cleanup, CleanupStats};
 pub use extract::{extract, Mesh};
 pub use simplify::simplify;
@@ -49,6 +52,9 @@ pub fn sensors_for_frames(poses: &[Pose], lidar_to_imu: &Isometry3<f64>) -> Vec<
         .collect()
 }
 
+/// Smallest texture page: the gray block of unseen faces and a chart with its border fit.
+pub const MIN_PAGE_SIZE: u32 = 16;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceConfig {
     /// Edge length of a TSDF voxel (m).
@@ -68,7 +74,7 @@ pub struct SurfaceConfig {
     pub max_edge: f64,
     /// Smallest texel size on the surface (m).
     pub min_texel: f64,
-    /// Edge of a texture page (pixels).
+    /// Edge of a texture page (pixels, at least [`MIN_PAGE_SIZE`]).
     pub page_size: u32,
     /// Camera views kept per face.
     pub views_per_face: usize,
@@ -124,8 +130,8 @@ impl SurfaceConfig {
         if !(self.min_texel.is_finite() && self.min_texel > 0.0) {
             return bad("kleinste Texelgröße muss größer als 0 sein");
         }
-        if self.page_size == 0 {
-            return bad("Texturseite muss mindestens 1 Pixel breit sein");
+        if self.page_size < MIN_PAGE_SIZE {
+            return bad("Texturseite muss mindestens 16 Pixel breit sein");
         }
         if self.views_per_face == 0 {
             return bad("Ansichten je Fläche müssen mindestens 1 sein");

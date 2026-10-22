@@ -426,7 +426,7 @@ struct Measured {
 }
 
 /// Number of images in the streams, from the bag indexes; `None` if a bag has none.
-fn image_count(images: &ImageSource) -> Option<u64> {
+pub(crate) fn image_count(images: &ImageSource) -> Option<u64> {
     let mut total = 0;
     for bag in &images.bags {
         let mut r = BagReader::open(bag).ok()?;
