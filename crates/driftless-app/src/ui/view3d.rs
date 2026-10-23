@@ -16,8 +16,9 @@
 //!
 //! A surface ([`View3d::set_surface`]) is drawn with [`MeshRenderer`] in the same depth
 //! buffer, moved into the frame of the cloud (else its own); „Oberfläche /
-//! Punktwolke / beides“ ([`ShowMode`]) picks what is drawn. Picking still looks at points
-//! only.
+//! Punktwolke / beides“ ([`ShowMode`]) picks what is drawn. It goes to the GPU a few pages per
+//! frame (about [`UPLOAD_SLICE_BYTES`]), the surface shown before stays until the last page is
+//! up. Picking still looks at points only.
 
 use super::{text, ViewSettings};
 use crate::camera::{fly_motion, Camera, CameraMode, FlyKeys, ZOOM_FACTOR};
@@ -245,6 +246,7 @@ struct SurfaceShown {
     origin: [f64; 3],
     /// Relative to `origin`.
     bounds: Option<([f32; 3], [f32; 3])>,
+    triangles: usize,
 }
 
 /// A press of the primary button inside the view, until it is released.
@@ -292,8 +294,10 @@ pub struct View3d {
     framed_run: Option<std::path::PathBuf>,
     /// The surface's GPU side; `None` before the first surface.
     mesh: Option<MeshRenderer>,
-    /// A surface waiting to be uploaded (its pixels are dropped once they are on the GPU).
+    /// A surface waiting to be uploaded (its pixels are dropped once they are on the GPU),
+    /// and its next page to upload.
     pending_surface: Option<LoadedSurface>,
+    next_page: usize,
     surface: Option<SurfaceShown>,
     surface_count: u64,
 }
@@ -320,12 +324,23 @@ impl View3d {
             self.surface_count += 1;
         }
         self.pending_surface = surface;
+        self.next_page = 0;
         self.last = None;
     }
 
     /// Whether a surface is shown or about to be.
     pub fn has_surface(&self) -> bool {
         self.surface.is_some() || self.pending_surface.is_some()
+    }
+
+    /// Triangles of the surface on the GPU.
+    pub fn surface_triangles(&self) -> Option<usize> {
+        self.surface.map(|s| s.triangles)
+    }
+
+    /// Whether a surface is still being written to the GPU.
+    pub fn is_uploading_surface(&self) -> bool {
+        self.pending_surface.is_some()
     }
 
     /// Points drawn in the last frame.
@@ -412,17 +427,33 @@ impl View3d {
             .or(self.surface.map(|s| s.origin))
             .or(overlay.map(|o| o.run.origin));
         let mut surface_new = false;
-        if let Some(surface) = self.pending_surface.take() {
+        if let Some(surface) = &self.pending_surface {
             let mesh = self
                 .mesh
                 .get_or_insert_with(|| MeshRenderer::new(device, VIEW_FORMAT));
-            mesh.upload(device, queue, &surface);
-            self.surface = Some(SurfaceShown {
-                origin: surface.origin,
-                bounds: surface.bounds(),
-            });
-            self.surface_count += 1;
-            surface_new = true;
+            if self.next_page == 0 {
+                mesh.begin_upload(surface.origin);
+            }
+            // pages until a slice is full: a 4096² page with its mipmaps is about 85 MB
+            let mut bytes = 0;
+            while self.next_page < surface.pages.len() && bytes < UPLOAD_SLICE_BYTES {
+                bytes += mesh.upload_page(device, queue, surface, self.next_page);
+                self.next_page += 1;
+            }
+            if self.next_page >= surface.pages.len() {
+                mesh.finish_upload();
+                self.surface = Some(SurfaceShown {
+                    origin: surface.origin,
+                    bounds: surface.bounds(),
+                    triangles: surface.triangles(),
+                });
+                self.surface_count += 1;
+                surface_new = true;
+                self.pending_surface = None;
+                self.next_page = 0;
+            } else {
+                ui.ctx().request_repaint();
+            }
         }
         if let (Some(mesh), Some(origin)) = (&mut self.mesh, view_origin) {
             mesh.set_view_origin(origin);
@@ -576,12 +607,23 @@ impl View3d {
             let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             ui.painter().image(id, rect, uv, Color32::WHITE);
         }
-        let stats = text::drawn_stats(
-            self.drawn_points,
-            cloud.map_or(0, |c| c.points.len()),
-            self.frame_ms,
-            self.gpu_timed,
-        );
+        let stats = match self.surface {
+            // the surface alone: its triangles, not „0 von 0 Punkten“
+            Some(s)
+                if self
+                    .last
+                    .as_ref()
+                    .is_some_and(|k| k.show == ShowMode::Surface) =>
+            {
+                text::surface_stats(s.triangles, self.frame_ms, self.gpu_timed)
+            }
+            _ => text::drawn_stats(
+                self.drawn_points,
+                cloud.map_or(0, |c| c.points.len()),
+                self.frame_ms,
+                self.gpu_timed,
+            ),
+        };
         let help = match settings.camera_mode {
             _ if overlay.is_some_and(|o| o.pick_places) => text::VIEW_HELP_PICK,
             CameraMode::Orbit => text::VIEW_HELP_ORBIT,

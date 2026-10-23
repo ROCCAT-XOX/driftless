@@ -29,16 +29,28 @@ pub enum ColorMode {
     Quality = 2,
 }
 
-/// What the view draws: the surface, the cloud or both (in one depth buffer).
+/// What the view draws: the surface, the cloud or both (in one depth buffer). The view shows
+/// the surface first (the default); without a surface it draws the points whatever is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShowMode {
     /// „Oberfläche“: the textured surface only.
+    #[default]
     Surface,
     /// „Punktwolke“: the points only.
-    #[default]
     Cloud,
     /// „beides“.
     Both,
+}
+
+impl ShowMode {
+    /// The next of the key `O`: Oberfläche → Punktwolke → beides → Oberfläche.
+    pub fn next(self) -> ShowMode {
+        match self {
+            ShowMode::Surface => ShowMode::Cloud,
+            ShowMode::Cloud => ShowMode::Both,
+            ShowMode::Both => ShowMode::Surface,
+        }
+    }
 }
 
 /// An end of a line segment, relative to [`Octree::origin`]; segments are pairs of them.

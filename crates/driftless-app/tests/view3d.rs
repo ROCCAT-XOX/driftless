@@ -602,4 +602,6 @@ fn show_mode_falls_back_to_what_is_there() {
         assert_eq!(effective_show(mode, true, true), mode);
     }
     assert_eq!(ViewSettings::default().show, Surface, "the surface first");
+    // one default for both
+    assert_eq!(ShowMode::default(), ViewSettings::default().show);
 }

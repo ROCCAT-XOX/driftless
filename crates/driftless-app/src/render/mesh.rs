@@ -50,6 +50,8 @@ pub struct MeshRenderer {
     pages: Vec<Page>,
     origin: [f64; 3],
     view_origin: [f64; 3],
+    /// A surface being uploaded page by page: its origin and the pages so far.
+    incoming: Option<([f64; 3], Vec<Page>)>,
 }
 
 impl MeshRenderer {
@@ -172,105 +174,153 @@ impl MeshRenderer {
             pages: Vec::new(),
             origin: [0.0; 3],
             view_origin: [0.0; 3],
+            incoming: None,
         }
     }
 
-    /// Puts `surface` on the GPU, replacing the previous one; the view's origin becomes the
-    /// surface's until [`MeshRenderer::set_view_origin`] says otherwise. Pages larger than
-    /// the device allows are halved until they fit. Empty pages are skipped.
+    /// Puts `surface` on the GPU at once, replacing the previous one (tests and tools; the
+    /// view uploads a page per frame with [`MeshRenderer::begin_upload`]).
     pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, surface: &LoadedSurface) {
-        let max_side = device.limits().max_texture_dimension_2d.max(1);
-        self.pages.clear();
-        self.origin = surface.origin;
-        self.view_origin = surface.origin;
-        for (vertices, indices, image) in &surface.pages {
-            if indices.is_empty() || vertices.is_empty() {
-                continue;
+        self.begin_upload(surface.origin);
+        for i in 0..surface.pages.len() {
+            self.upload_page(device, queue, surface, i);
+        }
+        self.finish_upload();
+    }
+
+    /// Starts uploading a surface with this origin; the one shown stays drawn until
+    /// [`MeshRenderer::finish_upload`]. Pages of an upload not finished are dropped.
+    pub fn begin_upload(&mut self, origin: [f64; 3]) {
+        self.incoming = Some((origin, Vec::new()));
+    }
+
+    /// Uploads page `i` of `surface` (after [`MeshRenderer::begin_upload`]); returns the
+    /// bytes written. A page larger than the device allows is halved until it fits; an empty
+    /// page is skipped. Its mipmaps are those of [`LoadedSurface::mips`], made only if
+    /// missing.
+    pub fn upload_page(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface: &LoadedSurface,
+        i: usize,
+    ) -> u64 {
+        let Some((vertices, indices, image)) = surface.pages.get(i) else {
+            return 0;
+        };
+        if indices.is_empty() || vertices.is_empty() {
+            return 0;
+        }
+        let made;
+        let mips = match surface.mips.get(i) {
+            Some(m) => m,
+            None => {
+                made = mip_levels(image);
+                &made
             }
-            let mut levels = mip_chain(image);
-            let skip = levels
-                .iter()
-                .position(|l| l.width() <= max_side && l.height() <= max_side)
-                .unwrap_or(levels.len() - 1);
-            levels.drain(..skip);
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Oberfläche Seite"),
-                size: wgpu::Extent3d {
-                    width: levels[0].width(),
-                    height: levels[0].height(),
+        };
+        let max_side = device.limits().max_texture_dimension_2d.max(1);
+        let mut levels: Vec<&RgbaImage> = std::iter::once(image).chain(mips).collect();
+        let skip = levels
+            .iter()
+            .position(|l| l.width() <= max_side && l.height() <= max_side)
+            .unwrap_or(levels.len() - 1);
+        levels.drain(..skip);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Oberfläche Seite"),
+            size: wgpu::Extent3d {
+                width: levels[0].width(),
+                height: levels[0].height(),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: levels.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // Not sRGB: the bytes are shown as they are, like the colours of the points.
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut bytes = 0;
+        for (level, img) in levels.iter().enumerate() {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                img.as_raw(),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(img.width() * 4),
+                    rows_per_image: Some(img.height()),
+                },
+                wgpu::Extent3d {
+                    width: img.width(),
+                    height: img.height(),
                     depth_or_array_layers: 1,
                 },
-                mip_level_count: levels.len() as u32,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                // Not sRGB: the bytes are shown as they are, like the colours of the points.
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            for (level, img) in levels.iter().enumerate() {
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &texture,
-                        mip_level: level as u32,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    img.as_raw(),
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(img.width() * 4),
-                        rows_per_image: Some(img.height()),
-                    },
-                    wgpu::Extent3d {
-                        width: img.width(),
-                        height: img.height(),
-                        depth_or_array_layers: 1,
-                    },
-                );
-            }
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Oberfläche Seite"),
-                layout: &self.page_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
-            let buffer = |label, contents: &[u8], usage| {
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(label),
-                    contents,
-                    usage,
-                })
-            };
-            self.pages.push(Page {
-                vertices: buffer(
-                    "Oberfläche Ecken",
-                    bytemuck::cast_slice(vertices),
-                    wgpu::BufferUsages::VERTEX,
-                ),
-                indices: buffer(
-                    "Oberfläche Dreiecke",
-                    bytemuck::cast_slice(indices),
-                    wgpu::BufferUsages::INDEX,
-                ),
-                index_count: indices.len() as u32,
-                bind,
-            });
+            );
+            bytes += img.as_raw().len() as u64;
+        }
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Oberfläche Seite"),
+            layout: &self.page_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        let buffer = |label, contents: &[u8], usage| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents,
+                usage,
+            })
+        };
+        let vertex_bytes: &[u8] = bytemuck::cast_slice(vertices);
+        let index_bytes: &[u8] = bytemuck::cast_slice(indices);
+        bytes += (vertex_bytes.len() + index_bytes.len()) as u64;
+        let page = Page {
+            vertices: buffer("Oberfläche Ecken", vertex_bytes, wgpu::BufferUsages::VERTEX),
+            indices: buffer(
+                "Oberfläche Dreiecke",
+                index_bytes,
+                wgpu::BufferUsages::INDEX,
+            ),
+            index_count: indices.len() as u32,
+            bind,
+        };
+        let incoming = self
+            .incoming
+            .get_or_insert_with(|| (surface.origin, Vec::new()));
+        incoming.1.push(page);
+        bytes
+    }
+
+    /// Shows the pages uploaded since [`MeshRenderer::begin_upload`] instead of the previous
+    /// surface; the view's origin becomes the surface's until
+    /// [`MeshRenderer::set_view_origin`] says otherwise.
+    pub fn finish_upload(&mut self) {
+        if let Some((origin, pages)) = self.incoming.take() {
+            self.pages = pages;
+            self.origin = origin;
+            self.view_origin = origin;
         }
     }
 
-    /// Removes the surface.
+    /// Removes the surface (and one being uploaded).
     pub fn clear(&mut self) {
         self.pages.clear();
+        self.incoming = None;
     }
 
     /// Whether nothing is uploaded.
@@ -312,12 +362,12 @@ impl MeshRenderer {
     }
 }
 
-/// `image` and its halvings down to 1 × 1 (2 × 2 box filter; an odd side repeats its last
-/// row or column).
-pub fn mip_chain(image: &RgbaImage) -> Vec<RgbaImage> {
-    let mut levels = vec![image.clone()];
+/// The halvings of `image` down to 1 × 1, without `image` itself (2 × 2 box filter; an odd
+/// side repeats its last row or column). Empty for a 1 × 1 image.
+pub fn mip_levels(image: &RgbaImage) -> Vec<RgbaImage> {
+    let mut levels: Vec<RgbaImage> = Vec::new();
     loop {
-        let prev = levels.last().expect("at least the image");
+        let prev = levels.last().unwrap_or(image);
         let (w, h) = prev.dimensions();
         if w <= 1 && h <= 1 {
             break;
@@ -325,14 +375,20 @@ pub fn mip_chain(image: &RgbaImage) -> Vec<RgbaImage> {
         let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
         let src = prev.as_raw();
         let mut out = vec![0u8; (nw * nh * 4) as usize];
-        for y in 0..nh {
+        for (y, row) in out.chunks_exact_mut((nw * 4) as usize).enumerate() {
+            let y = y as u32;
             let (y0, y1) = ((2 * y).min(h - 1), (2 * y + 1).min(h - 1));
-            for x in 0..nw {
+            for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let x = x as u32;
                 let (x0, x1) = ((2 * x).min(w - 1), (2 * x + 1).min(w - 1));
-                for c in 0..4 {
-                    let at = |xx: u32, yy: u32| u32::from(src[((yy * w + xx) * 4 + c) as usize]);
-                    let sum = at(x0, y0) + at(x1, y0) + at(x0, y1) + at(x1, y1);
-                    out[((y * nw + x) * 4 + c) as usize] = ((sum + 2) / 4) as u8;
+                let at = |xx: u32, yy: u32| ((yy * w + xx) * 4) as usize;
+                let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+                for (k, v) in px.iter_mut().enumerate() {
+                    let sum = u32::from(src[a + k])
+                        + u32::from(src[b + k])
+                        + u32::from(src[c + k])
+                        + u32::from(src[d + k]);
+                    *v = ((sum + 2) / 4) as u8;
                 }
             }
         }
@@ -346,13 +402,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mip_chain_halves_to_one() {
+    fn mip_levels_halve_to_one() {
         let mut img = RgbaImage::new(5, 2);
         for (x, _, p) in img.enumerate_pixels_mut() {
             *p = image::Rgba([if x % 2 == 0 { 0 } else { 200 }, 10, 20, 255]);
         }
-        let sizes: Vec<_> = mip_chain(&img).iter().map(|l| l.dimensions()).collect();
-        assert_eq!(sizes, [(5, 2), (2, 1), (1, 1)]);
-        assert_eq!(mip_chain(&img)[1].get_pixel(0, 0).0, [100, 10, 20, 255]);
+        let sizes: Vec<_> = mip_levels(&img).iter().map(|l| l.dimensions()).collect();
+        assert_eq!(sizes, [(2, 1), (1, 1)]);
+        assert_eq!(mip_levels(&img)[0].get_pixel(0, 0).0, [100, 10, 20, 255]);
+        assert!(mip_levels(&RgbaImage::new(1, 1)).is_empty());
     }
 }

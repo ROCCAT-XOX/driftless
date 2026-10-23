@@ -16,7 +16,9 @@ pub use app::{parse_args, Args, DriftlessApp};
 
 use crate::camera::CameraMode;
 use crate::jobs::JobStatus;
-use crate::project::{map_status, state_gap, MapStatus, Project, RunInfo, ScanState};
+use crate::project::{
+    map_status, state_gap, surface_status, MapStatus, Project, RunInfo, ScanState, SurfaceSettings,
+};
 use crate::render::{ColorMode, ShowMode};
 use driftless_io::progress::LogLine;
 use driftless_steps::inspect;
@@ -38,6 +40,8 @@ pub enum Selection {
     Map(PathBuf),
     /// A LAS file.
     Cloud(PathBuf),
+    /// A surface folder of a map.
+    Surface(PathBuf),
     /// A state in the history of a run.
     History { run: PathBuf, nr: u32 },
 }
@@ -73,6 +77,8 @@ pub enum Action {
     Reuse(PathBuf),
     /// A map of the run.
     RunMap(PathBuf),
+    /// A surface of the map (folder).
+    RunSurface(PathBuf),
     Cancel,
     /// Clears the messages of the status bar.
     DismissMessages,
@@ -153,7 +159,7 @@ impl Default for ViewSettings {
             show_submaps: false,
             show_compare: true,
             cut: None,
-            show: ShowMode::Surface,
+            show: ShowMode::default(),
         }
     }
 }
@@ -189,6 +195,9 @@ pub struct SurfaceSummary {
 pub struct ViewStats {
     pub drawn: usize,
     pub total: usize,
+    /// The triangles of the surface while it is shown alone (the line then names them
+    /// instead of the points).
+    pub triangles: Option<usize>,
     pub frame_ms: f32,
     /// `frame_ms` is GPU time (else time between frames).
     pub gpu: bool,
@@ -223,6 +232,8 @@ pub struct AppState {
     pub selection: Selection,
     pub map_settings: MapSettings,
     pub slam_settings: SlamSettings,
+    /// What the next surface of a map is computed with.
+    pub surface_settings: SurfaceSettings,
     pub view: ViewSettings,
     /// Oldest first; the status bar shows the last.
     pub messages: Vec<UiMessage>,
@@ -234,8 +245,9 @@ pub struct AppState {
     pub step: Option<Action>,
     /// The last check of a scan, shown under „Eigenschaften“ while that scan is selected.
     pub inspect: Option<InspectResult>,
-    /// The map folders of the tree whose status is known. Filled in the background (see
-    /// [`AppState::map_status_job`]), so a map may be missing here for a moment.
+    /// The map and surface folders of the tree whose status is known. Filled in the
+    /// background (see [`AppState::map_status_job`]), so a folder may be missing here for a
+    /// moment.
     pub map_status: BTreeMap<PathBuf, MapStatus>,
     /// Raised by every [`AppState::refresh`]: the program recomputes [`AppState::map_status`]
     /// in the background whenever it changed.
@@ -282,20 +294,44 @@ impl AppState {
                 })
                 .collect()
         });
-        // Statuses of maps still in the tree stay shown until the background job replaces them.
-        let maps: std::collections::BTreeSet<&PathBuf> = self
+        // Statuses of maps and surfaces still in the tree stay shown until the background job
+        // replaces them.
+        let maps = self
             .scans
             .iter()
             .flat_map(|s| &s.runs)
-            .flat_map(|r| &r.maps)
-            .map(|m| &m.dir)
+            .flat_map(|r| &r.maps);
+        let dirs: std::collections::BTreeSet<PathBuf> = maps
+            .flat_map(|m| std::iter::once(&m.dir).chain(m.surfaces.iter().map(|s| &s.dir)))
+            .cloned()
             .collect();
-        self.map_status.retain(|dir, _| maps.contains(dir));
+        self.map_status.retain(|dir, _| dirs.contains(dir));
+        self.mark_stale_surfaces();
         self.tree_version += 1;
     }
 
+    /// Takes the statuses of the background job ([`AppState::map_status_job`]).
+    pub fn set_map_status(&mut self, status: BTreeMap<PathBuf, MapStatus>) {
+        self.map_status = status;
+        self.mark_stale_surfaces();
+    }
+
+    /// [`crate::project::SurfaceInfo::stale`] of the tree from [`AppState::map_status`].
+    fn mark_stale_surfaces(&mut self) {
+        let status = &self.map_status;
+        let maps = self
+            .scans
+            .iter_mut()
+            .flat_map(|s| &mut s.runs)
+            .flat_map(|r| &mut r.maps);
+        for surface in maps.flat_map(|m| &mut m.surfaces) {
+            surface.stale = status.get(&surface.dir).is_some_and(|s| s.stale);
+        }
+    }
+
     /// The work of computing [`AppState::map_status`] for the current tree, to run off the
-    /// UI thread: it reads `traj.tum` and the bag list of every map ([`map_status`]).
+    /// UI thread: it reads `traj.tum` and the bag list of every map ([`map_status`]) and of
+    /// every surface ([`surface_status`]).
     pub fn map_status_job(&self) -> impl FnOnce() -> BTreeMap<PathBuf, MapStatus> + Send + 'static {
         let mut maps = Vec::new();
         if let Some(project) = &self.project {
@@ -311,9 +347,15 @@ impl AppState {
             }
         }
         move || {
-            maps.into_iter()
-                .map(|(scan, run, map)| (map.dir.clone(), map_status(&scan, &run, &map)))
-                .collect()
+            let mut out = BTreeMap::new();
+            for (scan, run, map) in maps {
+                for surface in &map.surfaces {
+                    let status = surface_status(&scan, &run, &map, surface);
+                    out.insert(surface.dir.clone(), status);
+                }
+                out.insert(map.dir.clone(), map_status(&scan, &run, &map));
+            }
+            out
         }
     }
 
@@ -335,6 +377,34 @@ impl AppState {
         }
     }
 
+    /// The map of the selection: the selected map, or the map of a selected surface.
+    pub fn selected_map(&self) -> Option<&crate::project::MapInfo> {
+        let maps = self
+            .scans
+            .iter()
+            .flat_map(|s| &s.runs)
+            .flat_map(|r| &r.maps);
+        match &self.selection {
+            Selection::Map(d) => maps.into_iter().find(|m| m.dir == *d),
+            Selection::Surface(d) => maps
+                .into_iter()
+                .find(|m| m.surfaces.iter().any(|s| s.dir == *d)),
+            _ => None,
+        }
+    }
+
+    /// The run and map of the map folder `dir`, with its scan.
+    pub fn map(
+        &self,
+        dir: &std::path::Path,
+    ) -> Option<(&ScanNode, &RunInfo, &crate::project::MapInfo)> {
+        self.scans.iter().find_map(|s| {
+            s.runs
+                .iter()
+                .find_map(|r| r.maps.iter().find(|m| m.dir == dir).map(|m| (s, r, m)))
+        })
+    }
+
     /// The scan with this id.
     pub fn scan_node(&self, id: &str) -> Option<&ScanNode> {
         self.scans.iter().find(|s| s.id == id)
@@ -348,7 +418,7 @@ impl AppState {
     }
 
     /// The run the selection belongs to: the run itself, or the run of a selected map,
-    /// cloud or state.
+    /// cloud, surface or state.
     pub fn selected_run(&self) -> Option<(&ScanNode, &RunInfo)> {
         let owns = |r: &RunInfo| match &self.selection {
             Selection::Run(d) => r.dir == *d,
@@ -356,6 +426,10 @@ impl AppState {
             Selection::Cloud(c) => {
                 r.cloud.as_ref() == Some(c) || r.maps.iter().any(|m| m.clouds.contains(c))
             }
+            Selection::Surface(d) => r
+                .maps
+                .iter()
+                .any(|m| m.surfaces.iter().any(|s| s.dir == *d)),
             Selection::History { run, .. } => r.dir == *run,
             Selection::None | Selection::Scan(_) => false,
         };

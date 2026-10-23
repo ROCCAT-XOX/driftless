@@ -8,9 +8,13 @@
 //!
 //! Every primitive becomes a page: its corners, its triangle indices and its base colour
 //! texture (JPEG, decoded to RGBA). A primitive without a texture gets a 1 × 1 gray page.
-//! Node transforms are not applied (the writer stores none).
+//! The mipmaps of every page are made here too, in the loader's thread, so that the UI thread
+//! only copies them to the GPU. Node transforms are not applied (the writer stores none), and
+//! only data inside the glb is read (no separate `.bin` or image files).
 
+use crate::render::mesh::mip_levels;
 pub use crate::render::mesh::MeshVertex;
+use crate::ui::text;
 use driftless_io::progress::Progress;
 use driftless_steps::StepError;
 use image::RgbaImage;
@@ -31,6 +35,9 @@ pub struct LoadedSurface {
     pub origin: [f64; 3],
     /// Per page: corners, triangle indices (three per triangle), texture.
     pub pages: Vec<(Vec<MeshVertex>, Vec<u32>, RgbaImage)>,
+    /// Per page the halvings of its texture down to 1 × 1 ([`mip_levels`]); a page without
+    /// them gets them made when it is uploaded.
+    pub mips: Vec<Vec<RgbaImage>>,
 }
 
 impl LoadedSurface {
@@ -70,8 +77,21 @@ fn from_gltf(v: [f32; 3]) -> [f64; 3] {
 /// check each). See the module docs.
 pub fn load_glb(path: &Path, progress: &Progress) -> Result<LoadedSurface, StepError> {
     let fail = |e: String| StepError::Failed(format!("{}: {e}", path.display()));
-    let bytes = std::fs::read(path).map_err(|e| fail(e.to_string()))?;
-    let gltf = gltf::Gltf::from_slice(&bytes).map_err(|e| fail(e.to_string()))?;
+    let bytes = std::fs::read(path).map_err(|e| {
+        fail(if e.kind() == std::io::ErrorKind::NotFound {
+            text::SURFACE_FILE_MISSING.to_string()
+        } else {
+            e.to_string()
+        })
+    })?;
+    let gltf = gltf::Gltf::from_slice(&bytes).map_err(|e| fail(text::bad_glb(&e.to_string())))?;
+    // a buffer in a file of its own would otherwise be taken as a primitive without data
+    if let Some(uri) = gltf.buffers().find_map(|b| match b.source() {
+        gltf::buffer::Source::Uri(uri) => Some(uri.to_string()),
+        gltf::buffer::Source::Bin => None,
+    }) {
+        return Err(fail(text::external_buffer(&uri)));
+    }
     let blob = gltf.blob.as_deref();
     let buffer = |b: gltf::Buffer<'_>| match b.source() {
         gltf::buffer::Source::Bin => blob,
@@ -171,6 +191,7 @@ pub fn load_glb(path: &Path, progress: &Progress) -> Result<LoadedSurface, StepE
                         .to_rgba8()
                 }
             };
+            let mips = mip_levels(&image);
             let vertices = raw
                 .positions
                 .iter()
@@ -180,11 +201,16 @@ pub fn load_glb(path: &Path, progress: &Progress) -> Result<LoadedSurface, StepE
                     uv,
                 })
                 .collect();
-            Ok((vertices, raw.indices, image))
+            Ok(((vertices, raw.indices, image), mips))
         })
         .collect::<Result<Vec<_>, StepError>>()?;
     progress.advance(1);
-    Ok(LoadedSurface { origin, pages })
+    let (pages, mips) = pages.into_iter().unzip();
+    Ok(LoadedSurface {
+        origin,
+        pages,
+        mips,
+    })
 }
 
 /// Centre of the bounds of `points` in whole metres; 0 without points.

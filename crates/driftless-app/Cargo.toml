@@ -19,6 +19,8 @@ bytemuck = { version = "1.25", features = ["derive"] }
 # Times of the history in local time.
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 driftless-io = { path = "../driftless-io" }
+# The settings of the surface (`SurfaceConfig`).
+driftless-map = { path = "../driftless-map" }
 driftless-slam = { path = "../driftless-slam" }
 driftless-steps = { path = "../driftless-steps" }
 driftless-traj = { path = "../driftless-traj" }
@@ -40,5 +42,4 @@ toml = "1"
 
 [dev-dependencies]
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
-driftless-map = { path = "../driftless-map" }
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }

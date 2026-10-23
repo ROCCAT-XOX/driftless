@@ -5,15 +5,15 @@
 
 use super::{text, Action, AppState};
 use crate::jobs::{JobOutput, JobRunner};
-use crate::project::{restore_job, run_map_job, run_slam_job, ScanState, SlamJob};
+use crate::project::{restore_job, run_map_job, run_slam_job, run_surface_job, ScanState, SlamJob};
 use driftless_steps::inspect;
 use driftless_steps::map::MapStep;
 
 /// Starts the job of a step action (`Inspect`, `RunSlam`, `Reuse`, `RestoreHistory`,
-/// `RunMap`) and records it in [`AppState::step`]. Refused with a German message while a job
-/// runs, for a scan that cannot be read, a run without `submaps.bin` (reuse, restore), while
-/// a change of the corrections is being written (reuse, restore), for invalid map settings,
-/// or any other action.
+/// `RunMap`, `RunSurface`) and records it in [`AppState::step`]. Refused with a German message
+/// while a job runs, for a scan that cannot be read, a run without `submaps.bin` (reuse,
+/// restore), while a change of the corrections is being written (reuse, restore), for invalid
+/// map or surface settings, a map without `map.json` (surface), or any other action.
 pub fn start_step(
     state: &mut AppState,
     runner: &mut JobRunner,
@@ -98,6 +98,22 @@ pub fn start_step(
             runner.start(text::STEP_MAP, move |p| {
                 let done = run_map_job(&run, &scan, &settings, p)?;
                 Ok(JobOutput::Map(Box::new(done)))
+            })
+        }
+        Action::RunSurface(dir) => {
+            let (scan_id, run, map) = state
+                .map(dir)
+                .map(|(s, r, m)| (s.id.clone(), r.clone(), m.clone()))
+                .ok_or_else(|| text::unknown_map(dir))?;
+            let scan = ready_scan(state, &scan_id)?;
+            let settings = state.surface_settings.clone();
+            settings.config.check().map_err(|e| e.to_string())?;
+            if map.settings.is_none() {
+                return Err(text::SURFACE_NEEDS_MAP.into());
+            }
+            runner.start(text::STEP_SURFACE, move |p| {
+                let done = run_surface_job(&run, &scan, &map, &settings, p)?;
+                Ok(JobOutput::SurfaceStep(Box::new(done)))
             })
         }
         _ => return Err(text::NOT_A_STEP.into()),

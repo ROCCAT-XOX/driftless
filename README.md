@@ -9,7 +9,8 @@ correctable by hand. Runs natively on **macOS (Apple Silicon)** and **Windows**.
 > before/after comparison and a history of states. Earlier: map in about 7 minutes with under 4 GB for a
 > 9.7-minute scan, thinner walls, window views removed (milestone 4), dense, cleaned and coloured map
 > (milestone 3), LiDAR-IMU odometry and SLAM with loop closure and manual corrections (milestone 2).
-> Results on real scans (German): [milestone 5](docs/ergebnisse/2026-10-22-meilenstein-5.md),
+> Results on real scans (German): [photo-like surface](docs/ergebnisse/2026-10-22-baustein-2.md),
+> [milestone 5](docs/ergebnisse/2026-10-22-meilenstein-5.md),
 > [milestone 4](docs/ergebnisse/2026-10-21-meilenstein-4.md),
 > [milestone 3](docs/ergebnisse/2026-10-21-meilenstein-3.md),
 > [milestone 2](docs/ergebnisse/2026-10-20-meilenstein-2.md).
@@ -82,13 +83,20 @@ Read the times for `correct loop` in the viewer on the timeline `ab_scan_beginn`
 `cargo build --release -p driftless-app`, then `target/release/driftless-app` (Windows:
 `driftless-app.exe`; every pull request also builds it as the CI artifact `driftless-app-windows`). The
 interface is German. It runs the same steps as the command line (`inspect`, `slam`, `slam --reuse`,
-`correct`, `map`, `compare`) through the shared crate `driftless-steps`, and writes the same files.
+`correct`, `map`, `surface`, `compare`) through the shared crate `driftless-steps`, and writes the same
+files.
 
 - **Project:** „Projekt → Neues Projekt …“ in an empty folder, then „Scan hinzufügen …“ (a scan folder
   as above). Runs made with the command line can be added with „Lauf hinzufügen …“.
 - **Steps** (right panel, for the selected scan, run or map): „Prüfen“, „SLAM rechnen“, „Neu rechnen
-  (aus Teilkarten)“, „Karte rechnen“ with the switches of `driftless map`. One step runs at a time, with
+  (aus Teilkarten)“, „Karte rechnen“ with the switches of `driftless map`, and for a map „Oberfläche
+  rechnen“ (voxel 1 / 1.5 / 2 cm, „ohne Fotos“ = `--no-texture`) into `karte-NNN/oberflaeche-NNN`; a
+  surface that already fits the map and settings is not computed again. One step runs at a time, with
   progress in the status bar; „Abbrechen“ leaves no half-written files.
+- **Surfaces:** listed under their map in the tree (also folders `oberflaeche…` made with
+  `driftless surface -o`); one that no longer fits its map is marked „veraltet – Karte oder Lauf neu
+  gerechnet“. A click loads it; „Projekt → Oberfläche öffnen …“ opens any `oberflaeche.glb`. The view
+  shows the surface first; „Anzeige: Oberfläche / Punktwolke / beides“ or the key `O` switches.
 - **3D view:** a map or cloud from the tree; colour, intensity or quality of the submap; orbit (left
   drag, wheel, F = show all) or fly (W/A/S/D, Q/E); click a point for its time, colour and quality; a
   height cut („Decke ausblenden“) to look into the rooms from above. A point budget (default 6 million)
@@ -109,6 +117,8 @@ Project folder:
                           slam-001/lauf.toml     scan and settings of the run
                           slam-001/verlauf/      states of the run
                           slam-001/karte-001/    a map of the run, one folder per set of switches
+                          slam-001/karte-001/oberflaeche-001/
+                                                 a surface of the map, one folder per set of settings
 ```
 
 Not yet: export (milestone 6), a cache for the levels of detail (they are rebuilt on every load), more

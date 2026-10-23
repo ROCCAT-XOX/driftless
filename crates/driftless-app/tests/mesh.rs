@@ -174,6 +174,7 @@ fn mesh_renders_texture() {
             [0.0, 0.0, 4.0],
             RED,
         )],
+        ..LoadedSurface::default()
     };
     let cam = camera([0.0; 3], 0.0, 0.0);
     let c = render(
@@ -204,6 +205,7 @@ fn z_cut_hides_ceiling() {
     let surface = LoadedSurface {
         origin: [0.0; 3],
         pages: vec![big(0.0, BLUE), big(3.0, RED)],
+        ..LoadedSurface::default()
     };
     let cam = camera([0.0, 0.0, 5.0], 0.0, -1.4);
     let shown = |z_range| {
@@ -233,6 +235,7 @@ fn surface_and_points_share_depth() {
             [0.0, 0.0, 4.0],
             RED,
         )],
+        ..LoadedSurface::default()
     };
     let cloud = |x: f32, rgb| {
         let mut p = PointSet::from_xyz([0.0; 3], vec![[x, 0.0, 0.0]]);
@@ -333,4 +336,115 @@ fn load_glb_matches_written() {
         assert!((0..3).all(|k| px[k].abs_diff(rgb[k]) < 25), "{px:?}");
         assert_eq!(px[3], 255);
     }
+}
+
+#[test]
+fn load_glb_builds_mips() {
+    let mut tex = TexturedMesh::default();
+    tex.pages = vec![TexturePage {
+        positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+        indices: vec![[0, 1, 2]],
+        image: page_image(16, GREEN),
+    }];
+    let dir = temp_dir("mips");
+    let path = dir.join("oberflaeche.glb");
+    write_glb(&path, &tex, 90).unwrap();
+    let loaded = load_glb(&path, &Progress::new()).unwrap();
+    // made in the loader (off the UI thread): only copied when uploaded
+    assert_eq!(loaded.mips.len(), 1);
+    let sizes: Vec<_> = loaded.mips[0].iter().map(|l| l.dimensions()).collect();
+    assert_eq!(sizes, [(8, 8), (4, 4), (2, 2), (1, 1)]);
+}
+
+fn load_error(name: &str, bytes: &[u8]) -> String {
+    let dir = temp_dir(name);
+    let path = dir.join("oberflaeche.glb");
+    fs::write(&path, bytes).unwrap();
+    let e = load_glb(&path, &Progress::new()).unwrap_err().to_string();
+    assert!(e.contains(&path.display().to_string()), "{e}");
+    e
+}
+
+#[test]
+fn missing_glb_is_a_german_error() {
+    let path = temp_dir("fehlt").join("oberflaeche.glb");
+    let e = load_glb(&path, &Progress::new()).unwrap_err().to_string();
+    assert!(e.contains(&path.display().to_string()), "{e}");
+    assert!(e.contains("nicht gefunden"), "{e}");
+}
+
+#[test]
+fn broken_glb_is_a_german_error() {
+    let e = load_error("kaputt", b"glTF kein echtes glb");
+    assert!(e.contains("keine gültige glb-Datei"), "{e}");
+    // cut off in the middle: also refused, not read halfway
+    let mut tex = TexturedMesh::default();
+    tex.pages = vec![TexturePage {
+        positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+        indices: vec![[0, 1, 2]],
+        image: page_image(16, GREEN),
+    }];
+    let dir = temp_dir("abgeschnitten");
+    write_glb(&dir.join("ganz.glb"), &tex, 90).unwrap();
+    let whole = fs::read(dir.join("ganz.glb")).unwrap();
+    let e = load_error("abgeschnitten-2", &whole[..whole.len() / 2]);
+    assert!(e.contains("keine gültige glb-Datei"), "{e}");
+}
+
+#[test]
+fn external_buffer_is_a_german_error() {
+    // a glTF whose data lie in a separate .bin (not what `driftless surface` writes)
+    let json = r#"{"asset":{"version":"2.0"},
+        "buffers":[{"uri":"oberflaeche.bin","byteLength":36}],
+        "bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36}],
+        "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3",
+                      "min":[0,0,0],"max":[1,1,0]}],
+        "meshes":[{"primitives":[{"attributes":{"POSITION":0}}]}]}"#;
+    let e = load_error("extern", json.as_bytes());
+    assert!(
+        e.contains("Daten liegen in einer eigenen Datei (oberflaeche.bin)"),
+        "{e}"
+    );
+}
+
+/// Draws what `mesh` holds and reads the centre back.
+fn centre_of(gpu: &Gpu, mesh: &MeshRenderer, frame: &FrameParams) -> [u8; 4] {
+    let (device, queue) = (&gpu.device, &gpu.queue);
+    let target = RenderTarget::new(device, [SIZE; 2], FORMAT);
+    let mut points = PointRenderer::new(device, queue, FORMAT);
+    let tree = no_cloud();
+    points.upload_cloud(device, queue, &tree);
+    points.render_with(device, queue, &target, frame, &tree, &[], Some(mesh));
+    read_back(gpu, &target).centre()
+}
+
+#[test]
+fn upload_in_steps_keeps_old_surface() {
+    let Some(gpu) = gpu() else { return };
+    let (device, queue) = (&gpu.device, &gpu.queue);
+    let wall = |rgb| quad([2.0, -2.0, -2.0], [0.0, 4.0, 0.0], [0.0, 0.0, 4.0], rgb);
+    let red = LoadedSurface {
+        pages: vec![wall(RED)],
+        ..LoadedSurface::default()
+    };
+    // two pages: the blue wall and a small one off to the side
+    let side = quad([2.0, 5.0, 5.0], [0.0, 0.1, 0.0], [0.0, 0.0, 0.1], GREEN);
+    let blue = LoadedSurface {
+        pages: vec![wall(BLUE), side],
+        ..LoadedSurface::default()
+    };
+    let cam = camera([0.0; 3], 0.0, 0.0);
+    let f = frame(&cam, ShowMode::Surface, NO_CUT);
+    let mut mesh = MeshRenderer::new(device, FORMAT);
+    mesh.upload(device, queue, &red);
+    assert!(near(centre_of(&gpu, &mesh, &f), RED, 2));
+    // a page per frame: until the last one is up, the old surface stays drawn
+    mesh.begin_upload(blue.origin);
+    assert!(mesh.upload_page(device, queue, &blue, 0) > 0);
+    assert!(near(centre_of(&gpu, &mesh, &f), RED, 2));
+    mesh.upload_page(device, queue, &blue, 1);
+    mesh.finish_upload();
+    assert!(near(centre_of(&gpu, &mesh, &f), BLUE, 2));
 }

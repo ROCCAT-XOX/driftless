@@ -30,7 +30,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::cloud::LoadedCloud;
-use crate::project::{MapDone, MapStatus, SlamDone};
+use crate::project::{MapDone, MapStatus, SlamDone, SurfaceDone};
 use crate::surface::LoadedSurface;
 use crate::ui::compare::{Comparison, MapComparison};
 use crate::ui::correct::{Corrected, RunLoaded};
@@ -46,6 +46,8 @@ pub enum JobOutput {
     Slam(Box<SlamDone>),
     /// With the map folder.
     Map(Box<MapDone>),
+    /// The step „Oberfläche rechnen“, with the surface folder.
+    SurfaceStep(Box<SurfaceDone>),
     /// A cloud with its levels of detail (loader runner).
     Cloud(Box<LoadedCloud>),
     /// A surface with its pages (surface loader).
