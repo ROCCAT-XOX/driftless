@@ -2,7 +2,8 @@
 //!
 //! Every chart gets a gain per mesh vertex and channel (linear RGB, solved as its logarithm):
 //!
-//! 1. **Border vertices** are vertices where charts meet along an edge. Both charts are
+//! 1. **Border vertices** are vertices where charts meet along an edge whose two faces bend by
+//!    at most 45° ([`SEAM_MIN_COS`]; across a crease the light differs). Both charts are
 //!    sampled at the same spots of every such edge next to the vertex: on the edge itself, at
 //!    [`SEAM_SAMPLES`] of its length from the vertex (bilinear; a chart's texels reach half a
 //!    texel beyond its triangles, so on the edge both charts show the same spot of the
@@ -35,6 +36,13 @@
 //! it to 1. [`MAX_GAIN`] bounds how much a dark texel's noise can grow; black stays black and
 //! white clips at white.
 //!
+//! Limits, from the black room (paired samples on 640,114 seam spots): the views of one face
+//! agree within 3.4 sRGB levels (median, 1/4-scale face means after the exposure fit), but on
+//! the seams 34 % of the spots differ by more than 2× (content at the seam, view-dependent
+//! glow). With `MAX_SEAM_RATIO` 2 the median step on flat seams fell from 5.7 to 2.4 levels
+//! (p90 37 → 29), with 3 to 2.2 (p90 → 17), 4 brought little more; across creases (> 45°,
+//! 13 % of the spots) the step is mostly shading and is left alone.
+//!
 //! Unseen (gray) faces belong to no chart: they neither give nor take a correction.
 //!
 //! Two seam measures ([`SeamStats`]), sRGB luminance levels: **jump** follows `seam_jumps` of
@@ -64,10 +72,13 @@ pub const SOLVE_ROUNDS_PER_VERTEX: usize = 2;
 /// Two charts at a border vertex whose luminances differ by more than this factor are not
 /// levelled against each other: exposures differ by less, so the difference is content (a
 /// highlight, an occlusion).
-pub const MAX_SEAM_RATIO: f64 = 2.0;
+pub const MAX_SEAM_RATIO: f64 = 3.0;
 /// Largest gain of a border vertex either way (per channel): √[`MAX_SEAM_RATIO`], so that two
 /// charts just within it meet halfway.
-pub const MAX_GAIN: f64 = std::f64::consts::SQRT_2;
+pub const MAX_GAIN: f64 = 1.732_050_807_568_877_2;
+/// Charts meeting at an edge whose faces' normals differ by more than this (45°, as cosine)
+/// are not levelled against each other: across a crease the light differs.
+pub const SEAM_MIN_COS: f32 = std::f32::consts::FRAC_1_SQRT_2;
 /// Added to both colours of a ratio (linear), so that a near-black sample gives no wild gain.
 pub const GAIN_FLOOR: f64 = 0.0005;
 /// Luminance (linear) below which a side counts as this dark for [`MAX_SEAM_RATIO`].
@@ -87,9 +98,12 @@ pub struct SeamStats {
     /// Jump (sRGB levels).
     pub seam_jump_before: f64,
     pub seam_jump_after: f64,
-    /// Step on the edges between images (sRGB levels).
+    /// Step on the edges between images (sRGB levels): mean and median over the samples. The
+    /// mean is dominated by content at the seams (an object's edge, a crease).
     pub seam_step_before: f64,
     pub seam_step_after: f64,
+    pub seam_step_median_before: f64,
+    pub seam_step_median_after: f64,
     /// Border vertex corrections (vertex and chart) …
     pub corrections: usize,
     /// … of them clamped to [`MAX_GAIN`] in a channel …
@@ -124,7 +138,7 @@ pub(crate) fn level_seams(
     }
     let edges = edge_pairs(mesh, &chart_of);
     let seam_jump_before = seam_jump(mesh, tex, &chart_of, &edges, &lin);
-    let seam_step_before = seam_step(mesh, tex, labels, &edges, &lin);
+    let (seam_step_before, seam_step_median_before) = seam_step(mesh, tex, labels, &edges, &lin);
 
     // 1. Every chart's vertices; the corrections of the border vertices from paired samples
     //    on the seams.
@@ -183,11 +197,14 @@ pub(crate) fn level_seams(
     });
 
     let seam_jump_after = seam_jump(mesh, tex, &chart_of, &edges, &lin);
+    let (seam_step_after, seam_step_median_after) = seam_step(mesh, tex, labels, &edges, &lin);
     SeamStats {
         seam_jump_before,
         seam_jump_after,
         seam_step_before,
-        seam_step_after: seam_step(mesh, tex, labels, &edges, &lin),
+        seam_step_after,
+        seam_step_median_before,
+        seam_step_median_after,
         corrections: border_count,
         clamped,
         content_pairs,
@@ -312,6 +329,13 @@ fn border_corrections(
     let paired: Vec<Paired> = edges
         .par_iter()
         .filter(|e| chart_of[e[0] as usize] != chart_of[e[1] as usize])
+        .filter(|e| {
+            let (a, b) = (
+                mesh.face_normal(e[0] as usize),
+                mesh.face_normal(e[1] as usize),
+            );
+            a[0] * b[0] + a[1] * b[1] + a[2] * b[2] >= SEAM_MIN_COS
+        })
         .flat_map_iter(|&[f, g, a, b]| {
             let (f, g) = if chart_of[f as usize] < chart_of[g as usize] {
                 (f, g)
@@ -413,31 +437,27 @@ fn seam_step(
     labels: &[Option<u32>],
     edges: &[EdgePair],
     lin: &[f32; 256],
-) -> f64 {
-    let steps: Vec<(f64, usize)> = edges
+) -> (f64, f64) {
+    let mut steps: Vec<f64> = edges
         .par_iter()
         .filter(|e| labels[e[0] as usize] != labels[e[1] as usize])
-        .map(|&[f, g, a, b]| {
-            let mut sum = 0.0;
-            for (v, w) in [(a, b), (b, a)] {
-                for &t in &SEAM_SAMPLES {
+        .flat_map_iter(|&[f, g, a, b]| {
+            [(a, b), (b, a)].into_iter().flat_map(move |(v, w)| {
+                SEAM_SAMPLES.iter().map(move |&t| {
                     let y = |face: u32| {
                         srgb_value(luminance(edge_colour(mesh, tex, face, v, w, t, lin)) as f32)
                     };
-                    sum += (y(f) - y(g)).abs();
-                }
-            }
-            (sum, 2 * SEAM_SAMPLES.len())
+                    (y(f) - y(g)).abs()
+                })
+            })
         })
         .collect();
-    let (sum, count) = steps
-        .iter()
-        .fold((0.0, 0usize), |(s, n), &(a, b)| (s + a, n + b));
-    if count == 0 {
-        0.0
-    } else {
-        sum / count as f64
+    if steps.is_empty() {
+        return (0.0, 0.0);
     }
+    let mean = steps.iter().sum::<f64>() / steps.len() as f64;
+    steps.par_sort_unstable_by(f64::total_cmp);
+    (mean, steps[steps.len() / 2])
 }
 
 /// Linear colour of face `f`'s texture at the point `t` of the way from its corner `v` to its
@@ -932,7 +952,7 @@ mod tests {
         let seam = (SMALL.cells[0] / 2, SMALL.cells[1] / 2);
         // The small speck covers the seam samples next to the vertex, the large one is white:
         // both differ from the other side by more than an exposure can.
-        for (radius, speck, label) in [(1u32, 150u8, "kleiner Fleck"), (4, 255, "großer Fleck")] {
+        for (radius, speck, label) in [(1u32, 200u8, "kleiner Fleck"), (4, 255, "großer Fleck")] {
             let (mesh, labels, mut tex) = SMALL.build(colour, colour);
             // A bright speck in chart 1 around a seam vertex.
             let [cx, cy] = SMALL.texel_of(&tex, 1, seam.0, seam.1);
@@ -1050,6 +1070,37 @@ mod tests {
         println!("largest step along the seam {before} → {after} sRGB levels; {stats:?}");
         assert!(before > 15, "{before}");
         assert!(after <= 3, "{before} → {after}");
+    }
+
+    #[test]
+    fn crease_is_not_levelled() {
+        // The wall folded by 90° along the seam: the two sides are different surfaces, their
+        // brightness differs by the light, not by the exposure.
+        let (mut mesh, labels, mut tex) = SMALL.build([100; 3], [130; 3]);
+        let half = SMALL.cells[0] / 2;
+        for iy in half + 1..=SMALL.cells[0] {
+            for iz in 0..=SMALL.cells[1] {
+                let p = &mut mesh.positions[SMALL.vertex(iy, iz) as usize];
+                p[0] = (iy - half) as f32 * 0.1;
+                p[1] = half as f32 * 0.1;
+            }
+        }
+        let before = tex.clone();
+        let stats = level_seams(&mesh, &labels, &mut tex);
+        assert_eq!(tex, before, "{stats:?}");
+        assert_eq!(stats.corrections, 0, "{stats:?}");
+    }
+
+    #[test]
+    fn large_exposure_step_is_levelled() {
+        // 2.5 times brighter in linear light: beyond the old limit of 2, within MAX_SEAM_RATIO.
+        let left = [60, 55, 50];
+        let (mesh, labels, mut tex) = SMALL.build(left, brighter(left, 2.5));
+        let stats = level_seams(&mesh, &labels, &mut tex);
+        assert!(
+            stats.seam_step_after < 0.2 * stats.seam_step_before,
+            "{stats:?}"
+        );
     }
 
     #[test]

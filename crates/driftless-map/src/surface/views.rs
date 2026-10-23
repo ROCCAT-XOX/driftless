@@ -21,7 +21,13 @@
 //!    the nearer part of its own wall in the same depth cell, as in colouring. Its score is
 //!    `projected area (pixels at full size) × sharpness_norm × cos(angle to the normal)`,
 //!    the area capped at `face area / min_texel²` ([`SurfaceConfig::min_texel`]): the texture
-//!    is never finer than that, so a nearer image is no better.
+//!    is never finer than that, so a nearer image is no better. The normal here is smoothed
+//!    over the neighbourhood ([`NORMAL_SMOOTH_ROUNDS`]; the area scaled by the ratio of the
+//!    cosines, within ½ … 2): the normals of a scanned surface scatter by tens of degrees from
+//!    face to face, and with the face's own normal neighbouring faces ranked the images
+//!    differently and kept different ones (black room: 57 % of a neighbour's views in common,
+//!    with the smoothed normal 79 %, and 2.5 times fewer charts). Visibility and facing still
+//!    use the face's own normal.
 //!    Each face keeps its [`SurfaceConfig::views_per_face`] best views (higher score first;
 //!    equal scores: the earlier image).
 //!
@@ -52,7 +58,8 @@
 //! [`MAX_VIEWS_PER_FACE`] per face. The exposure fit runs before this check (it needs the
 //! gains), so its sample still contains the dropped views.
 //!
-//! For a port of the pass (GPU): it has to fill [`ViewTable::per_face`] as
+//! For a port of the pass (GPU): the score uses the smoothed normals (computed once on the
+//! CPU, [`NORMAL_SMOOTH_ROUNDS`]). It has to fill [`ViewTable::per_face`] as
 //! [`keep_best_view`] does: [`FaceView`] has four fields (`image`, `score`, `colour`, `tag`;
 //! 12 bytes), `tag` holds the carrier bit (7) and the centroid's angle from the optical axis
 //! quantised to steps of π/127 (bits 0–6, rounded, at most 127); the slot order is
@@ -89,6 +96,10 @@ pub const EXPOSURE_FACES: usize = 200_000;
 pub const SAMPLE_GAP_CELLS: f64 = 2.0;
 /// A face is split into at most this many sample rows for the depth buffer.
 pub const MAX_SUBDIVISIONS: usize = 32;
+/// Rounds of smoothing the normal for the score (face → vertices, area-weighted → face).
+pub const NORMAL_SMOOTH_ROUNDS: usize = 2;
+/// The smoothed normal's cosine counts as at least this (it can face away at thin parts).
+const SMOOTH_COS_MIN: f64 = 0.05;
 /// A view of a face whose centroid lies within this horizontal distance (m) of the camera …
 pub const CARRIER_RADIUS: f64 = 1.2;
 /// … and more than this far below it (m) may show the carrier of the device (see the module
@@ -236,6 +247,8 @@ impl ViewTable {
 struct Faces {
     centroid: Vec<[f32; 3]>,
     normal: Vec<[f32; 3]>,
+    /// [`NORMAL_SMOOTH_ROUNDS`] rounds smoothed (for the score; zero where it cancels out).
+    smooth: Vec<[f32; 3]>,
     longest: Vec<f32>,
     reach: f64,
 }
@@ -262,12 +275,44 @@ impl Faces {
                     .fold(0.0, f64::max)
             })
             .reduce(|| 0.0, f64::max);
+        let normal: Vec<[f32; 3]> = (0..mesh.indices.len())
+            .into_par_iter()
+            .map(|f| mesh.face_normal(f))
+            .collect();
+        let area: Vec<f32> = (0..mesh.indices.len())
+            .into_par_iter()
+            .map(|f| mesh.face_area(f))
+            .collect();
+        let mut smooth = normal.clone();
+        for _ in 0..NORMAL_SMOOTH_ROUNDS {
+            let mut at_vertex = vec![[0.0f32; 3]; mesh.positions.len()];
+            for (f, t) in mesh.indices.iter().enumerate() {
+                for &v in t {
+                    for k in 0..3 {
+                        at_vertex[v as usize][k] += smooth[f][k] * area[f];
+                    }
+                }
+            }
+            smooth = mesh
+                .indices
+                .par_iter()
+                .map(|t| {
+                    let s: [f32; 3] = std::array::from_fn(|k| {
+                        t.iter().map(|&v| at_vertex[v as usize][k]).sum::<f32>()
+                    });
+                    let l = (s[0] * s[0] + s[1] * s[1] + s[2] * s[2]).sqrt();
+                    if l > 0.0 {
+                        s.map(|x| x / l)
+                    } else {
+                        [0.0; 3]
+                    }
+                })
+                .collect();
+        }
         Faces {
             centroid,
-            normal: (0..mesh.indices.len())
-                .into_par_iter()
-                .map(|f| mesh.face_normal(f))
-                .collect(),
+            normal,
+            smooth,
             longest,
             reach,
         }
@@ -383,7 +428,11 @@ fn image_views(
             let [a, b, c] =
                 mesh.indices[f].map(|i| Vector3::from(mesh.positions[i as usize]).cast::<f64>());
             let cap = 0.5 * (b - a).cross(&(c - a)).norm() / (shot.min_texel * shot.min_texel);
-            let score = (area.min(cap) * cos) as f32 * shot.sharpness_norm;
+            // The score with the smoothed normal (see the module docs).
+            let cos_s = Vector3::from(faces.smooth[f]).cast::<f64>().dot(&to_cam) / to_cam.norm();
+            let cos_s = cos_s.max(SMOOTH_COS_MIN);
+            let area = area * (cos_s / cos).clamp(0.5, 2.0);
+            let score = (area.min(cap) * cos_s) as f32 * shot.sharpness_norm;
             if score.is_nan() || score <= 0.0 {
                 return None;
             }
@@ -1212,6 +1261,60 @@ mod tests {
                 "face {f}: {v:?}"
             );
         }
+    }
+
+    #[test]
+    fn noisy_normals_share_candidates() {
+        // The walk with an image every 0.1 s from both cameras; the room as 5 cm squares with
+        // corners moved by up to ±1 cm (normals off by up to about 20°, as on real meshes).
+        // Neighbouring faces should mostly keep the same images: else they cannot share one.
+        let painted = walk_scene();
+        let cams = cameras();
+        let shots: Vec<Shot> = (1..=55)
+            .flat_map(|i| [0, 1].map(|c| shot(c, T0 + 0.1 * f64::from(i))))
+            .collect();
+        let images = write_bag("views-noisy", &painted, &walk(), &cams, &shots);
+        let src = source(&images, &poses(&walk(), 6.0), &cams);
+        let mut mesh = painted_mesh(&painted, 0.05);
+        for (i, p) in mesh.positions.iter_mut().enumerate() {
+            for (k, x) in p.iter_mut().enumerate() {
+                let mut h = (i as u64 * 3 + k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                h ^= h >> 29;
+                *x += ((h >> 11) as f64 / (1u64 << 53) as f64 - 0.5) as f32 * 0.02;
+            }
+        }
+        let cfg = SurfaceConfig::default();
+        let k = cfg.views_per_face;
+        let table = collect_views(&mesh, &src, &cfg, &Progress::new()).unwrap();
+        // Faces sharing an edge.
+        let mut by_edge: std::collections::BTreeMap<(u32, u32), Vec<usize>> = Default::default();
+        for (f, t) in mesh.indices.iter().enumerate() {
+            for e in 0..3 {
+                let (a, b) = (t[e], t[(e + 1) % 3]);
+                by_edge.entry((a.min(b), a.max(b))).or_default().push(f);
+            }
+        }
+        let set = |f: usize| -> Vec<u32> {
+            views(&table, k, f)
+                .iter()
+                .filter(|v| v.score > 0.0)
+                .map(|v| v.image)
+                .collect()
+        };
+        let (mut sum, mut pairs) = (0.0, 0usize);
+        for fs in by_edge.values().filter(|fs| fs.len() == 2) {
+            let (a, b) = (set(fs[0]), set(fs[1]));
+            if a.len() < k || b.len() < k {
+                continue;
+            }
+            let common = a.iter().filter(|x| b.contains(x)).count();
+            sum += common as f64 / (a.len() + b.len() - common) as f64;
+            pairs += 1;
+        }
+        let jaccard = sum / pairs as f64;
+        println!("{pairs} neighbour pairs with full slots, Jaccard {jaccard:.3}");
+        assert!(pairs > 1000, "{pairs}");
+        assert!(jaccard > 0.83, "{jaccard}");
     }
 
     #[test]

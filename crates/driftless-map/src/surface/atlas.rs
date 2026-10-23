@@ -18,7 +18,7 @@
 //!    [`SurfaceConfig::min_texel`] on the surface (`s = texel / min_texel`, texel =
 //!    `sqrt(surface area / image area)` of the chart) or the rectangle would not fit a page,
 //!    plus a border of [`MARGIN`] texels on every side. A chart that fills less than
-//!    [`MIN_CHART_FILL`] of its rectangle is split at median face centroids where the parts
+//!    [`MIN_CHART_FILL`] of its rectangle is cut at quantiles of its face centroids where the parts
 //!    need fewer texels than the whole ([`split_chart`]); [`TextureStats::fill_ratio`] and
 //!    [`TextureStats::texels_total`] show how well the rectangles are used.
 //! 3. **Packing** ([`pack`]): shelves on pages of `page_size²`, charts sorted by height (then
@@ -85,11 +85,14 @@ pub const UNSEEN_GRAY: u8 = GRAY_MIN + (255 - GRAY_MIN) / 2;
 /// A texel of a scaled-down chart averages at most this many samples per axis.
 pub const MAX_SUPERSAMPLE: u32 = 4;
 /// A chart of several faces whose triangles cover less than this share of its rectangle
-/// (border left out) is halved at the median face centroid along the rectangle's longer side,
-/// and so on (see [`split_chart`]); a split is kept where the parts together need fewer texels
-/// than the whole, borders included. An L-shaped or patchy chart would otherwise take its
-/// whole bounding box on the page, while splitting a small chart only adds borders.
-pub const MIN_CHART_FILL: f64 = 0.7;
+/// (border left out) is cut in two, and so on (see [`split_chart`]); a cut is kept where the
+/// parts together need fewer texels than the whole, borders included. An L-shaped or patchy
+/// chart would otherwise take its whole bounding box on the page, while splitting a small
+/// chart only adds borders.
+pub const MIN_CHART_FILL: f64 = 0.95;
+/// A chart is cut at one of this many − 1 quantiles of its face centroids along either side
+/// of its rectangle (see [`split_chart`]).
+pub const SPLIT_CUTS: usize = 16;
 /// "No chart" / "not yet assigned".
 const NONE: u32 = u32::MAX;
 
@@ -887,9 +890,10 @@ type Part = (Vec<u32>, [f64; 2]);
 /// Splits a chart (`faces` ascending, texel scale `scale`) into the parts that need the
 /// fewest texels, borders included (see [`MIN_CHART_FILL`]). Each part's rectangle is the
 /// smallest one around its corners in the image ([`best_axis`]); a part that fills less than
-/// [`MIN_CHART_FILL`] of it is halved at the median face centroid along its long side, each
-/// half again, down to single faces, and a split is kept where its parts together need fewer
-/// texels than the whole. Equal centroids are ordered by face index; the parts come in a fixed
+/// [`MIN_CHART_FILL`] of it is cut in two where the halves' rectangles need the fewest texels
+/// (among [`SPLIT_CUTS`] − 1 quantiles of the face centroids along either side), each half
+/// again, down to single faces, and a cut is kept where its parts together need fewer texels
+/// than the whole (black room: fill 0.55 with the median cut only, 0.61 with this). Equal centroids are ordered by face index; the parts come in a fixed
 /// order, each ascending.
 fn split_chart(faces: Vec<u32>, proj: &[Option<Projected>], scale: f64) -> Vec<Part> {
     split_best(faces, proj, scale).1
@@ -908,24 +912,40 @@ fn split_best(faces: Vec<u32>, proj: &[Option<Projected>], scale: f64) -> (f64, 
     if faces.len() <= 1 || area * scale * scale >= MIN_CHART_FILL * core[0] * core[1] {
         return (whole, vec![(faces, axis)]);
     }
-    // Along the long side (the rectangle's first one).
-    let mut keyed: Vec<(f64, u32)> = faces
-        .iter()
-        .map(|&f| {
-            let uv = proj[f as usize].expect("projected").uv;
-            let c = [0, 1].map(|k| f64::from(uv[0][k] + uv[1][k] + uv[2][k]) / 3.0);
-            (turn(axis, c)[0], f)
-        })
-        .collect();
-    keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    let mid = keyed.len() / 2;
-    let half = |s: &[(f64, u32)]| {
-        let mut v: Vec<u32> = s.iter().map(|k| k.1).collect();
-        v.sort_unstable();
-        v
+    // The cut: at one of SPLIT_CUTS − 1 quantiles of the face centroids along either side of
+    // the rectangle, the one whose two halves need the fewest texels as they stand.
+    let rect = |fs: &[u32]| {
+        let ax = best_axis(corners(fs, proj));
+        let (lo, hi) = bounds(fs, proj, ax);
+        let c = [0, 1].map(|k| ((hi[k] - lo[k]) * scale + 1.0).ceil());
+        (c[0] + 2.0 * f64::from(MARGIN)) * (c[1] + 2.0 * f64::from(MARGIN))
     };
-    let (low, high) = (half(&keyed[..mid]), half(&keyed[mid..]));
-    drop(keyed);
+    let mut cut: Option<(f64, Vec<u32>, Vec<u32>)> = None;
+    for side in 0..2 {
+        let mut keyed: Vec<(f64, u32)> = faces
+            .iter()
+            .map(|&f| {
+                let uv = proj[f as usize].expect("projected").uv;
+                let c = [0, 1].map(|k| f64::from(uv[0][k] + uv[1][k] + uv[2][k]) / 3.0);
+                (turn(axis, c)[side], f)
+            })
+            .collect();
+        keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for q in 1..SPLIT_CUTS {
+            let mid = (keyed.len() * q / SPLIT_CUTS).clamp(1, keyed.len() - 1);
+            let half = |s: &[(f64, u32)]| {
+                let mut v: Vec<u32> = s.iter().map(|k| k.1).collect();
+                v.sort_unstable();
+                v
+            };
+            let (low, high) = (half(&keyed[..mid]), half(&keyed[mid..]));
+            let cost = rect(&low) + rect(&high);
+            if cut.as_ref().is_none_or(|c| cost < c.0) {
+                cut = Some((cost, low, high));
+            }
+        }
+    }
+    let (_, low, high) = cut.expect("at least two faces");
     let (a, mut parts) = split_best(low, proj, scale);
     let (b, rest) = split_best(high, proj, scale);
     if a + b < whole {
@@ -1644,10 +1664,10 @@ mod tests {
 
     #[test]
     fn chart_rectangle_has_no_gray() {
-        // The front patch without its top-right corner (0.6 × 0.5 m): one concave chart,
+        // The front patch without its top-right corner (0.4 × 0.4 m): one concave chart,
         // well enough filled not to be split, with a corner far from every triangle.
         let (mut mesh, src, _) = fixture("atlas-notch", &[0.0], false);
-        keep_faces(&mut mesh, |c| !(c[0] > 0.4 && c[2] > 0.5));
+        keep_faces(&mut mesh, |c| !(c[0] > 0.6 && c[2] > 0.6));
         let faces = mesh.indices.len();
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
@@ -1668,6 +1688,23 @@ mod tests {
             }
         }
         assert!(check_fields(&mesh, &tm, faces) >= 40);
+    }
+
+    #[test]
+    fn lopsided_chart_is_cut_where_it_pays() {
+        // An L with a tall arm (0.3 × 1.5 m) and a low foot (1.7 × 0.2 m): most faces are in
+        // the arm, so the median cut along the long side falls inside the arm and leaves an L.
+        let (mut mesh, src, _) = fixture("atlas-lopsided", &[0.0], false);
+        keep_faces(&mut mesh, |c| c[0] < -0.7 || c[2] < -0.3);
+        let cfg = SurfaceConfig::default();
+        let progress = Progress::new();
+        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let labels = choose_labels(&mesh, &views, &cfg);
+        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        println!("{stats:?}");
+        assert_charts(&tm, cfg.page_size);
+        assert!(stats.fill_ratio > 0.75, "{stats:?}");
+        assert!(check_fields(&mesh, &tm, mesh.indices.len()) >= 10);
     }
 
     /// The views of a wall with one image everywhere and `patch` (cells 8–11 in both
