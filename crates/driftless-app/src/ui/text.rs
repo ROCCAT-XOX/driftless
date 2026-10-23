@@ -86,7 +86,8 @@ pub const SURFACE_VOXEL: &str = "Voxelgröße";
 pub const SURFACE_VOXEL_CHOICES: [(f64, &str); 3] =
     [(0.01, "1 cm"), (0.015, "1,5 cm"), (0.02, "2 cm")];
 pub const SURFACE_VOXEL_HINT: &str =
-    "Kleiner ist feiner, braucht mehr Speicher und Zeit; bei 1 cm bleiben dunkle Wände löchrig";
+    "Kleiner ist feiner, braucht mehr Speicher und Zeit; 1 cm braucht bei großen Aufnahmen über \
+     4 GB Arbeitsspeicher, und dunkle Wände bleiben löchrig";
 pub const SURFACE_NO_PHOTOS: &str = "ohne Fotos (graue Fläche)";
 
 // The 3D view and its properties (right panel)

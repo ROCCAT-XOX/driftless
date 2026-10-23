@@ -140,6 +140,9 @@ pub struct DriftlessApp {
     next_surface: Option<PathBuf>,
     /// The file stamp of the surface shown, when its load began.
     surface_stamp: FileStamp,
+    /// The surface being loaded was dropped: its result is thrown away even if it finished
+    /// before it saw the cancel.
+    discard_surface: bool,
     /// The cloud shown; a new one replaces it only when it is ready.
     cloud: Option<LoadedCloud>,
     /// The run folder the cloud shown was loaded with.
@@ -180,6 +183,7 @@ impl DriftlessApp {
             surface_loading: None,
             next_surface: None,
             surface_stamp: None,
+            discard_surface: false,
             loading: None,
             next_load: None,
             cloud: None,
@@ -497,6 +501,17 @@ impl DriftlessApp {
             let source = self.loading.take();
             match f.result {
                 Ok(JobOutput::Cloud(cloud)) => {
+                    // a surface of another map would hide this cloud: it goes; one of the
+                    // same map stays, and the cloud just picked is what is drawn
+                    let map = match &source {
+                        Some(CloudSource::File { path, .. }) => path.parent(),
+                        _ => None,
+                    };
+                    if self.surface_of(map) {
+                        self.state.view.show = ShowMode::Cloud;
+                    } else {
+                        self.drop_surface();
+                    }
                     self.cloud_run = match source {
                         Some(CloudSource::File { run, .. }) => run,
                         _ => None,
@@ -544,6 +559,32 @@ impl DriftlessApp {
     fn view_origin(&self) -> Option<[f64; 3]> {
         let surface = self.state.surface.as_ref().map(|s| s.origin);
         self.cloud.as_ref().map(|c| c.tree.origin).or(surface)
+    }
+
+    /// Whether the surface shown, and one being loaded, belong to the map folder `map`: a
+    /// surface folder lies in its map folder (`karte-NNN/oberflaeche-NNN/oberflaeche.glb`).
+    fn surface_of(&self, map: Option<&Path>) -> bool {
+        let in_map = |glb: &Path| map.is_some() && glb.parent().and_then(Path::parent) == map;
+        let shown = self.state.surface.as_ref().is_none_or(|s| in_map(&s.path));
+        let loading = self.surface_loading.as_ref().is_none_or(|(p, _)| in_map(p))
+            && self
+                .next_surface
+                .as_deref()
+                .is_none_or(|p| in_map(&surface_glb(p)));
+        shown && loading
+    }
+
+    /// Takes the surface out of the view, and stops loading one.
+    fn drop_surface(&mut self) {
+        self.next_surface = None;
+        if self.surface_loader.is_busy() {
+            self.surface_loader.cancel();
+            self.discard_surface = true;
+        }
+        if self.state.surface.take().is_some() || self.view.has_surface() {
+            self.view.set_surface(None);
+        }
+        self.surface_stamp = None;
     }
 
     /// Whether a surface is being loaded.
@@ -606,6 +647,9 @@ impl DriftlessApp {
 
     fn surface_finished(&mut self, f: JobFinished) {
         let (path, stamp) = self.surface_loading.take().unwrap_or_default();
+        if std::mem::take(&mut self.discard_surface) {
+            return;
+        }
         match f.result {
             Ok(JobOutput::Surface(surface)) => {
                 self.surface_stamp = stamp;
@@ -629,6 +673,8 @@ impl DriftlessApp {
                     }
                 }
                 self.view.set_surface(Some(*surface));
+                // the surface just picked is what is drawn
+                self.state.view.show = ShowMode::Surface;
             }
             Ok(_) => {}
             // a cancel for the next load needs no message
@@ -1113,6 +1159,7 @@ impl DriftlessApp {
 
     fn set_project(&mut self, project: Project) {
         self.info(text::project_opened(&project.name));
+        self.drop_surface();
         self.state.set_project(project);
     }
 

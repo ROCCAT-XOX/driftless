@@ -3,6 +3,7 @@
 
 use driftless_app::project::{canonical, run_surface_job, SurfaceSettings};
 use driftless_app::render::ShowMode;
+use driftless_app::ui::view3d::effective_show;
 use driftless_app::ui::{
     text, Action, AppState, CloudSummary, DriftlessApp, Selection, SurfaceSummary, UiMessage,
 };
@@ -331,4 +332,79 @@ fn changed_surface_file_loads_again() {
     app.apply(Action::ReloadSurface(glb.clone()));
     assert!(app.is_loading_surface());
     wait(&mut app);
+}
+
+/// A LAS file of `n` points at `path`.
+fn small_las(path: &Path, n: usize) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut builder = las::Builder::from((1, 2));
+    builder.point_format = las::point::Format::new(1).unwrap();
+    let mut w = las::Writer::from_path(path, builder.into_header().unwrap()).unwrap();
+    for i in 0..n {
+        w.write_point(las::Point {
+            x: i as f64 * 0.01,
+            y: 1.0,
+            z: 2.0,
+            intensity: 1000,
+            gps_time: Some(i as f64),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    w.close().unwrap();
+}
+
+#[test]
+fn cloud_of_another_map_drops_surface() {
+    let dir = tmp("ui-oberflaeche-andere-karte");
+    let surface = dir.join("karte-001/oberflaeche-001");
+    fs::create_dir_all(&surface).unwrap();
+    small_glb(&surface.join("oberflaeche.glb"), 2);
+    let (own, other) = (
+        dir.join("karte-001/color.las"),
+        dir.join("karte-002/color.las"),
+    );
+    small_las(&own, 100);
+    small_las(&other, 100);
+    let mut app = DriftlessApp::new(Arc::new(|| {}));
+    let wait = |app: &mut DriftlessApp| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.is_loading_surface() || app.is_loading() {
+            app.tick();
+            assert!(Instant::now() < deadline, "not loaded");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    let drawn = |app: &DriftlessApp| {
+        effective_show(
+            app.state().view.show,
+            app.view().has_surface(),
+            app.cloud().is_some(),
+        )
+    };
+    app.apply(Action::LoadSurface(surface.clone()));
+    wait(&mut app);
+    assert!(app.state().surface.is_some());
+    // a cloud of the surface's map: both stay, the picked cloud is what is drawn
+    app.apply(Action::Select(Selection::Cloud(own)));
+    wait(&mut app);
+    assert!(app.state().surface.is_some() && app.view().has_surface());
+    assert_eq!(drawn(&app), ShowMode::Cloud);
+    // a cloud of another map: the surface goes, the cloud is drawn
+    app.state_mut().view.show = ShowMode::Surface;
+    app.apply(Action::Select(Selection::Cloud(other)));
+    wait(&mut app);
+    assert!(app.state().surface.is_none());
+    assert!(!app.view().has_surface());
+    assert_eq!(drawn(&app), ShowMode::Cloud);
+    // another project: the surface goes too
+    app.apply(Action::LoadSurface(surface));
+    wait(&mut app);
+    assert!(app.view().has_surface());
+    app.apply(Action::NewProject {
+        dir: dir.join("projekt"),
+        name: "Neu".into(),
+    });
+    assert!(app.state().surface.is_none());
+    assert!(!app.view().has_surface());
 }
