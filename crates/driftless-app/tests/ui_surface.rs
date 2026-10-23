@@ -1,14 +1,17 @@
 //! The surface in the project, without a window: the step „Oberfläche rechnen“ on a synthetic
 //! scan, its folder in the tree, the note on a stale surface and the key `O` of the view.
 
-use driftless_app::project::{canonical, SurfaceSettings};
+use driftless_app::project::{canonical, run_surface_job, SurfaceSettings};
 use driftless_app::render::ShowMode;
 use driftless_app::ui::{
     text, Action, AppState, CloudSummary, DriftlessApp, Selection, SurfaceSummary, UiMessage,
 };
+use driftless_io::images::RgbImage;
+use driftless_io::progress::Progress;
 use driftless_io::testscan::{room_bag_secs, tmp};
-use driftless_map::surface::SurfaceConfig;
+use driftless_map::surface::{write_glb, SurfaceConfig, TexturePage, TexturedMesh};
 use driftless_steps::map::MapStep;
+use driftless_steps::StepError;
 use eframe::egui;
 use egui_kittest::kittest::Queryable;
 use egui_kittest::Harness;
@@ -225,4 +228,107 @@ fn surface_of_an_older_program_is_stale() {
     .unwrap();
     run(&mut h, Action::OpenProject(dir.join("projekt")));
     assert!(surfaces(h.state().state(), &map)[0].2, "not marked stale");
+}
+
+#[test]
+fn surface_without_report_is_stale() {
+    let dir = tmp("ui-oberflaeche-ohne-bericht");
+    let (mut h, _, map) = project_with_map(&dir);
+    run(&mut h, Action::RunSurface(map.clone()));
+    // a glb without its json: the step was killed between the two, or the folder copied
+    fs::remove_file(map.join("oberflaeche-001/oberflaeche.json")).unwrap();
+    run(&mut h, Action::OpenProject(dir.join("projekt")));
+    assert!(surfaces(h.state().state(), &map)[0].2, "not marked stale");
+}
+
+#[test]
+fn tree_marks_stale_after_a_step() {
+    let dir = tmp("ui-oberflaeche-nach-schritt");
+    let (mut h, run_dir, map) = project_with_map(&dir);
+    run(&mut h, Action::RunSurface(map.clone()));
+    assert!(!surfaces(h.state().state(), &map)[0].2);
+    // the trajectory changes; the next step reads the tree again and the background check
+    // marks the surface, without opening the project anew
+    let mut traj = fs::read(run_dir.join("traj.tum")).unwrap();
+    traj.extend_from_slice(b"\n");
+    fs::write(run_dir.join("traj.tum"), traj).unwrap();
+    run(&mut h, Action::Inspect("halle".into()));
+    assert!(surfaces(h.state().state(), &map)[0].2, "not marked stale");
+    h.get_by_label(&text::surface_stale("Oberfläche 001"));
+}
+
+#[test]
+fn cancelled_surface_leaves_no_folder() {
+    let dir = tmp("ui-oberflaeche-abbruch");
+    let (h, _, map) = project_with_map(&dir);
+    let state = h.state().state();
+    let (scan, run, info) = state.map(&map).unwrap();
+    let scan_dir = state
+        .project
+        .as_ref()
+        .unwrap()
+        .scan(&scan.id)
+        .unwrap()
+        .path
+        .clone();
+    let progress = Progress::new();
+    progress.cancel();
+    let settings = state.surface_settings.clone();
+    let e = run_surface_job(run, &scan_dir, info, &settings, &progress).unwrap_err();
+    assert!(matches!(e, StepError::Cancelled), "{e}");
+    assert!(!map.join("oberflaeche-001").exists());
+}
+
+/// Writes a one-page glb of `n` triangles to `path`.
+fn small_glb(path: &Path, n: usize) {
+    let mut tex = TexturedMesh::default();
+    let positions: Vec<[f32; 3]> = (0..n * 3)
+        .map(|i| [i as f32, (i % 3) as f32, 0.0])
+        .collect();
+    tex.pages = vec![TexturePage {
+        uvs: vec![[0.5; 2]; positions.len()],
+        indices: (0..n as u32)
+            .map(|t| [3 * t, 3 * t + 1, 3 * t + 2])
+            .collect(),
+        positions,
+        image: RgbImage {
+            width: 4,
+            height: 4,
+            data: vec![128; 48],
+        },
+    }];
+    write_glb(path, &tex, 90).unwrap();
+}
+
+#[test]
+fn changed_surface_file_loads_again() {
+    let dir = tmp("ui-oberflaeche-neu-laden");
+    let glb = dir.join("oberflaeche.glb");
+    small_glb(&glb, 1);
+    let mut app = DriftlessApp::new(Arc::new(|| {}));
+    let wait = |app: &mut DriftlessApp| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.is_loading_surface() {
+            app.tick();
+            assert!(Instant::now() < deadline, "surface not loaded");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    let triangles = |app: &DriftlessApp| app.state().surface.as_ref().map(|s| s.triangles);
+    app.apply(Action::LoadSurface(glb.clone()));
+    wait(&mut app);
+    assert_eq!(triangles(&app), Some(1));
+    // unchanged: not loaded again
+    app.apply(Action::LoadSurface(glb.clone()));
+    assert!(!app.is_loading_surface());
+    // written anew (as `driftless surface -o` into the same folder does): loaded again
+    small_glb(&glb, 2);
+    app.apply(Action::LoadSurface(glb.clone()));
+    assert!(app.is_loading_surface());
+    wait(&mut app);
+    assert_eq!(triangles(&app), Some(2));
+    // asked for again from the menu: loaded even unchanged
+    app.apply(Action::ReloadSurface(glb.clone()));
+    assert!(app.is_loading_surface());
+    wait(&mut app);
 }

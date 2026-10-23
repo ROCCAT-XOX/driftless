@@ -1208,9 +1208,10 @@ fn surface_request(
 /// (`seconds_total` of `oberflaeche.json`), and stale if it no longer fits the map
 /// ([`surface_fits`]: the map, the run, the images or the program changed since). A report
 /// whose settings cannot be read in full was written by an earlier version of the program and
-/// is stale too. Reads the lists of bags, the calibration, `traj.tum` and the head of
-/// `clean.bin`: call it off the UI thread. A surface without a report, or whose scan cannot
-/// be read, is never stale (that cannot be told).
+/// is stale too, and so is a folder without a report (the step writes it last: it was
+/// stopped before, or the folder was copied incompletely). Reads the lists of bags, the
+/// calibration, `traj.tum` and the head of `clean.bin`: call it off the UI thread. A surface
+/// with a report whose scan cannot be read is never stale (that cannot be told).
 pub fn surface_status(
     scan: &Path,
     run: &RunInfo,
@@ -1221,12 +1222,12 @@ pub fn surface_status(
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
     let seconds = report.as_ref().and_then(|v| v["seconds_total"].as_f64());
-    let stale = report.is_some()
-        && discover_project(scan).is_ok()
-        && surface.settings.as_ref().is_none_or(|settings| {
-            surface_request(scan, run, map, settings, &surface.dir)
-                .is_ok_and(|req| !surface_fits(&req))
-        });
+    let stale = report.is_none()
+        || (discover_project(scan).is_ok()
+            && surface.settings.as_ref().is_none_or(|settings| {
+                surface_request(scan, run, map, settings, &surface.dir)
+                    .is_ok_and(|req| !surface_fits(&req))
+            }));
     MapStatus { seconds, stale }
 }
 

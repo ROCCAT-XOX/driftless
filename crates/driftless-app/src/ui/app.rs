@@ -134,9 +134,12 @@ pub struct DriftlessApp {
     next_load: Option<CloudSource>,
     /// Loads surfaces, beside the cloud loader.
     surface_loader: JobRunner,
-    /// The glb it is loading, and the one to load once a cancelled load has stopped.
-    surface_loading: Option<PathBuf>,
+    /// The glb it is loading (with its file stamp when the load began), and the one to load
+    /// once a cancelled load has stopped.
+    surface_loading: Option<(PathBuf, FileStamp)>,
     next_surface: Option<PathBuf>,
+    /// The file stamp of the surface shown, when its load began.
+    surface_stamp: FileStamp,
     /// The cloud shown; a new one replaces it only when it is ready.
     cloud: Option<LoadedCloud>,
     /// The run folder the cloud shown was loaded with.
@@ -176,6 +179,7 @@ impl DriftlessApp {
             surface_loader: JobRunner::new(repaint),
             surface_loading: None,
             next_surface: None,
+            surface_stamp: None,
             loading: None,
             next_load: None,
             cloud: None,
@@ -550,14 +554,24 @@ impl DriftlessApp {
     /// Loads the surface at `path` (a `.glb` or a surface folder) in the background; it
     /// replaces the surface shown once ready. A surface load that runs is cancelled.
     fn load_surface(&mut self, path: &Path) {
+        self.load_surface_with(path, false);
+    }
+
+    /// [`DriftlessApp::load_surface`]; the surface shown or being loaded is loaded again only
+    /// if its file changed since (`driftless surface -o` into the same folder) or with
+    /// `force` (picked again from the menu).
+    fn load_surface_with(&mut self, path: &Path, force: bool) {
         let glb = surface_glb(path);
-        // the surface shown or being loaded is not loaded again (a surface folder is never
-        // written into after its step)
-        let shown = self.state.surface.as_ref().map(|s| &s.path) == Some(&glb);
-        if self.next_surface.is_none()
-            && (self.surface_loading.as_ref() == Some(&glb)
-                || (shown && !self.surface_loader.is_busy()))
-        {
+        let stamp = file_stamp(&glb);
+        let same = |p: &PathBuf, s: &FileStamp| *p == glb && *s == stamp && stamp.is_some();
+        let loading = self
+            .surface_loading
+            .as_ref()
+            .is_some_and(|(p, s)| same(p, s));
+        let shown = self.state.surface.as_ref().map(|s| &s.path) == Some(&glb)
+            && same(&glb, &self.surface_stamp)
+            && !self.surface_loader.is_busy();
+        if !force && self.next_surface.is_none() && (loading || shown) {
             return;
         }
         if self.surface_loader.is_busy() {
@@ -570,7 +584,7 @@ impl DriftlessApp {
             Ok(JobOutput::Surface(Box::new(load_glb(&job, p)?)))
         });
         match started {
-            Ok(()) => self.surface_loading = Some(glb),
+            Ok(()) => self.surface_loading = Some((glb, stamp)),
             Err(e) => self.error(e.to_string()),
         }
     }
@@ -591,9 +605,10 @@ impl DriftlessApp {
     }
 
     fn surface_finished(&mut self, f: JobFinished) {
-        let path = self.surface_loading.take().unwrap_or_default();
+        let (path, stamp) = self.surface_loading.take().unwrap_or_default();
         match f.result {
             Ok(JobOutput::Surface(surface)) => {
+                self.surface_stamp = stamp;
                 let (triangles, pages) = (surface.triangles(), surface.pages.len());
                 self.info(text::surface_loaded(&path, triangles, pages, f.seconds));
                 let z_range = surface.bounds().map_or([0.0; 2], |(lo, hi)| [lo[2], hi[2]]);
@@ -1050,10 +1065,11 @@ impl DriftlessApp {
                     .add_filter("glTF", &["glb"])
                     .pick_file()
                 {
-                    self.load_surface(&path);
+                    self.load_surface_with(&path, true);
                 }
             }
             Action::LoadSurface(path) => self.load_surface(&path),
+            Action::ReloadSurface(path) => self.load_surface_with(&path, true),
             // the status bar shows the step if one runs, else the load
             Action::Cancel if self.jobs.is_busy() => self.jobs.cancel(),
             Action::Cancel => {
@@ -1270,6 +1286,14 @@ impl DriftlessApp {
             self.apply(action);
         }
     }
+}
+
+/// When a file was last written, and its size; `None` if it cannot be read.
+type FileStamp = Option<(std::time::SystemTime, u64)>;
+
+fn file_stamp(path: &Path) -> FileStamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 /// The key `O` (while no text field has the keyboard) switches what the view shows:

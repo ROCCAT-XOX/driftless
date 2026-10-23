@@ -39,12 +39,12 @@ pub const THIS_SURFACE: &str = "Diese Oberfläche";
 pub const SURFACE_STALE: &str = "veraltet – Karte oder Lauf neu gerechnet";
 pub const SURFACE_NEEDS_MAP: &str =
     "Die Karte hat keine map.json – zuerst „Karte rechnen“ (mit „Bereinigen“ oder „Alles“)";
-/// Label of the background job of the map and surface statuses (not shown in the status bar).
 pub const UNKNOWN_SCAN: &str = "Scan nicht im Projekt";
 pub const UNKNOWN_RUN: &str = "Lauf nicht im Projekt";
 pub const UNKNOWN_MAP: &str = "Karte nicht im Projekt";
 pub const NOT_A_STEP: &str = "Diese Aktion ist kein Schritt";
 pub const NOT_REUSED: &str = "noch nicht neu gerechnet";
+/// Label of the background job of the map and surface statuses (not shown in the status bar).
 pub const MAP_STATUS_JOB: &str = "Karten prüfen";
 pub const MAP_SWITCHES: &str = "Einstellungen dieser Karte";
 pub const MAP_SWITCHES_UNKNOWN: &str = "Einstellungen unbekannt (map.json fehlt oder ist unlesbar)";

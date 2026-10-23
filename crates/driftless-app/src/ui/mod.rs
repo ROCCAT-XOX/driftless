@@ -67,8 +67,11 @@ pub enum Action {
     },
     /// Choose a surface (`oberflaeche.glb`) to show.
     PickOpenSurface,
-    /// Show the surface of a `.glb`, or of the `oberflaeche.glb` in a folder.
+    /// Show the surface of a `.glb`, or of the `oberflaeche.glb` in a folder; the one shown
+    /// is loaded again only if its file changed since.
     LoadSurface(PathBuf),
+    /// [`Action::LoadSurface`], also when the surface is shown and unchanged (picked again).
+    ReloadSurface(PathBuf),
     /// Check a scan (id).
     Inspect(String),
     /// A new SLAM run of the scan (id).
