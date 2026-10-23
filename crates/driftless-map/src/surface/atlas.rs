@@ -93,6 +93,9 @@ pub const MIN_CHART_FILL: f64 = 0.95;
 /// A chart is cut at one of this many − 1 quantiles of its face centroids along either side
 /// of its rectangle (see [`split_chart`]).
 pub const SPLIT_CUTS: usize = 16;
+/// The charts of one image are filled in batches of about this many texels (4 bytes each while
+/// they are filled).
+pub const FILL_BATCH_TEXELS: u64 = 16 << 20;
 /// "No chart" / "not yet assigned".
 const NONE: u32 = u32::MAX;
 
@@ -766,20 +769,34 @@ pub(crate) fn bake(
                 camera,
                 lin: &lin,
             };
-            let filled: Vec<(Vec<u8>, u64)> = todo
-                .par_iter()
-                .map(|&c| fill_chart(&charts[c as usize], faces_of(c as usize), &proj, &shot))
-                .collect();
-            for (&c, (buf, inside)) in todo.iter().zip(&filled) {
-                covered += inside;
-                let chart = &charts[c as usize];
-                let image = &mut pages[chart.page as usize].image.data;
-                let row = chart.size[0] as usize * 3;
-                for (y, src_row) in buf.chunks_exact(row).enumerate() {
-                    let start =
-                        ((chart.origin[1] as usize + y) * side + chart.origin[0] as usize) * 3;
-                    image[start..start + row].copy_from_slice(src_row);
+            // In batches of at most FILL_BATCH_TEXELS, so that the large charts of one image
+            // are not all held at once.
+            let mut from = 0;
+            while from < todo.len() {
+                let mut to = from;
+                let mut texels = 0u64;
+                while to < todo.len() && (to == from || texels < FILL_BATCH_TEXELS) {
+                    let size = charts[todo[to] as usize].size;
+                    texels += u64::from(size[0]) * u64::from(size[1]);
+                    to += 1;
                 }
+                let batch = &todo[from..to];
+                let filled: Vec<(Vec<u8>, u64)> = batch
+                    .par_iter()
+                    .map(|&c| fill_chart(&charts[c as usize], faces_of(c as usize), &proj, &shot))
+                    .collect();
+                for (&c, (buf, inside)) in batch.iter().zip(&filled) {
+                    covered += inside;
+                    let chart = &charts[c as usize];
+                    let image = &mut pages[chart.page as usize].image.data;
+                    let row = chart.size[0] as usize * 3;
+                    for (y, src_row) in buf.chunks_exact(row).enumerate() {
+                        let start =
+                            ((chart.origin[1] as usize + y) * side + chart.origin[0] as usize) * 3;
+                        image[start..start + row].copy_from_slice(src_row);
+                    }
+                }
+                from = to;
             }
             remaining -= 1;
             remaining > 0

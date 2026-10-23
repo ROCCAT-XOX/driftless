@@ -87,6 +87,17 @@ fn for_each_voxel(
     }
 }
 
+/// `keys` sorted, without repeats, in an allocation of their size: one chunk of points
+/// visits ten or more voxels per point in a few blocks, and all chunks' lists are held until
+/// they are merged (Büro: 3,650 chunks; with the visit-sized allocations kept this was the
+/// peak of the whole surface, about 1 GB above the TSDF itself).
+fn distinct(mut keys: Vec<[i32; 3]>) -> Vec<[i32; 3]> {
+    keys.sort_unstable();
+    keys.dedup();
+    keys.shrink_to_fit();
+    keys
+}
+
 impl Tsdf {
     /// Fuses the points of `input`.
     pub fn integrate(
@@ -133,10 +144,8 @@ impl Tsdf {
                 for i in r.clone() {
                     ray(i, &mut |k, _| keys.push(block_of(k).0));
                 }
-                keys.sort_unstable();
-                keys.dedup();
                 progress.advance(r.len() as u64);
-                keys
+                distinct(keys)
             })
             .collect();
         if progress.is_cancelled() {
@@ -231,6 +240,15 @@ impl Tsdf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn block_lists_are_compact() {
+        let keys: Vec<[i32; 3]> = (0..10_000).map(|i| [i % 3, 0, i % 2]).collect();
+        let d = super::distinct(keys);
+        assert_eq!(d.len(), 6);
+        assert!(d.capacity() <= 6, "{}", d.capacity());
+        assert!(d.windows(2).all(|w| w[0] < w[1]));
+    }
+
     use super::super::testutil::plane_x;
     use super::*;
 
