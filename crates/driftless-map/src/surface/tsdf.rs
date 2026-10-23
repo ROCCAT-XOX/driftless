@@ -240,14 +240,6 @@ impl Tsdf {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn block_lists_are_compact() {
-        let keys: Vec<[i32; 3]> = (0..10_000).map(|i| [i % 3, 0, i % 2]).collect();
-        let d = super::distinct(keys);
-        assert_eq!(d.len(), 6);
-        assert!(d.capacity() <= 6, "{}", d.capacity());
-        assert!(d.windows(2).all(|w| w[0] < w[1]));
-    }
 
     use super::super::testutil::plane_x;
     use super::*;
@@ -361,5 +353,14 @@ mod tests {
         let s = super::super::sensors_for_frames(&[pose], &mount);
         assert!((s[0][0] - 10.0).abs() < 1e-5 && (s[0][1] - 1.0).abs() < 1e-5);
         assert!((s[0][2] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn block_lists_are_compact() {
+        let keys: Vec<[i32; 3]> = (0..10_000).map(|i| [i % 3, 0, i % 2]).collect();
+        let d = super::distinct(keys);
+        assert_eq!(d.len(), 6);
+        assert!(d.capacity() <= 6, "{}", d.capacity());
+        assert!(d.windows(2).all(|w| w[0] < w[1]));
     }
 }

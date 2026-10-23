@@ -910,8 +910,8 @@ type Part = (Vec<u32>, [f64; 2]);
 /// [`MIN_CHART_FILL`] of it is cut in two where the halves' rectangles need the fewest texels
 /// (among [`SPLIT_CUTS`] − 1 quantiles of the face centroids along either side), each half
 /// again, down to single faces, and a cut is kept where its parts together need fewer texels
-/// than the whole (black room: fill 0.55 with the median cut only, 0.61 with this). Equal centroids are ordered by face index; the parts come in a fixed
-/// order, each ascending.
+/// than the whole (black room: fill 0.55 with the median cut only, 0.61 with this). Equal
+/// centroids are ordered by face index; the parts come in a fixed order, each ascending.
 fn split_chart(faces: Vec<u32>, proj: &[Option<Projected>], scale: f64) -> Vec<Part> {
     split_best(faces, proj, scale).1
 }

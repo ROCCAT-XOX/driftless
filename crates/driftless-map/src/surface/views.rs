@@ -47,11 +47,24 @@
 //! the carrier's legs, a strap – sits in the same part of a camera's image in every frame, also
 //! farther than the carrier rule reaches. Every view of a face with at least
 //! [`MASK_JUDGE_VIEWS`] views is judged against the median of them (as in the consistency
-//! check below), and counted in its cell of its camera's image ([`MASK_CELLS`]). A cell with
-//! at least [`MASK_MIN_VIEWS`] judged views of which more than [`MASK_SHARE`] disagree is
-//! masked; the views in masked cells are dropped from faces that have a decent other view (as
-//! for the carrier). Black room, camera "right": 30–48 % in the lower left cells, 1–25 %
-//! elsewhere.
+//! check below), and counted in its cell of its camera's image ([`MASK_CELLS`]) for its
+//! image. The statistic is per image, not per view (one frame shows hundreds of faces in a
+//! cell): an image disagrees in a cell if most of its judged views there disagree. A cell
+//! with at least [`MASK_MIN_VIEWS`] judged views from at least [`MASK_MIN_IMAGES`] images, of
+//! which more than [`MASK_SHARE`] disagree, is masked; the views in masked cells are dropped
+//! from faces that have a decent other view (as for the carrier). A camera with more than
+//! [`MASK_MAX_CELLS`] such cells is not masked at all (and warned about).
+//!
+//! Black room (VM, 133 / 134 cells with enough images per camera): camera "right" 31–44 % of
+//! the images disagree in the 7 lower-left cells (the carrier), at most 29 % elsewhere (p90
+//! 22 %); camera "left" at most 24 % (p90 18 %), nothing masked. Büro: 9 cells (counted per
+//! view). The cap is 3–4 times what both scans need. The median can be the carrier: where
+//! the carrier is in most views of a face (along the walking path), the clean views count as
+//! the outliers, in their cells. In the black room that is the case for 6,092 of 698,527
+//! judged faces (0.9 %; 4,450 have at least half their views in masked cells), too few to
+//! push a clean cell over [`MASK_SHARE`]; such faces lose their masked views where a decent
+//! other view exists. The margin to the next cell (29 % vs. 30 %) is thin; those cells lie next
+//! to the carrier's.
 //!
 //! **Photo consistency**: every view also keeps the mean colour of its face in the image
 //! ([`FaceView::colour`]: the centroid and the three points halfway to the corners, bilinear
@@ -128,10 +141,19 @@ pub const MASK_CELLS: [usize; 2] = [16, 12];
 pub const MASK_JUDGE_VIEWS: usize = 4;
 /// A cell is masked if at least this many views were judged in it …
 pub const MASK_MIN_VIEWS: u64 = 200;
-/// … and more than this share of them lay further than [`PHOTO_TOLERANCE`] from their face's
-/// median. Black room, camera "right": 30–48 % in the lower left (the carrier), elsewhere
-/// 1–25 %.
+/// … from at least this many different images (one frame shows hundreds of faces in a cell:
+/// a person passing once must not mask it) …
+pub const MASK_MIN_IMAGES: usize = 20;
+/// … and in more than this share of those images most of the cell's views lay further than
+/// [`PHOTO_TOLERANCE`] from their face's median (black room: carrier 31–44 %, elsewhere at
+/// most 29 %).
 pub const MASK_SHARE: f64 = 0.3;
+/// A camera with more masked cells than this (an eighth of [`MASK_CELLS`]) is not masked at
+/// all: that many cells point at something else than a carrier (a crowd, monitors, a glossy
+/// floor). The black room masks 7, the Büro 9.
+pub const MASK_MAX_CELLS: usize = 24;
+/// The mask statistics are summed over this many face ranges (one counter table each).
+const MASK_RANGES: usize = 16;
 /// Most views per face (`SurfaceConfig::views_per_face`); the consistency check works on
 /// fixed arrays of this size.
 pub const MAX_VIEWS_PER_FACE: usize = 32;
@@ -517,7 +539,7 @@ pub(crate) fn mask_views(
     vignetting: &Vignetting,
     cams: &[ColorCamera],
     centroids: &[[f32; 3]],
-) -> Vec<usize> {
+) -> Vec<MaskResult> {
     let [gx, gy] = MASK_CELLS;
     let lin = linear_table();
     let world_to_cam: Vec<Isometry3<f64>> =
@@ -534,16 +556,22 @@ pub(crate) fn mask_views(
         Some((u.camera * gy + y) * gx + x)
     };
     let cells = cams.len() * gx * gy;
-    // Learn: per cell the judged views and those far from their face's median.
-    let counts = per_face
-        .par_chunks(k)
-        .enumerate()
-        .fold(
-            || vec![[0u64; 2]; cells],
-            |mut acc, (f, slots)| {
+    let n_images = images.len();
+    // Learn: per cell and image the judged views and those far from their face's median, in a
+    // fixed number of face ranges (one counter table each, summed in order).
+    let faces = per_face.len() / k.max(1);
+    let ranges: Vec<std::ops::Range<usize>> = (0..MASK_RANGES)
+        .map(|r| faces * r / MASK_RANGES..faces * (r + 1) / MASK_RANGES)
+        .collect();
+    let tables: Vec<Vec<[u32; 2]>> = ranges
+        .par_iter()
+        .map(|range| {
+            let mut acc = vec![[0u32; 2]; cells * n_images];
+            for f in range.clone() {
+                let slots = &per_face[f * k..(f + 1) * k];
                 let n = slots.iter().take_while(|s| s.score > 0.0).count();
                 if n < MASK_JUDGE_VIEWS {
-                    return acc;
+                    continue;
                 }
                 let mut colours = [[0.0f64; 3]; MAX_VIEWS_PER_FACE];
                 for (c, v) in colours.iter_mut().zip(&slots[..n]) {
@@ -552,27 +580,51 @@ pub(crate) fn mask_views(
                 let median = median_of(&colours[..n]);
                 for (v, c) in slots[..n].iter().zip(&colours) {
                     if let Some(i) = cell(f, v) {
-                        acc[i][0] += 1;
-                        acc[i][1] += u64::from(off(c, &median) > PHOTO_TOLERANCE);
+                        let e = &mut acc[i * n_images + v.image as usize];
+                        e[0] += 1;
+                        e[1] += u32::from(off(c, &median) > PHOTO_TOLERANCE);
                     }
                 }
-                acc
-            },
-        )
-        .reduce(
-            || vec![[0u64; 2]; cells],
-            |mut a, b| {
-                for (x, y) in a.iter_mut().zip(b) {
-                    x[0] += y[0];
-                    x[1] += y[1];
-                }
-                a
-            },
-        );
-    let masked: Vec<bool> = counts
-        .iter()
-        .map(|&[n, out]| n >= MASK_MIN_VIEWS && out as f64 > MASK_SHARE * n as f64)
+            }
+            acc
+        })
         .collect();
+    let mut counts = vec![[0u32; 2]; cells * n_images];
+    for t in tables {
+        for (x, y) in counts.iter_mut().zip(t) {
+            x[0] += y[0];
+            x[1] += y[1];
+        }
+    }
+    // Per cell: the images with a judged view there and those whose views there mostly
+    // disagree (a frame counts once, however many faces it shows in the cell).
+    let stats: Vec<MaskCell> = (0..cells)
+        .map(|c| {
+            let row = &counts[c * n_images..(c + 1) * n_images];
+            MaskCell {
+                views: row.iter().map(|e| u64::from(e[0])).sum(),
+                images: row.iter().filter(|e| e[0] > 0).count(),
+                disagree: row.iter().filter(|e| e[0] > 0 && 2 * e[1] > e[0]).count(),
+            }
+        })
+        .collect();
+    drop(counts);
+    let mut masked: Vec<bool> = stats.iter().map(MaskCell::masked).collect();
+    // A camera with too many masked cells looks at something else than a carrier (many people,
+    // monitors, a glossy floor): its mask is not used.
+    let mut result = Vec::with_capacity(cams.len());
+    for c in 0..cams.len() {
+        let mine = &mut masked[c * gx * gy..(c + 1) * gx * gy];
+        let count = mine.iter().filter(|&&m| m).count();
+        let capped = count > MASK_MAX_CELLS;
+        if capped {
+            mine.fill(false);
+        }
+        result.push(MaskResult {
+            masked: if capped { 0 } else { count },
+            would_mask: count,
+        });
+    }
     per_face
         .par_chunks_mut(k)
         .enumerate()
@@ -602,14 +654,31 @@ pub(crate) fn mask_views(
                 }
             }
         });
-    (0..cams.len())
-        .map(|c| {
-            masked[c * gx * gy..(c + 1) * gx * gy]
-                .iter()
-                .filter(|&&m| m)
-                .count()
-        })
-        .collect()
+    result
+}
+
+/// What [`mask_views`] found for one camera.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MaskResult {
+    /// Cells masked.
+    pub masked: usize,
+    /// Cells that met the rule; more than [`MASK_MAX_CELLS`] and the camera's mask is not used.
+    pub would_mask: usize,
+}
+
+/// The statistics of one cell of a camera's image.
+struct MaskCell {
+    views: u64,
+    images: usize,
+    disagree: usize,
+}
+
+impl MaskCell {
+    fn masked(&self) -> bool {
+        self.views >= MASK_MIN_VIEWS
+            && self.images >= MASK_MIN_IMAGES
+            && self.disagree as f64 > MASK_SHARE * self.images as f64
+    }
 }
 
 /// Per-channel median of `colours` (the mean of the middle two for an even count).
@@ -912,12 +981,17 @@ pub(crate) fn collect_views(
         &centroids,
     );
     drop(centroids);
+    let all = MASK_CELLS[0] * MASK_CELLS[1];
     for (c, m) in cams.iter().zip(&masked) {
-        if *m > 0 {
+        if m.masked > 0 {
             progress.info(format!(
-                "Kamera {}: {m} von {} Bildbereichen zeigen oft etwas, das nicht zur Fläche passt (Träger, Personen)",
-                c.camera.name,
-                MASK_CELLS[0] * MASK_CELLS[1]
+                "Kamera {}: {} von {all} Bildbereichen zeigen oft etwas, das nicht zur Fläche passt (Träger, Personen)",
+                c.camera.name, m.masked
+            ));
+        } else if m.would_mask > 0 {
+            progress.warn(format!(
+                "Kamera {}: {} von {all} Bildbereichen passen oft nicht zur Fläche, zu viele für einen Träger; diese Kamera wird nicht maskiert",
+                c.camera.name, m.would_mask
             ));
         }
     }
@@ -1505,46 +1579,42 @@ mod tests {
         assert!(jaccard > 0.83, "{jaccard}");
     }
 
-    #[test]
-    fn image_region_with_carrier_is_masked() {
-        // 400 faces in front of camera 1 (at the origin, looking along +z): the half seen in
-        // one cell in the lower left of its images shows the carrier there in both of its two
-        // images, the other half lies in a cell in the middle; four images of camera 0 show
-        // every face in its colour.
-        let cams = cameras();
+    /// Points 1 m in front of camera 1 (at the origin, looking along +z), grouped by the mask
+    /// cell they appear in: `(cell column, cell row, point)`.
+    fn points_by_cell(cams: &[ColorCamera]) -> Vec<(usize, usize, [f32; 3])> {
         let cam1 = &cams[1].camera;
-        let cell_of = |p: [f64; 3]| {
-            let uv = cam1.project(&Vector3::from(p))?;
-            Some((
-                (uv[0] / f64::from(cam1.width) * MASK_CELLS[0] as f64) as usize,
-                (uv[1] / f64::from(cam1.height) * MASK_CELLS[1] as f64) as usize,
-            ))
-        };
-        let mut centroids: Vec<[f32; 3]> = Vec::new();
-        let mut carrier: Vec<bool> = Vec::new();
-        for i in 0..1_000_000 {
-            let p = [
-                -5.0 + 0.01 * f64::from(i % 1000),
-                -5.0 + 0.01 * f64::from(i / 1000),
-                1.0,
-            ];
-            let Some((x, y)) = cell_of(p) else { continue };
-            let in_blob = (x, y) == (1, 10);
-            let in_middle = (x, y) == (8, 6);
-            if (in_blob && carrier.iter().filter(|&&c| c).count() < 200)
-                || (in_middle && carrier.iter().filter(|&&c| !c).count() < 200)
-            {
-                centroids.push(p.map(|v| v as f32));
-                carrier.push(in_blob);
-            }
-        }
-        assert_eq!(centroids.len(), 400, "{}", centroids.len());
-        // Images 0–3: camera 0 (somewhere else); 4, 5: camera 1 at the origin.
-        let images: Vec<UsedImage> = (0..6)
+        (0..1_000_000)
+            .filter_map(|i| {
+                let p = [
+                    -5.0 + 0.01 * f64::from(i % 1000),
+                    -5.0 + 0.01 * f64::from(i / 1000),
+                    1.0,
+                ];
+                let uv = cam1.project(&Vector3::from(p))?;
+                Some((
+                    (uv[0] / f64::from(cam1.width) * MASK_CELLS[0] as f64) as usize,
+                    (uv[1] / f64::from(cam1.height) * MASK_CELLS[1] as f64) as usize,
+                    p.map(|v| v as f32),
+                ))
+            })
+            .collect()
+    }
+
+    /// A hand-made view table for [`mask_views`]: `faces` centroids, five images of camera 0
+    /// (elsewhere, every face in its colour) and `frames` images of camera 1 at the origin, of
+    /// which every face has three (the best views); `carrier(f)` paints those three in
+    /// [`CARRIER_BLOB`]; `weak(f)`: the face's camera-0 views score only 1 % of the others.
+    fn mask_table(
+        faces: &[[f32; 3]],
+        frames: u32,
+        carrier: impl Fn(usize) -> bool,
+        weak: impl Fn(usize) -> bool,
+    ) -> (Vec<FaceView>, Vec<UsedImage>) {
+        let images: Vec<UsedImage> = (0..5 + frames)
             .map(|i| UsedImage {
-                camera: usize::from(i >= 4),
+                camera: usize::from(i >= 5),
                 stamp: f64::from(i),
-                world_from_cam: if i >= 4 {
+                world_from_cam: if i >= 5 {
                     Isometry3::identity()
                 } else {
                     Isometry3::translation(f64::from(i), -2.0, 0.0)
@@ -1552,45 +1622,165 @@ mod tests {
             })
             .collect();
         let k = 8;
-        let mut per_face = vec![FaceView::EMPTY; centroids.len() * k];
-        for (f, &c) in carrier.iter().enumerate() {
-            for (s, image) in (0..6u32).enumerate() {
-                let colour = if image >= 4 && c {
-                    CARRIER_BLOB
-                } else {
-                    [90, 90, 90]
-                };
-                // The carrier's views are the nearest: the best ones.
-                let score = if image >= 4 { 100.0 } else { 50.0 } - s as f32;
+        let mut per_face = vec![FaceView::EMPTY; faces.len() * k];
+        for f in 0..faces.len() {
+            let slots = &mut per_face[f * k..(f + 1) * k];
+            for j in 0..3u32 {
+                let image = 5 + (f as u32 + j * 7) % frames;
+                let colour = if carrier(f) { CARRIER_BLOB } else { [90; 3] };
                 keep_best_view(
-                    &mut per_face[f * k..(f + 1) * k],
+                    slots,
                     FaceView {
                         image,
-                        score,
+                        score: 100.0 - j as f32,
                         colour,
                         tag: 0,
                     },
                 );
             }
-        }
-        let gains = vec![[1.0f32; 3]; 6];
-        let flat = Vignetting::flat(2, 4.0);
-        let masked = mask_views(&mut per_face, k, &images, &gains, &flat, &cams, &centroids);
-        println!("masked cells per camera: {masked:?}");
-        assert_eq!(masked[0], 0);
-        assert!(masked[1] >= 1, "{masked:?}");
-        for (f, &c) in carrier.iter().enumerate() {
-            let kept: Vec<u32> = per_face[f * k..(f + 1) * k]
-                .iter()
-                .filter(|v| v.score > 0.0)
-                .map(|v| v.image)
-                .collect();
-            if c {
-                assert_eq!(kept, [0, 1, 2, 3], "face {f}");
-            } else {
-                assert_eq!(kept, [4, 5, 0, 1, 2, 3], "face {f}");
+            for image in 0..5u32 {
+                let score = if weak(f) { 1.0 } else { 50.0 } - image as f32 * 0.1;
+                keep_best_view(
+                    slots,
+                    FaceView {
+                        image,
+                        score,
+                        colour: [90; 3],
+                        tag: 0,
+                    },
+                );
             }
         }
+        (per_face, images)
+    }
+
+    fn kept(per_face: &[FaceView], f: usize) -> Vec<u32> {
+        let mut v: Vec<u32> = per_face[f * 8..(f + 1) * 8]
+            .iter()
+            .filter(|v| v.score > 0.0)
+            .map(|v| v.image)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// 200 faces in a cell in the lower left of camera 1's image and 200 in a middle cell.
+    fn two_cells(cams: &[ColorCamera]) -> (Vec<[f32; 3]>, Vec<bool>) {
+        let mut faces = Vec::new();
+        let mut lower_left = Vec::new();
+        for (x, y, p) in points_by_cell(cams) {
+            let ll = (x, y) == (1, 10);
+            let mid = (x, y) == (8, 6);
+            let have = lower_left.iter().filter(|&&l| l == ll).count();
+            if (ll || mid) && have < 200 {
+                faces.push(p);
+                lower_left.push(ll);
+            }
+        }
+        assert_eq!(faces.len(), 400);
+        (faces, lower_left)
+    }
+
+    #[test]
+    fn image_region_with_carrier_is_masked() {
+        // The carrier in the lower left of 30 frames of camera 1; a tenth of those faces have
+        // only weak other views and keep the carrier.
+        let cams = cameras();
+        let (faces, lower_left) = two_cells(&cams);
+        let weak = |f: usize| lower_left[f] && f.is_multiple_of(10);
+        let (mut per_face, images) = mask_table(&faces, 30, |f| lower_left[f], weak);
+        let gains = vec![[1.0f32; 3]; images.len()];
+        let flat = Vignetting::flat(2, 4.0);
+        let masked = mask_views(&mut per_face, 8, &images, &gains, &flat, &cams, &faces);
+        println!("{masked:?}");
+        assert_eq!(masked[0].masked, 0);
+        assert!(masked[1].masked >= 1, "{masked:?}");
+        for (f, &ll) in lower_left.iter().enumerate() {
+            let k = kept(&per_face, f);
+            if ll && !weak(f) {
+                assert_eq!(k, [0, 1, 2, 3, 4], "face {f}");
+            } else {
+                assert_eq!(k.len(), 8, "face {f}: {k:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn few_frames_are_not_masked() {
+        // The same, but only 5 frames of camera 1 show the cells: 600 judged views per cell,
+        // but from too few images.
+        let cams = cameras();
+        let (faces, lower_left) = two_cells(&cams);
+        let (mut per_face, images) = mask_table(&faces, 5, |f| lower_left[f], |_| false);
+        let before = per_face.clone();
+        let gains = vec![[1.0f32; 3]; images.len()];
+        let masked = mask_views(
+            &mut per_face,
+            8,
+            &images,
+            &gains,
+            &Vignetting::flat(2, 4.0),
+            &cams,
+            &faces,
+        );
+        assert!(masked.iter().all(|m| m.would_mask == 0), "{masked:?}");
+        assert_eq!(per_face, before);
+    }
+
+    #[test]
+    fn too_many_cells_disable_the_mask() {
+        // Disagreement all over camera 1's image: that is no carrier; nothing is masked.
+        let cams = cameras();
+        let mut per_cell = std::collections::BTreeMap::new();
+        let faces: Vec<[f32; 3]> = points_by_cell(&cams)
+            .into_iter()
+            .filter(|&(x, y, _)| {
+                let n = per_cell.entry((x, y)).or_insert(0);
+                *n += 1;
+                *n <= 80
+            })
+            .map(|(_, _, p)| p)
+            .collect();
+        let (mut per_face, images) = mask_table(&faces, 30, |_| true, |_| false);
+        let before = per_face.clone();
+        let gains = vec![[1.0f32; 3]; images.len()];
+        let masked = mask_views(
+            &mut per_face,
+            8,
+            &images,
+            &gains,
+            &Vignetting::flat(2, 4.0),
+            &cams,
+            &faces,
+        );
+        println!("{masked:?}");
+        assert!(masked[1].would_mask > MASK_MAX_CELLS, "{masked:?}");
+        assert_eq!(masked[1].masked, 0);
+        assert_eq!(per_face, before);
+    }
+
+    #[test]
+    fn static_scene_masks_nothing() {
+        // The rendered walk without a carrier: no cell of either camera is masked.
+        let (painted, images, poses, cams) = walk_data();
+        let src = source(images, poses, cams);
+        let mesh = painted_mesh(painted, STEP);
+        let cfg = SurfaceConfig::default();
+        let mut table = collect_views(&mesh, &src, &cfg, &Progress::new()).unwrap();
+        let centroids: Vec<[f32; 3]> = (0..mesh.indices.len())
+            .map(|f| centroid(&mesh, f))
+            .collect();
+        let masked = mask_views(
+            &mut table.per_face,
+            cfg.views_per_face,
+            &table.images,
+            &table.gains,
+            &table.vignetting,
+            cams,
+            &centroids,
+        );
+        println!("{masked:?}");
+        assert!(masked.iter().all(|m| m.would_mask == 0), "{masked:?}");
     }
 
     const CARRIER_BLOB: [u8; 3] = [20, 30, 120];

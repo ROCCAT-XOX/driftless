@@ -42,6 +42,8 @@
 //! glow). With `MAX_SEAM_RATIO` 2 the median step on flat seams fell from 5.7 to 2.4 levels
 //! (p90 37 → 29), with 3 to 2.2 (p90 → 17), 4 brought little more; across creases (> 45°,
 //! 13 % of the spots) the step is mostly shading and is left alone.
+//! So content up to 3× (a speck, a stripe end at the seam) is treated as exposure: the old
+//! limit of 2 left more seams alone (p90 29 instead of 17 levels).
 //!
 //! Unseen (gray) faces belong to no chart: they neither give nor take a correction.
 //!
@@ -51,8 +53,9 @@
 //! different charts, minus that of the pairs within one chart (0 if either kind is missing).
 //! Content next to the edge enters it (a stripe ending at the seam). **Step**: the mean absolute
 //! difference of both sides on the edge itself (at [`SEAM_SAMPLES`] from either end), over the
-//! edges between faces of different images: what levelling aims at; what remains is
-//! misregistration and noise.
+//! edges between faces of different images, creases included (they are not levelled; in the
+//! black room 13 % of the seam spots): what levelling aims at; what remains is
+//! misregistration, noise and the creases.
 //!
 //! Memory: per chart its vertices with their corrections (≈ 32 bytes per vertex and chart, and
 //! the solver's vectors for one chart at a time per thread), per mesh edge between textured
@@ -1101,6 +1104,12 @@ mod tests {
             stats.seam_step_after < 0.2 * stats.seam_step_before,
             "{stats:?}"
         );
+    }
+
+    #[test]
+    fn max_gain_follows_the_ratio() {
+        // Two charts just within MAX_SEAM_RATIO meet halfway.
+        assert!((MAX_GAIN * MAX_GAIN - MAX_SEAM_RATIO).abs() < 1e-12);
     }
 
     #[test]
