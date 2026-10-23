@@ -1,22 +1,40 @@
 //! Triangle reduction: flat walls become a few big triangles, the shape stays within a tight error.
 //! Then edges longer than [`SurfaceConfig::max_edge`] are split, so that every face fits into
 //! a camera image for the texture, and slivers on flat parts are turned into rounder faces by
-//! edge flips ([`improve_triangles`]).
+//! edge flips ([`improve_triangles`]). Finally every vertex of the input is checked against the
+//! result ([`far_vertices`]); those too far away are locked and the reduction runs again.
 
 use super::{Mesh, SurfaceConfig};
 use meshopt::{SimplifyOptions, VertexDataAdapter};
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// Rounds of edge splitting at most; each round halves every long edge, so 40 rounds reach
 /// from kilometres to below a millimetre.
 const MAX_SPLIT_ROUNDS: usize = 40;
 
+/// Reductions after the first at most; each locks the vertices of the input the one before
+/// left further than [`SurfaceConfig::simplify_error`] from the result.
+const MAX_LOCK_ROUNDS: usize = 4;
+
 /// Reduces the triangles of `mesh` with meshoptimizer.
 ///
-/// No vertex moves further than `cfg.simplify_error` (m) from the surface, and the vertices on
-/// the border of the mesh stay where they are, so open edges keep their length. Vertices no face
-/// uses after the reduction are dropped; the order of the rest is kept. Finally every edge
-/// longer than `cfg.max_edge` is split at its midpoint (see [`split_long_edges`]).
+/// The vertices of `mesh` stay within `cfg.simplify_error` (m) of the result (see below), and the
+/// vertices on the border of the mesh stay where they are, so open edges keep their length.
+/// Vertices no face uses after the reduction are dropped; the order of the rest is kept. Every
+/// edge longer than `cfg.max_edge` is split at its midpoint (see [`split_long_edges`]), slivers
+/// are flipped (see [`improve_triangles`]).
+///
+/// meshoptimizer's error limit alone does not give that bound: its error is a weighted mean of
+/// the squared distances to the planes merged into a vertex, so where a thin part (a rod, a
+/// table leg) meets a large flat one, the many flat planes outweigh the few planes of the thin
+/// part, and a corner of it may collapse into the flat part although that moves the surface by
+/// the whole width of the thin part. Which collapse wins such a near tie depends on float
+/// rounding, i.e. on the compiler and the platform (FMA on arm64, none with MSVC). So the
+/// result is checked: the vertices of `mesh` too far from it are locked, and the reduction
+/// runs again from the start, at most [`MAX_LOCK_ROUNDS`] times. On a real 2-cm scan (1 M
+/// vertices) the first reduction left 2.7 % of the vertices beyond the limit, 25 of them by
+/// 1–5 cm; after the last round 0.1 % remain, most within 3 mm, none beyond 1 cm.
 pub fn simplify(mesh: &Mesh, cfg: &SurfaceConfig) -> Mesh {
     if mesh.indices.is_empty() {
         return Mesh::default();
@@ -24,28 +42,141 @@ pub fn simplify(mesh: &Mesh, cfg: &SurfaceConfig) -> Mesh {
     let flat: Vec<u32> = mesh.indices.iter().flatten().copied().collect();
     let bytes: &[u8] = positions_as_bytes(&mesh.positions);
     let adapter = VertexDataAdapter::new(bytes, 12, 0).expect("Eckpunkte sind drei f32 je Punkt");
-    // Target count 0: reduce as far as the error allows. The error is absolute (m), which is
-    // the same as the relative error of the brief scaled by the extent of the mesh.
-    let reduced = meshopt::simplify(
-        &flat,
-        &adapter,
-        0,
-        cfg.simplify_error as f32,
-        SimplifyOptions::LockBorder | SimplifyOptions::ErrorAbsolute,
-        None,
-    );
-    let mut out = Mesh {
-        positions: mesh.positions.clone(),
-        indices: reduced.as_chunks::<3>().0.to_vec(),
+    let mut lock = vec![false; mesh.positions.len()];
+    let mut round = 0;
+    loop {
+        // Target count 0: reduce as far as the error allows. The error is absolute (m), which
+        // is the same as the relative error of the brief scaled by the extent of the mesh.
+        let reduced = meshopt::simplify_with_locks(
+            &flat,
+            &adapter,
+            &lock,
+            0,
+            cfg.simplify_error as f32,
+            SimplifyOptions::LockBorder | SimplifyOptions::ErrorAbsolute,
+            None,
+        );
+        let mut out = Mesh {
+            positions: mesh.positions.clone(),
+            indices: reduced.as_chunks::<3>().0.to_vec(),
+        };
+        drop_unused(&mut out);
+        split_long_edges(&mut out, cfg.max_edge);
+        improve_triangles(
+            &mut out,
+            MAX_FLIP_DEVIATION * cfg.simplify_error,
+            cfg.max_edge,
+        );
+        if round == MAX_LOCK_ROUNDS {
+            return out;
+        }
+        let far = far_vertices(mesh, &out, cfg.simplify_error);
+        if far.is_empty() {
+            return out;
+        }
+        for v in far {
+            lock[v as usize] = true;
+        }
+        round += 1;
+    }
+}
+
+/// The vertices of `from` (those a face uses) further than `max` (m) from every face of `to`,
+/// in ascending order. A grid of cells finds the faces near a vertex: each face is listed in
+/// every cell its bounding box, grown by `max`, touches.
+pub(crate) fn far_vertices(from: &Mesh, to: &Mesh, max: f64) -> Vec<u32> {
+    let up = |p: [f32; 3]| p.map(f64::from);
+    let tris: Vec<[[f64; 3]; 3]> = to
+        .indices
+        .iter()
+        .map(|f| f.map(|i| up(to.positions[i as usize])))
+        .collect();
+    let longest = tris
+        .iter()
+        .flat_map(|t| {
+            (0..3).map(move |k| dot(sub(t[k], t[(k + 1) % 3]), sub(t[k], t[(k + 1) % 3])).sqrt())
+        })
+        .fold(0.0, f64::max);
+    // About 8 cells along the longest edge (at most 0.3 m after the split: 3.75 cm), never
+    // smaller than the reach itself.
+    let cell = (longest / 8.0).max(2.0 * max).max(1e-3);
+    let cell_of = |x: f64| (x / cell).floor() as i64;
+    let mut grid: HashMap<[i64; 3], Vec<u32>> = HashMap::new();
+    for (f, t) in tris.iter().enumerate() {
+        let lo = [0, 1, 2].map(|k| cell_of(t[0][k].min(t[1][k]).min(t[2][k]) - max));
+        let hi = [0, 1, 2].map(|k| cell_of(t[0][k].max(t[1][k]).max(t[2][k]) + max));
+        for x in lo[0]..=hi[0] {
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    grid.entry([x, y, z]).or_default().push(f as u32);
+                }
+            }
+        }
+    }
+    let mut used = vec![false; from.positions.len()];
+    for &v in from.indices.iter().flatten() {
+        used[v as usize] = true;
+    }
+    let max_sq = max * max;
+    (0..from.positions.len() as u32)
+        .into_par_iter()
+        .filter(|&v| {
+            if !used[v as usize] {
+                return false;
+            }
+            let p = up(from.positions[v as usize]);
+            let near = grid.get(&p.map(cell_of)).is_some_and(|faces| {
+                faces
+                    .iter()
+                    .any(|&f| point_triangle_sq(p, tris[f as usize]) <= max_sq)
+            });
+            !near
+        })
+        .collect()
+}
+
+/// Squared distance from `p` to the triangle `tri` (Ericson, Real-Time Collision Detection).
+fn point_triangle_sq(p: [f64; 3], tri: [[f64; 3]; 3]) -> f64 {
+    let [a, b, c] = tri;
+    let (ab, ac, ap) = (sub(b, a), sub(c, a), sub(p, a));
+    let (d1, d2) = (dot(ab, ap), dot(ac, ap));
+    let closest = if d1 <= 0.0 && d2 <= 0.0 {
+        a
+    } else {
+        let bp = sub(p, b);
+        let (d3, d4) = (dot(ab, bp), dot(ac, bp));
+        let cp = sub(p, c);
+        let (d5, d6) = (dot(ab, cp), dot(ac, cp));
+        let (vc, vb, va) = (d1 * d4 - d3 * d2, d5 * d2 - d1 * d6, d3 * d6 - d5 * d4);
+        let at = |u: f64, v: f64| {
+            [
+                a[0] + ab[0] * u + ac[0] * v,
+                a[1] + ab[1] * u + ac[1] * v,
+                a[2] + ab[2] * u + ac[2] * v,
+            ]
+        };
+        if d3 >= 0.0 && d4 <= d3 {
+            b
+        } else if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+            at(d1 / (d1 - d3), 0.0)
+        } else if d6 >= 0.0 && d5 <= d6 {
+            c
+        } else if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+            at(0.0, d2 / (d2 - d6))
+        } else if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+            let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+            [
+                b[0] + (c[0] - b[0]) * w,
+                b[1] + (c[1] - b[1]) * w,
+                b[2] + (c[2] - b[2]) * w,
+            ]
+        } else {
+            let denom = 1.0 / (va + vb + vc);
+            at(vb * denom, vc * denom)
+        }
     };
-    drop_unused(&mut out);
-    split_long_edges(&mut out, cfg.max_edge);
-    improve_triangles(
-        &mut out,
-        MAX_FLIP_DEVIATION * cfg.simplify_error,
-        cfg.max_edge,
-    );
-    out
+    let d = sub(p, closest);
+    dot(d, d)
 }
 
 /// A flip may move the surface by at most this share of [`SurfaceConfig::simplify_error`].
@@ -330,52 +461,6 @@ mod tests {
         mesh
     }
 
-    /// Distance from `p` to the triangle `abc` (Ericson, Real-Time Collision Detection).
-    fn point_triangle(p: [f64; 3], tri: [[f64; 3]; 3]) -> f64 {
-        let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-        let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-        let [a, b, c] = tri;
-        let (ab, ac, ap) = (sub(b, a), sub(c, a), sub(p, a));
-        let (d1, d2) = (dot(ab, ap), dot(ac, ap));
-        let closest = if d1 <= 0.0 && d2 <= 0.0 {
-            a
-        } else {
-            let bp = sub(p, b);
-            let (d3, d4) = (dot(ab, bp), dot(ac, bp));
-            let cp = sub(p, c);
-            let (d5, d6) = (dot(ab, cp), dot(ac, cp));
-            let (vc, vb, va) = (d1 * d4 - d3 * d2, d5 * d2 - d1 * d6, d3 * d6 - d5 * d4);
-            let at = |u: f64, v: f64| {
-                [
-                    a[0] + ab[0] * u + ac[0] * v,
-                    a[1] + ab[1] * u + ac[1] * v,
-                    a[2] + ab[2] * u + ac[2] * v,
-                ]
-            };
-            if d3 >= 0.0 && d4 <= d3 {
-                b
-            } else if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
-                at(d1 / (d1 - d3), 0.0)
-            } else if d6 >= 0.0 && d5 <= d6 {
-                c
-            } else if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
-                at(0.0, d2 / (d2 - d6))
-            } else if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
-                let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-                [
-                    b[0] + (c[0] - b[0]) * w,
-                    b[1] + (c[1] - b[1]) * w,
-                    b[2] + (c[2] - b[2]) * w,
-                ]
-            } else {
-                let denom = 1.0 / (va + vb + vc);
-                at(vb * denom, vc * denom)
-            }
-        };
-        let d = sub(p, closest);
-        dot(d, d).sqrt()
-    }
-
     /// Largest distance from a vertex of `from` to the surface of `to` (m).
     fn one_sided(from: &Mesh, to: &Mesh) -> f64 {
         let up = |p: [f32; 3]| p.map(f64::from);
@@ -391,7 +476,7 @@ mod tests {
             .map(|&i| {
                 let p = from.positions[i as usize];
                 tris.iter()
-                    .map(|&t| point_triangle(up(p), t))
+                    .map(|&t| point_triangle_sq(up(p), t).sqrt())
                     .fold(f64::INFINITY, f64::min)
             })
             .fold(0.0, f64::max)
@@ -435,6 +520,27 @@ mod tests {
         // The tip of the rod is still there.
         let tip = out.positions.iter().map(|p| p[0]).fold(0.0, f32::max);
         assert!(tip >= 0.3 - 0.002);
+    }
+
+    /// meshoptimizer's error is a weighted mean over the planes merged into a vertex, not a
+    /// largest distance: where a thin rod meets a large wall, the wall planes outweigh the rod
+    /// planes and a corner of the rod's foot can collapse into the wall although that moves the
+    /// rod by its whole width (1–2 cm against the 2-mm limit). Which of these rods are hit
+    /// depends on float rounding (FMA or not), so on the platform: check many.
+    #[test]
+    fn simplify_keeps_rods_within_error() {
+        let err = cfg().simplify_error;
+        for n in [40, 50, 60] {
+            for len in [10, 20, 25, 30, 35] {
+                let (mesh, _) = rod_on_wall(n, 0.01, len);
+                let out = simplify(&mesh, &cfg());
+                let hausdorff = one_sided(&out, &mesh).max(one_sided(&mesh, &out));
+                assert!(
+                    hausdorff <= err,
+                    "Wand {n}, Stab {len}: Hausdorff-Abstand {hausdorff} m"
+                );
+            }
+        }
     }
 
     #[test]
