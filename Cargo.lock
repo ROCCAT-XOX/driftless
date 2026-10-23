@@ -1643,6 +1643,8 @@ dependencies = [
  "eframe",
  "egui-wgpu",
  "egui_kittest",
+ "gltf",
+ "image",
  "las",
  "mimalloc",
  "nalgebra",

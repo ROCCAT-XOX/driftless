@@ -11,8 +11,13 @@
 //!
 //! Over the cloud the view draws the run of [`ViewOverlay`] (trajectory, odometry, loops,
 //! anchors, picked places); without a cloud the run alone. The height cut applies to the
-//! points only: the trajectory is neither cut nor kept from being clicked by it, so the
-//! places of a loop can be chosen with the ceiling cut away or not.
+//! points and the surface only: the trajectory is neither cut nor kept from being clicked by
+//! it, so the places of a loop can be chosen with the ceiling cut away or not.
+//!
+//! A surface ([`View3d::set_surface`]) is drawn with [`MeshRenderer`] in the same depth
+//! buffer, moved into the frame of the cloud (else its own); „Oberfläche /
+//! Punktwolke / beides“ ([`ShowMode`]) picks what is drawn. Picking still looks at points
+//! only.
 
 use super::{text, ViewSettings};
 use crate::camera::{fly_motion, Camera, CameraMode, FlyKeys, ZOOM_FACTOR};
@@ -21,7 +26,9 @@ use crate::lod::{select_nodes, Octree, PointVertex};
 use crate::overlay::RunOverlay;
 use crate::overlay::{COMPARE_B_COLOR, COMPARE_COLOR, PICK_COLOR};
 use crate::pick::{pick_point_in, project, to_physical};
-use crate::render::{ColorMode, FrameParams, PointRenderer, RenderTarget, NO_CUT};
+use crate::render::mesh::MeshRenderer;
+use crate::render::{ColorMode, FrameParams, PointRenderer, RenderTarget, ShowMode, NO_CUT};
+use crate::surface::LoadedSurface;
 use eframe::egui::{self, Color32, Key, PointerButton, Rect, Sense, Ui};
 use egui_wgpu::wgpu;
 use std::time::{Duration, Instant};
@@ -169,6 +176,16 @@ pub fn effective_color_mode(mode: ColorMode, has_rgb: bool) -> ColorMode {
     }
 }
 
+/// What is drawn for the setting `mode`: without a surface the points, without a cloud the
+/// surface, else as set.
+pub fn effective_show(mode: ShowMode, has_surface: bool, has_cloud: bool) -> ShowMode {
+    match (has_surface, has_cloud) {
+        (false, _) => ShowMode::Cloud,
+        (true, false) => ShowMode::Surface,
+        (true, true) => mode,
+    }
+}
+
 /// What the properties show of a picked point.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PointInfo {
@@ -217,6 +234,17 @@ struct FrameKey {
     picked: Option<u32>,
     z_range: [f32; 2],
     overlay: u64,
+    show: ShowMode,
+    /// How often a surface was uploaded, and the origin it is drawn in.
+    surface: (u64, Option<[f64; 3]>),
+}
+
+/// The surface on the GPU: what the view still needs of it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SurfaceShown {
+    origin: [f64; 3],
+    /// Relative to `origin`.
+    bounds: Option<([f32; 3], [f32; 3])>,
 }
 
 /// A press of the primary button inside the view, until it is released.
@@ -262,6 +290,12 @@ pub struct View3d {
     overlay_count: u64,
     /// The run whose trajectory was framed while there was no cloud.
     framed_run: Option<std::path::PathBuf>,
+    /// The surface's GPU side; `None` before the first surface.
+    mesh: Option<MeshRenderer>,
+    /// A surface waiting to be uploaded (its pixels are dropped once they are on the GPU).
+    pending_surface: Option<LoadedSurface>,
+    surface: Option<SurfaceShown>,
+    surface_count: u64,
 }
 
 impl View3d {
@@ -274,6 +308,24 @@ impl View3d {
         self.drawn.clear();
         self.drawn_points = 0;
         self.last = None;
+    }
+
+    /// Shows `surface` from the next frame on (replacing the one shown), or none.
+    pub fn set_surface(&mut self, surface: Option<LoadedSurface>) {
+        if surface.is_none() {
+            if let Some(mesh) = &mut self.mesh {
+                mesh.clear();
+            }
+            self.surface = None;
+            self.surface_count += 1;
+        }
+        self.pending_surface = surface;
+        self.last = None;
+    }
+
+    /// Whether a surface is shown or about to be.
+    pub fn has_surface(&self) -> bool {
+        self.surface.is_some() || self.pending_surface.is_some()
     }
 
     /// Points drawn in the last frame.
@@ -329,7 +381,7 @@ impl View3d {
         if !(rect.width() >= 1.0 && rect.height() >= 1.0) {
             return None;
         }
-        if cloud.is_none() && overlay.is_none() {
+        if cloud.is_none() && overlay.is_none() && !self.has_surface() {
             return None;
         }
         let ppp = ui.ctx().pixels_per_point();
@@ -352,12 +404,48 @@ impl View3d {
             self.overlay_key = None;
             self.last = None;
         }
+        // The frame of the camera: the cloud's, else the surface's (the program moves the
+        // run there too), else the run's.
+        let view_origin = cloud
+            .map(|c| c.tree.origin)
+            .or(self.pending_surface.as_ref().map(|s| s.origin))
+            .or(self.surface.map(|s| s.origin))
+            .or(overlay.map(|o| o.run.origin));
+        let mut surface_new = false;
+        if let Some(surface) = self.pending_surface.take() {
+            let mesh = self
+                .mesh
+                .get_or_insert_with(|| MeshRenderer::new(device, VIEW_FORMAT));
+            mesh.upload(device, queue, &surface);
+            self.surface = Some(SurfaceShown {
+                origin: surface.origin,
+                bounds: surface.bounds(),
+            });
+            self.surface_count += 1;
+            surface_new = true;
+        }
+        if let (Some(mesh), Some(origin)) = (&mut self.mesh, view_origin) {
+            mesh.set_view_origin(origin);
+        }
+        // The surface's bounds in the camera's frame.
+        let surface_bounds = self.surface.and_then(|s| {
+            let (lo, hi) = s.bounds?;
+            let o = view_origin.unwrap_or(s.origin);
+            let shift = [0, 1, 2].map(|k| (s.origin[k] - o[k]) as f32);
+            Some((
+                [0, 1, 2].map(|k| lo[k] + shift[k]),
+                [0, 1, 2].map(|k| hi[k] + shift[k]),
+            ))
+        });
         if cloud.is_none() {
-            // only the run: frame its trajectory once
+            // without a cloud: frame the surface when it comes, else the run once
             let run = overlay.map(|o| o.run);
-            if run.map(|r| &r.run) != self.framed_run.as_ref() {
+            if surface_new && surface_bounds.is_some() {
+                self.bounds = surface_bounds;
+                self.frame_all = true;
+            } else if run.map(|r| &r.run) != self.framed_run.as_ref() {
                 self.framed_run = run.map(|r| r.run.clone());
-                self.bounds = run.and_then(RunOverlay::bounds);
+                self.bounds = surface_bounds.or(run.and_then(RunOverlay::bounds));
                 self.frame_all = true;
             }
         }
@@ -428,14 +516,19 @@ impl View3d {
             picked: self.picked,
             z_range: settings.cut.unwrap_or(NO_CUT),
             overlay: self.overlay_count,
+            show: effective_show(settings.show, self.surface.is_some(), cloud.is_some()),
+            surface: (self.surface_count, view_origin),
         };
         if self.last.as_ref() != Some(&key) {
             let started = Instant::now();
             // Refine while the points of a node are farther apart on screen than drawn.
             let info = self.camera.view_info(viewport, point_px);
+            // the surface alone: no points, none to pick
             self.drawn = match cloud {
-                Some(c) => select_nodes(&c.tree, &info, settings.budget),
-                None => Vec::new(),
+                Some(c) if key.show != ShowMode::Surface => {
+                    select_nodes(&c.tree, &info, settings.budget)
+                }
+                _ => Vec::new(),
             };
             self.drawn_points = self
                 .drawn
@@ -453,11 +546,13 @@ impl View3d {
                 background: BACKGROUND,
                 quality_known: cloud.is_some_and(|c| c.points.quality_known),
                 z_range: key.z_range,
+                show: key.show,
             };
             if let (Some(target), Some(renderer)) = (&self.target, &mut self.renderer) {
-                // `render` writes the shared uniform buffers and submits its own work, so
-                // this frame is complete before anything else is drawn into the view.
-                renderer.render(device, queue, target, &frame, tree, &self.drawn);
+                // `render_with` writes the shared uniform buffers and submits its own work,
+                // so this frame is complete before anything else is drawn into the view.
+                let mesh = self.mesh.as_ref().filter(|m| !m.is_empty());
+                renderer.render_with(device, queue, target, &frame, tree, &self.drawn, mesh);
             }
             let now = Instant::now();
             self.frame_ms = match self.last_render_at {

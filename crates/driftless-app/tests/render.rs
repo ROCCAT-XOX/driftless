@@ -6,7 +6,8 @@ use driftless_app::cloud::PointSet;
 use driftless_app::lod::{build_octree, build_octree_with, Octree, PointVertex, LEAF_MAX};
 use driftless_app::pick::project;
 use driftless_app::render::{
-    headless_device, ColorMode, FrameParams, LineVertex, PointRenderer, RenderTarget, NO_CUT,
+    headless_device, ColorMode, FrameParams, LineVertex, PointRenderer, RenderTarget, ShowMode,
+    NO_CUT,
 };
 use driftless_app::synthetic::Rng;
 use driftless_io::progress::Progress;
@@ -57,6 +58,7 @@ fn frame(cam: &Camera, mode: ColorMode) -> FrameParams {
         background: BACKGROUND,
         quality_known: true,
         z_range: NO_CUT,
+        show: ShowMode::Cloud,
     }
 }
 

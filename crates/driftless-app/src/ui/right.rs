@@ -14,10 +14,10 @@
 use super::status::count;
 use super::view3d::{color_modes, effective_color_mode, PointInfo};
 use super::{compare, correct};
-use super::{text, Action, AppState, CloudSummary, ScanNode, Selection, ViewSettings};
+use super::{text, Action, AppState, ScanNode, Selection, ViewSettings};
 use crate::camera::CameraMode;
 use crate::project::{MapInfo, RunInfo, ScanState};
-use crate::render::ColorMode;
+use crate::render::{ColorMode, ShowMode};
 use driftless_steps::history::HistoryKind;
 use driftless_steps::map::{MapSettings, MapStep};
 use driftless_steps::slam::SlamSettings;
@@ -153,13 +153,22 @@ fn section(ui: &mut Ui, title: &str, body: impl FnOnce(&mut Ui)) {
 /// How the 3D view draws, the height cut, the numbers of the last frame and the point
 /// clicked in it.
 fn view_section(ui: &mut Ui, state: &mut AppState) {
+    if state.surface.is_some() {
+        show_mode_edit(ui, &mut state.view.show, state.cloud.is_some());
+    }
     let has_rgb = state.cloud.as_ref().is_none_or(|c| c.has_rgb);
     view_settings_edit(ui, &mut state.view, has_rgb);
     if state.cloud.as_ref().is_some_and(|c| !c.quality_known) {
         ui.weak(text::QUALITY_NONE_HINT);
     }
-    if let Some(cloud) = &state.cloud {
-        cut_edit(ui, &mut state.view.cut, cloud);
+    // the cut over the cloud, else over the surface alone
+    let cut_over = match (&state.cloud, &state.surface) {
+        (Some(c), _) => Some((c.z_range, c.ceiling)),
+        (None, Some(s)) => Some((s.z_range, None)),
+        (None, None) => None,
+    };
+    if let Some((z_range, ceiling)) = cut_over {
+        cut_edit(ui, &mut state.view.cut, z_range, ceiling);
     }
     if let Some(stats) = &state.view_stats {
         ui.label(text::drawn_stats(
@@ -172,6 +181,19 @@ fn view_section(ui: &mut Ui, state: &mut AppState) {
     ui.weak(text::FRAME_ALL_HINT);
     ui.separator();
     point_shown(ui, state.picked.as_ref());
+}
+
+/// „Anzeige: Oberfläche / Punktwolke / beides“; without a cloud only the surface can be
+/// shown, so the switch is off.
+fn show_mode_edit(ui: &mut Ui, show: &mut ShowMode, has_cloud: bool) {
+    ui.add_enabled_ui(has_cloud, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(text::SHOW_MODE);
+            ui.selectable_value(show, ShowMode::Surface, text::SHOW_SURFACE);
+            ui.selectable_value(show, ShowMode::Cloud, text::SHOW_CLOUD);
+            ui.selectable_value(show, ShowMode::Both, text::SHOW_BOTH);
+        });
+    });
 }
 
 /// How the 3D view draws. `has_rgb`: whether the loaded cloud has colours (offers the
@@ -229,10 +251,10 @@ fn view_settings_edit(ui: &mut Ui, view: &mut ViewSettings, has_rgb: bool) {
     });
 }
 
-/// The height cut: z min / z max over the cloud's z range, „Decke ausblenden“ (z max just
-/// below the estimated ceiling) and „Zurücksetzen“.
-fn cut_edit(ui: &mut Ui, cut: &mut Option<[f32; 2]>, cloud: &CloudSummary) {
-    let [lo, hi] = cloud.z_range;
+/// The height cut: z min / z max over `z_range` (of the cloud, or of the surface alone),
+/// „Decke ausblenden“ (z max just below the estimated `ceiling`) and „Zurücksetzen“.
+fn cut_edit(ui: &mut Ui, cut: &mut Option<[f32; 2]>, z_range: [f32; 2], ceiling: Option<f32>) {
+    let [lo, hi] = z_range;
     ui.strong(text::CUT).on_hover_text(text::CUT_HINT);
     let mut range = cut.unwrap_or([lo, hi]);
     let mut changed = false;
@@ -254,12 +276,9 @@ fn cut_edit(ui: &mut Ui, cut: &mut Option<[f32; 2]>, cloud: &CloudSummary) {
         *cut = Some(range);
     }
     ui.horizontal(|ui| {
-        let button = ui.add_enabled(
-            cloud.ceiling.is_some(),
-            egui::Button::new(text::HIDE_CEILING),
-        );
+        let button = ui.add_enabled(ceiling.is_some(), egui::Button::new(text::HIDE_CEILING));
         if button.clicked() {
-            if let Some(ceiling) = cloud.ceiling {
+            if let Some(ceiling) = ceiling {
                 *cut = Some(below_ceiling(range, ceiling, lo));
             }
         }

@@ -6,12 +6,13 @@ use super::correct::{Corrected, RunLoaded};
 use super::view3d::{point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
     actions, left, right, status, text, Action, AppState, CloudSummary, InspectResult, Selection,
-    UiMessage, ViewStats,
+    SurfaceSummary, UiMessage, ViewStats,
 };
 use crate::cloud::{load_cloud, LoadedCloud};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
 use crate::overlay::RunOverlay;
 use crate::project::{canonical, Project};
+use crate::surface::{load_glb, surface_glb};
 use crate::synthetic::synthetic_cloud;
 use driftless_io::progress::Progress;
 use driftless_steps::{correct, StepError};
@@ -130,6 +131,11 @@ pub struct DriftlessApp {
     /// What the loader is loading, and what to load once it has stopped.
     loading: Option<CloudSource>,
     next_load: Option<CloudSource>,
+    /// Loads surfaces, beside the cloud loader.
+    surface_loader: JobRunner,
+    /// The glb it is loading, and the one to load once a cancelled load has stopped.
+    surface_loading: Option<PathBuf>,
+    next_surface: Option<PathBuf>,
     /// The cloud shown; a new one replaces it only when it is ready.
     cloud: Option<LoadedCloud>,
     /// The run folder the cloud shown was loaded with.
@@ -165,7 +171,10 @@ impl DriftlessApp {
             helper: JobRunner::new(repaint.clone()),
             helper_queue: VecDeque::new(),
             helper_running: None,
-            loader: JobRunner::new(repaint),
+            loader: JobRunner::new(repaint.clone()),
+            surface_loader: JobRunner::new(repaint),
+            surface_loading: None,
+            next_surface: None,
             loading: None,
             next_load: None,
             cloud: None,
@@ -297,7 +306,7 @@ impl DriftlessApp {
         self.state.correct.corrections = Some(loaded.corrections);
         match loaded.overlay {
             Ok(mut o) => {
-                o.set_origin(self.cloud.as_ref().map(|c| c.tree.origin));
+                o.set_origin(self.view_origin());
                 self.overlay = Some(o);
                 self.compare_overlay();
             }
@@ -526,6 +535,84 @@ impl DriftlessApp {
         self.state.loading = self.loader.status();
     }
 
+    /// The origin the view draws in: the cloud's, else the surface's (`None`: the run's own).
+    fn view_origin(&self) -> Option<[f64; 3]> {
+        let surface = self.state.surface.as_ref().map(|s| s.origin);
+        self.cloud.as_ref().map(|c| c.tree.origin).or(surface)
+    }
+
+    /// Whether a surface is being loaded.
+    pub fn is_loading_surface(&self) -> bool {
+        self.surface_loader.is_busy() || self.next_surface.is_some()
+    }
+
+    /// Loads the surface at `path` (a `.glb` or a surface folder) in the background; it
+    /// replaces the surface shown once ready. A surface load that runs is cancelled.
+    fn load_surface(&mut self, path: &Path) {
+        let glb = surface_glb(path);
+        if self.surface_loader.is_busy() {
+            self.surface_loader.cancel();
+            self.next_surface = Some(glb);
+            return;
+        }
+        let job = glb.clone();
+        let started = self.surface_loader.start(text::LOAD_SURFACE, move |p| {
+            Ok(JobOutput::Surface(Box::new(load_glb(&job, p)?)))
+        });
+        match started {
+            Ok(()) => self.surface_loading = Some(glb),
+            Err(e) => self.error(e.to_string()),
+        }
+    }
+
+    /// Hands a loaded surface to the view.
+    fn tick_surface_loader(&mut self) {
+        if let Some(f) = self.surface_loader.poll() {
+            self.surface_finished(f);
+        }
+        if !self.surface_loader.is_busy() {
+            if let Some(next) = self.next_surface.take() {
+                self.load_surface(&next);
+            }
+        }
+        if self.state.loading.is_none() {
+            self.state.loading = self.surface_loader.status();
+        }
+    }
+
+    fn surface_finished(&mut self, f: JobFinished) {
+        let path = self.surface_loading.take().unwrap_or_default();
+        match f.result {
+            Ok(JobOutput::Surface(surface)) => {
+                let (triangles, pages) = (surface.triangles(), surface.pages.len());
+                self.info(text::surface_loaded(&path, triangles, pages, f.seconds));
+                let z_range = surface.bounds().map_or([0.0; 2], |(lo, hi)| [lo[2], hi[2]]);
+                self.state.surface = Some(SurfaceSummary {
+                    path,
+                    triangles,
+                    pages,
+                    origin: surface.origin,
+                    z_range,
+                });
+                if self.cloud.is_none() {
+                    // the surface's origin becomes the view's: the cut starts anew, the run
+                    // moves along
+                    self.state.view.cut = None;
+                    if let Some(o) = &mut self.overlay {
+                        o.set_origin(Some(surface.origin));
+                        self.overlay_version += 1;
+                    }
+                }
+                self.view.set_surface(Some(*surface));
+            }
+            Ok(_) => {}
+            // a cancel for the next load needs no message
+            Err(StepError::Cancelled) if self.next_surface.is_some() => {}
+            Err(StepError::Cancelled) => self.info(text::job_cancelled(&f.label)),
+            Err(e) => self.error(text::job_failed(&f.label, &text::step_error(&e))),
+        }
+    }
+
     /// Loads the cloud of `selection` if it is one, with the quality of its run.
     fn load_selected(&mut self) {
         if let Selection::Cloud(path) = &self.state.selection {
@@ -643,6 +730,7 @@ impl DriftlessApp {
             || self.helper.is_busy()
             || !self.helper_queue.is_empty()
             || self.is_loading()
+            || self.surface_loader.is_busy()
             || self.status_asked != self.state.tree_version
             || self.gaps_asked != self.state.tree_version
     }
@@ -781,6 +869,7 @@ impl DriftlessApp {
         self.state.log.drain(..over);
         self.state.job = self.jobs.status();
         self.tick_loader();
+        self.tick_surface_loader();
         self.sync_run();
         self.sync_compare();
         self.tick_helper();
@@ -934,11 +1023,23 @@ impl DriftlessApp {
                 }
             }
             Action::LoadCloud { path, run } => self.load(CloudSource::File { path, run }),
+            Action::PickOpenSurface => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title(text::DIALOG_OPEN_SURFACE)
+                    .add_filter("glTF", &["glb"])
+                    .pick_file()
+                {
+                    self.load_surface(&path);
+                }
+            }
+            Action::LoadSurface(path) => self.load_surface(&path),
             // the status bar shows the step if one runs, else the load
             Action::Cancel if self.jobs.is_busy() => self.jobs.cancel(),
             Action::Cancel => {
                 self.next_load = None;
                 self.loader.cancel();
+                self.next_surface = None;
+                self.surface_loader.cancel();
             }
             Action::DismissMessages => self.state.messages.clear(),
             step @ (Action::Inspect(_)
@@ -1061,6 +1162,9 @@ impl DriftlessApp {
                     {
                         actions.push(Action::PickAddScan);
                     }
+                    if ui.button(text::OPEN_SURFACE).clicked() {
+                        actions.push(Action::PickOpenSurface);
+                    }
                 });
             });
         });
@@ -1087,7 +1191,7 @@ impl DriftlessApp {
             avoid_submap,
             pick_places: self.state.correct.picking,
         });
-        let shown = self.cloud.is_some() || overlay.is_some();
+        let shown = self.cloud.is_some() || overlay.is_some() || self.view.has_surface();
         egui::CentralPanel::no_frame().show(ui, |ui| match (&self.render_state, shown) {
             (Some(rs), true) => {
                 event = self

@@ -31,6 +31,7 @@ use std::time::Instant;
 
 use crate::cloud::LoadedCloud;
 use crate::project::{MapDone, MapStatus, SlamDone};
+use crate::surface::LoadedSurface;
 use crate::ui::compare::{Comparison, MapComparison};
 use crate::ui::correct::{Corrected, RunLoaded};
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
@@ -47,6 +48,8 @@ pub enum JobOutput {
     Map(Box<MapDone>),
     /// A cloud with its levels of detail (loader runner).
     Cloud(Box<LoadedCloud>),
+    /// A surface with its pages (surface loader).
+    Surface(Box<LoadedSurface>),
     /// The status of every map folder of the tree (helper runner).
     MapStatus(Box<BTreeMap<PathBuf, MapStatus>>),
     /// The start↔end gaps of history states, by state folder (helper runner).

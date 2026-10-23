@@ -3,10 +3,10 @@
 
 use driftless_app::camera::{fly_motion, FlyKeys};
 use driftless_app::cloud::{LoadedCloud, PointSet};
-use driftless_app::render::{headless_device, ColorMode};
+use driftless_app::render::{headless_device, ColorMode, ShowMode};
 use driftless_app::ui::view3d::{
-    color_modes, effective_color_mode, fly_keys, is_click, point_info, target_size, view_bounds,
-    View3d,
+    color_modes, effective_color_mode, effective_show, fly_keys, is_click, point_info, target_size,
+    view_bounds, View3d,
 };
 use driftless_app::ui::{right, text, ViewSettings};
 use driftless_io::progress::Progress;
@@ -591,4 +591,15 @@ fn trajectory_alone_is_drawn_and_its_poses_clicked() {
     h.state_mut().3.show_trajectory = false;
     h.step();
     assert_eq!(click(&mut h), Some(ViewEvent::TrajectoryHidden));
+}
+
+#[test]
+fn show_mode_falls_back_to_what_is_there() {
+    use ShowMode::*;
+    for mode in [Surface, Cloud, Both] {
+        assert_eq!(effective_show(mode, false, true), Cloud, "no surface");
+        assert_eq!(effective_show(mode, true, false), Surface, "no cloud");
+        assert_eq!(effective_show(mode, true, true), mode);
+    }
+    assert_eq!(ViewSettings::default().show, Surface, "the surface first");
 }

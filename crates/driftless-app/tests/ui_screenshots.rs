@@ -237,3 +237,49 @@ fn ui_screenshots() {
     camera.pitch = -89f32.to_radians();
     shot(&mut h, &dir, "buero_vorher_nachher");
 }
+
+/// The surface of `$DRIFTLESS_SURFACE` (a `.glb` or a surface folder) alone, with the
+/// ceiling cut away, as `app_oberflaeche.png` in `$DRIFTLESS_SHOTS`. Run with
+///
+/// ```text
+/// DRIFTLESS_SHOTS=… DRIFTLESS_SURFACE=…/oberflaeche-001 cargo test -p driftless-app \
+///     --release --test ui_screenshots surface_screenshot -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "writes a picture; needs $DRIFTLESS_SHOTS, $DRIFTLESS_SURFACE and a GPU"]
+fn surface_screenshot() {
+    let (Some(dir), Some(surface)) = (
+        std::env::var_os("DRIFTLESS_SHOTS").map(PathBuf::from),
+        std::env::var_os("DRIFTLESS_SURFACE").map(PathBuf::from),
+    ) else {
+        eprintln!("DRIFTLESS_SHOTS oder DRIFTLESS_SURFACE nicht gesetzt, Test übersprungen");
+        return;
+    };
+    if headless_device().is_none() {
+        eprintln!("kein GPU-Adapter, Test übersprungen");
+        return;
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let rs = create_render_state(
+        default_wgpu_setup(),
+        egui_wgpu::RendererOptions::PREDICTABLE,
+    );
+    let mut app = DriftlessApp::new(Arc::new(|| {})).with_render_state(rs.clone());
+    app.apply(Action::LoadSurface(surface));
+    let mut h = harness(app, rs);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while h.state().is_loading_surface() {
+        h.step();
+        assert!(Instant::now() < deadline, "surface not loaded");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let summary = h.state().state().surface.clone().expect("surface loaded");
+    eprintln!("{summary:?}");
+    // looking in from above: the ceiling cut away
+    let [lo, hi] = summary.z_range;
+    h.state_mut().state_mut().view.cut = Some([lo, lo + (hi - lo) * 0.6]);
+    for _ in 0..3 {
+        h.step();
+    }
+    shot(&mut h, &dir, "app_oberflaeche");
+}

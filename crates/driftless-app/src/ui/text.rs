@@ -98,6 +98,13 @@ pub const VIEW_HELP_ORBIT: &str =
 pub const VIEW_HELP_FLY: &str =
     "W/A/S/D, Q/E: fliegen (Shift schneller) · rechte Taste: umsehen · Rad: vor/zurück · F: alles zeigen · Klick: Punkt";
 pub const LOAD_CLOUD: &str = "Wolke laden";
+pub const LOAD_SURFACE: &str = "Oberfläche laden";
+pub const OPEN_SURFACE: &str = "Oberfläche öffnen …";
+pub const DIALOG_OPEN_SURFACE: &str = "Oberfläche öffnen (oberflaeche.glb)";
+pub const SHOW_MODE: &str = "Anzeige";
+pub const SHOW_SURFACE: &str = "Oberfläche";
+pub const SHOW_CLOUD: &str = "Punktwolke";
+pub const SHOW_BOTH: &str = "beides";
 pub const SYNTHETIC_CLOUD: &str = "Testwolke";
 pub const PHASE_SYNTHETIC: &str = "Testwolke erzeugen";
 pub const POINT: &str = "Punkt";
@@ -419,6 +426,24 @@ pub fn bad_synthetic(value: Option<&str>) -> String {
         None => format!("--synthetic braucht eine Punktzahl; {USAGE}"),
         Some(v) => format!("--synthetic {v}: keine gültige Punktzahl; {USAGE}"),
     }
+}
+
+/// „Oberfläche geladen: oberflaeche-001/oberflaeche.glb (712.218 Dreiecke, 12 Seite(n),
+/// 3,4 s)“.
+pub fn surface_loaded(path: &std::path::Path, triangles: usize, pages: usize, s: f64) -> String {
+    let name: Vec<String> = path
+        .iter()
+        .rev()
+        .take(2)
+        .map(|c| c.to_string_lossy().into_owned())
+        .collect();
+    let name: Vec<&str> = name.iter().rev().map(String::as_str).collect();
+    format!(
+        "Oberfläche geladen: {} ({} Dreiecke, {pages} Seite(n), {} s)",
+        name.join("/"),
+        point_count(triangles),
+        decimal(s, 1)
+    )
 }
 
 /// „color.las geladen: 15,6 Mio. Punkte (Laden 4,1 s, Detailstufen 2,3 s)“.

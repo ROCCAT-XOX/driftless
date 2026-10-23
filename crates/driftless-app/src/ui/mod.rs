@@ -17,7 +17,7 @@ pub use app::{parse_args, Args, DriftlessApp};
 use crate::camera::CameraMode;
 use crate::jobs::JobStatus;
 use crate::project::{map_status, state_gap, MapStatus, Project, RunInfo, ScanState};
-use crate::render::ColorMode;
+use crate::render::{ColorMode, ShowMode};
 use driftless_io::progress::LogLine;
 use driftless_steps::inspect;
 use driftless_steps::map::MapSettings;
@@ -61,6 +61,10 @@ pub enum Action {
         path: PathBuf,
         run: Option<PathBuf>,
     },
+    /// Choose a surface (`oberflaeche.glb`) to show.
+    PickOpenSurface,
+    /// Show the surface of a `.glb`, or of the `oberflaeche.glb` in a folder.
+    LoadSurface(PathBuf),
     /// Check a scan (id).
     Inspect(String),
     /// A new SLAM run of the scan (id).
@@ -130,6 +134,8 @@ pub struct ViewSettings {
     /// Height cut: lowest and highest z drawn (relative to the cloud's origin); `None`
     /// draws everything. Reset when another cloud is shown.
     pub cut: Option<[f32; 2]>,
+    /// Surface, points or both, while a surface is loaded.
+    pub show: ShowMode,
 }
 
 impl Default for ViewSettings {
@@ -147,6 +153,7 @@ impl Default for ViewSettings {
             show_submaps: false,
             show_compare: true,
             cut: None,
+            show: ShowMode::Surface,
         }
     }
 }
@@ -163,6 +170,18 @@ pub struct CloudSummary {
     pub z_range: [f32; 2],
     /// A height just below the ceiling, if one was found.
     pub ceiling: Option<f32>,
+}
+
+/// The loaded surface, as the panels need it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceSummary {
+    pub path: PathBuf,
+    pub triangles: usize,
+    pub pages: usize,
+    /// The surface's origin (whole metres).
+    pub origin: [f64; 3],
+    /// Lowest and highest z relative to `origin` (the height cut while no cloud is shown).
+    pub z_range: [f32; 2],
 }
 
 /// The last frame of the 3D view.
@@ -226,6 +245,8 @@ pub struct AppState {
     pub history_gaps: BTreeMap<PathBuf, f64>,
     /// The cloud in the 3D view.
     pub cloud: Option<CloudSummary>,
+    /// The surface in the 3D view.
+    pub surface: Option<SurfaceSummary>,
     /// A cloud being loaded, as of this frame (the loader runs next to the steps).
     pub loading: Option<JobStatus>,
     /// The last frame of the 3D view.

@@ -1,13 +1,17 @@
 //! The GPU side of the 3D view: the point cloud as instanced quads, one vertex buffer per
-//! block of the octree, plus lines (screen-space quads of a width in points) and markers on
-//! top, drawn into an offscreen texture that the interface shows as an image.
+//! block of the octree, the textured surface ([`mesh`]) in the same depth buffer, plus lines
+//! (screen-space quads of a width in points) and markers on top, drawn into an offscreen
+//! texture that the interface shows as an image.
 //!
 //! Depth is reverse-Z (see [`crate::camera`]): cleared to 0, nearer is larger. wgpu is only
 //! used through `egui_wgpu::wgpu`, so that it is always the version egui renders with.
 
+pub mod mesh;
+
 use crate::lod::{Octree, PointVertex};
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::wgpu;
+use mesh::MeshRenderer;
 use std::ops::Range;
 
 /// Format of [`RenderTarget::depth`].
@@ -23,6 +27,18 @@ pub enum ColorMode {
     Intensity = 1,
     /// The submap quality, with the ramp of `driftless_steps::overlay::quality_color`.
     Quality = 2,
+}
+
+/// What the view draws: the surface, the cloud or both (in one depth buffer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShowMode {
+    /// „Oberfläche“: the textured surface only.
+    Surface,
+    /// „Punktwolke“: the points only.
+    #[default]
+    Cloud,
+    /// „beides“.
+    Both,
 }
 
 /// An end of a line segment, relative to [`Octree::origin`]; segments are pairs of them.
@@ -67,8 +83,10 @@ pub struct FrameParams {
     /// Whether the cloud carries submap qualities; without, [`ColorMode::Quality`] is gray.
     pub quality_known: bool,
     /// Height cut (relative z, inclusive): points outside are not drawn; markers always are.
-    /// [`NO_CUT`] draws everything.
+    /// [`NO_CUT`] draws everything. Cuts the surface too.
     pub z_range: [f32; 2],
+    /// Points, surface or both; the overlay is always drawn.
+    pub show: ShowMode,
 }
 
 /// A height cut that keeps every point.
@@ -604,6 +622,27 @@ impl PointRenderer {
         tree: &Octree,
         drawn: &[u32],
     ) -> wgpu::SubmissionIndex {
+        self.render_with(device, queue, target, frame, tree, drawn, None)
+    }
+
+    /// [`PointRenderer::render`], with the surface of `mesh` in the same pass and depth
+    /// buffer (before the points). [`FrameParams::show`] picks what is drawn: the points
+    /// unless [`ShowMode::Surface`], the surface unless [`ShowMode::Cloud`]. The same
+    /// contract holds for the uniforms of `mesh`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target: &RenderTarget,
+        frame: &FrameParams,
+        tree: &Octree,
+        drawn: &[u32],
+        mesh: Option<&MeshRenderer>,
+    ) -> wgpu::SubmissionIndex {
+        if let Some(mesh) = mesh {
+            mesh.prepare(queue, frame);
+        }
         queue.write_buffer(
             &self.cloud_uniforms,
             0,
@@ -626,7 +665,11 @@ impl PointRenderer {
             0,
             bytemuck::bytes_of(&Uniforms::new(frame, frame.line_scale, ColorMode::Rgb)),
         );
-        let draws = self.draws(tree, drawn);
+        let draws = if frame.show == ShowMode::Surface {
+            Vec::new()
+        } else {
+            self.draws(tree, drawn)
+        };
         // A free readback for the GPU time; without one this frame is not timed.
         let timer_slot = self
             .timer
@@ -666,6 +709,9 @@ impl PointRenderer {
                 multiview_mask: None,
             });
 
+            if let Some(mesh) = mesh {
+                mesh.render(&mut pass, frame);
+            }
             pass.set_pipeline(&self.points);
             pass.set_bind_group(0, &self.cloud_bind, &[]);
             let mut bound = None;
