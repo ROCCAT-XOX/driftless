@@ -237,3 +237,155 @@ fn ui_screenshots() {
     camera.pitch = -89f32.to_radians();
     shot(&mut h, &dir, "buero_vorher_nachher");
 }
+
+/// The surface of `$DRIFTLESS_SURFACE` (a `.glb` or a surface folder) alone, with the
+/// ceiling cut away, as `app_oberflaeche.png` in `$DRIFTLESS_SHOTS`. Run with
+///
+/// ```text
+/// DRIFTLESS_SHOTS=… DRIFTLESS_SURFACE=…/oberflaeche-001 cargo test -p driftless-app \
+///     --release --test ui_screenshots surface_screenshot -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "writes a picture; needs $DRIFTLESS_SHOTS, $DRIFTLESS_SURFACE and a GPU"]
+fn surface_screenshot() {
+    let (Some(dir), Some(surface)) = (
+        std::env::var_os("DRIFTLESS_SHOTS").map(PathBuf::from),
+        std::env::var_os("DRIFTLESS_SURFACE").map(PathBuf::from),
+    ) else {
+        eprintln!("DRIFTLESS_SHOTS oder DRIFTLESS_SURFACE nicht gesetzt, Test übersprungen");
+        return;
+    };
+    if headless_device().is_none() {
+        eprintln!("kein GPU-Adapter, Test übersprungen");
+        return;
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let rs = create_render_state(
+        default_wgpu_setup(),
+        egui_wgpu::RendererOptions::PREDICTABLE,
+    );
+    let mut app = DriftlessApp::new(Arc::new(|| {})).with_render_state(rs.clone());
+    app.apply(Action::LoadSurface(surface));
+    let mut h = harness(app, rs);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while h.state().is_loading_surface() {
+        h.step();
+        assert!(Instant::now() < deadline, "surface not loaded");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let summary = h.state().state().surface.clone().expect("surface loaded");
+    eprintln!("{summary:?}");
+    // looking in from above: the ceiling cut away
+    let [lo, hi] = summary.z_range;
+    h.state_mut().state_mut().view.cut = Some([lo, lo + (hi - lo) * 0.6]);
+    for _ in 0..3 {
+        h.step();
+    }
+    shot(&mut h, &dir, "app_oberflaeche");
+}
+
+/// The surfaces of a scan in a project, as `app_projekt_oberflaeche.png` in
+/// `$DRIFTLESS_SHOTS`: `$DRIFTLESS_SCAN` is a scan folder whose run `driftless/` (made with
+/// the CLI) holds a map and surfaces `oberflaeche…`. The project lives in `$DRIFTLESS_SHOTS`;
+/// nothing is written into the scan. Checks the tree (stale surfaces marked), the key `O` and
+/// the loading of a surface from the tree. Run with
+///
+/// ```text
+/// DRIFTLESS_SHOTS=… DRIFTLESS_SCAN=…/20261022133554 cargo test -p driftless-app --release \
+///     --test ui_screenshots project_surface_screenshot -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "writes a picture; needs $DRIFTLESS_SHOTS, $DRIFTLESS_SCAN and a GPU"]
+fn project_surface_screenshot() {
+    let (Some(dir), Some(scan)) = (
+        std::env::var_os("DRIFTLESS_SHOTS").map(PathBuf::from),
+        std::env::var_os("DRIFTLESS_SCAN").map(PathBuf::from),
+    ) else {
+        eprintln!("DRIFTLESS_SHOTS oder DRIFTLESS_SCAN nicht gesetzt, Test übersprungen");
+        return;
+    };
+    if headless_device().is_none() {
+        eprintln!("kein GPU-Adapter, Test übersprungen");
+        return;
+    }
+    let project_dir = dir.join("projekt-oberflaeche");
+    let _ = std::fs::remove_dir_all(&project_dir);
+    let mut project = Project::create(&project_dir, "Schwarzer Raum").unwrap();
+    let id = project.add_scan(&scan).unwrap();
+    project.add_run(&id, &scan.join("driftless")).unwrap();
+    project.save().unwrap();
+
+    let rs = create_render_state(
+        default_wgpu_setup(),
+        egui_wgpu::RendererOptions::PREDICTABLE,
+    );
+    let mut app = DriftlessApp::new(Arc::new(|| {})).with_render_state(rs.clone());
+    app.apply(Action::OpenProject(project_dir));
+    let mut h = harness(app, rs);
+    // the statuses of maps and surfaces come from the background
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while h.state().wants_repaint_while_busy() {
+        h.step();
+        assert!(Instant::now() < deadline, "statuses not read");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let maps: Vec<_> = h.state().state().scans[0]
+        .runs
+        .iter()
+        .flat_map(|r| r.maps.clone())
+        .collect();
+    let map = maps.first().expect("a map in the run");
+    for s in &map.surfaces {
+        eprintln!("{} veraltet: {} ({})", s.label, s.stale, s.dir.display());
+    }
+    let surface = map
+        .surfaces
+        .iter()
+        .rev()
+        .find(|s| s.label.ends_with("2cm"))
+        .or(map.surfaces.last())
+        .expect("a surface in the map")
+        .clone();
+    let label = if surface.stale {
+        text::surface_stale(&surface.label)
+    } else {
+        surface.label.clone()
+    };
+    // the cloud of the map first, then the surface from the tree
+    if let Some(cloud) = map.clouds.first() {
+        h.state_mut()
+            .apply(Action::Select(Selection::Cloud(cloud.clone())));
+        wait_loaded(&mut h);
+    }
+    h.get_by_label(&label).click();
+    h.step();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while h.state().is_loading_surface() || h.state().view().is_uploading_surface() {
+        h.step();
+        assert!(Instant::now() < deadline, "surface not loaded");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        h.state().state().selection,
+        Selection::Surface(surface.dir.clone())
+    );
+    let summary = h.state().state().surface.clone().expect("surface loaded");
+    eprintln!("{summary:?}");
+    // O: Oberfläche → Punktwolke → beides → Oberfläche
+    for _ in 0..3 {
+        h.key_press(egui::Key::O);
+        h.step();
+        eprintln!("Anzeige: {:?}", h.state().state().view.show);
+    }
+    // the cut is over the cloud while one is shown (its frame), else over the surface
+    let cloud = h.state().state().cloud.clone();
+    let [lo, hi] = cloud.as_ref().map_or(summary.z_range, |c| c.z_range);
+    let top = cloud
+        .and_then(|c| c.ceiling)
+        .unwrap_or(lo + (hi - lo) * 0.6);
+    h.state_mut().state_mut().view.cut = Some([lo, top]);
+    for _ in 0..3 {
+        h.step();
+    }
+    shot(&mut h, &dir, "app_projekt_oberflaeche");
+}

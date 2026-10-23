@@ -19,12 +19,17 @@ bytemuck = { version = "1.25", features = ["derive"] }
 # Times of the history in local time.
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 driftless-io = { path = "../driftless-io" }
+# The settings of the surface (`SurfaceConfig`).
+driftless-map = { path = "../driftless-map" }
 driftless-slam = { path = "../driftless-slam" }
 driftless-steps = { path = "../driftless-steps" }
 driftless-traj = { path = "../driftless-traj" }
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "accesskit", "persistence"] }
 # wgpu only through `egui_wgpu::wgpu`, so that both always agree.
 egui-wgpu = "0.36"
+# Reading the surface (`oberflaeche.glb`) and its JPEG pages.
+gltf = { version = "1.4.1", default-features = false, features = ["KHR_materials_unlit", "utils"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 las = "0.11"
 mimalloc = { version = "0.1", default-features = false }
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }
@@ -37,5 +42,4 @@ toml = "1"
 
 [dev-dependencies]
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
-driftless-map = { path = "../driftless-map" }
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }

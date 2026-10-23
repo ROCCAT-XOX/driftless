@@ -9,7 +9,8 @@ correctable by hand. Runs natively on **macOS (Apple Silicon)** and **Windows**.
 > before/after comparison and a history of states. Earlier: map in about 7 minutes with under 4 GB for a
 > 9.7-minute scan, thinner walls, window views removed (milestone 4), dense, cleaned and coloured map
 > (milestone 3), LiDAR-IMU odometry and SLAM with loop closure and manual corrections (milestone 2).
-> Results on real scans (German): [milestone 5](docs/ergebnisse/2026-10-22-meilenstein-5.md),
+> Results on real scans (German): [photo-like surface](docs/ergebnisse/2026-10-22-baustein-2.md),
+> [milestone 5](docs/ergebnisse/2026-10-22-meilenstein-5.md),
 > [milestone 4](docs/ergebnisse/2026-10-21-meilenstein-4.md),
 > [milestone 3](docs/ergebnisse/2026-10-21-meilenstein-3.md),
 > [milestone 2](docs/ergebnisse/2026-10-20-meilenstein-2.md).
@@ -49,6 +50,7 @@ Build with `cargo build --release`; the binaries are `driftless` (command line) 
 | `driftless slam <folder> -o <dir> --reuse` | Recomputes only the pose graph from `submaps.bin` with the current corrections (seconds instead of a full run) and rewrites all outputs; the previous `traj.tum` is kept as `traj.vorher.tum` (an older one is replaced) |
 | `driftless correct <dir> list` · `loop <a_s> <b_s> [--note TEXT]` · `disable <nr>` · `enable <nr>` | Manual corrections in `<dir>/corrections.toml`: list them, add a loop (the places at two times, seconds since scan start as in `slam.json`, are the same), switch entries off and on; entries are never removed |
 | `driftless map <folder> --slam <slam-out> [--step dense\|clean\|color\|all] [--no-ghosts] [--no-outliers] [--no-through] [--no-smooth] [--highlights] [--no-vignetting] [--voxel M] [--downscale 1\|2\|4]` | Map of a SLAM run, written into `<slam-out>`: dense cloud from the corrected `traj.tum` (`dense.las`), cleaned of ghosts, points measured through windows and outliers (`clean.las`, the removed points with their reason in `removed.las`; walls are projected onto their local plane, `dense.las` stays unsmoothed), coloured from the camera images (`color.las`, `color.ply`; points no camera saw are marked `user_data` 1 in the LAS; `color.ply` has a `colored` property, 1 = measured colour; `removed.las` carries the reason in `user_data`: 1 ghost, 2 outlier, 3 window), and `map.json` (settings, statistics, runtime per step, peak memory). The requested step always runs; the step before it is taken from `dense.bin` / `clean.bin` (full-precision intermediate results; LAS is export only) if they were written for the same input and settings, otherwise rebuilt. Outputs of earlier runs that no longer fit are never deleted, but warned about and listed under `stale` in `map.json`. Each cleaning and colour refinement can be switched off (`--no-through`, `--no-smooth`, `--no-vignetting` for the edge falloff of the cameras); `--highlights` additionally down-weights highlights but is experimental and off by default, because on a real scan it lowered floor reflections yet made the seams between images more visible. Quality figures (floor highlights, seam jump, edge-falloff residual, removed and smoothed points, wall thickness) are in `map.json` and on the console. Without `IMAGE_*.bag` or `calibration/calib.json`, `--step color` fails and `all` skips colouring with a warning |
+| `driftless surface <folder> --slam <slam-out> [--map <map-folder>] [-o <dir>] [--voxel M] [--no-texture]` | Photo-like surface of a map (default `<map-folder>` = `<slam-out>`): a TSDF of the cleaned points (`clean.bin`) becomes a closed, simplified mesh, textured from the camera images (one image per face, texture pages with seam levelling); writes `oberflaeche.glb` (glTF, unlit, Y up), `oberflaeche.obj` with `.mtl` and the page JPEGs (Z up) and `oberflaeche.json` (settings, face counts, mean and 95 % deviation to the points, seconds per phase, peak memory) into `-o` (default `<map-folder>/oberflaeche`), the JSON last. Needs a `clean.bin` that fits the trajectory and switches (run `driftless map` first), otherwise it stops with „Karte fehlt oder ist veraltet“. Without `IMAGE_*.bag` or `calibration/calib.json`, or with `--no-texture`, every face is gray (with a warning in the first case). `--voxel` (default 0.02 m) sets the fineness: smaller is finer, needs more memory and time, and at 0.01 m leaves dark walls full of holes. Holes in walls and floors with a rim up to 2 m are closed flat; rims of open pieces, pipe ends and windows stay open |
 | `driftless view <folder> --cloud <file.las>` | Shows a point cloud (e.g. `color.las`) in the viewer, with its colours or gray by intensity, evenly thinned to at most 5 million points |
 | `driftless export-glim <folder> -o <dir>` | Writes `imu.bin` and `lidar.bin` for the GLIM spike (`spikes/glim/`) |
 | `driftless compare <a.tum> <b.tum> [--json]` | Trajectory yardstick: ATE after alignment, path length, start-to-end gap |
@@ -69,6 +71,7 @@ driftless map <scan> --slam out              # dense, clean, colour → out/colo
 driftless map <scan> --slam out --step color --downscale 1   # recolour only, reuses clean.bin
 driftless map <scan> --slam out --no-smooth --no-through   # keep walls and window views as measured
 driftless map <scan> --slam out --voxel 0.02 # coarser cloud: about 1/3 of the memory, for long scans
+driftless surface <scan> --slam out           # needs clean.bin of a map run → out/oberflaeche/oberflaeche.glb
 driftless view <scan> --cloud out/color.las
 ```
 
@@ -80,13 +83,20 @@ Read the times for `correct loop` in the viewer on the timeline `ab_scan_beginn`
 `cargo build --release -p driftless-app`, then `target/release/driftless-app` (Windows:
 `driftless-app.exe`; every pull request also builds it as the CI artifact `driftless-app-windows`). The
 interface is German. It runs the same steps as the command line (`inspect`, `slam`, `slam --reuse`,
-`correct`, `map`, `compare`) through the shared crate `driftless-steps`, and writes the same files.
+`correct`, `map`, `surface`, `compare`) through the shared crate `driftless-steps`, and writes the same
+files.
 
 - **Project:** „Projekt → Neues Projekt …“ in an empty folder, then „Scan hinzufügen …“ (a scan folder
   as above). Runs made with the command line can be added with „Lauf hinzufügen …“.
 - **Steps** (right panel, for the selected scan, run or map): „Prüfen“, „SLAM rechnen“, „Neu rechnen
-  (aus Teilkarten)“, „Karte rechnen“ with the switches of `driftless map`. One step runs at a time, with
+  (aus Teilkarten)“, „Karte rechnen“ with the switches of `driftless map`, and for a map „Oberfläche
+  rechnen“ (voxel 1 / 1.5 / 2 cm, „ohne Fotos“ = `--no-texture`) into `karte-NNN/oberflaeche-NNN`; a
+  surface that already fits the map and settings is not computed again. One step runs at a time, with
   progress in the status bar; „Abbrechen“ leaves no half-written files.
+- **Surfaces:** listed under their map in the tree (also folders `oberflaeche…` made with
+  `driftless surface -o`); one that no longer fits its map is marked „veraltet – Karte oder Lauf neu
+  gerechnet“. A click loads it; „Projekt → Oberfläche öffnen …“ opens any `oberflaeche.glb`. The view
+  shows the surface first; „Anzeige: Oberfläche / Punktwolke / beides“ or the key `O` switches.
 - **3D view:** a map or cloud from the tree; colour, intensity or quality of the submap; orbit (left
   drag, wheel, F = show all) or fly (W/A/S/D, Q/E); click a point for its time, colour and quality; a
   height cut („Decke ausblenden“) to look into the rooms from above. A point budget (default 6 million)
@@ -107,6 +117,8 @@ Project folder:
                           slam-001/lauf.toml     scan and settings of the run
                           slam-001/verlauf/      states of the run
                           slam-001/karte-001/    a map of the run, one folder per set of switches
+                          slam-001/karte-001/oberflaeche-001/
+                                                 a surface of the map, one folder per set of settings
 ```
 
 Not yet: export (milestone 6), a cache for the levels of detail (they are rebuilt on every load), more

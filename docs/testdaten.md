@@ -47,6 +47,11 @@ $DRIFTLESS_TESTDATA/
       calibration/calib.json
       camera/camera_left/, camera/camera_right/
       thumbnail/                    Vorschaubilder des Scanners
+  jmk6-2026-10-22/
+    <JJJJMMTThhmmss>/               drei JMK6-Aufnahmen eines dunklen Raums (Aufbau wie oben),
+                                    als Verweise (Symlinks) auf die Rohdaten, keine Kopie
+      driftless/                    slam + map der Aufnahme; oberflaeche-b2*/ = `driftless surface`
+  ergebnisse-b2/                    Vergleichsbilder und Messprotokolle Baustein 2 (nicht im Repo)
 ```
 
 Zwei Aufnahmen liegen unter `jmk6-2026-10-20/`: `20261020143415` (63 s, ≈ 15 m) und
@@ -103,6 +108,21 @@ Lesen bricht dann mit „Operation timed out (os error 60)“ ab. Vorher herunte
 Die Dateien unter `Test/` stammen aus einem Testscan mit dem 3DMakerPro-Scanner. Die
 Referenzdateien (`trj.txt`, `smooth.las`) dienen nur zum Vergleich; Software
 des Scanner-Herstellers wird nicht ins Repository uebernommen.
+
+**`jmk6-2026-10-22/` („schwarzer Raum“):** drei Aufnahmen desselben dunklen Raums mit schwarz
+gestrichenen Wänden, Leuchtstäben an den Wänden, einem beleuchteten Notausgangsschild und einer Leiter.
+Wenig Licht, die Wände werfen wenig LiDAR zurück. Ohne Referenz.
+
+| Aufnahme | Dauer | Bilder (beide Kameras) |
+|---|---|---|
+| `20261022132520` | 252 s | 1.639 |
+| `20261022133028` | 264 s | 1.719 |
+| `20261022133554` | 345 s | 2.267 |
+
+`slam` und `map` liegen je Aufnahme unter `<aufnahme>/driftless/`, die Oberfläche unter
+`<aufnahme>/driftless/oberflaeche-b2/`. Der Test mit echten Daten für die Oberfläche
+(`crates/driftless-steps/tests/surface_real.rs`) liest diese Ausgaben (Schranken und Messwerte:
+`docs/ergebnisse/2026-10-22-baustein-2.md`).
 
 ## Programm (Meilenstein 5)
 

@@ -1,9 +1,10 @@
-//! The left panel: the project tree, project → scans → runs („SLAM 001“ …) → maps → clouds,
+//! The left panel: the project tree, project → scans → runs („SLAM 001“ …) → maps → clouds and
+//! surfaces („Oberfläche 001“, a stale one with „veraltet – Karte oder Lauf neu gerechnet“),
 //! and per run its history („Verlauf“: each state with number, kind, time and start↔end gap).
 //! Names too long for the panel end in „…“; the full name and the folder show on hover.
 
 use super::{text, Action, AppState, ScanNode, Selection};
-use crate::project::{MapInfo, RunInfo, ScanState};
+use crate::project::{MapInfo, RunInfo, ScanState, SurfaceInfo};
 use eframe::egui::{self, collapsing_header::CollapsingState, Id, Response, RichText, Ui};
 use std::path::Path;
 
@@ -125,12 +126,15 @@ fn map_node(ui: &mut Ui, state: &AppState, map: &MapInfo, action: &mut Option<Ac
         let hover = format!("{}\n{}", map.label, map.dir.display());
         entry(ui, selected, map.label.clone(), &hover)
     };
-    let header = if map.clouds.is_empty() {
+    let header = if map.clouds.is_empty() && map.surfaces.is_empty() {
         leaf(ui, header)
     } else {
         branch(ui, Id::new(("map", &map.dir)), header, |ui| {
             for cloud in &map.clouds {
                 cloud_leaf(ui, state, cloud, action);
+            }
+            for surface in &map.surfaces {
+                surface_leaf(ui, state, surface, action);
             }
         })
     };
@@ -150,6 +154,24 @@ fn cloud_leaf(ui: &mut Ui, state: &AppState, cloud: &Path, action: &mut Option<A
     });
     if r.clicked() {
         *action = Some(Action::Select(Selection::Cloud(cloud.to_path_buf())));
+    }
+}
+
+fn surface_leaf(ui: &mut Ui, state: &AppState, surface: &SurfaceInfo, action: &mut Option<Action>) {
+    let selected = state.selection == Selection::Surface(surface.dir.clone());
+    let r = leaf(ui, |ui| {
+        if surface.stale {
+            let name = text::surface_stale(&surface.label);
+            let hover = format!("{name}\n{}", surface.dir.display());
+            let warn = ui.visuals().warn_fg_color;
+            entry(ui, selected, RichText::new(name).color(warn), &hover)
+        } else {
+            let hover = format!("{}\n{}", surface.label, surface.dir.display());
+            entry(ui, selected, surface.label.clone(), &hover)
+        }
+    });
+    if r.clicked() {
+        *action = Some(Action::Select(Selection::Surface(surface.dir.clone())));
     }
 }
 

@@ -3,7 +3,9 @@
 //!
 //! A scan offers „Prüfen“ and „SLAM rechnen“ (a new run with the SLAM settings shown here);
 //! a run, or a map, cloud or state of it, offers „Neu rechnen (aus Teilkarten)“ and „Karte
-//! rechnen“ (with the map settings, every switch of `driftless map`). Every step button is
+//! rechnen“ (with the map settings, every switch of `driftless map`); a map, or a surface of it,
+//! also „Oberfläche rechnen“ (voxel size and „ohne Fotos“ of `driftless surface`). Every step
+//! button is
 //! locked while a step runs and while the scan cannot be read; selecting and viewing stay
 //! possible.
 //!
@@ -14,10 +16,10 @@
 use super::status::count;
 use super::view3d::{color_modes, effective_color_mode, PointInfo};
 use super::{compare, correct};
-use super::{text, Action, AppState, CloudSummary, ScanNode, Selection, ViewSettings};
+use super::{text, Action, AppState, ScanNode, Selection, ViewSettings};
 use crate::camera::CameraMode;
-use crate::project::{MapInfo, RunInfo, ScanState};
-use crate::render::ColorMode;
+use crate::project::{MapInfo, RunInfo, ScanState, SurfaceInfo, SurfaceSettings};
+use crate::render::{ColorMode, ShowMode};
 use driftless_steps::history::HistoryKind;
 use driftless_steps::map::{MapSettings, MapStep};
 use driftless_steps::slam::SlamSettings;
@@ -36,6 +38,8 @@ enum StepState {
     Done(Option<f64>),
     /// There is a result, but it no longer fits the run.
     Stale,
+    /// There is a surface, but it no longer fits its map.
+    StaleSurface,
 }
 
 /// What the steps act on.
@@ -59,10 +63,7 @@ fn target(state: &AppState) -> Target {
     let Some((scan, run)) = state.selected_run() else {
         return Target::None;
     };
-    let map = match &state.selection {
-        Selection::Map(dir) => run.maps.iter().find(|m| m.dir == *dir).cloned(),
-        _ => None,
-    };
+    let map = state.selected_map().cloned();
     Target::Run {
         scan: scan.clone(),
         run: Box::new(run.clone()),
@@ -133,6 +134,8 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
                     if let Some(map) = map {
                         ui.separator();
                         map_switches_shown(ui, map, &mut state.map_settings);
+                        ui.separator();
+                        surface_settings_edit(ui, &mut state.surface_settings);
                     }
                     ui.separator();
                     map_settings_edit(ui, &mut state.map_settings, scan.no_color.as_deref());
@@ -153,25 +156,46 @@ fn section(ui: &mut Ui, title: &str, body: impl FnOnce(&mut Ui)) {
 /// How the 3D view draws, the height cut, the numbers of the last frame and the point
 /// clicked in it.
 fn view_section(ui: &mut Ui, state: &mut AppState) {
+    if state.surface.is_some() {
+        show_mode_edit(ui, &mut state.view.show, state.cloud.is_some());
+    }
     let has_rgb = state.cloud.as_ref().is_none_or(|c| c.has_rgb);
     view_settings_edit(ui, &mut state.view, has_rgb);
     if state.cloud.as_ref().is_some_and(|c| !c.quality_known) {
         ui.weak(text::QUALITY_NONE_HINT);
     }
-    if let Some(cloud) = &state.cloud {
-        cut_edit(ui, &mut state.view.cut, cloud);
+    // the cut over the cloud, else over the surface alone
+    let cut_over = match (&state.cloud, &state.surface) {
+        (Some(c), _) => Some((c.z_range, c.ceiling)),
+        (None, Some(s)) => Some((s.z_range, None)),
+        (None, None) => None,
+    };
+    if let Some((z_range, ceiling)) = cut_over {
+        cut_edit(ui, &mut state.view.cut, z_range, ceiling);
     }
     if let Some(stats) = &state.view_stats {
-        ui.label(text::drawn_stats(
-            stats.drawn,
-            stats.total,
-            stats.frame_ms,
-            stats.gpu,
-        ));
+        ui.label(match stats.triangles {
+            Some(triangles) => text::surface_stats(triangles, stats.frame_ms, stats.gpu),
+            None => text::drawn_stats(stats.drawn, stats.total, stats.frame_ms, stats.gpu),
+        });
     }
     ui.weak(text::FRAME_ALL_HINT);
     ui.separator();
     point_shown(ui, state.picked.as_ref());
+}
+
+/// „Anzeige: Oberfläche / Punktwolke / beides“; without a cloud only the surface can be
+/// shown, so the switch is off.
+fn show_mode_edit(ui: &mut Ui, show: &mut ShowMode, has_cloud: bool) {
+    ui.add_enabled_ui(has_cloud, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(text::SHOW_MODE)
+                .on_hover_text(text::SHOW_MODE_KEY_HINT);
+            ui.selectable_value(show, ShowMode::Surface, text::SHOW_SURFACE);
+            ui.selectable_value(show, ShowMode::Cloud, text::SHOW_CLOUD);
+            ui.selectable_value(show, ShowMode::Both, text::SHOW_BOTH);
+        });
+    });
 }
 
 /// How the 3D view draws. `has_rgb`: whether the loaded cloud has colours (offers the
@@ -229,10 +253,10 @@ fn view_settings_edit(ui: &mut Ui, view: &mut ViewSettings, has_rgb: bool) {
     });
 }
 
-/// The height cut: z min / z max over the cloud's z range, „Decke ausblenden“ (z max just
-/// below the estimated ceiling) and „Zurücksetzen“.
-fn cut_edit(ui: &mut Ui, cut: &mut Option<[f32; 2]>, cloud: &CloudSummary) {
-    let [lo, hi] = cloud.z_range;
+/// The height cut: z min / z max over `z_range` (of the cloud, or of the surface alone),
+/// „Decke ausblenden“ (z max just below the estimated `ceiling`) and „Zurücksetzen“.
+fn cut_edit(ui: &mut Ui, cut: &mut Option<[f32; 2]>, z_range: [f32; 2], ceiling: Option<f32>) {
+    let [lo, hi] = z_range;
     ui.strong(text::CUT).on_hover_text(text::CUT_HINT);
     let mut range = cut.unwrap_or([lo, hi]);
     let mut changed = false;
@@ -254,12 +278,9 @@ fn cut_edit(ui: &mut Ui, cut: &mut Option<[f32; 2]>, cloud: &CloudSummary) {
         *cut = Some(range);
     }
     ui.horizontal(|ui| {
-        let button = ui.add_enabled(
-            cloud.ceiling.is_some(),
-            egui::Button::new(text::HIDE_CEILING),
-        );
+        let button = ui.add_enabled(ceiling.is_some(), egui::Button::new(text::HIDE_CEILING));
         if button.clicked() {
-            if let Some(ceiling) = cloud.ceiling {
+            if let Some(ceiling) = ceiling {
                 *cut = Some(below_ceiling(range, ceiling, lo));
             }
         }
@@ -406,15 +427,63 @@ fn run_steps(
         .map(|e| e.to_string())
         .or(no_color);
     let mapped = map_state(state, run, &state.map_settings);
-    if step_row(ui, text::STEP_MAP, blocked.or(invalid), mapped) {
+    if step_row(ui, text::STEP_MAP, blocked.clone().or(invalid), mapped) {
         *action = Some(Action::RunMap(run.dir.clone()));
     }
-    if let Some(map) = map {
-        ui.horizontal(|ui| {
-            ui.label(text::THIS_MAP);
-            state_label(ui, own_map_state(state, map));
+    let Some(map) = map else {
+        return;
+    };
+    ui.horizontal(|ui| {
+        ui.label(text::THIS_MAP);
+        state_label(ui, own_map_state(state, map));
+    });
+    let settings = &state.surface_settings;
+    let invalid = settings
+        .config
+        .check()
+        .err()
+        .map(|e| e.to_string())
+        .or_else(|| {
+            map.settings
+                .is_none()
+                .then(|| text::SURFACE_NEEDS_MAP.to_string())
         });
+    let surfaced = surface_state(state, map, settings);
+    if step_row(ui, text::STEP_SURFACE, blocked.or(invalid), surfaced) {
+        *action = Some(Action::RunSurface(map.dir.clone()));
     }
+    if let Selection::Surface(dir) = &state.selection {
+        if let Some(surface) = map.surfaces.iter().find(|s| s.dir == *dir) {
+            ui.horizontal(|ui| {
+                ui.label(text::THIS_SURFACE);
+                state_label(ui, own_surface_state(state, surface));
+            });
+        }
+    }
+}
+
+/// The state of a surface of `map` with `settings`: done if one made with them still fits,
+/// stale if all such ones no longer fit.
+fn surface_state(state: &AppState, map: &MapInfo, settings: &SurfaceSettings) -> StepState {
+    let mut same = map
+        .surfaces
+        .iter()
+        .rev()
+        .filter(|s| s.settings.as_ref() == Some(settings))
+        .peekable();
+    if same.peek().is_none() {
+        return StepState::NotComputed;
+    }
+    same.map(|s| own_surface_state(state, s))
+        .find(|s| *s != StepState::StaleSurface)
+        .unwrap_or(StepState::StaleSurface)
+}
+
+fn own_surface_state(state: &AppState, surface: &SurfaceInfo) -> StepState {
+    if surface.stale {
+        return StepState::StaleSurface;
+    }
+    StepState::Done(state.map_status.get(&surface.dir).and_then(|s| s.seconds))
 }
 
 /// The state of a map of `run` with `settings`: done if a folder with these switches still
@@ -462,9 +531,13 @@ fn state_label(ui: &mut Ui, state: StepState) {
         StepState::NotComputed => ui.weak(text::NOT_COMPUTED),
         StepState::NotReused => ui.weak(text::NOT_REUSED),
         StepState::Done(seconds) => ui.label(text::step_done(seconds)),
-        StepState::Stale => {
+        StepState::Stale | StepState::StaleSurface => {
             let warn = ui.visuals().warn_fg_color;
-            ui.label(RichText::new(text::STALE).color(warn))
+            let what = match state {
+                StepState::Stale => text::STALE,
+                _ => text::SURFACE_STALE,
+            };
+            ui.label(RichText::new(what).color(warn))
         }
     };
 }
@@ -556,6 +629,26 @@ fn map_switches_shown(ui: &mut Ui, map: &MapInfo, settings: &mut MapSettings) {
     ui.label(text::downscale_value(s.downscale));
     if ui.button(text::USE_AS_TEMPLATE).clicked() {
         settings.switches = s.clone();
+    }
+}
+
+/// The settings of the next surface: the voxel size (1, 1,5 or 2 cm) and „ohne Fotos“.
+fn surface_settings_edit(ui: &mut Ui, settings: &mut SurfaceSettings) {
+    ui.strong(text::SURFACE_SETTINGS);
+    ui.weak(text::SURFACE_SETTINGS_HINT);
+    ui.horizontal(|ui| {
+        ui.label(text::SURFACE_VOXEL)
+            .on_hover_text(text::SURFACE_VOXEL_HINT);
+        for (voxel, label) in text::SURFACE_VOXEL_CHOICES {
+            ui.selectable_value(&mut settings.config.voxel, voxel, label);
+        }
+    });
+    let mut no_photos = !settings.texture;
+    if ui
+        .checkbox(&mut no_photos, text::SURFACE_NO_PHOTOS)
+        .changed()
+    {
+        settings.texture = !no_photos;
     }
 }
 

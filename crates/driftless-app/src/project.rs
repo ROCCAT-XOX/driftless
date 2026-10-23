@@ -6,6 +6,7 @@
 //!                          slam-001/lauf.toml  scan and settings of the run
 //!                          slam-001/verlauf/   states of the run (driftless_steps::history)
 //!                          slam-001/karte-001/ a map of the run, one folder per set of switches
+//!                karte-001/oberflaeche-001/    a surface of the map (`driftless surface -o`)
 //! ```
 //!
 //! `project.toml`:
@@ -32,12 +33,17 @@
 //! Folders for results are only created by the jobs ([`run_slam_job`], [`run_map_job`]), never
 //! on the UI thread, and a job removes a folder it created when it is cancelled or fails. A
 //! full SLAM run always gets a new `slam-NNN` (so no earlier `traj.tum` is replaced), and a map
-//! is written only into a `karte-NNN` whose `map.json` fits the request, or into a new one.
+//! is written only into a `karte-NNN` whose `map.json` fits the request, or into a new one. A
+//! surface is only computed if no `oberflaeche-NNN` of the map fits the request, and then into a
+//! new one ([`run_surface_job`]).
 
+use crate::surface::SURFACE_GLB;
+use crate::ui::text;
 use driftless_io::atomic_write;
 use driftless_io::bag::BagReader;
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
+use driftless_map::surface::SurfaceConfig;
 use driftless_steps::correct::utc_now;
 use driftless_steps::history::{self, HistoryEntry};
 use driftless_steps::map::{
@@ -47,6 +53,7 @@ use driftless_steps::map::{
 use driftless_steps::slam::{
     cache_fits, run_slam, SlamOutcome, SlamRequest, SlamSettings, CACHE_FILE, CORRECTIONS_FILE,
 };
+use driftless_steps::surface::{run_surface, surface_fits, SurfaceRequest, SURFACE_REPORT};
 use driftless_steps::StepError;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -60,6 +67,9 @@ pub const SCANS_DIR: &str = "scans";
 const FORMAT: i64 = 1;
 const RUN_PREFIX: &str = "slam-";
 const MAP_PREFIX: &str = "karte-";
+/// Surfaces of a map: `oberflaeche-NNN` made here, other `oberflaeche…` folders by the CLI.
+const SURFACE_PREFIX: &str = "oberflaeche";
+const SURFACE_NUMBERED: &str = "oberflaeche-";
 /// The clouds of a map folder that can be shown, best first.
 const MAP_CLOUDS: [&str; 4] = ["color.las", "clean.las", "dense.las", "removed.las"];
 /// How far (s) a run's frames may lie outside the bag times of its scan: frame stamps come
@@ -147,6 +157,80 @@ pub struct MapInfo {
     pub settings: Option<MapSwitches>,
     /// The existing ones of `color.las`, `clean.las`, `dense.las`, `removed.las`, in this order.
     pub clouds: Vec<PathBuf>,
+    /// The surfaces of the map: its subfolders `oberflaeche…` with an `oberflaeche.glb`.
+    pub surfaces: Vec<SurfaceInfo>,
+}
+
+/// A surface folder of a map.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceInfo {
+    pub dir: PathBuf,
+    /// „Oberfläche 001“ for `oberflaeche-001`, else the folder name.
+    pub label: String,
+    /// It no longer fits its map (the map or the run was computed anew since). False until
+    /// the background check said so ([`surface_status`], `AppState::map_status`).
+    pub stale: bool,
+    /// What it was made with, from its `oberflaeche.json` ([`SurfaceSettings::from_report`]);
+    /// `None` without a readable one.
+    pub settings: Option<SurfaceSettings>,
+}
+
+/// What the next surface is computed with: the settings of `driftless surface` (the program
+/// offers the voxel size and „ohne Fotos“; the rest are the defaults).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceSettings {
+    pub config: SurfaceConfig,
+    /// Texture from the camera images (`false` = `--no-texture`: gray).
+    pub texture: bool,
+}
+
+impl Default for SurfaceSettings {
+    fn default() -> Self {
+        SurfaceSettings {
+            config: SurfaceConfig::default(),
+            texture: true,
+        }
+    }
+}
+
+impl SurfaceSettings {
+    /// The settings recorded under `settings` in an `oberflaeche.json`. The report does not
+    /// hold every camera setting; those take the defaults, which is what the program and
+    /// `driftless surface` always use. `None` if a value is missing or of the wrong type.
+    pub fn from_report(report: &serde_json::Value) -> Option<SurfaceSettings> {
+        let s = &report["settings"];
+        let f64_of = |v: &serde_json::Value| v.as_f64();
+        let u64_of = |v: &serde_json::Value| v.as_u64();
+        let c = &s["color"];
+        let defaults = SurfaceConfig::default();
+        let config = SurfaceConfig {
+            voxel: f64_of(&s["voxel"])?,
+            truncation_voxels: f64_of(&s["truncation_voxels"])? as f32,
+            min_weight: u64_of(&s["min_weight"])?.try_into().ok()?,
+            min_component_faces: u64_of(&s["min_component_faces"])?.try_into().ok()?,
+            max_hole_perimeter: f64_of(&s["max_hole_perimeter"])?,
+            simplify_error: f64_of(&s["simplify_error"])?,
+            max_edge: f64_of(&s["max_edge"])?,
+            min_texel: f64_of(&s["min_texel"])?,
+            page_size: u64_of(&s["page_size"])?.try_into().ok()?,
+            views_per_face: u64_of(&s["views_per_face"])?.try_into().ok()?,
+            smooth_weight: f64_of(&s["smooth_weight"])? as f32,
+            jpeg_quality: u64_of(&s["jpeg_quality"])?.try_into().ok()?,
+            color: driftless_map::ColorConfig {
+                downscale: u64_of(&c["downscale"])?.try_into().ok()?,
+                highlights: c["highlights"].as_bool()?,
+                max_dist: f64_of(&c["max_dist"])?,
+                depth_tolerance: f64_of(&c["depth_tolerance"])?,
+                min_sharpness: f64_of(&c["min_sharpness"])?,
+                view_gap: f64_of(&c["view_gap"])?,
+                ..defaults.color
+            },
+        };
+        Some(SurfaceSettings {
+            config,
+            texture: s["texture"].as_bool()?,
+        })
+    }
 }
 
 /// What a map folder holds, for the step list: read from its `map.json`.
@@ -410,6 +494,51 @@ fn create_numbered(dir: &Path, prefix: &str) -> Result<StepDir, ProjectError> {
     }
 }
 
+/// The surfaces in the map folder `dir`: `oberflaeche-NNN` by number, then other folders
+/// `oberflaeche…` (made with `driftless surface -o`) by name; only those with a glb.
+fn surfaces_of(dir: &Path) -> Vec<SurfaceInfo> {
+    let numbered = numbered(dir, SURFACE_NUMBERED);
+    let mut others: Vec<PathBuf> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(SURFACE_PREFIX))
+                && !numbered.iter().any(|(_, _, d)| d == p)
+        })
+        .collect();
+    others.sort();
+    let labelled = numbered
+        .into_iter()
+        .map(|(_, digits, path)| (text::surface_label(&digits), path))
+        .chain(others.into_iter().map(|p| {
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            (name, p)
+        }));
+    labelled
+        .filter(|(_, p)| p.join(SURFACE_GLB).is_file())
+        .map(|(label, dir)| {
+            let settings = fs::read_to_string(dir.join(SURFACE_REPORT))
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| SurfaceSettings::from_report(&v));
+            SurfaceInfo {
+                label,
+                stale: false,
+                settings,
+                dir,
+            }
+        })
+        .collect()
+}
+
 fn map_info(dir: &Path, label: String) -> MapInfo {
     let settings = fs::read_to_string(dir.join(REPORT))
         .ok()
@@ -424,6 +553,7 @@ fn map_info(dir: &Path, label: String) -> MapInfo {
             .map(|f| dir.join(f))
             .filter(|p| p.is_file())
             .collect(),
+        surfaces: surfaces_of(dir),
     }
 }
 
@@ -1038,6 +1168,117 @@ pub fn run_map_job(
     Ok(MapDone {
         dir: dir.keep(),
         report,
+    })
+}
+
+/// Creates the next `oberflaeche-NNN` in the map folder `map_dir`. For a job: the folder goes
+/// again when the guard is dropped without [`StepDir::keep`].
+pub fn new_surface_dir(map_dir: &Path) -> Result<StepDir, ProjectError> {
+    create_numbered(map_dir, SURFACE_NUMBERED)
+}
+
+/// The request of a surface of `map` of `run` with `settings` into `out_dir`: the map as it
+/// was made (its switches from `map.json`), the run with its settings.
+fn surface_request(
+    scan: &Path,
+    run: &RunInfo,
+    map: &MapInfo,
+    settings: &SurfaceSettings,
+    out_dir: &Path,
+) -> Result<SurfaceRequest, StepError> {
+    let switches = map.settings.clone().ok_or(text::SURFACE_NEEDS_MAP)?;
+    Ok(SurfaceRequest {
+        map: MapInput {
+            scan: scan.to_path_buf(),
+            slam_dir: run.dir.clone(),
+            slam: run.settings.clone(),
+            map: MapSettings {
+                step: MapStep::All,
+                switches,
+            },
+        },
+        map_dir: map.dir.clone(),
+        out_dir: out_dir.to_path_buf(),
+        config: settings.config.clone(),
+        texture: settings.texture,
+    })
+}
+
+/// The status of `surface` of `map` of `run`, made from the scan folder `scan`: its runtime
+/// (`seconds_total` of `oberflaeche.json`), and stale if it no longer fits the map
+/// ([`surface_fits`]: the map, the run, the images or the program changed since). A report
+/// whose settings cannot be read in full was written by an earlier version of the program and
+/// is stale too, and so is a folder without a report (the step writes it last: it was
+/// stopped before, or the folder was copied incompletely). Reads the lists of bags, the
+/// calibration, `traj.tum` and the head of `clean.bin`: call it off the UI thread. A surface
+/// with a report whose scan cannot be read is never stale (that cannot be told).
+pub fn surface_status(
+    scan: &Path,
+    run: &RunInfo,
+    map: &MapInfo,
+    surface: &SurfaceInfo,
+) -> MapStatus {
+    let report = fs::read_to_string(surface.dir.join(SURFACE_REPORT))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+    let seconds = report.as_ref().and_then(|v| v["seconds_total"].as_f64());
+    let stale = report.is_none()
+        || (discover_project(scan).is_ok()
+            && surface.settings.as_ref().is_none_or(|settings| {
+                surface_request(scan, run, map, settings, &surface.dir)
+                    .is_ok_and(|req| !surface_fits(&req))
+            }));
+    MapStatus { seconds, stale }
+}
+
+#[derive(Clone, Debug)]
+pub struct SurfaceDone {
+    pub dir: PathBuf,
+    /// The `oberflaeche.json` of the surface.
+    pub report: serde_json::Value,
+    /// A surface of the map already fitted the request: nothing was computed.
+    pub reused: bool,
+}
+
+/// Makes a surface of `map` of `run` (from the scan folder `scan`) with `settings`, as
+/// `driftless surface` does: if an `oberflaeche-NNN` of the map already fits, that one is
+/// kept and nothing is computed; else into a new `oberflaeche-NNN`, which is removed again if
+/// the step is cancelled or fails. Refused like a map for a run without `lauf.toml` whose
+/// cache needs other than the default settings, and for a map without `map.json`.
+pub fn run_surface_job(
+    run: &RunInfo,
+    scan: &Path,
+    map: &MapInfo,
+    settings: &SurfaceSettings,
+    progress: &Progress,
+) -> Result<SurfaceDone, StepError> {
+    settings.config.check()?;
+    map_refusal(run, scan)?;
+    for (_, _, dir) in numbered(&map.dir, SURFACE_NUMBERED).iter().rev() {
+        let req = surface_request(scan, run, map, settings, dir)?;
+        if surface_fits(&req) {
+            progress.info(text::surface_fits(dir));
+            let report = fs::read_to_string(dir.join(SURFACE_REPORT))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default();
+            return Ok(SurfaceDone {
+                dir: dir.clone(),
+                report,
+                reused: true,
+            });
+        }
+        if progress.is_cancelled() {
+            return Err(StepError::Cancelled);
+        }
+    }
+    let dir = new_surface_dir(&map.dir)?;
+    let req = surface_request(scan, run, map, settings, dir.path())?;
+    let report = run_surface(&req, progress)?;
+    Ok(SurfaceDone {
+        dir: dir.keep(),
+        report,
+        reused: false,
     })
 }
 

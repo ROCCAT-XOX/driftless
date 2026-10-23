@@ -10,6 +10,10 @@
 //! [`write_las`] and [`write_ply`] write the [`Cloud`]; [`save_stage`] and [`load_stage`] keep
 //! it between the steps at full precision.
 
+// The colouring tests' scene helpers (`tests/common`) name the crate; unit tests reuse them.
+#[cfg(test)]
+extern crate self as driftless_map;
+
 mod clean;
 mod cloud;
 mod color;
@@ -19,6 +23,7 @@ mod exposure;
 mod sharpness;
 mod smooth;
 mod stage;
+pub mod surface;
 mod through;
 pub mod visibility;
 
