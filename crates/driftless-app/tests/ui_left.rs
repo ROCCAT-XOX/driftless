@@ -1,5 +1,5 @@
-//! The project tree in the field „Daten“, without a window: what it shows and which actions
-//! its entries return.
+//! The scans in the field „Daten“ with their runs and maps below the selected one, without a
+//! window: what they show and which actions their entries return.
 
 use driftless_app::project::{MapInfo, Project, RunInfo, ScanEntry, ScanState};
 use driftless_app::ui::{steps, text, Action, AppState, ScanNode, Selection};
@@ -23,8 +23,17 @@ fn run(dir: &str, label: &str, maps: Vec<MapInfo>) -> RunInfo {
     }
 }
 
-/// A project „Halle“ with the scan „buero“: SLAM 001 with Karte 001 (color.las), SLAM 002.
+/// A project „Halle“ with the scan „buero“: SLAM 001 with Karte 001 (color.las), SLAM 002;
+/// the scan is selected, so its runs unfold below its card.
 fn state() -> AppState {
+    AppState {
+        selection: Selection::Scan("buero".into()),
+        ..unselected()
+    }
+}
+
+/// [`state`] with nothing selected.
+fn unselected() -> AppState {
     let map = MapInfo {
         dir: PathBuf::from("/p/scans/buero/slam-001/karte-001"),
         label: "Karte 001".into(),
@@ -79,7 +88,7 @@ fn left_shows_scans_runs_maps() {
     let mut h = harness(state());
     h.run();
     h.get_by_label(text::STEP_DATA);
-    h.get_by_label("Halle");
+    h.get_by_label(&text::project_line("Halle", 1));
     let order = ["buero", "SLAM 001", "Karte 001", "color.las", "SLAM 002"];
     let tops: Vec<f32> = order.iter().map(|l| top(&h, l)).collect();
     assert!(
@@ -88,6 +97,12 @@ fn left_shows_scans_runs_maps() {
     );
     h.get_by_label(text::ADD_SCAN);
     h.get_by_label(text::ADD_RUN);
+    // without a selection only the scan's card shows
+    let mut h = harness(unselected());
+    h.run();
+    h.get_by_label("buero");
+    assert!(h.query_by_label("SLAM 001").is_none());
+    assert!(h.query_by_label(text::ADD_RUN).is_none());
 }
 
 #[test]
@@ -110,6 +125,12 @@ fn clicking_run_selects_it() {
             "/p/scans/buero/slam-001/karte-001/color.las"
         ))))
     );
+    // the selected scan's card again: nothing selected
+    h.get_by_label("buero").click();
+    h.run();
+    assert_eq!(h.state().1, Some(Action::Select(Selection::None)));
+    let mut h = harness(unselected());
+    h.run();
     h.get_by_label("buero").click();
     h.run();
     assert_eq!(

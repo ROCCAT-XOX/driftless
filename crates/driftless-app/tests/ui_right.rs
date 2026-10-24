@@ -5,7 +5,7 @@
 use driftless_app::jobs::JobStatus;
 use driftless_app::project::{MapInfo, MapStatus, Project, RunInfo, ScanEntry, ScanState};
 use driftless_app::ui::{
-    settings, steps, text, Action, AppState, InspectResult, ScanNode, Selection,
+    settings, steps, steps::daten, text, Action, AppState, InspectResult, ScanNode, Selection,
 };
 use driftless_io::progress::ProgressSnapshot;
 use driftless_steps::history::{HistoryEntry, HistoryKind};
@@ -95,6 +95,8 @@ fn harness(state: AppState) -> H {
             (state, None),
         );
     h.ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.0);
+    // the steps, settings and corrections lie under „Erweitert“
+    daten::set_advanced(&h.ctx, true);
     h.run();
     h
 }

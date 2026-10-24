@@ -77,6 +77,8 @@ fn harness(app: DriftlessApp) -> H {
     let mut h = Harness::builder()
         .with_size([1400.0, 1800.0])
         .build_ui_state(|ui, app: &mut DriftlessApp| app.show(ui), app);
+    // the corrections and comparisons lie under „Erweitert“
+    driftless_app::ui::steps::daten::set_advanced(&h.ctx, true);
     frames_until(&mut h, |app| {
         let c = &app.state().correct;
         app.overlay().is_some() && c.corrections.is_some() && !app.wants_repaint_while_busy()
@@ -367,6 +369,7 @@ fn corrections_locked_while_a_step_of_the_run_runs() {
             },
             state.clone(),
         );
+    driftless_app::ui::steps::daten::set_advanced(&h.ctx, true);
     h.run();
     let disabled = |h: &Harness<'_, AppState>, label: &str| {
         h.get_by_label(label).accesskit_node().is_disabled()

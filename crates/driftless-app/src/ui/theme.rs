@@ -77,6 +77,37 @@ pub mod icon {
     pub const FIT: &str = p::CORNERS_OUT;
     pub const CHECK: &str = p::CHECK_CIRCLE;
     pub const RUNNING: &str = p::CIRCLE_NOTCH;
+    pub const STALE: &str = p::WARNING_CIRCLE;
+    pub const ADD: &str = p::PLUS;
+    pub const FOLDED: &str = p::CARET_RIGHT;
+    pub const UNFOLDED: &str = p::CARET_DOWN;
+}
+
+/// Size of the heading of a step (the body text is 12.5).
+pub const HEADING_SIZE: f32 = 20.0;
+/// Corner radius of the cards and the segments of a switch.
+pub const CARD_RADIUS: u8 = WIDGET_RADIUS;
+
+/// Frame of a card in the field of a step (a scan); `selected` draws an accent edge.
+pub fn card_frame(selected: bool) -> Frame {
+    let stroke = if selected {
+        Stroke::new(1.0, DARK.accent)
+    } else {
+        Stroke::NONE
+    };
+    Frame::new()
+        .fill(DARK.surface)
+        .stroke(stroke)
+        .corner_radius(CornerRadius::same(CARD_RADIUS))
+        .inner_margin(Margin::same(9))
+}
+
+/// Frame of a segmented switch (e.g. the precision): a dark trough around its segments.
+pub fn segment_frame() -> Frame {
+    Frame::new()
+        .fill(DARK.surface)
+        .corner_radius(CornerRadius::same(CARD_RADIUS))
+        .inner_margin(Margin::same(3))
 }
 
 /// Sets the dark visuals, spacing and the icon font. Call once at start.

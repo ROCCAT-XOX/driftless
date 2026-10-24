@@ -114,6 +114,15 @@ fn step_sets_show_mode() {
     app.apply(Action::SetStep(Step::Planung));
     assert_eq!(app.state().view.show, ShowMode::Cloud);
 
+    // a surface still being loaded counts as one
+    let mut app = self::app();
+    let glb = tmp("ui-layout-laedt").join("oberflaeche.glb");
+    app.apply(Action::LoadSurface(glb));
+    assert!(app.is_loading_surface());
+    assert!(app.state().surface.is_none());
+    app.apply(Action::SetStep(Step::Bilder));
+    assert_eq!(app.state().view.show, ShowMode::Surface);
+
     // without a surface the cloud stays, with a hint
     let mut h = window(self::app());
     h.state_mut().apply(Action::SetStep(Step::Bilder));
@@ -362,6 +371,6 @@ fn projects_of_disk_show_in_daten() {
     let mut app = app();
     app.apply(Action::OpenProject(dir));
     let h = window(app);
-    h.get_by_label("Leer");
+    h.get_by_label(&text::project_line("Leer", 0));
     h.get_by_label(text::EMPTY_NO_SCANS);
 }

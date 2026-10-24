@@ -37,6 +37,32 @@ pub const PLAN_COMING: &str = "Hier entstehen Grundriss, Maße und der DWG-Expor
 pub const ADD_RUN_NEEDS_SCAN: &str = "Zuerst im Feld „Daten“ einen Scan wählen";
 pub const ADD_SCAN_NEEDS_PROJECT: &str = "Zuerst ein Projekt öffnen";
 
+// Step 1 „Daten“
+/// The status of a scan in the list: no map yet.
+pub const STATUS_NEW: &str = "neu";
+/// The scan has a map that fits its newest run.
+pub const STATUS_DONE: &str = "fertig";
+/// The scan has a map, but it no longer fits (or belongs to an older run).
+pub const STATUS_STALE: &str = "veraltet";
+/// A job of the scan is running.
+pub const STATUS_RUNNING: &str = "rechnet";
+/// The scan waits in the queue of „Alle rechnen“.
+pub const STATUS_QUEUED: &str = "wartet";
+pub const PRECISION: &str = "Genauigkeit";
+pub const PRECISION_FAST: &str = "Schnell";
+pub const PRECISION_EXACT: &str = "Genau";
+pub const PRECISION_MAX: &str = "Maximal";
+pub const PRECISION_CUSTOM: &str = "Eigene";
+pub const PRECISION_MAX_HINT: &str = "braucht bei großen Aufnahmen über 4 GB Arbeitsspeicher";
+/// The main button without a selected scan: every new or stale scan, one after the other.
+pub const COMPUTE_ALL: &str = "Alle rechnen";
+/// The main button with a scan selected: only that scan.
+pub const COMPUTE_ONE: &str = "Rechnen";
+pub const COMPUTE_HINT: &str =
+    "Rechnet je Scan zuerst SLAM, falls nötig, dann die Punktwolke mit der gewählten Genauigkeit";
+pub const ALL_COMPUTED: &str = "Alle Scans sind gerechnet";
+pub const ADVANCED: &str = "Erweitert";
+
 // Panels
 pub const PANEL_STEPS: &str = "Schritte";
 pub const PANEL_PROPERTIES: &str = "Eigenschaften";
@@ -266,6 +292,50 @@ pub fn map_of(scan: &str, run: &str, map: &str) -> String {
 
 pub fn project_opened(name: &str) -> String {
     format!("Projekt {name} geöffnet")
+}
+
+/// Under the heading „Daten“: „Projekt „Halle“ · 3 Scans“.
+pub fn project_line(name: &str, scans: usize) -> String {
+    let scans = match scans {
+        1 => "1 Scan".to_string(),
+        n => format!("{n} Scans"),
+    };
+    format!("Projekt „{name}“ · {scans}")
+}
+
+/// A precision that is no level: „Eigene (0,013 m)“.
+pub fn precision_custom(voxel: f64) -> String {
+    format!("{PRECISION_CUSTOM} ({})", voxel_metres(voxel))
+}
+
+/// Tooltip of a precision level: „Raster 0,01 m“.
+pub fn precision_hover(voxel: f64) -> String {
+    format!("Raster {}", voxel_metres(voxel))
+}
+
+/// „0,005 m“, „0,01 m“: a voxel size without trailing zeros.
+fn voxel_metres(voxel: f64) -> String {
+    let fixed = decimal(voxel, 3);
+    let trimmed = fixed.trim_end_matches('0').trim_end_matches(',');
+    format!("{trimmed} m")
+}
+
+/// Under the precision while a job runs: „Scan 13:30 · Karte rechnen 62 %“, without a total
+/// „Scan 13:30 · Karte rechnen läuft“; without a scan only the job.
+pub fn job_of_scan(scan: Option<&str>, job: &str, fraction: Option<f32>) -> String {
+    let how = match fraction {
+        Some(f) => format!("{} %", (f * 100.0).round() as u32),
+        None => "läuft".into(),
+    };
+    match scan {
+        Some(scan) => format!("{scan} · {job} {how}"),
+        None => format!("{job} {how}"),
+    }
+}
+
+/// Under the main button when the map settings are invalid.
+pub fn cannot_compute(why: &str) -> String {
+    format!("Nicht rechenbar: {why}")
 }
 
 pub fn scan_missing(name: &str) -> String {

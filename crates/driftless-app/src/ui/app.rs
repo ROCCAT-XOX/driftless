@@ -1048,6 +1048,9 @@ impl DriftlessApp {
 
     fn finished(&mut self, f: JobFinished) {
         let step = self.state.running.take();
+        // whether the step computed the scan at the head of the queue (read before the tree
+        // is read again: a failed step may have left nothing behind)
+        let queued = step.as_ref().is_some_and(|a| self.computes_queue_head(a));
         let output = match f.result {
             Ok(output) => {
                 self.info(text::job_done(&f.label, &text::duration(f.seconds)));
@@ -1055,6 +1058,7 @@ impl DriftlessApp {
             }
             Err(StepError::Cancelled) => {
                 self.info(text::job_cancelled(&f.label));
+                self.state.queue.clear();
                 None
             }
             Err(e) => {
@@ -1064,6 +1068,9 @@ impl DriftlessApp {
         };
         // the step may have added runs or maps
         self.reload_project();
+        if queued {
+            self.queue_step_done(step.as_ref(), output.is_some());
+        }
         // a reuse started with the count of written changes (taken also if it failed)
         let current = match &output {
             Some(JobOutput::Slam(done)) => self.state.correct.computed_current(&done.run_dir),
@@ -1114,8 +1121,63 @@ impl DriftlessApp {
             }
             _ => {}
         }
+        self.advance_queue();
         if let Some(action) = self.pending.take() {
             self.apply(action);
+        }
+    }
+
+    /// Whether `step` works on the scan at the head of [`AppState::queue`].
+    fn computes_queue_head(&self, step: &Action) -> bool {
+        let (Some(head), Some(project)) = (self.state.queue.front(), &self.state.project) else {
+            return false;
+        };
+        self.state
+            .scan_of(step)
+            .and_then(|s| project.scan(&s.id))
+            .is_some_and(|e| e.path == *head)
+    }
+
+    /// After a step of the queue's head: the head is done once its map was computed, and
+    /// skipped when a step of it failed or SLAM gave no run to map.
+    fn queue_step_done(&mut self, step: Option<&Action>, ok: bool) {
+        let done = match step {
+            Some(Action::RunSlam(_)) if ok => {
+                !matches!(self.state.next_queued_step(), Some(Action::RunMap(_)))
+            }
+            _ => true,
+        };
+        if done {
+            self.state.queue.pop_front();
+        }
+    }
+
+    /// Queues `scans` (scan folders) and starts the first; refused while a step runs.
+    fn compute(&mut self, scans: Vec<PathBuf>) {
+        if let Some(job) = self.jobs.status() {
+            self.error(text::busy(&job.label));
+            return;
+        }
+        if scans.is_empty() {
+            self.info(text::ALL_COMPUTED.into());
+            return;
+        }
+        self.state.queue = scans.into();
+        self.advance_queue();
+    }
+
+    /// Starts the next step of the queue unless a step runs. A scan whose step cannot start
+    /// (or that left the project) is dropped with its reason, and the next one tried.
+    fn advance_queue(&mut self) {
+        while !self.jobs.is_busy() && !self.state.queue.is_empty() {
+            let started = match self.state.next_queued_step() {
+                Some(step) => actions::start_step(&mut self.state, &mut self.jobs, &step),
+                None => Err(text::UNKNOWN_SCAN.into()),
+            };
+            if let Err(e) = started {
+                self.error(e);
+                self.state.queue.pop_front();
+            }
         }
     }
 
@@ -1213,7 +1275,11 @@ impl DriftlessApp {
             Action::LoadSurface(path) => self.load_surface(&path),
             Action::ReloadSurface(path) => self.load_surface_with(&path, true),
             // the status bar shows the step if one runs, else the load
-            Action::Cancel if self.jobs.is_busy() => self.jobs.cancel(),
+            Action::Cancel if self.jobs.is_busy() => {
+                // nothing of the queue starts after the step that is stopped
+                self.state.queue.clear();
+                self.jobs.cancel();
+            }
             Action::Cancel => {
                 self.next_load = None;
                 self.loader.cancel();
@@ -1237,6 +1303,22 @@ impl DriftlessApp {
             Action::Compare { a, b } => self.start_compare(a, b),
             Action::CompareMaps { a, b } => self.start_compare_maps(a, b),
             Action::SetStep(step) => self.set_step(step),
+            Action::ComputeAllMaps => {
+                let scans = self.state.scans_to_compute();
+                self.compute(scans);
+            }
+            Action::ComputeMap(id) => {
+                let path = self
+                    .state
+                    .project
+                    .as_ref()
+                    .and_then(|p| p.scan(&id))
+                    .map(|e| e.path.clone());
+                match path {
+                    Some(path) => self.compute(vec![path]),
+                    None => self.error(text::unknown_scan(&id)),
+                }
+            }
         }
     }
 
@@ -1270,6 +1352,7 @@ impl DriftlessApp {
     }
 
     fn set_project(&mut self, project: Project) {
+        self.state.queue.clear();
         self.info(text::project_opened(&project.name));
         self.drop_surface();
         self.state.set_project(project);

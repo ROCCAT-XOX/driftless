@@ -30,7 +30,7 @@ use driftless_io::progress::LogLine;
 use driftless_steps::inspect;
 use driftless_steps::map::MapSettings;
 use driftless_steps::slam::SlamSettings;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
 /// The steps of the work, in the order they are done; the rail switches between them.
@@ -130,6 +130,12 @@ pub enum Action {
     /// Bilder the surface if there is one or one is being loaded). The active step again
     /// changes nothing.
     SetStep(Step),
+    /// Queue every new or stale scan ([`steps::daten::scan_status`]), in the order of the
+    /// list, and compute them one after the other: SLAM first if the scan has no run with a
+    /// result, then the map of its newest run with the current map settings.
+    ComputeAllMaps,
+    /// [`Action::ComputeAllMaps`] for this one scan (id), whatever its status.
+    ComputeMap(String),
     /// Compare trajectory `a` (aligned to `b`) with `b`.
     Compare {
         a: compare::TrajRef,
@@ -276,6 +282,10 @@ pub struct AppState {
     pub running: Option<Action>,
     /// The step of the work shown in the field next to the rail.
     pub step: Step,
+    /// The scan folders ([`crate::project::ScanEntry::path`]) still to compute by
+    /// [`Action::ComputeAllMaps`], in order; the first is the one being computed. Emptied by
+    /// „Abbrechen“.
+    pub queue: VecDeque<PathBuf>,
     /// The settings window ⚙.
     pub settings_window: SettingsWindow,
     /// The last check of a scan, shown under „Eigenschaften“ while that scan is selected.
@@ -438,6 +448,57 @@ impl AppState {
                 .iter()
                 .find_map(|r| r.maps.iter().find(|m| m.dir == dir).map(|m| (s, r, m)))
         })
+    }
+
+    /// The scans [`Action::ComputeAllMaps`] queues: the new and the stale ones, in the order
+    /// of the list, as scan folders.
+    pub fn scans_to_compute(&self) -> Vec<PathBuf> {
+        let Some(project) = &self.project else {
+            return Vec::new();
+        };
+        self.scans
+            .iter()
+            .filter(|s| {
+                matches!(
+                    steps::daten::scan_status(self, s),
+                    steps::daten::ScanStatus::New | steps::daten::ScanStatus::Stale
+                )
+            })
+            .filter_map(|s| project.scan(&s.id).map(|e| e.path.clone()))
+            .collect()
+    }
+
+    /// The scan with the folder `path`.
+    pub fn scan_at(&self, path: &std::path::Path) -> Option<&ScanNode> {
+        let entry = self
+            .project
+            .as_ref()?
+            .scans
+            .iter()
+            .find(|s| s.path == path)?;
+        self.scan_node(&entry.id)
+    }
+
+    /// The step that computes the scan at the head of [`AppState::queue`] further: the map of
+    /// its newest run with a result, or SLAM if it has none.
+    pub fn next_queued_step(&self) -> Option<Action> {
+        let scan = self.scan_at(self.queue.front()?)?;
+        Some(match scan.runs.iter().rev().find(|r| r.has_result) {
+            Some(run) => Action::RunMap(run.dir.clone()),
+            None => Action::RunSlam(scan.id.clone()),
+        })
+    }
+
+    /// The scan a step action works on.
+    pub fn scan_of(&self, action: &Action) -> Option<&ScanNode> {
+        match action {
+            Action::Inspect(id) | Action::RunSlam(id) => self.scan_node(id),
+            Action::Reuse(dir) | Action::RunMap(dir) | Action::RestoreHistory { run: dir, .. } => {
+                self.run(dir).map(|(s, _)| s)
+            }
+            Action::RunSurface(dir) => self.map(dir).map(|(s, _, _)| s),
+            _ => None,
+        }
     }
 
     /// The scan with this id.

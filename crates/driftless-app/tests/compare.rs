@@ -82,6 +82,8 @@ fn harness(app: DriftlessApp) -> H {
     let mut h = Harness::builder()
         .with_size([1400.0, 2400.0])
         .build_ui_state(|ui, app: &mut DriftlessApp| app.show(ui), app);
+    // the corrections and comparisons lie under „Erweitert“
+    driftless_app::ui::steps::daten::set_advanced(&h.ctx, true);
     frames_until(&mut h, |app| {
         app.overlay().is_some() && !app.wants_repaint_while_busy()
     });

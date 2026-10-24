@@ -12,7 +12,7 @@ pub mod planung;
 mod tree;
 
 use super::view3d::PointInfo;
-use super::{text, Action, AppState, ScanNode, Step};
+use super::{text, theme, Action, AppState, ScanNode, Step};
 use crate::project::ScanState;
 use eframe::egui::{self, RichText, Ui};
 
@@ -25,9 +25,9 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     }
 }
 
-/// The heading of a step.
+/// The heading of a step: larger than everything below it in the field.
 fn heading(ui: &mut Ui, title: &str) {
-    ui.heading(RichText::new(title).strong());
+    ui.label(RichText::new(title).size(theme::HEADING_SIZE).strong());
 }
 
 /// Without a project: what to do, and the two buttons for it.
@@ -60,9 +60,10 @@ pub(super) enum StepState {
     StaleSurface,
 }
 
-/// A section that can be folded away (open at first; egui keeps the choice).
+/// A section that can be folded away (open at first; egui keeps the choice). Its title is
+/// body-sized, below the heading of the step.
 pub(super) fn section(ui: &mut Ui, title: &str, body: impl FnOnce(&mut Ui)) {
-    egui::CollapsingHeader::new(RichText::new(title).heading())
+    egui::CollapsingHeader::new(RichText::new(title).strong())
         .id_salt(title)
         .default_open(true)
         .show(ui, body);
