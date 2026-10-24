@@ -63,6 +63,9 @@ const CONTINUOUS: Duration = Duration::from_millis(500);
 const TIMER_POLL: Duration = Duration::from_millis(16);
 /// Background of the view, sRGB 0..1 as written.
 const BACKGROUND: [f32; 4] = [0.08, 0.085, 0.09, 1.0];
+/// Clear colour of the view's target: transparent, so the gradient of
+/// [`super::theme::view_background`] shows behind the points.
+const CLEAR: [f32; 4] = [0.0; 4];
 const MARKER_COLOR: u32 = 0xffff_ffff;
 
 /// [`BACKGROUND`] for egui (the same sRGB bytes).
@@ -574,7 +577,7 @@ impl View3d {
                 line_scale: ppp,
                 color_mode: key.color_mode,
                 round: key.round,
-                background: BACKGROUND,
+                background: CLEAR,
                 quality_known: cloud.is_some_and(|c| c.points.quality_known),
                 z_range: key.z_range,
                 show: key.show,
@@ -605,6 +608,7 @@ impl View3d {
         }
         if let Some(id) = self.texture {
             let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            super::theme::view_background(ui.painter(), rect);
             ui.painter().image(id, rect, uv, Color32::WHITE);
         }
         let stats = match self.surface {

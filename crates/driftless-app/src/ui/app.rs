@@ -167,6 +167,8 @@ pub struct DriftlessApp {
     closing: bool,
     /// The stored last project could not be opened: forget it on the next save.
     forget_last: bool,
+    /// [`super::theme::apply`] was called (once, at the first frame or in the creation context).
+    themed: bool,
 }
 
 impl DriftlessApp {
@@ -198,6 +200,7 @@ impl DriftlessApp {
             title: String::new(),
             closing: false,
             forget_last: false,
+            themed: false,
         }
     }
 
@@ -205,7 +208,9 @@ impl DriftlessApp {
     /// generating the synthetic cloud if asked for.
     pub fn from_creation_context(cc: &eframe::CreationContext<'_>, args: Args) -> Self {
         let ctx = cc.egui_ctx.clone();
+        super::theme::apply(&cc.egui_ctx);
         let mut app = DriftlessApp::new(Arc::new(move || ctx.request_repaint()));
+        app.themed = true;
         app.render_state = cc.wgpu_render_state.clone();
         if let Some(dir) = args.project {
             app.apply(Action::OpenProject(dir));
@@ -1218,6 +1223,11 @@ impl DriftlessApp {
     /// One frame of the window (what [`eframe::App::ui`] does; without eframe for tests).
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if !self.themed {
+            // Windowless harnesses come here without the creation context.
+            super::theme::apply(&ctx);
+            self.themed = true;
+        }
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_requested() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }

@@ -10,6 +10,7 @@ pub mod left;
 pub mod right;
 pub mod status;
 pub mod text;
+pub mod theme;
 pub mod view3d;
 
 pub use app::{parse_args, Args, DriftlessApp};
