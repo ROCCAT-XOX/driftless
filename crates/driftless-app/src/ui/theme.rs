@@ -20,6 +20,8 @@ pub struct Palette {
     /// Hovered or raised surfaces.
     pub surface_hi: Color32,
     pub accent: Color32,
+    /// Text and symbols on [`Palette::accent`].
+    pub on_accent: Color32,
     pub text: Color32,
     pub text_dim: Color32,
     pub ok: Color32,
@@ -41,6 +43,7 @@ pub const DARK: Palette = Palette {
     surface: Color32::from_rgb(0x1b, 0x1f, 0x27),
     surface_hi: Color32::from_rgb(0x2a, 0x30, 0x3b),
     accent: Color32::from_rgb(0x2f, 0x6f, 0xed),
+    on_accent: Color32::WHITE,
     text: Color32::from_rgb(0xc9, 0xce, 0xd6),
     text_dim: Color32::from_rgb(0x8a, 0x91, 0x9c),
     ok: Color32::from_rgb(0x3e, 0xcf, 0x8e),
@@ -93,7 +96,7 @@ pub fn apply(ctx: &Context) {
     v.window_corner_radius = CornerRadius::same(FLOAT_RADIUS);
     v.menu_corner_radius = CornerRadius::same(WIDGET_RADIUS);
     v.selection.bg_fill = p.accent;
-    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    v.selection.stroke = Stroke::new(1.0, p.on_accent);
     v.hyperlink_color = p.accent;
     v.warn_fg_color = p.warn;
     v.error_fg_color = p.error;
@@ -117,7 +120,7 @@ pub fn apply(ctx: &Context) {
     w.active.bg_fill = p.accent;
     w.active.weak_bg_fill = p.accent;
     w.active.bg_stroke = Stroke::NONE;
-    w.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    w.active.fg_stroke = Stroke::new(1.0, p.on_accent);
     w.open.bg_fill = p.surface_hi;
     w.open.weak_bg_fill = p.surface_hi;
     for s in [

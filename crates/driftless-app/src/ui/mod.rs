@@ -127,7 +127,8 @@ pub enum Action {
         nr: u32,
     },
     /// Show another step: also sets what the view shows (Daten and Planung the cloud,
-    /// Bilder the surface if there is one or one is being loaded).
+    /// Bilder the surface if there is one or one is being loaded). The active step again
+    /// changes nothing.
     SetStep(Step),
     /// Compare trajectory `a` (aligned to `b`) with `b`.
     Compare {

@@ -1241,8 +1241,12 @@ impl DriftlessApp {
     }
 
     /// Shows `step` and what belongs to it in the view: the surface in „Bilder“ if one is
-    /// shown or being loaded, else the cloud. A switch by hand holds until the next step.
+    /// shown or being loaded, else the cloud. A switch by hand holds until the next step; the
+    /// step already shown asked for again changes nothing.
     fn set_step(&mut self, step: Step) {
+        if self.state.step == step {
+            return;
+        }
         self.state.step = step;
         let surface = self.state.surface.is_some() || self.is_loading_surface();
         self.state.view.show = match step {

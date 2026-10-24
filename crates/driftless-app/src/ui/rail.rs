@@ -5,8 +5,8 @@
 use super::theme::{icon, DARK, RAIL_RADIUS};
 use super::{text, Action, AppState, Selection, Step};
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, FontId, Layout, RectAlign, Response, Sense, Ui,
-    WidgetInfo, WidgetType,
+    self, Align, Align2, CornerRadius, FontId, Layout, RectAlign, Response, Sense, Ui, WidgetInfo,
+    WidgetType,
 };
 
 /// Width of the rail (points), its frame included.
@@ -101,7 +101,7 @@ fn button(ui: &mut Ui, symbol: &str, caption: Option<&str>, name: &str, on: bool
             p.surface
         };
         let fg = if on {
-            Color32::WHITE
+            p.on_accent
         } else if response.hovered() {
             p.text
         } else {

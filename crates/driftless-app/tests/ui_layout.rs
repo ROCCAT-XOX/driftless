@@ -127,6 +127,25 @@ fn step_sets_show_mode() {
 }
 
 #[test]
+fn active_step_again_keeps_manual_view() {
+    let mut app = app();
+    app.state_mut().surface = Some(surface());
+    app.apply(Action::SetStep(Step::Bilder));
+    app.state_mut().view.show = ShowMode::Both;
+    // a click on the step already shown changes nothing
+    app.apply(Action::SetStep(Step::Bilder));
+    assert_eq!(app.state().view.show, ShowMode::Both);
+
+    // the same through the rail
+    let mut h = window(app);
+    h.get_by_role_and_label(Role::Button, text::STEP_IMAGES)
+        .click();
+    h.run();
+    assert_eq!(h.state().state().step, Step::Bilder);
+    assert_eq!(h.state().state().view.show, ShowMode::Both);
+}
+
+#[test]
 fn menu_has_all_project_actions() {
     let entries = [
         (text::NEW_PROJECT, Action::PickNewProject),
