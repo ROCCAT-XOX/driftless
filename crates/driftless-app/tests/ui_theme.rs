@@ -52,3 +52,24 @@ fn float_frame_is_translucent_and_round() {
     assert_eq!(f.corner_radius.nw, 12);
     assert!(f.fill.a() < 255 && f.fill.a() > 0);
 }
+
+/// Without the creation context (harnesses) the theme comes in the first frame: the pass that
+/// is shown already draws themed, not only the next frame.
+#[test]
+fn first_harness_frame_is_themed() {
+    use driftless_app::ui::DriftlessApp;
+    use std::sync::Arc;
+    let app = DriftlessApp::new(Arc::new(|| {}));
+    // building the harness runs the first frame (all its passes)
+    let h = egui_kittest::Harness::builder()
+        .with_size([800.0, 600.0])
+        .build_ui_state(
+            |ui, (app, fills): &mut (DriftlessApp, Vec<egui::Color32>)| {
+                fills.push(ui.visuals().panel_fill);
+                app.show(ui);
+            },
+            (app, Vec::new()),
+        );
+    let fills = &h.state().1;
+    assert_eq!(fills.last(), Some(&DARK.panel), "passes: {fills:?}");
+}

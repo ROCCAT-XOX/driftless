@@ -5,8 +5,8 @@ use super::compare::{compare_maps, compare_refs, default_refs, TrajRef};
 use super::correct::{Corrected, RunLoaded};
 use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
-    actions, left, right, status, text, Action, AppState, CloudSummary, InspectResult, Selection,
-    SurfaceSummary, UiMessage, ViewStats,
+    actions, rail, settings, status, steps, text, theme, Action, AppState, CloudSummary,
+    InspectResult, Selection, Step, SurfaceSummary, UiMessage, ViewSettings, ViewStats,
 };
 use crate::cloud::{load_cloud, LoadedCloud};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
@@ -25,6 +25,9 @@ use std::time::Duration;
 
 /// Key of the last opened project in eframe's storage.
 const LAST_PROJECT_KEY: &str = "letztes_projekt";
+/// Key of the stored layout (step and view settings) in eframe's storage. A new layout gets
+/// a new version: what an older program stored is then not read.
+pub const UI_KEY: &str = "ui-v2";
 /// While a step runs, the window draws this often, so progress and runtime move (the job
 /// runner only wakes the UI when a job ends, see `crate::jobs`).
 const REPAINT_WHILE_BUSY: Duration = Duration::from_millis(100);
@@ -32,10 +35,9 @@ const REPAINT_WHILE_BUSY: Duration = Duration::from_millis(100);
 const LOG_LIMIT: usize = 10_000;
 /// Messages kept for the status bar (it shows the last); older ones are dropped.
 const MESSAGE_LIMIT: usize = 100;
-const LEFT_WIDTH: f32 = 280.0;
-/// The project tree never gets narrower than this (names are cut with „…“ instead).
-const LEFT_MIN_WIDTH: f32 = 220.0;
-const RIGHT_WIDTH: f32 = 340.0;
+const STEP_WIDTH: f32 = 250.0;
+/// The field of the step never gets narrower than this (names are cut with „…“ instead).
+const STEP_MIN_WIDTH: f32 = 220.0;
 
 /// Seed of the synthetic cloud of `--synthetic`.
 const SYNTHETIC_SEED: u64 = 1;
@@ -78,6 +80,68 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String
         out.project = Some(PathBuf::from(arg));
     }
     Ok(out)
+}
+
+/// What is kept of the layout between starts, under [`UI_KEY`]: the step and how the view
+/// draws. A field missing in what was stored keeps its default; an unknown one means another
+/// format, and the whole is not read.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StoredUi {
+    step: Step,
+    color_mode: crate::render::ColorMode,
+    point_px: f32,
+    round: bool,
+    budget: usize,
+    camera_mode: crate::camera::CameraMode,
+    show_trajectory: bool,
+    show_odometry: bool,
+    show_loops: bool,
+    show_rejected: bool,
+    show_submaps: bool,
+    show_compare: bool,
+}
+
+impl Default for StoredUi {
+    fn default() -> Self {
+        StoredUi::of(Step::default(), &ViewSettings::default())
+    }
+}
+
+impl StoredUi {
+    fn of(step: Step, v: &ViewSettings) -> Self {
+        StoredUi {
+            step,
+            color_mode: v.color_mode,
+            point_px: v.point_px,
+            round: v.round,
+            budget: v.budget,
+            camera_mode: v.camera_mode,
+            show_trajectory: v.show_trajectory,
+            show_odometry: v.show_odometry,
+            show_loops: v.show_loops,
+            show_rejected: v.show_rejected,
+            show_submaps: v.show_submaps,
+            show_compare: v.show_compare,
+        }
+    }
+
+    /// The view settings as stored, the rest from `v`.
+    fn apply_to(&self, v: &mut ViewSettings) {
+        v.color_mode = self.color_mode;
+        v.point_px = self.point_px.clamp(1.0, 10.0);
+        v.round = self.round;
+        v.budget = self
+            .budget
+            .clamp(*text::BUDGET_RANGE.start(), *text::BUDGET_RANGE.end());
+        v.camera_mode = self.camera_mode;
+        v.show_trajectory = self.show_trajectory;
+        v.show_odometry = self.show_odometry;
+        v.show_loops = self.show_loops;
+        v.show_rejected = self.show_rejected;
+        v.show_submaps = self.show_submaps;
+        v.show_compare = self.show_compare;
+    }
 }
 
 /// Where a cloud comes from.
@@ -212,6 +276,7 @@ impl DriftlessApp {
         let mut app = DriftlessApp::new(Arc::new(move || ctx.request_repaint()));
         app.themed = true;
         app.render_state = cc.wgpu_render_state.clone();
+        app.restore_ui(&cc.egui_ctx, cc.storage);
         if let Some(dir) = args.project {
             app.apply(Action::OpenProject(dir));
         } else {
@@ -748,6 +813,32 @@ impl DriftlessApp {
         }
     }
 
+    /// Takes the layout stored under [`UI_KEY`]. Without one, or with one that cannot be read
+    /// (an older program, another format), the defaults hold and egui's stored window state
+    /// (panel widths, folded sections, windows of the old layout) is dropped, so that the
+    /// first start after an update shows the new layout clean.
+    pub fn restore_ui(&mut self, ctx: &egui::Context, storage: Option<&dyn eframe::Storage>) {
+        let stored = storage
+            .and_then(|s| s.get_string(UI_KEY))
+            .and_then(|s| serde_json::from_str::<StoredUi>(&s).ok());
+        match stored {
+            Some(ui) => {
+                self.state.step = ui.step;
+                ui.apply_to(&mut self.state.view);
+            }
+            None => ctx.memory_mut(|m| {
+                m.data.clear();
+                m.reset_areas();
+            }),
+        }
+    }
+
+    /// The layout to store under [`UI_KEY`].
+    pub fn ui_to_store(&self) -> String {
+        let ui = StoredUi::of(self.state.step, &self.state.view);
+        serde_json::to_string(&ui).unwrap_or_default()
+    }
+
     /// What to store as the last project: the open one, empty to forget a gone one, `None`
     /// to keep what is stored. A folder whose path is not valid UTF-8 is not stored (the
     /// storage holds text, and a changed path would point elsewhere).
@@ -956,7 +1047,7 @@ impl DriftlessApp {
     }
 
     fn finished(&mut self, f: JobFinished) {
-        let step = self.state.step.take();
+        let step = self.state.running.take();
         let output = match f.result {
             Ok(output) => {
                 self.info(text::job_done(&f.label, &text::duration(f.seconds)));
@@ -1145,7 +1236,19 @@ impl DriftlessApp {
             }
             Action::Compare { a, b } => self.start_compare(a, b),
             Action::CompareMaps { a, b } => self.start_compare_maps(a, b),
+            Action::SetStep(step) => self.set_step(step),
         }
+    }
+
+    /// Shows `step` and what belongs to it in the view: the surface in „Bilder“ if one is
+    /// shown or being loaded, else the cloud. A switch by hand holds until the next step.
+    fn set_step(&mut self, step: Step) {
+        self.state.step = step;
+        let surface = self.state.surface.is_some() || self.is_loading_surface();
+        self.state.view.show = match step {
+            Step::Bilder if surface => ShowMode::Surface,
+            _ => ShowMode::Cloud,
+        };
     }
 
     /// Reads the open project again from disk, keeping the selection.
@@ -1220,12 +1323,35 @@ impl DriftlessApp {
         }
     }
 
+    /// In „Bilder“ without a surface: a hint over the top of the view that the cloud stays
+    /// until one is computed.
+    fn no_surface_hint(&self, ctx: &egui::Context, view: egui::Rect) {
+        if self.state.step != Step::Bilder
+            || self.state.surface.is_some()
+            || self.is_loading_surface()
+        {
+            return;
+        }
+        let top = view.center_top() + egui::vec2(0.0, 12.0);
+        egui::Area::new(egui::Id::new("hinweis_oberflaeche"))
+            .fixed_pos(top)
+            .pivot(egui::Align2::CENTER_TOP)
+            .interactable(false)
+            .show(ctx, |ui| {
+                theme::float_frame().show(ui, |ui| ui.label(text::NO_SURFACE_YET));
+            });
+    }
+
     /// One frame of the window (what [`eframe::App::ui`] does; without eframe for tests).
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if !self.themed {
-            // Windowless harnesses come here without the creation context.
-            super::theme::apply(&ctx);
+            // Windowless harnesses come here without the creation context: theme now, and
+            // draw this pass again, so that the first frame shown is themed (the fonts with the
+            // symbols take effect at the start of a pass).
+            theme::apply(&ctx);
+            ui.set_style(ctx.global_style());
+            ctx.request_discard("theme applied");
             self.themed = true;
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_requested() {
@@ -1242,42 +1368,24 @@ impl DriftlessApp {
         show_mode_key(&ctx, &mut self.state);
 
         let mut actions: Vec<Action> = Vec::new();
-        let has_project = self.state.project.is_some();
-        egui::Panel::top("menu").show(ui, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button(text::MENU_PROJECT, |ui| {
-                    if ui.button(text::NEW_PROJECT).clicked() {
-                        actions.push(Action::PickNewProject);
-                    }
-                    if ui.button(text::OPEN_PROJECT).clicked() {
-                        actions.push(Action::PickOpenProject);
-                    }
-                    if ui
-                        .add_enabled(has_project, egui::Button::new(text::ADD_SCAN))
-                        .clicked()
-                    {
-                        actions.push(Action::PickAddScan);
-                    }
-                    if ui.button(text::OPEN_SURFACE).clicked() {
-                        actions.push(Action::PickOpenSurface);
-                    }
-                });
+        egui::Panel::left("leiste")
+            .exact_size(rail::WIDTH)
+            .resizable(false)
+            .frame(theme::rail_frame())
+            .show(ui, |ui| {
+                actions.extend(rail::show(ui, &mut self.state));
             });
-        });
         egui::Panel::bottom("status").show(ui, |ui| {
             actions.extend(status::show(ui, &self.state));
         });
-        egui::Panel::left("projekt")
-            .default_size(LEFT_WIDTH)
-            .min_size(LEFT_MIN_WIDTH)
+        egui::Panel::left("schritt")
+            .default_size(STEP_WIDTH)
+            .min_size(STEP_MIN_WIDTH)
+            .frame(theme::step_frame())
             .show(ui, |ui| {
-                actions.extend(left::show(ui, &self.state));
+                actions.extend(steps::show(ui, &mut self.state));
             });
-        egui::Panel::right("schritte")
-            .default_size(RIGHT_WIDTH)
-            .show(ui, |ui| {
-                actions.extend(right::show(ui, &mut self.state));
-            });
+        settings::show(&ctx, &mut self.state);
         let mut event = None;
         let (places, avoid_submap) = self.places();
         let overlay = self.overlay.as_ref().map(|run| ViewOverlay {
@@ -1288,19 +1396,21 @@ impl DriftlessApp {
             pick_places: self.state.correct.picking,
         });
         let shown = self.cloud.is_some() || overlay.is_some() || self.view.has_surface();
-        egui::CentralPanel::no_frame().show(ui, |ui| match (&self.render_state, shown) {
-            (Some(rs), true) => {
-                event = self
-                    .view
-                    .show(ui, rs, self.cloud.as_ref(), overlay, &self.state.view);
-            }
-            (None, true) => {
-                ui.centered_and_justified(|ui| ui.weak(text::VIEW_NO_GPU));
-            }
-            (_, false) => {
-                ui.centered_and_justified(|ui| ui.weak(text::VIEW_EMPTY));
-            }
-        });
+        let central =
+            egui::CentralPanel::no_frame().show(ui, |ui| match (&self.render_state, shown) {
+                (Some(rs), true) => {
+                    event = self
+                        .view
+                        .show(ui, rs, self.cloud.as_ref(), overlay, &self.state.view);
+                }
+                (None, true) => {
+                    ui.centered_and_justified(|ui| ui.weak(text::VIEW_NO_GPU));
+                }
+                (_, false) => {
+                    ui.centered_and_justified(|ui| ui.weak(text::VIEW_EMPTY));
+                }
+            });
+        self.no_surface_hint(&ctx, central.response.rect);
         match event {
             Some(ViewEvent::PickedPose(i)) => self.pose_picked(i),
             Some(ViewEvent::TrajectoryHidden) => {
@@ -1400,5 +1510,6 @@ impl eframe::App for DriftlessApp {
         if let Some(last) = self.last_to_store() {
             storage.set_string(LAST_PROJECT_KEY, last);
         }
+        storage.set_string(UI_KEY, self.ui_to_store());
     }
 }

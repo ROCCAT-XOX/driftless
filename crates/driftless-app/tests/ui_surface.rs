@@ -5,7 +5,7 @@ use driftless_app::project::{canonical, run_surface_job, SurfaceSettings};
 use driftless_app::render::ShowMode;
 use driftless_app::ui::view3d::effective_show;
 use driftless_app::ui::{
-    text, Action, AppState, CloudSummary, DriftlessApp, Selection, SurfaceSummary, UiMessage,
+    text, Action, AppState, CloudSummary, DriftlessApp, Selection, Step, SurfaceSummary, UiMessage,
 };
 use driftless_io::images::RgbImage;
 use driftless_io::progress::Progress;
@@ -115,6 +115,9 @@ fn surfaces(state: &AppState, map: &Path) -> Vec<(PathBuf, String, bool)> {
 fn surface_button_runs_step() {
     let dir = tmp("ui-oberflaeche");
     let (mut h, _, map) = project_with_map(&dir);
+    // „Oberfläche rechnen“ is in the step „Bilder“
+    h.state_mut().apply(Action::SetStep(Step::Bilder));
+    h.step();
     h.get_by_label(text::STEP_SURFACE).click();
     h.step();
     assert!(h.state().state().job.is_some(), "the step did not start");

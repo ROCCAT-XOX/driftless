@@ -1,19 +1,24 @@
 //! The window: the panels show an [`AppState`] and hand back what was asked for as an
 //! [`Action`]; only [`DriftlessApp`] carries actions out (dialogs, project changes, jobs).
 //! So the panels can be tested without a window (`egui_kittest`).
+//!
+//! Layout: the rail at the left edge ([`rail`]: ☰, the three [`Step`]s, ⚙), next to it the
+//! field of the active step ([`steps`]), the 3D view ([`view3d`]) in the rest, the status bar
+//! ([`status`]) at the bottom and the settings window ⚙ ([`settings`]).
 
 pub mod actions;
 mod app;
 pub mod compare;
 pub mod correct;
-pub mod left;
-pub mod right;
+pub mod rail;
+pub mod settings;
 pub mod status;
+pub mod steps;
 pub mod text;
 pub mod theme;
 pub mod view3d;
 
-pub use app::{parse_args, Args, DriftlessApp};
+pub use app::{parse_args, Args, DriftlessApp, UI_KEY};
 
 use crate::camera::CameraMode;
 use crate::jobs::JobStatus;
@@ -27,6 +32,24 @@ use driftless_steps::map::MapSettings;
 use driftless_steps::slam::SlamSettings;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+/// The steps of the work, in the order they are done; the rail switches between them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum Step {
+    /// Scans, maps, corrections: the view shows the cloud.
+    #[default]
+    Daten,
+    /// Surfaces of the maps: the view shows the surface.
+    Bilder,
+    /// Floor plan and measures (comes with Baustein 5).
+    Planung,
+}
+
+/// The settings window ⚙.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SettingsWindow {
+    pub open: bool,
+}
 
 /// What is selected in the project tree.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -103,6 +126,9 @@ pub enum Action {
         run: PathBuf,
         nr: u32,
     },
+    /// Show another step: also sets what the view shows (Daten and Planung the cloud,
+    /// Bilder the surface if there is one or one is being loaded).
+    SetStep(Step),
     /// Compare trajectory `a` (aligned to `b`) with `b`.
     Compare {
         a: compare::TrajRef,
@@ -246,7 +272,11 @@ pub struct AppState {
     /// Messages of the steps, oldest first.
     pub log: Vec<LogLine>,
     /// The step action that is running (set by [`actions::start_step`]).
-    pub step: Option<Action>,
+    pub running: Option<Action>,
+    /// The step of the work shown in the field next to the rail.
+    pub step: Step,
+    /// The settings window ⚙.
+    pub settings_window: SettingsWindow,
     /// The last check of a scan, shown under „Eigenschaften“ while that scan is selected.
     pub inspect: Option<InspectResult>,
     /// The map and surface folders of the tree whose status is known. Filled in the

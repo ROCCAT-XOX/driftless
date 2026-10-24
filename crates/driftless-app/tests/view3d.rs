@@ -8,7 +8,7 @@ use driftless_app::ui::view3d::{
     color_modes, effective_color_mode, effective_show, fly_keys, is_click, point_info, target_size,
     view_bounds, View3d,
 };
-use driftless_app::ui::{right, text, ViewSettings};
+use driftless_app::ui::{steps, text, ViewSettings};
 use driftless_io::progress::Progress;
 use eframe::egui;
 use std::path::PathBuf;
@@ -103,7 +103,7 @@ fn pick_info_formats_absolute_coordinates() {
     for (got, want) in info.position.iter().zip([512_345.678, 5_400_000.25, 97.5]) {
         assert!((got - want).abs() < 1e-4, "{got} vs {want}");
     }
-    let lines = right::point_lines(&info);
+    let lines = steps::point_lines(&info);
     let value = |label: &str| {
         lines
             .iter()
@@ -129,7 +129,7 @@ fn pick_info_quality_unknown_without_report() {
     let c = cloud("/k/dense.las", points);
     let info = point_info(&c, 0);
     assert_eq!(info.quality, None);
-    let lines = right::point_lines(&info);
+    let lines = steps::point_lines(&info);
     assert!(lines.contains(&(text::POINT_QUALITY, text::QUALITY_UNKNOWN.to_string())));
 }
 
@@ -191,13 +191,13 @@ fn pick_info_without_colour_and_removed() {
     points.flags = vec![0, 1, 3];
     // A cloud without colours.
     let c = cloud("/k/dense.las", points.clone());
-    let lines = right::point_lines(&point_info(&c, 0));
+    let lines = steps::point_lines(&point_info(&c, 0));
     assert!(lines.contains(&(text::POINT_COLOR, text::NO_COLOR.to_string())));
     // Flag 1 in a coloured cloud: no measured colour.
     points.rgb = Some(vec![[9, 9, 9]; 3]);
     let c = cloud("/k/color.las", points.clone());
     let colour = |c: &LoadedCloud, i| {
-        right::point_lines(&point_info(c, i))
+        steps::point_lines(&point_info(c, i))
             .into_iter()
             .find(|(l, _)| *l == text::POINT_COLOR)
             .unwrap()
@@ -207,7 +207,7 @@ fn pick_info_without_colour_and_removed() {
     assert_eq!(colour(&c, 1), text::NO_COLOR);
     // In removed.las the flags are the removal reason.
     let c = cloud("/k/removed.las", points);
-    let lines = right::point_lines(&point_info(&c, 2));
+    let lines = steps::point_lines(&point_info(&c, 2));
     assert!(lines.contains(&(text::POINT_REMOVED, "Durchblick".to_string())));
 }
 

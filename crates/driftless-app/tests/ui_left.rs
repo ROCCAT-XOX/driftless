@@ -1,8 +1,8 @@
-//! The project tree on the left, without a window: what it shows and which actions its
-//! entries return.
+//! The project tree in the field „Daten“, without a window: what it shows and which actions
+//! its entries return.
 
 use driftless_app::project::{MapInfo, Project, RunInfo, ScanEntry, ScanState};
-use driftless_app::ui::{left, text, Action, AppState, ScanNode, Selection};
+use driftless_app::ui::{steps, text, Action, AppState, ScanNode, Selection};
 use driftless_steps::slam::SlamSettings;
 use egui_kittest::kittest::Queryable;
 use egui_kittest::Harness;
@@ -60,9 +60,9 @@ fn state() -> AppState {
 
 /// A harness that shows the tree of `state` and keeps the last action.
 fn harness(state: AppState) -> Harness<'static, (AppState, Option<Action>)> {
-    Harness::builder().with_size([320.0, 600.0]).build_ui_state(
+    Harness::builder().with_size([320.0, 900.0]).build_ui_state(
         |ui, (state, action): &mut (AppState, Option<Action>)| {
-            if let Some(a) = left::show(ui, state) {
+            if let Some(a) = steps::show(ui, state) {
                 *action = Some(a);
             }
         },
@@ -78,7 +78,7 @@ fn top(h: &Harness<'_, (AppState, Option<Action>)>, label: &str) -> f32 {
 fn left_shows_scans_runs_maps() {
     let mut h = harness(state());
     h.run();
-    h.get_by_label(text::PANEL_PROJECT);
+    h.get_by_label(text::STEP_DATA);
     h.get_by_label("Halle");
     let order = ["buero", "SLAM 001", "Karte 001", "color.las", "SLAM 002"];
     let tops: Vec<f32> = order.iter().map(|l| top(&h, l)).collect();
@@ -171,7 +171,7 @@ fn missing_scan_is_marked() {
 fn no_project_offers_open_and_new() {
     let mut h = harness(AppState::default());
     h.run();
-    h.get_by_label(text::NO_PROJECT);
+    h.get_by_label(text::EMPTY_NO_PROJECT);
     h.get_by_label(text::NEW_PROJECT).click();
     h.run();
     assert_eq!(h.state().1, Some(Action::PickNewProject));

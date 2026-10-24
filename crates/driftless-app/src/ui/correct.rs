@@ -167,7 +167,7 @@ pub fn status(enabled: bool) -> &'static str {
 /// read them at its start, and its state is recorded with those).
 pub fn locked(state: &AppState, run: &Path) -> Option<String> {
     let of_run = matches!(
-        &state.step,
+        &state.running,
         Some(Action::Reuse(d) | Action::RunMap(d) | Action::RestoreHistory { run: d, .. })
             if d == run
     );

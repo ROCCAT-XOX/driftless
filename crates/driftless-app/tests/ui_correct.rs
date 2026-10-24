@@ -7,7 +7,7 @@
 use driftless_app::jobs::JobStatus;
 use driftless_app::project::canonical;
 use driftless_app::ui::correct::{parse_time, CorrectState, Place};
-use driftless_app::ui::{right, text, Action, AppState, DriftlessApp, Selection, UiMessage};
+use driftless_app::ui::{steps, text, Action, AppState, DriftlessApp, Selection, UiMessage};
 use driftless_io::progress::ProgressSnapshot;
 use driftless_io::testscan::{room_bag_secs, tmp};
 use driftless_slam::Corrections;
@@ -275,7 +275,7 @@ fn toggle_entry_and_reuse() {
 
     // recompute: the reuse of this run starts
     click(&mut h, text::RECOMPUTE_NOW);
-    assert_eq!(h.state().state().step, Some(Action::Reuse(run.clone())));
+    assert_eq!(h.state().state().running, Some(Action::Reuse(run.clone())));
     frames_until(&mut h, |app| {
         app.state().job.is_none() && !app.wants_repaint_while_busy()
     });
@@ -352,7 +352,7 @@ fn corrections_locked_while_a_step_of_the_run_runs() {
     state.correct.place(2.0);
     state.correct.place(11.5);
     // as the program shows a running reuse of this run
-    state.step = Some(Action::Reuse(run.clone()));
+    state.running = Some(Action::Reuse(run.clone()));
     state.job = Some(JobStatus {
         label: text::STEP_REUSE.into(),
         progress: ProgressSnapshot::default(),
@@ -363,7 +363,7 @@ fn corrections_locked_while_a_step_of_the_run_runs() {
         .with_size([400.0, 1600.0])
         .build_ui_state(
             |ui, state: &mut AppState| {
-                right::show(ui, state);
+                steps::show(ui, state);
             },
             state.clone(),
         );
@@ -378,7 +378,7 @@ fn corrections_locked_while_a_step_of_the_run_runs() {
     h.get_by_label(&text::busy(text::STEP_REUSE));
 
     // a step of another run locks nothing here
-    h.state_mut().step = Some(Action::Reuse(PathBuf::from("/anderer/lauf")));
+    h.state_mut().running = Some(Action::Reuse(PathBuf::from("/anderer/lauf")));
     h.run();
     assert!(!disabled(&h, text::ADD_LOOP));
     assert!(!disabled(&h, &text::loop_switch(1)));
@@ -408,7 +408,7 @@ fn recompute_waits_for_writes_and_later_writes_keep_the_hint() {
     });
     assert!(h.state().state().correct.busy);
     h.state_mut().apply(Action::Reuse(run.clone()));
-    assert_eq!(h.state().state().step, None, "reuse refused");
+    assert_eq!(h.state().state().running, None, "reuse refused");
     assert_eq!(
         errors(h.state()).last().map(String::as_str),
         Some(text::CORRECTION_BUSY)
@@ -426,7 +426,7 @@ fn recompute_waits_for_writes_and_later_writes_keep_the_hint() {
 
     // a reuse starts, then a change lands (as from a write that was under way)
     h.state_mut().apply(Action::Reuse(run.clone()));
-    assert_eq!(h.state().state().step, Some(Action::Reuse(run.clone())));
+    assert_eq!(h.state().state().running, Some(Action::Reuse(run.clone())));
     h.state_mut().apply(Action::SetLoopEnabled {
         run: run.clone(),
         nr: 1,

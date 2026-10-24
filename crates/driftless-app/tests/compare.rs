@@ -391,7 +391,7 @@ fn restore_history_creates_new_state() {
     h.step();
     h.get_by_label(text::RESTORE_STATE).click();
     h.step();
-    assert_eq!(h.state().state().step, Some(restore.clone()));
+    assert_eq!(h.state().state().running, Some(restore.clone()));
     // the corrections are locked while it runs
     assert!(driftless_app::ui::correct::locked(h.state().state(), &run).is_some());
     idle(&mut h);

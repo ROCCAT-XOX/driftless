@@ -1,9 +1,12 @@
-//! The steps and properties on the right, without a window: which steps a selection offers,
-//! when they are locked and why, the state of each step, and the map settings.
+//! The steps and properties of the selection in the field „Daten“ (formerly the right panel),
+//! without a window: which steps a selection offers, when they are locked and why, the state
+//! of each step, and the map settings; the numbers of the view in the settings window ⚙.
 
 use driftless_app::jobs::JobStatus;
 use driftless_app::project::{MapInfo, MapStatus, Project, RunInfo, ScanEntry, ScanState};
-use driftless_app::ui::{right, text, Action, AppState, InspectResult, ScanNode, Selection};
+use driftless_app::ui::{
+    settings, steps, text, Action, AppState, InspectResult, ScanNode, Selection,
+};
 use driftless_io::progress::ProgressSnapshot;
 use driftless_steps::history::{HistoryEntry, HistoryKind};
 use driftless_steps::inspect::{Device, Report, TopicReport};
@@ -77,15 +80,17 @@ fn run_selected(has_cache: bool) -> AppState {
 
 type H = Harness<'static, (AppState, Option<Action>)>;
 
-/// A harness that shows the right panel of `state` and keeps the last action.
+/// A harness that shows the field „Daten“ of `state` (and the settings window, if open) and
+/// keeps the last action.
 fn harness(state: AppState) -> H {
     let mut h = Harness::builder()
         .with_size([360.0, 1400.0])
         .build_ui_state(
             |ui, (state, action): &mut (AppState, Option<Action>)| {
-                if let Some(a) = right::show(ui, state) {
+                if let Some(a) = steps::show(ui, state) {
                     *action = Some(a);
                 }
+                settings::show(ui.ctx(), state);
             },
             (state, None),
         );
@@ -491,6 +496,7 @@ fn surface_alone_shows_triangles() {
         origin: [0.0; 3],
         z_range: [0.0, 3.0],
     });
+    s.settings_window.open = true;
     s.view_stats = Some(ViewStats {
         drawn: 0,
         total: 0,

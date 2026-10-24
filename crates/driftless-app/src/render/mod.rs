@@ -19,7 +19,7 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// What the colour of a point shows.
 #[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ColorMode {
     /// The measured colour; without colours the intensity (see [`PointVertex::rgbi`]).
     #[default]

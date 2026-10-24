@@ -13,7 +13,9 @@ pub struct Palette {
     pub bg: Color32,
     /// Side panels and bars.
     pub panel: Color32,
-    /// Fields and cards.
+    /// The field of the active step and text fields (`#151920` in the design).
+    pub field: Color32,
+    /// Cards and buttons.
     pub surface: Color32,
     /// Hovered or raised surfaces.
     pub surface_hi: Color32,
@@ -23,12 +25,19 @@ pub struct Palette {
     pub ok: Color32,
     pub warn: Color32,
     pub error: Color32,
+    /// Fill of the floating bars over the view (translucent).
+    pub float_fill: Color32,
+    /// Edge of the floating bars.
+    pub float_stroke: Color32,
+    /// The light middle of the view's gradient; its edges are [`Palette::bg`].
+    pub view_glow: Color32,
 }
 
 /// The only theme.
 pub const DARK: Palette = Palette {
     bg: Color32::from_rgb(0x0f, 0x11, 0x15),
     panel: Color32::from_rgb(0x12, 0x15, 0x1a),
+    field: Color32::from_rgb(0x15, 0x19, 0x20),
     surface: Color32::from_rgb(0x1b, 0x1f, 0x27),
     surface_hi: Color32::from_rgb(0x2a, 0x30, 0x3b),
     accent: Color32::from_rgb(0x2f, 0x6f, 0xed),
@@ -37,10 +46,12 @@ pub const DARK: Palette = Palette {
     ok: Color32::from_rgb(0x3e, 0xcf, 0x8e),
     warn: Color32::from_rgb(0xe0, 0xa4, 0x3a),
     error: Color32::from_rgb(0xe5, 0x5b, 0x5b),
+    float_fill: Color32::from_rgba_unmultiplied_const(22, 26, 33, 217),
+    // white at 14/255, premultiplied
+    float_stroke: Color32::from_rgba_premultiplied(14, 14, 14, 14),
+    view_glow: Color32::from_rgb(0x2a, 0x2f, 0x38),
 };
 
-/// Text fields: slightly darker than cards (`#151920` in the design).
-const FIELD: Color32 = Color32::from_rgb(0x15, 0x19, 0x20);
 /// Corner radius of buttons and fields.
 const WIDGET_RADIUS: u8 = 8;
 /// Corner radius of the floating bars.
@@ -77,7 +88,7 @@ pub fn apply(ctx: &Context) {
     v.panel_fill = p.panel;
     v.window_fill = p.panel;
     v.faint_bg_color = p.surface;
-    v.extreme_bg_color = FIELD;
+    v.extreme_bg_color = p.field;
     v.window_stroke = Stroke::new(1.0, p.surface_hi);
     v.window_corner_radius = CornerRadius::same(FLOAT_RADIUS);
     v.menu_corner_radius = CornerRadius::same(WIDGET_RADIUS);
@@ -130,20 +141,35 @@ pub fn apply(ctx: &Context) {
     });
 }
 
+/// Corner radius of the buttons of the rail.
+pub const RAIL_RADIUS: u8 = 10;
+
+/// Frame of the rail at the left edge.
+pub fn rail_frame() -> Frame {
+    Frame::new()
+        .fill(DARK.panel)
+        .inner_margin(Margin::symmetric(8, 12))
+}
+
+/// Frame of the field of the active step, next to the rail.
+pub fn step_frame() -> Frame {
+    Frame::new().fill(DARK.field).inner_margin(Margin::same(14))
+}
+
 /// Frame of the floating bars over the view: translucent, rounded.
 pub fn float_frame() -> Frame {
     Frame::new()
-        .fill(Color32::from_rgba_unmultiplied(22, 26, 33, 217))
-        .stroke(Stroke::new(1.0, Color32::from_white_alpha(14)))
+        .fill(DARK.float_fill)
+        .stroke(Stroke::new(1.0, DARK.float_stroke))
         .corner_radius(CornerRadius::same(FLOAT_RADIUS))
         .inner_margin(Margin::same(8))
 }
 
-/// Paints the soft gradient behind the 3D view: light in the lower middle, [`DARK`]`.bg` at the
-/// edges. One mesh of a few triangles; the cloud is drawn over it with a transparent clear.
+/// Paints the soft gradient behind the 3D view: [`Palette::view_glow`] in the lower middle,
+/// [`Palette::bg`] at the edges. One mesh of a few triangles; the cloud is drawn over it with a transparent clear.
 pub fn view_background(painter: &Painter, rect: Rect) {
     const SEGMENTS: usize = 32;
-    let inner = Color32::from_rgb(0x2a, 0x2f, 0x38);
+    let inner = DARK.view_glow;
     let outer = DARK.bg;
     // Ellipse centre at 50% / 60% of the rect; the colour reaches the edge colour at 72%.
     let centre = egui::pos2(rect.center().x, rect.top() + rect.height() * 0.6);

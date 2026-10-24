@@ -61,18 +61,10 @@ pub const UPLOAD_SLICE_BYTES: u64 = 50_000_000;
 const CONTINUOUS: Duration = Duration::from_millis(500);
 /// While GPU times are on their way, the view looks again this often.
 const TIMER_POLL: Duration = Duration::from_millis(16);
-/// Background of the view, sRGB 0..1 as written.
-const BACKGROUND: [f32; 4] = [0.08, 0.085, 0.09, 1.0];
 /// Clear colour of the view's target: transparent, so the gradient of
 /// [`super::theme::view_background`] shows behind the points.
 const CLEAR: [f32; 4] = [0.0; 4];
 const MARKER_COLOR: u32 = 0xffff_ffff;
-
-/// [`BACKGROUND`] for egui (the same sRGB bytes).
-fn background_color() -> Color32 {
-    let [r, g, b, _] = BACKGROUND.map(|v| (v * 255.0).round() as u8);
-    Color32::from_rgb(r, g, b)
-}
 
 /// What the view reports from a click.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -488,13 +480,14 @@ impl View3d {
             // A slice per frame; the window stays usable meanwhile.
             self.last_upload_bytes = renderer.upload_step(queue, tree, UPLOAD_SLICE_BYTES);
             let percent = (renderer.upload_fraction() * 100.0).round();
-            ui.painter().rect_filled(rect, 0.0, background_color());
+            // the same gradient as behind the points, so the view does not jump
+            super::theme::view_background(ui.painter(), rect);
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 text::uploading(percent),
                 egui::TextStyle::Body.resolve(ui.style()),
-                Color32::LIGHT_GRAY,
+                super::theme::DARK.text_dim,
             );
             ui.ctx().request_repaint();
             return None;

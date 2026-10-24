@@ -10,7 +10,7 @@ use driftless_steps::inspect;
 use driftless_steps::map::MapStep;
 
 /// Starts the job of a step action (`Inspect`, `RunSlam`, `Reuse`, `RestoreHistory`,
-/// `RunMap`, `RunSurface`) and records it in [`AppState::step`]. Refused with a German message
+/// `RunMap`, `RunSurface`) and records it in [`AppState::running`]. Refused with a German message
 /// while a job runs, for a scan that cannot be read, a run without `submaps.bin` (reuse,
 /// restore), while a change of the corrections is being written (reuse, restore), for invalid
 /// map or surface settings, a map without `map.json` (surface), or any other action.
@@ -119,7 +119,7 @@ pub fn start_step(
         _ => return Err(text::NOT_A_STEP.into()),
     };
     started.map_err(|e| e.to_string())?;
-    state.step = Some(action.clone());
+    state.running = Some(action.clone());
     state.job = runner.status();
     Ok(())
 }

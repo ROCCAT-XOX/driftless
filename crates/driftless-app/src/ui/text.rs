@@ -12,13 +12,32 @@ pub const ADD_SCAN: &str = "Scan hinzufügen …";
 pub const ADD_RUN: &str = "Lauf hinzufügen …";
 pub const MENU_PROJECT: &str = "Projekt";
 pub const NO_PROJECT: &str = "Kein Projekt geöffnet";
-pub const NO_SCANS: &str = "Noch kein Scan im Projekt";
 pub const NO_RUNS: &str = "Noch kein SLAM-Lauf";
 /// After the name of a scan whose folder cannot be read.
 pub const SCAN_MISSING: &str = "fehlt";
 
+// Rail and the fields of the steps
+pub const STEP_DATA: &str = "Daten";
+pub const STEP_IMAGES: &str = "Bilder";
+pub const STEP_PLAN: &str = "Planung";
+/// The settings window ⚙ and its button in the rail.
+pub const SETTINGS: &str = "Einstellungen";
+pub const EMPTY_NO_PROJECT: &str =
+    "Noch kein Projekt offen. Ein Projekt öffnen oder ein neues anlegen, dann Scans hinzufügen.";
+pub const EMPTY_NO_SCANS: &str =
+    "Das Projekt hat noch keinen Scan. Einen Scan-Ordner hinzufügen, um zu beginnen.";
+pub const EMPTY_NO_MAPS: &str = "Noch keine Karte. Zuerst in „Daten“ eine Karte rechnen.";
+pub const GO_TO_DATA: &str = "Zu „Daten“";
+/// Over the view in „Bilder“ while no surface is shown.
+pub const NO_SURFACE_YET: &str = "Noch keine Oberfläche – im Feld „Bilder“ rechnen";
+pub const SELECT_MAP_FOR_SURFACE: &str = "Eine Karte wählen, um ihre Oberfläche zu rechnen";
+pub const MAPS_AND_SURFACES: &str = "Karten und Oberflächen";
+pub const PLAN_COMING: &str = "Hier entstehen Grundriss, Maße und der DWG-Export. Das folgt in \
+     einem späteren Baustein.";
+pub const ADD_RUN_NEEDS_SCAN: &str = "Zuerst im Feld „Daten“ einen Scan wählen";
+pub const ADD_SCAN_NEEDS_PROJECT: &str = "Zuerst ein Projekt öffnen";
+
 // Panels
-pub const PANEL_PROJECT: &str = "Projekt";
 pub const PANEL_STEPS: &str = "Schritte";
 pub const PANEL_PROPERTIES: &str = "Eigenschaften";
 pub const VIEW_EMPTY: &str = "Keine Wolke geladen – links eine Karte oder Wolke wählen";
@@ -32,7 +51,7 @@ pub const STEP_SURFACE: &str = "Oberfläche rechnen";
 pub const NOT_COMPUTED: &str = "nicht gerechnet";
 pub const STALE: &str = "veraltet – Laufbahn neu gerechnet";
 pub const NO_CACHE: &str = "Kein Zwischenspeicher submaps.bin – zuerst SLAM rechnen";
-pub const SELECT_FOR_STEPS: &str = "Links einen Scan oder einen Lauf wählen";
+pub const SELECT_FOR_STEPS: &str = "Oben einen Scan oder einen Lauf wählen";
 pub const THIS_MAP: &str = "Diese Karte";
 pub const THIS_SURFACE: &str = "Diese Oberfläche";
 /// The state of a surface that no longer fits its map.
@@ -92,8 +111,7 @@ pub const SURFACE_NO_PHOTOS: &str = "ohne Fotos (graue Fläche)";
 
 // The 3D view and its properties (right panel)
 pub const VIEW_NO_GPU: &str = "3D-Ansicht nicht verfügbar: keine wgpu-Grafik";
-pub const VIEW_SETTINGS: &str = "Ansicht";
-pub const COLOR_MODE: &str = "Farbe";
+pub const COLOR_MODE: &str = "Farbart";
 pub const MODE_RGB: &str = "Farbe";
 pub const MODE_INTENSITY: &str = "Intensität";
 pub const MODE_QUALITY: &str = "Güte";
@@ -239,6 +257,11 @@ pub fn pose_hover(t: f64, submap: usize) -> String {
 /// A time of a place in the field: one decimal.
 pub fn place_time(t: f64) -> String {
     decimal(t, 1)
+}
+
+/// A map in „Bilder“: „buero · SLAM 001 · Karte 001“.
+pub fn map_of(scan: &str, run: &str, map: &str) -> String {
+    format!("{scan} · {run} · {map}")
 }
 
 pub fn project_opened(name: &str) -> String {

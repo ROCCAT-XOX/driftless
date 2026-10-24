@@ -229,10 +229,8 @@ fn ui_screenshots() {
         c.b.label(),
         driftless_steps::compare::render_text(&c.report)
     );
-    for section in [text::CORRECTIONS, text::VIEW_SETTINGS] {
-        h.get_by_label(section).click();
-        h.step();
-    }
+    h.get_by_label(text::CORRECTIONS).click();
+    h.step();
     let camera = h.state_mut().view_mut().camera_mut();
     camera.pitch = -89f32.to_radians();
     shot(&mut h, &dir, "buero_vorher_nachher");
@@ -388,4 +386,44 @@ fn project_surface_screenshot() {
         h.step();
     }
     shot(&mut h, &dir, "app_projekt_oberflaeche");
+}
+
+/// The layout with rail, field „Daten“ and view: a project with one small synthetic scan and a
+/// synthetic cloud, as `layout.png` in `$DRIFTLESS_SHOTS`. Run with
+///
+/// ```text
+/// DRIFTLESS_SHOTS=… cargo test -p driftless-app --test ui_screenshots layout_screenshot \
+///     -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "writes a picture; needs $DRIFTLESS_SHOTS and a GPU"]
+fn layout_screenshot() {
+    let Some(dir) = std::env::var_os("DRIFTLESS_SHOTS").map(PathBuf::from) else {
+        eprintln!("DRIFTLESS_SHOTS nicht gesetzt, Test übersprungen");
+        return;
+    };
+    if headless_device().is_none() {
+        eprintln!("kein GPU-Adapter, Test übersprungen");
+        return;
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let work = dir.join("projekt-aufbau");
+    let _ = std::fs::remove_dir_all(&work);
+    let scan = work.join("scan-1335");
+    std::fs::create_dir_all(&scan).unwrap();
+    driftless_io::testscan::room_bag_secs(&scan, true, 1.0);
+    let rs = create_render_state(
+        default_wgpu_setup(),
+        egui_wgpu::RendererOptions::PREDICTABLE,
+    );
+    let mut app = DriftlessApp::new(Arc::new(|| {})).with_render_state(rs.clone());
+    app.apply(Action::NewProject {
+        dir: work.join("projekt"),
+        name: "Schwarzer Raum".into(),
+    });
+    app.apply(Action::AddScan(scan));
+    app.load_synthetic(1_000_000);
+    let mut h = harness(app, rs);
+    wait_loaded(&mut h);
+    shot(&mut h, &dir, "layout");
 }
