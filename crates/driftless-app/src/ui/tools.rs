@@ -144,11 +144,16 @@ const SLIDER_WIDTH: f32 = 140.0;
 const END_RADIUS: f32 = 4.0;
 const LINE_WIDTH: f32 = 2.0;
 
-/// Makes `tool` the active one; a measurement being made is dropped.
+/// Makes `tool` the active one; a measurement being made is dropped, and „Punkt wählen“ or
+/// „Messen“ ends picking the places of a loop.
 pub fn select(state: &mut AppState, tool: Tool) {
     if state.tool != tool {
         state.tool = tool;
         state.measure_a = None;
+    }
+    // a click picks points now, not the places of a loop
+    if tool.picks_points() {
+        state.correct.picking = false;
     }
 }
 

@@ -744,3 +744,72 @@ fn stale_surface_does_not_widen_the_field() {
     let width = h.state().layout().step.width();
     assert!(width <= 251.0, "the field grew to {width}");
 }
+
+/// Ticks until the step running is `want` (or nothing runs any more).
+fn tick_until_running(app: &mut DriftlessApp, want: &Action) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while app.state().running.as_ref() != Some(want) && app.wants_repaint_while_busy() {
+        assert!(Instant::now() < deadline, "{want:?} did not start");
+        std::thread::sleep(Duration::from_millis(5));
+        app.tick();
+    }
+}
+
+#[test]
+fn queue_loads_only_its_last_result_and_keeps_the_step_view() {
+    use driftless_app::render::ShowMode;
+    let dir = tmp("ui-bilder-ansicht");
+    let (mut app, maps) = mapped_project(&dir, &["a", "b"]);
+    // the maps' queue showed only its last map
+    let shown = app.state().cloud.as_ref().map(|c| c.path.clone());
+    assert!(
+        shown.as_ref().is_some_and(|p| p.starts_with(&maps[1])),
+        "{shown:?}"
+    );
+    // „Alle Oberflächen rechnen“ in „Bilder“, then off to „Daten“ while it runs
+    app.apply(Action::SetStep(Step::Bilder));
+    app.apply(Action::Select(Selection::None));
+    app.apply(Action::ComputeAllSurfaces);
+    app.apply(Action::SetStep(Step::Daten));
+    // the first surface done, the second running: nothing of the first was loaded
+    tick_until_running(&mut app, &Action::RunSurface(maps[1].clone()));
+    assert!(has_surface(&maps[0]));
+    assert!(app.state().surface.is_none() && !app.is_loading_surface());
+    assert_eq!(app.state().selection, Selection::None);
+    tick_settle(&mut app);
+    assert_eq!(errors(&app), Vec::<String>::new());
+    // the last one is loaded, but „Daten“ keeps showing the points
+    let surface = app.state().surface.as_ref().map(|s| s.path.clone());
+    assert!(
+        surface.as_ref().is_some_and(|p| p.starts_with(&maps[1])),
+        "{surface:?}"
+    );
+    assert_eq!(app.state().view.show, ShowMode::Cloud);
+    // in „Bilder“ a finished surface is shown
+    app.apply(Action::SetStep(Step::Bilder));
+    assert_eq!(app.state().view.show, ShowMode::Surface);
+    app.state_mut().view.show = ShowMode::Cloud;
+    app.state_mut().surface_settings = quick(0.2);
+    app.apply(Action::Select(Selection::Map(maps[0].clone())));
+    tick_settle(&mut app);
+    app.apply(Action::RunSurface(maps[0].clone()));
+    tick_settle(&mut app);
+    assert_eq!(errors(&app), Vec::<String>::new());
+    assert_eq!(app.state().view.show, ShowMode::Surface);
+}
+
+#[test]
+fn queue_loads_nothing_after_a_load_by_hand() {
+    let dir = tmp("ui-bilder-handlast");
+    let (mut app, maps) = mapped_project(&dir, &["a", "b"]);
+    app.apply(Action::SetStep(Step::Bilder));
+    app.apply(Action::Select(Selection::None));
+    app.apply(Action::ComputeAllSurfaces);
+    // the user looks at map a meanwhile: the queue's result does not replace it
+    app.apply(Action::Select(Selection::Map(maps[0].clone())));
+    tick_settle(&mut app);
+    assert_eq!(errors(&app), Vec::<String>::new());
+    assert!(has_surface(&maps[0]) && has_surface(&maps[1]));
+    assert_eq!(app.state().selection, Selection::Map(maps[0].clone()));
+    assert!(app.state().surface.is_none());
+}

@@ -587,3 +587,26 @@ fn active_cut_shows_in_info() {
     click_button(&mut h, text::TOOL_ORBIT);
     assert!(h.query_by_label(&line).is_none());
 }
+
+#[test]
+fn picking_places_ends_outside_daten_and_with_point_tools() {
+    use driftless_app::ui::tools;
+    let mut app = app();
+    app.state_mut().correct.picking = true;
+    // leaving „Daten“ ends it
+    app.apply(Action::SetStep(Step::Planung));
+    assert!(!app.state().correct.picking);
+    // in „Daten“, „Messen“ and „Punkt wählen“ end it; turning the view does not
+    app.apply(Action::SetStep(Step::Daten));
+    for (tool, ends) in [
+        (Tool::Pan, false),
+        (Tool::Measure, true),
+        (Tool::Orbit, false),
+        (Tool::Pick, true),
+    ] {
+        tools::select(app.state_mut(), Tool::Orbit);
+        app.state_mut().correct.picking = true;
+        tools::select(app.state_mut(), tool);
+        assert_eq!(app.state().correct.picking, !ends, "{tool:?}");
+    }
+}

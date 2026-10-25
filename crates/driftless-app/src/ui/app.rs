@@ -203,11 +203,14 @@ enum Batch {
     Surfaces,
 }
 
-/// The settings a queue started with, lent to each of its steps.
+/// The settings a queue started with, lent to each of its steps, and the count of loads by
+/// hand when it started.
 #[derive(Debug, Clone)]
 struct QueueSettings {
+    slam: driftless_steps::slam::SlamSettings,
     map: driftless_steps::map::MapSettings,
     surface: crate::project::SurfaceSettings,
+    hand_loads: u64,
 }
 
 pub struct DriftlessApp {
@@ -260,6 +263,12 @@ pub struct DriftlessApp {
     /// The settings the queue started with: every step of it uses them, even if the
     /// switches change meanwhile.
     queue_settings: Option<QueueSettings>,
+    /// Clouds and surfaces asked for by hand (picked, opened) so far: a queue shows its last
+    /// result only if none was asked for while it ran.
+    hand_loads: u64,
+    /// Whether the surface being loaded was asked for by hand: it is shown in any step, a
+    /// computed one only in „Bilder“.
+    surface_by_hand: bool,
     /// The window title last sent.
     title: String,
     /// Closing waits for the cancelled step; the window closes once it has ended.
@@ -300,6 +309,8 @@ impl DriftlessApp {
             pending: None,
             compute_all_waiting: None,
             queue_settings: None,
+            hand_loads: 0,
+            surface_by_hand: false,
             title: String::new(),
             closing: false,
             forget_last: false,
@@ -789,8 +800,11 @@ impl DriftlessApp {
                     }
                 }
                 self.view.set_surface(Some(*surface));
-                // the surface just picked is what is drawn
-                self.state.view.show = ShowMode::Surface;
+                // the surface just picked is what is drawn; a computed one only in „Bilder“,
+                // the other steps keep showing the points
+                if std::mem::take(&mut self.surface_by_hand) || self.state.step == Step::Bilder {
+                    self.state.view.show = ShowMode::Surface;
+                }
             }
             Ok(_) => {}
             // a cancel for the next load needs no message
@@ -1123,8 +1137,17 @@ impl DriftlessApp {
         };
         // the step may have added runs or maps
         self.reload_project();
+        let hand_loads = self.queue_settings.as_ref().map(|q| q.hand_loads);
         if queued {
             self.queue_step_done(step.as_ref(), output.is_some());
+        }
+        // A step of a queue shows its result only as the queue's last, and only if nothing
+        // was picked by hand meanwhile: the queue does not load every result beside the next
+        // job, nor take the view from the user.
+        let show = !queued
+            || (self.state.queue.is_empty() && hand_loads.is_none_or(|n| n == self.hand_loads));
+        if show {
+            self.surface_by_hand = false;
         }
         // a reuse started with the count of written changes (taken also if it failed)
         let current = match &output {
@@ -1140,9 +1163,11 @@ impl DriftlessApp {
                 if current {
                     self.state.correct.changed.remove(&done.run_dir);
                 }
-                self.state.selection = Selection::Run(done.run_dir.clone());
                 self.reload_run(&done.run_dir);
-                self.load_run_cloud(&done.run_dir);
+                if show {
+                    self.state.selection = Selection::Run(done.run_dir.clone());
+                    self.load_run_cloud(&done.run_dir);
+                }
                 // its trajectories changed: compare again, as preset (before/after) for the
                 // run drawn, else the same pair if one of them is of this run
                 let c = &self.state.compare;
@@ -1156,7 +1181,7 @@ impl DriftlessApp {
             }
             // a failed or cancelled restore wrote its corrections back: show them again
             (None, Some(Action::RestoreHistory { run, .. })) => self.reload_run(&run),
-            (Some(JobOutput::Map(done)), _) => {
+            (Some(JobOutput::Map(done)), _) if show => {
                 self.state.selection = Selection::Map(done.dir.clone());
                 self.load_best_of_map(&done.dir);
             }
@@ -1164,8 +1189,10 @@ impl DriftlessApp {
                 if done.reused {
                     self.info(text::surface_fits(&done.dir));
                 }
-                self.state.selection = Selection::Surface(done.dir.clone());
-                self.load_surface(&done.dir);
+                if show {
+                    self.state.selection = Selection::Surface(done.dir.clone());
+                    self.load_surface(&done.dir);
+                }
             }
             (Some(JobOutput::Inspect(report)), Some(Action::Inspect(scan))) => {
                 self.state.inspect = Some(InspectResult {
@@ -1260,8 +1287,10 @@ impl DriftlessApp {
         }
         self.state.queue = items.into();
         self.queue_settings = Some(QueueSettings {
+            slam: self.state.slam_settings.clone(),
             map: self.state.map_settings.clone(),
             surface: self.state.surface_settings.clone(),
+            hand_loads: self.hand_loads,
         });
         self.advance_queue();
     }
@@ -1276,11 +1305,14 @@ impl DriftlessApp {
             Some(step) => {
                 // the step reads the settings from the state: lend it the queue's
                 let own = self.queue_settings.clone().map(|q| QueueSettings {
+                    slam: std::mem::replace(&mut self.state.slam_settings, q.slam),
                     map: std::mem::replace(&mut self.state.map_settings, q.map),
                     surface: std::mem::replace(&mut self.state.surface_settings, q.surface),
+                    hand_loads: q.hand_loads,
                 });
                 let started = actions::start_step(&mut self.state, &mut self.jobs, &step);
                 if let Some(own) = own {
+                    self.state.slam_settings = own.slam;
                     self.state.map_settings = own.map;
                     self.state.surface_settings = own.surface;
                 }
@@ -1370,6 +1402,8 @@ impl DriftlessApp {
                 }
             }
             Action::Select(selection) => {
+                self.hand_loads += 1;
+                self.surface_by_hand = matches!(selection, Selection::Surface(_));
                 self.state.selection = selection;
                 self.load_selected();
                 // choosing the shown run again reads it again (e.g. after `driftless correct`)
@@ -1379,18 +1413,31 @@ impl DriftlessApp {
                     }
                 }
             }
-            Action::LoadCloud { path, run } => self.load(CloudSource::File { path, run }),
+            Action::LoadCloud { path, run } => {
+                self.hand_loads += 1;
+                self.load(CloudSource::File { path, run })
+            }
             Action::PickOpenSurface => {
                 if let Some(path) = rfd::FileDialog::new()
                     .set_title(text::DIALOG_OPEN_SURFACE)
                     .add_filter("glTF", &["glb"])
                     .pick_file()
                 {
+                    self.hand_loads += 1;
+                    self.surface_by_hand = true;
                     self.load_surface_with(&path, true);
                 }
             }
-            Action::LoadSurface(path) => self.load_surface(&path),
-            Action::ReloadSurface(path) => self.load_surface_with(&path, true),
+            Action::LoadSurface(path) => {
+                self.hand_loads += 1;
+                self.surface_by_hand = true;
+                self.load_surface(&path)
+            }
+            Action::ReloadSurface(path) => {
+                self.hand_loads += 1;
+                self.surface_by_hand = true;
+                self.load_surface_with(&path, true)
+            }
             // the status bar shows the step if one runs, else the load
             Action::Cancel if self.jobs.is_busy() => {
                 // nothing of the queue starts after the step that is stopped
@@ -1398,6 +1445,8 @@ impl DriftlessApp {
                 self.jobs.cancel();
             }
             Action::Cancel => {
+                // a queue waiting for the map check does not start either
+                self.stop_queue();
                 self.next_load = None;
                 self.loader.cancel();
                 self.next_surface = None;
@@ -1446,6 +1495,10 @@ impl DriftlessApp {
             return;
         }
         self.state.step = step;
+        // picking places of a loop belongs to „Daten“: elsewhere a click measures or picks
+        if step != Step::Daten {
+            self.state.correct.picking = false;
+        }
         let surface = self.state.surface.is_some() || self.is_loading_surface();
         self.state.view.show = match step {
             Step::Bilder if surface => ShowMode::Surface,
