@@ -627,3 +627,117 @@ fn bilder_screenshot() {
     shot(&mut h, &dir, "bilder");
     h.state_mut().apply(Action::Cancel);
 }
+
+/// Points in world size against fixed pixels: the GPU time of the synthetic cloud of
+/// `--synthetic 6_000_000` in both modes, from afar and close to a wall, and – with
+/// `$DRIFTLESS_CLOUD`, a colour cloud of a map folder – `flecken_pixel.png` and
+/// `flecken_meter.png` close to a wall, in `$DRIFTLESS_SHOTS`. Run with
+///
+/// ```text
+/// DRIFTLESS_SHOTS=… DRIFTLESS_CLOUD=…/color.las cargo test -p driftless-app --release \
+///     --test ui_screenshots spot_screenshots -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "writes pictures; needs $DRIFTLESS_SHOTS and a GPU"]
+fn spot_screenshots() {
+    use driftless_app::render::{with_timestamps, PointSize};
+    let Some(dir) = std::env::var_os("DRIFTLESS_SHOTS").map(PathBuf::from) else {
+        eprintln!("DRIFTLESS_SHOTS nicht gesetzt, Test übersprungen");
+        return;
+    };
+    if headless_device().is_none() {
+        eprintln!("kein GPU-Adapter, Test übersprungen");
+        return;
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    // with timestamps, as the program asks for them: the view reports the GPU time
+    let setup = match default_wgpu_setup() {
+        egui_wgpu::WgpuSetup::CreateNew(s) => egui_wgpu::WgpuSetup::CreateNew(with_timestamps(s)),
+        other => other,
+    };
+    let rs = create_render_state(setup, egui_wgpu::RendererOptions::PREDICTABLE);
+    let mut app = DriftlessApp::new(Arc::new(|| {})).with_render_state(rs.clone());
+    app.load_synthetic(6_000_000);
+    let mut h = harness(app, rs);
+    wait_loaded(&mut h);
+
+    // The median GPU time of frames that each turn the camera a little (so that every step
+    // draws anew).
+    let median_ms = |h: &mut Harness<'_, DriftlessApp>, size: PointSize| {
+        h.state_mut().state_mut().view.point_size = size;
+        let mut times = Vec::new();
+        for i in 0..80 {
+            h.state_mut().view_mut().camera_mut().yaw += if i % 2 == 0 { 1e-3 } else { -1e-3 };
+            h.step();
+            std::thread::sleep(Duration::from_millis(5));
+            if i >= 10 && h.state().view().gpu_timed() {
+                times.push(h.state().view().frame_ms());
+            }
+        }
+        times.sort_by(f32::total_cmp);
+        let drawn = h.state().view().drawn_points();
+        (times.get(times.len() / 2).copied(), drawn)
+    };
+    for place in ["fern", "nah"] {
+        if place == "nah" {
+            to_wall(&mut h, 1.0);
+        }
+        let pixel = median_ms(&mut h, PointSize::Pixel);
+        let world = median_ms(&mut h, PointSize::World);
+        let pixel_again = median_ms(&mut h, PointSize::Pixel);
+        eprintln!(
+            "synthetisch 6 Mio., {place}: Pixel {:?} ms ({} Punkte), Meter {:?} ms ({} Punkte), \
+             Pixel wieder {:?} ms",
+            pixel.0, pixel.1, world.0, world.1, pixel_again.0
+        );
+    }
+
+    let Some(cloud) = std::env::var_os("DRIFTLESS_CLOUD").map(PathBuf::from) else {
+        eprintln!("DRIFTLESS_CLOUD nicht gesetzt, echte Wolke übersprungen");
+        return;
+    };
+    h.state_mut().apply(Action::LoadCloud {
+        path: cloud,
+        run: None,
+    });
+    wait_loaded(&mut h);
+    eprintln!(
+        "Fleckgröße der Karte: {} m",
+        h.state().cloud().unwrap().point_m
+    );
+    to_wall(&mut h, 1.2);
+    h.state_mut().state_mut().view.point_size = PointSize::Pixel;
+    shot(&mut h, &dir, "flecken_pixel");
+    h.state_mut().state_mut().view.point_size = PointSize::World;
+    shot(&mut h, &dir, "flecken_meter");
+}
+
+/// Orbits around the nearest point straight ahead (+x) of the middle of the cloud, at
+/// `distance` metres, looking horizontally at it: close to a wall.
+fn to_wall(h: &mut Harness<'_, DriftlessApp>, distance: f32) {
+    let points = &h.state().cloud().expect("cloud").points;
+    let (min, max) = points.bounds();
+    let centre: [f32; 3] = std::array::from_fn(|k| (min[k] + max[k]) / 2.0);
+    // 1.5 m above the floor (the lowest 2 % of the heights: stray points below it do not
+    // count), not the middle of the bounds
+    let mut heights: Vec<f32> = points.xyz.iter().step_by(97).map(|p| p[2]).collect();
+    heights.sort_by(f32::total_cmp);
+    let floor = heights.get(heights.len() / 50).copied().unwrap_or(min[2]);
+    let z = (floor + 1.5).min(max[2]);
+    let hit = points
+        .xyz
+        .iter()
+        .filter(|p| p[0] > centre[0] && (p[1] - centre[1]).abs() < 0.05 && (p[2] - z).abs() < 0.05)
+        .map(|p| p[0])
+        .min_by(f32::total_cmp)
+        .unwrap_or(max[0]);
+    eprintln!("Wand bei x = {hit:.2} m (Mitte {centre:?}, z = {z:.2})");
+    let camera = h.state_mut().view_mut().camera_mut();
+    camera.target = [hit, centre[1], z].into();
+    camera.yaw = 0.0;
+    camera.pitch = 0.0;
+    camera.distance = distance;
+    for _ in 0..3 {
+        h.step();
+    }
+}

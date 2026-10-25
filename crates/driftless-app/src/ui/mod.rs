@@ -25,7 +25,7 @@ use crate::jobs::JobStatus;
 use crate::project::{
     map_status, state_gap, surface_status, MapStatus, Project, RunInfo, ScanState, SurfaceSettings,
 };
-use crate::render::{ColorMode, ShowMode};
+use crate::render::{ColorMode, PointSize, ShowMode};
 use driftless_io::progress::LogLine;
 use driftless_steps::inspect;
 use driftless_steps::map::MapSettings;
@@ -195,6 +195,10 @@ pub struct ViewSettings {
     pub cut: Option<[f32; 2]>,
     /// Surface, points or both, while a surface is loaded.
     pub show: ShowMode,
+    /// Fixed pixels or spots in metres (the default).
+    pub point_size: PointSize,
+    /// Spot diameter in metres; `None` = from the map ([`CloudSummary::point_m`]).
+    pub point_m: Option<f32>,
 }
 
 impl Default for ViewSettings {
@@ -213,6 +217,8 @@ impl Default for ViewSettings {
             show_compare: true,
             cut: None,
             show: ShowMode::default(),
+            point_size: PointSize::default(),
+            point_m: None,
         }
     }
 }
@@ -229,6 +235,8 @@ pub struct CloudSummary {
     pub z_range: [f32; 2],
     /// A height just below the ceiling, if one was found.
     pub ceiling: Option<f32>,
+    /// The spot diameter (m) of its map ([`crate::cloud::point_m_of_map`]).
+    pub point_m: f32,
 }
 
 /// The loaded surface, as the panels need it.

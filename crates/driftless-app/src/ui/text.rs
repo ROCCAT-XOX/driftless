@@ -173,6 +173,18 @@ pub const MODE_INTENSITY: &str = "Intensität";
 pub const MODE_QUALITY: &str = "Güte";
 pub const POINT_SIZE: &str = "Punktgröße (px)";
 pub const ROUND_POINTS: &str = "rund";
+pub const POINT_SIZE_MODE: &str = "Punkte";
+pub const POINT_SIZE_PIXEL: &str = "Pixel";
+pub const POINT_SIZE_WORLD: &str = "Meter";
+pub const POINT_SIZE_MODE_HINT: &str = "Meter: jeder Punkt ist ein runder Fleck in echter Größe, aus \
+     der Nähe schließen sich die Flecken zu einem Bild. Pixel: jeder Punkt gleich groß, egal wie weit weg.";
+/// The point size slider in world size: the smallest a spot gets.
+pub const POINT_SIZE_MIN: &str = "Mindestgröße (px)";
+pub const SPOT_SIZE: &str = "Fleckgröße (cm)";
+pub const SPOT_FROM_MAP: &str = "aus der Karte";
+pub const SPOT_FROM_MAP_HINT: &str = "Raster der Karte × 1,5 (ohne Angabe 1,5 cm)";
+/// Range of a spot size set by hand (m).
+pub const POINT_M_RANGE: [f32; 2] = [0.002, 0.2];
 pub const BUDGET: &str = "Punktbudget";
 /// Range of the point budget.
 pub const BUDGET_RANGE: std::ops::RangeInclusive<usize> = 1_000_000..=30_000_000;

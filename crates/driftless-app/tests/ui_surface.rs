@@ -183,6 +183,7 @@ fn summaries(state: &mut AppState) {
         quality_known: false,
         z_range: [0.0, 1.0],
         ceiling: None,
+        point_m: 0.015,
     });
     state.surface = Some(SurfaceSummary {
         path: "oberflaeche.glb".into(),

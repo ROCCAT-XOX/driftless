@@ -6,7 +6,8 @@ use driftless_app::cloud::PointSet;
 use driftless_app::lod::{build_octree, Octree};
 use driftless_app::render::mesh::{MeshRenderer, MeshVertex};
 use driftless_app::render::{
-    headless_device, ColorMode, FrameParams, PointRenderer, RenderTarget, ShowMode, NO_CUT,
+    headless_device, ColorMode, FrameParams, PointRenderer, PointSize, RenderTarget, ShowMode,
+    NO_CUT,
 };
 use driftless_app::surface::{load_glb, LoadedSurface};
 use driftless_io::images::RgbImage;
@@ -61,6 +62,9 @@ fn frame(cam: &Camera, show: ShowMode, z_range: [f32; 2]) -> FrameParams {
         quality_known: true,
         z_range,
         show,
+        point_size: PointSize::Pixel,
+        point_m: 0.05,
+        point_px_range: [1.0, 1000.0],
     }
 }
 

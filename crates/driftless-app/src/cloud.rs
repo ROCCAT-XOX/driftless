@@ -244,6 +244,24 @@ pub struct LoadedCloud {
     pub z_range: [f32; 2],
     /// A height (relative z) just below the ceiling ([`estimate_ceiling`]), if there is one.
     pub ceiling: Option<f32>,
+    /// Spot diameter in metres for the world-size view ([`point_m_of_map`] of its folder).
+    pub point_m: f32,
+}
+
+/// Spot diameter in metres when the map's grid is unknown.
+pub const DEFAULT_POINT_M: f32 = 0.015;
+/// Spot diameter per voxel of the dense grid: a little larger, so that spots overlap.
+const POINT_M_PER_VOXEL: f64 = 1.5;
+
+/// The spot diameter for the clouds of the map folder `dir`: its `map.json`'s
+/// `settings.dense.voxel` × 1.5, else [`DEFAULT_POINT_M`].
+pub fn point_m_of_map(dir: &Path) -> f32 {
+    std::fs::read_to_string(dir.join("map.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v["settings"]["dense"]["voxel"].as_f64())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map_or(DEFAULT_POINT_M, |v| (v * POINT_M_PER_VOXEL) as f32)
 }
 
 impl LoadedCloud {
@@ -262,6 +280,11 @@ impl LoadedCloud {
             view_bounds: view_bounds(&points),
             z_range: [min[2], max[2]],
             ceiling: estimate_ceiling(&points),
+            // a bare file name (the synthetic cloud) has no map folder
+            point_m: path
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .map_or(DEFAULT_POINT_M, point_m_of_map),
             path,
             points,
             tree,

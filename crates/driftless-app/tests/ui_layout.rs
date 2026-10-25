@@ -2,7 +2,7 @@
 //! step, the settings window, the empty states and the stored layout.
 
 use driftless_app::project::{Project, ScanEntry, ScanState};
-use driftless_app::render::{ColorMode, ShowMode};
+use driftless_app::render::{ColorMode, PointSize, ShowMode};
 use driftless_app::ui::{
     rail, steps, text, Action, AppState, DriftlessApp, ScanNode, Selection, Step, SurfaceSummary,
     ViewSettings, UI_KEY,
@@ -215,6 +215,27 @@ fn settings_window_has_view_settings() {
         .click();
     h.run();
     assert!(h.state().state().settings_window.open);
+    // world size is the default: the smallest size and the spot size from the map
+    assert_eq!(h.state().state().view.point_size, PointSize::World);
+    for label in [
+        text::POINT_SIZE_MODE,
+        text::POINT_SIZE_PIXEL,
+        text::POINT_SIZE_WORLD,
+        text::POINT_SIZE_MIN,
+        text::SPOT_SIZE,
+        text::SPOT_FROM_MAP,
+    ] {
+        h.get_by_label(label);
+    }
+    // off „aus der Karte“: the size of the map (here the default) to set by hand
+    assert_eq!(h.state().state().view.point_m, None);
+    h.get_by_label(text::SPOT_FROM_MAP).click();
+    h.run();
+    assert_eq!(h.state().state().view.point_m, Some(0.015));
+    // „Pixel“: a fixed size, square or round
+    h.get_by_label(text::POINT_SIZE_PIXEL).click();
+    h.run();
+    assert_eq!(h.state().state().view.point_size, PointSize::Pixel);
     for label in [
         text::POINT_SIZE,
         text::ROUND_POINTS,

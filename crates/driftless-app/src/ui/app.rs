@@ -100,6 +100,8 @@ struct StoredUi {
     show_rejected: bool,
     show_submaps: bool,
     show_compare: bool,
+    point_size: crate::render::PointSize,
+    point_m: Option<f32>,
 }
 
 impl Default for StoredUi {
@@ -123,6 +125,8 @@ impl StoredUi {
             show_rejected: v.show_rejected,
             show_submaps: v.show_submaps,
             show_compare: v.show_compare,
+            point_size: v.point_size,
+            point_m: v.point_m,
         }
     }
 
@@ -141,6 +145,11 @@ impl StoredUi {
         v.show_rejected = self.show_rejected;
         v.show_submaps = self.show_submaps;
         v.show_compare = self.show_compare;
+        v.point_size = self.point_size;
+        v.point_m = self
+            .point_m
+            .filter(|m| m.is_finite())
+            .map(|m| m.clamp(text::POINT_M_RANGE[0], text::POINT_M_RANGE[1]));
     }
 }
 
@@ -627,6 +636,7 @@ impl DriftlessApp {
                         quality_known: cloud.points.quality_known,
                         z_range: cloud.z_range,
                         ceiling: cloud.ceiling,
+                        point_m: cloud.point_m,
                     });
                     self.state.view.cut = None;
                     self.state.picked = None;

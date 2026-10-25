@@ -22,13 +22,15 @@
 
 use super::{text, ViewSettings};
 use crate::camera::{fly_motion, Camera, CameraMode, FlyKeys, ZOOM_FACTOR};
-use crate::cloud::LoadedCloud;
+use crate::cloud::{LoadedCloud, DEFAULT_POINT_M};
 use crate::lod::{select_nodes, Octree, PointVertex};
 use crate::overlay::RunOverlay;
 use crate::overlay::{COMPARE_B_COLOR, COMPARE_COLOR, PICK_COLOR};
 use crate::pick::{pick_point_in, project, to_physical};
 use crate::render::mesh::MeshRenderer;
-use crate::render::{ColorMode, FrameParams, PointRenderer, RenderTarget, ShowMode, NO_CUT};
+use crate::render::{
+    ColorMode, FrameParams, PointRenderer, PointSize, RenderTarget, ShowMode, NO_CUT,
+};
 use crate::surface::LoadedSurface;
 use eframe::egui::{self, Color32, Key, PointerButton, Rect, Sense, Ui};
 use egui_wgpu::wgpu;
@@ -48,6 +50,9 @@ const PICK_RADIUS: f32 = 6.0;
 /// Diameter of the largest markers – the picked point and the picked places (points); the
 /// submap anchors are half as large.
 pub const MARKER_PX: f32 = 14.0;
+/// Largest diameter of a world-size spot (points), so that nothing near the eye covers the
+/// view.
+pub const SPOT_MAX_PX: f32 = 24.0;
 /// One step of the mouse wheel (points of scrolling).
 const WHEEL_STEP: f32 = 50.0;
 /// Flying speed: this fraction of the cloud's diagonal per second, within the bounds (m/s).
@@ -231,6 +236,8 @@ struct FrameKey {
     z_range: [f32; 2],
     overlay: u64,
     show: ShowMode,
+    point_size: PointSize,
+    point_m: f32,
     /// How often a surface was uploaded, and the origin it is drawn in.
     surface: (u64, Option<[f64; 3]>),
 }
@@ -544,6 +551,10 @@ impl View3d {
             z_range: settings.cut.unwrap_or(NO_CUT),
             overlay: self.overlay_count,
             show: effective_show(settings.show, self.surface.is_some(), cloud.is_some()),
+            point_size: settings.point_size,
+            point_m: settings
+                .point_m
+                .unwrap_or_else(|| cloud.map_or(DEFAULT_POINT_M, |c| c.point_m)),
             surface: (self.surface_count, view_origin),
         };
         if self.last.as_ref() != Some(&key) {
@@ -574,6 +585,10 @@ impl View3d {
                 quality_known: cloud.is_some_and(|c| c.points.quality_known),
                 z_range: key.z_range,
                 show: key.show,
+                point_size: key.point_size,
+                point_m: key.point_m,
+                // the setting is the smallest spot, so that far ones never vanish
+                point_px_range: [point_px, (SPOT_MAX_PX * ppp).max(point_px)],
             };
             if let (Some(target), Some(renderer)) = (&self.target, &mut self.renderer) {
                 // `render_with` writes the shared uniform buffers and submits its own work,

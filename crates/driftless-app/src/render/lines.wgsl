@@ -13,6 +13,11 @@ struct Frame {
     quality_known: u32,
     z_min: f32,
     z_max: f32,
+    // Used by the points only (see points.wgsl).
+    point_size: u32,
+    point_m: f32,
+    px_min: f32,
+    px_max: f32,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;

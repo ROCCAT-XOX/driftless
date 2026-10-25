@@ -3,7 +3,7 @@
 
 use driftless_app::camera::{fly_motion, FlyKeys};
 use driftless_app::cloud::{LoadedCloud, PointSet};
-use driftless_app::render::{headless_device, ColorMode, ShowMode};
+use driftless_app::render::{headless_device, ColorMode, PointSize, ShowMode};
 use driftless_app::ui::view3d::{
     color_modes, effective_color_mode, effective_show, fly_keys, is_click, point_info, target_size,
     view_bounds, View3d,
@@ -291,6 +291,8 @@ fn view_shows_point_colours_unchanged() {
     let settings = ViewSettings {
         point_px: 12.0,
         round: false,
+        // fixed squares: world-size spots are darker at their rim
+        point_size: PointSize::Pixel,
         ..ViewSettings::default()
     };
     let rs = create_render_state(
