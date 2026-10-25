@@ -211,13 +211,14 @@ fn selection_state(ui: &mut Ui, state: &AppState) {
         return;
     };
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
+    // wrapped: a long state („veraltet – …“) must not widen the field
+    ui.horizontal_wrapped(|ui| {
         ui.label(text::WITH_THIS_FINENESS);
         state_label(ui, surface_state(state, map, &state.surface_settings));
     });
     if let Selection::Surface(dir) = &state.selection {
         if let Some(surface) = map.surfaces.iter().find(|s| s.dir == *dir) {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(text::THIS_SURFACE);
                 state_label(ui, own_surface_state(state, surface));
             });

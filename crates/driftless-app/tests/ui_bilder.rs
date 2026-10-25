@@ -728,3 +728,19 @@ fn queued_map_that_left_the_project_says_so() {
         "{errors:?}"
     );
 }
+
+/// A stale surface selected: its state („veraltet – Karte oder Lauf neu gerechnet“) wraps in
+/// the field and does not widen it.
+#[test]
+fn stale_surface_does_not_widen_the_field() {
+    let mut app = app();
+    *app.state_mut() = four_maps();
+    app.state_mut().selection = Selection::Surface(format!("{MAP_C}/oberflaeche-001").into());
+    let mut h = Harness::builder()
+        .with_size([1400.0, 900.0])
+        .build_ui_state(|ui, app: &mut DriftlessApp| app.show(ui), app);
+    h.run();
+    h.get_by_label(text::THIS_SURFACE);
+    let width = h.state().layout().step.width();
+    assert!(width <= 251.0, "the field grew to {width}");
+}
