@@ -72,19 +72,20 @@ Bilder, keine Pfade mit Kundennamen).
   `thickness_before`) und neu den **Versatz zwischen Durchgängen** (Median, p90; Durchgänge über
   Zeitlücken > 5 s wie in der Kampagne) sowie Ebene lokal RMS auf `dense`.
 - `oberflaeche.json` → `accuracy` zusätzlich gegen die **ungeglättete** Wolke (`accuracy_dense`).
-- Ein Messwerkzeug im Repo (`driftless quality <ordner>` oder Test `quality_real` mit
-  Umgebungsvariable für den Datenpfad), das aus einem Lauf die Tabelle oben erzeugt: Löcher von oben
-  und Rundblick (wie `surface_real.rs`), Raummaße (große Ebenen), Versatz, Laufbahnwerte aus
-  `slam.json`. Die Python-Skripte der Kampagne sind die Vorlage; das Werkzeug ist Rust.
+- Ein Messwerkzeug für die Tabelle oben: Löcher von oben und Rundblick (wie `surface_real.rs`),
+  Raummaße (große Ebenen), Versatz, Laufbahnwerte aus `slam.json`.
 - Kein Einfluss auf Ergebnisse; die Versionen der Schritte bleiben.
-- Form: Unterbefehl `driftless qualitaet <scan> --slam <ordner> [--surface <ordner>]`, Ausgabe JSON
-  plus Tabellenzeile; dazu ein Lauf-Skript für die vier Scans auf VM 101. Die Daten liegen dort
-  unter `~/td/jmk6-2026-10-22/{20261022133554,20261022132520,20261022133028}` und
+- Form: Die Kennwerte, die jeder Lauf braucht (Versatz, Dicke, Ebene lokal RMS vor dem Glätten;
+  `accuracy_dense`), rechnet das Programm selbst in Rust und schreibt sie in `map.json` /
+  `oberflaeche.json`. Die Auswertung der Vorlagen (Raumebenen, Raummaße, Löcher aus Ansichten,
+  Tabelle) bleibt Python und kommt als Entwicklerwerkzeug nach `tools/qualitaet/` ins Repo, ohne
+  Daten. Dazu ein Lauf-Skript für die vier Scans auf VM 101. Die Daten liegen dort unter
+  `~/td/jmk6-2026-10-22/{20261022133554,20261022132520,20261022133028}` und
   `~/td/jmk6-2026-10-20/20261020173822`; normale `cargo test` brauchen sie nicht.
 - **Definitionen = die der Kampagne** (Python in `.superpowers/quality/skripte/q-analyze.py`,
   `q-views.py`, Bericht `.superpowers/quality/2026-10-24-qualitaet-report.md`, beides lokal, nicht im
-  Repo). Die Rust-Fassung muss die b-Werte der Tabelle auf denselben Daten bis auf das Laufrauschen
-  wiedergeben, bevor B beginnt.
+  Repo). Die Rust-Kennwerte müssen die Python-Werte der Kampagne auf denselben Daten bis auf 1 mm treffen
+  (sonst stehen beide im Bericht und die Python-Werte gelten).
 
 ### B – Oberfläche ohne Löcher bei 1 cm (Engpass 1)
 
@@ -167,5 +168,6 @@ entzerren. Es gibt keinen Zeitversatz LiDAR↔IMU und als Extrinsik die Identit�
   - Zwei-Stufen-TSDF als erste Wahl für B.
   - C0 vor C1, C1 vor C3 (Extrinsik nur mit Beleg).
   - Toleranzen für „nicht schlechter“, Laufrauschen-Messung in A.
-  - Messwerkzeug als Unterbefehl `driftless qualitaet`, Definitionen aus der Kampagne.
+  - Laufkennwerte in Rust (`map.json`/`oberflaeche.json`), Vorlagen-Auswertung als Python-Werkzeug
+    in `tools/qualitaet/`, Definitionen aus der Kampagne.
   - Änderungen für alle Genauigkeitsstufen; Büro-Ziel verfehlt → benennen, kein Lochfüllen.
