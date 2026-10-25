@@ -198,7 +198,8 @@ impl SurfaceSettings {
     /// The settings recorded under `settings` in an `oberflaeche.json`. The report does not
     /// hold every camera setting; those take the defaults, which is what the program and
     /// `driftless surface` always use. `None` if a value is missing or of the wrong type;
-    /// reports from before the coarse grid have no `coarse_fallback` and read as `true`.
+    /// reports from before the coarse grid have no `coarse_fallback` and read as `true`, and
+    /// ones without `max_fill_gap` take the default.
     pub fn from_report(report: &serde_json::Value) -> Option<SurfaceSettings> {
         let s = &report["settings"];
         let f64_of = |v: &serde_json::Value| v.as_f64();
@@ -212,6 +213,10 @@ impl SurfaceSettings {
             coarse_fallback: match &s["coarse_fallback"] {
                 serde_json::Value::Null => true,
                 v => v.as_bool()?,
+            },
+            max_fill_gap: match &s["max_fill_gap"] {
+                serde_json::Value::Null => defaults.max_fill_gap,
+                v => v.as_f64()?,
             },
             min_component_faces: u64_of(&s["min_component_faces"])?.try_into().ok()?,
             max_hole_perimeter: f64_of(&s["max_hole_perimeter"])?,

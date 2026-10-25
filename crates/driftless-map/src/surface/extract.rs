@@ -54,12 +54,13 @@ impl Mesh {
 }
 
 /// The mesh of the zero crossing of `sdf`, normals towards the side with positive sdf (the
-/// sensor side), and the number of cells with faces that took a corner from the coarse grid.
-/// [`FusedSdf::sample`] already applies `min_weight`.
-pub fn extract(sdf: &FusedSdf) -> (Mesh, usize) {
+/// sensor side), per face whether its cell took a corner from the coarse grid, and the number
+/// of such cells. [`FusedSdf::sample`] already applies `min_weight`.
+pub fn extract(sdf: &FusedSdf) -> (Mesh, Vec<bool>, usize) {
     let voxel = sdf.voxel();
     let mut mesh = Mesh::default();
     let mut from_coarse = 0;
+    let mut face_coarse = Vec::new();
     // (lower voxel of the edge, axis) -> vertex index
     let mut vertex_of: HashMap<([i32; 3], u8), u32> = HashMap::new();
     // The voxels the cells of a block touch (the block and one more layer above), each
@@ -82,14 +83,14 @@ pub fn extract(sdf: &FusedSdf) -> (Mesh, usize) {
                 for lx in 0..BLOCK {
                     let values = CORNERS.map(|o| corners[at([lx + o[0], ly + o[1], lz + o[2]])]);
                     let cell = [origin[0] + lx, origin[1] + ly, origin[2] + lz];
-                    if cell_triangles(values, voxel, cell, &mut vertex_of, &mut mesh) {
-                        from_coarse += 1;
-                    }
+                    let coarse = cell_triangles(values, voxel, cell, &mut vertex_of, &mut mesh);
+                    from_coarse += usize::from(coarse);
+                    face_coarse.resize(mesh.indices.len(), coarse);
                 }
             }
         }
     }
-    (mesh, from_coarse)
+    (mesh, face_coarse, from_coarse)
 }
 
 /// Adds the faces of `cell` from the values of its corners (in [`CORNERS`] order; `None` =
@@ -240,7 +241,7 @@ mod tests {
             let dense = |y: f64, _| stripes && (y / 0.1).floor().rem_euclid(2.0) == 0.0;
             let scan = wall_x(2.003, f64::from(half), step, dense);
             let sdf = FusedSdf::integrate(&scan.input(), &cfg, &Progress::new()).unwrap();
-            let (m, from_coarse) = extract(&sdf);
+            let (m, _, from_coarse) = extract(&sdf);
             assert!(from_coarse > 0, "stripes {stripes}");
             let mut edges: HashMap<(u32, u32), u32> = HashMap::new();
             for f in &m.indices {

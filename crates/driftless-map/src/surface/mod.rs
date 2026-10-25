@@ -79,6 +79,10 @@ pub struct SurfaceConfig {
     /// grid of twice the voxel edge ([`FusedSdf`]); off, or with `min_weight` 1, it stays
     /// unobserved.
     pub coarse_fallback: bool,
+    /// A face from the coarse grid is dropped if no input point lies within this distance
+    /// of its centre (m): the coarse band reaches twice as far and can close surfaces
+    /// nothing was measured on.
+    pub max_fill_gap: f64,
     /// Mesh components with fewer faces are dropped.
     pub min_component_faces: usize,
     /// Holes in a surface with a rim of at most this length are closed (m). The rims of open
@@ -110,6 +114,7 @@ impl Default for SurfaceConfig {
             truncation_voxels: 4.0,
             min_weight: 2,
             coarse_fallback: true,
+            max_fill_gap: 0.015,
             min_component_faces: 200,
             max_hole_perimeter: 2.0,
             simplify_error: 0.002,
@@ -138,6 +143,9 @@ impl SurfaceConfig {
         }
         if self.min_weight == 0 {
             return bad("Mindestgewicht eines Voxels muss mindestens 1 sein");
+        }
+        if !(self.max_fill_gap.is_finite() && self.max_fill_gap > 0.0) {
+            return bad("Abstand gefüllter Flächen zu Messpunkten muss größer als 0 sein");
         }
         if !(self.max_hole_perimeter.is_finite() && self.max_hole_perimeter >= 0.0) {
             return bad("Lochumfang darf nicht negativ sein");
@@ -184,6 +192,9 @@ pub struct SurfaceStats {
     /// Cells of the extracted mesh with faces that took at least one corner from the coarse
     /// grid.
     pub cells_from_coarse: usize,
+    /// Faces from the coarse grid dropped for lack of a point within
+    /// [`SurfaceConfig::max_fill_gap`].
+    pub faces_unsupported: usize,
     /// Faces of the final mesh.
     pub faces_final: usize,
     /// Vertices of the final mesh (shared between faces; the texture pages repeat the ones
@@ -274,10 +285,11 @@ pub fn build_mesh(
     check_cancel(progress)?;
 
     progress.phase("Oberfläche: Netz", None);
-    let (mut raw, cells_from_coarse) = extract(&sdf);
+    let (mut raw, face_coarse, cells_from_coarse) = extract(&sdf);
     drop(sdf);
     stats.faces_raw = raw.indices.len();
     stats.cells_from_coarse = cells_from_coarse;
+    stats.faces_unsupported = drop_unsupported(&mut raw, &face_coarse, input.xyz, cfg.max_fill_gap);
     clock.lap(&mut stats, "extract");
     check_cancel(progress)?;
 
@@ -509,6 +521,46 @@ fn accuracy(mesh: &Mesh, xyz: &[[f32; 3]]) -> AccuracySplit {
         edges: Accuracy::of(pick(false)),
         all: Accuracy::of(mm),
     }
+}
+
+/// Removes the faces flagged in `coarse` whose centre has no point of `xyz` within
+/// `max_gap` (m); returns how many. Unused vertices stay for [`cleanup`] to drop.
+fn drop_unsupported(mesh: &mut Mesh, coarse: &[bool], xyz: &[[f32; 3]], max_gap: f64) -> usize {
+    use kiddo::{ImmutableKdTree, SquaredEuclidean};
+    use rayon::prelude::*;
+    if !coarse.contains(&true) {
+        return 0;
+    }
+    let tree = (xyz.len() >= 2)
+        .then(|| ImmutableKdTree::<f32, 3>::new_from_slice(xyz).expect("fewer than 2^32 points"));
+    let gap2 = (max_gap * max_gap) as f32;
+    let keep: Vec<bool> = mesh
+        .indices
+        .par_iter()
+        .zip(coarse)
+        .map(|(f, &c)| {
+            if !c {
+                return true;
+            }
+            let p = f.map(|v| mesh.positions[v as usize]);
+            let cen = [0, 1, 2].map(|a| (p[0][a] + p[1][a] + p[2][a]) / 3.0);
+            let d2 = match (&tree, xyz.first()) {
+                (Some(t), _) => {
+                    t.query(&cen)
+                        .nearest_one::<SquaredEuclidean<f32>>()
+                        .execute()
+                        .distance
+                }
+                (None, Some(q)) => (0..3).map(|a| (cen[a] - q[a]).powi(2)).sum(),
+                (None, None) => f32::INFINITY,
+            };
+            d2 <= gap2
+        })
+        .collect();
+    let before = mesh.indices.len();
+    let mut it = keep.iter();
+    mesh.indices.retain(|_| *it.next().unwrap());
+    before - mesh.indices.len()
 }
 
 /// Wall-clock time per phase.
@@ -782,6 +834,29 @@ mod tests {
         assert_eq!(on.positions, off.positions);
         assert_eq!(on.indices, off.indices);
         assert_eq!(stats.cells_from_coarse, 0);
+    }
+
+    #[test]
+    fn coarse_faces_far_from_points_are_dropped() {
+        // Two faces at x = 0 and two 5 cm away; the points lie on x = 0. Only the far face
+        // from the coarse grid goes.
+        let mut mesh = Mesh {
+            positions: vec![
+                [0.0, 0.0, 0.0],
+                [0.0, 0.01, 0.0],
+                [0.0, 0.0, 0.01],
+                [0.05, 0.0, 0.0],
+                [0.05, 0.01, 0.0],
+                [0.05, 0.0, 0.01],
+            ],
+            indices: vec![[0, 1, 2], [0, 1, 2], [3, 4, 5], [3, 4, 5]],
+        };
+        let xyz = [[0.0f32, 0.0, 0.0], [0.0, 0.01, 0.01]];
+        let coarse = [false, true, false, true];
+        assert_eq!(drop_unsupported(&mut mesh, &coarse, &xyz, 0.015), 1);
+        assert_eq!(mesh.indices, vec![[0, 1, 2], [0, 1, 2], [3, 4, 5]]);
+        // Nothing from the coarse grid: nothing to do, even without points.
+        assert_eq!(drop_unsupported(&mut mesh, &[false; 3], &[], 0.015), 0);
     }
 
     #[test]
