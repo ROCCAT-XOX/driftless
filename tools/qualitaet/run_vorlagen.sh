@@ -56,6 +56,7 @@ for scan in "${scans[@]}"; do
   step "$d" slam 0 driftless slam "$scan" -o "$d" || continue
   step "$d" map 1 driftless map "$scan" --slam "$d" --voxel "$map_voxel" --gpu an || continue
   step "$d" surface 1 driftless surface "$scan" --slam "$d" --voxel "$surface_voxel" --gpu an -o "$d/oberflaeche" || continue
+  "$here/q_images.sh" "$d" || echo "   Bilder/Löcher fehlgeschlagen (weiter)"
   step "$d" analyze 0 "$python" "$here/q_analyze.py" variant "$d" || continue
   names+=("$name")
 done

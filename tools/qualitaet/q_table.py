@@ -31,7 +31,22 @@ def f(v, nd=1):
     return str(v)
 
 
+def holes(scan):
+    """LOECHER lines of <scan>/images.log: {view: percent}."""
+    out = {}
+    try:
+        for line in open(os.path.join(BASE, scan, "images.log"), errors="replace"):
+            p = line.split()
+            if len(p) == 3 and p[0] == "LOECHER":
+                out[p[1]] = float(p[2])
+    except FileNotFoundError:
+        pass
+    return out
+
+
 ROWS = [
+    ("Löcher von oben (%)", lambda m: holes(m["scan"]).get("oben"), 1),
+    ("Löcher Rundblick min–max (%)", lambda m: (lambda h: f"{min(h):.1f}–{max(h):.1f}" if h else None)([v for k, v in holes(m["scan"]).items() if k.startswith("rundblick_")]), 0),
     ("Zeit SLAM (s)", lambda m: g(m, "steps", "slam", "seconds"), 1),
     ("Zeit Karte (s)", lambda m: g(m, "steps", "map", "seconds") or g(m, "steps", "color", "seconds"), 0),
     ("Zeit Oberfläche (s)", lambda m: g(m, "steps", "surface", "seconds"), 0),

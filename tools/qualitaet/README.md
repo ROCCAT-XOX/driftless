@@ -9,6 +9,7 @@ Die Messgrößen und Ziele stehen in `docs/superpowers/specs/2026-10-25-qualitae
 | `run_vorlagen.sh` | Lauf für alle Scans: slam, map (GPU), surface (GPU), Messung, Tabelle |
 | `q_analyze.py` | `variant <Lauf-Ordner>` → `metrics.json`; `cross <Label-Ordner> <Ref> <S2> <S3>` → `cross.json`, `canon.json` |
 | `q_table.py` | `<Label-Ordner> [Scan …]` → Markdown-Tabelle |
+| `q_images.sh` | `<Lauf-Ordner>` → Bilder in `bilder/` (bleiben auf der VM) und `images.log` mit den Zeilen `LOECHER <Ansicht> <Prozent>`; nutzt den ignorierten Test `crates/driftless-steps/tests/quality_real.rs` (baut ihn, falls nötig) |
 | `q_views.py` | `<Scan> <canon.json>` → Kamerapositionen (`QA_VIEWS`) des schwarzen Raums im Rahmen des jeweiligen Scans |
 
 ## Was gemessen wird (Python, `q_analyze.py`)
@@ -36,8 +37,16 @@ Die Zeilen „Programm: …“ der Tabelle sind die Kennwerte, die das Programm 
 (`map.json` → `steps.clean.stats.dense_quality`, `oberflaeche.json` → `stats.accuracy_dense`), die
 Zeilen „dense: …“ derselbe Wert nach der Python-Definition. Beide sollen innerhalb 1 mm liegen.
 
-Nicht enthalten: „Löcher von oben“ und Rundblick (Ziel Z1) kommen aus dem Ansichtswerkzeug
-(`surface_real.rs`), nicht aus diesen Skripten.
+### Löcher (Ziel Z1, `q_images.sh`)
+
+Der Test `quality_real` zeichnet die Oberfläche (`oberflaeche.glb`) und die Punktwolke (`color.las`)
+aus derselben Kamera und zählt, wie viele Pixel mit Punkten keine Oberfläche zeigen. Ansichten:
+`oben` (von oben, bis 0,6 m über der mittleren Bahnhöhe), `rundblick_000` bis `rundblick_315`
+(8 Richtungen aus der Raummitte) und, wenn `<Label-Ordner>/canon.json` von `q_analyze.py cross`
+existiert, die festen Ansichten des schwarzen Raums. Die Tabelle zeigt „Löcher von oben“ und die
+Spanne min–max der Rundblick-Ansichten. Der Test ist `#[ignore]` und braucht Daten über
+Umgebungsvariablen (`QA_A_SURF`, `QA_A_CLOUD`, `QA_TRAJ`, `QA_OUT`; optional `QA_B_*` für einen
+zweiten Lauf nebeneinander), normale `cargo test` laufen ohne ihn.
 
 ## Auf VM 101 ausführen
 
