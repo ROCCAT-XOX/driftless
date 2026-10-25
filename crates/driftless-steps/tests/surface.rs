@@ -121,6 +121,8 @@ fn surface_end_to_end() {
     assert_eq!(report["axes"], "glb: Y oben; obj: Z oben");
     assert_eq!(report["input_id"].as_str().unwrap().len(), 16);
     assert!(report["stats"]["seconds"]["tsdf"].is_number());
+    assert_eq!(report["settings"]["coarse_fallback"], true);
+    assert!(report["stats"]["cells_from_coarse"].is_u64(), "{report}");
     assert!(report["files"].as_array().unwrap().len() >= 4);
     let on_disk: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dest.join(SURFACE_REPORT)).unwrap()).unwrap();

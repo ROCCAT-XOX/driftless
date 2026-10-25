@@ -1,7 +1,7 @@
 //! Photo-like surface (baustein 2): a TSDF from the cleaned points, then mesh, texture, glb/obj.
 //!
-//! [`build_surface`] runs the chain ([`build_mesh`] and [`texture_mesh`] are its two halves): [`Tsdf`] (the cleaned points and the positions they were
-//! measured from fused into a truncated signed distance field) → [`extract`] → [`cleanup`] →
+//! [`build_surface`] runs the chain ([`build_mesh`] and [`texture_mesh`] are its two halves): [`FusedSdf`] (the cleaned points and the positions they were
+//! measured from fused into a truncated signed distance field, fine and coarse) → [`extract`] → [`cleanup`] →
 //! [`simplify`] → camera views per face → one image per face → texture pages → seam
 //! levelling. [`write_glb`] and [`write_obj`] write the result, [`render_preview`] draws it.
 
@@ -26,7 +26,7 @@ pub use extract::{extract, Mesh};
 pub use level::SeamStats;
 pub use preview::render_preview;
 pub use simplify::simplify;
-pub use tsdf::Tsdf;
+pub use tsdf::{FusedSdf, Tsdf};
 pub use views::TextureSource;
 pub use write::{encode_pages, write_glb, write_obj, PageJpegs};
 
@@ -75,6 +75,10 @@ pub struct SurfaceConfig {
     pub truncation_voxels: f32,
     /// A voxel needs this many measurements to count as observed.
     pub min_weight: u32,
+    /// A fine voxel with fewer than `min_weight` measurements takes its value from a second
+    /// grid of twice the voxel edge ([`FusedSdf`]); off, or with `min_weight` 1, it stays
+    /// unobserved.
+    pub coarse_fallback: bool,
     /// Mesh components with fewer faces are dropped.
     pub min_component_faces: usize,
     /// Holes in a surface with a rim of at most this length are closed (m). The rims of open
@@ -105,6 +109,7 @@ impl Default for SurfaceConfig {
             voxel: 0.02,
             truncation_voxels: 4.0,
             min_weight: 2,
+            coarse_fallback: true,
             min_component_faces: 200,
             max_hole_perimeter: 2.0,
             simplify_error: 0.002,
@@ -170,12 +175,15 @@ impl SurfaceConfig {
 /// What [`build_surface`] did.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SurfaceStats {
-    /// Allocated TSDF blocks.
+    /// Allocated TSDF blocks (fine and coarse grid).
     pub tsdf_blocks: usize,
-    /// Bytes of the TSDF voxels (8 per voxel).
+    /// Bytes of the TSDF voxels (8 per voxel, both grids).
     pub tsdf_bytes: usize,
     /// Faces of the extracted mesh, before cleanup.
     pub faces_raw: usize,
+    /// Cells of the extracted mesh with faces that took at least one corner from the coarse
+    /// grid.
+    pub cells_from_coarse: usize,
     /// Faces of the final mesh.
     pub faces_final: usize,
     /// Vertices of the final mesh (shared between faces; the texture pages repeat the ones
@@ -246,7 +254,7 @@ fn check_cancel(progress: &Progress) -> Result<(), MapError> {
     }
 }
 
-/// The untextured surface of `input`: [`Tsdf::integrate`] → [`extract`] → [`cleanup`] →
+/// The untextured surface of `input`: [`FusedSdf::integrate`] → [`extract`] → [`cleanup`] →
 /// [`simplify`], and its accuracy against the points. After this the points are no longer
 /// needed: a caller that owns them can free them before [`texture_mesh`].
 pub fn build_mesh(
@@ -259,16 +267,17 @@ pub fn build_mesh(
     let mut clock = Clock::new();
     check_cancel(progress)?;
 
-    let tsdf = Tsdf::integrate(input, cfg, progress)?;
-    stats.tsdf_blocks = tsdf.blocks().count();
-    stats.tsdf_bytes = tsdf.voxel_bytes();
+    let sdf = FusedSdf::integrate(input, cfg, progress)?;
+    stats.tsdf_blocks = sdf.block_count();
+    stats.tsdf_bytes = sdf.voxel_bytes();
     clock.lap(&mut stats, "tsdf");
     check_cancel(progress)?;
 
     progress.phase("Oberfläche: Netz", None);
-    let mut raw = extract(&tsdf, cfg);
-    drop(tsdf);
+    let (mut raw, cells_from_coarse) = extract(&sdf);
+    drop(sdf);
     stats.faces_raw = raw.indices.len();
+    stats.cells_from_coarse = cells_from_coarse;
     clock.lap(&mut stats, "extract");
     check_cancel(progress)?;
 
@@ -530,12 +539,14 @@ mod tests {
         }
     }
 
-    /// 2 cm voxels close the dark walls of real scans (1 cm left 45 % open); the band stays
-    /// 4 voxels (8 cm): the run with these values is the one that was approved.
+    /// 2 cm voxels close the dark walls of real scans (1 cm with a single grid left 45 %
+    /// open); the band stays 4 voxels (8 cm): the run with these values is the one that was
+    /// approved.
     #[test]
     fn default_voxel_is_2cm() {
         let c = SurfaceConfig::default();
         assert_eq!(c.voxel, 0.02);
+        assert!(c.coarse_fallback);
         let band = f64::from(c.truncation_voxels) * c.voxel;
         assert!((band - 0.08).abs() < 1e-9, "{band}");
     }
@@ -714,6 +725,77 @@ mod tests {
         // Without the points there is no figure.
         let (_, none) = build_mesh(&scan.input(), &small(), &Progress::new()).unwrap();
         assert_eq!(none.accuracy_dense, None);
+    }
+
+    /// [`small`] at 1 cm voxels, with or without the coarse grid.
+    fn one_cm(coarse_fallback: bool) -> SurfaceConfig {
+        SurfaceConfig {
+            voxel: 0.01,
+            coarse_fallback,
+            ..small()
+        }
+    }
+
+    /// Area (m²) of the faces of `mesh` within 1 cm of the wall `x = x0`, `|y|, |z| ≤ half`.
+    fn wall_area(mesh: &Mesh, x0: f32, half: f32) -> f64 {
+        (0..mesh.indices.len())
+            .filter(|&f| {
+                let c = mesh.indices[f].map(|v| mesh.positions[v as usize]);
+                let cen = [0, 1, 2].map(|a| (c[0][a] + c[1][a] + c[2][a]) / 3.0);
+                (cen[0] - x0).abs() < 0.01 && cen[1].abs() <= half && cen[2].abs() <= half
+            })
+            .map(|f| f64::from(mesh.face_area(f)))
+            .sum()
+    }
+
+    #[test]
+    fn sparse_wall_closes_with_coarse_fallback() {
+        // A 2 × 2 m wall, one ray every 7 mm: a 1 cm voxel column gets 1, 2 or 4 votes (about
+        // 2 on average), and every 2 × 2 columns hold one with a single vote, below
+        // min_weight; a 2 cm column gets at least 4. The 7 mm keep the distance of the
+        // vertices to their nearest point (not to the wall) below 3 mm.
+        let scan = wall_x(2.003, 1.0, 0.007, |_, _| false);
+        let (off, off_stats) = build_mesh(&scan.input(), &one_cm(false), &Progress::new()).unwrap();
+        let (on, stats) = build_mesh(&scan.input(), &one_cm(true), &Progress::new()).unwrap();
+        let (covered_off, covered_on) = (
+            wall_area(&off, 2.003, 1.0) / 4.0,
+            wall_area(&on, 2.003, 1.0) / 4.0,
+        );
+        assert!(covered_off < 0.5, "without fallback {covered_off}");
+        assert!(covered_on > 0.95, "with fallback {covered_on}");
+        assert!(stats.accuracy.walls.median_mm < 3.0, "{stats:?}");
+        assert_eq!(off_stats.cells_from_coarse, 0);
+        assert!(stats.cells_from_coarse > 0, "{stats:?}");
+        // Both grids are counted.
+        assert!(stats.tsdf_blocks > off_stats.tsdf_blocks);
+        assert!(stats.tsdf_bytes > off_stats.tsdf_bytes);
+    }
+
+    #[test]
+    fn dense_wall_is_unchanged() {
+        // 4 votes in every fine voxel the wall crosses: the coarse grid is never asked.
+        let scan = wall_x(2.003, 1.0, 0.01, |_, _| true);
+        let (off, _) = build_mesh(&scan.input(), &one_cm(false), &Progress::new()).unwrap();
+        let (on, stats) = build_mesh(&scan.input(), &one_cm(true), &Progress::new()).unwrap();
+        assert!(wall_area(&on, 2.003, 1.0) / 4.0 > 0.95);
+        assert_eq!(on.positions, off.positions);
+        assert_eq!(on.indices, off.indices);
+        assert_eq!(stats.cells_from_coarse, 0);
+    }
+
+    #[test]
+    fn min_weight_one_ignores_coarse() {
+        let scan = wall_x(2.003, 1.0, 0.007, |_, _| false);
+        let cfg = |coarse_fallback| SurfaceConfig {
+            min_weight: 1,
+            ..one_cm(coarse_fallback)
+        };
+        let (off, off_stats) = build_mesh(&scan.input(), &cfg(false), &Progress::new()).unwrap();
+        let (on, stats) = build_mesh(&scan.input(), &cfg(true), &Progress::new()).unwrap();
+        assert!(!on.indices.is_empty());
+        assert_eq!(on, off);
+        assert_eq!(stats.cells_from_coarse, 0);
+        assert_eq!(stats.tsdf_bytes, off_stats.tsdf_bytes);
     }
 
     #[test]

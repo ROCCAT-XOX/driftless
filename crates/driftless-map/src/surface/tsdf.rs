@@ -7,6 +7,10 @@
 //! counts), so the result does not depend on the order the parallel workers add them in. All
 //! voxels sit in two flat arrays (sum i32, weight u32: 8 bytes per voxel), filled as atomics
 //! and taken over in place.
+//!
+//! [`FusedSdf`] adds a second, coarse grid of twice the voxel edge from the same points: where a
+//! fine voxel has too few votes (weakly hit surfaces at a small voxel), its value comes from
+//! the coarse grid.
 
 use super::{SurfaceConfig, SurfaceInput};
 use crate::MapError;
@@ -24,6 +28,12 @@ const BLOCK_VOXELS: usize = (BLOCK * BLOCK * BLOCK) as usize;
 const VOTE_STEPS: f64 = 1000.0;
 /// Points per parallel work item (and per progress step).
 const CHUNK: usize = 4096;
+/// Progress phases of the two passes of the fine grid and of the coarse one.
+const FINE_PHASES: [&str; 2] = ["Oberfläche: Blöcke", "Oberfläche: Voxel"];
+const COARSE_PHASES: [&str; 2] = [
+    "Oberfläche: grobes Gitter, Blöcke",
+    "Oberfläche: grobes Gitter",
+];
 
 /// Fused signed distances; see the module docs.
 #[derive(Debug)]
@@ -105,6 +115,17 @@ impl Tsdf {
         cfg: &SurfaceConfig,
         progress: &Progress,
     ) -> Result<Tsdf, MapError> {
+        Tsdf::integrate_as(input, cfg, progress, FINE_PHASES)
+    }
+
+    /// [`Tsdf::integrate`] with the progress phases of its two passes (blocks, voxels) named
+    /// `phases`.
+    fn integrate_as(
+        input: &SurfaceInput,
+        cfg: &SurfaceConfig,
+        progress: &Progress,
+        phases: [&str; 2],
+    ) -> Result<Tsdf, MapError> {
         cfg.check()?;
         if input.sensor_of_point.len() != input.xyz.len() {
             return Err(MapError::Config(
@@ -129,7 +150,7 @@ impl Tsdf {
         let total = input.xyz.len() as u64;
 
         // Pass 1: which blocks are touched. Sorted, so the layout does not depend on threads.
-        progress.phase("Oberfläche: Blöcke", Some(total));
+        progress.phase(phases[0], Some(total));
         let ranges: Vec<std::ops::Range<usize>> = (0..input.xyz.len())
             .step_by(CHUNK)
             .map(|a| a..(a + CHUNK).min(input.xyz.len()))
@@ -161,7 +182,7 @@ impl Tsdf {
             .collect();
 
         // Pass 2: the votes.
-        progress.phase("Oberfläche: Voxel", Some(total));
+        progress.phase(phases[1], Some(total));
         let voxels = keys.len() * BLOCK_VOXELS;
         let sums: Vec<AtomicI32> = (0..voxels).map(|_| AtomicI32::new(0)).collect();
         let weights: Vec<AtomicU32> = (0..voxels).map(|_| AtomicU32::new(0)).collect();
@@ -235,6 +256,89 @@ impl Tsdf {
     /// Keys of the blocks (8³ voxels, key = voxel key ÷ 8) that hold any measurement, sorted.
     pub fn blocks(&self) -> impl Iterator<Item = [i32; 3]> + '_ {
         self.keys.iter().copied()
+    }
+}
+
+/// A fine [`Tsdf`] with an optional coarse one (twice the voxel edge, same
+/// `truncation_voxels`, same `min_weight`), fused from the same points.
+#[derive(Debug)]
+pub struct FusedSdf {
+    fine: Tsdf,
+    coarse: Option<Tsdf>,
+}
+
+impl FusedSdf {
+    /// Fuses the points of `input` into the fine grid and, with
+    /// [`SurfaceConfig::coarse_fallback`] and a `min_weight` above 1, into the coarse one. With
+    /// `min_weight` 1 the coarse grid is not built: the result is the single-grid one.
+    pub fn integrate(
+        input: &SurfaceInput,
+        cfg: &SurfaceConfig,
+        progress: &Progress,
+    ) -> Result<FusedSdf, MapError> {
+        let fine = Tsdf::integrate(input, cfg, progress)?;
+        let coarse = if cfg.coarse_fallback && cfg.min_weight > 1 {
+            let c = SurfaceConfig {
+                voxel: 2.0 * cfg.voxel,
+                ..cfg.clone()
+            };
+            Some(Tsdf::integrate_as(input, &c, progress, COARSE_PHASES)?)
+        } else {
+            None
+        };
+        Ok(FusedSdf { fine, coarse })
+    }
+
+    /// The signed distance (m) at fine voxel `key`: the fine value if the voxel has at least
+    /// `min_weight` votes; else the coarse grid trilinearly at the fine voxel centre if all 8
+    /// coarse voxels around it are observed; else `None`.
+    pub fn sample(&self, key: [i32; 3]) -> Option<f32> {
+        self.sample_tagged(key).map(|(s, _)| s)
+    }
+
+    /// [`FusedSdf::sample`] and whether the value came from the coarse grid.
+    pub(crate) fn sample_tagged(&self, key: [i32; 3]) -> Option<(f32, bool)> {
+        if let Some((s, _)) = self.fine.sample(key) {
+            return Some((s, false));
+        }
+        let coarse = self.coarse.as_ref()?;
+        // The fine centre (k + 0.5)·v in coarse voxel units, from the coarse centres:
+        // (k + 0.5) / 2 − 0.5 = k / 2 − 0.25 (exact in binary).
+        let g = key.map(|k| f64::from(k) * 0.5 - 0.25);
+        let base = g.map(|x| x.floor() as i32);
+        let t = [0, 1, 2].map(|a| g[a] - f64::from(base[a]));
+        let mut value = 0.0f64;
+        for corner in 0..8 {
+            let d = [corner & 1, (corner >> 1) & 1, (corner >> 2) & 1];
+            let (s, _) = coarse.sample([0, 1, 2].map(|a| base[a] + d[a]))?;
+            let w: f64 = (0..3)
+                .map(|a| if d[a] == 1 { t[a] } else { 1.0 - t[a] })
+                .product();
+            value += w * f64::from(s);
+        }
+        Some((value as f32, true))
+    }
+
+    /// Edge length of a fine voxel (m).
+    pub fn voxel(&self) -> f64 {
+        self.fine.voxel()
+    }
+
+    /// Keys of the fine blocks, sorted (see [`Tsdf::blocks`]). The zero crossings lie near
+    /// the points, inside the fine band: these blocks hold every cell with faces, also the
+    /// ones filled from the coarse grid.
+    pub fn blocks(&self) -> impl Iterator<Item = [i32; 3]> + '_ {
+        self.fine.blocks()
+    }
+
+    /// Blocks of both grids.
+    pub fn block_count(&self) -> usize {
+        self.fine.keys.len() + self.coarse.as_ref().map_or(0, |c| c.keys.len())
+    }
+
+    /// Bytes of the voxel arrays of both grids.
+    pub fn voxel_bytes(&self) -> usize {
+        self.fine.voxel_bytes() + self.coarse.as_ref().map_or(0, Tsdf::voxel_bytes)
     }
 }
 
@@ -353,6 +457,53 @@ mod tests {
         let s = super::super::sensors_for_frames(&[pose], &mount);
         assert!((s[0][0] - 10.0).abs() < 1e-5 && (s[0][1] - 1.0).abs() < 1e-5);
         assert!((s[0][2] - 0.5).abs() < 1e-5);
+    }
+
+    /// One ray per fine column `[y, z]` (1 cm voxels) to the wall x = 2.003 m, each from its
+    /// own sensor 2 m in front.
+    fn rays(columns: &[[i32; 2]]) -> super::super::testutil::Scan {
+        let xyz: Vec<[f32; 3]> = columns
+            .iter()
+            .map(|c| c.map(|k| (k as f32 + 0.5) * 0.01))
+            .map(|[y, z]| [2.003, y, z])
+            .collect();
+        super::super::testutil::Scan {
+            sensor_of_point: (0..xyz.len() as u32).collect(),
+            sensors: xyz.iter().map(|p| [p[0] - 2.0, p[1], p[2]]).collect(),
+            xyz,
+        }
+    }
+
+    #[test]
+    fn coarse_edge_gives_no_value() {
+        let cfg = SurfaceConfig {
+            voxel: 0.01,
+            ..SurfaceConfig::default()
+        };
+        // Fine voxel [199, 1, 1] (centre x = 1.995 m) has one vote; its coarse neighbours are
+        // the coarse columns 0 and 1 in y and z. Columns (1, 0), (0, 1) and (1, 1) get two
+        // rays each, column (0, 0) only the ray of the fine voxel: unobserved.
+        let mut columns = vec![[1, 1], [2, 0], [3, 0], [0, 2], [0, 3], [2, 2], [3, 3]];
+        let key = [199, 1, 1];
+        let sdf = FusedSdf::integrate(&rays(&columns).input(), &cfg, &Progress::new()).unwrap();
+        assert!(
+            sdf.fine.sample(key).is_none(),
+            "weight 1 is below min_weight"
+        );
+        assert_eq!(sdf.sample(key), None);
+        // A second ray in coarse column (0, 0): all 8 observed, the value is the distance of
+        // the voxel centre to the wall (8 mm).
+        columns.push([0, 0]);
+        let sdf = FusedSdf::integrate(&rays(&columns).input(), &cfg, &Progress::new()).unwrap();
+        let v = sdf.sample(key).expect("coarse value");
+        assert!((v - 0.008).abs() < 0.001, "{v}");
+        // Without the fallback it stays unobserved.
+        let off = SurfaceConfig {
+            coarse_fallback: false,
+            ..cfg
+        };
+        let sdf = FusedSdf::integrate(&rays(&columns).input(), &off, &Progress::new()).unwrap();
+        assert_eq!(sdf.sample(key), None);
     }
 
     #[test]
