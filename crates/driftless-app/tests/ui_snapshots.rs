@@ -4,8 +4,9 @@
 //! `tests/snapshots/`. Only on macOS (the references are made there; fonts and the GPU round
 //! differently elsewhere), and only with a GPU adapter (else the test says it was skipped).
 //!
-//! The numbers of the last frame (the frame time changes from run to run) are painted over
-//! before the comparison. New references after a wanted change of the layout:
+//! The 3D view is checked by probes (the cloud drawn, the measurement line) and then painted
+//! over, except its floating bars; the numbers of the last frame (the frame time changes from
+//! run to run) are painted over too. What is compared is the layout around the view. New references after a wanted change of the layout:
 //!
 //! ```text
 //! UPDATE_SNAPSHOTS=1 cargo test -p driftless-app --test ui_snapshots
@@ -25,7 +26,7 @@ use std::time::{Duration, Instant};
 
 const SIZE: [f32; 2] = [1400.0, 900.0];
 /// Points of the synthetic cloud: enough to fill the view, quick to build.
-const CLOUD_POINTS: usize = 300_000;
+const CLOUD_POINTS: usize = 100_000;
 /// How much a pixel may differ (YIQ distance) before it counts, and how many may: room for
 /// the rounding of text edges and of the points, not for a moved panel or button.
 const THRESHOLD: f32 = 1.5;
@@ -113,31 +114,96 @@ fn scene(name: &str) -> Option<Harness<'static, DriftlessApp>> {
     Some(h)
 }
 
-/// Renders the window, paints over the numbers of the last frame and compares it with the
-/// reference `name`.
-fn check(h: &mut Harness<'_, DriftlessApp>, name: &str) {
+/// What the 3D view must show before it is painted over.
+#[derive(Clone, Copy, PartialEq)]
+enum Probe {
+    /// The cloud: the view is not one flat background.
+    Cloud,
+    /// The cloud and a measurement line in its colour.
+    Measurement,
+}
+
+/// The pixels of `rect` (points) in `image`, clipped to it.
+fn pixels(
+    image: &image::RgbaImage,
+    rect: egui::Rect,
+    ppp: f32,
+) -> impl Iterator<Item = (u32, u32)> {
+    let (x0, y0) = (
+        (rect.min.x * ppp).max(0.0) as u32,
+        (rect.min.y * ppp).max(0.0) as u32,
+    );
+    let x1 = ((rect.max.x * ppp) as u32).min(image.width());
+    let y1 = ((rect.max.y * ppp) as u32).min(image.height());
+    (y0..y1).flat_map(move |y| (x0..x1).map(move |x| (x, y)))
+}
+
+/// Renders the window, checks the 3D view with `probe`, then paints over the view (all but
+/// the floating bars) and the numbers of the last frame, and compares the rest – rail, step
+/// field, status bar and the bars – with the reference `name`. The view itself is the part
+/// that a GPU or driver rounds differently, and noise there would bloat the references; the
+/// render tests check its pixels.
+fn check(h: &mut Harness<'_, DriftlessApp>, name: &str, probe: Probe) {
+    use driftless_app::ui::theme::DARK;
     for _ in 0..4 {
         h.step();
     }
     let ppp = h.ctx.pixels_per_point();
-    let masks: Vec<egui::Rect> = h
+    let frame_lines: Vec<egui::Rect> = h
         .query_all(By::new().label_contains(" ms "))
-        .map(|node| node.rect())
+        .map(|node| node.rect().expand(2.0))
         .collect();
-    assert!(!masks.is_empty(), "no frame line in the info");
+    assert!(!frame_lines.is_empty(), "no frame line in the info");
+    let layout = *h.state().layout();
+    let bars: Vec<egui::Rect> = [layout.info, layout.show, layout.tools, layout.cut]
+        .into_iter()
+        .flatten()
+        .collect();
     let mut image = h.render().expect("render");
-    const MASK: egui::Color32 = driftless_app::ui::theme::DARK.surface_hi;
-    for rect in masks {
-        let rect = rect.expand(2.0);
-        let (x0, y0) = ((rect.min.x * ppp) as u32, (rect.min.y * ppp) as u32);
-        let (x1, y1) = (
-            ((rect.max.x * ppp) as u32).min(image.width()),
-            ((rect.max.y * ppp) as u32).min(image.height()),
+
+    // the probes: the cloud was drawn (a spread of brightness), the measurement line is there
+    let luma: Vec<f32> = pixels(&image, layout.view, ppp)
+        .map(|(x, y)| {
+            let p = image.get_pixel(x, y).0;
+            0.3 * f32::from(p[0]) + 0.59 * f32::from(p[1]) + 0.11 * f32::from(p[2])
+        })
+        .collect();
+    let mean = luma.iter().sum::<f32>() / luma.len() as f32;
+    let spread = (luma.iter().map(|l| (l - mean).powi(2)).sum::<f32>() / luma.len() as f32).sqrt();
+    assert!(spread > 20.0, "the view looks empty (spread {spread:.1})");
+    if probe == Probe::Measurement {
+        let [r, g, b, _] = DARK.measure.to_array();
+        let near = |p: [u8; 4]| {
+            (i32::from(p[0]) - i32::from(r)).abs()
+                + (i32::from(p[1]) - i32::from(g)).abs()
+                + (i32::from(p[2]) - i32::from(b)).abs()
+                < 30
+        };
+        let line = pixels(&image, layout.view, ppp)
+            .filter(|&(x, y)| near(image.get_pixel(x, y).0))
+            .count();
+        assert!(
+            line > 100,
+            "no measurement line in the view ({line} pixels)"
         );
-        for y in y0..y1 {
-            for x in x0..x1 {
-                image.put_pixel(x, y, image::Rgba(MASK.to_array()));
-            }
+    }
+
+    let fill = image::Rgba(DARK.bg.to_array());
+    let in_bar = |x: u32, y: u32| {
+        let p = egui::pos2(x as f32 / ppp, y as f32 / ppp);
+        bars.iter().any(|b| b.contains(p))
+    };
+    let view: Vec<(u32, u32)> = pixels(&image, layout.view, ppp)
+        .filter(|&(x, y)| !in_bar(x, y))
+        .collect();
+    for (x, y) in view {
+        image.put_pixel(x, y, fill);
+    }
+    let mask = image::Rgba(DARK.surface_hi.to_array());
+    for rect in frame_lines {
+        let at: Vec<(u32, u32)> = pixels(&image, rect, ppp).collect();
+        for (x, y) in at {
+            image.put_pixel(x, y, mask);
         }
     }
     let options = SnapshotOptions::new()
@@ -151,7 +217,7 @@ fn snapshot_daten() {
     let Some(mut h) = scene("daten") else {
         return;
     };
-    check(&mut h, "snapshot_daten");
+    check(&mut h, "snapshot_daten", Probe::Cloud);
 }
 
 #[test]
@@ -160,7 +226,7 @@ fn snapshot_bilder() {
         return;
     };
     h.state_mut().apply(Action::SetStep(Step::Bilder));
-    check(&mut h, "snapshot_bilder");
+    check(&mut h, "snapshot_bilder", Probe::Cloud);
 }
 
 #[test]
@@ -189,5 +255,5 @@ fn snapshot_planung() {
         a: at(0.5, 0.2),
         b: at(0.5, 0.8),
     });
-    check(&mut h, "snapshot_planung");
+    check(&mut h, "snapshot_planung", Probe::Measurement);
 }
