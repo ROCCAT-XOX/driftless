@@ -130,7 +130,7 @@ fn vs_main(
 // Darkening at the very edge of a world-size spot (factor 1 − RIM_DARKEN), so that
 // neighbouring spots stay apart; it starts at RIM_START of the radius.
 const RIM_START: f32 = 0.8;
-const RIM_DARKEN: f32 = 0.25;
+const RIM_DARKEN: f32 = 0.12;
 
 @fragment
 fn fs_main(in: Out) -> @location(0) vec4<f32> {

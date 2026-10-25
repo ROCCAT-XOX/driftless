@@ -384,6 +384,52 @@ fn old_stored_layout_is_ignored() {
     assert_eq!(kept, Some(300.0));
 }
 
+/// A `ui-v2` stored before the spot size existed (without `point_size` and `point_m`)
+/// still loads: its settings come back, the two new fields take their defaults (spots from
+/// the map). And both new fields survive saving and loading.
+#[test]
+fn stored_view_without_spot_fields_loads() {
+    use driftless_app::render::PointSize;
+    // what is stored now, minus the two new fields: the format of before
+    let mut app = app();
+    app.apply(Action::SetStep(Step::Bilder));
+    app.state_mut().view.point_px = 3.5;
+    app.state_mut().view.color_mode = ColorMode::Intensity;
+    let mut stored: serde_json::Value = serde_json::from_str(&app.ui_to_store()).unwrap();
+    let fields = stored.as_object_mut().unwrap();
+    assert!(fields.remove("point_size").is_some());
+    assert!(fields.remove("point_m").is_some());
+    let storage = Storage([(UI_KEY.to_string(), stored.to_string())].into());
+    let mut back = self::app();
+    back.restore_ui(&egui::Context::default(), Some(&storage));
+    assert_eq!(back.state().step, Step::Bilder);
+    assert_eq!(back.state().view.point_px, 3.5);
+    assert_eq!(back.state().view.color_mode, ColorMode::Intensity);
+    assert_eq!(back.state().view.point_size, PointSize::World);
+    assert_eq!(back.state().view.point_m, None);
+
+    // round trip of both new fields
+    for (size, m) in [(PointSize::Pixel, Some(0.04)), (PointSize::World, None)] {
+        let mut app = self::app();
+        app.state_mut().view.point_size = size;
+        app.state_mut().view.point_m = m;
+        let mut storage = Storage::default();
+        eframe::App::save(&mut app, &mut storage);
+        let mut back = self::app();
+        back.restore_ui(&egui::Context::default(), Some(&storage));
+        assert_eq!(back.state().view.point_size, size);
+        assert_eq!(back.state().view.point_m, m);
+    }
+    // a hand-set size out of range is clamped when loaded
+    let mut app = self::app();
+    app.state_mut().view.point_m = Some(5.0);
+    let mut storage = Storage::default();
+    eframe::App::save(&mut app, &mut storage);
+    let mut back = self::app();
+    back.restore_ui(&egui::Context::default(), Some(&storage));
+    assert_eq!(back.state().view.point_m, Some(text::POINT_M_RANGE[1]));
+}
+
 #[test]
 fn projects_of_disk_show_in_daten() {
     // a real (empty) project: Daten shows its name and the hint for a first scan
