@@ -160,6 +160,34 @@ fn stale_map_is_refused() {
 }
 
 #[test]
+fn surface_without_dense_bin_still_succeeds() {
+    let (dir, out) = prepared("steps-surface-dense", false);
+    assert!(out.join("dense.bin").is_file(), "the map step writes it");
+    let with = run_surface(&request(&dir, &out, &out.join("with")), &Progress::new()).unwrap();
+    assert!(
+        with["stats"]["accuracy_dense"]["walls"]["median_mm"].is_number(),
+        "{with}"
+    );
+    fs::remove_file(out.join("dense.bin")).unwrap();
+    let p = Progress::new();
+    let without = run_surface(&request(&dir, &out, &out.join("without")), &p).unwrap();
+    assert!(without["stats"]["accuracy_dense"].is_null(), "{without}");
+    let infos: Vec<String> = p
+        .take_log()
+        .into_iter()
+        .filter_map(|l| match l {
+            LogLine::Info(i) => Some(i),
+            LogLine::Warning(_) => None,
+        })
+        .collect();
+    assert_eq!(
+        infos.iter().filter(|i| i.contains("dense.bin")).count(),
+        1,
+        "{infos:?}"
+    );
+}
+
+#[test]
 fn surface_without_images_is_gray_with_warning() {
     let (dir, out) = prepared("steps-surface-gray", false);
     let dest = out.join("oberflaeche");

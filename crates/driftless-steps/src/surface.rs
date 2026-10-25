@@ -10,8 +10,8 @@
 
 use crate::error::{check_cancel, failed, StepError};
 use crate::map::{
-    clean_stage_id, color_input, fallback_reason, gpu_json, hex, peak_rss_bytes, read_traj,
-    MapInput, CLEAN_BIN,
+    clean_stage_id, color_input, dense_stage_id, fallback_reason, gpu_json, hex, peak_rss_bytes,
+    read_traj, MapInput, CLEAN_BIN, DENSE_BIN,
 };
 use driftless_gpu::{GpuChoice, GpuContext, GpuPref};
 use driftless_io::atomic_write;
@@ -19,7 +19,7 @@ use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_map::surface::{
     build_mesh, encode_pages, sensors_for_frames, texture_mesh, write_glb, write_obj, Accuracy,
-    SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
+    AccuracySplit, SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
 };
 use driftless_map::{load_stage, stage_fits};
 use serde_json::{json, Value};
@@ -143,6 +143,35 @@ fn accuracy_json(a: &Accuracy) -> Value {
     })
 }
 
+fn accuracy_split_json(a: &AccuracySplit) -> Value {
+    json!({
+        "all": accuracy_json(&a.all),
+        "walls": accuracy_json(&a.walls),
+        "edges": accuracy_json(&a.edges),
+    })
+}
+
+/// The points of `dense.bin` of the map, to measure the accuracy against the cloud before
+/// cleaning and smoothing. Any failure gives `None` and a line: the surface does not need it.
+fn load_dense(req: &SurfaceRequest, progress: &Progress) -> Option<Vec<[f32; 3]>> {
+    let loaded = dense_stage_id(&req.map)
+        .map_err(|e| e.to_string())
+        .and_then(|id| {
+            load_stage(&req.map_dir.join(DENSE_BIN), &id)
+                .map_err(|e| e.to_string())
+                .map(|(cloud, _)| cloud.xyz)
+        });
+    match loaded {
+        Ok(xyz) => Some(xyz),
+        Err(why) => {
+            progress.info(format!(
+                "{DENSE_BIN} nicht lesbar ({why}): keine Genauigkeit gegen die ungeglättete Wolke"
+            ));
+            None
+        }
+    }
+}
+
 fn stats_json(s: &SurfaceStats) -> Value {
     json!({
         "tsdf_blocks": s.tsdf_blocks,
@@ -181,11 +210,8 @@ fn stats_json(s: &SurfaceStats) -> Value {
         },
         "accuracy_mean_mm": s.accuracy.all.mean_mm,
         "accuracy_p95_mm": s.accuracy.all.p95_mm,
-        "accuracy": {
-            "all": accuracy_json(&s.accuracy.all),
-            "walls": accuracy_json(&s.accuracy.walls),
-            "edges": accuracy_json(&s.accuracy.edges),
-        },
+        "accuracy": accuracy_split_json(&s.accuracy),
+        "accuracy_dense": s.accuracy_dense.as_ref().map(accuracy_split_json),
         "seconds": s.seconds,
     })
 }
@@ -251,10 +277,12 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
     }
     progress.info(format!("Karte: {} Punkte aus {CLEAN_BIN}", cloud.len()));
     let sensors = sensors_for_frames(&poses, &odom.lidar_to_imu);
+    let dense = load_dense(req, progress);
     let input = SurfaceInput {
         xyz: &cloud.xyz,
         sensor_of_point: &cloud.frame,
         sensors: &sensors,
+        dense_xyz: dense.as_deref(),
     };
     let sources: Vec<TextureSource> = color
         .map(|c| TextureSource {
@@ -266,7 +294,7 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
         .collect();
     let (mesh, mut stats) = build_mesh(&input, &req.config, progress)?;
     // The points are not needed for the texture: free them before the pages are made.
-    drop(cloud);
+    drop((cloud, dense));
     let tex = texture_mesh(
         &mesh,
         &sources,

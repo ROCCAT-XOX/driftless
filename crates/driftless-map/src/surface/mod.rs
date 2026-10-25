@@ -47,6 +47,9 @@ pub struct SurfaceInput<'a> {
     /// LiDAR positions in the world frame (m). For a map: one per frame, from
     /// [`sensors_for_frames`]; several scans are these lists appended.
     pub sensors: &'a [[f32; 3]],
+    /// The dense cloud before cleaning and smoothing, if at hand: the accuracy is measured
+    /// against it as well ([`SurfaceStats::accuracy_dense`]).
+    pub dense_xyz: Option<&'a [[f32; 3]]>,
 }
 
 /// The LiDAR position of every frame: `pose(frame_end) · lidar_to_imu`.
@@ -184,6 +187,8 @@ pub struct SurfaceStats {
     /// Distance of the final vertices to their nearest input point, all of them and split
     /// into walls and edges (see [`FLAT_VERTEX_ANGLE`]).
     pub accuracy: AccuracySplit,
+    /// The same against [`SurfaceInput::dense_xyz`]; `None` without it.
+    pub accuracy_dense: Option<AccuracySplit>,
     /// Wall-clock seconds per phase (not deterministic; never written into the mesh files).
     pub seconds: BTreeMap<&'static str, f64>,
     /// Of `seconds["views"]`: the quality pass, the pass over the images and, on the GPU,
@@ -280,6 +285,7 @@ pub fn build_mesh(
 
     progress.phase("Oberfläche: Genauigkeit", None);
     stats.accuracy = accuracy(&mesh, input.xyz);
+    stats.accuracy_dense = input.dense_xyz.map(|dense| accuracy(&mesh, dense));
     clock.lap(&mut stats, "accuracy");
     check_cancel(progress)?;
     Ok((mesh, stats))
@@ -680,6 +686,34 @@ mod tests {
         assert!((a.edges.p95_mm - 4.0).abs() < 0.01, "{a:?}");
         assert!(a.all.mean_mm > 1.0 && a.all.mean_mm < 4.0, "{a:?}");
         assert_eq!(a.all.vertices, mesh.positions.len());
+    }
+
+    #[test]
+    fn accuracy_dense_measures_against_given_points() {
+        let scan = box_room([0.0; 3], [1.0, 0.8, 0.6], 0.002);
+        let half = [1.0f32, 0.8, 0.6];
+        // Every point 5 mm into the room, along the normal of its wall.
+        let shifted: Vec<[f32; 3]> = scan
+            .xyz
+            .iter()
+            .map(|p| {
+                let mut q = *p;
+                let axis = (0..3)
+                    .find(|&k| (p[k].abs() - half[k]).abs() < 1e-6)
+                    .unwrap();
+                q[axis] -= 0.005 * p[axis].signum();
+                q
+            })
+            .collect();
+        let mut input = scan.input();
+        input.dense_xyz = Some(&shifted);
+        let (_, stats) = build_mesh(&input, &small(), &Progress::new()).unwrap();
+        let dense = stats.accuracy_dense.expect("dense accuracy");
+        assert!((dense.walls.median_mm - 5.0).abs() < 1.5, "{dense:?}");
+        assert!(stats.accuracy.walls.median_mm < 2.0, "{stats:?}");
+        // Without the points there is no figure.
+        let (_, none) = build_mesh(&scan.input(), &small(), &Progress::new()).unwrap();
+        assert_eq!(none.accuracy_dense, None);
     }
 
     #[test]

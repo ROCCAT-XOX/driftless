@@ -15,6 +15,7 @@ impl Scan {
             xyz: &self.xyz,
             sensor_of_point: &self.sensor_of_point,
             sensors: &self.sensors,
+            dense_xyz: None,
         }
     }
 }

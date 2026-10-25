@@ -1025,6 +1025,21 @@ pub fn folder_fits(input: &MapInput, dir: &Path) -> bool {
     fits().unwrap_or(false)
 }
 
+/// Input id of the dense step (and so of `dense.bin`) of a map of `input`.
+pub fn dense_stage_id(input: &MapInput) -> Result<String, StepError> {
+    let odom = input.slam.config()?.odom;
+    let project = discover_project(&input.scan).map_err(failed)?;
+    let (traj_bytes, _) = read_traj(&input.slam_dir)?;
+    dense_id(
+        &project,
+        &input.slam,
+        &odom,
+        &traj_bytes,
+        &input.map.switches.dense_config(),
+    )
+    .map_err(Into::into)
+}
+
 /// Input id of the clean step (and so of `clean.bin`) of a map of `input`: what a surface
 /// is built from.
 pub fn clean_stage_id(input: &MapInput) -> Result<String, StepError> {
