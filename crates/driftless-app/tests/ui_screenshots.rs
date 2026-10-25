@@ -229,7 +229,8 @@ fn ui_screenshots() {
         c.b.label(),
         driftless_steps::compare::render_text(&c.report)
     );
-    // „Korrekturen“ lies under „Erweitert“: fold it to leave room for the comparison
+    // „Korrekturen“ lies under „Erweitert“: open „Erweitert“, then fold „Korrekturen“ to leave
+    // room for the comparison
     driftless_app::ui::steps::daten::set_advanced(&h.ctx, true);
     h.step();
     h.get_by_label(text::CORRECTIONS).click();

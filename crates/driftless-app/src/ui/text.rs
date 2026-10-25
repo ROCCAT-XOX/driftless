@@ -61,6 +61,10 @@ pub const COMPUTE_ONE: &str = "Rechnen";
 pub const COMPUTE_HINT: &str =
     "Rechnet je Scan zuerst SLAM, falls nötig, dann die Punktwolke mit der gewählten Genauigkeit";
 pub const ALL_COMPUTED: &str = "Alle Scans sind gerechnet";
+/// With every scan done, but their maps of another precision than the one chosen.
+pub const RECOMPUTE_HINT: &str = "Scan wählen und „Rechnen“ drücken";
+/// While the background check of the maps runs: „Alle rechnen“ starts once it is done.
+pub const MAP_STATUS_PENDING: &str = "Karten werden geprüft …";
 pub const ADVANCED: &str = "Erweitert";
 
 // Panels

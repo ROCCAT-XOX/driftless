@@ -286,6 +286,9 @@ pub struct AppState {
     /// [`Action::ComputeAllMaps`], in order; the first is the one being computed. Emptied by
     /// „Abbrechen“.
     pub queue: VecDeque<PathBuf>,
+    /// The background check of [`AppState::map_status`] has not caught up with the tree yet:
+    /// until then a stale map counts as fitting, so „Alle rechnen“ waits for it.
+    pub map_status_pending: bool,
     /// The settings window ⚙.
     pub settings_window: SettingsWindow,
     /// The last check of a scan, shown under „Eigenschaften“ while that scan is selected.

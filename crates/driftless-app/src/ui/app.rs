@@ -225,6 +225,12 @@ pub struct DriftlessApp {
     /// A project switch that waits until the cancelled step has stopped: until then the
     /// step may still write into the old project, which therefore stays shown.
     pending: Option<Action>,
+    /// „Alle rechnen“ was asked for while the maps were being checked: it starts once the
+    /// check is done ([`AppState::map_status_pending`]).
+    compute_all_waiting: bool,
+    /// The map settings „Alle rechnen“ started with: every scan of the queue uses them, even
+    /// if the switches change meanwhile.
+    queue_settings: Option<driftless_steps::map::MapSettings>,
     /// The window title last sent.
     title: String,
     /// Closing waits for the cancelled step; the window closes once it has ended.
@@ -261,6 +267,8 @@ impl DriftlessApp {
             status_asked: 0,
             gaps_asked: 0,
             pending: None,
+            compute_all_waiting: false,
+            queue_settings: None,
             title: String::new(),
             closing: false,
             forget_last: false,
@@ -860,6 +868,7 @@ impl DriftlessApp {
         if !self.closing {
             self.closing = true;
             self.pending = None;
+            self.stop_queue();
             self.jobs.cancel();
             self.info(text::CLOSE_AFTER_CANCEL.to_string());
         }
@@ -1044,6 +1053,10 @@ impl DriftlessApp {
         self.sync_run();
         self.sync_compare();
         self.tick_helper();
+        self.state.map_status_pending = self.map_status_pending();
+        if self.compute_all_waiting && !self.state.map_status_pending {
+            self.compute_all();
+        }
     }
 
     fn finished(&mut self, f: JobFinished) {
@@ -1058,7 +1071,7 @@ impl DriftlessApp {
             }
             Err(StepError::Cancelled) => {
                 self.info(text::job_cancelled(&f.label));
-                self.state.queue.clear();
+                self.stop_queue();
                 None
             }
             Err(e) => {
@@ -1138,11 +1151,16 @@ impl DriftlessApp {
             .is_some_and(|e| e.path == *head)
     }
 
-    /// After a step of the queue's head: the head is done once its map was computed, and
-    /// skipped when a step of it failed or SLAM gave no run to map.
+    /// After a step of the queue's head: the head is done once its map was computed. A failed
+    /// step stops the whole queue (its error is in the status bar); SLAM that gave no run to
+    /// map drops the head.
     fn queue_step_done(&mut self, step: Option<&Action>, ok: bool) {
+        if !ok {
+            self.stop_queue();
+            return;
+        }
         let done = match step {
-            Some(Action::RunSlam(_)) if ok => {
+            Some(Action::RunSlam(_)) => {
                 !matches!(self.state.next_queued_step(), Some(Action::RunMap(_)))
             }
             _ => true,
@@ -1152,7 +1170,32 @@ impl DriftlessApp {
         }
     }
 
-    /// Queues `scans` (scan folders) and starts the first; refused while a step runs.
+    /// Empties the queue: nothing of it starts any more.
+    fn stop_queue(&mut self) {
+        self.state.queue.clear();
+        self.queue_settings = None;
+        self.compute_all_waiting = false;
+    }
+
+    /// Whether the map statuses of the current tree are still being checked.
+    fn map_status_pending(&self) -> bool {
+        self.status_asked != self.state.tree_version
+            || matches!(self.helper_running, Some(HelperTask::MapStatus(_)))
+    }
+
+    /// [`Action::ComputeAllMaps`]: the new and stale scans, once the map check is done.
+    fn compute_all(&mut self) {
+        if self.map_status_pending() && !self.jobs.is_busy() {
+            self.compute_all_waiting = true;
+            return;
+        }
+        self.compute_all_waiting = false;
+        let scans = self.state.scans_to_compute();
+        self.compute(scans);
+    }
+
+    /// Queues `scans` (scan folders) with the current map settings and starts the first;
+    /// refused while a step runs.
     fn compute(&mut self, scans: Vec<PathBuf>) {
         if let Some(job) = self.jobs.status() {
             self.error(text::busy(&job.label));
@@ -1163,21 +1206,34 @@ impl DriftlessApp {
             return;
         }
         self.state.queue = scans.into();
+        self.queue_settings = Some(self.state.map_settings.clone());
         self.advance_queue();
     }
 
-    /// Starts the next step of the queue unless a step runs. A scan whose step cannot start
-    /// (or that left the project) is dropped with its reason, and the next one tried.
+    /// Starts the next step of the queue unless a step runs, with the map settings the queue
+    /// started with. A step that cannot start stops the queue with its reason.
     fn advance_queue(&mut self) {
-        while !self.jobs.is_busy() && !self.state.queue.is_empty() {
-            let started = match self.state.next_queued_step() {
-                Some(step) => actions::start_step(&mut self.state, &mut self.jobs, &step),
-                None => Err(text::UNKNOWN_SCAN.into()),
-            };
-            if let Err(e) = started {
-                self.error(e);
-                self.state.queue.pop_front();
+        if self.jobs.is_busy() || self.state.queue.is_empty() {
+            return;
+        }
+        let started = match self.state.next_queued_step() {
+            Some(step) => {
+                // the step reads the settings from the state: lend it the queue's
+                let own = match &self.queue_settings {
+                    Some(q) => Some(std::mem::replace(&mut self.state.map_settings, q.clone())),
+                    None => None,
+                };
+                let started = actions::start_step(&mut self.state, &mut self.jobs, &step);
+                if let Some(own) = own {
+                    self.state.map_settings = own;
+                }
+                started
             }
+            None => Err(text::UNKNOWN_SCAN.into()),
+        };
+        if let Err(e) = started {
+            self.error(e);
+            self.stop_queue();
         }
     }
 
@@ -1213,6 +1269,7 @@ impl DriftlessApp {
                 if self.jobs.is_busy() =>
             {
                 // The step belongs to the old project: stop it first, switch when it ended.
+                self.stop_queue();
                 self.jobs.cancel();
                 self.pending = Some(switch);
                 self.info(text::SWITCH_AFTER_CANCEL.to_string());
@@ -1277,7 +1334,7 @@ impl DriftlessApp {
             // the status bar shows the step if one runs, else the load
             Action::Cancel if self.jobs.is_busy() => {
                 // nothing of the queue starts after the step that is stopped
-                self.state.queue.clear();
+                self.stop_queue();
                 self.jobs.cancel();
             }
             Action::Cancel => {
@@ -1303,10 +1360,7 @@ impl DriftlessApp {
             Action::Compare { a, b } => self.start_compare(a, b),
             Action::CompareMaps { a, b } => self.start_compare_maps(a, b),
             Action::SetStep(step) => self.set_step(step),
-            Action::ComputeAllMaps => {
-                let scans = self.state.scans_to_compute();
-                self.compute(scans);
-            }
+            Action::ComputeAllMaps => self.compute_all(),
             Action::ComputeMap(id) => {
                 let path = self
                     .state
@@ -1352,7 +1406,7 @@ impl DriftlessApp {
     }
 
     fn set_project(&mut self, project: Project) {
-        self.state.queue.clear();
+        self.stop_queue();
         self.info(text::project_opened(&project.name));
         self.drop_surface();
         self.state.set_project(project);

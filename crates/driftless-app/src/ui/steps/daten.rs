@@ -390,10 +390,11 @@ fn job_progress(ui: &mut Ui, state: &AppState) {
 fn compute_buttons(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
     let busy = state.job.as_ref().map(|j| text::busy(&j.label));
     let invalid = state.map_settings.check().err().map(|e| e.to_string());
-    let nothing = state
-        .scans_to_compute()
-        .is_empty()
-        .then(|| text::ALL_COMPUTED.to_string());
+    // until the maps are checked a stale one counts as fitting: „Alle rechnen“ then waits
+    // for the check instead of saying that all is done
+    let pending = state.map_status_pending;
+    let nothing =
+        (!pending && state.scans_to_compute().is_empty()).then(|| text::ALL_COMPUTED.to_string());
     let selected = match &state.selection {
         Selection::Scan(id) => state.scan_node(id),
         _ => None,
@@ -431,15 +432,41 @@ fn compute_buttons(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
             match (busy, invalid) {
                 (Some(_), _) => None,
                 (None, Some(e)) => Some(text::cannot_compute(&e)),
-                (None, None) => nothing,
+                (None, None) if pending => Some(text::MAP_STATUS_PENDING.to_string()),
+                (None, None) => nothing.clone(),
             }
         }
     };
-    if let Some(why) = below {
+    let mut lines: Vec<String> = below.into_iter().collect();
+    // all done, but with another precision than the one chosen now: how to get it
+    if selected.is_none() && nothing.is_some() && other_precision(state) {
+        lines.push(text::RECOMPUTE_HINT.to_string());
+    }
+    for line in lines {
         ui.vertical_centered(|ui| {
-            ui.add(egui::Label::new(RichText::new(why).color(DARK.text_dim)).wrap());
+            ui.add(egui::Label::new(RichText::new(line).color(DARK.text_dim)).wrap());
         });
     }
+}
+
+/// Whether a computed scan has no fitting map of the voxel size chosen now.
+fn other_precision(state: &AppState) -> bool {
+    let voxel = state.map_settings.switches.voxel;
+    state.scans.iter().any(|scan| {
+        scan_status(state, scan) == ScanStatus::Done
+            && scan
+                .runs
+                .iter()
+                .rev()
+                .find(|r| r.has_result)
+                .is_some_and(|run| {
+                    !mapped(run).iter().any(|m| {
+                        m.settings
+                            .as_ref()
+                            .is_some_and(|s| (s.voxel - voxel).abs() < 1e-9)
+                    })
+                })
+    })
 }
 
 /// A wide button in the accent colour; locked with the reason as tooltip. True when clicked.

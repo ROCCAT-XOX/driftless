@@ -426,6 +426,8 @@ fn compute_all_queues_new_and_stale() {
     let d = add_scan(&mut app, &dir, "d");
     let e = add_scan(&mut app, &dir, "e");
     app.apply(Action::ComputeAllMaps);
+    // it starts once the new scans' maps are checked
+    tick_until(&mut app, |a| a.state().running.is_some());
     assert_eq!(app.state().queue.len(), 2);
     assert_eq!(app.state().running, Some(Action::RunSlam(d)));
     app.apply(Action::Cancel);
@@ -485,4 +487,145 @@ fn job_survives_step_switch() {
         std::thread::sleep(Duration::from_millis(5));
         h.step();
     }
+}
+
+/// Ticks until `cond` holds.
+fn tick_until(app: &mut DriftlessApp, cond: impl Fn(&DriftlessApp) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !cond(app) {
+        assert!(Instant::now() < deadline, "condition not reached");
+        std::thread::sleep(Duration::from_millis(2));
+        app.tick();
+    }
+}
+
+/// An app with a new project in `dir` and the new scans `names`, map statuses known.
+fn project_with(dir: &Path, names: &[&str]) -> (DriftlessApp, Vec<String>) {
+    let mut app = app();
+    app.apply(Action::NewProject {
+        dir: dir.join("projekt"),
+        name: "Halle".into(),
+    });
+    let ids = names.iter().map(|n| add_scan(&mut app, dir, n)).collect();
+    settle(&mut app);
+    (app, ids)
+}
+
+/// The `slam-NNN` folders of the scan `id` on disk.
+fn run_dirs(project: &Path, id: &str) -> usize {
+    std::fs::read_dir(project.join("scans").join(id))
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("slam-"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn closing_empties_the_queue() {
+    let dir = tmp("ui-daten-schliessen");
+    let (mut app, ids) = project_with(&dir, &["a", "b"]);
+    let project = app.state().project.as_ref().unwrap().dir.clone();
+    app.apply(Action::ComputeAllMaps);
+    assert_eq!(app.state().queue.len(), 2);
+    // a step runs: the close is put off, and nothing of the queue follows
+    assert!(!app.close_requested());
+    assert!(app.state().queue.is_empty());
+    tick_until(&mut app, |a| a.state().running.is_none());
+    settle(&mut app);
+    assert!(app.take_close());
+    assert_eq!(run_dirs(&project, &ids[1]), 0);
+}
+
+#[test]
+fn project_switch_empties_the_queue() {
+    let dir = tmp("ui-daten-wechsel");
+    let (mut app, ids) = project_with(&dir, &["a", "b"]);
+    let old = app.state().project.as_ref().unwrap().dir.clone();
+    app.apply(Action::ComputeAllMaps);
+    assert_eq!(app.state().queue.len(), 2);
+    app.apply(Action::NewProject {
+        dir: dir.join("anderes"),
+        name: "Anderes".into(),
+    });
+    assert!(app.state().queue.is_empty());
+    settle(&mut app);
+    assert_eq!(app.state().project.as_ref().unwrap().name, "Anderes");
+    assert!(app.state().queue.is_empty());
+    assert!(app.state().running.is_none());
+    // the second scan of the old project never started
+    assert_eq!(run_dirs(&old, &ids[1]), 0);
+}
+
+#[test]
+fn failed_step_stops_the_queue() {
+    // Chosen: a failing scan stops „Alle rechnen“ with its error and empties the queue, so
+    // that nothing runs on unseen after a problem.
+    let dir = tmp("ui-daten-fehler");
+    let (mut app, ids) = project_with(&dir, &["a", "b", "c"]);
+    app.apply(Action::ComputeAllMaps);
+    assert_eq!(app.state().queue.len(), 3);
+    // b's folder goes while a is computed
+    std::fs::remove_dir_all(dir.join("b")).unwrap();
+    settle(&mut app);
+    assert_eq!(status_of(&app, &ids[0]), ScanStatus::Done);
+    assert!(!errors(&app).is_empty(), "no error shown");
+    assert!(app.state().queue.is_empty());
+    assert_eq!(status_of(&app, &ids[2]), ScanStatus::New);
+    assert!(app.state().scan_node(&ids[2]).unwrap().runs.is_empty());
+}
+
+#[test]
+fn queue_keeps_the_settings_it_started_with() {
+    let dir = tmp("ui-daten-schnappschuss");
+    let (mut app, ids) = project_with(&dir, &["a", "b"]);
+    app.apply(Action::ComputeAllMaps);
+    // changed while the first scan is computed: the queue does not take it
+    app.state_mut().map_settings.switches.voxel = 0.02;
+    settle(&mut app);
+    assert_eq!(errors(&app), Vec::<String>::new());
+    for id in &ids {
+        let node = app.state().scan_node(id).unwrap();
+        let map = node.runs.last().unwrap().maps.last().unwrap();
+        assert_eq!(map.settings.as_ref().unwrap().voxel, 0.01, "{id}");
+    }
+    assert_eq!(app.state().map_settings.switches.voxel, 0.02);
+}
+
+#[test]
+fn compute_all_waits_for_the_map_check() {
+    let dir = tmp("ui-daten-pruefung");
+    let (mut app, _) = project_with(&dir, &["a"]);
+    // a new scan: the tree changed, its maps are being checked
+    let b = add_scan(&mut app, &dir, "b");
+    app.apply(Action::ComputeAllMaps);
+    tick_until(&mut app, |a| a.state().running.is_some());
+    let queue: Vec<PathBuf> = app.state().queue.iter().cloned().collect();
+    assert_eq!(queue.len(), 2);
+    assert_eq!(queue[1], scan_path(&app, &b));
+    settle(&mut app);
+
+    // the field says so instead of „Alle Scans sind gerechnet“
+    let mut state = three_scans();
+    state.scans.truncate(2);
+    state.scans.remove(0);
+    state.map_status_pending = true;
+    let h = panel(state);
+    h.get_by_label(text::MAP_STATUS_PENDING);
+    assert!(h.query_by_label(text::ALL_COMPUTED).is_none());
+}
+
+#[test]
+fn new_precision_with_all_done_says_what_to_do() {
+    let mut state = three_scans();
+    state.scans.truncate(2);
+    state.scans.remove(0);
+    let mut h = panel(state);
+    h.get_by_label(text::ALL_COMPUTED);
+    assert!(h.query_by_label(text::RECOMPUTE_HINT).is_none());
+    click(&mut h, text::PRECISION_MAX);
+    h.get_by_label(text::RECOMPUTE_HINT);
+    click(&mut h, text::PRECISION_EXACT);
+    assert!(h.query_by_label(text::RECOMPUTE_HINT).is_none());
 }
