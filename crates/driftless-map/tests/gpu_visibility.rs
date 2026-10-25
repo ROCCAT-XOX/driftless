@@ -153,15 +153,29 @@ fn visible_set_matches_cpu() {
         let depth = v.read_depth();
         let seen = cpu.iter().filter(|&&s| s).count();
         let mut d = 0;
+        let mut off_edge = 0;
         for i in (0..cpu.len()).filter(|&i| cpu[i] != gpu[i]) {
             d += 1;
-            assert!(
-                at_depth_edge(&cloud.xyz[i], cam, world_cam, &depth, params.zbuffer_scale),
-                "Bild {n}: Punkt {i} {:?} weicht ab (CPU {}), liegt an keiner Tiefenkante",
-                cloud.xyz[i],
-                cpu[i]
-            );
+            if !at_depth_edge(&cloud.xyz[i], cam, world_cam, &depth, params.zbuffer_scale) {
+                off_edge += 1;
+                eprintln!(
+                    "Bild {n}: Punkt {i} {:?} weicht ab (CPU {}), liegt an keiner Tiefenkante",
+                    cloud.xyz[i], cpu[i]
+                );
+            }
         }
+        // A hardware GPU differs only at depth edges. A software rasteriser (WARP on the
+        // Windows runners) may round a division differently: one point in 10 000 visible ones
+        // that sits at the depth tolerance may flip there as well.
+        let allowed = if ctx.info().software {
+            seen / 10_000 + 1
+        } else {
+            0
+        };
+        assert!(
+            off_edge <= allowed,
+            "Bild {n}: {off_edge} Punkte weichen abseits der Tiefenkanten ab (erlaubt {allowed})"
+        );
         assert!(seen > 1000, "Bild {n}: nur {seen} Punkte sichtbar");
         assert!(
             d * 1000 <= seen,
