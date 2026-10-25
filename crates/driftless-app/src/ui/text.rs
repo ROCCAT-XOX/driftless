@@ -28,16 +28,23 @@ pub const STEP_INSPECT: &str = "Prüfen";
 pub const STEP_SLAM: &str = "SLAM rechnen";
 pub const STEP_REUSE: &str = "Neu rechnen (aus Teilkarten)";
 pub const STEP_MAP: &str = "Karte rechnen";
+pub const STEP_SURFACE: &str = "Oberfläche rechnen";
 pub const NOT_COMPUTED: &str = "nicht gerechnet";
 pub const STALE: &str = "veraltet – Laufbahn neu gerechnet";
 pub const NO_CACHE: &str = "Kein Zwischenspeicher submaps.bin – zuerst SLAM rechnen";
 pub const SELECT_FOR_STEPS: &str = "Links einen Scan oder einen Lauf wählen";
 pub const THIS_MAP: &str = "Diese Karte";
+pub const THIS_SURFACE: &str = "Diese Oberfläche";
+/// The state of a surface that no longer fits its map.
+pub const SURFACE_STALE: &str = "veraltet – Karte oder Lauf neu gerechnet";
+pub const SURFACE_NEEDS_MAP: &str =
+    "Die Karte hat keine map.json – zuerst „Karte rechnen“ (mit „Bereinigen“ oder „Alles“)";
 pub const UNKNOWN_SCAN: &str = "Scan nicht im Projekt";
 pub const UNKNOWN_RUN: &str = "Lauf nicht im Projekt";
+pub const UNKNOWN_MAP: &str = "Karte nicht im Projekt";
 pub const NOT_A_STEP: &str = "Diese Aktion ist kein Schritt";
 pub const NOT_REUSED: &str = "noch nicht neu gerechnet";
-/// Label of the background job for the map statuses (not shown in the status bar).
+/// Label of the background job of the map and surface statuses (not shown in the status bar).
 pub const MAP_STATUS_JOB: &str = "Karten prüfen";
 pub const MAP_SWITCHES: &str = "Einstellungen dieser Karte";
 pub const MAP_SWITCHES_UNKNOWN: &str = "Einstellungen unbekannt (map.json fehlt oder ist unlesbar)";
@@ -72,6 +79,16 @@ pub const VOXEL: &str = "Voxelgröße (m)";
 pub const DOWNSCALE: &str = "Bilder verkleinern";
 /// The choices of [`DOWNSCALE`] for 1, 2 and 4.
 pub const DOWNSCALE_CHOICES: [(u32, &str); 3] = [(1, "1/1"), (2, "1/2"), (4, "1/4")];
+pub const SURFACE_SETTINGS: &str = "Oberflächen-Einstellungen";
+pub const SURFACE_SETTINGS_HINT: &str = "Gelten für die nächste Oberfläche dieser Karte";
+pub const SURFACE_VOXEL: &str = "Voxelgröße";
+/// The choices of [`SURFACE_VOXEL`] (m): finer needs more memory and time.
+pub const SURFACE_VOXEL_CHOICES: [(f64, &str); 3] =
+    [(0.01, "1 cm"), (0.015, "1,5 cm"), (0.02, "2 cm")];
+pub const SURFACE_VOXEL_HINT: &str =
+    "Kleiner ist feiner, braucht mehr Speicher und Zeit; 1 cm braucht bei großen Aufnahmen über \
+     4 GB Arbeitsspeicher, und dunkle Wände bleiben löchrig";
+pub const SURFACE_NO_PHOTOS: &str = "ohne Fotos (graue Fläche)";
 
 // The 3D view and its properties (right panel)
 pub const VIEW_NO_GPU: &str = "3D-Ansicht nicht verfügbar: keine wgpu-Grafik";
@@ -98,6 +115,16 @@ pub const VIEW_HELP_ORBIT: &str =
 pub const VIEW_HELP_FLY: &str =
     "W/A/S/D, Q/E: fliegen (Shift schneller) · rechte Taste: umsehen · Rad: vor/zurück · F: alles zeigen · Klick: Punkt";
 pub const LOAD_CLOUD: &str = "Wolke laden";
+pub const LOAD_SURFACE: &str = "Oberfläche laden";
+pub const OPEN_SURFACE: &str = "Oberfläche öffnen …";
+pub const DIALOG_OPEN_SURFACE: &str = "Oberfläche öffnen (oberflaeche.glb)";
+pub const SHOW_MODE: &str = "Anzeige";
+pub const SHOW_SURFACE: &str = "Oberfläche";
+pub const SHOW_CLOUD: &str = "Punktwolke";
+pub const SHOW_BOTH: &str = "beides";
+pub const SHOW_MODE_KEY_HINT: &str = "Taste O: Oberfläche → Punktwolke → beides";
+/// A glb that cannot be read from disk because it is not there.
+pub const SURFACE_FILE_MISSING: &str = "Datei nicht gefunden";
 pub const SYNTHETIC_CLOUD: &str = "Testwolke";
 pub const PHASE_SYNTHETIC: &str = "Testwolke erzeugen";
 pub const POINT: &str = "Punkt";
@@ -266,6 +293,10 @@ pub fn unknown_run(dir: &std::path::Path) -> String {
     format!("{UNKNOWN_RUN}: {}", dir.display())
 }
 
+pub fn unknown_map(dir: &std::path::Path) -> String {
+    format!("{UNKNOWN_MAP}: {}", dir.display())
+}
+
 /// „Einfärben wird übersprungen: keine Kamerabilder …“ (step „Alles“ on a scan without them).
 pub fn color_skipped(why: &str) -> String {
     format!("{STEP_COLOR} wird übersprungen: {why}")
@@ -419,6 +450,66 @@ pub fn bad_synthetic(value: Option<&str>) -> String {
         None => format!("--synthetic braucht eine Punktzahl; {USAGE}"),
         Some(v) => format!("--synthetic {v}: keine gültige Punktzahl; {USAGE}"),
     }
+}
+
+/// „Oberfläche 001“: a surface folder `oberflaeche-001` in the tree.
+pub fn surface_label(digits: &str) -> String {
+    format!("Oberfläche {digits}")
+}
+
+/// A stale surface in the tree: „Oberfläche 001 · veraltet – Karte oder Lauf neu gerechnet“.
+pub fn surface_stale(label: &str) -> String {
+    format!("{label} · {SURFACE_STALE}")
+}
+
+/// The step found a surface that fits: nothing to compute.
+pub fn surface_fits(dir: &std::path::Path) -> String {
+    let name = dir.file_name().map_or_else(
+        || dir.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    format!("{name} passt schon zu Karte und Einstellungen; nichts zu rechnen")
+}
+
+/// A file that is no glb (or is cut off).
+pub fn bad_glb(error: &str) -> String {
+    format!("keine gültige glb-Datei ({error})")
+}
+
+/// A glTF whose data lie in a file of their own.
+pub fn external_buffer(uri: &str) -> String {
+    format!(
+        "Daten liegen in einer eigenen Datei ({uri}); nur eine glb mit allen Daten in der Datei \
+         wird gelesen (wie `driftless surface` sie schreibt)"
+    )
+}
+
+/// „Oberfläche: 712.218 Dreiecke · 8,4 ms GPU“ – the stats line of a surface shown alone.
+pub fn surface_stats(triangles: usize, frame_ms: f32, gpu: bool) -> String {
+    format!(
+        "Oberfläche: {} Dreiecke · {} ms {}",
+        super::status::count(triangles as u64),
+        decimal(f64::from(frame_ms), 1),
+        if gpu { "GPU" } else { "je Bild" }
+    )
+}
+
+/// „Oberfläche geladen: oberflaeche-001/oberflaeche.glb (712.218 Dreiecke, 12 Seite(n),
+/// 3,4 s)“.
+pub fn surface_loaded(path: &std::path::Path, triangles: usize, pages: usize, s: f64) -> String {
+    let name: Vec<String> = path
+        .iter()
+        .rev()
+        .take(2)
+        .map(|c| c.to_string_lossy().into_owned())
+        .collect();
+    let name: Vec<&str> = name.iter().rev().map(String::as_str).collect();
+    format!(
+        "Oberfläche geladen: {} ({} Dreiecke, {pages} Seite(n), {} s)",
+        name.join("/"),
+        point_count(triangles),
+        decimal(s, 1)
+    )
 }
 
 /// „color.las geladen: 15,6 Mio. Punkte (Laden 4,1 s, Detailstufen 2,3 s)“.

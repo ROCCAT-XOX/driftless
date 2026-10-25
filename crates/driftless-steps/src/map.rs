@@ -219,15 +219,15 @@ fn bag_list(bags: &[PathBuf]) -> Result<String, String> {
 }
 
 /// Everything colouring needs besides the cloud and the trajectory.
-struct ColorInput {
-    images: ImageSource,
-    cams: Vec<ColorCamera>,
+pub(crate) struct ColorInput {
+    pub(crate) images: ImageSource,
+    pub(crate) cams: Vec<ColorCamera>,
     /// Image bags, topics and calibration, for the input id.
-    id: String,
+    pub(crate) id: String,
 }
 
 /// The camera images and mounts of the scan, or why the scan cannot be coloured (German).
-fn color_input(
+pub(crate) fn color_input(
     scan: &Path,
     project: &Project,
     lidar_to_imu: &driftless_traj::nalgebra::Isometry3<f64>,
@@ -293,7 +293,7 @@ struct Ids {
     color: Option<String>,
 }
 
-fn hex(id: &str) -> String {
+pub(crate) fn hex(id: &str) -> String {
     format!("{:016x}", content_hash(id.as_bytes()))
 }
 
@@ -889,7 +889,7 @@ fn warn_stale(
 }
 
 /// Reads the trajectory of the SLAM folder: its bytes (for the input id) and its poses.
-fn read_traj(slam_dir: &Path) -> Result<(Vec<u8>, Vec<Pose>), String> {
+pub(crate) fn read_traj(slam_dir: &Path) -> Result<(Vec<u8>, Vec<Pose>), String> {
     let traj_path = slam_dir.join("traj.tum");
     let traj_bytes = fs::read(&traj_path).map_err(|e| {
         format!(
@@ -920,6 +920,23 @@ pub fn folder_fits(input: &MapInput, dir: &Path) -> bool {
         Some(report["steps"]["dense"]["input_id"].as_str() == Some(hex(&id).as_str()))
     };
     fits().unwrap_or(false)
+}
+
+/// Input id of the clean step (and so of `clean.bin`) of a map of `input`: what a surface
+/// is built from.
+pub fn clean_stage_id(input: &MapInput) -> Result<String, StepError> {
+    let odom = input.slam.config()?.odom;
+    let project = discover_project(&input.scan).map_err(failed)?;
+    let (traj_bytes, _) = read_traj(&input.slam_dir)?;
+    let switches = &input.map.switches;
+    let dense = dense_id(
+        &project,
+        &input.slam,
+        &odom,
+        &traj_bytes,
+        &switches.dense_config(),
+    )?;
+    Ok(clean_id(&dense, &switches.clean_config()))
 }
 
 /// The stages in `dir` ([`DENSE_BIN`], [`CLEAN_BIN`], in this order) that a map of `input`

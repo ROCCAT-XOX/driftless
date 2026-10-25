@@ -30,6 +30,7 @@ fn state() -> AppState {
         label: "Karte 001".into(),
         settings: None,
         clouds: vec![PathBuf::from("/p/scans/buero/slam-001/karte-001/color.las")],
+        surfaces: Vec::new(),
     };
     let project = Project {
         dir: PathBuf::from("/p"),

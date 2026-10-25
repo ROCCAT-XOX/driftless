@@ -3,15 +3,17 @@
 
 use super::compare::{compare_maps, compare_refs, default_refs, TrajRef};
 use super::correct::{Corrected, RunLoaded};
-use super::view3d::{point_info, View3d, ViewEvent, ViewOverlay};
+use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
     actions, left, right, status, text, Action, AppState, CloudSummary, InspectResult, Selection,
-    UiMessage, ViewStats,
+    SurfaceSummary, UiMessage, ViewStats,
 };
 use crate::cloud::{load_cloud, LoadedCloud};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
 use crate::overlay::RunOverlay;
 use crate::project::{canonical, Project};
+use crate::render::ShowMode;
+use crate::surface::{load_glb, surface_glb};
 use crate::synthetic::synthetic_cloud;
 use driftless_io::progress::Progress;
 use driftless_steps::{correct, StepError};
@@ -130,6 +132,17 @@ pub struct DriftlessApp {
     /// What the loader is loading, and what to load once it has stopped.
     loading: Option<CloudSource>,
     next_load: Option<CloudSource>,
+    /// Loads surfaces, beside the cloud loader.
+    surface_loader: JobRunner,
+    /// The glb it is loading (with its file stamp when the load began), and the one to load
+    /// once a cancelled load has stopped.
+    surface_loading: Option<(PathBuf, FileStamp)>,
+    next_surface: Option<PathBuf>,
+    /// The file stamp of the surface shown, when its load began.
+    surface_stamp: FileStamp,
+    /// The surface being loaded was dropped: its result is thrown away even if it finished
+    /// before it saw the cancel.
+    discard_surface: bool,
     /// The cloud shown; a new one replaces it only when it is ready.
     cloud: Option<LoadedCloud>,
     /// The run folder the cloud shown was loaded with.
@@ -165,7 +178,12 @@ impl DriftlessApp {
             helper: JobRunner::new(repaint.clone()),
             helper_queue: VecDeque::new(),
             helper_running: None,
-            loader: JobRunner::new(repaint),
+            loader: JobRunner::new(repaint.clone()),
+            surface_loader: JobRunner::new(repaint),
+            surface_loading: None,
+            next_surface: None,
+            surface_stamp: None,
+            discard_surface: false,
             loading: None,
             next_load: None,
             cloud: None,
@@ -297,7 +315,7 @@ impl DriftlessApp {
         self.state.correct.corrections = Some(loaded.corrections);
         match loaded.overlay {
             Ok(mut o) => {
-                o.set_origin(self.cloud.as_ref().map(|c| c.tree.origin));
+                o.set_origin(self.view_origin());
                 self.overlay = Some(o);
                 self.compare_overlay();
             }
@@ -483,6 +501,17 @@ impl DriftlessApp {
             let source = self.loading.take();
             match f.result {
                 Ok(JobOutput::Cloud(cloud)) => {
+                    // a surface of another map would hide this cloud: it goes; one of the
+                    // same map stays, and the cloud just picked is what is drawn
+                    let map = match &source {
+                        Some(CloudSource::File { path, .. }) => path.parent(),
+                        _ => None,
+                    };
+                    if self.surface_of(map) {
+                        self.state.view.show = ShowMode::Cloud;
+                    } else {
+                        self.drop_surface();
+                    }
                     self.cloud_run = match source {
                         Some(CloudSource::File { run, .. }) => run,
                         _ => None,
@@ -526,12 +555,145 @@ impl DriftlessApp {
         self.state.loading = self.loader.status();
     }
 
-    /// Loads the cloud of `selection` if it is one, with the quality of its run.
+    /// The origin the view draws in: the cloud's, else the surface's (`None`: the run's own).
+    fn view_origin(&self) -> Option<[f64; 3]> {
+        let surface = self.state.surface.as_ref().map(|s| s.origin);
+        self.cloud.as_ref().map(|c| c.tree.origin).or(surface)
+    }
+
+    /// Whether the surface shown, and one being loaded, belong to the map folder `map`: a
+    /// surface folder lies in its map folder (`karte-NNN/oberflaeche-NNN/oberflaeche.glb`).
+    fn surface_of(&self, map: Option<&Path>) -> bool {
+        let in_map = |glb: &Path| map.is_some() && glb.parent().and_then(Path::parent) == map;
+        let shown = self.state.surface.as_ref().is_none_or(|s| in_map(&s.path));
+        let loading = self.surface_loading.as_ref().is_none_or(|(p, _)| in_map(p))
+            && self
+                .next_surface
+                .as_deref()
+                .is_none_or(|p| in_map(&surface_glb(p)));
+        shown && loading
+    }
+
+    /// Takes the surface out of the view, and stops loading one.
+    fn drop_surface(&mut self) {
+        self.next_surface = None;
+        if self.surface_loader.is_busy() {
+            self.surface_loader.cancel();
+            self.discard_surface = true;
+        }
+        if self.state.surface.take().is_some() || self.view.has_surface() {
+            self.view.set_surface(None);
+        }
+        self.surface_stamp = None;
+    }
+
+    /// Whether a surface is being loaded.
+    pub fn is_loading_surface(&self) -> bool {
+        self.surface_loader.is_busy() || self.next_surface.is_some()
+    }
+
+    /// Loads the surface at `path` (a `.glb` or a surface folder) in the background; it
+    /// replaces the surface shown once ready. A surface load that runs is cancelled.
+    fn load_surface(&mut self, path: &Path) {
+        self.load_surface_with(path, false);
+    }
+
+    /// [`DriftlessApp::load_surface`]; the surface shown or being loaded is loaded again only
+    /// if its file changed since (`driftless surface -o` into the same folder) or with
+    /// `force` (picked again from the menu).
+    fn load_surface_with(&mut self, path: &Path, force: bool) {
+        let glb = surface_glb(path);
+        let stamp = file_stamp(&glb);
+        let same = |p: &PathBuf, s: &FileStamp| *p == glb && *s == stamp && stamp.is_some();
+        let loading = self
+            .surface_loading
+            .as_ref()
+            .is_some_and(|(p, s)| same(p, s));
+        let shown = self.state.surface.as_ref().map(|s| &s.path) == Some(&glb)
+            && same(&glb, &self.surface_stamp)
+            && !self.surface_loader.is_busy();
+        if !force && self.next_surface.is_none() && (loading || shown) {
+            return;
+        }
+        if self.surface_loader.is_busy() {
+            self.surface_loader.cancel();
+            self.next_surface = Some(glb);
+            return;
+        }
+        let job = glb.clone();
+        let started = self.surface_loader.start(text::LOAD_SURFACE, move |p| {
+            Ok(JobOutput::Surface(Box::new(load_glb(&job, p)?)))
+        });
+        match started {
+            Ok(()) => self.surface_loading = Some((glb, stamp)),
+            Err(e) => self.error(e.to_string()),
+        }
+    }
+
+    /// Hands a loaded surface to the view.
+    fn tick_surface_loader(&mut self) {
+        if let Some(f) = self.surface_loader.poll() {
+            self.surface_finished(f);
+        }
+        if !self.surface_loader.is_busy() {
+            if let Some(next) = self.next_surface.take() {
+                self.load_surface(&next);
+            }
+        }
+        if self.state.loading.is_none() {
+            self.state.loading = self.surface_loader.status();
+        }
+    }
+
+    fn surface_finished(&mut self, f: JobFinished) {
+        let (path, stamp) = self.surface_loading.take().unwrap_or_default();
+        if std::mem::take(&mut self.discard_surface) {
+            return;
+        }
+        match f.result {
+            Ok(JobOutput::Surface(surface)) => {
+                self.surface_stamp = stamp;
+                let (triangles, pages) = (surface.triangles(), surface.pages.len());
+                self.info(text::surface_loaded(&path, triangles, pages, f.seconds));
+                let z_range = surface.bounds().map_or([0.0; 2], |(lo, hi)| [lo[2], hi[2]]);
+                self.state.surface = Some(SurfaceSummary {
+                    path,
+                    triangles,
+                    pages,
+                    origin: surface.origin,
+                    z_range,
+                });
+                if self.cloud.is_none() {
+                    // the surface's origin becomes the view's: the cut starts anew, the run
+                    // moves along
+                    self.state.view.cut = None;
+                    if let Some(o) = &mut self.overlay {
+                        o.set_origin(Some(surface.origin));
+                        self.overlay_version += 1;
+                    }
+                }
+                self.view.set_surface(Some(*surface));
+                // the surface just picked is what is drawn
+                self.state.view.show = ShowMode::Surface;
+            }
+            Ok(_) => {}
+            // a cancel for the next load needs no message
+            Err(StepError::Cancelled) if self.next_surface.is_some() => {}
+            Err(StepError::Cancelled) => self.info(text::job_cancelled(&f.label)),
+            Err(e) => self.error(text::job_failed(&f.label, &text::step_error(&e))),
+        }
+    }
+
+    /// Loads the cloud or surface of `selection` if it is one, a cloud with the quality of
+    /// its run.
     fn load_selected(&mut self) {
-        if let Selection::Cloud(path) = &self.state.selection {
-            let run = self.state.selected_run().map(|(_, r)| r.dir.clone());
-            let path = path.clone();
-            self.load(CloudSource::File { path, run });
+        match self.state.selection.clone() {
+            Selection::Cloud(path) => {
+                let run = self.state.selected_run().map(|(_, r)| r.dir.clone());
+                self.load(CloudSource::File { path, run });
+            }
+            Selection::Surface(dir) => self.load_surface(&dir),
+            _ => {}
         }
     }
 
@@ -643,6 +805,7 @@ impl DriftlessApp {
             || self.helper.is_busy()
             || !self.helper_queue.is_empty()
             || self.is_loading()
+            || self.surface_loader.is_busy()
             || self.status_asked != self.state.tree_version
             || self.gaps_asked != self.state.tree_version
     }
@@ -655,7 +818,7 @@ impl DriftlessApp {
                 (Some(HelperTask::MapStatus(v)), Ok(JobOutput::MapStatus(status))) => {
                     // an older tree's statuses are dropped; the newer job follows
                     if v == self.state.tree_version {
-                        self.state.map_status = *status;
+                        self.state.set_map_status(*status);
                     }
                 }
                 (Some(HelperTask::HistoryGaps(_)), Ok(JobOutput::HistoryGaps(gaps))) => {
@@ -781,6 +944,7 @@ impl DriftlessApp {
         self.state.log.drain(..over);
         self.state.job = self.jobs.status();
         self.tick_loader();
+        self.tick_surface_loader();
         self.sync_run();
         self.sync_compare();
         self.tick_helper();
@@ -837,6 +1001,13 @@ impl DriftlessApp {
             (Some(JobOutput::Map(done)), _) => {
                 self.state.selection = Selection::Map(done.dir.clone());
                 self.load_best_of_map(&done.dir);
+            }
+            (Some(JobOutput::SurfaceStep(done)), _) => {
+                if done.reused {
+                    self.info(text::surface_fits(&done.dir));
+                }
+                self.state.selection = Selection::Surface(done.dir.clone());
+                self.load_surface(&done.dir);
             }
             (Some(JobOutput::Inspect(report)), Some(Action::Inspect(scan))) => {
                 self.state.inspect = Some(InspectResult {
@@ -934,18 +1105,32 @@ impl DriftlessApp {
                 }
             }
             Action::LoadCloud { path, run } => self.load(CloudSource::File { path, run }),
+            Action::PickOpenSurface => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title(text::DIALOG_OPEN_SURFACE)
+                    .add_filter("glTF", &["glb"])
+                    .pick_file()
+                {
+                    self.load_surface_with(&path, true);
+                }
+            }
+            Action::LoadSurface(path) => self.load_surface(&path),
+            Action::ReloadSurface(path) => self.load_surface_with(&path, true),
             // the status bar shows the step if one runs, else the load
             Action::Cancel if self.jobs.is_busy() => self.jobs.cancel(),
             Action::Cancel => {
                 self.next_load = None;
                 self.loader.cancel();
+                self.next_surface = None;
+                self.surface_loader.cancel();
             }
             Action::DismissMessages => self.state.messages.clear(),
             step @ (Action::Inspect(_)
             | Action::RunSlam(_)
             | Action::Reuse(_)
             | Action::RestoreHistory { .. }
-            | Action::RunMap(_)) => {
+            | Action::RunMap(_)
+            | Action::RunSurface(_)) => {
                 if let Err(e) = actions::start_step(&mut self.state, &mut self.jobs, &step) {
                     self.error(e);
                 }
@@ -974,6 +1159,7 @@ impl DriftlessApp {
 
     fn set_project(&mut self, project: Project) {
         self.info(text::project_opened(&project.name));
+        self.drop_surface();
         self.state.set_project(project);
     }
 
@@ -1043,6 +1229,7 @@ impl DriftlessApp {
             ctx.request_repaint_after(REPAINT_WHILE_BUSY);
         }
         self.update_title(&ctx);
+        show_mode_key(&ctx, &mut self.state);
 
         let mut actions: Vec<Action> = Vec::new();
         let has_project = self.state.project.is_some();
@@ -1060,6 +1247,9 @@ impl DriftlessApp {
                         .clicked()
                     {
                         actions.push(Action::PickAddScan);
+                    }
+                    if ui.button(text::OPEN_SURFACE).clicked() {
+                        actions.push(Action::PickOpenSurface);
                     }
                 });
             });
@@ -1087,7 +1277,7 @@ impl DriftlessApp {
             avoid_submap,
             pick_places: self.state.correct.picking,
         });
-        let shown = self.cloud.is_some() || overlay.is_some();
+        let shown = self.cloud.is_some() || overlay.is_some() || self.view.has_surface();
         egui::CentralPanel::no_frame().show(ui, |ui| match (&self.render_state, shown) {
             (Some(rs), true) => {
                 event = self
@@ -1109,25 +1299,57 @@ impl DriftlessApp {
             }
             _ => {}
         }
-        if let Some(cloud) = &self.cloud {
-            let stats = Some(ViewStats {
-                drawn: self.view.drawn_points(),
-                total: cloud.points.len(),
+        let shown = effective_show(
+            self.state.view.show,
+            self.view.has_surface(),
+            self.cloud.is_some(),
+        );
+        let stats = match (&self.cloud, self.view.surface_triangles()) {
+            (_, Some(triangles)) if shown == ShowMode::Surface => Some(ViewStats {
+                drawn: 0,
+                total: 0,
+                triangles: Some(triangles),
                 frame_ms: self.view.frame_ms(),
                 gpu: self.view.gpu_timed(),
-            });
-            // the right panel was drawn before the view: show the new numbers next frame
-            if stats != self.state.view_stats {
-                self.state.view_stats = stats;
-                ctx.request_repaint();
-            }
-            if let Some(ViewEvent::PickedPoint(i)) = event {
-                self.state.picked = Some(point_info(cloud, i));
-            }
+            }),
+            (Some(cloud), _) => Some(ViewStats {
+                drawn: self.view.drawn_points(),
+                total: cloud.points.len(),
+                triangles: None,
+                frame_ms: self.view.frame_ms(),
+                gpu: self.view.gpu_timed(),
+            }),
+            _ => None,
+        };
+        // the right panel was drawn before the view: show the new numbers next frame
+        if stats.is_some() && stats != self.state.view_stats {
+            self.state.view_stats = stats;
+            ctx.request_repaint();
+        }
+        if let (Some(cloud), Some(ViewEvent::PickedPoint(i))) = (&self.cloud, event) {
+            self.state.picked = Some(point_info(cloud, i));
         }
         for action in actions {
             self.apply(action);
         }
+    }
+}
+
+/// When a file was last written, and its size; `None` if it cannot be read.
+type FileStamp = Option<(std::time::SystemTime, u64)>;
+
+fn file_stamp(path: &Path) -> FileStamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// The key `O` (while no text field has the keyboard) switches what the view shows:
+/// Oberfläche → Punktwolke → beides; only with a surface and a cloud, like the switch.
+fn show_mode_key(ctx: &egui::Context, state: &mut super::AppState) {
+    let free = ctx.memory(|m| m.focused()).is_none();
+    let pressed = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.is_none());
+    if free && pressed && state.surface.is_some() && state.cloud.is_some() {
+        state.view.show = state.view.show.next();
     }
 }
 

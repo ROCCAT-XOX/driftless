@@ -8,6 +8,7 @@ mod inspect;
 mod map;
 mod odom;
 mod slam;
+mod surface;
 mod view;
 
 use clap::{Parser, Subcommand};
@@ -49,6 +50,9 @@ enum Command {
     /// Karte eines SLAM-Laufs: dichte Wolke (dense.las), bereinigt (clean.las, removed.las),
     /// eingefärbt (color.las, color.ply) und map.json; jeder Schritt einzeln startbar
     Map(map::Args),
+    /// Fotoähnliche Oberfläche einer Karte: oberflaeche.glb, oberflaeche.obj (mit .mtl und
+    /// Texturseiten) und oberflaeche.json
+    Surface(surface::Args),
 }
 
 /// Progress of a step on the console: messages to stdout, warnings as „Warnung: …“ to stderr.
@@ -71,6 +75,7 @@ fn main() -> ExitCode {
         Command::Correct(args) => correct::run(&args),
         Command::CalibCheck(args) => calib_check::run(&args),
         Command::Map(args) => map::run(&args),
+        Command::Surface(args) => surface::run(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

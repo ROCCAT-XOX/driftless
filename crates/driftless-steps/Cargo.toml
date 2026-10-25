@@ -30,3 +30,5 @@ windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win
 
 [dev-dependencies]
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
+# Comparison images of the real-data surface test.
+png = "0.18"
