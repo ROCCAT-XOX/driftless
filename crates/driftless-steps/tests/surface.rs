@@ -121,6 +121,10 @@ fn surface_end_to_end() {
     assert_eq!(report["axes"], "glb: Y oben; obj: Z oben");
     assert_eq!(report["input_id"].as_str().unwrap().len(), 16);
     assert!(report["stats"]["seconds"]["tsdf"].is_number());
+    assert_eq!(report["settings"]["coarse_fallback"], true);
+    assert!(report["stats"]["cells_from_coarse"].is_u64(), "{report}");
+    assert!(report["stats"]["faces_unsupported"].is_u64(), "{report}");
+    assert_eq!(report["settings"]["max_fill_gap"], 0.015);
     assert!(report["files"].as_array().unwrap().len() >= 4);
     let on_disk: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dest.join(SURFACE_REPORT)).unwrap()).unwrap();
@@ -156,6 +160,34 @@ fn stale_map_is_refused() {
     assert!(
         err.to_string().contains("Karte fehlt oder ist veraltet"),
         "{err}"
+    );
+}
+
+#[test]
+fn surface_without_dense_bin_still_succeeds() {
+    let (dir, out) = prepared("steps-surface-dense", false);
+    assert!(out.join("dense.bin").is_file(), "the map step writes it");
+    let with = run_surface(&request(&dir, &out, &out.join("with")), &Progress::new()).unwrap();
+    assert!(
+        with["stats"]["accuracy_dense"]["walls"]["median_mm"].is_number(),
+        "{with}"
+    );
+    fs::remove_file(out.join("dense.bin")).unwrap();
+    let p = Progress::new();
+    let without = run_surface(&request(&dir, &out, &out.join("without")), &p).unwrap();
+    assert!(without["stats"]["accuracy_dense"].is_null(), "{without}");
+    let infos: Vec<String> = p
+        .take_log()
+        .into_iter()
+        .filter_map(|l| match l {
+            LogLine::Info(i) => Some(i),
+            LogLine::Warning(_) => None,
+        })
+        .collect();
+    assert_eq!(
+        infos.iter().filter(|i| i.contains("dense.bin")).count(),
+        1,
+        "{infos:?}"
     );
 }
 

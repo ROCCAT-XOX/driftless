@@ -401,6 +401,7 @@ fn removed_plus_kept_equals_input() {
             outliers: stats.outliers,
             kept: kept.len(),
             smooth: SmoothStats::default(),
+            dense_quality: stats.dense_quality.clone(),
         }
     );
     assert_eq!(stats.ghosts + stats.through + stats.outliers, removed.len());

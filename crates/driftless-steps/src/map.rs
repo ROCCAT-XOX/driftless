@@ -414,6 +414,7 @@ fn dense_json(s: &DenseStats) -> Value {
 }
 
 fn clean_json(s: &CleanStats) -> Value {
+    let q = &s.dense_quality;
     json!({
         "kept": s.kept,
         "ghosts": s.ghosts,
@@ -424,6 +425,15 @@ fn clean_json(s: &CleanStats) -> Value {
             "mean_shift": s.smooth.mean_shift,
             "thickness_before": s.smooth.thickness_before,
             "thickness_after": s.smooth.thickness_after,
+        },
+        "dense_quality": {
+            "patches": q.patches,
+            "patches_multi_pass": q.patches_multi_pass,
+            "local_rms_mm": q.local_rms_mm,
+            "thickness95_mm": q.thickness95_mm,
+            "within_pass_rms_mm": q.within_pass_rms_mm,
+            "pass_offset_median_mm": q.pass_offset_median_mm,
+            "pass_offset_p90_mm": q.pass_offset_p90_mm,
         },
     })
 }
@@ -1013,6 +1023,21 @@ pub fn folder_fits(input: &MapInput, dir: &Path) -> bool {
         Some(report["steps"]["dense"]["input_id"].as_str() == Some(hex(&id).as_str()))
     };
     fits().unwrap_or(false)
+}
+
+/// Input id of the dense step (and so of `dense.bin`) of a map of `input`.
+pub fn dense_stage_id(input: &MapInput) -> Result<String, StepError> {
+    let odom = input.slam.config()?.odom;
+    let project = discover_project(&input.scan).map_err(failed)?;
+    let (traj_bytes, _) = read_traj(&input.slam_dir)?;
+    dense_id(
+        &project,
+        &input.slam,
+        &odom,
+        &traj_bytes,
+        &input.map.switches.dense_config(),
+    )
+    .map_err(Into::into)
 }
 
 /// Input id of the clean step (and so of `clean.bin`) of a map of `input`: what a surface

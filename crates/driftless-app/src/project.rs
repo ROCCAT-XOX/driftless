@@ -197,7 +197,9 @@ impl Default for SurfaceSettings {
 impl SurfaceSettings {
     /// The settings recorded under `settings` in an `oberflaeche.json`. The report does not
     /// hold every camera setting; those take the defaults, which is what the program and
-    /// `driftless surface` always use. `None` if a value is missing or of the wrong type.
+    /// `driftless surface` always use. `None` if a value is missing or of the wrong type;
+    /// reports from before the coarse grid have no `coarse_fallback` and read as `true`, and
+    /// ones without `max_fill_gap` take the default.
     pub fn from_report(report: &serde_json::Value) -> Option<SurfaceSettings> {
         let s = &report["settings"];
         let f64_of = |v: &serde_json::Value| v.as_f64();
@@ -208,6 +210,14 @@ impl SurfaceSettings {
             voxel: f64_of(&s["voxel"])?,
             truncation_voxels: f64_of(&s["truncation_voxels"])? as f32,
             min_weight: u64_of(&s["min_weight"])?.try_into().ok()?,
+            coarse_fallback: match &s["coarse_fallback"] {
+                serde_json::Value::Null => true,
+                v => v.as_bool()?,
+            },
+            max_fill_gap: match &s["max_fill_gap"] {
+                serde_json::Value::Null => defaults.max_fill_gap,
+                v => v.as_f64()?,
+            },
             min_component_faces: u64_of(&s["min_component_faces"])?.try_into().ok()?,
             max_hole_perimeter: f64_of(&s["max_hole_perimeter"])?,
             simplify_error: f64_of(&s["simplify_error"])?,
@@ -1300,5 +1310,50 @@ mod tests {
         assert_eq!(from_stored(base, "a\\b"), Path::new("/p/a/b"));
         assert_eq!(from_stored(base, "./a//b/"), Path::new("/p/a/b"));
         assert_eq!(from_stored(base, "/q/a"), Path::new("/q/a"));
+    }
+
+    #[test]
+    fn surface_settings_from_old_and_new_reports() {
+        let c = SurfaceConfig::default();
+        let mut report = serde_json::json!({"settings": {
+            "texture": true,
+            "voxel": c.voxel,
+            "truncation_voxels": c.truncation_voxels,
+            "min_weight": c.min_weight,
+            "min_component_faces": c.min_component_faces,
+            "max_hole_perimeter": c.max_hole_perimeter,
+            "simplify_error": c.simplify_error,
+            "max_edge": c.max_edge,
+            "min_texel": c.min_texel,
+            "page_size": c.page_size,
+            "views_per_face": c.views_per_face,
+            "smooth_weight": c.smooth_weight,
+            "jpeg_quality": c.jpeg_quality,
+            "color": {
+                "downscale": c.color.downscale,
+                "highlights": c.color.highlights,
+                "max_dist": c.color.max_dist,
+                "depth_tolerance": c.color.depth_tolerance,
+                "min_sharpness": c.color.min_sharpness,
+                "view_gap": c.color.view_gap,
+            },
+        }});
+        // Before the coarse grid: no key, read as on, so it matches the defaults.
+        assert_eq!(
+            SurfaceSettings::from_report(&report),
+            Some(SurfaceSettings::default())
+        );
+        report["settings"]["coarse_fallback"] = false.into();
+        let off = SurfaceSettings::from_report(&report).unwrap();
+        assert!(!off.config.coarse_fallback);
+        report["settings"]["coarse_fallback"] = "ja".into();
+        assert_eq!(SurfaceSettings::from_report(&report), None);
+        // Before the fill filter: no key, the default; a stored value is kept.
+        report["settings"]["coarse_fallback"] = true.into();
+        report["settings"]["max_fill_gap"] = 0.03.into();
+        let wide = SurfaceSettings::from_report(&report).unwrap();
+        assert_eq!(wide.config.max_fill_gap, 0.03);
+        report["settings"]["max_fill_gap"] = "weit".into();
+        assert_eq!(SurfaceSettings::from_report(&report), None);
     }
 }

@@ -15,6 +15,7 @@ impl Scan {
             xyz: &self.xyz,
             sensor_of_point: &self.sensor_of_point,
             sensors: &self.sensors,
+            dense_xyz: None,
         }
     }
 }
@@ -63,6 +64,38 @@ pub(crate) fn box_room(origin: [f32; 3], half: [f32; 3], step: f32) -> Scan {
         sensor_of_point: vec![0; xyz.len()],
         xyz,
         sensors: vec![origin],
+    }
+}
+
+/// The wall `x = x0` over `|y|, |z| ≤ half`: a grid of `step` (m) starting half a step in
+/// from `-half`, one point per grid square, or four (a grid of `step / 2`) where `dense(y, z)`
+/// holds at the square's middle. Every point is measured from its own sensor 2 m in front
+/// (rays along +x), so a voxel column gets one vote per point in it.
+pub(crate) fn wall_x(x0: f32, half: f64, step: f64, dense: impl Fn(f64, f64) -> bool) -> Scan {
+    let n = (2.0 * half / step + 1e-9).floor() as usize;
+    let (mut xyz, mut sensors) = (Vec::new(), Vec::new());
+    for iy in 0..n {
+        for iz in 0..n {
+            let (y, z) = (
+                -half + (iy as f64 + 0.5) * step,
+                -half + (iz as f64 + 0.5) * step,
+            );
+            let offsets: &[(f64, f64)] = if dense(y, z) {
+                &[(-0.25, -0.25), (-0.25, 0.25), (0.25, -0.25), (0.25, 0.25)]
+            } else {
+                &[(0.0, 0.0)]
+            };
+            for (dy, dz) in offsets {
+                let (py, pz) = ((y + dy * step) as f32, (z + dz * step) as f32);
+                xyz.push([x0, py, pz]);
+                sensors.push([x0 - 2.0, py, pz]);
+            }
+        }
+    }
+    Scan {
+        sensor_of_point: (0..xyz.len() as u32).collect(),
+        xyz,
+        sensors,
     }
 }
 
