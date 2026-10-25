@@ -1,12 +1,75 @@
-//! Step 2 „Bilder“: the maps of the project with their surfaces („Oberfläche 001“, a stale one
-//! marked), and for the chosen map „Oberfläche rechnen“ with its settings (voxel size 1, 1,5 or
-//! 2 cm and „ohne Fotos“ of `driftless surface`). Clicking a surface shows it.
+//! Step 2 „Bilder“, in the form of „Daten“: the heading with the number of maps and
+//! surfaces, a card per map with its status (neu, wartet, rechnet, fertig ✓, veraltet, Karte
+//! veraltet) and its surfaces below it („Oberfläche 001“, a stale one marked; a click shows
+//! it), the fineness of the next surface as a three-way switch (1 / 1,5 / 2 cm), the progress
+//! of the running job, and at the bottom the main button: „Alle Oberflächen rechnen“ queues
+//! every map without a current surface ([`Action::ComputeAllSurfaces`]), „Oberfläche
+//! rechnen“ only the selected map. „ohne Fotos“ lies under „▸ Erweitert“.
 
-use super::StepState;
-use super::{blocked, heading, hint, no_project, state_label, step_row, tree};
+use super::{
+    badge, below_lines, blocked, card, fraction, heading, hint, job_progress, main_button,
+    no_project, pinned, quiet_button, segments, state_label, tree, StepState,
+};
 use crate::project::{MapInfo, SurfaceInfo, SurfaceSettings};
-use crate::ui::{text, Action, AppState, Selection, Step};
-use eframe::egui::{self, Ui};
+use crate::ui::theme::{icon, DARK};
+use crate::ui::{text, Action, AppState, Queued, Selection, Step};
+use eframe::egui::{self, RichText, Ui};
+
+/// Where the surfaces of a map stand, as its card shows it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SurfaceStatus {
+    /// No surface yet.
+    New,
+    /// Waits in the queue of „Alle Oberflächen rechnen“.
+    Queued,
+    /// Its surface is being computed, with its progress (0…1) if the step knows its total.
+    Running(Option<f32>),
+    /// One of its surfaces still fits it.
+    Done,
+    /// It has surfaces, but none fits any more.
+    Stale,
+    /// The map itself no longer fits its run, or has no `map.json`: it is computed anew in
+    /// „Daten“ first, „Alle Oberflächen rechnen“ leaves it out.
+    MapStale,
+}
+
+/// The status of the surfaces of `map`: a running step or the queue first, then the map, then
+/// its surfaces. A map or surface counts as fitting until the background check
+/// ([`AppState::map_status`]) says it is stale.
+pub fn surface_status(state: &AppState, map: &MapInfo) -> SurfaceStatus {
+    if state.running.as_ref() == Some(&Action::RunSurface(map.dir.clone())) {
+        return SurfaceStatus::Running(state.job.as_ref().and_then(fraction));
+    }
+    if state.queue.contains(&Queued::Surface(map.dir.clone())) {
+        return SurfaceStatus::Queued;
+    }
+    let map_stale = state.map_status.get(&map.dir).is_some_and(|s| s.stale);
+    if map.settings.is_none() || map_stale {
+        SurfaceStatus::MapStale
+    } else if map.surfaces.iter().any(|s| !s.stale) {
+        SurfaceStatus::Done
+    } else if !map.surfaces.is_empty() {
+        SurfaceStatus::Stale
+    } else {
+        SurfaceStatus::New
+    }
+}
+
+/// Opens or closes „Erweitert“ (as its toggle does; for tests and pictures).
+pub fn set_advanced(ctx: &egui::Context, open: bool) {
+    super::set_advanced(ctx, Step::Bilder, open);
+}
+
+/// Every map of the project, in the order of the list.
+fn maps(state: &AppState) -> impl Iterator<Item = (&str, &str, &MapInfo)> {
+    state.scans.iter().flat_map(|scan| {
+        scan.runs.iter().flat_map(move |run| {
+            run.maps
+                .iter()
+                .map(move |m| (scan.name.as_str(), run.label.as_str(), m))
+        })
+    })
+}
 
 pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     let mut action = None;
@@ -15,72 +78,125 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
         no_project(ui, &mut action);
         return action;
     }
-    let has_maps = state
-        .scans
-        .iter()
-        .flat_map(|s| &s.runs)
-        .any(|r| !r.maps.is_empty());
-    if !has_maps {
+    let count = maps(state).count();
+    if count == 0 {
         hint(ui, text::EMPTY_NO_MAPS);
         if ui.button(text::GO_TO_DATA).clicked() {
             action = Some(Action::SetStep(Step::Daten));
         }
         return action;
     }
-    egui::ScrollArea::vertical()
-        .auto_shrink(false)
-        .show(ui, |ui| {
-            ui.strong(text::MAPS_AND_SURFACES);
-            map_list(ui, state, &mut action);
-            ui.separator();
-            surface_step(ui, state, &mut action);
-        });
+    let surfaces = maps(state).map(|(_, _, m)| m.surfaces.len()).sum();
+    ui.weak(text::surfaces_line(count, surfaces));
+    // the main button and „Erweitert“ stay at the bottom, the rest scrolls above them
+    pinned(
+        ui,
+        Step::Bilder,
+        &mut (state, &mut action),
+        |ui, (state, action), advanced| {
+            ui.add_space(4.0);
+            map_list(ui, state, action);
+            ui.add_space(6.0);
+            fineness_switch(ui, &mut state.surface_settings);
+            selection_state(ui, state);
+            job_progress(ui, state);
+            if advanced {
+                ui.separator();
+                advanced_content(ui, &mut state.surface_settings);
+            }
+        },
+        |ui, (state, action)| compute_buttons(ui, state, action),
+    );
     action
 }
 
-/// Every map of the project, its surfaces below it.
+/// A card per map, its surfaces below it. A click on a card selects the map (again:
+/// deselects), a click on a surface selects and shows it.
 fn map_list(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
-    for scan in &state.scans {
-        for run in &scan.runs {
-            for map in &run.maps {
-                let selected = state.selection == Selection::Map(map.dir.clone());
-                let name = text::map_of(&scan.name, &run.label, &map.label);
-                let hover = format!("{name}\n{}", map.dir.display());
-                if tree::entry(ui, selected, name, &hover).clicked() {
-                    *action = Some(Action::Select(Selection::Map(map.dir.clone())));
-                }
+    for (scan, run, map) in maps(state) {
+        let selected = state.selection == Selection::Map(map.dir.clone());
+        let name = text::map_of(scan, run, &map.label);
+        let status = surface_status(state, map);
+        let hover = match status {
+            SurfaceStatus::MapStale => {
+                format!(
+                    "{name}\n{}\n{}",
+                    text::STATUS_MAP_STALE_HINT,
+                    map.dir.display()
+                )
+            }
+            _ => format!("{name}\n{}", map.dir.display()),
+        };
+        let r = card(
+            ui,
+            ("karte", &map.dir),
+            selected,
+            RichText::new(name),
+            &hover,
+            |ui| status_label(ui, status),
+        );
+        if r.clicked() {
+            let selection = if selected {
+                Selection::None
+            } else {
+                Selection::Map(map.dir.clone())
+            };
+            *action = Some(Action::Select(selection));
+        }
+        if !map.surfaces.is_empty() {
+            ui.indent(("oberflaechen", &map.dir), |ui| {
                 for surface in &map.surfaces {
                     tree::surface_leaf(ui, state, surface, action);
                 }
-            }
+            });
         }
     }
 }
 
-/// „Oberfläche rechnen“ for the map of the selection, with the settings of the next surface.
-fn surface_step(ui: &mut Ui, state: &mut AppState, action: &mut Option<Action>) {
-    let Some(map) = state.selected_map().cloned() else {
-        hint(ui, text::SELECT_MAP_FOR_SURFACE);
+/// The status at the right of a card.
+fn status_label(ui: &mut Ui, status: SurfaceStatus) {
+    let (symbol, word, color) = match status {
+        SurfaceStatus::New => (None, text::STATUS_NEW, DARK.text_dim),
+        SurfaceStatus::Queued => (None, text::STATUS_QUEUED, DARK.text_dim),
+        SurfaceStatus::Running(_) => (Some(icon::RUNNING), text::STATUS_RUNNING, DARK.warn),
+        SurfaceStatus::Done => (Some(icon::CHECK), text::STATUS_DONE, DARK.ok),
+        SurfaceStatus::Stale => (Some(icon::STALE), text::STATUS_STALE, DARK.warn),
+        SurfaceStatus::MapStale => (Some(icon::STALE), text::STATUS_MAP_STALE, DARK.text_dim),
+    };
+    badge(ui, symbol, word, color);
+}
+
+/// „Feinheit“: 1 / 1,5 / 2 cm, the voxel size of the next surface; the memory hint at 1 cm,
+/// the value of a size that is none of them („Eigene“).
+fn fineness_switch(ui: &mut Ui, settings: &mut SurfaceSettings) {
+    ui.label(RichText::new(text::SURFACE_FINENESS).strong())
+        .on_hover_text(text::SURFACE_VOXEL_HINT);
+    let voxel = &mut settings.config.voxel;
+    let choices = text::SURFACE_VOXEL_CHOICES.into_iter();
+    segments(ui, choices, voxel, |_| None);
+    let finest = text::SURFACE_VOXEL_CHOICES[0].0;
+    let known = text::SURFACE_VOXEL_CHOICES
+        .iter()
+        .any(|(v, _)| (v - *voxel).abs() < 1e-9);
+    if (*voxel - finest).abs() < 1e-9 {
+        let warn = RichText::new(text::SURFACE_FINE_HINT).color(DARK.warn);
+        ui.add(egui::Label::new(warn).wrap());
+    } else if !known {
+        ui.weak(text::precision_custom(*voxel));
+    }
+}
+
+/// For a selected map: the state of its surface with the settings chosen now; for a
+/// selected surface also its own state.
+fn selection_state(ui: &mut Ui, state: &AppState) {
+    let Some(map) = state.selected_map() else {
         return;
     };
-    let blocked = state
-        .map(&map.dir)
-        .and_then(|(scan, _, _)| blocked(state, scan));
-    let settings = &state.surface_settings;
-    let invalid = settings
-        .config
-        .check()
-        .err()
-        .map(|e| e.to_string())
-        .or_else(|| {
-            map.settings
-                .is_none()
-                .then(|| text::SURFACE_NEEDS_MAP.to_string())
-        });
-    let surfaced = surface_state(state, &map, settings);
-    if step_row(ui, text::STEP_SURFACE, blocked.or(invalid), surfaced) {
-        *action = Some(Action::RunSurface(map.dir.clone()));
-    }
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(text::WITH_THIS_FINENESS);
+        state_label(ui, surface_state(state, map, &state.surface_settings));
+    });
     if let Selection::Surface(dir) = &state.selection {
         if let Some(surface) = map.surfaces.iter().find(|s| s.dir == *dir) {
             ui.horizontal(|ui| {
@@ -89,8 +205,6 @@ fn surface_step(ui: &mut Ui, state: &mut AppState, action: &mut Option<Action>) 
             });
         }
     }
-    ui.separator();
-    surface_settings_edit(ui, &mut state.surface_settings);
 }
 
 /// The state of a surface of `map` with `settings`: done if one made with them still fits,
@@ -117,17 +231,86 @@ fn own_surface_state(state: &AppState, surface: &SurfaceInfo) -> StepState {
     StepState::Done(state.map_status.get(&surface.dir).and_then(|s| s.seconds))
 }
 
-/// The settings of the next surface: the voxel size (1, 1,5 or 2 cm) and „ohne Fotos“.
-fn surface_settings_edit(ui: &mut Ui, settings: &mut SurfaceSettings) {
+/// The main button – „Oberfläche rechnen“ with a map (or a surface of it) selected, else
+/// „Alle Oberflächen rechnen“ – and, with a map selected, „Alle Oberflächen rechnen“ quietly
+/// below it. Locked while a step runs, while the scan cannot be read, for invalid settings,
+/// for a map without `map.json`, and with nothing to compute; the reason shows on hover, and
+/// below the button unless the field shows it already (the progress of the running step).
+fn compute_buttons(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
+    let busy = state.job.as_ref().map(|j| text::busy(&j.label));
+    let invalid = state
+        .surface_settings
+        .config
+        .check()
+        .err()
+        .map(|e| e.to_string());
+    // until the maps are checked a stale surface counts as fitting: the button then waits
+    // for the check instead of saying that all is done
+    let pending = state.map_status_pending;
+    let nothing =
+        (!pending && state.maps_to_surface().is_empty()).then(|| text::ALL_SURFACED.to_string());
+    let all_locked = busy.clone().or(invalid.clone()).or(nothing.clone());
+    let selected = state.selected_map();
+    let below = match selected {
+        Some(map) => {
+            let no_map = map
+                .settings
+                .is_none()
+                .then(|| text::SURFACE_NEEDS_MAP.to_string());
+            let scan_blocked = state
+                .map(&map.dir)
+                .and_then(|(scan, _, _)| blocked(state, scan));
+            let locked = scan_blocked.or(invalid.clone()).or(no_map.clone());
+            if main_button(ui, text::STEP_SURFACE, locked, text::COMPUTE_SURFACE_HINT) {
+                *action = Some(Action::RunSurface(map.dir.clone()));
+            }
+            if quiet_button(ui, text::COMPUTE_ALL_SURFACES, all_locked) {
+                *action = Some(Action::ComputeAllSurfaces);
+            }
+            busy.is_none()
+                .then_some(invalid.or(no_map))
+                .flatten()
+                .map(|e| text::cannot_compute(&e))
+        }
+        None => {
+            let hover = text::COMPUTE_SURFACES_HINT;
+            if main_button(ui, text::COMPUTE_ALL_SURFACES, all_locked, hover) {
+                *action = Some(Action::ComputeAllSurfaces);
+            }
+            match (busy, invalid) {
+                (Some(_), _) => None,
+                (None, Some(e)) => Some(text::cannot_compute(&e)),
+                (None, None) if pending => Some(text::MAP_STATUS_PENDING.to_string()),
+                (None, None) => nothing.clone(),
+            }
+        }
+    };
+    let mut lines: Vec<String> = below.into_iter().collect();
+    // all done, but with another fineness than the one chosen now: how to get it
+    if selected.is_none() && nothing.is_some() && other_fineness(state) {
+        lines.push(text::SURFACE_RECOMPUTE_HINT.to_string());
+    }
+    below_lines(ui, lines);
+}
+
+/// Whether a map with a current surface has none of the voxel size chosen now.
+fn other_fineness(state: &AppState) -> bool {
+    let voxel = state.surface_settings.config.voxel;
+    maps(state).any(|(_, _, map)| {
+        surface_status(state, map) == SurfaceStatus::Done
+            && !map.surfaces.iter().any(|s| {
+                !s.stale
+                    && s.settings
+                        .as_ref()
+                        .is_some_and(|s| (s.config.voxel - voxel).abs() < 1e-9)
+            })
+    })
+}
+
+/// Under „Erweitert“: „ohne Fotos“, for the next surface.
+fn advanced_content(ui: &mut Ui, settings: &mut SurfaceSettings) {
     ui.strong(text::SURFACE_SETTINGS);
     ui.weak(text::SURFACE_SETTINGS_HINT);
-    ui.horizontal(|ui| {
-        ui.label(text::SURFACE_VOXEL)
-            .on_hover_text(text::SURFACE_VOXEL_HINT);
-        for (voxel, label) in text::SURFACE_VOXEL_CHOICES {
-            ui.selectable_value(&mut settings.config.voxel, voxel, label);
-        }
-    });
     let mut no_photos = !settings.texture;
     if ui
         .checkbox(&mut no_photos, text::SURFACE_NO_PHOTOS)

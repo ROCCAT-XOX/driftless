@@ -34,7 +34,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
 /// The steps of the work, in the order they are done; the rail switches between them.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, Debug, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum Step {
     /// Scans, maps, corrections: the view shows the cloud.
     #[default]
@@ -136,6 +138,10 @@ pub enum Action {
     ComputeAllMaps,
     /// [`Action::ComputeAllMaps`] for this one scan (id), whatever its status.
     ComputeMap(String),
+    /// Queue every map without a current surface ([`AppState::maps_to_surface`]), in the
+    /// order of the list, and compute their surfaces one after the other with the current
+    /// surface settings.
+    ComputeAllSurfaces,
     /// Compare trajectory `a` (aligned to `b`) with `b`.
     Compare {
         a: compare::TrajRef,
@@ -146,6 +152,16 @@ pub enum Action {
         a: PathBuf,
         b: PathBuf,
     },
+}
+
+/// What the queue of [`AppState::queue`] computes one after the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Queued {
+    /// A scan folder ([`crate::project::ScanEntry::path`]): SLAM if it has no run with a
+    /// result, then the map of its newest run ([`Action::ComputeAllMaps`]).
+    Scan(PathBuf),
+    /// A map folder: its surface ([`Action::ComputeAllSurfaces`]).
+    Surface(PathBuf),
 }
 
 /// A message for the status bar (German).
@@ -282,12 +298,13 @@ pub struct AppState {
     pub running: Option<Action>,
     /// The step of the work shown in the field next to the rail.
     pub step: Step,
-    /// The scan folders ([`crate::project::ScanEntry::path`]) still to compute by
-    /// [`Action::ComputeAllMaps`], in order; the first is the one being computed. Emptied by
-    /// „Abbrechen“.
-    pub queue: VecDeque<PathBuf>,
+    /// What is still to compute by [`Action::ComputeAllMaps`] or
+    /// [`Action::ComputeAllSurfaces`], in order; the first is the one being computed. Emptied
+    /// by „Abbrechen“, a failed step, closing and a project switch.
+    pub queue: VecDeque<Queued>,
     /// The background check of [`AppState::map_status`] has not caught up with the tree yet:
-    /// until then a stale map counts as fitting, so „Alle rechnen“ waits for it.
+    /// until then a stale map or surface counts as fitting, so „Alle rechnen“ and „Alle
+    /// Oberflächen rechnen“ wait for it.
     pub map_status_pending: bool,
     /// The settings window ⚙.
     pub settings_window: SettingsWindow,
@@ -471,6 +488,25 @@ impl AppState {
             .collect()
     }
 
+    /// The maps [`Action::ComputeAllSurfaces`] queues: those without a current surface
+    /// ([`steps::bilder::surface_status`] new or stale), in the order of the list, as map
+    /// folders. A map that no longer fits its run is left to „Daten“.
+    pub fn maps_to_surface(&self) -> Vec<PathBuf> {
+        self.scans
+            .iter()
+            .filter(|s| s.state == ScanState::Ready)
+            .flat_map(|s| &s.runs)
+            .flat_map(|r| &r.maps)
+            .filter(|m| {
+                matches!(
+                    steps::bilder::surface_status(self, m),
+                    steps::bilder::SurfaceStatus::New | steps::bilder::SurfaceStatus::Stale
+                )
+            })
+            .map(|m| m.dir.clone())
+            .collect()
+    }
+
     /// The scan with the folder `path`.
     pub fn scan_at(&self, path: &std::path::Path) -> Option<&ScanNode> {
         let entry = self
@@ -482,14 +518,38 @@ impl AppState {
         self.scan_node(&entry.id)
     }
 
-    /// The step that computes the scan at the head of [`AppState::queue`] further: the map of
-    /// its newest run with a result, or SLAM if it has none.
+    /// The step that computes the head of [`AppState::queue`] further: for a scan the map of
+    /// its newest run with a result, or SLAM if it has none; for a map its surface. `None` if
+    /// the head is no longer in the project.
     pub fn next_queued_step(&self) -> Option<Action> {
-        let scan = self.scan_at(self.queue.front()?)?;
-        Some(match scan.runs.iter().rev().find(|r| r.has_result) {
-            Some(run) => Action::RunMap(run.dir.clone()),
-            None => Action::RunSlam(scan.id.clone()),
-        })
+        match self.queue.front()? {
+            Queued::Scan(path) => {
+                let scan = self.scan_at(path)?;
+                Some(match scan.runs.iter().rev().find(|r| r.has_result) {
+                    Some(run) => Action::RunMap(run.dir.clone()),
+                    None => Action::RunSlam(scan.id.clone()),
+                })
+            }
+            Queued::Surface(dir) => {
+                self.map(dir)?;
+                Some(Action::RunSurface(dir.clone()))
+            }
+        }
+    }
+
+    /// Whether `step` works on the head of [`AppState::queue`]: on its scan, or the surface
+    /// of its map.
+    pub fn computes_queue_head(&self, step: &Action) -> bool {
+        match (self.queue.front(), step) {
+            (Some(Queued::Surface(head)), Action::RunSurface(dir)) => head == dir,
+            (Some(Queued::Surface(_)), _) | (None, _) => false,
+            (Some(Queued::Scan(head)), step) => {
+                let project = self.project.as_ref();
+                self.scan_of(step)
+                    .and_then(|s| project?.scan(&s.id))
+                    .is_some_and(|e| e.path == *head)
+            }
+        }
     }
 
     /// The scan a step action works on.

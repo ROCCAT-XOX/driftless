@@ -13,7 +13,7 @@
 use driftless_app::camera::CameraMode;
 use driftless_app::project::{canonical, Project};
 use driftless_app::render::{headless_device, ColorMode};
-use driftless_app::ui::{text, Action, DriftlessApp, Selection};
+use driftless_app::ui::{text, Action, DriftlessApp, Selection, Step};
 use eframe::egui;
 use egui_kittest::kittest::Queryable;
 use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
@@ -514,5 +514,116 @@ fn daten_screenshot() {
     let mut h = harness(app, rs);
     wait_loaded(&mut h);
     shot(&mut h, &dir, "daten");
+    h.state_mut().apply(Action::Cancel);
+}
+
+/// The field „Bilder“ as in the design: project „Schwarzer Raum“ with three small synthetic
+/// scans and their maps – one with a surface („fertig“, shown in the view), one whose surface
+/// is being computed (a job held at 40 %), one without – as `bilder.png` in
+/// `$DRIFTLESS_SHOTS`.
+#[test]
+#[ignore = "writes a picture; needs $DRIFTLESS_SHOTS and a GPU"]
+fn bilder_screenshot() {
+    let Some(dir) = std::env::var_os("DRIFTLESS_SHOTS").map(PathBuf::from) else {
+        eprintln!("DRIFTLESS_SHOTS nicht gesetzt, Test übersprungen");
+        return;
+    };
+    if headless_device().is_none() {
+        eprintln!("kein GPU-Adapter, Test übersprungen");
+        return;
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let work = dir.join("projekt-bilder");
+    let _ = std::fs::remove_dir_all(&work);
+    let rs = create_render_state(
+        default_wgpu_setup(),
+        egui_wgpu::RendererOptions::PREDICTABLE,
+    );
+    let mut app = DriftlessApp::new(Arc::new(|| {})).with_render_state(rs.clone());
+    app.apply(Action::NewProject {
+        dir: work.join("projekt"),
+        name: "Schwarzer Raum".into(),
+    });
+    let names = ["Scan 13:35", "Scan 13:30", "Scan 13:25"];
+    let mut ids = Vec::new();
+    for name in names {
+        let scan = work.join(name.replace([' ', ':'], "-"));
+        std::fs::create_dir_all(&scan).unwrap();
+        driftless_io::testscan::room_bag_secs(&scan, true, 1.0);
+        app.apply(Action::AddScan(scan));
+        ids.push(
+            app.state()
+                .project
+                .as_ref()
+                .unwrap()
+                .scans
+                .last()
+                .unwrap()
+                .id
+                .clone(),
+        );
+    }
+    let settle = |app: &mut DriftlessApp| {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while app.wants_repaint_while_busy() {
+            assert!(Instant::now() < deadline, "work did not end");
+            std::thread::sleep(Duration::from_millis(5));
+            app.tick();
+        }
+    };
+    app.state_mut().map_settings.step = driftless_steps::map::MapStep::Clean;
+    app.apply(Action::ComputeAllMaps);
+    settle(&mut app);
+    let map_of = |app: &DriftlessApp, id: &str| {
+        let node = app.state().scan_node(id).unwrap();
+        node.runs.last().unwrap().maps.last().unwrap().dir.clone()
+    };
+    // 13:35 with a surface, coarse enough for the synthetic room
+    app.state_mut().surface_settings = driftless_app::project::SurfaceSettings {
+        config: driftless_map::surface::SurfaceConfig {
+            voxel: 0.15,
+            min_weight: 1,
+            min_component_faces: 10,
+            page_size: 256,
+            simplify_error: 0.01,
+            ..Default::default()
+        },
+        texture: true,
+    };
+    app.apply(Action::RunSurface(map_of(&app, &ids[0])));
+    settle(&mut app);
+    // the shown names as in the design (folder names cannot hold „:“ everywhere)
+    let mut project = app.state().project.clone().unwrap();
+    for (scan, name) in project.scans.iter_mut().zip(names) {
+        scan.name = name.into();
+    }
+    app.state_mut().set_project(project);
+    app.apply(Action::SetStep(Step::Bilder));
+    let surface = app.state().scan_node(&ids[0]).unwrap().runs[0].maps[0].surfaces[0]
+        .dir
+        .clone();
+    app.apply(Action::Select(Selection::Surface(surface)));
+    settle(&mut app);
+    app.apply(Action::Select(Selection::None));
+    app.state_mut().surface_settings = Default::default();
+    app.state_mut().surface_settings.config.voxel = 0.015;
+    // 13:30: its surface is being computed
+    let map = map_of(&app, &ids[1]);
+    app.start_job(text::STEP_SURFACE, |p| {
+        p.phase("Oberfläche", Some(100));
+        p.advance(40);
+        while !p.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(driftless_steps::StepError::Cancelled)
+    })
+    .unwrap();
+    app.state_mut().running = Some(Action::RunSurface(map));
+    let mut h = harness(app, rs);
+    for _ in 0..10 {
+        h.step();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    shot(&mut h, &dir, "bilder");
     h.state_mut().apply(Action::Cancel);
 }

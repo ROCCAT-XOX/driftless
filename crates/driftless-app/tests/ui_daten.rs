@@ -4,7 +4,9 @@
 
 use driftless_app::project::{MapInfo, MapStatus, Project, RunInfo, ScanEntry, ScanState};
 use driftless_app::ui::steps::daten::{precision_of, scan_status, voxel_of, Precision, ScanStatus};
-use driftless_app::ui::{steps, text, Action, AppState, DriftlessApp, ScanNode, Selection, Step};
+use driftless_app::ui::{
+    steps, text, Action, AppState, DriftlessApp, Queued, ScanNode, Selection, Step,
+};
 use driftless_io::testscan::{room_bag_secs, tmp};
 use driftless_steps::map::MapSwitches;
 use driftless_steps::slam::SlamSettings;
@@ -394,8 +396,14 @@ fn compute_all_queues_new_and_stale() {
 
     app.apply(Action::ComputeAllMaps);
     // exactly the new and the stale ones, in the order of the list; one job runs
-    let queue: Vec<PathBuf> = app.state().queue.iter().cloned().collect();
-    assert_eq!(queue, [scan_path(&app, &a), scan_path(&app, &c)]);
+    let queue: Vec<Queued> = app.state().queue.iter().cloned().collect();
+    assert_eq!(
+        queue,
+        [
+            Queued::Scan(scan_path(&app, &a)),
+            Queued::Scan(scan_path(&app, &c))
+        ]
+    );
     assert_eq!(app.state().running, Some(Action::RunSlam(a.clone())));
     assert!(matches!(status_of(&app, &a), ScanStatus::Running(_)));
     assert_eq!(status_of(&app, &c), ScanStatus::Queued);
@@ -449,8 +457,8 @@ fn compute_one_scan_runs_only_that_one() {
     let a = add_scan(&mut app, &dir, "a");
     let b = add_scan(&mut app, &dir, "b");
     app.apply(Action::ComputeMap(b.clone()));
-    let queue: Vec<PathBuf> = app.state().queue.iter().cloned().collect();
-    assert_eq!(queue, [scan_path(&app, &b)]);
+    let queue: Vec<Queued> = app.state().queue.iter().cloned().collect();
+    assert_eq!(queue, [Queued::Scan(scan_path(&app, &b))]);
     settle(&mut app);
     assert_eq!(errors(&app), Vec::<String>::new());
     assert_eq!(status_of(&app, &a), ScanStatus::New);
@@ -601,9 +609,9 @@ fn compute_all_waits_for_the_map_check() {
     let b = add_scan(&mut app, &dir, "b");
     app.apply(Action::ComputeAllMaps);
     tick_until(&mut app, |a| a.state().running.is_some());
-    let queue: Vec<PathBuf> = app.state().queue.iter().cloned().collect();
+    let queue: Vec<Queued> = app.state().queue.iter().cloned().collect();
     assert_eq!(queue.len(), 2);
-    assert_eq!(queue[1], scan_path(&app, &b));
+    assert_eq!(queue[1], Queued::Scan(scan_path(&app, &b)));
     settle(&mut app);
 
     // the field says so instead of „Alle Scans sind gerechnet“

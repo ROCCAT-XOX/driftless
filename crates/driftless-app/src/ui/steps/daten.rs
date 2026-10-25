@@ -14,33 +14,21 @@
 //! stay possible.
 
 use super::{
-    blocked, error_label, heading, hint, no_project, point_shown, section, state_label, step_row,
-    tree, StepState,
+    badge, below_lines, blocked, card, error_label, fraction, heading, hint, job_progress,
+    main_button, no_project, pinned, point_shown, quiet_button, section, segments, state_label,
+    step_row, tree, StepState,
 };
-use crate::jobs::JobStatus;
 use crate::project::{MapInfo, RunInfo, ScanState};
 use crate::ui::status::count;
-use crate::ui::theme::{self, icon, DARK};
-use crate::ui::{compare, correct, text, Action, AppState, ScanNode, Selection};
+use crate::ui::theme::{icon, DARK};
+use crate::ui::{compare, correct, text, Action, AppState, Queued, ScanNode, Selection, Step};
 use driftless_steps::history::HistoryKind;
 use driftless_steps::map::{MapSettings, MapStep};
 use driftless_steps::slam::SlamSettings;
-use eframe::egui::{self, Align, Layout, RichText, Sense, Ui};
+use eframe::egui::{self, RichText, Ui};
 
 /// The LiDAR pose a switched-on pose field starts with: no offset, no rotation.
 const IDENTITY_POSE: [f64; 7] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
-/// Height of the main button (points).
-const MAIN_BUTTON_HEIGHT: f32 = 34.0;
-/// Height of the line in a scan card (points).
-const CARD_ROW_HEIGHT: f32 = 18.0;
-/// Height of a segment of the precision switch (points).
-const SEGMENT_HEIGHT: f32 = 26.0;
-/// The height of the main button and „Erweitert“ in the last frame (egui's memory).
-const BOTTOM_HEIGHT_ID: &str = "daten_unten_hoehe";
-/// The list keeps at least this height in a very small window (points).
-const MIN_LIST_HEIGHT: f32 = 120.0;
-/// Whether „Erweitert“ is open (kept in egui's memory).
-const ADVANCED_ID: &str = "daten_erweitert";
 
 /// The precision of the map: only its voxel size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +89,7 @@ pub fn scan_status(state: &AppState, scan: &ScanNode) -> ScanStatus {
         return ScanStatus::Running(state.job.as_ref().and_then(fraction));
     }
     let path = state.project.as_ref().and_then(|p| p.scan(&scan.id));
-    if path.is_some_and(|e| state.queue.contains(&e.path)) {
+    if path.is_some_and(|e| state.queue.contains(&Queued::Scan(e.path.clone()))) {
         return ScanStatus::Queued;
     }
     let Some(newest) = scan.runs.iter().rev().find(|r| r.has_result) else {
@@ -121,18 +109,6 @@ pub fn scan_status(state: &AppState, scan: &ScanNode) -> ScanStatus {
 /// The maps of `run` with recorded switches (a folder without `map.json` is no map yet).
 fn mapped(run: &RunInfo) -> Vec<&MapInfo> {
     run.maps.iter().filter(|m| m.settings.is_some()).collect()
-}
-
-/// How far a job is (0…1), if it knows its total.
-fn fraction(job: &JobStatus) -> Option<f32> {
-    let p = &job.progress;
-    p.total.map(|total| {
-        if total == 0 {
-            0.0
-        } else {
-            (p.done as f64 / total as f64).clamp(0.0, 1.0) as f32
-        }
-    })
 }
 
 /// What the steps act on.
@@ -166,7 +142,7 @@ fn target(state: &AppState) -> Target {
 
 /// Opens or closes „Erweitert“ (as its toggle does; for tests and pictures).
 pub fn set_advanced(ctx: &egui::Context, open: bool) {
-    ctx.data_mut(|d| d.insert_persisted(egui::Id::new(ADVANCED_ID), open));
+    super::set_advanced(ctx, Step::Daten, open);
 }
 
 pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
@@ -180,29 +156,23 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
         .on_hover_text(project.dir.display().to_string());
     if state.scans.is_empty() {
         hint(ui, text::EMPTY_NO_SCANS);
-        if main_button(ui, text::ADD_SCAN, None) {
+        if main_button(ui, text::ADD_SCAN, None, text::COMPUTE_HINT) {
             action = Some(Action::PickAddScan);
         }
         return action;
     }
-    let advanced_id = egui::Id::new(ADVANCED_ID);
-    let mut advanced = ui.data_mut(|d| *d.get_persisted_mut_or(advanced_id, false));
-    // The main button and „Erweitert“ stay at the bottom, the rest scrolls above them: the
-    // scroll area leaves the height the bottom took in the last frame.
-    let bottom_id = egui::Id::new(BOTTOM_HEIGHT_ID);
-    let bottom = ui.data(|d| d.get_temp::<f32>(bottom_id)).unwrap_or(90.0);
-    // a solid bar that is always there: the field can be longer than the window
-    ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
-    egui::ScrollArea::vertical()
-        .auto_shrink(false)
-        .max_height((ui.available_height() - bottom).max(MIN_LIST_HEIGHT))
-        .show(ui, |ui| {
+    // the main button and „Erweitert“ stay at the bottom, the rest scrolls above them
+    pinned(
+        ui,
+        Step::Daten,
+        &mut (state, &mut action),
+        |ui, (state, action), advanced| {
             ui.add_space(4.0);
             for scan in &state.scans {
-                scan_card(ui, state, scan, &mut action);
+                scan_card(ui, state, scan, action);
             }
             if add_scan_link(ui) {
-                action = Some(Action::PickAddScan);
+                **action = Some(Action::PickAddScan);
             }
             ui.add_space(6.0);
             precision_switch(ui, state);
@@ -210,22 +180,12 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
             if advanced {
                 ui.separator();
                 if let Some(a) = advanced_content(ui, state) {
-                    action = Some(a);
+                    **action = Some(a);
                 }
             }
-        });
-    let top = ui.cursor().top();
-    ui.add_space(8.0);
-    compute_buttons(ui, state, &mut action);
-    if advanced_toggle(ui, advanced) {
-        advanced = !advanced;
-        ui.data_mut(|d| d.insert_persisted(advanced_id, advanced));
-    }
-    let used = ui.min_rect().bottom() - top;
-    if (used - bottom).abs() > 0.5 {
-        ui.data_mut(|d| d.insert_temp(bottom_id, used));
-        ui.ctx().request_repaint();
-    }
+        },
+        |ui, (state, action)| compute_buttons(ui, state, action),
+    );
     action
 }
 
@@ -251,20 +211,9 @@ fn scan_card(ui: &mut Ui, state: &AppState, scan: &ScanNode, action: &mut Option
             (RichText::new(label).color(DARK.text_dim), hover)
         }
     };
-    let card = theme::card_frame(selected).show(ui, |ui| {
-        let row = egui::vec2(ui.available_width(), CARD_ROW_HEIGHT);
-        ui.allocate_ui_with_layout(row, Layout::right_to_left(Align::Center), |ui| {
-            status_label(ui, status);
-            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                ui.add(egui::Label::new(name).truncate().selectable(false));
-            });
-        });
+    let r = card(ui, ("scan", &scan.id), selected, name, &hover, |ui| {
+        status_label(ui, status);
     });
-    let id = ui.id().with(("scan_karte", &scan.id));
-    let r = ui
-        .interact(card.response.rect, id, Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(hover);
     if r.clicked() {
         let selection = if selected {
             Selection::None
@@ -289,7 +238,7 @@ fn scan_card(ui: &mut Ui, state: &AppState, scan: &ScanNode, action: &mut Option
     }
 }
 
-/// The status at the right of a card: symbol and word (added right to left).
+/// The status at the right of a card.
 fn status_label(ui: &mut Ui, status: ScanStatus) {
     let (symbol, word, color) = match status {
         ScanStatus::New => (None, text::STATUS_NEW, DARK.text_dim),
@@ -300,11 +249,7 @@ fn status_label(ui: &mut Ui, status: ScanStatus) {
         // the name says it („… (fehlt)“)
         ScanStatus::Missing => return,
     };
-    ui.spacing_mut().item_spacing.x = 4.0;
-    ui.label(RichText::new(word).color(color));
-    if let Some(symbol) = symbol {
-        ui.label(RichText::new(symbol).color(color));
-    }
+    badge(ui, symbol, word, color);
 }
 
 /// „+ Scan hinzufügen …“, quiet under the cards. True when clicked.
@@ -324,32 +269,8 @@ fn add_scan_link(ui: &mut Ui) -> bool {
 fn precision_switch(ui: &mut Ui, state: &mut AppState) {
     ui.label(RichText::new(text::PRECISION).strong());
     let voxel = &mut state.map_settings.switches.voxel;
-    let current = precision_of(*voxel);
-    theme::segment_frame().show(ui, |ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        let width = ui.available_width() / LEVELS.len() as f32;
-        ui.horizontal(|ui| {
-            for (level, value, label) in LEVELS {
-                let on = current == level;
-                let (fill, color) = if on {
-                    (DARK.surface_hi, DARK.on_accent)
-                } else {
-                    (egui::Color32::TRANSPARENT, DARK.text_dim)
-                };
-                let segment = egui::Button::new(RichText::new(label).color(color))
-                    .fill(fill)
-                    .corner_radius(egui::CornerRadius::same(theme::CARD_RADIUS - 2))
-                    .min_size(egui::vec2(width, SEGMENT_HEIGHT));
-                if ui
-                    .add(segment)
-                    .on_hover_text(text::precision_hover(value))
-                    .clicked()
-                {
-                    *voxel = value;
-                }
-            }
-        });
-    });
+    let choices = LEVELS.iter().map(|(_, value, label)| (*value, *label));
+    segments(ui, choices, voxel, |v| Some(text::precision_hover(v)));
     match precision_of(*voxel) {
         Precision::Maximal => {
             let warn = RichText::new(text::PRECISION_MAX_HINT).color(DARK.warn);
@@ -360,26 +281,6 @@ fn precision_switch(ui: &mut Ui, state: &mut AppState) {
         }
         _ => {}
     }
-}
-
-/// The running step: a thin bar (if it knows its total) and „Scan 13:30 · Karte rechnen 62 %“.
-fn job_progress(ui: &mut Ui, state: &AppState) {
-    let Some(job) = &state.job else {
-        return;
-    };
-    let f = fraction(job);
-    ui.add_space(4.0);
-    // without a total only the line (the status bar has the spinner)
-    if let Some(f) = f {
-        ui.add(
-            egui::ProgressBar::new(f)
-                .desired_height(6.0)
-                .fill(DARK.accent),
-        );
-    }
-    let scan = state.running.as_ref().and_then(|a| state.scan_of(a));
-    let line = text::job_of_scan(scan.map(|s| s.name.as_str()), &job.label, f);
-    ui.add(egui::Label::new(RichText::new(line).color(DARK.text_dim)).truncate());
 }
 
 /// The main button – „Rechnen“ with a scan selected, else „Alle rechnen“ – and, with a scan
@@ -403,21 +304,10 @@ fn compute_buttons(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
     let below = match selected {
         Some(scan) => {
             let locked = blocked(state, scan).or(invalid.clone());
-            if main_button(ui, text::COMPUTE_ONE, locked) {
+            if main_button(ui, text::COMPUTE_ONE, locked, text::COMPUTE_HINT) {
                 *action = Some(Action::ComputeMap(scan.id.clone()));
             }
-            let all = ui.add_enabled_ui(all_locked.is_none(), |ui| {
-                ui.vertical_centered(|ui| {
-                    let label = RichText::new(text::COMPUTE_ALL).color(DARK.text_dim);
-                    ui.add(egui::Button::new(label).frame(false))
-                })
-                .inner
-            });
-            let all = match &all_locked {
-                Some(why) => all.inner.on_disabled_hover_text(why),
-                None => all.inner,
-            };
-            if all.clicked() {
+            if quiet_button(ui, text::COMPUTE_ALL, all_locked) {
                 *action = Some(Action::ComputeAllMaps);
             }
             busy.is_none()
@@ -426,7 +316,7 @@ fn compute_buttons(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
                 .map(|e| text::cannot_compute(&e))
         }
         None => {
-            if main_button(ui, text::COMPUTE_ALL, all_locked) {
+            if main_button(ui, text::COMPUTE_ALL, all_locked, text::COMPUTE_HINT) {
                 *action = Some(Action::ComputeAllMaps);
             }
             match (busy, invalid) {
@@ -442,11 +332,7 @@ fn compute_buttons(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
     if selected.is_none() && nothing.is_some() && other_precision(state) {
         lines.push(text::RECOMPUTE_HINT.to_string());
     }
-    for line in lines {
-        ui.vertical_centered(|ui| {
-            ui.add(egui::Label::new(RichText::new(line).color(DARK.text_dim)).wrap());
-        });
-    }
+    below_lines(ui, lines);
 }
 
 /// Whether a computed scan has no fitting map of the voxel size chosen now.
@@ -467,52 +353,6 @@ fn other_precision(state: &AppState) -> bool {
                     })
                 })
     })
-}
-
-/// A wide button in the accent colour; locked with the reason as tooltip. True when clicked.
-fn main_button(ui: &mut Ui, label: &str, locked: Option<String>) -> bool {
-    let button =
-        egui::Button::new(RichText::new(label).strong().color(DARK.on_accent)).fill(DARK.accent);
-    let size = egui::vec2(ui.available_width(), MAIN_BUTTON_HEIGHT);
-    // add_sized centres the label
-    let r = ui
-        .add_enabled_ui(locked.is_none(), |ui| ui.add_sized(size, button))
-        .inner
-        .on_hover_text(text::COMPUTE_HINT);
-    let r = match locked {
-        Some(why) => r.on_disabled_hover_text(why),
-        None => r,
-    };
-    r.clicked()
-}
-
-/// „▸ Erweitert“ / „▾ Erweitert“, centred. True when clicked.
-fn advanced_toggle(ui: &mut Ui, open: bool) -> bool {
-    ui.vertical_centered(|ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let symbol = if open { icon::UNFOLDED } else { icon::FOLDED };
-            let label =
-                egui::Button::new(RichText::new(text::ADVANCED).color(DARK.text_dim)).frame(false);
-            // centre the pair by hand: vertical_centered centres single widgets only
-            let width = 14.0
-                + 4.0
-                + ui.fonts_mut(|f| {
-                    f.layout_no_wrap(
-                        text::ADVANCED.into(),
-                        egui::TextStyle::Button.resolve(ui.style()),
-                        DARK.text_dim,
-                    )
-                    .size()
-                    .x
-                });
-            ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
-            ui.label(RichText::new(symbol).color(DARK.text_dim));
-            ui.add(label).clicked()
-        })
-        .inner
-    })
-    .inner
 }
 
 /// Under „Erweitert“: the map switches, two layers, and for the selection its steps,

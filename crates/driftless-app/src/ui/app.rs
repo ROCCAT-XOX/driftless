@@ -6,7 +6,7 @@ use super::correct::{Corrected, RunLoaded};
 use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
     actions, rail, settings, status, steps, text, theme, Action, AppState, CloudSummary,
-    InspectResult, Selection, Step, SurfaceSummary, UiMessage, ViewSettings, ViewStats,
+    InspectResult, Queued, Selection, Step, SurfaceSummary, UiMessage, ViewSettings, ViewStats,
 };
 use crate::cloud::{load_cloud, LoadedCloud};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
@@ -181,6 +181,22 @@ enum HelperTask {
     CompareMaps(PathBuf, PathBuf),
 }
 
+/// What a „compute all“ button puts into the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Batch {
+    /// „Alle rechnen“ in „Daten“: the new and stale scans.
+    Maps,
+    /// „Alle Oberflächen rechnen“ in „Bilder“: the maps without a current surface.
+    Surfaces,
+}
+
+/// The settings a queue started with, lent to each of its steps.
+#[derive(Debug, Clone)]
+struct QueueSettings {
+    map: driftless_steps::map::MapSettings,
+    surface: crate::project::SurfaceSettings,
+}
+
 pub struct DriftlessApp {
     state: AppState,
     /// The processing steps, one at a time. Dropping it (closing the window) cancels the
@@ -225,12 +241,12 @@ pub struct DriftlessApp {
     /// A project switch that waits until the cancelled step has stopped: until then the
     /// step may still write into the old project, which therefore stays shown.
     pending: Option<Action>,
-    /// „Alle rechnen“ was asked for while the maps were being checked: it starts once the
-    /// check is done ([`AppState::map_status_pending`]).
-    compute_all_waiting: bool,
-    /// The map settings „Alle rechnen“ started with: every scan of the queue uses them, even
-    /// if the switches change meanwhile.
-    queue_settings: Option<driftless_steps::map::MapSettings>,
+    /// „Alle rechnen“ or „Alle Oberflächen rechnen“ was asked for while the maps were being
+    /// checked: it starts once the check is done ([`AppState::map_status_pending`]).
+    compute_all_waiting: Option<Batch>,
+    /// The settings the queue started with: every step of it uses them, even if the
+    /// switches change meanwhile.
+    queue_settings: Option<QueueSettings>,
     /// The window title last sent.
     title: String,
     /// Closing waits for the cancelled step; the window closes once it has ended.
@@ -267,7 +283,7 @@ impl DriftlessApp {
             status_asked: 0,
             gaps_asked: 0,
             pending: None,
-            compute_all_waiting: false,
+            compute_all_waiting: None,
             queue_settings: None,
             title: String::new(),
             closing: false,
@@ -1054,8 +1070,10 @@ impl DriftlessApp {
         self.sync_compare();
         self.tick_helper();
         self.state.map_status_pending = self.map_status_pending();
-        if self.compute_all_waiting && !self.state.map_status_pending {
-            self.compute_all();
+        if let Some(batch) = self.compute_all_waiting {
+            if !self.state.map_status_pending {
+                self.compute_all(batch);
+            }
         }
     }
 
@@ -1063,7 +1081,9 @@ impl DriftlessApp {
         let step = self.state.running.take();
         // whether the step computed the scan at the head of the queue (read before the tree
         // is read again: a failed step may have left nothing behind)
-        let queued = step.as_ref().is_some_and(|a| self.computes_queue_head(a));
+        let queued = step
+            .as_ref()
+            .is_some_and(|a| self.state.computes_queue_head(a));
         let output = match f.result {
             Ok(output) => {
                 self.info(text::job_done(&f.label, &text::duration(f.seconds)));
@@ -1140,20 +1160,9 @@ impl DriftlessApp {
         }
     }
 
-    /// Whether `step` works on the scan at the head of [`AppState::queue`].
-    fn computes_queue_head(&self, step: &Action) -> bool {
-        let (Some(head), Some(project)) = (self.state.queue.front(), &self.state.project) else {
-            return false;
-        };
-        self.state
-            .scan_of(step)
-            .and_then(|s| project.scan(&s.id))
-            .is_some_and(|e| e.path == *head)
-    }
-
-    /// After a step of the queue's head: the head is done once its map was computed. A failed
-    /// step stops the whole queue (its error is in the status bar); SLAM that gave no run to
-    /// map drops the head.
+    /// After a step of the queue's head: a scan is done once its map was computed, a map once
+    /// its surface was. A failed step stops the whole queue (its error is in the status bar);
+    /// SLAM that gave no run to map drops the head.
     fn queue_step_done(&mut self, step: Option<&Action>, ok: bool) {
         if !ok {
             self.stop_queue();
@@ -1174,7 +1183,7 @@ impl DriftlessApp {
     fn stop_queue(&mut self) {
         self.state.queue.clear();
         self.queue_settings = None;
-        self.compute_all_waiting = false;
+        self.compute_all_waiting = None;
     }
 
     /// Whether the map statuses of the current tree are still being checked.
@@ -1183,34 +1192,49 @@ impl DriftlessApp {
             || matches!(self.helper_running, Some(HelperTask::MapStatus(_)))
     }
 
-    /// [`Action::ComputeAllMaps`]: the new and stale scans, once the map check is done.
-    fn compute_all(&mut self) {
+    /// [`Action::ComputeAllMaps`] (the new and stale scans) or [`Action::ComputeAllSurfaces`]
+    /// (the maps without a current surface), once the map check is done: until then a stale
+    /// map or surface would count as fitting.
+    fn compute_all(&mut self, batch: Batch) {
         if self.map_status_pending() && !self.jobs.is_busy() {
-            self.compute_all_waiting = true;
+            self.compute_all_waiting = Some(batch);
             return;
         }
-        self.compute_all_waiting = false;
-        let scans = self.state.scans_to_compute();
-        self.compute(scans);
+        self.compute_all_waiting = None;
+        match batch {
+            Batch::Maps => {
+                let scans = self.state.scans_to_compute();
+                let items = scans.into_iter().map(Queued::Scan).collect();
+                self.compute(items, text::ALL_COMPUTED);
+            }
+            Batch::Surfaces => {
+                let maps = self.state.maps_to_surface();
+                let items = maps.into_iter().map(Queued::Surface).collect();
+                self.compute(items, text::ALL_SURFACED);
+            }
+        }
     }
 
-    /// Queues `scans` (scan folders) with the current map settings and starts the first;
-    /// refused while a step runs.
-    fn compute(&mut self, scans: Vec<PathBuf>) {
+    /// Queues `items` with the current map and surface settings and starts the first;
+    /// refused while a step runs. `nothing`: the message when there is nothing to queue.
+    fn compute(&mut self, items: Vec<Queued>, nothing: &str) {
         if let Some(job) = self.jobs.status() {
             self.error(text::busy(&job.label));
             return;
         }
-        if scans.is_empty() {
-            self.info(text::ALL_COMPUTED.into());
+        if items.is_empty() {
+            self.info(nothing.into());
             return;
         }
-        self.state.queue = scans.into();
-        self.queue_settings = Some(self.state.map_settings.clone());
+        self.state.queue = items.into();
+        self.queue_settings = Some(QueueSettings {
+            map: self.state.map_settings.clone(),
+            surface: self.state.surface_settings.clone(),
+        });
         self.advance_queue();
     }
 
-    /// Starts the next step of the queue unless a step runs, with the map settings the queue
+    /// Starts the next step of the queue unless a step runs, with the settings the queue
     /// started with. A step that cannot start stops the queue with its reason.
     fn advance_queue(&mut self) {
         if self.jobs.is_busy() || self.state.queue.is_empty() {
@@ -1219,13 +1243,14 @@ impl DriftlessApp {
         let started = match self.state.next_queued_step() {
             Some(step) => {
                 // the step reads the settings from the state: lend it the queue's
-                let own = match &self.queue_settings {
-                    Some(q) => Some(std::mem::replace(&mut self.state.map_settings, q.clone())),
-                    None => None,
-                };
+                let own = self.queue_settings.clone().map(|q| QueueSettings {
+                    map: std::mem::replace(&mut self.state.map_settings, q.map),
+                    surface: std::mem::replace(&mut self.state.surface_settings, q.surface),
+                });
                 let started = actions::start_step(&mut self.state, &mut self.jobs, &step);
                 if let Some(own) = own {
-                    self.state.map_settings = own;
+                    self.state.map_settings = own.map;
+                    self.state.surface_settings = own.surface;
                 }
                 started
             }
@@ -1360,7 +1385,8 @@ impl DriftlessApp {
             Action::Compare { a, b } => self.start_compare(a, b),
             Action::CompareMaps { a, b } => self.start_compare_maps(a, b),
             Action::SetStep(step) => self.set_step(step),
-            Action::ComputeAllMaps => self.compute_all(),
+            Action::ComputeAllMaps => self.compute_all(Batch::Maps),
+            Action::ComputeAllSurfaces => self.compute_all(Batch::Surfaces),
             Action::ComputeMap(id) => {
                 let path = self
                     .state
@@ -1369,7 +1395,7 @@ impl DriftlessApp {
                     .and_then(|p| p.scan(&id))
                     .map(|e| e.path.clone());
                 match path {
-                    Some(path) => self.compute(vec![path]),
+                    Some(path) => self.compute(vec![Queued::Scan(path)], text::ALL_COMPUTED),
                     None => self.error(text::unknown_scan(&id)),
                 }
             }

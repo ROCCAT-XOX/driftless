@@ -30,8 +30,6 @@ pub const EMPTY_NO_MAPS: &str = "Noch keine Karte. Zuerst in „Daten“ eine Ka
 pub const GO_TO_DATA: &str = "Zu „Daten“";
 /// Over the view in „Bilder“ while no surface is shown.
 pub const NO_SURFACE_YET: &str = "Noch keine Oberfläche – im Feld „Bilder“ rechnen";
-pub const SELECT_MAP_FOR_SURFACE: &str = "Eine Karte wählen, um ihre Oberfläche zu rechnen";
-pub const MAPS_AND_SURFACES: &str = "Karten und Oberflächen";
 pub const PLAN_COMING: &str = "Hier entstehen Grundriss, Maße und der DWG-Export. Das folgt in \
      einem späteren Baustein.";
 pub const ADD_RUN_NEEDS_SCAN: &str = "Zuerst im Feld „Daten“ einen Scan wählen";
@@ -66,6 +64,29 @@ pub const RECOMPUTE_HINT: &str = "Scan wählen und „Rechnen“ drücken";
 /// While the background check of the maps runs: „Alle rechnen“ starts once it is done.
 pub const MAP_STATUS_PENDING: &str = "Karten werden geprüft …";
 pub const ADVANCED: &str = "Erweitert";
+
+// Step 2 „Bilder“
+/// The main button without a selected map: every map without a current surface, one after
+/// the other.
+pub const COMPUTE_ALL_SURFACES: &str = "Alle Oberflächen rechnen";
+pub const COMPUTE_SURFACES_HINT: &str =
+    "Rechnet je Karte die Oberfläche mit der gewählten Feinheit, eine nach der anderen";
+pub const COMPUTE_SURFACE_HINT: &str =
+    "Rechnet die Oberfläche der gewählten Karte mit der gewählten Feinheit";
+pub const ALL_SURFACED: &str = "Alle Karten haben eine Oberfläche";
+/// With every map surfaced, but their surfaces of another fineness than the one chosen.
+pub const SURFACE_RECOMPUTE_HINT: &str = "Karte wählen und „Oberfläche rechnen“ drücken";
+/// The voxel size of the surface as a switch (1 / 1,5 / 2 cm, [`SURFACE_VOXEL_CHOICES`]).
+pub const SURFACE_FINENESS: &str = "Feinheit";
+/// Under the switch at 1 cm.
+pub const SURFACE_FINE_HINT: &str =
+    "braucht bei großen Aufnahmen über 4 GB Arbeitsspeicher, dunkle Wände bleiben löchrig";
+/// The status of a map whose own map no longer fits its run: its surface waits for „Daten“.
+pub const STATUS_MAP_STALE: &str = "Karte veraltet";
+pub const STATUS_MAP_STALE_HINT: &str =
+    "Die Karte passt nicht mehr zu ihrem Lauf – zuerst in „Daten“ neu rechnen";
+/// Before the state of a surface of the selected map with the fineness chosen now.
+pub const WITH_THIS_FINENESS: &str = "Mit dieser Feinheit";
 
 // Panels
 pub const PANEL_STEPS: &str = "Schritte";
@@ -130,8 +151,7 @@ pub const DOWNSCALE: &str = "Bilder verkleinern";
 pub const DOWNSCALE_CHOICES: [(u32, &str); 3] = [(1, "1/1"), (2, "1/2"), (4, "1/4")];
 pub const SURFACE_SETTINGS: &str = "Oberflächen-Einstellungen";
 pub const SURFACE_SETTINGS_HINT: &str = "Gelten für die nächste Oberfläche dieser Karte";
-pub const SURFACE_VOXEL: &str = "Voxelgröße";
-/// The choices of [`SURFACE_VOXEL`] (m): finer needs more memory and time.
+/// The choices of [`SURFACE_FINENESS`] (m): finer needs more memory and time.
 pub const SURFACE_VOXEL_CHOICES: [(f64, &str); 3] =
     [(0.01, "1 cm"), (0.015, "1,5 cm"), (0.02, "2 cm")];
 pub const SURFACE_VOXEL_HINT: &str =
@@ -287,6 +307,19 @@ pub fn pose_hover(t: f64, submap: usize) -> String {
 /// A time of a place in the field: one decimal.
 pub fn place_time(t: f64) -> String {
     decimal(t, 1)
+}
+
+/// Under the heading „Bilder“: „3 Karten · 2 Oberflächen“.
+pub fn surfaces_line(maps: usize, surfaces: usize) -> String {
+    let maps = match maps {
+        1 => "1 Karte".to_string(),
+        n => format!("{n} Karten"),
+    };
+    let surfaces = match surfaces {
+        1 => "1 Oberfläche".to_string(),
+        n => format!("{n} Oberflächen"),
+    };
+    format!("{maps} · {surfaces}")
 }
 
 /// A map in „Bilder“: „buero · SLAM 001 · Karte 001“.
