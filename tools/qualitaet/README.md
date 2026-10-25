@@ -47,12 +47,12 @@ Halbe Last (6 von 12 vCPU, `nice 10`) und immer nur ein Lauf zur Zeit; `driftles
 ```
 driftless-vm sync
 driftless-vm run cargo build --release -p driftless-cli
-driftless-vm run env DQ_PYTHON=/home/yannick/td/quality-venv/bin/python tools/qualitaet/run_vorlagen.sh b0
+driftless-vm run bash -c 'DQ_PYTHON=$HOME/td/quality-venv/bin/python tools/qualitaet/run_vorlagen.sh b0'
 ```
 
 `DQ_PYTHON` muss ein Python mit numpy, scipy und laspy sein (auf der VM die venv
-`~/td/quality-venv`, hier mit absolutem Pfad, weil `driftless-vm run` kein `~` auflöst); ohne Angabe
-gilt `python3`. Die Variable steht hinter `env`, weil sie sonst nur lokal gesetzt wäre.
+`~/td/quality-venv`); ohne Angabe gilt `python3`. Die Variable wird mit `bash -c` auf der VM gesetzt,
+weil sie sonst nur lokal gälte und `~` dort nicht aufgelöst würde.
 
 Optionen: `--map-voxel 0.005` (Karte, m) und `--surface-voxel 0.01` (Oberfläche, m) sind die
 Vorgaben „Maximal“. Umgebung:
