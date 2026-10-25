@@ -4,7 +4,8 @@ use driftless_app::camera::Camera;
 use driftless_app::cloud::PointSet;
 use driftless_app::lod::{build_octree, build_octree_with, Octree};
 use driftless_app::pick::{
-    pick_point, pick_point_in, pick_pose, project, relative_to, to_physical,
+    pick_point, pick_point_in, pick_point_spots, pick_pose, project, relative_to, to_physical,
+    Spots,
 };
 use driftless_app::synthetic::Rng;
 use driftless_io::progress::Progress;
@@ -322,4 +323,36 @@ fn pick_respects_height_cut() {
     assert_eq!(pick([-1.0, 0.0]), Some(far));
     assert_eq!(pick([0.0, 1.0]), Some(near));
     assert_eq!(pick([0.5, 1.0]), None);
+}
+
+#[test]
+fn spots_are_hit_on_their_edge() {
+    // spots of 5 cm, drawn 2 … 48 px across, as the point shader sizes them
+    let spots = Some(Spots {
+        point_m: 0.05,
+        px_range: [2.0, 48.0],
+    });
+    let cam = along_x();
+    let pick = |x: f32, dx: f32, spots| {
+        let tree = tree_of(vec![[x, 0.0, 0.0]]);
+        let drawn = all_nodes(&tree);
+        let pixel = [CENTRE[0] + dx, CENTRE[1]];
+        pick_point_spots(
+            &tree,
+            &drawn,
+            &cam,
+            VIEWPORT,
+            pixel,
+            6.0,
+            [f32::MIN, f32::MAX],
+            spots,
+        )
+    };
+    // 1 m away the spot is 48 px across: 15 px off its centre is still on it
+    assert_eq!(pick(1.0, 15.0, None), None);
+    assert_eq!(pick(1.0, 15.0, spots), Some(0));
+    assert_eq!(pick(1.0, 30.0, spots), None);
+    // far away the spot is small: the radius stays the usual one
+    assert_eq!(pick(50.0, 15.0, spots), None);
+    assert_eq!(pick(50.0, 5.0, spots), Some(0));
 }

@@ -7,6 +7,11 @@ use crate::ui::theme::{self, icon, DARK};
 use crate::ui::{text, Action, AppState};
 use eframe::egui::{self, Align, Layout, RichText, Ui};
 
+/// Height kept below the list of measurements for the hint, „Messungen löschen“ and the card
+/// of what comes next (points), and the least height of the list.
+const BELOW_LIST: f32 = 230.0;
+const MIN_LIST: f32 = 80.0;
+
 pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     let mut action = None;
     heading(ui, text::STEP_PLAN);
@@ -39,18 +44,25 @@ fn measurements(ui: &mut Ui, state: &mut AppState) {
         hint(ui, text::NO_MEASUREMENTS);
         return;
     }
-    for (i, m) in state.measurements.iter().enumerate() {
-        theme::card_frame(false).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(icon::MEASURE).color(DARK.measure));
-                ui.label(text::measurement_name(i + 1));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(text::meters(m.distance())).strong());
+    // the cards scroll; the hint, „Messungen löschen“ and the card below stay in the field
+    let height = (ui.available_height() - BELOW_LIST).max(MIN_LIST);
+    egui::ScrollArea::vertical()
+        .id_salt("messungen")
+        .max_height(height)
+        .show(ui, |ui| {
+            for (i, m) in state.measurements.iter().enumerate() {
+                theme::card_frame(false).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(icon::MEASURE).color(DARK.measure));
+                        ui.label(text::measurement_name(i + 1));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new(text::meters(m.distance())).strong());
+                        });
+                    });
                 });
-            });
+            }
         });
-    }
     hint(ui, text::MEASUREMENTS_NOT_SAVED);
     if ui.button(text::CLEAR_MEASUREMENTS).clicked() {
         state.measurements.clear();

@@ -89,7 +89,13 @@ pub fn scan_status(state: &AppState, scan: &ScanNode) -> ScanStatus {
         return ScanStatus::Running(state.job.as_ref().and_then(fraction));
     }
     let path = state.project.as_ref().and_then(|p| p.scan(&scan.id));
-    if path.is_some_and(|e| state.queue.contains(&Queued::Scan(e.path.clone()))) {
+    let queued = |e: &crate::project::ScanEntry| {
+        state
+            .queue
+            .iter()
+            .any(|q| matches!(q, Queued::Scan(p) if *p == e.path))
+    };
+    if path.is_some_and(queued) {
         return ScanStatus::Queued;
     }
     let Some(newest) = scan.runs.iter().rev().find(|r| r.has_result) else {
@@ -300,9 +306,22 @@ fn compute_buttons(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
         Selection::Scan(id) => state.scan_node(id),
         _ => None,
     };
-    let all_locked = busy.clone().or(invalid.clone()).or(nothing.clone());
+    // colouring a scan without colour fails: lock before the click, not at that scan of the
+    // queue
+    let no_color = |scan: &ScanNode| {
+        (state.map_settings.step == MapStep::Color)
+            .then(|| scan.no_color.clone())
+            .flatten()
+    };
+    let to_compute =
+        |s: &&ScanNode| matches!(scan_status(state, s), ScanStatus::New | ScanStatus::Stale);
+    let all_invalid = invalid
+        .clone()
+        .or_else(|| state.scans.iter().filter(to_compute).find_map(no_color));
+    let all_locked = busy.clone().or(all_invalid.clone()).or(nothing.clone());
     let below = match selected {
         Some(scan) => {
+            let invalid = invalid.clone().or_else(|| no_color(scan));
             let locked = blocked(state, scan).or(invalid.clone());
             if main_button(ui, text::COMPUTE_ONE, locked, text::COMPUTE_HINT) {
                 *action = Some(Action::ComputeMap(scan.id.clone()));
@@ -319,7 +338,7 @@ fn compute_buttons(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
             if main_button(ui, text::COMPUTE_ALL, all_locked, text::COMPUTE_HINT) {
                 *action = Some(Action::ComputeAllMaps);
             }
-            match (busy, invalid) {
+            match (busy, all_invalid) {
                 (Some(_), _) => None,
                 (None, Some(e)) => Some(text::cannot_compute(&e)),
                 (None, None) if pending => Some(text::MAP_STATUS_PENDING.to_string()),

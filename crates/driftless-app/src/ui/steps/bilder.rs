@@ -41,10 +41,12 @@ pub enum SurfaceStatus {
 /// the map, then its surfaces. A map or surface counts as fitting until the background check
 /// ([`AppState::map_status`]) says it is stale.
 pub fn surface_status(state: &AppState, map: &MapInfo) -> SurfaceStatus {
-    if state.running.as_ref() == Some(&Action::RunSurface(map.dir.clone())) {
+    // compared by reference: this runs several times per map and frame
+    if matches!(&state.running, Some(Action::RunSurface(d)) if *d == map.dir) {
         return SurfaceStatus::Running(state.job.as_ref().and_then(fraction));
     }
-    if state.queue.contains(&Queued::Surface(map.dir.clone())) {
+    let queued = |q: &Queued| matches!(q, Queued::Surface(d) if *d == map.dir);
+    if state.queue.iter().any(queued) {
         return SurfaceStatus::Queued;
     }
     let scan_missing = state

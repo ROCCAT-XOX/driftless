@@ -610,3 +610,44 @@ fn picking_places_ends_outside_daten_and_with_point_tools() {
         assert_eq!(app.state().correct.picking, !ends, "{tool:?}");
     }
 }
+
+#[test]
+fn many_measurements_scroll_in_planung() {
+    let mut app = app();
+    app.state_mut().cloud = Some(cloud_summary());
+    app.state_mut().step = Step::Planung;
+    for i in 0..40 {
+        app.state_mut().measurements.push(Measurement {
+            a: A,
+            b: [A[0] + 1.0 + f64::from(i), A[1], A[2]],
+        });
+    }
+    let h = window(app, [1024.0, 640.0]);
+    // „Messungen löschen“ stays in the field, the list scrolls above it
+    let field = h.state().layout().step;
+    let clear = h.get_by_label(text::CLEAR_MEASUREMENTS).rect();
+    assert!(
+        clear.max.y <= field.max.y.min(640.0),
+        "{clear:?} below {field:?}"
+    );
+    h.get_by_label(&text::measurement_name(1));
+}
+
+#[test]
+fn measuring_over_the_surface_says_it_uses_the_cloud() {
+    let mut app = app();
+    app.state_mut().cloud = Some(cloud_summary());
+    app.state_mut().surface = Some(surface_summary());
+    app.state_mut().view.show = ShowMode::Surface;
+    app.state_mut().tool = Tool::Measure;
+    let mut h = window(app, [1400.0, 900.0]);
+    h.get_by_label(text::PICKS_ON_CLOUD);
+    // with the points shown, or the view turned, it says nothing of it
+    h.state_mut().state_mut().view.show = ShowMode::Both;
+    h.run();
+    assert!(h.query_by_label(text::PICKS_ON_CLOUD).is_none());
+    h.state_mut().state_mut().view.show = ShowMode::Surface;
+    h.state_mut().state_mut().tool = Tool::Orbit;
+    h.run();
+    assert!(h.query_by_label(text::PICKS_ON_CLOUD).is_none());
+}

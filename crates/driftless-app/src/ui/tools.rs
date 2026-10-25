@@ -299,6 +299,13 @@ fn info(ctx: &Context, view: Rect, state: &mut AppState) -> Rect {
         }
         if let Some(hint) = click_hint(s) {
             ui.add(egui::Label::new(RichText::new(hint).color(DARK.measure)).wrap());
+            // the clicks hit the points, also while only the surface is seen
+            if s.tool.picks_points() && s.cloud.is_some() && shown == ShowMode::Surface {
+                ui.add(
+                    egui::Label::new(RichText::new(text::PICKS_ON_CLOUD).color(DARK.text_dim))
+                        .wrap(),
+                );
+            }
         }
         if let Some(point) = &s.picked {
             // no separator: it would stretch the info to its widest

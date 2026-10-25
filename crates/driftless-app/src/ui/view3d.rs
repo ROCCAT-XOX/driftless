@@ -30,7 +30,7 @@ use crate::cloud::{LoadedCloud, DEFAULT_POINT_M};
 use crate::lod::{select_nodes, Octree, PointVertex};
 use crate::overlay::RunOverlay;
 use crate::overlay::{COMPARE_B_COLOR, COMPARE_COLOR, PICK_COLOR};
-use crate::pick::{pick_point_in, project, to_physical};
+use crate::pick::{pick_point_spots, project, to_physical, Spots};
 use crate::render::mesh::MeshRenderer;
 use crate::render::{
     ColorMode, FrameParams, PointRenderer, PointSize, RenderTarget, ShowMode, NO_CUT,
@@ -132,6 +132,22 @@ fn paint_legend(painter: &egui::Painter, rect: Rect, run: &RunOverlay, font: egu
         y = back.bottom() + 4.0;
         painter.galley(at, galley, color);
     }
+}
+
+/// How the points are drawn in world size, for picking on their spots; `None` in the pixel
+/// mode. The same size as the frame: `point_m` of the settings or of the map, between the
+/// point size of the settings and [`SPOT_MAX_PX`].
+fn spots(settings: &ViewSettings, cloud: Option<&LoadedCloud>, ppp: f32) -> Option<Spots> {
+    if settings.point_size != PointSize::World {
+        return None;
+    }
+    let point_px = (settings.point_px * ppp).max(1.0);
+    Some(Spots {
+        point_m: settings
+            .point_m
+            .unwrap_or_else(|| cloud.map_or(DEFAULT_POINT_M, |c| c.point_m)),
+        px_range: [point_px, (SPOT_MAX_PX * ppp).max(point_px)],
+    })
 }
 
 /// The size of the offscreen image for a panel of `panel_points` at `ppp` pixels per
@@ -856,7 +872,7 @@ impl View3d {
                                 .pick(&vp, viewport, pixel, radius, o.avoid_submap)
                                 .map(ViewEvent::PickedPose)
                         }
-                        (None, Some(cloud)) if self.tool.picks_points() => pick_point_in(
+                        (None, Some(cloud)) if self.tool.picks_points() => pick_point_spots(
                             &cloud.tree,
                             &self.drawn,
                             &self.camera,
@@ -864,6 +880,7 @@ impl View3d {
                             pixel,
                             PICK_RADIUS * ppp,
                             z_range,
+                            spots(settings, Some(cloud), ppp),
                         )
                         .map(|v| ViewEvent::PickedPoint(cloud.tree.source[v as usize])),
                         (None, _) => None,
@@ -873,7 +890,7 @@ impl View3d {
         }
         if response.double_clicked()
             && event.is_none()
-            && self.hit_nothing(rect, ppp, viewport, cloud, pos)
+            && self.hit_nothing(rect, ppp, viewport, cloud, pos, settings)
         {
             self.frame_all = true;
         }
@@ -891,13 +908,14 @@ impl View3d {
         viewport: [f32; 2],
         cloud: Option<&LoadedCloud>,
         pos: Option<egui::Pos2>,
+        settings: &ViewSettings,
     ) -> bool {
         let (Some(pos), Some(cloud)) = (pos, cloud) else {
             return true;
         };
         let z_range = self.z_range;
         let pixel = to_physical([pos.x, pos.y], [rect.min.x, rect.min.y], ppp);
-        pick_point_in(
+        pick_point_spots(
             &cloud.tree,
             &self.drawn,
             &self.camera,
@@ -905,6 +923,7 @@ impl View3d {
             pixel,
             PICK_RADIUS * ppp,
             z_range,
+            spots(settings, Some(cloud), ppp),
         )
         .is_none()
     }

@@ -636,3 +636,34 @@ fn new_precision_with_all_done_says_what_to_do() {
     click(&mut h, text::PRECISION_EXACT);
     assert!(h.query_by_label(text::RECOMPUTE_HINT).is_none());
 }
+
+#[test]
+fn no_colour_locks_compute_when_colouring() {
+    use driftless_steps::map::MapStep;
+    let why = "Keine Kamerabilder im Scan";
+    let mut state = three_scans();
+    state.scans[2].no_color = Some(why.into());
+    state.map_settings.step = MapStep::Color;
+    let mut h = panel(state);
+    // „Alle rechnen“ would stop at that scan: locked, with the reason
+    assert_eq!(click(&mut h, text::COMPUTE_ALL), None);
+    h.get_by_label(&text::cannot_compute(why));
+    // the scan alone too; a scan with colour can still be computed alone
+    h.state_mut().0.selection = Selection::Scan("scan-1335".into());
+    h.run();
+    assert_eq!(click(&mut h, text::COMPUTE_ONE), None);
+    h.state_mut().0.selection = Selection::Scan("scan-1325".into());
+    h.run();
+    assert_eq!(
+        click(&mut h, text::COMPUTE_ONE),
+        Some(Action::ComputeMap("scan-1325".into()))
+    );
+    // „Alles“ skips the colours with a warning: nothing locked
+    h.state_mut().0.map_settings.step = MapStep::All;
+    h.state_mut().0.selection = Selection::None;
+    h.run();
+    assert_eq!(
+        click(&mut h, text::COMPUTE_ALL),
+        Some(Action::ComputeAllMaps)
+    );
+}

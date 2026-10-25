@@ -259,6 +259,9 @@ pub const TOOL_MEASURE_HINT: &str =
 pub const MEASURE_FIRST: &str = "Messen: ersten Punkt anklicken";
 pub const MEASURE_SECOND: &str = "Messen: zweiten Punkt anklicken · Esc bricht ab";
 pub const PICK_POINT: &str = "Punkt wählen: auf einen Punkt klicken";
+/// Under the hint of „Messen“ / „Punkt wählen“ while only the surface is shown: the clicks
+/// hit the points of the cloud, not the surface.
+pub const PICKS_ON_CLOUD: &str = "misst an der Punktwolke, nicht an der Fläche";
 /// Measuring and picking look at points only.
 pub const TOOL_NEEDS_CLOUD: &str = "Messen und Punkt wählen brauchen eine Punktwolke";
 
