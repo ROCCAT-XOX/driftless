@@ -1348,5 +1348,12 @@ mod tests {
         assert!(!off.config.coarse_fallback);
         report["settings"]["coarse_fallback"] = "ja".into();
         assert_eq!(SurfaceSettings::from_report(&report), None);
+        // Before the fill filter: no key, the default; a stored value is kept.
+        report["settings"]["coarse_fallback"] = true.into();
+        report["settings"]["max_fill_gap"] = 0.03.into();
+        let wide = SurfaceSettings::from_report(&report).unwrap();
+        assert_eq!(wide.config.max_fill_gap, 0.03);
+        report["settings"]["max_fill_gap"] = "weit".into();
+        assert_eq!(SurfaceSettings::from_report(&report), None);
     }
 }
