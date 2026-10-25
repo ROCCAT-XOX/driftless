@@ -16,3 +16,8 @@
 # GLIM spike: locally built dependencies and run outputs
 spikes/glim/.deps/
 spikes/glim/out/
+
+# Snapshot tests: the outputs of a failed or updated comparison
+crates/driftless-app/tests/snapshots/*.new.png
+crates/driftless-app/tests/snapshots/*.diff.png
+crates/driftless-app/tests/snapshots/*.old.png

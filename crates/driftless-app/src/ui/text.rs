@@ -12,13 +12,89 @@ pub const ADD_SCAN: &str = "Scan hinzufügen …";
 pub const ADD_RUN: &str = "Lauf hinzufügen …";
 pub const MENU_PROJECT: &str = "Projekt";
 pub const NO_PROJECT: &str = "Kein Projekt geöffnet";
-pub const NO_SCANS: &str = "Noch kein Scan im Projekt";
 pub const NO_RUNS: &str = "Noch kein SLAM-Lauf";
 /// After the name of a scan whose folder cannot be read.
 pub const SCAN_MISSING: &str = "fehlt";
 
+// Rail and the fields of the steps
+pub const STEP_DATA: &str = "Daten";
+pub const STEP_IMAGES: &str = "Bilder";
+pub const STEP_PLAN: &str = "Planung";
+/// The settings window ⚙ and its button in the rail.
+pub const SETTINGS: &str = "Einstellungen";
+pub const EMPTY_NO_PROJECT: &str =
+    "Noch kein Projekt offen. Ein Projekt öffnen oder ein neues anlegen, dann Scans hinzufügen.";
+pub const EMPTY_NO_SCANS: &str =
+    "Das Projekt hat noch keinen Scan. Einen Scan-Ordner hinzufügen, um zu beginnen.";
+pub const EMPTY_NO_MAPS: &str = "Noch keine Karte. Zuerst in „Daten“ eine Karte rechnen.";
+pub const GO_TO_DATA: &str = "Zu „Daten“";
+/// Over the view in „Bilder“ while no surface is shown.
+pub const NO_SURFACE_YET: &str = "Noch keine Oberfläche – im Feld „Bilder“ rechnen";
+pub const PLAN_COMING: &str = "Hier entstehen Grundriss, Maße und der DWG-Export. Das folgt in \
+     einem späteren Baustein.";
+pub const ADD_RUN_NEEDS_SCAN: &str = "Zuerst im Feld „Daten“ einen Scan wählen";
+pub const ADD_SCAN_NEEDS_PROJECT: &str = "Zuerst ein Projekt öffnen";
+
+// Step 1 „Daten“
+/// The status of a scan in the list: no map yet.
+pub const STATUS_NEW: &str = "neu";
+/// The scan has a map that fits its newest run.
+pub const STATUS_DONE: &str = "fertig";
+/// The scan has a map, but it no longer fits (or belongs to an older run).
+pub const STATUS_STALE: &str = "veraltet";
+/// A job of the scan is running.
+pub const STATUS_RUNNING: &str = "rechnet";
+/// The scan waits in the queue of „Alle rechnen“.
+pub const STATUS_QUEUED: &str = "wartet";
+pub const PRECISION: &str = "Genauigkeit";
+pub const PRECISION_FAST: &str = "Schnell";
+pub const PRECISION_EXACT: &str = "Genau";
+pub const PRECISION_MAX: &str = "Maximal";
+pub const PRECISION_CUSTOM: &str = "Eigene";
+pub const PRECISION_MAX_HINT: &str = "braucht bei großen Aufnahmen über 4 GB Arbeitsspeicher";
+/// The main button without a selected scan: every new or stale scan, one after the other.
+pub const COMPUTE_ALL: &str = "Alle rechnen";
+/// The main button with a scan selected: only that scan.
+pub const COMPUTE_ONE: &str = "Rechnen";
+pub const COMPUTE_HINT: &str =
+    "Rechnet je Scan zuerst SLAM, falls nötig, dann die Punktwolke mit der gewählten Genauigkeit";
+pub const ALL_COMPUTED: &str = "Alle Scans sind gerechnet";
+/// With every scan done, but their maps of another precision than the one chosen.
+pub const RECOMPUTE_HINT: &str = "Scan wählen und „Rechnen“ drücken";
+/// While the background check of the maps runs: „Alle rechnen“ starts once it is done.
+pub const MAP_STATUS_PENDING: &str = "Karten werden geprüft …";
+pub const ADVANCED: &str = "Erweitert";
+
+// Step 2 „Bilder“
+/// The main button without a selected map: every map without a current surface, one after
+/// the other.
+pub const COMPUTE_ALL_SURFACES: &str = "Alle Oberflächen rechnen";
+pub const COMPUTE_SURFACES_HINT: &str =
+    "Rechnet je Karte die Oberfläche mit der gewählten Feinheit, eine nach der anderen";
+pub const COMPUTE_SURFACE_HINT: &str =
+    "Rechnet die Oberfläche der gewählten Karte mit der gewählten Feinheit";
+pub const ALL_SURFACED: &str = "Alle Karten haben eine Oberfläche";
+/// With every map surfaced, but their surfaces of another fineness than the one chosen.
+pub const SURFACE_RECOMPUTE_HINT: &str = "Karte wählen und „Oberfläche rechnen“ drücken";
+/// The voxel size of the surface as a switch (1 / 1,5 / 2 cm, [`SURFACE_VOXEL_CHOICES`]).
+pub const SURFACE_FINENESS: &str = "Feinheit";
+/// Under the switch at 1 cm.
+pub const SURFACE_FINE_HINT: &str =
+    "braucht bei großen Aufnahmen über 4 GB Arbeitsspeicher, dunkle Wände bleiben löchrig";
+/// The status of a map whose own map no longer fits its run: its surface waits for „Daten“.
+pub const STATUS_MAP_STALE: &str = "Karte veraltet";
+pub const STATUS_MAP_STALE_HINT: &str =
+    "Die Karte passt nicht mehr zu ihrem Lauf – zuerst in „Daten“ neu rechnen";
+/// The status of a map without `map.json` yet (still being computed, or failed).
+pub const STATUS_MAP_NOT_READY: &str = "Karte noch nicht fertig";
+/// The status of a map whose scan folder cannot be read.
+pub const STATUS_SCAN_MISSING: &str = "Scan fehlt";
+/// A map of the queue of „Alle Oberflächen rechnen“ is no longer in the project.
+pub const MAP_GONE: &str = "Karte nicht mehr im Projekt";
+/// Before the state of a surface of the selected map with the fineness chosen now.
+pub const WITH_THIS_FINENESS: &str = "Mit dieser Feinheit";
+
 // Panels
-pub const PANEL_PROJECT: &str = "Projekt";
 pub const PANEL_STEPS: &str = "Schritte";
 pub const PANEL_PROPERTIES: &str = "Eigenschaften";
 pub const VIEW_EMPTY: &str = "Keine Wolke geladen – links eine Karte oder Wolke wählen";
@@ -32,7 +108,7 @@ pub const STEP_SURFACE: &str = "Oberfläche rechnen";
 pub const NOT_COMPUTED: &str = "nicht gerechnet";
 pub const STALE: &str = "veraltet – Laufbahn neu gerechnet";
 pub const NO_CACHE: &str = "Kein Zwischenspeicher submaps.bin – zuerst SLAM rechnen";
-pub const SELECT_FOR_STEPS: &str = "Links einen Scan oder einen Lauf wählen";
+pub const SELECT_FOR_STEPS: &str = "Oben einen Scan oder einen Lauf wählen";
 pub const THIS_MAP: &str = "Diese Karte";
 pub const THIS_SURFACE: &str = "Diese Oberfläche";
 /// The state of a surface that no longer fits its map.
@@ -81,8 +157,7 @@ pub const DOWNSCALE: &str = "Bilder verkleinern";
 pub const DOWNSCALE_CHOICES: [(u32, &str); 3] = [(1, "1/1"), (2, "1/2"), (4, "1/4")];
 pub const SURFACE_SETTINGS: &str = "Oberflächen-Einstellungen";
 pub const SURFACE_SETTINGS_HINT: &str = "Gelten für die nächste Oberfläche dieser Karte";
-pub const SURFACE_VOXEL: &str = "Voxelgröße";
-/// The choices of [`SURFACE_VOXEL`] (m): finer needs more memory and time.
+/// The choices of [`SURFACE_FINENESS`] (m): finer needs more memory and time.
 pub const SURFACE_VOXEL_CHOICES: [(f64, &str); 3] =
     [(0.01, "1 cm"), (0.015, "1,5 cm"), (0.02, "2 cm")];
 pub const SURFACE_VOXEL_HINT: &str =
@@ -90,15 +165,26 @@ pub const SURFACE_VOXEL_HINT: &str =
      4 GB Arbeitsspeicher, und dunkle Wände bleiben löchrig";
 pub const SURFACE_NO_PHOTOS: &str = "ohne Fotos (graue Fläche)";
 
-// The 3D view and its properties (right panel)
+// The 3D view and its settings (window ⚙)
 pub const VIEW_NO_GPU: &str = "3D-Ansicht nicht verfügbar: keine wgpu-Grafik";
-pub const VIEW_SETTINGS: &str = "Ansicht";
-pub const COLOR_MODE: &str = "Farbe";
+pub const COLOR_MODE: &str = "Farbart";
 pub const MODE_RGB: &str = "Farbe";
 pub const MODE_INTENSITY: &str = "Intensität";
 pub const MODE_QUALITY: &str = "Güte";
 pub const POINT_SIZE: &str = "Punktgröße (px)";
 pub const ROUND_POINTS: &str = "rund";
+pub const POINT_SIZE_MODE: &str = "Punkte";
+pub const POINT_SIZE_PIXEL: &str = "Pixel";
+pub const POINT_SIZE_WORLD: &str = "Meter";
+pub const POINT_SIZE_MODE_HINT: &str = "Meter: jeder Punkt ist ein runder Fleck in echter Größe, aus \
+     der Nähe schließen sich die Flecken zu einem Bild. Pixel: jeder Punkt gleich groß, egal wie weit weg.";
+/// The point size slider in world size: the smallest a spot gets.
+pub const POINT_SIZE_MIN: &str = "Mindestgröße (px)";
+pub const SPOT_SIZE: &str = "Fleckgröße (cm)";
+pub const SPOT_FROM_MAP: &str = "aus der Karte";
+pub const SPOT_FROM_MAP_HINT: &str = "Raster der Karte × 1,5 (ohne Angabe 1,5 cm)";
+/// Range of a spot size set by hand (m).
+pub const POINT_M_RANGE: [f32; 2] = [0.002, 0.2];
 pub const BUDGET: &str = "Punktbudget";
 /// Range of the point budget.
 pub const BUDGET_RANGE: std::ops::RangeInclusive<usize> = 1_000_000..=30_000_000;
@@ -111,18 +197,21 @@ pub const LAYER_ODOMETRY: &str = "Odometrie";
 pub const LAYER_LOOPS: &str = "Schleifen";
 pub const LAYER_SUBMAPS: &str = "Teilkarten";
 pub const VIEW_HELP_ORBIT: &str =
-    "Linke Taste: umkreisen · rechte/mittlere Taste oder Shift: verschieben · Rad: Zoom · F oder Doppelklick ins Leere: alles zeigen · Klick: Punkt";
+    "Linke Taste: wie das Werkzeug unten · rechte/mittlere Taste oder Shift: verschieben · Rad: Zoom · F oder Doppelklick ins Leere: alles zeigen · O: Fläche/Punkte/beides · Esc: Messen abbrechen";
 pub const VIEW_HELP_FLY: &str =
-    "W/A/S/D, Q/E: fliegen (Shift schneller) · rechte Taste: umsehen · Rad: vor/zurück · F: alles zeigen · Klick: Punkt";
+    "W/A/S/D, Q/E: fliegen (Shift schneller) · linke Taste: wie das Werkzeug unten · rechte Taste: umsehen · Rad: vor/zurück · F: alles zeigen · O: Fläche/Punkte/beides · Esc: Messen abbrechen";
 pub const LOAD_CLOUD: &str = "Wolke laden";
 pub const LOAD_SURFACE: &str = "Oberfläche laden";
 pub const OPEN_SURFACE: &str = "Oberfläche öffnen …";
 pub const DIALOG_OPEN_SURFACE: &str = "Oberfläche öffnen (oberflaeche.glb)";
-pub const SHOW_MODE: &str = "Anzeige";
-pub const SHOW_SURFACE: &str = "Oberfläche";
-pub const SHOW_CLOUD: &str = "Punktwolke";
+/// The switch at the top right of the view.
+pub const SHOW_MODE: &str = "Ansicht";
+pub const SHOW_SURFACE: &str = "Fläche";
+pub const SHOW_CLOUD: &str = "Punkte";
 pub const SHOW_BOTH: &str = "beides";
-pub const SHOW_MODE_KEY_HINT: &str = "Taste O: Oberfläche → Punktwolke → beides";
+pub const SHOW_MODE_KEY_HINT: &str = "Taste O: Fläche → Punkte → beides";
+/// Why „Punkte“ and „beides“ are locked while only a surface is loaded.
+pub const SHOW_NEEDS_CLOUD: &str = "Keine Punktwolke geladen – nur die Fläche";
 /// A glb that cannot be read from disk because it is not there.
 pub const SURFACE_FILE_MISSING: &str = "Datei nicht gefunden";
 pub const SYNTHETIC_CLOUD: &str = "Testwolke";
@@ -137,20 +226,51 @@ pub const POINT_COLOR: &str = "Farbe";
 pub const POINT_QUALITY: &str = "Güte der Teilkarte";
 pub const POINT_REMOVED: &str = "Entfernt als";
 pub const NO_COLOR: &str = "ohne Farbe";
-pub const NO_POINT: &str = "Kein Punkt angeklickt";
+/// Tooltip of the × of the clicked point.
+pub const CLOSE_POINT: &str = "Punkt schließen";
 /// Point info and quality mode of a cloud without SLAM report.
 pub const QUALITY_UNKNOWN: &str = "unbekannt";
-pub const CUT: &str = "Schnitt";
-pub const CUT_Z_MIN: &str = "z min";
-pub const CUT_Z_MAX: &str = "z max";
+pub const CUT_MIN: &str = "z min";
+pub const CUT_MAX: &str = "z max";
 pub const HIDE_CEILING: &str = "Decke ausblenden";
 pub const NO_CEILING: &str = "Keine Decke erkannt";
 pub const CUT_RESET: &str = "Zurücksetzen";
 pub const CUT_HINT: &str =
     "Höhen relativ zum Wolkenursprung; Punkte außerhalb werden weder gezeichnet noch angeklickt";
-/// Hover text of the view: what „alles zeigen“ frames.
-pub const FRAME_ALL_HINT: &str =
-    "Alles zeigen rahmt die Wolke ohne die äußersten 0,5 % je Achse ein (ferne Ausreißer)";
+/// Tooltip of the line „Schnitt aktiv: …“ in the info of the view.
+pub const CUT_ACTIVE_HINT: &str =
+    "Punkte außerhalb dieser Höhen sind ausgeblendet; Werkzeug „Schnitt“ ändert oder setzt zurück";
+/// Tooltip of „Alles“: what it frames.
+pub const FRAME_ALL_HINT: &str = "Alles zeigen (Taste F); ohne die äußersten 0,5 % je Achse \
+     (ferne Ausreißer)";
+
+// The tools at the bottom of the view; exactly one is active. „Alles“ is a button, no tool.
+pub const TOOL_ORBIT: &str = "Drehen";
+pub const TOOL_PAN: &str = "Verschieben";
+pub const TOOL_PICK: &str = "Punkt wählen";
+pub const TOOL_MEASURE: &str = "Messen";
+pub const TOOL_CUT: &str = "Schnitt";
+pub const FIT_ALL: &str = "Alles";
+pub const TOOL_ORBIT_HINT: &str = "Linke Taste dreht die Ansicht um die Mitte";
+pub const TOOL_PAN_HINT: &str = "Linke Taste verschiebt die Ansicht";
+pub const TOOL_PICK_HINT: &str = "Klick auf einen Punkt zeigt seine Werte oben links";
+pub const TOOL_MEASURE_HINT: &str =
+    "Zwei Punkte nacheinander anklicken: ihr Abstand in Metern · Esc bricht ab";
+pub const MEASURE_FIRST: &str = "Messen: ersten Punkt anklicken";
+pub const MEASURE_SECOND: &str = "Messen: zweiten Punkt anklicken · Esc bricht ab";
+pub const PICK_POINT: &str = "Punkt wählen: auf einen Punkt klicken";
+/// Under the hint of „Messen“ / „Punkt wählen“ while only the surface is shown: the clicks
+/// hit the points of the cloud, not the surface.
+pub const PICKS_ON_CLOUD: &str = "misst an der Punktwolke, nicht an der Fläche";
+/// Measuring and picking look at points only.
+pub const TOOL_NEEDS_CLOUD: &str = "Messen und Punkt wählen brauchen eine Punktwolke";
+
+// Measurements (field „Planung“)
+pub const MEASUREMENTS: &str = "Messungen";
+pub const NO_MEASUREMENTS: &str =
+    "Noch keine Messungen. Unten in der Ansicht „Messen“ wählen und zwei Punkte anklicken.";
+pub const MEASUREMENTS_NOT_SAVED: &str = "Messungen werden noch nicht gespeichert (Baustein 5).";
+pub const CLEAR_MEASUREMENTS: &str = "Messungen löschen";
 pub const QUALITY_NONE_HINT: &str =
     "Ohne SLAM-Bericht oder ohne Punktzeiten: Güte unbekannt, grau gezeigt";
 
@@ -168,7 +288,7 @@ pub const PLACE_HINT: &str = "Zeit ab Scan-Beginn in s";
 pub const PLACE_A_SHORT: &str = "A";
 pub const PLACE_B_SHORT: &str = "B";
 pub const PICK_NEEDS_TRAJECTORY: &str =
-    "Stellen wählen braucht die Ebene „Laufbahn“ – unter Ansicht einschalten";
+    "Stellen wählen braucht die Ebene „Laufbahn“ – in den Einstellungen einschalten";
 pub const LAYER_REJECTED: &str = "Verworfene Kandidaten";
 pub const NEXT_PLACE_A: &str = "Nächster Klick auf die Laufbahn: Stelle A";
 pub const NEXT_PLACE_B: &str = "Nächster Klick auf die Laufbahn: Stelle B";
@@ -241,8 +361,84 @@ pub fn place_time(t: f64) -> String {
     decimal(t, 1)
 }
 
+/// Below „Alle Oberflächen rechnen“: the maps it leaves out because they wait for „Daten“
+/// (stale, not done, or of a scan that cannot be read).
+pub fn maps_wait_for_data(n: usize) -> String {
+    match n {
+        1 => "1 Karte erst in „Daten“ neu rechnen".to_string(),
+        n => format!("{n} Karten erst in „Daten“ neu rechnen"),
+    }
+}
+
+/// A queued map that is no longer in the project.
+pub fn map_gone(dir: &std::path::Path) -> String {
+    format!("{MAP_GONE}: {}", dir.display())
+}
+
+/// Under the heading „Bilder“: „3 Karten · 2 Oberflächen“.
+pub fn surfaces_line(maps: usize, surfaces: usize) -> String {
+    let maps = match maps {
+        1 => "1 Karte".to_string(),
+        n => format!("{n} Karten"),
+    };
+    let surfaces = match surfaces {
+        1 => "1 Oberfläche".to_string(),
+        n => format!("{n} Oberflächen"),
+    };
+    format!("{maps} · {surfaces}")
+}
+
+/// A map in „Bilder“: „buero · SLAM 001 · Karte 001“.
+pub fn map_of(scan: &str, run: &str, map: &str) -> String {
+    format!("{scan} · {run} · {map}")
+}
+
 pub fn project_opened(name: &str) -> String {
     format!("Projekt {name} geöffnet")
+}
+
+/// Under the heading „Daten“: „Projekt „Halle“ · 3 Scans“.
+pub fn project_line(name: &str, scans: usize) -> String {
+    let scans = match scans {
+        1 => "1 Scan".to_string(),
+        n => format!("{n} Scans"),
+    };
+    format!("Projekt „{name}“ · {scans}")
+}
+
+/// A precision that is no level: „Eigene (0,013 m)“.
+pub fn precision_custom(voxel: f64) -> String {
+    format!("{PRECISION_CUSTOM} ({})", voxel_metres(voxel))
+}
+
+/// Tooltip of a precision level: „Raster 0,01 m“.
+pub fn precision_hover(voxel: f64) -> String {
+    format!("Raster {}", voxel_metres(voxel))
+}
+
+/// „0,005 m“, „0,01 m“: a voxel size without trailing zeros.
+fn voxel_metres(voxel: f64) -> String {
+    let fixed = decimal(voxel, 3);
+    let trimmed = fixed.trim_end_matches('0').trim_end_matches(',');
+    format!("{trimmed} m")
+}
+
+/// Under the precision while a job runs: „Scan 13:30 · Karte rechnen 62 %“, without a total
+/// „Scan 13:30 · Karte rechnen läuft“; without a scan only the job.
+pub fn job_of_scan(scan: Option<&str>, job: &str, fraction: Option<f32>) -> String {
+    let how = match fraction {
+        Some(f) => format!("{} %", (f * 100.0).round() as u32),
+        None => "läuft".into(),
+    };
+    match scan {
+        Some(scan) => format!("{scan} · {job} {how}"),
+        None => format!("{job} {how}"),
+    }
+}
+
+/// Under the main button when the map settings are invalid.
+pub fn cannot_compute(why: &str) -> String {
+    format!("Nicht rechenbar: {why}")
 }
 
 pub fn scan_missing(name: &str) -> String {
@@ -417,26 +613,62 @@ pub fn point_count(n: usize) -> String {
     }
 }
 
-/// „gezeichnet 5,9 Mio. von 15,6 Mio. Punkten · 8,4 ms GPU“; without GPU timer the time
-/// between frames: „… · 16,7 ms je Bild“.
-pub fn drawn_stats(drawn: usize, total: usize, frame_ms: f32, gpu: bool) -> String {
-    format!(
-        "gezeichnet {} von {} Punkten · {} ms {}",
-        point_count(drawn),
-        point_count(total),
-        decimal(f64::from(frame_ms), 1),
-        if gpu { "GPU" } else { "je Bild" }
-    )
-}
-
 /// „Wolke wird hochgeladen … 40 %“.
 pub fn uploading(percent: f32) -> String {
     format!("Wolke wird hochgeladen … {percent:.0} %")
 }
 
+/// A distance: „2,00 m“ (centimetres).
+pub fn meters(d: f64) -> String {
+    format!("{} m", decimal(d, 2))
+}
+
+/// „Messung 1“: the name of a measurement in the field „Planung“ (counted from 1).
+pub fn measurement_name(nr: usize) -> String {
+    format!("Messung {nr}")
+}
+
+/// The info at the top left of the view: „Punktwolke · 6,0 Mio. Punkte“.
+pub fn info_cloud(points: usize) -> String {
+    format!("Punktwolke · {} Punkte", point_count(points))
+}
+
+/// „Oberfläche · 712.218 Dreiecke“.
+pub fn info_surface(triangles: usize) -> String {
+    format!(
+        "Oberfläche · {} Dreiecke",
+        super::status::count(triangles as u64)
+    )
+}
+
+/// The numbers of the last frame below the info: „gezeichnet 5,9 Mio. · 8,4 ms GPU“, for a
+/// surface alone (`drawn` none) only the time; without GPU timer the time between frames
+/// („… ms je Bild“).
+pub fn frame_line(drawn: Option<usize>, frame_ms: f32, gpu: bool) -> String {
+    let time = format!(
+        "{} ms {}",
+        decimal(f64::from(frame_ms), 1),
+        if gpu { "GPU" } else { "je Bild" }
+    );
+    match drawn {
+        Some(n) => format!("gezeichnet {} · {time}", point_count(n)),
+        None => time,
+    }
+}
+
 /// A height of the cut: „2,85 m“.
 pub fn height(z: f32) -> String {
     format!("{} m", decimal(f64::from(z), 2))
+}
+
+/// The line in the info of the view while a height cut hides points and its bar is not shown:
+/// „Schnitt aktiv: z -0,50 bis 2,80 m“.
+pub fn cut_active([lo, hi]: [f32; 2]) -> String {
+    format!(
+        "Schnitt aktiv: z {} bis {}",
+        decimal(f64::from(lo), 2),
+        height(hi)
+    )
 }
 
 /// The name of the synthetic cloud of `n` points.
@@ -481,16 +713,6 @@ pub fn external_buffer(uri: &str) -> String {
     format!(
         "Daten liegen in einer eigenen Datei ({uri}); nur eine glb mit allen Daten in der Datei \
          wird gelesen (wie `driftless surface` sie schreibt)"
-    )
-}
-
-/// „Oberfläche: 712.218 Dreiecke · 8,4 ms GPU“ – the stats line of a surface shown alone.
-pub fn surface_stats(triangles: usize, frame_ms: f32, gpu: bool) -> String {
-    format!(
-        "Oberfläche: {} Dreiecke · {} ms {}",
-        super::status::count(triangles as u64),
-        decimal(f64::from(frame_ms), 1),
-        if gpu { "GPU" } else { "je Bild" }
     )
 }
 

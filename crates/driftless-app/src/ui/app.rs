@@ -3,10 +3,11 @@
 
 use super::compare::{compare_maps, compare_refs, default_refs, TrajRef};
 use super::correct::{Corrected, RunLoaded};
+use super::tools::{self, ScreenLayout};
 use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
-    actions, left, right, status, text, Action, AppState, CloudSummary, InspectResult, Selection,
-    SurfaceSummary, UiMessage, ViewStats,
+    actions, rail, settings, status, steps, text, theme, Action, AppState, CloudSummary,
+    InspectResult, Queued, Selection, Step, SurfaceSummary, UiMessage, ViewSettings, ViewStats,
 };
 use crate::cloud::{load_cloud, LoadedCloud};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
@@ -25,6 +26,9 @@ use std::time::Duration;
 
 /// Key of the last opened project in eframe's storage.
 const LAST_PROJECT_KEY: &str = "letztes_projekt";
+/// Key of the stored layout (step and view settings) in eframe's storage. A new layout gets
+/// a new version: what an older program stored is then not read.
+pub const UI_KEY: &str = "ui-v2";
 /// While a step runs, the window draws this often, so progress and runtime move (the job
 /// runner only wakes the UI when a job ends, see `crate::jobs`).
 const REPAINT_WHILE_BUSY: Duration = Duration::from_millis(100);
@@ -32,10 +36,12 @@ const REPAINT_WHILE_BUSY: Duration = Duration::from_millis(100);
 const LOG_LIMIT: usize = 10_000;
 /// Messages kept for the status bar (it shows the last); older ones are dropped.
 const MESSAGE_LIMIT: usize = 100;
-const LEFT_WIDTH: f32 = 280.0;
-/// The project tree never gets narrower than this (names are cut with „…“ instead).
-const LEFT_MIN_WIDTH: f32 = 220.0;
-const RIGHT_WIDTH: f32 = 340.0;
+const STEP_WIDTH: f32 = 250.0;
+/// The field of the step never gets narrower than this (names are cut with „…“ instead).
+const STEP_MIN_WIDTH: f32 = 220.0;
+/// The hint „Noch keine Oberfläche“ stands this far below the top of the view (points), under
+/// the floating info.
+const HINT_TOP: f32 = 64.0;
 
 /// Seed of the synthetic cloud of `--synthetic`.
 const SYNTHETIC_SEED: u64 = 1;
@@ -80,6 +86,77 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String
     Ok(out)
 }
 
+/// What is kept of the layout between starts, under [`UI_KEY`]: the step and how the view
+/// draws. A field missing in what was stored keeps its default; an unknown one means another
+/// format, and the whole is not read.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StoredUi {
+    step: Step,
+    color_mode: crate::render::ColorMode,
+    point_px: f32,
+    round: bool,
+    budget: usize,
+    camera_mode: crate::camera::CameraMode,
+    show_trajectory: bool,
+    show_odometry: bool,
+    show_loops: bool,
+    show_rejected: bool,
+    show_submaps: bool,
+    show_compare: bool,
+    point_size: crate::render::PointSize,
+    point_m: Option<f32>,
+}
+
+impl Default for StoredUi {
+    fn default() -> Self {
+        StoredUi::of(Step::default(), &ViewSettings::default())
+    }
+}
+
+impl StoredUi {
+    fn of(step: Step, v: &ViewSettings) -> Self {
+        StoredUi {
+            step,
+            color_mode: v.color_mode,
+            point_px: v.point_px,
+            round: v.round,
+            budget: v.budget,
+            camera_mode: v.camera_mode,
+            show_trajectory: v.show_trajectory,
+            show_odometry: v.show_odometry,
+            show_loops: v.show_loops,
+            show_rejected: v.show_rejected,
+            show_submaps: v.show_submaps,
+            show_compare: v.show_compare,
+            point_size: v.point_size,
+            point_m: v.point_m,
+        }
+    }
+
+    /// The view settings as stored, the rest from `v`.
+    fn apply_to(&self, v: &mut ViewSettings) {
+        v.color_mode = self.color_mode;
+        v.point_px = self.point_px.clamp(1.0, 10.0);
+        v.round = self.round;
+        v.budget = self
+            .budget
+            .clamp(*text::BUDGET_RANGE.start(), *text::BUDGET_RANGE.end());
+        v.camera_mode = self.camera_mode;
+        v.show_trajectory = self.show_trajectory;
+        v.show_odometry = self.show_odometry;
+        v.show_loops = self.show_loops;
+        v.show_rejected = self.show_rejected;
+        v.show_submaps = self.show_submaps;
+        v.show_compare = self.show_compare;
+        v.point_size = self.point_size;
+        v.point_m = self
+            .point_m
+            .filter(|m| m.is_finite())
+            .map(|m| m.clamp(text::POINT_M_RANGE[0], text::POINT_M_RANGE[1]));
+    }
+}
+
 /// Where a cloud comes from.
 #[derive(Debug, Clone, PartialEq)]
 enum CloudSource {
@@ -115,6 +192,25 @@ enum HelperTask {
     Compare(TrajRef, TrajRef),
     /// Two `map.json` side by side.
     CompareMaps(PathBuf, PathBuf),
+}
+
+/// What a „compute all“ button puts into the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Batch {
+    /// „Alle rechnen“ in „Daten“: the new and stale scans.
+    Maps,
+    /// „Alle Oberflächen rechnen“ in „Bilder“: the maps without a current surface.
+    Surfaces,
+}
+
+/// The settings a queue started with, lent to each of its steps, and the count of loads by
+/// hand when it started.
+#[derive(Debug, Clone)]
+struct QueueSettings {
+    slam: driftless_steps::slam::SlamSettings,
+    map: driftless_steps::map::MapSettings,
+    surface: crate::project::SurfaceSettings,
+    hand_loads: u64,
 }
 
 pub struct DriftlessApp {
@@ -161,12 +257,28 @@ pub struct DriftlessApp {
     /// A project switch that waits until the cancelled step has stopped: until then the
     /// step may still write into the old project, which therefore stays shown.
     pending: Option<Action>,
+    /// „Alle rechnen“ or „Alle Oberflächen rechnen“ was asked for while the maps were being
+    /// checked: it starts once the check is done ([`AppState::map_status_pending`]).
+    compute_all_waiting: Option<Batch>,
+    /// The settings the queue started with: every step of it uses them, even if the
+    /// switches change meanwhile.
+    queue_settings: Option<QueueSettings>,
+    /// Clouds and surfaces asked for by hand (picked, opened) so far: a queue shows its last
+    /// result only if none was asked for while it ran.
+    hand_loads: u64,
+    /// Whether the surface being loaded was asked for by hand: it is shown in any step, a
+    /// computed one only in „Bilder“.
+    surface_by_hand: bool,
     /// The window title last sent.
     title: String,
     /// Closing waits for the cancelled step; the window closes once it has ended.
     closing: bool,
     /// The stored last project could not be opened: forget it on the next save.
     forget_last: bool,
+    /// [`super::theme::apply`] was called (once, at the first frame or in the creation context).
+    themed: bool,
+    /// Where the panels and the floating bars were in the last frame.
+    layout: ScreenLayout,
 }
 
 impl DriftlessApp {
@@ -195,9 +307,15 @@ impl DriftlessApp {
             status_asked: 0,
             gaps_asked: 0,
             pending: None,
+            compute_all_waiting: None,
+            queue_settings: None,
+            hand_loads: 0,
+            surface_by_hand: false,
             title: String::new(),
             closing: false,
             forget_last: false,
+            themed: false,
+            layout: ScreenLayout::default(),
         }
     }
 
@@ -205,8 +323,11 @@ impl DriftlessApp {
     /// generating the synthetic cloud if asked for.
     pub fn from_creation_context(cc: &eframe::CreationContext<'_>, args: Args) -> Self {
         let ctx = cc.egui_ctx.clone();
+        super::theme::apply(&cc.egui_ctx);
         let mut app = DriftlessApp::new(Arc::new(move || ctx.request_repaint()));
+        app.themed = true;
         app.render_state = cc.wgpu_render_state.clone();
+        app.restore_ui(&cc.egui_ctx, cc.storage);
         if let Some(dir) = args.project {
             app.apply(Action::OpenProject(dir));
         } else {
@@ -237,6 +358,11 @@ impl DriftlessApp {
 
     pub fn view(&self) -> &View3d {
         &self.view
+    }
+
+    /// Where the panels and the floating bars were in the last frame.
+    pub fn layout(&self) -> &ScreenLayout {
+        &self.layout
     }
 
     /// The 3D view (tests and tools move its camera).
@@ -533,6 +659,7 @@ impl DriftlessApp {
                         quality_known: cloud.points.quality_known,
                         z_range: cloud.z_range,
                         ceiling: cloud.ceiling,
+                        point_m: cloud.point_m,
                     });
                     self.state.view.cut = None;
                     self.state.picked = None;
@@ -673,8 +800,11 @@ impl DriftlessApp {
                     }
                 }
                 self.view.set_surface(Some(*surface));
-                // the surface just picked is what is drawn
-                self.state.view.show = ShowMode::Surface;
+                // the surface just picked is what is drawn; a computed one only in „Bilder“,
+                // the other steps keep showing the points
+                if std::mem::take(&mut self.surface_by_hand) || self.state.step == Step::Bilder {
+                    self.state.view.show = ShowMode::Surface;
+                }
             }
             Ok(_) => {}
             // a cancel for the next load needs no message
@@ -743,6 +873,32 @@ impl DriftlessApp {
         }
     }
 
+    /// Takes the layout stored under [`UI_KEY`]. Without one, or with one that cannot be read
+    /// (an older program, another format), the defaults hold and egui's stored window state
+    /// (panel widths, folded sections, windows of the old layout) is dropped, so that the
+    /// first start after an update shows the new layout clean.
+    pub fn restore_ui(&mut self, ctx: &egui::Context, storage: Option<&dyn eframe::Storage>) {
+        let stored = storage
+            .and_then(|s| s.get_string(UI_KEY))
+            .and_then(|s| serde_json::from_str::<StoredUi>(&s).ok());
+        match stored {
+            Some(ui) => {
+                self.state.step = ui.step;
+                ui.apply_to(&mut self.state.view);
+            }
+            None => ctx.memory_mut(|m| {
+                m.data.clear();
+                m.reset_areas();
+            }),
+        }
+    }
+
+    /// The layout to store under [`UI_KEY`].
+    pub fn ui_to_store(&self) -> String {
+        let ui = StoredUi::of(self.state.step, &self.state.view);
+        serde_json::to_string(&ui).unwrap_or_default()
+    }
+
     /// What to store as the last project: the open one, empty to forget a gone one, `None`
     /// to keep what is stored. A folder whose path is not valid UTF-8 is not stored (the
     /// storage holds text, and a changed path would point elsewhere).
@@ -764,6 +920,7 @@ impl DriftlessApp {
         if !self.closing {
             self.closing = true;
             self.pending = None;
+            self.stop_queue();
             self.jobs.cancel();
             self.info(text::CLOSE_AFTER_CANCEL.to_string());
         }
@@ -948,10 +1105,21 @@ impl DriftlessApp {
         self.sync_run();
         self.sync_compare();
         self.tick_helper();
+        self.state.map_status_pending = self.map_status_pending();
+        if let Some(batch) = self.compute_all_waiting {
+            if !self.state.map_status_pending {
+                self.compute_all(batch);
+            }
+        }
     }
 
     fn finished(&mut self, f: JobFinished) {
-        let step = self.state.step.take();
+        let step = self.state.running.take();
+        // whether the step computed the scan at the head of the queue (read before the tree
+        // is read again: a failed step may have left nothing behind)
+        let queued = step
+            .as_ref()
+            .is_some_and(|a| self.state.computes_queue_head(a));
         let output = match f.result {
             Ok(output) => {
                 self.info(text::job_done(&f.label, &text::duration(f.seconds)));
@@ -959,6 +1127,7 @@ impl DriftlessApp {
             }
             Err(StepError::Cancelled) => {
                 self.info(text::job_cancelled(&f.label));
+                self.stop_queue();
                 None
             }
             Err(e) => {
@@ -968,6 +1137,18 @@ impl DriftlessApp {
         };
         // the step may have added runs or maps
         self.reload_project();
+        let hand_loads = self.queue_settings.as_ref().map(|q| q.hand_loads);
+        if queued {
+            self.queue_step_done(step.as_ref(), output.is_some());
+        }
+        // A step of a queue shows its result only as the queue's last, and only if nothing
+        // was picked by hand meanwhile: the queue does not load every result beside the next
+        // job, nor take the view from the user.
+        let show = !queued
+            || (self.state.queue.is_empty() && hand_loads.is_none_or(|n| n == self.hand_loads));
+        if show {
+            self.surface_by_hand = false;
+        }
         // a reuse started with the count of written changes (taken also if it failed)
         let current = match &output {
             Some(JobOutput::Slam(done)) => self.state.correct.computed_current(&done.run_dir),
@@ -982,9 +1163,11 @@ impl DriftlessApp {
                 if current {
                     self.state.correct.changed.remove(&done.run_dir);
                 }
-                self.state.selection = Selection::Run(done.run_dir.clone());
                 self.reload_run(&done.run_dir);
-                self.load_run_cloud(&done.run_dir);
+                if show {
+                    self.state.selection = Selection::Run(done.run_dir.clone());
+                    self.load_run_cloud(&done.run_dir);
+                }
                 // its trajectories changed: compare again, as preset (before/after) for the
                 // run drawn, else the same pair if one of them is of this run
                 let c = &self.state.compare;
@@ -998,7 +1181,7 @@ impl DriftlessApp {
             }
             // a failed or cancelled restore wrote its corrections back: show them again
             (None, Some(Action::RestoreHistory { run, .. })) => self.reload_run(&run),
-            (Some(JobOutput::Map(done)), _) => {
+            (Some(JobOutput::Map(done)), _) if show => {
                 self.state.selection = Selection::Map(done.dir.clone());
                 self.load_best_of_map(&done.dir);
             }
@@ -1006,8 +1189,10 @@ impl DriftlessApp {
                 if done.reused {
                     self.info(text::surface_fits(&done.dir));
                 }
-                self.state.selection = Selection::Surface(done.dir.clone());
-                self.load_surface(&done.dir);
+                if show {
+                    self.state.selection = Selection::Surface(done.dir.clone());
+                    self.load_surface(&done.dir);
+                }
             }
             (Some(JobOutput::Inspect(report)), Some(Action::Inspect(scan))) => {
                 self.state.inspect = Some(InspectResult {
@@ -1018,8 +1203,129 @@ impl DriftlessApp {
             }
             _ => {}
         }
+        self.advance_queue();
         if let Some(action) = self.pending.take() {
             self.apply(action);
+        }
+    }
+
+    /// After a step of the queue's head: a scan is done once its map was computed, a map once
+    /// its surface was. A failed step stops the whole queue (its error is in the status bar);
+    /// SLAM that gave no run to map drops the head.
+    fn queue_step_done(&mut self, step: Option<&Action>, ok: bool) {
+        if !ok {
+            self.stop_queue();
+            return;
+        }
+        let done = match step {
+            Some(Action::RunSlam(_)) => {
+                !matches!(self.state.next_queued_step(), Some(Action::RunMap(_)))
+            }
+            _ => true,
+        };
+        if done {
+            self.state.queue.pop_front();
+        }
+    }
+
+    /// Empties the queue: nothing of it starts any more.
+    fn stop_queue(&mut self) {
+        self.state.queue.clear();
+        self.queue_settings = None;
+        self.compute_all_waiting = None;
+    }
+
+    /// Whether the map statuses of the current tree are still being checked.
+    fn map_status_pending(&self) -> bool {
+        self.status_asked != self.state.tree_version
+            || matches!(self.helper_running, Some(HelperTask::MapStatus(_)))
+    }
+
+    /// [`Action::ComputeAllMaps`] (the new and stale scans) or [`Action::ComputeAllSurfaces`]
+    /// (the maps without a current surface), once the map check is done: until then a stale
+    /// map or surface would count as fitting.
+    fn compute_all(&mut self, batch: Batch) {
+        if self.map_status_pending() && !self.jobs.is_busy() {
+            self.compute_all_waiting = Some(batch);
+            return;
+        }
+        self.compute_all_waiting = None;
+        match batch {
+            Batch::Maps => {
+                let scans = self.state.scans_to_compute();
+                let items = scans.into_iter().map(Queued::Scan).collect();
+                self.compute(items, text::ALL_COMPUTED);
+            }
+            Batch::Surfaces => {
+                let maps = self.state.maps_to_surface();
+                let items = maps.into_iter().map(Queued::Surface).collect();
+                // the maps left out are named, whether others are queued or not
+                let waiting = self.state.maps_waiting_for_data();
+                if waiting == 0 {
+                    self.compute(items, text::ALL_SURFACED);
+                } else {
+                    let wait = text::maps_wait_for_data(waiting);
+                    self.compute(items, &wait);
+                    if !self.state.queue.is_empty() {
+                        self.info(wait);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Queues `items` with the current map and surface settings and starts the first;
+    /// refused while a step runs. `nothing`: the message when there is nothing to queue.
+    fn compute(&mut self, items: Vec<Queued>, nothing: &str) {
+        if let Some(job) = self.jobs.status() {
+            self.error(text::busy(&job.label));
+            return;
+        }
+        if items.is_empty() {
+            self.info(nothing.into());
+            return;
+        }
+        self.state.queue = items.into();
+        self.queue_settings = Some(QueueSettings {
+            slam: self.state.slam_settings.clone(),
+            map: self.state.map_settings.clone(),
+            surface: self.state.surface_settings.clone(),
+            hand_loads: self.hand_loads,
+        });
+        self.advance_queue();
+    }
+
+    /// Starts the next step of the queue unless a step runs, with the settings the queue
+    /// started with. A step that cannot start stops the queue with its reason.
+    fn advance_queue(&mut self) {
+        if self.jobs.is_busy() || self.state.queue.is_empty() {
+            return;
+        }
+        let started = match self.state.next_queued_step() {
+            Some(step) => {
+                // the step reads the settings from the state: lend it the queue's
+                let own = self.queue_settings.clone().map(|q| QueueSettings {
+                    slam: std::mem::replace(&mut self.state.slam_settings, q.slam),
+                    map: std::mem::replace(&mut self.state.map_settings, q.map),
+                    surface: std::mem::replace(&mut self.state.surface_settings, q.surface),
+                    hand_loads: q.hand_loads,
+                });
+                let started = actions::start_step(&mut self.state, &mut self.jobs, &step);
+                if let Some(own) = own {
+                    self.state.slam_settings = own.slam;
+                    self.state.map_settings = own.map;
+                    self.state.surface_settings = own.surface;
+                }
+                started
+            }
+            None => Err(match self.state.queue.front() {
+                Some(Queued::Surface(dir)) => text::map_gone(dir),
+                _ => text::UNKNOWN_SCAN.into(),
+            }),
+        };
+        if let Err(e) = started {
+            self.error(e);
+            self.stop_queue();
         }
     }
 
@@ -1055,6 +1361,7 @@ impl DriftlessApp {
                 if self.jobs.is_busy() =>
             {
                 // The step belongs to the old project: stop it first, switch when it ended.
+                self.stop_queue();
                 self.jobs.cancel();
                 self.pending = Some(switch);
                 self.info(text::SWITCH_AFTER_CANCEL.to_string());
@@ -1095,6 +1402,8 @@ impl DriftlessApp {
                 }
             }
             Action::Select(selection) => {
+                self.hand_loads += 1;
+                self.surface_by_hand = matches!(selection, Selection::Surface(_));
                 self.state.selection = selection;
                 self.load_selected();
                 // choosing the shown run again reads it again (e.g. after `driftless correct`)
@@ -1104,27 +1413,47 @@ impl DriftlessApp {
                     }
                 }
             }
-            Action::LoadCloud { path, run } => self.load(CloudSource::File { path, run }),
+            Action::LoadCloud { path, run } => {
+                self.hand_loads += 1;
+                self.load(CloudSource::File { path, run })
+            }
             Action::PickOpenSurface => {
                 if let Some(path) = rfd::FileDialog::new()
                     .set_title(text::DIALOG_OPEN_SURFACE)
                     .add_filter("glTF", &["glb"])
                     .pick_file()
                 {
+                    self.hand_loads += 1;
+                    self.surface_by_hand = true;
                     self.load_surface_with(&path, true);
                 }
             }
-            Action::LoadSurface(path) => self.load_surface(&path),
-            Action::ReloadSurface(path) => self.load_surface_with(&path, true),
+            Action::LoadSurface(path) => {
+                self.hand_loads += 1;
+                self.surface_by_hand = true;
+                self.load_surface(&path)
+            }
+            Action::ReloadSurface(path) => {
+                self.hand_loads += 1;
+                self.surface_by_hand = true;
+                self.load_surface_with(&path, true)
+            }
             // the status bar shows the step if one runs, else the load
-            Action::Cancel if self.jobs.is_busy() => self.jobs.cancel(),
+            Action::Cancel if self.jobs.is_busy() => {
+                // nothing of the queue starts after the step that is stopped
+                self.stop_queue();
+                self.jobs.cancel();
+            }
             Action::Cancel => {
+                // a queue waiting for the map check does not start either
+                self.stop_queue();
                 self.next_load = None;
                 self.loader.cancel();
                 self.next_surface = None;
                 self.surface_loader.cancel();
             }
             Action::DismissMessages => self.state.messages.clear(),
+            Action::FrameAll => self.view.frame_all(),
             step @ (Action::Inspect(_)
             | Action::RunSlam(_)
             | Action::Reuse(_)
@@ -1140,7 +1469,41 @@ impl DriftlessApp {
             }
             Action::Compare { a, b } => self.start_compare(a, b),
             Action::CompareMaps { a, b } => self.start_compare_maps(a, b),
+            Action::SetStep(step) => self.set_step(step),
+            Action::ComputeAllMaps => self.compute_all(Batch::Maps),
+            Action::ComputeAllSurfaces => self.compute_all(Batch::Surfaces),
+            Action::ComputeMap(id) => {
+                let path = self
+                    .state
+                    .project
+                    .as_ref()
+                    .and_then(|p| p.scan(&id))
+                    .map(|e| e.path.clone());
+                match path {
+                    Some(path) => self.compute(vec![Queued::Scan(path)], text::ALL_COMPUTED),
+                    None => self.error(text::unknown_scan(&id)),
+                }
+            }
         }
+    }
+
+    /// Shows `step` and what belongs to it in the view: the surface in „Bilder“ if one is
+    /// shown or being loaded, else the cloud. A switch by hand holds until the next step; the
+    /// step already shown asked for again changes nothing.
+    fn set_step(&mut self, step: Step) {
+        if self.state.step == step {
+            return;
+        }
+        self.state.step = step;
+        // picking places of a loop belongs to „Daten“: elsewhere a click measures or picks
+        if step != Step::Daten {
+            self.state.correct.picking = false;
+        }
+        let surface = self.state.surface.is_some() || self.is_loading_surface();
+        self.state.view.show = match step {
+            Step::Bilder if surface => ShowMode::Surface,
+            _ => ShowMode::Cloud,
+        };
     }
 
     /// Reads the open project again from disk, keeping the selection.
@@ -1158,6 +1521,10 @@ impl DriftlessApp {
     }
 
     fn set_project(&mut self, project: Project) {
+        self.stop_queue();
+        // the measurements belong to the project shown (they are not saved yet)
+        self.state.measurements.clear();
+        self.state.measure_a = None;
         self.info(text::project_opened(&project.name));
         self.drop_surface();
         self.state.set_project(project);
@@ -1215,9 +1582,37 @@ impl DriftlessApp {
         }
     }
 
+    /// In „Bilder“ without a surface: a hint over the top of the view that the cloud stays
+    /// until one is computed.
+    fn no_surface_hint(&self, ctx: &egui::Context, view: egui::Rect) {
+        if self.state.step != Step::Bilder
+            || self.state.surface.is_some()
+            || self.is_loading_surface()
+        {
+            return;
+        }
+        let top = view.center_top() + egui::vec2(0.0, HINT_TOP);
+        egui::Area::new(egui::Id::new("hinweis_oberflaeche"))
+            .fixed_pos(top)
+            .pivot(egui::Align2::CENTER_TOP)
+            .interactable(false)
+            .show(ctx, |ui| {
+                theme::float_frame().show(ui, |ui| ui.label(text::NO_SURFACE_YET));
+            });
+    }
+
     /// One frame of the window (what [`eframe::App::ui`] does; without eframe for tests).
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if !self.themed {
+            // Windowless harnesses come here without the creation context: theme now, and
+            // draw this pass again, so that the first frame shown is themed (the fonts with the
+            // symbols take effect at the start of a pass).
+            theme::apply(&ctx);
+            ui.set_style(ctx.global_style());
+            ctx.request_discard("theme applied");
+            self.themed = true;
+        }
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_requested() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
@@ -1230,44 +1625,38 @@ impl DriftlessApp {
         }
         self.update_title(&ctx);
         show_mode_key(&ctx, &mut self.state);
+        tools::keys(&ctx, &mut self.state);
 
         let mut actions: Vec<Action> = Vec::new();
-        let has_project = self.state.project.is_some();
-        egui::Panel::top("menu").show(ui, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button(text::MENU_PROJECT, |ui| {
-                    if ui.button(text::NEW_PROJECT).clicked() {
-                        actions.push(Action::PickNewProject);
-                    }
-                    if ui.button(text::OPEN_PROJECT).clicked() {
-                        actions.push(Action::PickOpenProject);
-                    }
-                    if ui
-                        .add_enabled(has_project, egui::Button::new(text::ADD_SCAN))
-                        .clicked()
-                    {
-                        actions.push(Action::PickAddScan);
-                    }
-                    if ui.button(text::OPEN_SURFACE).clicked() {
-                        actions.push(Action::PickOpenSurface);
-                    }
-                });
-            });
-        });
-        egui::Panel::bottom("status").show(ui, |ui| {
-            actions.extend(status::show(ui, &self.state));
-        });
-        egui::Panel::left("projekt")
-            .default_size(LEFT_WIDTH)
-            .min_size(LEFT_MIN_WIDTH)
+        self.layout.rail = egui::Panel::left("leiste")
+            .exact_size(rail::WIDTH)
+            .resizable(false)
+            .frame(theme::rail_frame())
             .show(ui, |ui| {
-                actions.extend(left::show(ui, &self.state));
-            });
-        egui::Panel::right("schritte")
-            .default_size(RIGHT_WIDTH)
+                actions.extend(rail::show(ui, &mut self.state));
+            })
+            .response
+            .rect;
+        self.layout.status = egui::Panel::bottom("status")
             .show(ui, |ui| {
-                actions.extend(right::show(ui, &mut self.state));
-            });
+                actions.extend(status::show(ui, &self.state));
+            })
+            .response
+            .rect;
+        self.layout.step = egui::Panel::left("schritt")
+            .default_size(STEP_WIDTH)
+            .min_size(STEP_MIN_WIDTH)
+            .frame(theme::step_frame())
+            .show(ui, |ui| {
+                actions.extend(steps::show(ui, &mut self.state));
+            })
+            .response
+            .rect;
+        settings::show(&ctx, &mut self.state);
+        self.view.set_tool(self.state.tool);
+        self.view
+            .set_picked(self.state.picked.as_ref().map(|p| p.index));
+        let origin = self.view_origin();
         let mut event = None;
         let (places, avoid_submap) = self.places();
         let overlay = self.overlay.as_ref().map(|run| ViewOverlay {
@@ -1278,19 +1667,28 @@ impl DriftlessApp {
             pick_places: self.state.correct.picking,
         });
         let shown = self.cloud.is_some() || overlay.is_some() || self.view.has_surface();
-        egui::CentralPanel::no_frame().show(ui, |ui| match (&self.render_state, shown) {
-            (Some(rs), true) => {
-                event = self
-                    .view
-                    .show(ui, rs, self.cloud.as_ref(), overlay, &self.state.view);
-            }
-            (None, true) => {
-                ui.centered_and_justified(|ui| ui.weak(text::VIEW_NO_GPU));
-            }
-            (_, false) => {
-                ui.centered_and_justified(|ui| ui.weak(text::VIEW_EMPTY));
-            }
-        });
+        let central =
+            egui::CentralPanel::no_frame().show(ui, |ui| match (&self.render_state, shown) {
+                (Some(rs), true) => {
+                    let rect = ui.max_rect();
+                    event = self
+                        .view
+                        .show(ui, rs, self.cloud.as_ref(), overlay, &self.state.view);
+                    if let (Some(origin), false) = (origin, self.view.is_uploading()) {
+                        let camera = self.view.camera();
+                        tools::paint_measurements(ui, rect, camera, origin, &self.state);
+                    }
+                }
+                (None, true) => {
+                    ui.centered_and_justified(|ui| ui.weak(text::VIEW_NO_GPU));
+                }
+                (_, false) => {
+                    ui.centered_and_justified(|ui| ui.weak(text::VIEW_EMPTY));
+                }
+            });
+        self.no_surface_hint(&ctx, central.response.rect);
+        let view = central.response.rect;
+        actions.extend(tools::floats(&ctx, view, &mut self.state, &mut self.layout));
         match event {
             Some(ViewEvent::PickedPose(i)) => self.pose_picked(i),
             Some(ViewEvent::TrajectoryHidden) => {
@@ -1327,11 +1725,14 @@ impl DriftlessApp {
             ctx.request_repaint();
         }
         if let (Some(cloud), Some(ViewEvent::PickedPoint(i))) = (&self.cloud, event) {
-            self.state.picked = Some(point_info(cloud, i));
+            tools::point_clicked(&mut self.state, point_info(cloud, i));
+            // the marker and the measurement show from the next frame on
+            ctx.request_repaint();
         }
         for action in actions {
             self.apply(action);
         }
+        tools::remember_text_focus(&ctx);
     }
 }
 
@@ -1346,9 +1747,8 @@ fn file_stamp(path: &Path) -> FileStamp {
 /// The key `O` (while no text field has the keyboard) switches what the view shows:
 /// Oberfläche → Punktwolke → beides; only with a surface and a cloud, like the switch.
 fn show_mode_key(ctx: &egui::Context, state: &mut super::AppState) {
-    let free = ctx.memory(|m| m.focused()).is_none();
     let pressed = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.is_none());
-    if free && pressed && state.surface.is_some() && state.cloud.is_some() {
+    if pressed && tools::keys_free(ctx) && state.surface.is_some() && state.cloud.is_some() {
         state.view.show = state.view.show.next();
     }
 }
@@ -1390,5 +1790,6 @@ impl eframe::App for DriftlessApp {
         if let Some(last) = self.last_to_store() {
             storage.set_string(LAST_PROJECT_KEY, last);
         }
+        storage.set_string(UI_KEY, self.ui_to_store());
     }
 }

@@ -9,7 +9,8 @@ correctable by hand. Runs natively on **macOS (Apple Silicon)** and **Windows**.
 > before/after comparison and a history of states. Earlier: map in about 7 minutes with under 4 GB for a
 > 9.7-minute scan, thinner walls, window views removed (milestone 4), dense, cleaned and coloured map
 > (milestone 3), LiDAR-IMU odometry and SLAM with loop closure and manual corrections (milestone 2).
-> Results on real scans (German): [photo-like surface](docs/ergebnisse/2026-10-22-baustein-2.md),
+> Results on real scans (German): [new interface](docs/ergebnisse/2026-10-24-baustein-4.md),
+> [photo-like surface](docs/ergebnisse/2026-10-22-baustein-2.md),
 > [milestone 5](docs/ergebnisse/2026-10-22-meilenstein-5.md),
 > [milestone 4](docs/ergebnisse/2026-10-21-meilenstein-4.md),
 > [milestone 3](docs/ergebnisse/2026-10-21-meilenstein-3.md),
@@ -86,28 +87,50 @@ interface is German. It runs the same steps as the command line (`inspect`, `sla
 `correct`, `map`, `surface`, `compare`) through the shared crate `driftless-steps`, and writes the same
 files.
 
-- **Project:** „Projekt → Neues Projekt …“ in an empty folder, then „Scan hinzufügen …“ (a scan folder
-  as above). Runs made with the command line can be added with „Lauf hinzufügen …“.
-- **Steps** (right panel, for the selected scan, run or map): „Prüfen“, „SLAM rechnen“, „Neu rechnen
-  (aus Teilkarten)“, „Karte rechnen“ with the switches of `driftless map`, and for a map „Oberfläche
-  rechnen“ (voxel 1 / 1.5 / 2 cm, „ohne Fotos“ = `--no-texture`) into `karte-NNN/oberflaeche-NNN`; a
-  surface that already fits the map and settings is not computed again. One step runs at a time, with
-  progress in the status bar; „Abbrechen“ leaves no half-written files.
-- **Surfaces:** listed under their map in the tree (also folders `oberflaeche…` made with
-  `driftless surface -o`); one that no longer fits its map is marked „veraltet – Karte oder Lauf neu
-  gerechnet“. A click loads it; „Projekt → Oberfläche öffnen …“ opens any `oberflaeche.glb`. The view
-  shows the surface first; „Anzeige: Oberfläche / Punktwolke / beides“ or the key `O` switches.
-- **3D view:** a map or cloud from the tree; colour, intensity or quality of the submap; orbit (left
-  drag, wheel, F = show all) or fly (W/A/S/D, Q/E); click a point for its time, colour and quality; a
-  height cut („Decke ausblenden“) to look into the rooms from above. A point budget (default 6 million)
-  bounds the points drawn per frame; the view shows the points drawn and the frame time.
-- **Corrections:** with a run selected, the trajectory is drawn by quality with its loops; „Stellen
-  wählen“ and two clicks on the trajectory mark a loop, „Schleife eintragen“ writes it to
-  `corrections.toml`, „Jetzt neu rechnen“ recomputes the run from `submaps.bin`. Entries can be switched
-  off and on.
-- **Before/after and history:** every computation of a run keeps a state under `verlauf/`; „Vergleichen“
-  shows two states or the odometry against the corrected trajectory, with the numbers of
-  `driftless compare`, and „Diesen Stand wiederherstellen“ brings back the switches of an earlier state.
+The window has a rail at the left edge, the field of the chosen step next to it, the 3D view and a
+slim status bar:
+
+- **Rail:** ☰ opens the project menu („Neues Projekt …“ in an empty folder, „Projekt öffnen …“,
+  „Scan hinzufügen …“ for a scan folder as above, „Lauf hinzufügen …“ for a run made with the command
+  line, „Oberfläche öffnen …“ for any `oberflaeche.glb`). Below it the three steps, and ⚙ at the bottom.
+- **1 Daten:** a card per scan with its state (neu, wartet, rechnet, fertig ✓, veraltet) and „+ Scan
+  hinzufügen“; the precision Schnell · Genau · Maximal sets only the voxel size of the map (0.02 /
+  0.01 / 0.005 m; Maximal needs over 4 GB of memory on large scans, another voxel shows „Eigene“). „Alle
+  rechnen“ queues every new or stale scan and computes them one after the other; with a scan selected,
+  „Rechnen“ computes only that one. The runs and maps of a scan unfold below its card. „▸ Erweitert“
+  holds the rest: the switches of `driftless map` with the voxel as a number, the single steps
+  („Prüfen“, „SLAM rechnen“, „Neu rechnen (aus Teilkarten)“, „Karte rechnen“), the corrections (loops:
+  „Stellen wählen“ and two clicks on the trajectory, „Schleife eintragen“, „Jetzt neu rechnen“ from
+  `submaps.bin`), before/after („Vergleichen“ of two states or of the odometry against the corrected
+  trajectory, with the numbers of `driftless compare`; „Diesen Stand wiederherstellen“), and the layers
+  „Teilkarten“ and „Verworfene Kandidaten“.
+- **2 Bilder:** a card per map with its surfaces below it (one that no longer fits its map is marked
+  „veraltet – Karte oder Lauf neu gerechnet“); a click shows it. The fineness 1 · 1,5 · 2 cm applies to
+  the next surface; „Alle Oberflächen rechnen“ queues every map without a current surface, „Oberfläche
+  rechnen“ only the selected one, into `karte-NNN/oberflaeche-NNN`. „ohne Fotos“ (= `--no-texture`) is
+  under „▸ Erweitert“. Entering the step shows the surface; Daten and Planung show the points.
+- **3 Planung:** the measurements of the tool „Messen“ (not saved yet) and „Messungen löschen“; floor
+  plan, measures and DWG export follow in a later milestone.
+- **3D view:** top left an info (what is shown, the points drawn and the frame time, what a click does
+  now, the clicked point with ×, and „Schnitt aktiv: z … bis … m“ while a height cut hides points); top
+  right, with a surface loaded, Punkte · Fläche · beides. At the bottom the tools, exactly one active:
+  „Drehen“ (left drag orbits), „Verschieben“ (left drag pans), „Punkt wählen“ (a click shows the time,
+  colour and quality of a point), „Messen“ (two clicks: the distance in metres, drawn in the view),
+  „Schnitt“ (z min / z max, „Decke ausblenden“, „Zurücksetzen“ in a bar above the tools); „Alles“ frames
+  everything. With every tool the right or middle button (or Shift) pans and the wheel zooms; a click
+  picks only with „Punkt wählen“ and „Messen“. Keys: `F` shows everything, `O` switches Fläche → Punkte →
+  beides, Esc drops the first point of a measurement, W/A/S/D and Q/E fly in fly mode. The keys do
+  nothing while a text field has the keyboard.
+- **⚙ (Einstellungen):** how the view draws, for the whole program: colour mode (Farbe, Intensität,
+  Güte), points as „Meter“ (default: round spots in world size, 1.5 × the map's voxel, at least the
+  minimum size in pixels and at most 24 px, so that they close into an image up close) or „Pixel“ (every
+  point the same size, with „rund“), the spot size „aus der Karte“ or by hand, the point budget
+  (default 6 million points per frame), „Bedienung“ (Umkreisen or Fliegen) and the layers (Laufbahn,
+  Odometrie, Schleifen, Teilkarten, Verworfene Kandidaten, Vergleich (A)).
+- **Status bar:** „▸ Protokoll“ with the log and the last message at the left; the running job, its
+  progress and „Abbrechen“ at the right. It stays while switching steps. One step runs at a time;
+  „Abbrechen“ leaves no half-written files and empties the queue. A surface that already fits its map
+  and settings is not computed again. Every computation of a run keeps a state under `verlauf/`.
 
 Project folder:
 

@@ -25,7 +25,7 @@ const FRAME_PITCH_DEG: f32 = -35.0;
 /// Room around the bounds after [`Camera::frame_bounds`].
 const FRAME_MARGIN: f32 = 1.05;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CameraMode {
     /// Around [`Camera::target`] at [`Camera::distance`].
     Orbit,

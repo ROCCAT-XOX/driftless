@@ -6,7 +6,8 @@ use driftless_app::cloud::PointSet;
 use driftless_app::lod::{build_octree, Octree};
 use driftless_app::render::mesh::{MeshRenderer, MeshVertex};
 use driftless_app::render::{
-    headless_device, ColorMode, FrameParams, PointRenderer, RenderTarget, ShowMode, NO_CUT,
+    headless_device, ColorMode, FrameParams, PointRenderer, PointSize, RenderTarget, ShowMode,
+    NO_CUT,
 };
 use driftless_app::surface::{load_glb, LoadedSurface};
 use driftless_io::images::RgbImage;
@@ -31,7 +32,7 @@ struct Gpu {
 
 fn gpu() -> Option<Gpu> {
     let Some((device, queue, info)) = headless_device() else {
-        eprintln!("kein GPU-Adapter, Test übersprungen");
+        skipped("kein GPU-Adapter");
         return None;
     };
     eprintln!("GPU-Adapter: {} ({:?})", info.name, info.backend);
@@ -61,6 +62,9 @@ fn frame(cam: &Camera, show: ShowMode, z_range: [f32; 2]) -> FrameParams {
         quality_known: true,
         z_range,
         show,
+        point_size: PointSize::Pixel,
+        point_m: 0.05,
+        point_px_range: [1.0, 1000.0],
     }
 }
 
@@ -447,4 +451,13 @@ fn upload_in_steps_keeps_old_surface() {
     mesh.upload_page(device, queue, &blue, 1);
     mesh.finish_upload();
     assert!(near(centre_of(&gpu, &mesh, &f), BLUE, 2));
+}
+
+/// Says that the running test was skipped, and why. Written past the test harness's capture
+/// (straight to stderr, not with `eprintln!`), so that a run without a GPU – in CI, say –
+/// shows which tests did not test anything instead of passing in silence.
+fn skipped(why: &str) {
+    use std::io::Write;
+    let name = std::thread::current().name().unwrap_or("?").to_string();
+    let _ = writeln!(std::io::stderr(), "ÜBERSPRUNGEN {name}: {why}");
 }

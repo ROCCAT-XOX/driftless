@@ -56,7 +56,7 @@ fn run_step(app: &mut DriftlessApp, action: Action) {
         app.tick();
     }
     assert_eq!(errors(app), Vec::<String>::new(), "{action:?}");
-    assert!(app.state().step.is_none());
+    assert!(app.state().running.is_none());
 }
 
 /// Ticks until no step and no background work is left.
@@ -257,7 +257,7 @@ fn start_step_checks_without_a_window() {
     // inspect: the step is known while it runs
     let inspect = Action::Inspect("halle".into());
     start_step(&mut state, &mut runner, &inspect).unwrap();
-    assert_eq!(state.step, Some(inspect));
+    assert_eq!(state.running, Some(inspect));
     let deadline = Instant::now() + Duration::from_secs(60);
     let finished = loop {
         if let Some(f) = runner.poll() {

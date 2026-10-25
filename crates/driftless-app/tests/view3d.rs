@@ -3,12 +3,12 @@
 
 use driftless_app::camera::{fly_motion, FlyKeys};
 use driftless_app::cloud::{LoadedCloud, PointSet};
-use driftless_app::render::{headless_device, ColorMode, ShowMode};
+use driftless_app::render::{headless_device, ColorMode, PointSize, ShowMode};
 use driftless_app::ui::view3d::{
     color_modes, effective_color_mode, effective_show, fly_keys, is_click, point_info, target_size,
     view_bounds, View3d,
 };
-use driftless_app::ui::{right, text, ViewSettings};
+use driftless_app::ui::{steps, text, ViewSettings};
 use driftless_io::progress::Progress;
 use eframe::egui;
 use std::path::PathBuf;
@@ -103,7 +103,7 @@ fn pick_info_formats_absolute_coordinates() {
     for (got, want) in info.position.iter().zip([512_345.678, 5_400_000.25, 97.5]) {
         assert!((got - want).abs() < 1e-4, "{got} vs {want}");
     }
-    let lines = right::point_lines(&info);
+    let lines = steps::point_lines(&info);
     let value = |label: &str| {
         lines
             .iter()
@@ -129,7 +129,7 @@ fn pick_info_quality_unknown_without_report() {
     let c = cloud("/k/dense.las", points);
     let info = point_info(&c, 0);
     assert_eq!(info.quality, None);
-    let lines = right::point_lines(&info);
+    let lines = steps::point_lines(&info);
     assert!(lines.contains(&(text::POINT_QUALITY, text::QUALITY_UNKNOWN.to_string())));
 }
 
@@ -191,13 +191,13 @@ fn pick_info_without_colour_and_removed() {
     points.flags = vec![0, 1, 3];
     // A cloud without colours.
     let c = cloud("/k/dense.las", points.clone());
-    let lines = right::point_lines(&point_info(&c, 0));
+    let lines = steps::point_lines(&point_info(&c, 0));
     assert!(lines.contains(&(text::POINT_COLOR, text::NO_COLOR.to_string())));
     // Flag 1 in a coloured cloud: no measured colour.
     points.rgb = Some(vec![[9, 9, 9]; 3]);
     let c = cloud("/k/color.las", points.clone());
     let colour = |c: &LoadedCloud, i| {
-        right::point_lines(&point_info(c, i))
+        steps::point_lines(&point_info(c, i))
             .into_iter()
             .find(|(l, _)| *l == text::POINT_COLOR)
             .unwrap()
@@ -207,7 +207,7 @@ fn pick_info_without_colour_and_removed() {
     assert_eq!(colour(&c, 1), text::NO_COLOR);
     // In removed.las the flags are the removal reason.
     let c = cloud("/k/removed.las", points);
-    let lines = right::point_lines(&point_info(&c, 2));
+    let lines = steps::point_lines(&point_info(&c, 2));
     assert!(lines.contains(&(text::POINT_REMOVED, "Durchblick".to_string())));
 }
 
@@ -246,14 +246,14 @@ fn removed_reason_text() {
 }
 
 #[test]
-fn drawn_stats_text() {
+fn frame_line_text() {
     assert_eq!(
-        text::drawn_stats(5_900_000, 15_600_000, 8.44, true),
-        "gezeichnet 5,9 Mio. von 15,6 Mio. Punkten · 8,4 ms GPU"
+        text::frame_line(Some(5_900_000), 8.44, true),
+        "gezeichnet 5,9 Mio. · 8,4 ms GPU"
     );
     assert_eq!(
-        text::drawn_stats(300_000, 300_000, 16.7, false),
-        "gezeichnet 300.000 von 300.000 Punkten · 16,7 ms je Bild"
+        text::frame_line(Some(300_000), 16.7, false),
+        "gezeichnet 300.000 · 16,7 ms je Bild"
     );
     assert_eq!(text::uploading(40.0), "Wolke wird hochgeladen … 40 %");
 }
@@ -274,7 +274,7 @@ fn view_settings_defaults() {
 #[test]
 fn view_shows_point_colours_unchanged() {
     if headless_device().is_none() {
-        eprintln!("kein GPU-Adapter, Test übersprungen");
+        skipped("kein GPU-Adapter");
         return;
     }
     use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
@@ -291,6 +291,8 @@ fn view_shows_point_colours_unchanged() {
     let settings = ViewSettings {
         point_px: 12.0,
         round: false,
+        // fixed squares: world-size spots are darker at their rim
+        point_size: PointSize::Pixel,
         ..ViewSettings::default()
     };
     let rs = create_render_state(
@@ -331,7 +333,7 @@ fn upload_is_spread_over_frames() {
     use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
     use egui_kittest::Harness;
     if headless_device().is_none() {
-        eprintln!("kein GPU-Adapter, Test übersprungen");
+        skipped("kein GPU-Adapter");
         return;
     }
     // 3 million points: 60 MB, more than one slice
@@ -387,7 +389,7 @@ fn synthetic_50m_frame_time() {
     use std::time::Instant;
 
     let Some((_, _, info)) = headless_device() else {
-        eprintln!("kein GPU-Adapter, Test übersprungen");
+        skipped("kein GPU-Adapter");
         return;
     };
     let t = Instant::now();
@@ -486,7 +488,7 @@ fn trajectory_alone_is_drawn_and_its_poses_clicked() {
     use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
     use egui_kittest::Harness;
     if headless_device().is_none() {
-        eprintln!("kein GPU-Adapter, Test übersprungen");
+        skipped("kein GPU-Adapter");
         return;
     }
     let none = BeforeAfter {
@@ -604,4 +606,13 @@ fn show_mode_falls_back_to_what_is_there() {
     assert_eq!(ViewSettings::default().show, Surface, "the surface first");
     // one default for both
     assert_eq!(ShowMode::default(), ViewSettings::default().show);
+}
+
+/// Says that the running test was skipped, and why. Written past the test harness's capture
+/// (straight to stderr, not with `eprintln!`), so that a run without a GPU – in CI, say –
+/// shows which tests did not test anything instead of passing in silence.
+fn skipped(why: &str) {
+    use std::io::Write;
+    let name = std::thread::current().name().unwrap_or("?").to_string();
+    let _ = writeln!(std::io::stderr(), "ÜBERSPRUNGEN {name}: {why}");
 }

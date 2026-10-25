@@ -1,8 +1,8 @@
-//! The project tree on the left, without a window: what it shows and which actions its
-//! entries return.
+//! The scans in the field „Daten“ with their runs and maps below the selected one, without a
+//! window: what they show and which actions their entries return.
 
 use driftless_app::project::{MapInfo, Project, RunInfo, ScanEntry, ScanState};
-use driftless_app::ui::{left, text, Action, AppState, ScanNode, Selection};
+use driftless_app::ui::{steps, text, Action, AppState, ScanNode, Selection};
 use driftless_steps::slam::SlamSettings;
 use egui_kittest::kittest::Queryable;
 use egui_kittest::Harness;
@@ -23,8 +23,17 @@ fn run(dir: &str, label: &str, maps: Vec<MapInfo>) -> RunInfo {
     }
 }
 
-/// A project „Halle“ with the scan „buero“: SLAM 001 with Karte 001 (color.las), SLAM 002.
+/// A project „Halle“ with the scan „buero“: SLAM 001 with Karte 001 (color.las), SLAM 002;
+/// the scan is selected, so its runs unfold below its card.
 fn state() -> AppState {
+    AppState {
+        selection: Selection::Scan("buero".into()),
+        ..unselected()
+    }
+}
+
+/// [`state`] with nothing selected.
+fn unselected() -> AppState {
     let map = MapInfo {
         dir: PathBuf::from("/p/scans/buero/slam-001/karte-001"),
         label: "Karte 001".into(),
@@ -60,9 +69,9 @@ fn state() -> AppState {
 
 /// A harness that shows the tree of `state` and keeps the last action.
 fn harness(state: AppState) -> Harness<'static, (AppState, Option<Action>)> {
-    Harness::builder().with_size([320.0, 600.0]).build_ui_state(
+    Harness::builder().with_size([320.0, 900.0]).build_ui_state(
         |ui, (state, action): &mut (AppState, Option<Action>)| {
-            if let Some(a) = left::show(ui, state) {
+            if let Some(a) = steps::show(ui, state) {
                 *action = Some(a);
             }
         },
@@ -78,8 +87,8 @@ fn top(h: &Harness<'_, (AppState, Option<Action>)>, label: &str) -> f32 {
 fn left_shows_scans_runs_maps() {
     let mut h = harness(state());
     h.run();
-    h.get_by_label(text::PANEL_PROJECT);
-    h.get_by_label("Halle");
+    h.get_by_label(text::STEP_DATA);
+    h.get_by_label(&text::project_line("Halle", 1));
     let order = ["buero", "SLAM 001", "Karte 001", "color.las", "SLAM 002"];
     let tops: Vec<f32> = order.iter().map(|l| top(&h, l)).collect();
     assert!(
@@ -88,6 +97,12 @@ fn left_shows_scans_runs_maps() {
     );
     h.get_by_label(text::ADD_SCAN);
     h.get_by_label(text::ADD_RUN);
+    // without a selection only the scan's card shows
+    let mut h = harness(unselected());
+    h.run();
+    h.get_by_label("buero");
+    assert!(h.query_by_label("SLAM 001").is_none());
+    assert!(h.query_by_label(text::ADD_RUN).is_none());
 }
 
 #[test]
@@ -110,6 +125,12 @@ fn clicking_run_selects_it() {
             "/p/scans/buero/slam-001/karte-001/color.las"
         ))))
     );
+    // the selected scan's card again: nothing selected
+    h.get_by_label("buero").click();
+    h.run();
+    assert_eq!(h.state().1, Some(Action::Select(Selection::None)));
+    let mut h = harness(unselected());
+    h.run();
     h.get_by_label("buero").click();
     h.run();
     assert_eq!(
@@ -171,7 +192,7 @@ fn missing_scan_is_marked() {
 fn no_project_offers_open_and_new() {
     let mut h = harness(AppState::default());
     h.run();
-    h.get_by_label(text::NO_PROJECT);
+    h.get_by_label(text::EMPTY_NO_PROJECT);
     h.get_by_label(text::NEW_PROJECT).click();
     h.run();
     assert_eq!(h.state().1, Some(Action::PickNewProject));

@@ -86,15 +86,62 @@ pub fn pick_point_in(
     radius_px: f32,
     z_range: [f32; 2],
 ) -> Option<u32> {
+    pick_point_spots(
+        tree,
+        drawn,
+        cam,
+        viewport_px,
+        pixel_px,
+        radius_px,
+        z_range,
+        None,
+    )
+}
+
+/// How the points are drawn in world size (`PointSize::World`): `point_m` across in the
+/// world, within `px_range` (diameters in pixels), as the point shader sizes them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Spots {
+    pub point_m: f32,
+    pub px_range: [f32; 2],
+}
+
+/// Like [`pick_point_in`]; with `spots`, a point is hit anywhere on its drawn spot (half its
+/// diameter in pixels around it), never less than `radius_px`, so that a click on the edge of
+/// a near spot picks it.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_point_spots(
+    tree: &Octree,
+    drawn: &[u32],
+    cam: &Camera,
+    viewport_px: [f32; 2],
+    pixel_px: [f32; 2],
+    radius_px: f32,
+    z_range: [f32; 2],
+    spots: Option<Spots>,
+) -> Option<u32> {
     if !valid_viewport(viewport_px) {
         return None;
     }
     let view_proj = cam.view_proj(viewport_px[0] / viewport_px[1]);
     let ray = cam.ray(pixel_px, viewport_px);
+    // The radius of the point at clip depth `w`: as `point_size_px` in points.wgsl.
+    let row_y = view_proj.row(1).transpose();
+    let spot_focal =
+        nalgebra::Vector3::new(row_y[0], row_y[1], row_y[2]).norm() * 0.5 * viewport_px[1];
+    let radius_at = |p: [f32; 3]| match spots {
+        None => radius_px,
+        Some(s) => {
+            let w = (view_proj * nalgebra::Vector4::new(p[0], p[1], p[2], 1.0))[3];
+            let d = (s.point_m * spot_focal / w.max(1e-6)).clamp(s.px_range[0], s.px_range[1]);
+            radius_px.max(d / 2.0)
+        }
+    };
+    let max_radius = spots.map_or(radius_px, |s| radius_px.max(s.px_range[1] / 2.0));
     // Two rays through pixels `radius_px` apart differ by at most radius / focal length
     // (radians), the most at the centre of the image; a little slack for rounding.
     let focal_px = viewport_px[1] / (2.0 * (cam.fov_y / 2.0).tan());
-    let half_angle = (radius_px / focal_px + 1e-4).min(1.5);
+    let half_angle = (max_radius / focal_px + 1e-4).min(1.5);
     let (sin_a, cos_a) = half_angle.sin_cos();
     let mut best: Option<(f32, u32)> = None;
     for &id in drawn {
@@ -116,7 +163,7 @@ pub fn pick_point_in(
             if p[2] < z_range[0] || p[2] > z_range[1] {
                 continue;
             }
-            let Some((_, z)) = hit(&view_proj, p, viewport_px, pixel_px, radius_px) else {
+            let Some((_, z)) = hit(&view_proj, p, viewport_px, pixel_px, radius_at(p)) else {
                 continue;
             };
             let better = match best {

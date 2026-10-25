@@ -19,7 +19,7 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// What the colour of a point shows.
 #[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ColorMode {
     /// The measured colour; without colours the intensity (see [`PointVertex::rgbi`]).
     #[default]
@@ -27,6 +27,18 @@ pub enum ColorMode {
     Intensity = 1,
     /// The submap quality, with the ramp of `driftless_steps::overlay::quality_color`.
     Quality = 2,
+}
+
+/// How big a point is drawn: a fixed number of pixels, or a spot of a fixed diameter in
+/// metres that shrinks with distance (within [`FrameParams::point_px_range`]).
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum PointSize {
+    /// [`FrameParams::point_px`] across, at any distance.
+    Pixel = 0,
+    /// [`FrameParams::point_m`] across in the world: round spots that close into a surface.
+    #[default]
+    World = 1,
 }
 
 /// What the view draws: the surface, the cloud or both (in one depth buffer). The view shows
@@ -99,6 +111,12 @@ pub struct FrameParams {
     pub z_range: [f32; 2],
     /// Points, surface or both; the overlay is always drawn.
     pub show: ShowMode,
+    /// Fixed pixels or world size; markers and lines are always in pixels.
+    pub point_size: PointSize,
+    /// Spot diameter in metres for [`PointSize::World`].
+    pub point_m: f32,
+    /// Smallest and largest spot diameter in physical pixels for [`PointSize::World`].
+    pub point_px_range: [f32; 2],
 }
 
 /// A height cut that keeps every point.
@@ -116,7 +134,14 @@ struct Uniforms {
     quality_known: u32,
     z_min: f32,
     z_max: f32,
+    point_size: u32,
+    point_m: f32,
+    px_min: f32,
+    px_max: f32,
 }
+
+// The WGSL struct is 16-byte aligned (its mat4x4); the Rust one must match it byte for byte.
+const _: () = assert!(size_of::<Uniforms>().is_multiple_of(16));
 
 impl Uniforms {
     fn new(frame: &FrameParams, point_px: f32, color_mode: ColorMode) -> Self {
@@ -130,6 +155,11 @@ impl Uniforms {
             quality_known: u32::from(frame.quality_known),
             z_min: frame.z_range[0],
             z_max: frame.z_range[1],
+            point_size: frame.point_size as u32,
+            point_m: frame.point_m,
+            px_min: frame.point_px_range[0],
+            // never below the minimum, so that the clamp in the shader is defined
+            px_max: frame.point_px_range[1].max(frame.point_px_range[0]),
         }
     }
 }
@@ -666,6 +696,7 @@ impl PointRenderer {
             bytemuck::bytes_of(&Uniforms::new(
                 &FrameParams {
                     z_range: NO_CUT,
+                    point_size: PointSize::Pixel,
                     ..*frame
                 },
                 frame.marker_px,

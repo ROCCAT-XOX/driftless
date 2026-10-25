@@ -1,31 +1,59 @@
 //! The window: the panels show an [`AppState`] and hand back what was asked for as an
 //! [`Action`]; only [`DriftlessApp`] carries actions out (dialogs, project changes, jobs).
 //! So the panels can be tested without a window (`egui_kittest`).
+//!
+//! Layout: the rail at the left edge ([`rail`]: ☰, the three [`Step`]s, ⚙), next to it the
+//! field of the active step ([`steps`]), the 3D view ([`view3d`]) in the rest with its floating
+//! bars ([`tools`]: info, the switch Punkte · Fläche · beides, the tools and the cut), the
+//! status bar ([`status`]) at the bottom and the settings window ⚙ ([`settings`]).
 
 pub mod actions;
 mod app;
 pub mod compare;
 pub mod correct;
-pub mod left;
-pub mod right;
+pub mod rail;
+pub mod settings;
 pub mod status;
+pub mod steps;
 pub mod text;
+pub mod theme;
+pub mod tools;
 pub mod view3d;
 
-pub use app::{parse_args, Args, DriftlessApp};
+pub use app::{parse_args, Args, DriftlessApp, UI_KEY};
 
 use crate::camera::CameraMode;
 use crate::jobs::JobStatus;
 use crate::project::{
     map_status, state_gap, surface_status, MapStatus, Project, RunInfo, ScanState, SurfaceSettings,
 };
-use crate::render::{ColorMode, ShowMode};
+use crate::render::{ColorMode, PointSize, ShowMode};
 use driftless_io::progress::LogLine;
 use driftless_steps::inspect;
 use driftless_steps::map::MapSettings;
 use driftless_steps::slam::SlamSettings;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+
+/// The steps of the work, in the order they are done; the rail switches between them.
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, Debug, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum Step {
+    /// Scans, maps, corrections: the view shows the cloud.
+    #[default]
+    Daten,
+    /// Surfaces of the maps: the view shows the surface.
+    Bilder,
+    /// Floor plan and measures (comes with Baustein 5).
+    Planung,
+}
+
+/// The settings window ⚙.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SettingsWindow {
+    pub open: bool,
+}
 
 /// What is selected in the project tree.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -85,6 +113,8 @@ pub enum Action {
     Cancel,
     /// Clears the messages of the status bar.
     DismissMessages,
+    /// Show everything in the view (the button „Alles“, as the key `F`).
+    FrameAll,
     AddLoop {
         run: PathBuf,
         a: f64,
@@ -102,6 +132,20 @@ pub enum Action {
         run: PathBuf,
         nr: u32,
     },
+    /// Show another step: also sets what the view shows (Daten and Planung the cloud,
+    /// Bilder the surface if there is one or one is being loaded). The active step again
+    /// changes nothing.
+    SetStep(Step),
+    /// Queue every new or stale scan ([`steps::daten::scan_status`]), in the order of the
+    /// list, and compute them one after the other: SLAM first if the scan has no run with a
+    /// result, then the map of its newest run with the current map settings.
+    ComputeAllMaps,
+    /// [`Action::ComputeAllMaps`] for this one scan (id), whatever its status.
+    ComputeMap(String),
+    /// Queue every map without a current surface ([`AppState::maps_to_surface`]), in the
+    /// order of the list, and compute their surfaces one after the other with the current
+    /// surface settings.
+    ComputeAllSurfaces,
     /// Compare trajectory `a` (aligned to `b`) with `b`.
     Compare {
         a: compare::TrajRef,
@@ -112,6 +156,16 @@ pub enum Action {
         a: PathBuf,
         b: PathBuf,
     },
+}
+
+/// What the queue of [`AppState::queue`] computes one after the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Queued {
+    /// A scan folder ([`crate::project::ScanEntry::path`]): SLAM if it has no run with a
+    /// result, then the map of its newest run ([`Action::ComputeAllMaps`]).
+    Scan(PathBuf),
+    /// A map folder: its surface ([`Action::ComputeAllSurfaces`]).
+    Surface(PathBuf),
 }
 
 /// A message for the status bar (German).
@@ -145,6 +199,10 @@ pub struct ViewSettings {
     pub cut: Option<[f32; 2]>,
     /// Surface, points or both, while a surface is loaded.
     pub show: ShowMode,
+    /// Fixed pixels or spots in metres (the default).
+    pub point_size: PointSize,
+    /// Spot diameter in metres; `None` = from the map ([`CloudSummary::point_m`]).
+    pub point_m: Option<f32>,
 }
 
 impl Default for ViewSettings {
@@ -163,6 +221,8 @@ impl Default for ViewSettings {
             show_compare: true,
             cut: None,
             show: ShowMode::default(),
+            point_size: PointSize::default(),
+            point_m: None,
         }
     }
 }
@@ -179,6 +239,8 @@ pub struct CloudSummary {
     pub z_range: [f32; 2],
     /// A height just below the ceiling, if one was found.
     pub ceiling: Option<f32>,
+    /// The spot diameter (m) of its map ([`crate::cloud::point_m_of_map`]).
+    pub point_m: f32,
 }
 
 /// The loaded surface, as the panels need it.
@@ -245,7 +307,19 @@ pub struct AppState {
     /// Messages of the steps, oldest first.
     pub log: Vec<LogLine>,
     /// The step action that is running (set by [`actions::start_step`]).
-    pub step: Option<Action>,
+    pub running: Option<Action>,
+    /// The step of the work shown in the field next to the rail.
+    pub step: Step,
+    /// What is still to compute by [`Action::ComputeAllMaps`] or
+    /// [`Action::ComputeAllSurfaces`], in order; the first is the one being computed. Emptied
+    /// by „Abbrechen“, a failed step, closing and a project switch.
+    pub queue: VecDeque<Queued>,
+    /// The background check of [`AppState::map_status`] has not caught up with the tree yet:
+    /// until then a stale map or surface counts as fitting, so „Alle rechnen“ and „Alle
+    /// Oberflächen rechnen“ wait for it.
+    pub map_status_pending: bool,
+    /// The settings window ⚙.
+    pub settings_window: SettingsWindow,
     /// The last check of a scan, shown under „Eigenschaften“ while that scan is selected.
     pub inspect: Option<InspectResult>,
     /// The map and surface folders of the tree whose status is known. Filled in the
@@ -266,8 +340,14 @@ pub struct AppState {
     pub loading: Option<JobStatus>,
     /// The last frame of the 3D view.
     pub view_stats: Option<ViewStats>,
-    /// The point clicked in the 3D view.
+    /// The point clicked in the 3D view with the tool „Punkt wählen“.
     pub picked: Option<view3d::PointInfo>,
+    /// The tool of the view; always exactly one.
+    pub tool: tools::Tool,
+    /// The measurements of the tool „Messen“, oldest first (not saved yet: Baustein 5).
+    pub measurements: Vec<tools::Measurement>,
+    /// The first end of a measurement being made (absolute); Esc or another tool drops it.
+    pub measure_a: Option<[f64; 3]>,
     /// The manual corrections of the run the view draws.
     pub correct: correct::CorrectState,
     /// The comparison of two trajectories and of two maps.
@@ -406,6 +486,122 @@ impl AppState {
                 .iter()
                 .find_map(|r| r.maps.iter().find(|m| m.dir == dir).map(|m| (s, r, m)))
         })
+    }
+
+    /// The scans [`Action::ComputeAllMaps`] queues: the new and the stale ones, in the order
+    /// of the list, as scan folders.
+    pub fn scans_to_compute(&self) -> Vec<PathBuf> {
+        let Some(project) = &self.project else {
+            return Vec::new();
+        };
+        self.scans
+            .iter()
+            .filter(|s| {
+                matches!(
+                    steps::daten::scan_status(self, s),
+                    steps::daten::ScanStatus::New | steps::daten::ScanStatus::Stale
+                )
+            })
+            .filter_map(|s| project.scan(&s.id).map(|e| e.path.clone()))
+            .collect()
+    }
+
+    /// The maps [`Action::ComputeAllSurfaces`] queues: those without a current surface
+    /// ([`steps::bilder::surface_status`] new or stale), in the order of the list, as map
+    /// folders. A map that waits for „Daten“ ([`AppState::maps_waiting_for_data`]) is left
+    /// out.
+    pub fn maps_to_surface(&self) -> Vec<PathBuf> {
+        use steps::bilder::SurfaceStatus;
+        self.all_maps()
+            .filter(|m| {
+                matches!(
+                    steps::bilder::surface_status(self, m),
+                    SurfaceStatus::New | SurfaceStatus::Stale
+                )
+            })
+            .map(|m| m.dir.clone())
+            .collect()
+    }
+
+    /// How many maps [`Action::ComputeAllSurfaces`] leaves out because they wait for „Daten“:
+    /// the map no longer fits its run, has no `map.json` yet, or its scan cannot be read.
+    pub fn maps_waiting_for_data(&self) -> usize {
+        use steps::bilder::SurfaceStatus;
+        self.all_maps()
+            .filter(|m| {
+                matches!(
+                    steps::bilder::surface_status(self, m),
+                    SurfaceStatus::MapStale
+                        | SurfaceStatus::MapNotReady
+                        | SurfaceStatus::ScanMissing
+                )
+            })
+            .count()
+    }
+
+    /// Every map of the tree, in the order of the list.
+    fn all_maps(&self) -> impl Iterator<Item = &crate::project::MapInfo> {
+        self.scans
+            .iter()
+            .flat_map(|s| &s.runs)
+            .flat_map(|r| &r.maps)
+    }
+
+    /// The scan with the folder `path`.
+    pub fn scan_at(&self, path: &std::path::Path) -> Option<&ScanNode> {
+        let entry = self
+            .project
+            .as_ref()?
+            .scans
+            .iter()
+            .find(|s| s.path == path)?;
+        self.scan_node(&entry.id)
+    }
+
+    /// The step that computes the head of [`AppState::queue`] further: for a scan the map of
+    /// its newest run with a result, or SLAM if it has none; for a map its surface. `None` if
+    /// the head is no longer in the project.
+    pub fn next_queued_step(&self) -> Option<Action> {
+        match self.queue.front()? {
+            Queued::Scan(path) => {
+                let scan = self.scan_at(path)?;
+                Some(match scan.runs.iter().rev().find(|r| r.has_result) {
+                    Some(run) => Action::RunMap(run.dir.clone()),
+                    None => Action::RunSlam(scan.id.clone()),
+                })
+            }
+            Queued::Surface(dir) => {
+                self.map(dir)?;
+                Some(Action::RunSurface(dir.clone()))
+            }
+        }
+    }
+
+    /// Whether `step` works on the head of [`AppState::queue`]: on its scan, or the surface
+    /// of its map.
+    pub fn computes_queue_head(&self, step: &Action) -> bool {
+        match (self.queue.front(), step) {
+            (Some(Queued::Surface(head)), Action::RunSurface(dir)) => head == dir,
+            (Some(Queued::Surface(_)), _) | (None, _) => false,
+            (Some(Queued::Scan(head)), step) => {
+                let project = self.project.as_ref();
+                self.scan_of(step)
+                    .and_then(|s| project?.scan(&s.id))
+                    .is_some_and(|e| e.path == *head)
+            }
+        }
+    }
+
+    /// The scan a step action works on.
+    pub fn scan_of(&self, action: &Action) -> Option<&ScanNode> {
+        match action {
+            Action::Inspect(id) | Action::RunSlam(id) => self.scan_node(id),
+            Action::Reuse(dir) | Action::RunMap(dir) | Action::RestoreHistory { run: dir, .. } => {
+                self.run(dir).map(|(s, _)| s)
+            }
+            Action::RunSurface(dir) => self.map(dir).map(|(s, _, _)| s),
+            _ => None,
+        }
     }
 
     /// The scan with this id.

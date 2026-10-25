@@ -1,77 +1,15 @@
-//! The left panel: the project tree, project → scans → runs („SLAM 001“ …) → maps → clouds and
-//! surfaces („Oberfläche 001“, a stale one with „veraltet – Karte oder Lauf neu gerechnet“),
-//! and per run its history („Verlauf“: each state with number, kind, time and start↔end gap).
-//! Names too long for the panel end in „…“; the full name and the folder show on hover.
+//! What „Daten“ shows below the card of a scan: its runs („SLAM 001“ …) → maps → clouds and
+//! surfaces („Oberfläche 001“, a stale one with „veraltet – Karte oder Lauf neu gerechnet“), and
+//! per run its history („Verlauf“: each state with number, kind, time and start↔end gap). Names
+//! too long for the field end in „…“; the full name and the folder show on hover.
 
-use super::{text, Action, AppState, ScanNode, Selection};
-use crate::project::{MapInfo, RunInfo, ScanState, SurfaceInfo};
+use crate::project::{MapInfo, RunInfo, SurfaceInfo};
+use crate::ui::{text, Action, AppState, Selection};
 use eframe::egui::{self, collapsing_header::CollapsingState, Id, Response, RichText, Ui};
 use std::path::Path;
 
-pub fn show(ui: &mut Ui, state: &AppState) -> Option<Action> {
-    let mut action = None;
-    ui.heading(text::PANEL_PROJECT);
-    let Some(project) = &state.project else {
-        ui.label(text::NO_PROJECT);
-        if ui.button(text::NEW_PROJECT).clicked() {
-            action = Some(Action::PickNewProject);
-        }
-        if ui.button(text::OPEN_PROJECT).clicked() {
-            action = Some(Action::PickOpenProject);
-        }
-        return action;
-    };
-    ui.label(RichText::new(&project.name).strong())
-        .on_hover_text(project.dir.display().to_string());
-    if ui.button(text::ADD_SCAN).clicked() {
-        action = Some(Action::PickAddScan);
-    }
-    ui.separator();
-    egui::ScrollArea::vertical()
-        .auto_shrink(false)
-        .show(ui, |ui| {
-            if state.scans.is_empty() {
-                ui.weak(text::NO_SCANS);
-            }
-            for scan in &state.scans {
-                scan_node(ui, state, scan, &mut action);
-            }
-        });
-    action
-}
-
-fn scan_node(ui: &mut Ui, state: &AppState, scan: &ScanNode, action: &mut Option<Action>) {
-    let selected = state.selection == Selection::Scan(scan.id.clone());
-    let header = branch(
-        ui,
-        Id::new(("scan", &scan.id)),
-        |ui| match &scan.state {
-            ScanState::Ready => entry(ui, selected, scan.name.clone(), &scan.name),
-            ScanState::Missing(reason) => {
-                let label = text::scan_missing(&scan.name);
-                let weak = ui.visuals().weak_text_color();
-                let hover = format!("{label}\n{reason}");
-                entry(ui, selected, RichText::new(label).color(weak), &hover)
-            }
-        },
-        |ui| {
-            if scan.runs.is_empty() {
-                ui.weak(text::NO_RUNS);
-            }
-            for run in &scan.runs {
-                run_node(ui, state, run, action);
-            }
-            if ui.small_button(text::ADD_RUN).clicked() {
-                *action = Some(Action::PickAddRun(scan.id.clone()));
-            }
-        },
-    );
-    if header.clicked() {
-        *action = Some(Action::Select(Selection::Scan(scan.id.clone())));
-    }
-}
-
-fn run_node(ui: &mut Ui, state: &AppState, run: &RunInfo, action: &mut Option<Action>) {
+/// A run of a scan with its cloud, maps and history, below the scan's card in „Daten“.
+pub(super) fn run_node(ui: &mut Ui, state: &AppState, run: &RunInfo, action: &mut Option<Action>) {
     let selected = state.selection == Selection::Run(run.dir.clone());
     let header = |ui: &mut Ui| {
         let hover = format!("{}\n{}", run.label, run.dir.display());
@@ -157,7 +95,12 @@ fn cloud_leaf(ui: &mut Ui, state: &AppState, cloud: &Path, action: &mut Option<A
     }
 }
 
-fn surface_leaf(ui: &mut Ui, state: &AppState, surface: &SurfaceInfo, action: &mut Option<Action>) {
+pub(super) fn surface_leaf(
+    ui: &mut Ui,
+    state: &AppState,
+    surface: &SurfaceInfo,
+    action: &mut Option<Action>,
+) {
     let selected = state.selection == Selection::Surface(surface.dir.clone());
     let r = leaf(ui, |ui| {
         if surface.stale {
@@ -176,7 +119,12 @@ fn surface_leaf(ui: &mut Ui, state: &AppState, surface: &SurfaceInfo, action: &m
 }
 
 /// A selectable name, cut with „…“ where the panel ends, the full text on hover.
-fn entry(ui: &mut Ui, selected: bool, name: impl Into<egui::WidgetText>, hover: &str) -> Response {
+pub(super) fn entry(
+    ui: &mut Ui,
+    selected: bool,
+    name: impl Into<egui::WidgetText>,
+    hover: &str,
+) -> Response {
     ui.add(egui::Button::selectable(selected, name).truncate())
         .on_hover_text(hover)
 }
@@ -195,7 +143,7 @@ fn branch(
 }
 
 /// An entry without children, aligned with the headers of [`branch`].
-fn leaf(ui: &mut Ui, entry: impl FnOnce(&mut Ui) -> Response) -> Response {
+pub(super) fn leaf(ui: &mut Ui, entry: impl FnOnce(&mut Ui) -> Response) -> Response {
     ui.horizontal(|ui| {
         ui.add_space(ui.spacing().indent);
         entry(ui)

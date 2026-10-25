@@ -6,8 +6,8 @@ use driftless_app::cloud::PointSet;
 use driftless_app::lod::{build_octree, build_octree_with, Octree, PointVertex, LEAF_MAX};
 use driftless_app::pick::project;
 use driftless_app::render::{
-    headless_device, ColorMode, FrameParams, LineVertex, PointRenderer, RenderTarget, ShowMode,
-    NO_CUT,
+    headless_device, ColorMode, FrameParams, LineVertex, PointRenderer, PointSize, RenderTarget,
+    ShowMode, NO_CUT,
 };
 use driftless_app::synthetic::Rng;
 use driftless_io::progress::Progress;
@@ -28,7 +28,7 @@ struct Gpu {
 /// The device, or `None` (and a note) when there is no adapter.
 fn gpu() -> Option<Gpu> {
     let Some((device, queue, info)) = headless_device() else {
-        eprintln!("kein GPU-Adapter, Test übersprungen");
+        skipped("kein GPU-Adapter");
         return None;
     };
     eprintln!("GPU-Adapter: {} ({:?})", info.name, info.backend);
@@ -59,6 +59,10 @@ fn frame(cam: &Camera, mode: ColorMode) -> FrameParams {
         quality_known: true,
         z_range: NO_CUT,
         show: ShowMode::Cloud,
+        // the tests below this helper measure fixed pixel sizes
+        point_size: PointSize::Pixel,
+        point_m: 0.05,
+        point_px_range: [1.0, 1000.0],
     }
 }
 
@@ -555,7 +559,7 @@ fn gpu_time_comes_back() {
         egui_kittest::wgpu::create_render_state(setup, egui_wgpu::RendererOptions::PREDICTABLE);
     let mut renderer = PointRenderer::new(&rs.device, &rs.queue, FORMAT);
     if !renderer.has_gpu_timer() {
-        eprintln!("keine Zeitstempel, Test übersprungen");
+        skipped("keine GPU-Zeitstempel");
         return;
     }
     let tree = tree(&cloud(vec![[2.0, 0.0, 0.0]], vec![RED]));
@@ -574,4 +578,153 @@ fn gpu_time_comes_back() {
     let ms = got.expect("GPU time");
     eprintln!("GPU {ms} ms");
     assert!(ms > 0.0 && ms < 1000.0);
+}
+
+/// How many pixels of the centre row are not background.
+fn centre_row_width(image: &Image) -> usize {
+    (0..SIZE)
+        .filter(|&x| !is_background(image.at(x, SIZE / 2)))
+        .count()
+}
+
+/// A frame in world size: diameter `point_m`, at least `min` and at most `max` px.
+fn world_frame(cam: &Camera, point_m: f32, range: [f32; 2]) -> FrameParams {
+    FrameParams {
+        point_size: PointSize::World,
+        point_m,
+        point_px: range[0],
+        point_px_range: range,
+        ..frame(cam, ColorMode::Rgb)
+    }
+}
+
+/// In world size a point four times as far is a quarter as wide on screen.
+#[test]
+fn world_size_shrinks_with_distance() {
+    let Some(gpu) = gpu() else { return };
+    // A narrow field of view, so that a 5 cm spot is many pixels across at 1 m.
+    let cam = Camera {
+        fov_y: 10f32.to_radians(),
+        ..camera([0.0; 3], 0.0)
+    };
+    let width = |d: f32| {
+        let tree = tree(&cloud(vec![[d, 0.0, 0.0]], vec![RED]));
+        let f = world_frame(&cam, 0.05, [1.0, 1000.0]);
+        centre_row_width(&render(&gpu, &tree, &f, &[], &[]))
+    };
+    let (near, far) = (width(1.0), width(4.0));
+    eprintln!("5 cm: {near} px bei 1 m, {far} px bei 4 m");
+    assert!(far >= 2, "far point visible: {far}");
+    assert!(
+        (near as f32 / 4.0 - far as f32).abs() <= 1.0,
+        "near {near} ≈ 4 × far {far}"
+    );
+}
+
+/// Very near spots stay at most `max` px wide, very far ones at least `min` px.
+#[test]
+fn world_size_clamped() {
+    let Some(gpu) = gpu() else { return };
+    // an even minimum: a round 4 px spot at the image centre covers 4 pixel centres of a row
+    let (min, max) = (4.0, 24.0);
+    // the near plane in front of the point, so that it is drawn
+    let cam = Camera {
+        near: 0.01,
+        ..camera([0.0; 3], 0.0)
+    };
+    let width = |d: f32| {
+        let tree = tree(&cloud(vec![[d, 0.0, 0.0]], vec![RED]));
+        let f = world_frame(&cam, 0.05, [min, max]);
+        centre_row_width(&render(&gpu, &tree, &f, &[], &[]))
+    };
+    let (near, far) = (width(0.05), width(200.0));
+    eprintln!("5 cm: {near} px bei 0,05 m, {far} px bei 200 m");
+    // unclamped ≈ 55 px across
+    assert!(near as f32 <= max, "near {near} > {max}");
+    assert!(near as f32 >= max - 2.0, "near {near}: drawn at the limit");
+    assert!(far as f32 >= min, "far {far} < {min}");
+    assert!(far as f32 <= min + 1.0, "far {far}");
+}
+
+/// In pixel mode the world size is ignored: the image is the same pixel for pixel, and a
+/// square 8 px point covers exactly the 8 × 8 pixels around the centre, as before.
+#[test]
+fn pixel_mode_unchanged() {
+    let Some(gpu) = gpu() else { return };
+    let cam = camera([0.0; 3], 0.0);
+    let tree = tree(&cloud(
+        vec![[2.0, 0.0, 0.0], [4.0, 0.5, 0.3], [8.0, -1.0, -0.5]],
+        vec![RED, BLUE, [0, 255, 0]],
+    ));
+    for round in [false, true] {
+        let a = FrameParams {
+            round,
+            ..frame(&cam, ColorMode::Rgb)
+        };
+        let b = FrameParams {
+            point_m: 5.0,
+            point_px_range: [30.0, 40.0],
+            ..a
+        };
+        let (ia, ib) = (
+            render(&gpu, &tree, &a, &[], &[]),
+            render(&gpu, &tree, &b, &[], &[]),
+        );
+        assert!(
+            ia.0 == ib.0,
+            "round {round}: pixel mode depends on the world size"
+        );
+    }
+    let only_red = tree_of_one();
+    let image = render(&gpu, &only_red, &frame(&cam, ColorMode::Rgb), &[], &[]);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let inside = (SIZE / 2 - 4..SIZE / 2 + 4).contains(&x)
+                && (SIZE / 2 - 4..SIZE / 2 + 4).contains(&y);
+            let p = image.at(x, y);
+            if inside {
+                assert!(near(p, RED, 0), "({x}, {y}) {p:?}");
+            } else {
+                assert!(is_background(p), "({x}, {y}) {p:?}");
+            }
+        }
+    }
+}
+
+fn tree_of_one() -> Octree {
+    tree(&cloud(vec![[2.0, 0.0, 0.0]], vec![RED]))
+}
+
+/// The spot size comes from the map's grid: `dense.voxel` × 1.5, else 1.5 cm.
+#[test]
+fn point_m_from_map() {
+    use driftless_app::cloud::{point_m_of_map, LoadedCloud, DEFAULT_POINT_M};
+    let dir = std::env::temp_dir().join(format!("driftless-app-point-m-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(DEFAULT_POINT_M, 0.015);
+    assert_eq!(point_m_of_map(&dir), 0.015, "without map.json");
+    std::fs::write(dir.join("map.json"), "kein json").unwrap();
+    assert_eq!(point_m_of_map(&dir), 0.015, "unreadable map.json");
+    std::fs::write(
+        dir.join("map.json"),
+        r#"{"settings": {"dense": {"voxel": 0.02}}}"#,
+    )
+    .unwrap();
+    let m = point_m_of_map(&dir);
+    assert!((m - 0.03).abs() < 1e-6, "{m}");
+    // a loaded cloud of that map takes it
+    let points = cloud(vec![[2.0, 0.0, 0.0]], vec![RED]);
+    let loaded = LoadedCloud::build(dir.join("color.las"), points, 0.0, &Progress::new()).unwrap();
+    assert!((loaded.point_m - 0.03).abs() < 1e-6, "{}", loaded.point_m);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Says that the running test was skipped, and why. Written past the test harness's capture
+/// (straight to stderr, not with `eprintln!`), so that a run without a GPU – in CI, say –
+/// shows which tests did not test anything instead of passing in silence.
+fn skipped(why: &str) {
+    use std::io::Write;
+    let name = std::thread::current().name().unwrap_or("?").to_string();
+    let _ = writeln!(std::io::stderr(), "ÜBERSPRUNGEN {name}: {why}");
 }
