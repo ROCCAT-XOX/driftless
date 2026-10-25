@@ -192,6 +192,14 @@ pub const CAMERA_MODE: &str = "Bedienung";
 pub const ORBIT: &str = "Umkreisen";
 pub const FLY: &str = "Fliegen";
 pub const LAYERS: &str = "Ebenen";
+pub const GPU: &str = "Grafikkarte nutzen";
+pub const GPU_HINT: &str =
+    "Für Karte und Oberfläche. Auto: die Grafikkarte, wenn eine da ist, sonst \
+     der Prozessor. An: nur mit Grafikkarte, ohne eine bricht der Schritt ab. Aus: immer der \
+     Prozessor. Das Ergebnis ist gleichwertig, nur die Rechenzeit unterscheidet sich.";
+pub const GPU_AUTO: &str = "Auto";
+pub const GPU_ON: &str = "An";
+pub const GPU_OFF: &str = "Aus";
 pub const LAYER_TRAJECTORY: &str = "Laufbahn";
 pub const LAYER_ODOMETRY: &str = "Odometrie";
 pub const LAYER_LOOPS: &str = "Schleifen";

@@ -46,6 +46,7 @@ use crate::exposure::{
 use crate::sharpness::measure;
 use crate::visibility::{visible_points, PointGrid, Seen};
 use crate::{Cloud, MapError};
+use driftless_gpu::GpuContext;
 use driftless_io::bag::BagReader;
 use driftless_io::calib::CAMERA_TIME_OFFSET_S;
 use driftless_io::camera::Camera;
@@ -314,6 +315,9 @@ pub struct ColorStats {
     /// main image. 0 if either kind is missing. Before and after as for the floor.
     pub seam_jump_before: f64,
     pub seam_jump_after: f64,
+    /// Why the GPU given to [`colorize_with`] was not used and the CPU coloured (German);
+    /// `None` on the GPU and without one.
+    pub gpu_fallback: Option<String>,
 }
 
 /// What the quality pass found for one image of the stream.
@@ -676,7 +680,7 @@ pub(crate) fn sample_linear(img: &RgbImage, uv: [f32; 2], lin: &[f32; 256]) -> [
 
 /// Weight of a view: `cos(incidence) / (1 + d²/4) · edge falloff(θ) · sharpness_norm`.
 /// Without a normal the incidence counts as head-on.
-fn view_weight(
+pub(crate) fn view_weight(
     p: &[f32; 3],
     normal: Option<&Vector3<f32>>,
     cam_pos: &Vector3<f32>,
@@ -718,7 +722,7 @@ pub(crate) struct View {
     pub(crate) theta: u16,
 }
 
-const EMPTY: View = View {
+pub(crate) const EMPTY: View = View {
     weight: 0.0,
     rank: u32::MAX,
     rgb: [0; 3],
@@ -783,7 +787,7 @@ pub(crate) fn keep_best(slots: &mut [View], v: View) {
 /// and one camera kept a single view.) Two kept views of a camera are thus at least a
 /// stretch boundary apart, mostly about `gap`. `images[rank]` is the capture time and camera
 /// of each image. With `gap = 0` the same as [`keep_best`].
-fn keep_best_apart(slots: &mut [View], v: View, images: &[(f64, usize)], gap: f64) {
+pub(crate) fn keep_best_apart(slots: &mut [View], v: View, images: &[(f64, usize)], gap: f64) {
     if gap > 0.0 {
         let stretch = |rank: u32| {
             let (t, cam) = images[rank as usize];
@@ -1105,12 +1109,16 @@ pub fn colorize(
     cams: &[ColorCamera],
     cfg: &ColorConfig,
 ) -> Result<ColorStats, MapError> {
-    colorize_with(cloud, images, poses, cams, cfg, &Progress::new())
+    colorize_with(cloud, images, poses, cams, cfg, &Progress::new(), None)
 }
 
 /// [`colorize`] with progress: phase „Bilder prüfen“ (the quality pass) and „Einfärben“,
 /// one step per image of the stream. Checks `progress` for a cancel at every image and
 /// returns [`MapError::Cancelled`] with `cloud` unchanged.
+///
+/// With `gpu`, the views of the images (projection, depth buffer, weight, colour, the best
+/// views per point) are found on the GPU; the result matches the CPU's up to rounding.
+/// Without, everything runs on the CPU as in [`colorize`].
 pub fn colorize_with(
     cloud: &mut Cloud,
     images: ImageSource,
@@ -1118,6 +1126,53 @@ pub fn colorize_with(
     cams: &[ColorCamera],
     cfg: &ColorConfig,
     progress: &Progress,
+    gpu: Option<&GpuContext>,
+) -> Result<ColorStats, MapError> {
+    colorize_on(
+        cloud,
+        images,
+        poses,
+        cams,
+        cfg,
+        progress,
+        gpu.map(|ctx| (ctx, None)),
+    )
+}
+
+/// [`colorize_with`] on the GPU with at most `batch_points` points per batch of the cloud
+/// on the GPU (tests: several batches give the same result as one).
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn colorize_gpu_batched(
+    cloud: &mut Cloud,
+    images: ImageSource,
+    poses: &[Pose],
+    cams: &[ColorCamera],
+    cfg: &ColorConfig,
+    progress: &Progress,
+    gpu: &GpuContext,
+    batch_points: usize,
+) -> Result<ColorStats, MapError> {
+    colorize_on(
+        cloud,
+        images,
+        poses,
+        cams,
+        cfg,
+        progress,
+        Some((gpu, Some(batch_points))),
+    )
+}
+
+/// [`colorize_with`] with the GPU and its batch size, if any.
+fn colorize_on(
+    cloud: &mut Cloud,
+    images: ImageSource,
+    poses: &[Pose],
+    cams: &[ColorCamera],
+    cfg: &ColorConfig,
+    progress: &Progress,
+    gpu: Option<(&GpuContext, Option<usize>)>,
 ) -> Result<ColorStats, MapError> {
     if progress.is_cancelled() {
         return Err(MapError::Cancelled);
@@ -1167,102 +1222,134 @@ pub fn colorize_with(
     if let (Some(last_used), false) = (last_used, cloud.is_empty()) {
         let (normals, spacing, samples) = local_geometry(&cloud.xyz);
         seam = samples;
-        slots = vec![EMPTY; cloud.len() * k];
-        let grid = PointGrid::new(&cloud.xyz);
-        let lin = linear_table();
-        let scaled: Vec<Camera> = cams
-            .iter()
-            .map(|c| c.camera.downscaled(cfg.downscale))
-            .collect();
-        let mut index = 0usize;
-        let mut failure: Option<MapError> = None;
-        let mut one = |frame: Result<Frame, ImageError>| {
-            let i = index;
-            index += 1;
-            let rec = records.get(i).copied();
-            let Some(ImageRecord {
-                camera,
-                stamp,
-                status:
-                    Status::Used {
-                        rank,
-                        sharpness_norm,
-                    },
-            }) = rec
-            else {
-                return i < last_used;
-            };
-            let frame = match frame {
-                Ok(f)
-                    if f.stamp == stamp
-                        && frame_camera(&f, cams, cfg.downscale) == Some(camera) =>
-                {
-                    f
+        let on_gpu = match gpu {
+            None => None,
+            Some((ctx, batch_points)) => match crate::color_gpu::gpu_slots(
+                &crate::color_gpu::GpuInput {
+                    ctx,
+                    batch_points,
+                    xyz: &cloud.xyz,
+                    normals: &normals,
+                    spacing: &spacing,
+                    images: &images,
+                    records: &records,
+                    last_used,
+                    by_rank: &by_rank,
+                    poses,
+                    cams,
+                    cfg,
+                },
+                progress,
+            ) {
+                Ok(s) => Some(s),
+                Err(crate::color_gpu::GpuStop::Fail(e)) => return Err(e),
+                Err(crate::color_gpu::GpuStop::Fallback(why)) => {
+                    progress.info(format!("Einfärben auf der CPU: {why}"));
+                    stats.gpu_fallback = Some(why);
+                    None
                 }
-                _ => {
-                    failure = Some(MapError::Images(
-                        "Bilder haben sich zwischen zwei Durchläufen geändert".into(),
-                    ));
+            },
+        };
+        if let Some(s) = on_gpu {
+            slots = s;
+        } else {
+            slots = vec![EMPTY; cloud.len() * k];
+            let grid = PointGrid::new(&cloud.xyz);
+            let lin = linear_table();
+            let scaled: Vec<Camera> = cams
+                .iter()
+                .map(|c| c.camera.downscaled(cfg.downscale))
+                .collect();
+            let mut index = 0usize;
+            let mut failure: Option<MapError> = None;
+            let mut one = |frame: Result<Frame, ImageError>| {
+                let i = index;
+                index += 1;
+                let rec = records.get(i).copied();
+                let Some(ImageRecord {
+                    camera,
+                    stamp,
+                    status:
+                        Status::Used {
+                            rank,
+                            sharpness_norm,
+                        },
+                }) = rec
+                else {
+                    return i < last_used;
+                };
+                let frame = match frame {
+                    Ok(f)
+                        if f.stamp == stamp
+                            && frame_camera(&f, cams, cfg.downscale) == Some(camera) =>
+                    {
+                        f
+                    }
+                    _ => {
+                        failure = Some(MapError::Images(
+                            "Bilder haben sich zwischen zwei Durchläufen geändert".into(),
+                        ));
+                        return false;
+                    }
+                };
+                let body = interpolate_pose(poses, stamp + cfg.time_offset)
+                    .expect("checked in the quality pass");
+                let world_cam = body * cams[camera].cam_in_body;
+                let cam_pos = world_cam.translation.vector;
+                let cam = &scaled[camera];
+                let candidates = grid.near(&cam_pos, cfg.max_dist);
+                let seen = visible_points(
+                    &cloud.xyz,
+                    &spacing,
+                    &candidates,
+                    cam,
+                    &world_cam.inverse(),
+                    cfg.max_dist,
+                    cfg.zbuffer_scale,
+                    cfg.depth_tolerance,
+                );
+                let cam_pos = cam_pos.cast::<f32>();
+                let views: Vec<(u32, View)> = seen
+                    .par_iter()
+                    .filter_map(|s| {
+                        let p = &cloud.xyz[s.index as usize];
+                        let weight = view_weight(
+                            p,
+                            normals[s.index as usize].as_ref(),
+                            &cam_pos,
+                            s,
+                            cam.max_theta,
+                            sharpness_norm,
+                        );
+                        (weight > 0.0).then(|| {
+                            let rgb = sample_linear(&frame.rgb, s.proj.uv, &lin);
+                            (s.index, View::new(weight, rank, rgb, s.proj.theta))
+                        })
+                    })
+                    .collect();
+                for (p, v) in views {
+                    let p = p as usize;
+                    keep_best_apart(&mut slots[p * k..(p + 1) * k], v, &by_rank, cfg.view_gap);
+                }
+                i < last_used
+            };
+            let mut cancelled = false;
+            let read = for_each_image(&images.bags, &images.topics, cfg.downscale, |frame| {
+                if progress.is_cancelled() {
+                    cancelled = true;
                     return false;
                 }
-            };
-            let body = interpolate_pose(poses, stamp + cfg.time_offset)
-                .expect("checked in the quality pass");
-            let world_cam = body * cams[camera].cam_in_body;
-            let cam_pos = world_cam.translation.vector;
-            let cam = &scaled[camera];
-            let candidates = grid.near(&cam_pos, cfg.max_dist);
-            let seen = visible_points(
-                &cloud.xyz,
-                &spacing,
-                &candidates,
-                cam,
-                &world_cam.inverse(),
-                cfg.max_dist,
-                cfg.zbuffer_scale,
-                cfg.depth_tolerance,
-            );
-            let cam_pos = cam_pos.cast::<f32>();
-            let views: Vec<(u32, View)> = seen
-                .par_iter()
-                .filter_map(|s| {
-                    let p = &cloud.xyz[s.index as usize];
-                    let weight = view_weight(
-                        p,
-                        normals[s.index as usize].as_ref(),
-                        &cam_pos,
-                        s,
-                        cam.max_theta,
-                        sharpness_norm,
-                    );
-                    (weight > 0.0).then(|| {
-                        let rgb = sample_linear(&frame.rgb, s.proj.uv, &lin);
-                        (s.index, View::new(weight, rank, rgb, s.proj.theta))
-                    })
-                })
-                .collect();
-            for (p, v) in views {
-                let p = p as usize;
-                keep_best_apart(&mut slots[p * k..(p + 1) * k], v, &by_rank, cfg.view_gap);
+                let go = one(frame);
+                progress.advance(1);
+                go
+            });
+            if cancelled {
+                return Err(MapError::Cancelled);
             }
-            i < last_used
-        };
-        let mut cancelled = false;
-        let read = for_each_image(&images.bags, &images.topics, cfg.downscale, |frame| {
-            if progress.is_cancelled() {
-                cancelled = true;
-                return false;
+            read.map_err(|e| MapError::Images(e.to_string()))?;
+            if let Some(e) = failure {
+                return Err(e);
             }
-            let go = one(frame);
-            progress.advance(1);
-            go
-        });
-        if cancelled {
-            return Err(MapError::Cancelled);
-        }
-        read.map_err(|e| MapError::Images(e.to_string()))?;
-        if let Some(e) = failure {
-            return Err(e);
         }
         horizontal = normals
             .iter()

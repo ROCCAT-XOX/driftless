@@ -16,6 +16,7 @@ use crate::project::{canonical, Project};
 use crate::render::ShowMode;
 use crate::surface::{load_glb, surface_glb};
 use crate::synthetic::synthetic_cloud;
+use driftless_gpu::GpuPref;
 use driftless_io::progress::Progress;
 use driftless_steps::{correct, StepError};
 use eframe::egui;
@@ -106,16 +107,22 @@ struct StoredUi {
     show_compare: bool,
     point_size: crate::render::PointSize,
     point_m: Option<f32>,
+    /// „Grafikkarte nutzen“ as its CLI word (`auto`, `an`, `aus`).
+    gpu: String,
 }
 
 impl Default for StoredUi {
     fn default() -> Self {
-        StoredUi::of(Step::default(), &ViewSettings::default())
+        StoredUi::of(
+            Step::default(),
+            &ViewSettings::default(),
+            GpuPref::default(),
+        )
     }
 }
 
 impl StoredUi {
-    fn of(step: Step, v: &ViewSettings) -> Self {
+    fn of(step: Step, v: &ViewSettings, gpu: GpuPref) -> Self {
         StoredUi {
             step,
             color_mode: v.color_mode,
@@ -131,7 +138,13 @@ impl StoredUi {
             show_compare: v.show_compare,
             point_size: v.point_size,
             point_m: v.point_m,
+            gpu: gpu.to_string(),
         }
+    }
+
+    /// „Grafikkarte nutzen“ as stored; an unknown word is `auto`.
+    fn gpu(&self) -> GpuPref {
+        self.gpu.parse().unwrap_or_default()
     }
 
     /// The view settings as stored, the rest from `v`.
@@ -885,6 +898,7 @@ impl DriftlessApp {
             Some(ui) => {
                 self.state.step = ui.step;
                 ui.apply_to(&mut self.state.view);
+                self.state.gpu = ui.gpu();
             }
             None => ctx.memory_mut(|m| {
                 m.data.clear();
@@ -895,7 +909,7 @@ impl DriftlessApp {
 
     /// The layout to store under [`UI_KEY`].
     pub fn ui_to_store(&self) -> String {
-        let ui = StoredUi::of(self.state.step, &self.state.view);
+        let ui = StoredUi::of(self.state.step, &self.state.view, self.state.gpu);
         serde_json::to_string(&ui).unwrap_or_default()
     }
 

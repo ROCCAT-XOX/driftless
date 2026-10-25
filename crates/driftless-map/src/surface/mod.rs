@@ -14,6 +14,7 @@ mod preview;
 mod simplify;
 mod tsdf;
 mod views;
+mod views_gpu;
 mod write;
 
 #[cfg(test)]
@@ -27,9 +28,10 @@ pub use preview::render_preview;
 pub use simplify::simplify;
 pub use tsdf::Tsdf;
 pub use views::TextureSource;
-pub use write::{write_glb, write_obj};
+pub use write::{encode_pages, write_glb, write_obj, PageJpegs};
 
 use crate::{ColorConfig, MapError};
+use driftless_gpu::GpuContext;
 use driftless_io::progress::Progress;
 use driftless_traj::Pose;
 use nalgebra::Isometry3;
@@ -184,6 +186,21 @@ pub struct SurfaceStats {
     pub accuracy: AccuracySplit,
     /// Wall-clock seconds per phase (not deterministic; never written into the mesh files).
     pub seconds: BTreeMap<&'static str, f64>,
+    /// Of `seconds["views"]`: the quality pass, the pass over the images and, on the GPU,
+    /// how long that pass waited for decoded images.
+    pub views_seconds: ViewsSeconds,
+    /// A GPU was given to [`texture_mesh`] but could not start (`--gpu auto`): the views were
+    /// found on the CPU, for this reason (German).
+    pub gpu_fallback: Option<String>,
+}
+
+/// Where the time of the views went (wall clock, s).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ViewsSeconds {
+    pub quality: f64,
+    pub pass: f64,
+    /// `None` on the CPU.
+    pub waiting_for_images: Option<f64>,
 }
 
 /// The textured surface of `input`: [`build_mesh`], then [`texture_mesh`] from `sources`.
@@ -203,7 +220,7 @@ pub fn build_surface(
 ) -> Result<(TexturedMesh, SurfaceStats), MapError> {
     check_sources(sources)?;
     let (mesh, mut stats) = build_mesh(input, cfg, progress)?;
-    let tex = texture_mesh(&mesh, sources, cfg, progress, &mut stats)?;
+    let tex = texture_mesh(&mesh, sources, cfg, progress, &mut stats, None)?;
     Ok((tex, stats))
 }
 
@@ -269,13 +286,16 @@ pub fn build_mesh(
 }
 
 /// `mesh` (from [`build_mesh`]) textured from `sources`: views, labels, baking and seam
-/// levelling; gray without sources. Adds its figures and phases to `stats`.
+/// levelling; gray without sources. Adds its figures and phases to `stats`. With `gpu` the
+/// views per face are found on the GPU (the same views up to rounding; see
+/// [`ViewsSeconds`] and [`SurfaceStats::gpu_fallback`]).
 pub fn texture_mesh(
     mesh: &Mesh,
     sources: &[TextureSource],
     cfg: &SurfaceConfig,
     progress: &Progress,
     stats: &mut SurfaceStats,
+    gpu: Option<&GpuContext>,
 ) -> Result<TexturedMesh, MapError> {
     cfg.check()?;
     check_sources(sources)?;
@@ -283,7 +303,15 @@ pub fn texture_mesh(
     check_cancel(progress)?;
     let tex = match sources.first() {
         Some(src) => {
-            let mut views = views::collect_views(mesh, src, cfg, progress)?;
+            let (mut views, info) =
+                views::collect_views_on(mesh, src, cfg, progress, gpu.map(|g| (g, None)))?;
+            stats.views_seconds = ViewsSeconds {
+                quality: info.quality_seconds,
+                pass: info.views_seconds,
+                waiting_for_images: (gpu.is_some() && info.gpu_fallback.is_none())
+                    .then_some(info.decode_wait_seconds),
+            };
+            stats.gpu_fallback = info.gpu_fallback;
             clock.lap(stats, "views");
             check_cancel(progress)?;
             let labels = atlas::choose_labels(mesh, &views, cfg);

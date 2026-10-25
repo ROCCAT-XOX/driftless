@@ -16,6 +16,7 @@ workspace = true
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+driftless-gpu = { path = "../driftless-gpu" }
 driftless-io = { path = "../driftless-io" }
 driftless-map = { path = "../driftless-map" }
 driftless-odom = { path = "../driftless-odom" }

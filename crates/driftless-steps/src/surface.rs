@@ -10,13 +10,16 @@
 
 use crate::error::{check_cancel, failed, StepError};
 use crate::map::{
-    clean_stage_id, color_input, hex, peak_rss_bytes, read_traj, MapInput, CLEAN_BIN,
+    clean_stage_id, color_input, fallback_reason, gpu_json, hex, peak_rss_bytes, read_traj,
+    MapInput, CLEAN_BIN,
 };
+use driftless_gpu::{GpuChoice, GpuContext, GpuPref};
+use driftless_io::atomic_write;
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_map::surface::{
-    build_mesh, sensors_for_frames, texture_mesh, write_glb, write_obj, Accuracy, SurfaceConfig,
-    SurfaceInput, SurfaceStats, TextureSource,
+    build_mesh, encode_pages, sensors_for_frames, texture_mesh, write_glb, write_obj, Accuracy,
+    SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
 };
 use driftless_map::{load_stage, stage_fits};
 use serde_json::{json, Value};
@@ -27,7 +30,7 @@ use std::time::Instant;
 pub const SURFACE_REPORT: &str = "oberflaeche.json";
 /// Part of the input id: raised whenever the surface gives another result for the same
 /// settings, so an older folder counts as stale.
-const SURFACE_VERSION: u32 = 8;
+const SURFACE_VERSION: u32 = 9;
 /// File stem of the glb and the obj.
 const STEM: &str = "oberflaeche";
 const AXES: &str = "glb: Y oben; obj: Z oben";
@@ -43,6 +46,9 @@ pub struct SurfaceRequest {
     pub config: SurfaceConfig,
     /// Texture the surface from the camera images (`false` = `--no-texture`: gray).
     pub texture: bool,
+    /// Find the views per face on the GPU (`--gpu auto|an|aus`). Gives an equivalent
+    /// result: not part of the input id; the report says what was used.
+    pub gpu: GpuPref,
 }
 
 fn stale_map() -> StepError {
@@ -211,6 +217,28 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
     req.map.map.check()?;
     let odom = req.map.slam.config()?.odom;
     let (plan, color) = plan(req, progress)?;
+    // The device is opened before any work, so `--gpu an` without a GPU fails at once.
+    let mut no_device = None;
+    let gpu = match &color {
+        None => None,
+        Some(_) => match GpuContext::open(req.gpu).map_err(|e| e.to_string())? {
+            GpuChoice::Gpu(ctx) => {
+                let i = ctx.info();
+                progress.info(format!(
+                    "Ansichten auf der Grafikkarte: {} ({})",
+                    i.name, i.backend
+                ));
+                Some(ctx)
+            }
+            GpuChoice::Cpu(why) => {
+                no_device = fallback_reason(req.gpu, &why);
+                if let Some(why) = &no_device {
+                    progress.info(format!("Ansichten auf der CPU: {why}"));
+                }
+                None
+            }
+        },
+    };
     let (_, poses) = read_traj(&req.map.slam_dir)?;
 
     let clean_path = req.map_dir.join(CLEAN_BIN);
@@ -239,8 +267,24 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
     let (mesh, mut stats) = build_mesh(&input, &req.config, progress)?;
     // The points are not needed for the texture: free them before the pages are made.
     drop(cloud);
-    let tex = texture_mesh(&mesh, &sources, &req.config, progress, &mut stats)?;
+    let tex = texture_mesh(
+        &mesh,
+        &sources,
+        &req.config,
+        progress,
+        &mut stats,
+        gpu.as_ref(),
+    )?;
     drop((sources, mesh));
+    let fallback = stats.gpu_fallback.as_deref().or(no_device.as_deref());
+    let mut gpu_report = gpu_json(gpu.as_ref(), fallback);
+    drop(gpu);
+    let v = &stats.views_seconds;
+    gpu_report["seconds"] = json!({
+        "quality": v.quality,
+        "pass": v.pass,
+        "waiting_for_images": v.waiting_for_images,
+    });
 
     // Last chance to stop: from here on files are written.
     check_cancel(progress)?;
@@ -248,8 +292,10 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
     fs::create_dir_all(out).map_err(|e| format!("{} nicht anlegbar: {e}", out.display()))?;
     let report_path = out.join(SURFACE_REPORT);
     let quality = req.config.jpeg_quality;
-    write_glb(&out.join(format!("{STEM}.glb")), &tex, quality)?;
-    write_obj(out, STEM, &tex, quality)?;
+    let jpegs = encode_pages(&tex, quality)?;
+    write_glb(&out.join(format!("{STEM}.glb")), &tex, &jpegs)?;
+    write_obj(out, STEM, &tex, &jpegs)?;
+    drop(jpegs);
     let mut files = vec![
         format!("{STEM}.glb"),
         format!("{STEM}.obj"),
@@ -272,18 +318,14 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
         "stats": stats_json(&stats),
         "seconds_total": (start.elapsed().as_secs_f64() * 1000.0).round() / 1000.0,
         "peak_rss_bytes": peak,
+        "gpu": gpu_report,
         "axes": AXES,
         "files": files,
         "stale": stale,
     });
     let text = serde_json::to_string_pretty(&report).map_err(failed)? + "\n";
-    let tmp = out.join(format!("{SURFACE_REPORT}.tmp"));
-    fs::write(&tmp, &text)
-        .and_then(|()| fs::rename(&tmp, &report_path))
-        .map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            format!("{} nicht schreibbar: {e}", report_path.display())
-        })?;
+    atomic_write(&report_path, text.as_bytes())
+        .map_err(|e| format!("{} nicht schreibbar: {e}", report_path.display()))?;
 
     let t = &stats.texture;
     let (all, walls) = (&stats.accuracy.all, &stats.accuracy.walls);

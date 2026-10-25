@@ -11,6 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+driftless-gpu = { path = "../driftless-gpu" }
 driftless-io = { path = "../driftless-io" }
 driftless-map = { path = "../driftless-map" }
 driftless-odom = { path = "../driftless-odom" }

@@ -70,6 +70,7 @@ fn request(scan: &Path, map_dir: &Path, out_dir: &Path) -> SurfaceRequest {
         out_dir: out_dir.to_path_buf(),
         config: small_config(),
         texture: true,
+        gpu: driftless_gpu::GpuPref::default(),
     }
 }
 

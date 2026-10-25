@@ -8,6 +8,7 @@ members = [
     "crates/driftless-map",
     "crates/driftless-graph",
     "crates/driftless-steps",
+    "crates/driftless-gpu",
     "crates/driftless-app",
     "crates/driftless-cli",
 ]
@@ -18,6 +19,10 @@ edition = "2021"
 rust-version = "1.99"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/ROCCAT-XOX/driftless"
+
+[workspace.dependencies]
+# Exactly the wgpu that `egui-wgpu` 0.36 uses, so that the workspace has a single wgpu.
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "metal", "vulkan", "dx12"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -42,6 +47,9 @@ opt-level = 2
 [profile.dev.package.jpeg-encoder]
 opt-level = 2
 [profile.dev.package.zune-jpeg]
+opt-level = 2
+# The GPU tests compare against the CPU camera model over many points.
+[profile.dev.package.driftless-gpu]
 opt-level = 2
 # The step tests run whole synthetic scans (odometry, map) through the library.
 [profile.dev.package.driftless-steps]

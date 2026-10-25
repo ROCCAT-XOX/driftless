@@ -12,7 +12,7 @@ use driftless_app::render::{
 use driftless_app::surface::{load_glb, LoadedSurface};
 use driftless_io::images::RgbImage;
 use driftless_io::progress::Progress;
-use driftless_map::surface::{write_glb, TexturePage, TexturedMesh};
+use driftless_map::surface::{encode_pages, write_glb, TexturePage, TexturedMesh};
 use egui_wgpu::wgpu;
 use image::RgbaImage;
 use std::fs;
@@ -308,7 +308,7 @@ fn load_glb_matches_written() {
     ];
     let dir = temp_dir("roundtrip");
     let path = dir.join("oberflaeche.glb");
-    write_glb(&path, &tex, 90).unwrap();
+    write_glb(&path, &tex, &encode_pages(&tex, 90).unwrap()).unwrap();
 
     let loaded = load_glb(&path, &Progress::new()).unwrap();
     assert_eq!(loaded.pages.len(), tex.pages.len());
@@ -353,7 +353,7 @@ fn load_glb_builds_mips() {
     }];
     let dir = temp_dir("mips");
     let path = dir.join("oberflaeche.glb");
-    write_glb(&path, &tex, 90).unwrap();
+    write_glb(&path, &tex, &encode_pages(&tex, 90).unwrap()).unwrap();
     let loaded = load_glb(&path, &Progress::new()).unwrap();
     // made in the loader (off the UI thread): only copied when uploaded
     assert_eq!(loaded.mips.len(), 1);
@@ -391,7 +391,12 @@ fn broken_glb_is_a_german_error() {
         image: page_image(16, GREEN),
     }];
     let dir = temp_dir("abgeschnitten");
-    write_glb(&dir.join("ganz.glb"), &tex, 90).unwrap();
+    write_glb(
+        &dir.join("ganz.glb"),
+        &tex,
+        &encode_pages(&tex, 90).unwrap(),
+    )
+    .unwrap();
     let whole = fs::read(dir.join("ganz.glb")).unwrap();
     let e = load_error("abgeschnitten-2", &whole[..whole.len() / 2]);
     assert!(e.contains("keine gültige glb-Datei"), "{e}");

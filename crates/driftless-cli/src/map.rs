@@ -3,6 +3,7 @@
 //! `clean.las`/`removed.las`/`clean.bin`, `color.las`/`color.ply`, plus `map.json`. The run
 //! itself is [`driftless_steps::map::run_map`].
 
+use driftless_gpu::GpuPref;
 use driftless_map::{ColorConfig, DenseConfig};
 use driftless_steps::map::{run_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches};
 use driftless_steps::scan::extrinsic_values;
@@ -54,6 +55,10 @@ pub struct Args {
     /// Bilder zum Einfärben verkleinert dekodieren: 1, 2 oder 4
     #[arg(long, default_value_t = ColorConfig::default().downscale)]
     downscale: u32,
+    /// Grafikkarte zum Einfärben: auto (nutzen, wenn eine taugliche da ist, sonst CPU mit
+    /// Hinweis), an (verlangen) oder aus (nur CPU). Das Ergebnis ist gleichwertig.
+    #[arg(long, value_name = "auto|an|aus", default_value_t = GpuPref::Auto)]
+    gpu: GpuPref,
     /// LiDAR-Lage im IMU-Rahmen: x y z qx qy qz qw (wie bei `slam`; Standard: Identität)
     #[arg(long, num_args = 7, value_names = ["X", "Y", "Z", "QX", "QY", "QZ", "QW"], allow_negative_numbers = true)]
     lidar_to_imu: Option<Vec<f64>>,
@@ -88,6 +93,7 @@ fn settings(args: &Args) -> MapSettings {
             vignetting: !args.no_vignetting,
             voxel: args.voxel,
             downscale: args.downscale,
+            gpu: args.gpu,
         },
     }
 }
@@ -147,5 +153,15 @@ mod tests {
         let s = &all_off.switches;
         assert!(!s.ghosts && !s.outliers && !s.through && !s.smooth && !s.vignetting);
         assert!(s.highlights);
+    }
+
+    #[test]
+    fn gpu_switch_parses() {
+        assert_eq!(parse(&[]).switches.gpu, GpuPref::Auto);
+        assert_eq!(parse(&["--gpu", "an"]).switches.gpu, GpuPref::On);
+        assert_eq!(parse(&["--gpu", "aus"]).switches.gpu, GpuPref::Off);
+        let argv = ["map", "scan", "--slam", "ziel", "--gpu", "ja"];
+        let err = Cli::try_parse_from(argv).err().unwrap().to_string();
+        assert!(err.contains("auto|an|aus"), "{err}");
     }
 }

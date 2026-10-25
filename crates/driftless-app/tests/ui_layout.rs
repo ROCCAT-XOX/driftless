@@ -268,6 +268,15 @@ fn settings_window_has_view_settings() {
     h.get_by_label(text::MODE_INTENSITY).click();
     h.run();
     assert_eq!(h.state().state().view.color_mode, ColorMode::Intensity);
+    // „Grafikkarte nutzen“: Auto by default, the choice is kept in the state
+    assert_eq!(h.state().state().gpu, driftless_gpu::GpuPref::Auto);
+    h.get_by_label(text::GPU);
+    h.get_by_label(text::GPU_OFF).click();
+    h.run();
+    assert_eq!(h.state().state().gpu, driftless_gpu::GpuPref::Off);
+    h.get_by_label(text::GPU_ON).click();
+    h.run();
+    assert_eq!(h.state().state().gpu, driftless_gpu::GpuPref::On);
     // ⚙ again closes it
     h.get_by_role_and_label(Role::Button, text::SETTINGS)
         .click();
@@ -440,4 +449,38 @@ fn projects_of_disk_show_in_daten() {
     let h = window(app);
     h.get_by_label(&text::project_line("Leer", 0));
     h.get_by_label(text::EMPTY_NO_SCANS);
+}
+
+/// „Grafikkarte nutzen“ survives saving and loading; stored without it (before it existed) or
+/// with an unknown word it is Auto.
+#[test]
+fn stored_gpu_choice() {
+    use driftless_gpu::GpuPref;
+    for gpu in [GpuPref::Off, GpuPref::On, GpuPref::Auto] {
+        let mut app = app();
+        app.state_mut().gpu = gpu;
+        let mut storage = Storage::default();
+        eframe::App::save(&mut app, &mut storage);
+        let mut back = self::app();
+        back.restore_ui(&egui::Context::default(), Some(&storage));
+        assert_eq!(back.state().gpu, gpu);
+    }
+    for stored in [None, Some("vielleicht")] {
+        let mut app = app();
+        app.state_mut().gpu = GpuPref::Off;
+        app.state_mut().view.point_px = 3.5;
+        let mut ui: serde_json::Value = serde_json::from_str(&app.ui_to_store()).unwrap();
+        let fields = ui.as_object_mut().unwrap();
+        match stored {
+            None => assert!(fields.remove("gpu").is_some()),
+            Some(word) => {
+                fields.insert("gpu".into(), word.into());
+            }
+        }
+        let storage = Storage([(UI_KEY.to_string(), ui.to_string())].into());
+        let mut back = self::app();
+        back.restore_ui(&egui::Context::default(), Some(&storage));
+        assert_eq!(back.state().gpu, GpuPref::Auto, "{stored:?}");
+        assert_eq!(back.state().view.point_px, 3.5, "{stored:?}");
+    }
 }

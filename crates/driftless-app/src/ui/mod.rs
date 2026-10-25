@@ -28,6 +28,7 @@ use crate::project::{
     map_status, state_gap, surface_status, MapStatus, Project, RunInfo, ScanState, SurfaceSettings,
 };
 use crate::render::{ColorMode, PointSize, ShowMode};
+use driftless_gpu::GpuPref;
 use driftless_io::progress::LogLine;
 use driftless_steps::inspect;
 use driftless_steps::map::MapSettings;
@@ -299,6 +300,9 @@ pub struct AppState {
     pub slam_settings: SlamSettings,
     /// What the next surface of a map is computed with.
     pub surface_settings: SurfaceSettings,
+    /// „Grafikkarte nutzen“ (⚙): what maps and surfaces are computed on. Gives an
+    /// equivalent result, so it is not part of the settings a map or surface is told by.
+    pub gpu: GpuPref,
     pub view: ViewSettings,
     /// Oldest first; the status bar shows the last.
     pub messages: Vec<UiMessage>,

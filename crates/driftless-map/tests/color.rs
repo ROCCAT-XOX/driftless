@@ -279,7 +279,16 @@ fn colorize_with_matches_colorize() {
     let mut a = surface_cloud(painted);
     let sa = colorize(&mut a, images.clone(), poses, cams, &cfg).unwrap();
     let mut b = surface_cloud(painted);
-    let sb = colorize_with(&mut b, images.clone(), poses, cams, &cfg, &Progress::new()).unwrap();
+    let sb = colorize_with(
+        &mut b,
+        images.clone(),
+        poses,
+        cams,
+        &cfg,
+        &Progress::new(),
+        None,
+    )
+    .unwrap();
     assert_eq!(sa, sb);
     assert_eq!(a.rgb, b.rgb);
     assert_eq!(a.colored, b.colored);
@@ -294,7 +303,7 @@ fn colorize_cancelled_returns_cancelled() {
     let p = Progress::new();
     p.cancel();
     let mut cloud = before.clone();
-    let r = colorize_with(&mut cloud, images.clone(), poses, cams, &cfg, &p);
+    let r = colorize_with(&mut cloud, images.clone(), poses, cams, &cfg, &p, None);
     assert!(matches!(r, Err(MapError::Cancelled)), "{r:?}");
     assert_eq!(cloud, before);
 
@@ -308,7 +317,7 @@ fn colorize_cancelled_returns_cancelled() {
             }
         });
         let mut cloud = before.clone();
-        let r = colorize_with(&mut cloud, images.clone(), poses, cams, &cfg, &p);
+        let r = colorize_with(&mut cloud, images.clone(), poses, cams, &cfg, &p, None);
         assert!(matches!(r, Err(MapError::Cancelled)), "{phase}: {r:?}");
         assert_eq!(cloud, before, "{phase}");
         assert_eq!(p.snapshot().phase, phase);
@@ -336,6 +345,7 @@ fn colorize_reports_images() {
         cams,
         &ColorConfig::default(),
         &p,
+        None,
     )
     .unwrap();
     let images_total = (stats.images_used
