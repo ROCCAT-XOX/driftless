@@ -525,3 +525,206 @@ fn small_glb(path: &Path) {
     }];
     write_glb(path, &tex, 90).unwrap();
 }
+
+/// The info messages of the status bar.
+fn infos(app: &DriftlessApp) -> Vec<String> {
+    app.state()
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            UiMessage::Info(i) => Some(i.clone()),
+            UiMessage::Error(_) => None,
+        })
+        .collect()
+}
+
+#[test]
+fn maps_left_to_daten_are_named() {
+    // only a (surfaced) and d (its map no longer fits): nothing to queue, but not „all done“
+    let mut state = four_maps();
+    state.scans = vec![state.scans[0].clone(), state.scans[3].clone()];
+    assert!(state.maps_to_surface().is_empty());
+    let mut h = panel(state.clone());
+    let wait = text::maps_wait_for_data(1);
+    h.get_by_label(&wait);
+    assert!(h.query_by_label(text::ALL_SURFACED).is_none());
+    assert_eq!(click(&mut h, text::COMPUTE_ALL_SURFACES), None);
+    // the click says it too
+    let mut app = app();
+    *app.state_mut() = state;
+    app.apply(Action::ComputeAllSurfaces);
+    assert!(app.state().queue.is_empty());
+    assert_eq!(infos(&app), std::slice::from_ref(&wait));
+    assert!(!infos(&app).iter().any(|i| i == text::ALL_SURFACED));
+    assert_eq!(
+        text::maps_wait_for_data(3),
+        "3 Karten erst in „Daten“ neu rechnen"
+    );
+
+    // with something to queue the skipped ones are named as well
+    let state = four_maps();
+    let h = panel(state);
+    h.get_by_label(&wait);
+}
+
+#[test]
+fn map_states_of_their_own() {
+    let mut state = four_maps();
+    // b's scan cannot be read, c's map has no map.json yet
+    state.scans[1].state = ScanState::Missing("fehlt".into());
+    state.scans[2].runs[0].maps[0].settings = None;
+    let status: Vec<SurfaceStatus> = state
+        .scans
+        .iter()
+        .map(|s| surface_status(&state, &s.runs[0].maps[0]))
+        .collect();
+    assert_eq!(
+        status,
+        [
+            SurfaceStatus::Done,
+            SurfaceStatus::ScanMissing,
+            SurfaceStatus::MapNotReady,
+            SurfaceStatus::MapStale
+        ]
+    );
+    assert!(state.maps_to_surface().is_empty());
+    let h = panel(state.clone());
+    for (id, label) in [
+        ("b", text::STATUS_SCAN_MISSING),
+        ("c", text::STATUS_MAP_NOT_READY),
+        ("d", text::STATUS_MAP_STALE),
+    ] {
+        let row = h.get_by_label(&map_name(id)).rect();
+        let found = h
+            .query_all_by_label(label)
+            .any(|s| (s.rect().center().y - row.center().y).abs() < 6.0);
+        assert!(found, "{label} not next to map {id}");
+    }
+    h.get_by_label(&text::maps_wait_for_data(3));
+}
+
+#[test]
+fn stale_map_locks_its_surface() {
+    let mut state = four_maps();
+    state.selection = Selection::Map(MAP_D.into());
+    let mut h = panel(state);
+    h.get_by_label(text::STATUS_MAP_STALE_HINT);
+    assert_eq!(click(&mut h, text::STEP_SURFACE), None);
+    // a fitting map: free
+    h.state_mut().0.selection = Selection::Map(MAP_B.into());
+    h.run();
+    assert!(h.query_by_label(text::STATUS_MAP_STALE_HINT).is_none());
+    assert_eq!(
+        click(&mut h, text::STEP_SURFACE),
+        Some(Action::RunSurface(MAP_B.into()))
+    );
+}
+
+/// Ticks like frames do until no step and no background work is left.
+fn tick_settle(app: &mut DriftlessApp) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while app.wants_repaint_while_busy() {
+        assert!(Instant::now() < deadline, "work did not end");
+        std::thread::sleep(Duration::from_millis(5));
+        app.tick();
+    }
+}
+
+/// An app with a new project in `dir` and the scans `names`, each with a cleaned map, quick
+/// surface settings; returns the map folders.
+fn mapped_project(dir: &Path, names: &[&str]) -> (DriftlessApp, Vec<PathBuf>) {
+    let mut app = app();
+    app.apply(Action::NewProject {
+        dir: dir.join("projekt"),
+        name: "Halle".into(),
+    });
+    for name in names {
+        let scan = dir.join(name);
+        fs::create_dir_all(&scan).unwrap();
+        room_bag_secs(&scan, true, 1.5);
+        app.apply(Action::AddScan(scan));
+    }
+    app.state_mut().map_settings.step = MapStep::Clean;
+    app.state_mut().surface_settings = quick(0.15);
+    app.apply(Action::ComputeAllMaps);
+    tick_settle(&mut app);
+    assert_eq!(errors(&app), Vec::<String>::new());
+    let maps = names
+        .iter()
+        .map(|id| {
+            let node = app.state().scan_node(id).unwrap();
+            node.runs.last().unwrap().maps.last().unwrap().dir.clone()
+        })
+        .collect();
+    (app, maps)
+}
+
+fn has_surface(map: &Path) -> bool {
+    map.join("oberflaeche-001").exists()
+}
+
+#[test]
+fn closing_empties_the_surface_queue() {
+    let dir = tmp("ui-bilder-schliessen");
+    let (mut app, maps) = mapped_project(&dir, &["a", "b"]);
+    app.apply(Action::ComputeAllSurfaces);
+    assert_eq!(app.state().queue.len(), 2);
+    assert!(matches!(app.state().queue[0], Queued::Surface(_)));
+    assert!(!app.close_requested());
+    assert!(app.state().queue.is_empty());
+    tick_settle(&mut app);
+    assert!(app.take_close());
+    assert!(!has_surface(&maps[1]));
+}
+
+#[test]
+fn project_switch_empties_the_surface_queue() {
+    let dir = tmp("ui-bilder-wechsel");
+    let (mut app, maps) = mapped_project(&dir, &["a", "b"]);
+    app.apply(Action::ComputeAllSurfaces);
+    assert_eq!(app.state().queue.len(), 2);
+    app.apply(Action::NewProject {
+        dir: dir.join("anderes"),
+        name: "Anderes".into(),
+    });
+    assert!(app.state().queue.is_empty());
+    tick_settle(&mut app);
+    assert_eq!(app.state().project.as_ref().unwrap().name, "Anderes");
+    assert!(app.state().queue.is_empty());
+    assert!(app.state().running.is_none());
+    assert!(!has_surface(&maps[1]));
+}
+
+#[test]
+fn failed_surface_stops_the_queue() {
+    let dir = tmp("ui-bilder-fehler");
+    let (mut app, maps) = mapped_project(&dir, &["a", "b", "c"]);
+    app.apply(Action::ComputeAllSurfaces);
+    assert_eq!(app.state().queue.len(), 3);
+    // b's scan folder goes while a's surface is computed
+    fs::remove_dir_all(dir.join("b")).unwrap();
+    tick_settle(&mut app);
+    assert!(has_surface(&maps[0]));
+    assert!(!errors(&app).is_empty(), "no error shown");
+    assert!(app.state().queue.is_empty());
+    assert!(!has_surface(&maps[1]));
+    assert!(!has_surface(&maps[2]));
+}
+
+#[test]
+fn queued_map_that_left_the_project_says_so() {
+    let dir = tmp("ui-bilder-weg");
+    let (mut app, maps) = mapped_project(&dir, &["a", "b"]);
+    app.apply(Action::ComputeAllSurfaces);
+    assert_eq!(app.state().queue.len(), 2);
+    // b's map folder goes while a's surface is computed
+    fs::remove_dir_all(&maps[1]).unwrap();
+    tick_settle(&mut app);
+    assert!(has_surface(&maps[0]));
+    assert!(app.state().queue.is_empty());
+    let errors = errors(&app);
+    assert!(
+        errors.iter().any(|e| e.contains(text::MAP_GONE)),
+        "{errors:?}"
+    );
+}

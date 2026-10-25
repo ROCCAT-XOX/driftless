@@ -85,6 +85,12 @@ pub const SURFACE_FINE_HINT: &str =
 pub const STATUS_MAP_STALE: &str = "Karte veraltet";
 pub const STATUS_MAP_STALE_HINT: &str =
     "Die Karte passt nicht mehr zu ihrem Lauf – zuerst in „Daten“ neu rechnen";
+/// The status of a map without `map.json` yet (still being computed, or failed).
+pub const STATUS_MAP_NOT_READY: &str = "Karte noch nicht fertig";
+/// The status of a map whose scan folder cannot be read.
+pub const STATUS_SCAN_MISSING: &str = "Scan fehlt";
+/// A map of the queue of „Alle Oberflächen rechnen“ is no longer in the project.
+pub const MAP_GONE: &str = "Karte nicht mehr im Projekt";
 /// Before the state of a surface of the selected map with the fineness chosen now.
 pub const WITH_THIS_FINENESS: &str = "Mit dieser Feinheit";
 
@@ -307,6 +313,20 @@ pub fn pose_hover(t: f64, submap: usize) -> String {
 /// A time of a place in the field: one decimal.
 pub fn place_time(t: f64) -> String {
     decimal(t, 1)
+}
+
+/// Below „Alle Oberflächen rechnen“: the maps it leaves out because they wait for „Daten“
+/// (stale, not done, or of a scan that cannot be read).
+pub fn maps_wait_for_data(n: usize) -> String {
+    match n {
+        1 => "1 Karte erst in „Daten“ neu rechnen".to_string(),
+        n => format!("{n} Karten erst in „Daten“ neu rechnen"),
+    }
+}
+
+/// A queued map that is no longer in the project.
+pub fn map_gone(dir: &std::path::Path) -> String {
+    format!("{MAP_GONE}: {}", dir.display())
 }
 
 /// Under the heading „Bilder“: „3 Karten · 2 Oberflächen“.

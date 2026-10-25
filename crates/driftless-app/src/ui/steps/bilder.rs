@@ -1,6 +1,6 @@
 //! Step 2 „Bilder“, in the form of „Daten“: the heading with the number of maps and
 //! surfaces, a card per map with its status (neu, wartet, rechnet, fertig ✓, veraltet, Karte
-//! veraltet) and its surfaces below it („Oberfläche 001“, a stale one marked; a click shows
+//! veraltet, Karte noch nicht fertig, Scan fehlt) and its surfaces below it („Oberfläche 001“, a stale one marked; a click shows
 //! it), the fineness of the next surface as a three-way switch (1 / 1,5 / 2 cm), the progress
 //! of the running job, and at the bottom the main button: „Alle Oberflächen rechnen“ queues
 //! every map without a current surface ([`Action::ComputeAllSurfaces`]), „Oberfläche
@@ -10,7 +10,7 @@ use super::{
     badge, below_lines, blocked, card, fraction, heading, hint, job_progress, main_button,
     no_project, pinned, quiet_button, segments, state_label, tree, StepState,
 };
-use crate::project::{MapInfo, SurfaceInfo, SurfaceSettings};
+use crate::project::{MapInfo, ScanState, SurfaceInfo, SurfaceSettings};
 use crate::ui::theme::{icon, DARK};
 use crate::ui::{text, Action, AppState, Queued, Selection, Step};
 use eframe::egui::{self, RichText, Ui};
@@ -28,13 +28,17 @@ pub enum SurfaceStatus {
     Done,
     /// It has surfaces, but none fits any more.
     Stale,
-    /// The map itself no longer fits its run, or has no `map.json`: it is computed anew in
-    /// „Daten“ first, „Alle Oberflächen rechnen“ leaves it out.
+    /// The map itself no longer fits its run: it is computed anew in „Daten“ first, „Alle
+    /// Oberflächen rechnen“ leaves it out.
     MapStale,
+    /// The map has no `map.json` yet (still being computed, or failed): left out as well.
+    MapNotReady,
+    /// The folder of its scan cannot be read: left out as well.
+    ScanMissing,
 }
 
-/// The status of the surfaces of `map`: a running step or the queue first, then the map, then
-/// its surfaces. A map or surface counts as fitting until the background check
+/// The status of the surfaces of `map`: a running step or the queue first, then its scan and
+/// the map, then its surfaces. A map or surface counts as fitting until the background check
 /// ([`AppState::map_status`]) says it is stale.
 pub fn surface_status(state: &AppState, map: &MapInfo) -> SurfaceStatus {
     if state.running.as_ref() == Some(&Action::RunSurface(map.dir.clone())) {
@@ -43,8 +47,15 @@ pub fn surface_status(state: &AppState, map: &MapInfo) -> SurfaceStatus {
     if state.queue.contains(&Queued::Surface(map.dir.clone())) {
         return SurfaceStatus::Queued;
     }
+    let scan_missing = state
+        .map(&map.dir)
+        .is_some_and(|(scan, _, _)| matches!(scan.state, ScanState::Missing(_)));
     let map_stale = state.map_status.get(&map.dir).is_some_and(|s| s.stale);
-    if map.settings.is_none() || map_stale {
+    if scan_missing {
+        SurfaceStatus::ScanMissing
+    } else if map.settings.is_none() {
+        SurfaceStatus::MapNotReady
+    } else if map_stale {
         SurfaceStatus::MapStale
     } else if map.surfaces.iter().any(|s| !s.stale) {
         SurfaceStatus::Done
@@ -117,15 +128,20 @@ fn map_list(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
         let selected = state.selection == Selection::Map(map.dir.clone());
         let name = text::map_of(scan, run, &map.label);
         let status = surface_status(state, map);
-        let hover = match status {
-            SurfaceStatus::MapStale => {
-                format!(
-                    "{name}\n{}\n{}",
-                    text::STATUS_MAP_STALE_HINT,
-                    map.dir.display()
-                )
-            }
-            _ => format!("{name}\n{}", map.dir.display()),
+        let why = match status {
+            SurfaceStatus::MapStale => Some(text::STATUS_MAP_STALE_HINT.to_string()),
+            SurfaceStatus::MapNotReady => Some(text::SURFACE_NEEDS_MAP.to_string()),
+            SurfaceStatus::ScanMissing => state.map(&map.dir).and_then(|(scan, _, _)| match &scan
+                .state
+            {
+                ScanState::Missing(why) => Some(why.clone()),
+                ScanState::Ready => None,
+            }),
+            _ => None,
+        };
+        let hover = match why {
+            Some(why) => format!("{name}\n{why}\n{}", map.dir.display()),
+            None => format!("{name}\n{}", map.dir.display()),
         };
         let r = card(
             ui,
@@ -162,6 +178,8 @@ fn status_label(ui: &mut Ui, status: SurfaceStatus) {
         SurfaceStatus::Done => (Some(icon::CHECK), text::STATUS_DONE, DARK.ok),
         SurfaceStatus::Stale => (Some(icon::STALE), text::STATUS_STALE, DARK.warn),
         SurfaceStatus::MapStale => (Some(icon::STALE), text::STATUS_MAP_STALE, DARK.text_dim),
+        SurfaceStatus::MapNotReady => (None, text::STATUS_MAP_NOT_READY, DARK.text_dim),
+        SurfaceStatus::ScanMissing => (Some(icon::STALE), text::STATUS_SCAN_MISSING, DARK.text_dim),
     };
     badge(ui, symbol, word, color);
 }
@@ -234,8 +252,10 @@ fn own_surface_state(state: &AppState, surface: &SurfaceInfo) -> StepState {
 /// The main button – „Oberfläche rechnen“ with a map (or a surface of it) selected, else
 /// „Alle Oberflächen rechnen“ – and, with a map selected, „Alle Oberflächen rechnen“ quietly
 /// below it. Locked while a step runs, while the scan cannot be read, for invalid settings,
-/// for a map without `map.json`, and with nothing to compute; the reason shows on hover, and
-/// below the button unless the field shows it already (the progress of the running step).
+/// for a map without `map.json` or that no longer fits its run (its surface would be stale at
+/// once), and with nothing to compute; the reason shows on hover, and below the button unless
+/// the field shows it already (the progress of the running step). The maps „Alle Oberflächen
+/// rechnen“ leaves out because they wait for „Daten“ are named below it.
 fn compute_buttons(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
     let busy = state.job.as_ref().map(|j| text::busy(&j.label));
     let invalid = state
@@ -247,8 +267,12 @@ fn compute_buttons(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
     // until the maps are checked a stale surface counts as fitting: the button then waits
     // for the check instead of saying that all is done
     let pending = state.map_status_pending;
-    let nothing =
-        (!pending && state.maps_to_surface().is_empty()).then(|| text::ALL_SURFACED.to_string());
+    let waiting = state.maps_waiting_for_data();
+    let wait = (!pending && waiting > 0).then(|| text::maps_wait_for_data(waiting));
+    let nothing = (!pending && state.maps_to_surface().is_empty()).then(|| {
+        wait.clone()
+            .unwrap_or_else(|| text::ALL_SURFACED.to_string())
+    });
     let all_locked = busy.clone().or(invalid.clone()).or(nothing.clone());
     let selected = state.selected_map();
     let below = match selected {
@@ -260,17 +284,26 @@ fn compute_buttons(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
             let scan_blocked = state
                 .map(&map.dir)
                 .and_then(|(scan, _, _)| blocked(state, scan));
-            let locked = scan_blocked.or(invalid.clone()).or(no_map.clone());
+            let map_stale = (surface_status(state, map) == SurfaceStatus::MapStale)
+                .then(|| text::STATUS_MAP_STALE_HINT.to_string());
+            let locked = scan_blocked
+                .or(invalid.clone())
+                .or(no_map.clone())
+                .or(map_stale.clone());
             if main_button(ui, text::STEP_SURFACE, locked, text::COMPUTE_SURFACE_HINT) {
                 *action = Some(Action::RunSurface(map.dir.clone()));
             }
             if quiet_button(ui, text::COMPUTE_ALL_SURFACES, all_locked) {
                 *action = Some(Action::ComputeAllSurfaces);
             }
-            busy.is_none()
-                .then_some(invalid.or(no_map))
-                .flatten()
-                .map(|e| text::cannot_compute(&e))
+            if busy.is_some() {
+                None
+            } else {
+                invalid
+                    .or(no_map)
+                    .map(|e| text::cannot_compute(&e))
+                    .or(map_stale)
+            }
         }
         None => {
             let hover = text::COMPUTE_SURFACES_HINT;
@@ -281,7 +314,8 @@ fn compute_buttons(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
                 (Some(_), _) => None,
                 (None, Some(e)) => Some(text::cannot_compute(&e)),
                 (None, None) if pending => Some(text::MAP_STATUS_PENDING.to_string()),
-                (None, None) => nothing.clone(),
+                // „all done“, or the maps that wait for „Daten“
+                (None, None) => nothing.clone().or(wait),
             }
         }
     };

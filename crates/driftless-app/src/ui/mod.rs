@@ -490,21 +490,43 @@ impl AppState {
 
     /// The maps [`Action::ComputeAllSurfaces`] queues: those without a current surface
     /// ([`steps::bilder::surface_status`] new or stale), in the order of the list, as map
-    /// folders. A map that no longer fits its run is left to „Daten“.
+    /// folders. A map that waits for „Daten“ ([`AppState::maps_waiting_for_data`]) is left
+    /// out.
     pub fn maps_to_surface(&self) -> Vec<PathBuf> {
-        self.scans
-            .iter()
-            .filter(|s| s.state == ScanState::Ready)
-            .flat_map(|s| &s.runs)
-            .flat_map(|r| &r.maps)
+        use steps::bilder::SurfaceStatus;
+        self.all_maps()
             .filter(|m| {
                 matches!(
                     steps::bilder::surface_status(self, m),
-                    steps::bilder::SurfaceStatus::New | steps::bilder::SurfaceStatus::Stale
+                    SurfaceStatus::New | SurfaceStatus::Stale
                 )
             })
             .map(|m| m.dir.clone())
             .collect()
+    }
+
+    /// How many maps [`Action::ComputeAllSurfaces`] leaves out because they wait for „Daten“:
+    /// the map no longer fits its run, has no `map.json` yet, or its scan cannot be read.
+    pub fn maps_waiting_for_data(&self) -> usize {
+        use steps::bilder::SurfaceStatus;
+        self.all_maps()
+            .filter(|m| {
+                matches!(
+                    steps::bilder::surface_status(self, m),
+                    SurfaceStatus::MapStale
+                        | SurfaceStatus::MapNotReady
+                        | SurfaceStatus::ScanMissing
+                )
+            })
+            .count()
+    }
+
+    /// Every map of the tree, in the order of the list.
+    fn all_maps(&self) -> impl Iterator<Item = &crate::project::MapInfo> {
+        self.scans
+            .iter()
+            .flat_map(|s| &s.runs)
+            .flat_map(|r| &r.maps)
     }
 
     /// The scan with the folder `path`.

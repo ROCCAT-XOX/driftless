@@ -1210,7 +1210,17 @@ impl DriftlessApp {
             Batch::Surfaces => {
                 let maps = self.state.maps_to_surface();
                 let items = maps.into_iter().map(Queued::Surface).collect();
-                self.compute(items, text::ALL_SURFACED);
+                // the maps left out are named, whether others are queued or not
+                let waiting = self.state.maps_waiting_for_data();
+                if waiting == 0 {
+                    self.compute(items, text::ALL_SURFACED);
+                } else {
+                    let wait = text::maps_wait_for_data(waiting);
+                    self.compute(items, &wait);
+                    if !self.state.queue.is_empty() {
+                        self.info(wait);
+                    }
+                }
             }
         }
     }
@@ -1254,7 +1264,10 @@ impl DriftlessApp {
                 }
                 started
             }
-            None => Err(text::UNKNOWN_SCAN.into()),
+            None => Err(match self.state.queue.front() {
+                Some(Queued::Surface(dir)) => text::map_gone(dir),
+                _ => text::UNKNOWN_SCAN.into(),
+            }),
         };
         if let Err(e) = started {
             self.error(e);
