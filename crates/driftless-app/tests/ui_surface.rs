@@ -7,10 +7,11 @@ use driftless_app::ui::view3d::effective_show;
 use driftless_app::ui::{
     text, Action, AppState, CloudSummary, DriftlessApp, Selection, Step, SurfaceSummary, UiMessage,
 };
+use driftless_gpu::GpuPref;
 use driftless_io::images::RgbImage;
 use driftless_io::progress::Progress;
 use driftless_io::testscan::{room_bag_secs, tmp};
-use driftless_map::surface::{write_glb, SurfaceConfig, TexturePage, TexturedMesh};
+use driftless_map::surface::{encode_pages, write_glb, SurfaceConfig, TexturePage, TexturedMesh};
 use driftless_steps::map::MapStep;
 use driftless_steps::StepError;
 use eframe::egui;
@@ -279,7 +280,15 @@ fn cancelled_surface_leaves_no_folder() {
     let progress = Progress::new();
     progress.cancel();
     let settings = state.surface_settings.clone();
-    let e = run_surface_job(run, &scan_dir, info, &settings, &progress).unwrap_err();
+    let e = run_surface_job(
+        run,
+        &scan_dir,
+        info,
+        &settings,
+        GpuPref::default(),
+        &progress,
+    )
+    .unwrap_err();
     assert!(matches!(e, StepError::Cancelled), "{e}");
     assert!(!map.join("oberflaeche-001").exists());
 }
@@ -302,7 +311,7 @@ fn small_glb(path: &Path, n: usize) {
             data: vec![128; 48],
         },
     }];
-    write_glb(path, &tex, 90).unwrap();
+    write_glb(path, &tex, &encode_pages(&tex, 90).unwrap()).unwrap();
 }
 
 #[test]

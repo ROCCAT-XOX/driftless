@@ -536,7 +536,11 @@ fn map_state(state: &AppState, run: &RunInfo, settings: &MapSettings) -> StepSta
         .maps
         .iter()
         .rev()
-        .filter(|m| m.settings.as_ref() == Some(&settings.switches))
+        .filter(|m| {
+            m.settings
+                .as_ref()
+                .is_some_and(|s| s.same_map(&settings.switches))
+        })
         .peekable();
     if same.peek().is_none() {
         return StepState::NotComputed;

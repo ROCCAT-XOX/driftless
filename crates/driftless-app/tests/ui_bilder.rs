@@ -13,7 +13,7 @@ use driftless_app::ui::{
 };
 use driftless_io::images::RgbImage;
 use driftless_io::testscan::{room_bag_secs, tmp};
-use driftless_map::surface::{write_glb, SurfaceConfig, TexturePage, TexturedMesh};
+use driftless_map::surface::{encode_pages, write_glb, SurfaceConfig, TexturePage, TexturedMesh};
 use driftless_steps::map::{MapStep, MapSwitches};
 use driftless_steps::slam::SlamSettings;
 use egui_kittest::kittest::Queryable;
@@ -523,7 +523,7 @@ fn small_glb(path: &Path) {
             data: vec![128; 48],
         },
     }];
-    write_glb(path, &tex, 90).unwrap();
+    write_glb(path, &tex, &encode_pages(&tex, 90).unwrap()).unwrap();
 }
 
 /// The info messages of the status bar.

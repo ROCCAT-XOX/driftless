@@ -21,6 +21,7 @@
 use crate::error::{check_cancel, failed, StepError};
 use crate::scan::{image_topics, read_imu, warn_if_not_static, with_lidar_frames, IMAGE_TYPE};
 use crate::slam::SlamSettings;
+use driftless_gpu::{CpuFallback, GpuChoice, GpuContext, GpuPref};
 use driftless_io::calib::load_calibration;
 use driftless_io::camera::Camera;
 use driftless_io::progress::Progress;
@@ -84,6 +85,27 @@ pub struct MapSwitches {
     pub voxel: f64,
     /// Decode images downscaled: 1, 2 or 4.
     pub downscale: u32,
+    /// Colour on the GPU (`--gpu auto|an|aus`). Gives an equivalent result: not part of the
+    /// colour input id, not in `settings` of `map.json` (the colour step's entry records under
+    /// `gpu` what was used), and ignored by [`MapSwitches::same_map`].
+    #[serde(default, with = "gpu_pref")]
+    pub gpu: GpuPref,
+}
+
+/// `GpuPref` as its CLI word (`auto`, `an`, `aus`).
+mod gpu_pref {
+    use driftless_gpu::GpuPref;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(p: &GpuPref, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(p)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<GpuPref, D::Error> {
+        String::deserialize(d)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl Default for MapSwitches {
@@ -97,6 +119,7 @@ impl Default for MapSwitches {
             vignetting: true,
             voxel: DenseConfig::default().voxel,
             downscale: ColorConfig::default().downscale,
+            gpu: GpuPref::default(),
         }
     }
 }
@@ -113,7 +136,17 @@ impl MapSwitches {
         Ok(())
     }
 
-    /// The switches recorded in `map.json` (the whole file); `None` if they are missing.
+    /// Whether `self` and `other` make the same map: all switches but `gpu` agree.
+    pub fn same_map(&self, other: &MapSwitches) -> bool {
+        let without_gpu = |s: &MapSwitches| MapSwitches {
+            gpu: GpuPref::default(),
+            ..s.clone()
+        };
+        without_gpu(self) == without_gpu(other)
+    }
+
+    /// The switches recorded in `map.json` (the whole file); `None` if they are missing. The
+    /// GPU preference is not recorded there: `gpu` is the default.
     pub fn from_map_json(map_json: &Value) -> Option<Self> {
         let s = &map_json["settings"];
         Some(MapSwitches {
@@ -125,6 +158,7 @@ impl MapSwitches {
             vignetting: s["color"]["exposure"]["vignetting"].as_bool()?,
             voxel: s["dense"]["voxel"].as_f64()?,
             downscale: u32::try_from(s["color"]["downscale"].as_u64()?).ok()?,
+            gpu: GpuPref::default(),
         })
     }
 
@@ -500,6 +534,32 @@ fn color_json(s: &ColorStats, cameras: &[&str]) -> Value {
     })
 }
 
+/// Why the CPU computes although the GPU was asked for (`--gpu auto|an`), for the console
+/// and the report; `None` for `--gpu aus`.
+pub(crate) fn fallback_reason(pref: GpuPref, why: &CpuFallback) -> Option<String> {
+    (pref != GpuPref::Off).then(|| why.to_string())
+}
+
+/// What the colour step (or the views of the surface) ran on: `used`, and the device's `name`, `backend` and `driver`
+/// (`null` on the CPU); `fallback`: why the opened GPU was not used (`--gpu auto`).
+pub(crate) fn gpu_json(gpu: Option<&GpuContext>, fallback: Option<&str>) -> Value {
+    match (gpu.map(GpuContext::info), fallback) {
+        (Some(i), None) => json!({
+            "used": true,
+            "name": i.name,
+            "backend": i.backend,
+            "driver": i.driver,
+        }),
+        (_, fallback) => json!({
+            "used": false,
+            "name": null,
+            "backend": null,
+            "driver": null,
+            "fallback": fallback,
+        }),
+    }
+}
+
 fn settings_json(
     slam: &SlamSettings,
     odom: &OdomConfig,
@@ -781,8 +841,34 @@ impl MapRun<'_> {
         self.run_clean(cloud, rays)
     }
 
-    fn run_color(&mut self, mut cloud: Cloud, input: ColorInput) -> Result<(), StepError> {
+    /// Colours `cloud` on `device` (opened by [`run_map`] before any work, so `--gpu an`
+    /// without a GPU fails at once).
+    fn run_color(
+        &mut self,
+        mut cloud: Cloud,
+        input: ColorInput,
+        device: GpuChoice,
+    ) -> Result<(), StepError> {
         let start = Instant::now();
+        let pref = self.input.map.switches.gpu;
+        let mut no_device = None;
+        let gpu = match device {
+            GpuChoice::Gpu(ctx) => {
+                let i = ctx.info();
+                self.progress.info(format!(
+                    "Einfärben auf der Grafikkarte: {} ({})",
+                    i.name, i.backend
+                ));
+                Some(ctx)
+            }
+            GpuChoice::Cpu(why) => {
+                no_device = fallback_reason(pref, &why);
+                if let Some(why) = &no_device {
+                    self.progress.info(format!("Einfärben auf der CPU: {why}"));
+                }
+                None
+            }
+        };
         let stats = colorize_with(
             &mut cloud,
             input.images,
@@ -790,7 +876,11 @@ impl MapRun<'_> {
             &input.cams,
             &self.color_cfg,
             self.progress,
+            gpu.as_ref(),
         )?;
+        let fallback = stats.gpu_fallback.as_deref().or(no_device.as_deref());
+        let gpu_report = gpu_json(gpu.as_ref(), fallback);
+        drop(gpu);
         self.ready_to_write()?;
         for w in color_warnings(&stats) {
             self.progress.warn(w);
@@ -836,6 +926,9 @@ impl MapRun<'_> {
             color_json(&stats, &names),
             &["color.las", "color.ply"],
         );
+        if let Some(e) = self.steps.get_mut("color") {
+            e["gpu"] = gpu_report;
+        }
         Ok(())
     }
 }
@@ -909,7 +1002,7 @@ pub fn folder_fits(input: &MapInput, dir: &Path) -> bool {
     let fits = || -> Option<bool> {
         let text = fs::read_to_string(dir.join(REPORT)).ok()?;
         let report: Value = serde_json::from_str(&text).ok()?;
-        if MapSwitches::from_map_json(&report)? != input.map.switches {
+        if !MapSwitches::from_map_json(&report)?.same_map(&input.map.switches) {
             return Some(false);
         }
         let odom = input.slam.config().ok()?.odom;
@@ -994,6 +1087,10 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
     if let (MapStep::Color, Err(why)) = (step, &color) {
         return Err(why.clone().into());
     }
+    let device = match &color {
+        Ok(_) => Some(GpuContext::open(switches.gpu).map_err(|e| e.to_string())?),
+        Err(_) => None,
+    };
 
     let (traj_bytes, poses) = read_traj(&input.slam_dir)?;
     let dense_cfg = switches.dense_config();
@@ -1040,13 +1137,19 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
         }
         MapStep::Color => {
             let cloud = run.clean_input()?;
-            run.run_color(cloud, color.expect("checked above"))?;
+            run.run_color(
+                cloud,
+                color.expect("checked above"),
+                device.expect("opened with the colour input"),
+            )?;
         }
         MapStep::All => {
             let (cloud, rays) = run.run_dense()?;
             let cloud = run.run_clean(cloud, rays)?;
             match color {
-                Ok(input) => run.run_color(cloud, input)?,
+                Ok(input) => {
+                    run.run_color(cloud, input, device.expect("opened with the colour input"))?
+                }
                 Err(why) => {
                     progress.warn(format!("nicht eingefärbt, {why}"));
                     run.steps.insert("color", json!({"skipped": why}));

@@ -3,6 +3,7 @@
 //! texture pages, `oberflaeche.json`). The run itself is
 //! [`driftless_steps::surface::run_surface`].
 
+use driftless_gpu::GpuPref;
 use driftless_map::surface::SurfaceConfig;
 use driftless_steps::map::{MapInput, MapSettings, MapStep, MapSwitches, REPORT};
 use driftless_steps::scan::extrinsic_values;
@@ -39,6 +40,10 @@ pub struct Args {
     /// Imu-Topic (Standard: das einzige in der Bag)
     #[arg(long)]
     imu_topic: Option<String>,
+    /// Grafikkarte für die Ansichten je Fläche: auto (nutzen, wenn eine taugliche da ist, sonst
+    /// CPU mit Hinweis), an (verlangen) oder aus (nur CPU). Das Ergebnis ist gleichwertig.
+    #[arg(long, value_name = "auto|an|aus", default_value_t = GpuPref::Auto)]
+    gpu: GpuPref,
 }
 
 fn config(args: &Args) -> SurfaceConfig {
@@ -83,6 +88,7 @@ fn request(args: &Args) -> Result<SurfaceRequest, Box<dyn std::error::Error>> {
         out_dir,
         config: config(args),
         texture: !args.no_texture,
+        gpu: args.gpu,
     })
 }
 
@@ -123,5 +129,14 @@ mod tests {
         assert!(!r.texture);
         assert_eq!(r.map_dir, PathBuf::from("k"));
         assert_eq!(r.out_dir, PathBuf::from("x"));
+    }
+
+    #[test]
+    fn gpu_switch_parses() {
+        assert_eq!(parse(&[]).gpu, GpuPref::Auto);
+        assert_eq!(parse(&["--gpu", "an"]).gpu, GpuPref::On);
+        assert_eq!(parse(&["--gpu", "aus"]).gpu, GpuPref::Off);
+        let argv = ["surface", "scan", "--slam", "ziel", "--gpu", "ja"];
+        assert!(Cli::try_parse_from(argv).is_err());
     }
 }

@@ -12,8 +12,8 @@
 //!
 //! Both are deterministic: fixed generator string, no time, fixed key and file order, floats
 //! in their shortest round-trip form. Every file goes to `<name>.tmp` first and is renamed
-//! when complete, so an interrupted write leaves no half file under the real name. Pages are
-//! encoded one at a time; only the compressed JPEGs are held together.
+//! when complete, so an interrupted write leaves no half file under the real name. The pages
+//! are encoded once ([`encode_pages`]) for both files; only the compressed JPEGs are held.
 
 use super::TexturedMesh;
 use crate::MapError;
@@ -29,15 +29,57 @@ use std::path::{Path, PathBuf};
 /// `asset.generator` of every glb.
 pub const GENERATOR: &str = "Driftless";
 
-/// Writes `tex` as one binary glTF (see the module docs).
-pub fn write_glb(path: &Path, tex: &TexturedMesh, jpeg_quality: u8) -> Result<(), MapError> {
+/// The texture pages of a [`TexturedMesh`] as JPEG, encoded once for the glb and the obj.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageJpegs {
+    jpegs: Vec<Vec<u8>>,
+}
+
+impl PageJpegs {
+    /// Number of pages.
+    pub fn len(&self) -> usize {
+        self.jpegs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.jpegs.is_empty()
+    }
+
+    /// The JPEG of page `p`.
+    pub fn page(&self, p: usize) -> &[u8] {
+        &self.jpegs[p]
+    }
+
+    /// Fails if these are not the pages of `tex`.
+    fn check(&self, tex: &TexturedMesh) -> Result<(), MapError> {
+        if self.jpegs.len() != tex.pages.len() {
+            return Err(MapError::Config(format!(
+                "{} JPEG-Seiten für {} Texturseiten",
+                self.jpegs.len(),
+                tex.pages.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Encodes every page of `tex` as baseline JPEG of `jpeg_quality`.
+pub fn encode_pages(tex: &TexturedMesh, jpeg_quality: u8) -> Result<PageJpegs, MapError> {
+    let jpegs = tex
+        .pages
+        .iter()
+        .map(|page| encode_jpeg(&page.image, jpeg_quality))
+        .collect::<Result<_, _>>()?;
+    Ok(PageJpegs { jpegs })
+}
+
+/// Writes `tex` with its encoded pages `jpegs` as one binary glTF (see the module docs).
+pub fn write_glb(path: &Path, tex: &TexturedMesh, jpegs: &PageJpegs) -> Result<(), MapError> {
+    jpegs.check(tex)?;
     let pages: Vec<usize> = (0..tex.pages.len())
         .filter(|&p| !tex.pages[p].indices.is_empty())
         .collect();
-    let jpegs: Vec<Vec<u8>> = pages
-        .iter()
-        .map(|&p| encode_jpeg(&tex.pages[p].image, jpeg_quality))
-        .collect::<Result<_, _>>()?;
+    let jpegs: Vec<&[u8]> = pages.iter().map(|&p| jpegs.page(p)).collect();
 
     // Layout of the binary chunk: per page positions, uvs, indices, then the images; every
     // part starts at a multiple of 4.
@@ -138,7 +180,7 @@ pub fn write_glb(path: &Path, tex: &TexturedMesh, jpeg_quality: u8) -> Result<()
         primitives: Vec::new(),
         weights: None,
     };
-    for ((pos, uv, idx), jpeg) in primitives.into_iter().zip(&jpegs) {
+    for ((pos, uv, idx), jpeg) in primitives.into_iter().zip(jpegs.iter().copied()) {
         let image_view = view(&mut root, jpeg.len() as u64, None);
         let image = root.push(json::Image {
             buffer_view: Some(image_view),
@@ -247,7 +289,7 @@ pub fn write_glb(path: &Path, tex: &TexturedMesh, jpeg_quality: u8) -> Result<()
             let idx = page.indices.iter().flatten();
             part(w, &mut idx.map(|x| x.to_le_bytes()))?;
         }
-        for jpeg in &jpegs {
+        for &jpeg in &jpegs {
             w.write_all(jpeg)?;
             let pad = padded(jpeg.len() as u64) - jpeg.len() as u64;
             w.write_all(&[0u8; 3][..pad as usize])?;
@@ -258,18 +300,19 @@ pub fn write_glb(path: &Path, tex: &TexturedMesh, jpeg_quality: u8) -> Result<()
     })
 }
 
-/// Writes `tex` as `stem.obj`, `stem.mtl` and one `stem_seite_NN.jpg` per page into `dir`
-/// (see the module docs). The `.obj` comes last: once it is there, the rest is too.
+/// Writes `tex` as `stem.obj`, `stem.mtl` and its encoded pages `jpegs` as one
+/// `stem_seite_NN.jpg` per page into `dir` (see the module docs). The `.obj` comes last:
+/// once it is there, the rest is too.
 pub fn write_obj(
     dir: &Path,
     stem: &str,
     tex: &TexturedMesh,
-    jpeg_quality: u8,
+    jpegs: &PageJpegs,
 ) -> Result<(), MapError> {
+    jpegs.check(tex)?;
     let jpg = |p: usize| format!("{stem}_{}.jpg", page_name(p));
-    for (p, page) in tex.pages.iter().enumerate() {
-        let bytes = encode_jpeg(&page.image, jpeg_quality)?;
-        write_atomic(&dir.join(jpg(p)), |w| w.write_all(&bytes))?;
+    for p in 0..tex.pages.len() {
+        write_atomic(&dir.join(jpg(p)), |w| w.write_all(jpegs.page(p)))?;
     }
     write_atomic(&dir.join(format!("{stem}.mtl")), |w| {
         writeln!(
@@ -444,7 +487,7 @@ mod tests {
         let tex = floor_and_ceiling();
         let dir = temp_dir("roundtrip");
         let path = dir.join("oberflaeche.glb");
-        write_glb(&path, &tex, 90).unwrap();
+        write_glb(&path, &tex, &encode_pages(&tex, 90).unwrap()).unwrap();
         assert!(!dir.join("oberflaeche.glb.tmp").exists());
         let prims = read_glb(&path);
         assert_eq!(prims.len(), tex.pages.len());
@@ -474,7 +517,7 @@ mod tests {
         let tex = floor_and_ceiling();
         let dir = temp_dir("yup");
         let path = dir.join("a.glb");
-        write_glb(&path, &tex, 80).unwrap();
+        write_glb(&path, &tex, &encode_pages(&tex, 80).unwrap()).unwrap();
         let prims = read_glb(&path);
         let ys = |p: &Prim| -> Vec<f32> { p.0.iter().flatten().map(|v| v[1]).collect() };
         assert!(
@@ -495,7 +538,7 @@ mod tests {
     fn obj_files_complete() {
         let tex = floor_and_ceiling();
         let dir = temp_dir("obj");
-        write_obj(&dir, "oberflaeche", &tex, 90).unwrap();
+        write_obj(&dir, "oberflaeche", &tex, &encode_pages(&tex, 90).unwrap()).unwrap();
         let obj = fs::read_to_string(dir.join("oberflaeche.obj")).unwrap();
         let mtl = fs::read_to_string(dir.join("oberflaeche.mtl")).unwrap();
         assert!(obj.lines().any(|l| l == "mtllib oberflaeche.mtl"));
@@ -567,8 +610,9 @@ mod tests {
         let tex = floor_and_ceiling();
         let (a, b) = (temp_dir("same-a"), temp_dir("same-b"));
         for d in [&a, &b] {
-            write_glb(&d.join("x.glb"), &tex, 90).unwrap();
-            write_obj(d, "x", &tex, 90).unwrap();
+            let pages = encode_pages(&tex, 90).unwrap();
+            write_glb(&d.join("x.glb"), &tex, &pages).unwrap();
+            write_obj(d, "x", &tex, &pages).unwrap();
         }
         for name in [
             "x.glb",
@@ -584,5 +628,29 @@ mod tests {
             assert!(!x.is_empty(), "{name}");
             assert!(x == y, "{name} differs");
         }
+    }
+
+    #[test]
+    fn pages_are_encoded_once_for_glb_and_obj() {
+        let tex = floor_and_ceiling();
+        let pages = encode_pages(&tex, 90).unwrap();
+        assert_eq!(pages.len(), tex.pages.len());
+        let dir = temp_dir("once");
+        write_glb(&dir.join("x.glb"), &tex, &pages).unwrap();
+        write_obj(&dir, "x", &tex, &pages).unwrap();
+        // The jpg files and the glb's embedded images are the very same bytes.
+        let glb = fs::read(dir.join("x.glb")).unwrap();
+        for p in 0..tex.pages.len() {
+            let jpg = fs::read(dir.join(format!("x_seite_{p:02}.jpg"))).unwrap();
+            assert_eq!(jpg, pages.page(p));
+            assert!(glb.windows(jpg.len()).any(|w| w == jpg), "page {p}");
+        }
+        // Pages of another mesh are refused.
+        let mut fewer = tex.clone();
+        fewer.pages.pop();
+        let other = encode_pages(&fewer, 90).unwrap();
+        assert!(write_glb(&dir.join("y.glb"), &tex, &other).is_err());
+        assert!(write_obj(&dir, "y", &tex, &other).is_err());
+        assert!(!dir.join("y.glb").exists() && !dir.join("y.obj").exists());
     }
 }

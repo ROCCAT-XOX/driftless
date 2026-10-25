@@ -87,7 +87,8 @@ pub fn start_step(
                 .map(|(s, r)| (s.id.clone(), r.clone()))
                 .ok_or_else(|| unknown_run(dir))?;
             let scan = ready_scan(state, &scan_id)?;
-            let settings = state.map_settings.clone();
+            let mut settings = state.map_settings.clone();
+            settings.switches.gpu = state.gpu;
             settings.check().map_err(|e| e.to_string())?;
             // `Alles` skips colouring with a warning, as `driftless map` does
             if settings.step == MapStep::Color {
@@ -107,12 +108,13 @@ pub fn start_step(
                 .ok_or_else(|| text::unknown_map(dir))?;
             let scan = ready_scan(state, &scan_id)?;
             let settings = state.surface_settings.clone();
+            let gpu = state.gpu;
             settings.config.check().map_err(|e| e.to_string())?;
             if map.settings.is_none() {
                 return Err(text::SURFACE_NEEDS_MAP.into());
             }
             runner.start(text::STEP_SURFACE, move |p| {
-                let done = run_surface_job(&run, &scan, &map, &settings, p)?;
+                let done = run_surface_job(&run, &scan, &map, &settings, gpu, p)?;
                 Ok(JobOutput::SurfaceStep(Box::new(done)))
             })
         }

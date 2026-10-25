@@ -276,6 +276,7 @@ fn map_settings_edit_all_switches() {
                 vignetting: !d.vignetting,
                 voxel: d.voxel,
                 downscale: 1,
+                gpu: d.gpu,
             },
         }
     );

@@ -1,11 +1,13 @@
 //! The settings window ⚙: how the 3D view draws, for the whole program – colour mode, point
-//! size, point budget, camera („Bedienung“), layers.
+//! size, point budget, camera („Bedienung“), layers – and what maps and surfaces are computed on
+//! („Grafikkarte nutzen“).
 
 use super::steps::parse_decimal;
 use super::view3d::{color_modes, effective_color_mode};
 use super::{text, AppState, ViewSettings};
 use crate::camera::CameraMode;
 use crate::render::{ColorMode, PointSize};
+use driftless_gpu::GpuPref;
 use eframe::egui::{self, Context, Ui};
 
 /// Width of the window (points).
@@ -20,7 +22,11 @@ pub fn show(ctx: &Context, state: &mut AppState) {
         .collapsible(false)
         .resizable(false)
         .default_width(WIDTH)
-        .show(ctx, |ui| view_section(ui, state));
+        .show(ctx, |ui| {
+            view_section(ui, state);
+            ui.separator();
+            gpu_edit(ui, &mut state.gpu);
+        });
     // the × closes it; the button in the rail may have closed it meanwhile
     state.settings_window.open &= open;
 }
@@ -148,4 +154,14 @@ fn point_size_edit(ui: &mut Ui, view: &mut ViewSettings, map_point_m: f32) {
             }
         });
     }
+}
+
+/// „Grafikkarte nutzen“: Auto · An · Aus.
+fn gpu_edit(ui: &mut Ui, gpu: &mut GpuPref) {
+    ui.horizontal(|ui| {
+        ui.label(text::GPU).on_hover_text(text::GPU_HINT);
+        ui.selectable_value(gpu, GpuPref::Auto, text::GPU_AUTO);
+        ui.selectable_value(gpu, GpuPref::On, text::GPU_ON);
+        ui.selectable_value(gpu, GpuPref::Off, text::GPU_OFF);
+    });
 }

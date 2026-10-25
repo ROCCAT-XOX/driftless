@@ -87,13 +87,13 @@ impl PointGrid {
 
 /// A cloud point projected into an image.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Projection {
+pub struct Projection {
     /// Pixel coordinates in the image (pixel centres at integers).
-    pub(crate) uv: [f32; 2],
+    pub uv: [f32; 2],
     /// Distance from the camera centre (m).
-    pub(crate) range: f32,
+    pub range: f32,
     /// Angle from the optical axis (rad).
-    pub(crate) theta: f32,
+    pub theta: f32,
 }
 
 /// Projects world point `p` into `cam` (pose inverse `world_to_cam`); `None` beyond
@@ -195,17 +195,17 @@ impl DepthBuffer {
 
 /// A point an image sees.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Seen {
-    pub(crate) index: u32,
-    pub(crate) proj: Projection,
+pub struct Seen {
+    pub index: u32,
+    pub proj: Projection,
 }
 
 /// The points among `candidates` that `cam` at pose inverse `world_to_cam` sees: within
 /// `max_dist`, inside the image and at most the depth tolerance behind the depth buffer
 /// (cells of `zbuffer_scale` pixels, each point splatted with its neighbour spacing). In
-/// candidate order.
+/// candidate order. Public as the reference of the GPU path (`driftless-gpu`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn visible_points(
+pub fn visible_points(
     xyz: &[[f32; 3]],
     spacing: &[f32],
     candidates: &[u32],

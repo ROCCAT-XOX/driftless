@@ -19,6 +19,8 @@ bytemuck = { version = "1.25", features = ["derive"] }
 # Times of the history in local time.
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 driftless-io = { path = "../driftless-io" }
+# „Grafikkarte nutzen“ (`GpuPref`) in ⚙.
+driftless-gpu = { path = "../driftless-gpu" }
 # The settings of the surface (`SurfaceConfig`).
 driftless-map = { path = "../driftless-map" }
 driftless-slam = { path = "../driftless-slam" }

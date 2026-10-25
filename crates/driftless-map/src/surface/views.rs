@@ -90,21 +90,38 @@
 //! view's score counted at [`CARRIER_ALTERNATIVE`], then the earlier image; a view goes in
 //! only if it beats the last slot. [`filter_views`] then runs on the result as it stands.
 //!
-//! Exposure and white balance: every `k`-th face (at most [`EXPOSURE_FACES`]) also keeps the
-//! colour (bilinear, linear RGB, at its centroid) and the angle from the optical axis of its
-//! kept views; from these, [`crate::exposure::estimate_exposure`] fits the gains and the edge
-//! falloff as in colouring. Unlike colouring (which fits on [`ColorConfig::views_kept`] views
-//! per point, at most one per camera and [`ColorConfig::view_gap`]), the fit sees the
-//! [`SurfaceConfig::views_per_face`] best views by score.
+//! Exposure and white balance: every `k`-th face (at most [`EXPOSURE_FACES`] and
+//! [`crate::ExposureConfig::samples`]) also keeps the colour (bilinear, linear RGB, at its
+//! centroid) and the angle from the optical axis of [`SurfaceConfig::views_per_face`] of its
+//! views (not of the carrier); from these, [`crate::exposure::estimate_exposure`] fits the
+//! gains and the edge falloff as in colouring. The sample is chosen so that it does not hang
+//! on rounding: the GPU's scores differ from the CPU's in the last bits, and consecutive
+//! images of a face score nearly the same.
+//! - Which views a sample face keeps depends on the score only coarsely ([`sample_key`]): the
+//!   views of the highest half octaves of score (`⌊2 · log₂ score⌋`) are kept, and within a
+//!   half octave a hash of face and image decides (equal: the earlier image). By the exact
+//!   score, a ±1e-4 change of the scores swapped views at the last slot, and the gains of
+//!   single images moved by up to 4.7 % between CPU and GPU (black room, 2,145 images). By
+//!   the hash alone (no score), the fit also took grazing and far views, and the seams before
+//!   levelling got 6 % worse (black room `seam_step_before` 26.2 → 27.7).
+//! - There are at most as many sample faces as the fit takes, so it takes every one with views
+//!   from 2 images. With more, it took every `m / samples`-th of the `m` such faces, and one
+//!   face more or less with 2 views shifted the whole selection.
+//!
+//! Unlike colouring (which fits on [`ColorConfig::views_kept`] views per point, at most one
+//! per camera and [`ColorConfig::view_gap`]), the fit sees the
+//! [`SurfaceConfig::views_per_face`] best views by half octave of score.
 
 use super::{Mesh, SurfaceConfig};
 use crate::color::{
     frame_camera, keep_best, linear_table, quality_pass, sample_linear, srgb_value, ColorCamera,
-    ColorConfig, ImageSource, Status, View, SHARPNESS_DOWNSCALE,
+    ColorConfig, ImageRecord, ImageSource, Status, View, SHARPNESS_DOWNSCALE,
 };
+use crate::color_gpu::GpuStop;
 use crate::exposure::{estimate_exposure, sample_observations, Vignetting};
 use crate::visibility::{project_point, DepthBuffer, PointGrid};
 use crate::MapError;
+use driftless_gpu::GpuContext;
 use driftless_io::camera::Camera;
 use driftless_io::images::{for_each_image, Frame, ImageError, RgbImage};
 use driftless_io::progress::Progress;
@@ -122,7 +139,7 @@ pub const MAX_SUBDIVISIONS: usize = 32;
 /// Rounds of smoothing the normal for the score (face → vertices, area-weighted → face).
 pub const NORMAL_SMOOTH_ROUNDS: usize = 2;
 /// The smoothed normal's cosine counts as at least this (it can face away at thin parts).
-const SMOOTH_COS_MIN: f64 = 0.05;
+pub(crate) const SMOOTH_COS_MIN: f64 = 0.05;
 /// A view of a face whose centroid lies within this horizontal distance (m) of the camera …
 pub const CARRIER_RADIUS: f64 = 1.2;
 /// … and more than this far below it (m) may show the carrier of the device (see the module
@@ -160,7 +177,7 @@ pub const MAX_VIEWS_PER_FACE: usize = 32;
 /// [`FaceView::tag`] bit of a view that may show the carrier.
 const TAG_CARRIER: u8 = 0x80;
 /// [`FaceView::tag`] bits 0–6: the angle from the optical axis in steps of this (rad).
-const ANGLE_STEP: f32 = std::f32::consts::PI / 127.0;
+pub(crate) const ANGLE_STEP: f32 = std::f32::consts::PI / 127.0;
 /// Faces with at least this many views are checked for photo consistency (see the module
 /// docs): with fewer the median is no majority.
 pub const CONSISTENCY_MIN_VIEWS: usize = 3;
@@ -246,6 +263,42 @@ fn keep_best_view(slots: &mut [FaceView], v: FaceView) {
     }
 }
 
+/// lowbias32 (C. Wellons): a 32-bit integer hash; the GPU pass has the same.
+pub(crate) fn hash32(mut x: u32) -> u32 {
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb_352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846c_a68b);
+    x ^ (x >> 16)
+}
+
+/// Mantissa bits of √2: an `f32` at or above `2^e · √2` has at least these.
+const HALF_OCTAVE_MANTISSA: u32 = 0x3504f3;
+
+/// Weight of image `rank`'s view with `score` in exposure sample `slot` (see the module docs):
+/// the score's half octave (`⌊2 · log₂ score⌋`, from the bits, exact) as the exponent and a
+/// hash of sample and image as the mantissa. Higher half octaves first; within one, the hash
+/// decides, not the last bits of the score. A positive normal `f32`; 0 for a score ≤ 0.
+pub(crate) fn sample_key(slot: u32, rank: u32, score: f32) -> f32 {
+    if score.is_nan() || score <= 0.0 {
+        return 0.0;
+    }
+    let bits = score.to_bits();
+    let octave = ((bits >> 23) & 0xff) as i32 - 127;
+    let band = 2 * octave + i32::from(bits & 0x7f_ffff >= HALF_OCTAVE_MANTISSA);
+    // Exponent field 1 … 254: half octaves −126 … 127 (scores from about 2⁻⁶³ to 2⁶³).
+    let exponent = (band.clamp(-126, 127) + 127) as u32;
+    f32::from_bits(exponent << 23 | hash32(rank ^ hash32(slot)) >> 9)
+}
+
+/// Inserts image `v.rank`'s view into exposure sample `slot`'s views: [`keep_best`] by
+/// [`sample_key`] instead of the score, so that which views a sample keeps does not hang on
+/// the last bits of near-equal scores.
+fn keep_sample(slots: &mut [View], slot: usize, v: View) {
+    let weight = sample_key(slot as u32, v.rank, v.weight);
+    keep_best(slots, View { weight, ..v });
+}
+
 /// A used image.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UsedImage {
@@ -286,13 +339,13 @@ impl ViewTable {
 
 /// Per face: centroid, unit normal and longest edge; and the largest distance from a centroid
 /// to a corner.
-struct Faces {
-    centroid: Vec<[f32; 3]>,
-    normal: Vec<[f32; 3]>,
+pub(crate) struct Faces {
+    pub centroid: Vec<[f32; 3]>,
+    pub normal: Vec<[f32; 3]>,
     /// [`NORMAL_SMOOTH_ROUNDS`] rounds smoothed (for the score; zero where it cancels out).
-    smooth: Vec<[f32; 3]>,
-    longest: Vec<f32>,
-    reach: f64,
+    pub smooth: Vec<[f32; 3]>,
+    pub longest: Vec<f32>,
+    pub reach: f64,
 }
 
 impl Faces {
@@ -544,8 +597,9 @@ pub(crate) fn mask_views(
     let lin = linear_table();
     let world_to_cam: Vec<Isometry3<f64>> =
         images.iter().map(|i| i.world_from_cam.inverse()).collect();
-    // The cell of a view: camera · gx · gy + row · gx + column.
-    let cell = |f: usize, v: &FaceView| -> Option<usize> {
+    let per_cam = gx * gy;
+    // The camera of a view and its cell in the camera's image (row · gx + column).
+    let cell = |f: usize, v: &FaceView| -> Option<(usize, usize)> {
         let u = &images[v.image as usize];
         let cam = &cams.get(u.camera)?.camera;
         let pc = world_to_cam[v.image as usize]
@@ -553,20 +607,20 @@ pub(crate) fn mask_views(
         let uv = cam.project(&pc.coords)?;
         let x = ((uv[0] / f64::from(cam.width)) * gx as f64).clamp(0.0, gx as f64 - 1.0) as usize;
         let y = ((uv[1] / f64::from(cam.height)) * gy as f64).clamp(0.0, gy as f64 - 1.0) as usize;
-        Some((u.camera * gy + y) * gx + x)
+        Some((u.camera, y * gx + x))
     };
-    let cells = cams.len() * gx * gy;
     let n_images = images.len();
-    // Learn: per cell and image the judged views and those far from their face's median, in a
-    // fixed number of face ranges (one counter table each, summed in order).
+    // Learn: per image and cell of its camera the judged views and those far from their
+    // face's median, in a fixed number of face ranges (one counter table each, summed in
+    // order).
     let faces = per_face.len() / k.max(1);
     let ranges: Vec<std::ops::Range<usize>> = (0..MASK_RANGES)
         .map(|r| faces * r / MASK_RANGES..faces * (r + 1) / MASK_RANGES)
         .collect();
-    let tables: Vec<Vec<[u32; 2]>> = ranges
+    let tables: Vec<MaskCounts> = ranges
         .par_iter()
         .map(|range| {
-            let mut acc = vec![[0u32; 2]; cells * n_images];
+            let mut acc = MaskCounts::new(n_images);
             for f in range.clone() {
                 let slots = &per_face[f * k..(f + 1) * k];
                 let n = slots.iter().take_while(|s| s.score > 0.0).count();
@@ -579,8 +633,8 @@ pub(crate) fn mask_views(
                 }
                 let median = median_of(&colours[..n]);
                 for (v, c) in slots[..n].iter().zip(&colours) {
-                    if let Some(i) = cell(f, v) {
-                        let e = &mut acc[i * n_images + v.image as usize];
+                    if let Some((_, i)) = cell(f, v) {
+                        let e = acc.at(v.image as usize, i);
                         e[0] += 1;
                         e[1] += u32::from(off(c, &median) > PHOTO_TOLERANCE);
                     }
@@ -589,23 +643,34 @@ pub(crate) fn mask_views(
             acc
         })
         .collect();
-    let mut counts = vec![[0u32; 2]; cells * n_images];
-    for t in tables {
-        for (x, y) in counts.iter_mut().zip(t) {
-            x[0] += y[0];
-            x[1] += y[1];
+    let mut counts = MaskCounts::new(n_images);
+    for t in &tables {
+        counts.add(t);
+    }
+    drop(tables);
+    // Per camera and cell: the images with a judged view there and those whose views there
+    // mostly disagree (a frame counts once, however many faces it shows in the cell).
+    let mut by_camera: Vec<Vec<usize>> = vec![Vec::new(); cams.len()];
+    for (i, u) in images.iter().enumerate() {
+        if let Some(list) = by_camera.get_mut(u.camera) {
+            list.push(i);
         }
     }
-    // Per cell: the images with a judged view there and those whose views there mostly
-    // disagree (a frame counts once, however many faces it shows in the cell).
-    let stats: Vec<MaskCell> = (0..cells)
+    let stats: Vec<MaskCell> = (0..cams.len() * per_cam)
         .map(|c| {
-            let row = &counts[c * n_images..(c + 1) * n_images];
-            MaskCell {
-                views: row.iter().map(|e| u64::from(e[0])).sum(),
-                images: row.iter().filter(|e| e[0] > 0).count(),
-                disagree: row.iter().filter(|e| e[0] > 0 && 2 * e[1] > e[0]).count(),
+            let (cam, cell) = (c / per_cam, c % per_cam);
+            let mut s = MaskCell {
+                views: 0,
+                images: 0,
+                disagree: 0,
+            };
+            for &i in &by_camera[cam] {
+                let e = counts.image(i)[cell];
+                s.views += u64::from(e[0]);
+                s.images += usize::from(e[0] > 0);
+                s.disagree += usize::from(e[0] > 0 && 2 * e[1] > e[0]);
             }
+            s
         })
         .collect();
     drop(counts);
@@ -632,7 +697,7 @@ pub(crate) fn mask_views(
             let n = slots.iter().take_while(|s| s.score > 0.0).count();
             let mut is_masked = [false; MAX_VIEWS_PER_FACE];
             for (m, v) in is_masked.iter_mut().zip(&slots[..n]) {
-                *m = cell(f, v).is_some_and(|i| masked[i]);
+                *m = cell(f, v).is_some_and(|(cam, i)| masked[cam * per_cam + i]);
             }
             let best = |want: bool| {
                 (0..n)
@@ -664,6 +729,43 @@ pub(crate) struct MaskResult {
     pub masked: usize,
     /// Cells that met the rule; more than [`MASK_MAX_CELLS`] and the camera's mask is not used.
     pub would_mask: usize,
+}
+
+/// Per image and cell of its camera's image ([`MASK_CELLS`]): the judged views and those
+/// far from their face's median.
+struct MaskCounts {
+    counts: Vec<[u32; 2]>,
+}
+
+impl MaskCounts {
+    const CELLS: usize = MASK_CELLS[0] * MASK_CELLS[1];
+
+    fn new(images: usize) -> MaskCounts {
+        MaskCounts {
+            counts: vec![[0; 2]; images * Self::CELLS],
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.counts.len()
+    }
+
+    fn at(&mut self, image: usize, cell: usize) -> &mut [u32; 2] {
+        &mut self.counts[image * Self::CELLS + cell]
+    }
+
+    /// The cells of one image.
+    fn image(&self, image: usize) -> &[[u32; 2]] {
+        &self.counts[image * Self::CELLS..(image + 1) * Self::CELLS]
+    }
+
+    fn add(&mut self, other: &MaskCounts) {
+        for (x, y) in self.counts.iter_mut().zip(&other.counts) {
+            x[0] += y[0];
+            x[1] += y[1];
+        }
+    }
 }
 
 /// The statistics of one cell of a camera's image.
@@ -803,12 +905,51 @@ pub(crate) fn filter_views(
 /// [`MapError::Cancelled`]. Same input, same result.
 ///
 /// Fails if `cfg` is invalid, two cameras share a name or the images cannot be read.
+#[cfg(test)]
 pub(crate) fn collect_views(
     mesh: &Mesh,
     src: &TextureSource,
     cfg: &SurfaceConfig,
     progress: &Progress,
 ) -> Result<ViewTable, MapError> {
+    collect_views_with(mesh, src, cfg, progress, None)
+}
+
+/// [`collect_views`], with `gpu` the pass over the images on the GPU (see
+/// [`super::views_gpu`]): the same views up to rounding.
+#[cfg(test)]
+pub(crate) fn collect_views_with(
+    mesh: &Mesh,
+    src: &TextureSource,
+    cfg: &SurfaceConfig,
+    progress: &Progress,
+    gpu: Option<&GpuContext>,
+) -> Result<ViewTable, MapError> {
+    collect_views_on(mesh, src, cfg, progress, gpu.map(|g| (g, None))).map(|(t, _)| t)
+}
+
+/// What [`collect_views_on`] reports besides the views.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ViewsInfo {
+    /// The GPU was given but could not start (`--gpu auto`): the CPU looked, for this reason
+    /// (German).
+    pub gpu_fallback: Option<String>,
+    /// Seconds of the quality pass and of the pass over the images (wall clock).
+    pub quality_seconds: f64,
+    pub views_seconds: f64,
+    /// Of `views_seconds`, how long the GPU waited for decoded images.
+    pub decode_wait_seconds: f64,
+}
+
+/// [`collect_views_with`] with the GPU's batch size (faces per batch; `None`: as large as the
+/// device allows), and what the run reports.
+pub(crate) fn collect_views_on(
+    mesh: &Mesh,
+    src: &TextureSource,
+    cfg: &SurfaceConfig,
+    progress: &Progress,
+    gpu: Option<(&GpuContext, Option<usize>)>,
+) -> Result<(ViewTable, ViewsInfo), MapError> {
     if progress.is_cancelled() {
         return Err(MapError::Cancelled);
     }
@@ -822,7 +963,11 @@ pub(crate) fn collect_views(
             )));
         }
     }
+    let mut info = ViewsInfo::default();
+    let clock = std::time::Instant::now();
     let (records, _, _) = quality_pass(&src.images, poses, cams, ccfg, progress)?;
+    info.quality_seconds = clock.elapsed().as_secs_f64();
+    let clock = std::time::Instant::now();
 
     // The used images by rank, with their world poses.
     let mut images: Vec<Option<UsedImage>> = Vec::new();
@@ -848,16 +993,16 @@ pub(crate) fn collect_views(
 
     let k = cfg.views_per_face;
     let face_count = mesh.indices.len();
-    let mut per_face = vec![FaceView::EMPTY; face_count * k];
-    // Exposure samples: every `stride`-th face, `slot = face / stride`.
-    let stride = face_count.div_ceil(EXPOSURE_FACES).max(1);
+    // Exposure samples: every `stride`-th face, `slot = face / stride`; at most as many as the
+    // fit takes, so that it takes every one with 2 views (see the module docs).
+    let most = EXPOSURE_FACES.min(ccfg.exposure.samples).max(1);
+    let stride = face_count.div_ceil(most).max(1);
     let sample_faces = if ccfg.exposure.samples > 0 {
         face_count.div_ceil(stride)
     } else {
         0
     };
     let empty = View::new(0.0, u32::MAX, [0.0; 3], 0.0);
-    let mut samples = vec![empty; sample_faces * k];
 
     let last_used = records
         .iter()
@@ -867,88 +1012,45 @@ pub(crate) fn collect_views(
         _ => 0,
     };
     progress.phase("Ansichten suchen", Some(walked));
-    if let (Some(last_used), 1..) = (last_used, face_count) {
+    let (mut per_face, samples) = if let (Some(last_used), 1..) = (last_used, face_count) {
         let faces = Faces::new(mesh);
-        let grid = PointGrid::new(&faces.centroid);
-        let lin = linear_table();
-        let geometry: Vec<Camera> = cams
-            .iter()
-            .map(|c| c.camera.downscaled(ccfg.downscale))
-            .collect();
-        let sampled = |f: usize| sample_faces > 0 && f.is_multiple_of(stride);
-        let mut index = 0usize;
-        let mut failure: Option<MapError> = None;
-        let mut one = |frame: Result<Frame, ImageError>| {
-            let i = index;
-            index += 1;
-            let Some(&crate::color::ImageRecord {
-                camera,
-                stamp,
-                status:
-                    Status::Used {
-                        rank,
-                        sharpness_norm,
-                    },
-            }) = records.get(i)
-            else {
-                return i < last_used;
-            };
-            let frame = match frame {
-                Ok(f)
-                    if f.stamp == stamp
-                        && frame_camera(&f, cams, SHARPNESS_DOWNSCALE) == Some(camera) =>
-                {
-                    f
-                }
-                _ => {
-                    failure = Some(MapError::Images(
-                        "Bilder haben sich zwischen zwei Durchläufen geändert".into(),
-                    ));
-                    return false;
-                }
-            };
-            let shot = Shot {
-                geometry: &geometry[camera],
-                full: &cams[camera].camera,
-                world_from_cam: images[rank as usize].world_from_cam,
-                rank,
-                sharpness_norm,
-                rgb: &frame.rgb,
-                min_texel: cfg.min_texel,
-            };
-            for (f, view, colour) in image_views(mesh, &faces, &grid, &shot, ccfg, sampled, &lin) {
-                let f = f as usize;
-                keep_best_view(&mut per_face[f * k..(f + 1) * k], view);
-                if let Some(v) = colour {
-                    let s = f / stride;
-                    keep_best(&mut samples[s * k..(s + 1) * k], v);
-                }
-            }
-            i < last_used
+        let pass = Pass {
+            mesh,
+            faces: &faces,
+            src,
+            cfg,
+            records: &records,
+            images: &images,
+            last_used,
+            stride,
+            sample_faces,
         };
-        let mut cancelled = false;
-        let read = for_each_image(
-            &src.images.bags,
-            &src.images.topics,
-            SHARPNESS_DOWNSCALE,
-            |frame| {
-                if progress.is_cancelled() {
-                    cancelled = true;
-                    return false;
+        let on_gpu = match gpu {
+            None => None,
+            Some((ctx, batch)) => match super::views_gpu::gpu_views(&pass, ctx, batch, progress) {
+                Ok((views, wait)) => {
+                    info.decode_wait_seconds = wait;
+                    Some(views)
                 }
-                let go = one(frame);
-                progress.advance(1);
-                go
+                Err(GpuStop::Fail(e)) => return Err(e),
+                Err(GpuStop::Fallback(why)) => {
+                    progress.info(format!("Ansichten auf der CPU: {why}"));
+                    info.gpu_fallback = Some(why);
+                    None
+                }
             },
-        );
-        if cancelled {
-            return Err(MapError::Cancelled);
+        };
+        match on_gpu {
+            Some(views) => views,
+            None => cpu_views(&pass, progress)?,
         }
-        read.map_err(|e| MapError::Images(e.to_string()))?;
-        if let Some(e) = failure {
-            return Err(e);
-        }
-    }
+    } else {
+        (
+            vec![FaceView::EMPTY; face_count * k],
+            vec![empty; sample_faces * k],
+        )
+    };
+    info.views_seconds = clock.elapsed().as_secs_f64();
 
     // Exposure and white balance, fitted on the sample faces' kept views (as `colorize`).
     let cameras: Vec<usize> = images.iter().map(|i| i.camera).collect();
@@ -996,12 +1098,135 @@ pub(crate) fn collect_views(
         }
     }
     filter_views(&mut per_face, k, &images, &gains, &vignetting);
-    Ok(ViewTable {
+    Ok((
+        ViewTable {
+            images,
+            per_face,
+            gains,
+            vignetting,
+        },
+        info,
+    ))
+}
+
+/// The pass over the images: what [`cpu_views`] and the GPU need.
+pub(crate) struct Pass<'a> {
+    pub mesh: &'a Mesh,
+    pub faces: &'a Faces,
+    pub src: &'a TextureSource,
+    pub cfg: &'a SurfaceConfig,
+    pub records: &'a [ImageRecord],
+    /// The used images by rank.
+    pub images: &'a [UsedImage],
+    /// Stream index of the last used image.
+    pub last_used: usize,
+    /// Every `stride`-th face keeps exposure samples (`sample_faces` of them; none if 0).
+    pub stride: usize,
+    pub sample_faces: usize,
+}
+
+/// The views per face ([`SurfaceConfig::views_per_face`] slots each, as [`keep_best_view`]
+/// fills them) and the exposure samples, on the CPU.
+fn cpu_views(pass: &Pass, progress: &Progress) -> Result<(Vec<FaceView>, Vec<View>), MapError> {
+    let Pass {
+        mesh,
+        faces,
+        src,
+        cfg,
+        records,
         images,
-        per_face,
-        gains,
-        vignetting,
-    })
+        last_used,
+        stride,
+        sample_faces,
+    } = *pass;
+    let (cams, ccfg) = (&src.cams, &cfg.color);
+    let k = cfg.views_per_face;
+    let face_count = mesh.indices.len();
+    let mut per_face = vec![FaceView::EMPTY; face_count * k];
+    let empty = View::new(0.0, u32::MAX, [0.0; 3], 0.0);
+    let mut samples = vec![empty; sample_faces * k];
+    {
+        let grid = PointGrid::new(&faces.centroid);
+        let lin = linear_table();
+        let geometry: Vec<Camera> = cams
+            .iter()
+            .map(|c| c.camera.downscaled(ccfg.downscale))
+            .collect();
+        let sampled = |f: usize| sample_faces > 0 && f.is_multiple_of(stride);
+        let mut index = 0usize;
+        let mut failure: Option<MapError> = None;
+        let mut one = |frame: Result<Frame, ImageError>| {
+            let i = index;
+            index += 1;
+            let Some(&ImageRecord {
+                camera,
+                stamp,
+                status:
+                    Status::Used {
+                        rank,
+                        sharpness_norm,
+                    },
+            }) = records.get(i)
+            else {
+                return i < last_used;
+            };
+            let frame = match frame {
+                Ok(f)
+                    if f.stamp == stamp
+                        && frame_camera(&f, cams, SHARPNESS_DOWNSCALE) == Some(camera) =>
+                {
+                    f
+                }
+                _ => {
+                    failure = Some(MapError::Images(
+                        "Bilder haben sich zwischen zwei Durchläufen geändert".into(),
+                    ));
+                    return false;
+                }
+            };
+            let shot = Shot {
+                geometry: &geometry[camera],
+                full: &cams[camera].camera,
+                world_from_cam: images[rank as usize].world_from_cam,
+                rank,
+                sharpness_norm,
+                rgb: &frame.rgb,
+                min_texel: cfg.min_texel,
+            };
+            for (f, view, colour) in image_views(mesh, faces, &grid, &shot, ccfg, sampled, &lin) {
+                let f = f as usize;
+                keep_best_view(&mut per_face[f * k..(f + 1) * k], view);
+                if let Some(v) = colour {
+                    let s = f / stride;
+                    keep_sample(&mut samples[s * k..(s + 1) * k], s, v);
+                }
+            }
+            i < last_used
+        };
+        let mut cancelled = false;
+        let read = for_each_image(
+            &src.images.bags,
+            &src.images.topics,
+            SHARPNESS_DOWNSCALE,
+            |frame| {
+                if progress.is_cancelled() {
+                    cancelled = true;
+                    return false;
+                }
+                let go = one(frame);
+                progress.advance(1);
+                go
+            },
+        );
+        if cancelled {
+            return Err(MapError::Cancelled);
+        }
+        read.map_err(|e| MapError::Images(e.to_string()))?;
+        if let Some(e) = failure {
+            return Err(e);
+        }
+    }
+    Ok((per_face, samples))
 }
 
 #[cfg(test)]
@@ -1013,10 +1238,90 @@ mod tests {
     use super::super::testutil::{blur, centroid, face_near, painted_mesh, Steps};
     use super::*;
     use crate::{colorize, ColorConfig, ExposureConfig};
+    use driftless_gpu::GpuContext;
     use nalgebra::{UnitQuaternion, Vector3};
 
     /// Square size of the test meshes (m).
     const STEP: f64 = 0.1;
+
+    /// The exposure gains from sample slots filled as `cpu_views` fills them: 3,000 points,
+    /// each seen by 16 consecutive of 30 images (two cameras) with nearly equal scores, so that
+    /// the 8 best by score depend on rounding. Colours: albedo × the image's gain × ±5 % noise.
+    fn sampled_gains(perturb: f32) -> Vec<[f32; 3]> {
+        let (images, points, seen, k) = (30u32, 3000usize, 16u32, 8usize);
+        let mix = |a: u64| {
+            let h = a.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            ((h ^ (h >> 29)) >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let empty = View::new(0.0, u32::MAX, [0.0; 3], 0.0);
+        let mut slots = vec![empty; points * k];
+        for rank in 0..images {
+            let gain = 0.8 + 0.45 * mix(u64::from(rank) + 7);
+            for j in 0..points {
+                let first = (j as u32 * 7) % (images - seen);
+                if !(first..first + seen).contains(&rank) {
+                    continue;
+                }
+                let at = (j as u64) << 8 | u64::from(rank);
+                let albedo = 0.1 + 0.5 * mix(j as u64 * 3 + 1);
+                let rgb = [0.0, 1.0, 2.0].map(|c| {
+                    albedo * gain * (0.95 + 0.1 * mix(at * 4 + c as u64)) * (1.0 - 0.05 * c)
+                });
+                // Near-equal scores: the order among them is set by the last bits.
+                let score = 100.0 * (1.0 + 1e-6 * mix(at * 4 + 3));
+                let sign = if mix(at * 5 + 11) < 0.5 { -1.0 } else { 1.0 };
+                let score = score * (1.0 + sign * perturb);
+                let theta = 0.1 + 0.03 * rank as f32;
+                let v = View::new(score, rank, rgb, theta);
+                keep_sample(&mut slots[j * k..(j + 1) * k], j, v);
+            }
+        }
+        let cameras = (0..images as usize).map(|i| i % 2).collect();
+        let obs = sample_observations(&slots, k, cameras, ExposureConfig::default().samples);
+        estimate_exposure(&obs, &ExposureConfig::default()).0
+    }
+
+    #[test]
+    fn exposure_sample_prefers_higher_half_octaves() {
+        // Half octaves: [64, 90.5), [90.5, 128), [128, 181) …
+        let key = |rank, score| sample_key(3, rank, score);
+        assert!(key(0, 91.0) > key(1, 90.0) && key(1, 91.0) > key(0, 90.0));
+        assert!(key(0, 130.0) > key(1, 127.0) && key(1, 130.0) > key(0, 127.0));
+        // Within one, the hash decides: one order for the pair, whatever the scores.
+        let (a, b) = (key(0, 100.0), key(1, 100.0));
+        assert_ne!(a, b);
+        assert_eq!(key(0, 95.0) > key(1, 120.0), a > b);
+        assert_eq!(key(0, 0.0), 0.0);
+        assert!(key(0, 1e-30) > 0.0 && key(0, 1e30).is_finite());
+    }
+
+    #[test]
+    fn exposure_sample_ignores_near_tie_scores() {
+        let plain = sampled_gains(0.0);
+        assert!(
+            plain.iter().any(|g| (g[0] - 1.0).abs() > 0.02),
+            "the fit sees the gains: {plain:?}"
+        );
+        // Scores off by ±1e-4 (relative): the same samples, the same gains.
+        assert_eq!(sampled_gains(1e-4), plain);
+        assert_eq!(sampled_gains(-1e-4), plain);
+    }
+
+    #[test]
+    fn mask_counts_hold_one_row_of_cells_per_image() {
+        let cells = MASK_CELLS[0] * MASK_CELLS[1];
+        // Seven images: the table does not grow with the number of cameras.
+        let mut counts = MaskCounts::new(7);
+        assert_eq!(counts.len(), 7 * cells);
+        counts.at(6, cells - 1)[0] += 3;
+        counts.at(0, 0)[1] += 1;
+        assert_eq!(counts.image(6)[cells - 1], [3, 0]);
+        assert_eq!(counts.image(0)[0], [0, 1]);
+        let mut other = MaskCounts::new(7);
+        other.at(6, cells - 1)[0] += 2;
+        counts.add(&other);
+        assert_eq!(counts.image(6)[cells - 1], [5, 0]);
+    }
 
     fn source(images: &ImageSource, poses: &[Pose], cams: &[ColorCamera]) -> TextureSource {
         TextureSource {
@@ -1142,6 +1447,19 @@ mod tests {
 
     #[test]
     fn partly_hidden_face_rejected() {
+        partly_hidden_case(None);
+    }
+
+    #[test]
+    fn partly_hidden_face_rejected_gpu() {
+        let Some(ctx) = test_gpu() else {
+            eprintln!("übersprungen: kein Grafikadapter vorhanden");
+            return;
+        };
+        partly_hidden_case(Some(&ctx));
+    }
+
+    fn partly_hidden_case(gpu: Option<&GpuContext>) {
         // A pillar between the left camera at the origin and the +y wall hides the wall for
         // x within about −0.29 … 0.22 m; the depth buffer widens that by its splats and the
         // silhouette rule to about ±0.5 m. One extra wall face has a corner deep in the shadow
@@ -1167,7 +1485,7 @@ mod tests {
         let images = write_bag("views-partly", &painted, &traj, &cams, &[shot(0, T0 + 1.0)]);
         let src = source(&images, &poses(&traj, 2.0), &cams);
         let cfg = SurfaceConfig::default();
-        let table = collect_views(&mesh, &src, &cfg, &Progress::new()).unwrap();
+        let table = collect_views_with(&mesh, &src, &cfg, &Progress::new(), gpu).unwrap();
         assert_eq!(table.images.len(), 1);
         let k = cfg.views_per_face;
         // The centroid alone is in view: the grid face around it is seen …
@@ -1181,6 +1499,19 @@ mod tests {
 
     #[test]
     fn simplified_wall_gets_views() {
+        simplified_wall_case(None);
+    }
+
+    #[test]
+    fn simplified_wall_gets_views_gpu() {
+        let Some(ctx) = test_gpu() else {
+            eprintln!("übersprungen: kein Grafikadapter vorhanden");
+            return;
+        };
+        simplified_wall_case(Some(&ctx));
+    }
+
+    fn simplified_wall_case(gpu: Option<&GpuContext>) {
         // A 10 × 2 m stretch of the +y wall as 2 triangles, and the left camera walking along
         // it 1.5 m away. Only views within 50° of the optical axis count (a stand-in for a wall
         // too long for one image): the big triangles fit into no image, their split pieces do.
@@ -1217,7 +1548,7 @@ mod tests {
         let mut cfg = SurfaceConfig::default();
         cfg.color.rim_theta = 50f64.to_radians();
         let seen = |mesh: &Mesh| {
-            let table = collect_views(mesh, &src, &cfg, &Progress::new()).unwrap();
+            let table = collect_views_with(mesh, &src, &cfg, &Progress::new(), gpu).unwrap();
             assert_eq!(table.images.len(), xs.len());
             (0..mesh.indices.len())
                 .filter(|&f| views(&table, cfg.views_per_face, f)[0].score > 0.0)
@@ -1918,6 +2249,187 @@ mod tests {
             let r = collect_views(&mesh, &src, &cfg, &p);
             assert!(matches!(r, Err(MapError::Cancelled)), "{phase}: {r:?}");
             assert_eq!(p.snapshot().phase, phase);
+        }
+    }
+
+    /// A GPU for the tests that fails instead of falling back to the CPU (else a broken
+    /// kernel would pass unnoticed).
+    fn test_gpu() -> Option<GpuContext> {
+        GpuContext::new_for_tests().map(|c| c.with_fallback(false))
+    }
+
+    /// `mesh` with every vertex moved by up to ±1 cm (normals off by up to about 20°, as on
+    /// real meshes).
+    fn jittered(mut mesh: Mesh) -> Mesh {
+        for (i, p) in mesh.positions.iter_mut().enumerate() {
+            for (k, x) in p.iter_mut().enumerate() {
+                let mut h = (i as u64 * 3 + k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                h ^= h >> 29;
+                *x += ((h >> 11) as f64 / (1u64 << 53) as f64 - 0.5) as f32 * 0.02;
+            }
+        }
+        mesh
+    }
+
+    /// How far the views of `gpu` are from those of `cpu`: (faces with a view in either,
+    /// faces whose best view is the same image, of those the ones whose score differs by more
+    /// than 1 %, largest relative score difference of the same best view, and the ones whose
+    /// colour differs by more than one level in a channel).
+    fn agreement(cpu: &ViewTable, gpu: &ViewTable, k: usize) -> (usize, usize, usize, f32, usize) {
+        assert_eq!(cpu.images, gpu.images);
+        assert_eq!(cpu.per_face.len(), gpu.per_face.len());
+        let (mut seen, mut same, mut off, mut worst, mut tint) = (0, 0, 0, 0.0f32, 0);
+        for (c, g) in cpu.per_face.chunks(k).zip(gpu.per_face.chunks(k)) {
+            if c[0].score == 0.0 && g[0].score == 0.0 {
+                continue;
+            }
+            seen += 1;
+            if c[0].score > 0.0 && c[0].image == g[0].image {
+                same += 1;
+                let d = (g[0].score - c[0].score).abs() / c[0].score;
+                worst = worst.max(d);
+                off += usize::from(d > 0.01);
+                tint += usize::from((0..3).any(|ch| c[0].colour[ch].abs_diff(g[0].colour[ch]) > 1));
+            }
+        }
+        (seen, same, off, worst, tint)
+    }
+
+    #[test]
+    fn views_gpu_match_cpu() {
+        let Some(ctx) = test_gpu() else {
+            eprintln!("übersprungen: kein Grafikadapter vorhanden");
+            return;
+        };
+        // The rendered walk (both cameras): the room as 10 cm squares, and as 5 cm squares
+        // with jittered corners (smoothed normals matter).
+        let (painted, images, poses, cams) = walk_data();
+        let src = source(images, poses, cams);
+        let cfg = SurfaceConfig::default();
+        let k = cfg.views_per_face;
+        for mesh in [
+            painted_mesh(painted, STEP),
+            jittered(painted_mesh(painted, 0.05)),
+        ] {
+            let cpu = collect_views(&mesh, &src, &cfg, &Progress::new()).unwrap();
+            let (gpu, info) =
+                collect_views_on(&mesh, &src, &cfg, &Progress::new(), Some((&ctx, None))).unwrap();
+            assert_eq!(info.gpu_fallback, None);
+            let (seen, same, off, worst, tint) = agreement(&cpu, &gpu, k);
+            println!(
+                "{} faces: {seen} with views, best view the same for {same}, score off > 1 % \
+                 for {off} (at most {:.4} %), colour off > 1 level for {tint}",
+                mesh.indices.len(),
+                100.0 * worst
+            );
+            assert!(seen > mesh.indices.len() / 4, "{seen}");
+            assert!(same * 100 >= seen * 99, "{same} of {seen}");
+            assert!(off * 100 <= same, "{off} of {same}");
+            assert!(tint * 100 <= same, "{tint} of {same}");
+            // The exposure comes from the same samples.
+            let gain_off = cpu
+                .gains
+                .iter()
+                .zip(&gpu.gains)
+                .flat_map(|(c, g)| (0..3).map(move |ch| (c[ch] / g[ch] - 1.0).abs()))
+                .fold(0.0f32, f32::max);
+            println!(
+                "gains: largest relative difference {:.4} %",
+                100.0 * gain_off
+            );
+            for (c, g) in cpu.gains.iter().zip(&gpu.gains) {
+                for ch in 0..3 {
+                    assert!((c[ch] / g[ch] - 1.0).abs() < 0.001, "{c:?} vs {g:?}");
+                }
+            }
+            // Same device, same result.
+            let again = collect_views_with(&mesh, &src, &cfg, &Progress::new(), Some(&ctx));
+            assert_eq!(again.unwrap(), gpu);
+        }
+    }
+
+    #[test]
+    fn gpu_views_in_batches_match_one_batch() {
+        let Some(ctx) = test_gpu() else {
+            eprintln!("übersprungen: kein Grafikadapter vorhanden");
+            return;
+        };
+        let (painted, images, poses, cams) = walk_data();
+        let src = source(images, poses, cams);
+        let cfg = SurfaceConfig::default();
+        let mesh = painted_mesh(painted, STEP);
+        let run = |batch: Option<usize>| {
+            collect_views_on(&mesh, &src, &cfg, &Progress::new(), Some((&ctx, batch)))
+                .unwrap()
+                .0
+        };
+        let one = run(None);
+        let many = run(Some(777));
+        assert!(mesh.indices.len() > 3 * 777, "{}", mesh.indices.len());
+        assert_eq!(one, many);
+    }
+
+    #[test]
+    fn cancel_during_gpu_views() {
+        let Some(ctx) = test_gpu() else {
+            eprintln!("übersprungen: kein Grafikadapter vorhanden");
+            return;
+        };
+        let (painted, images, poses, cams) = walk_data();
+        let src = source(images, poses, cams);
+        let cfg = SurfaceConfig::default();
+        let mesh = painted_mesh(painted, STEP);
+        let p = Progress::new();
+        let q = p.clone();
+        let p = p.with_observer(move |s| {
+            if s.phase == "Ansichten suchen" && s.done == 2 {
+                q.cancel();
+            }
+        });
+        let r = collect_views_with(&mesh, &src, &cfg, &p, Some(&ctx));
+        assert!(matches!(r, Err(MapError::Cancelled)), "{r:?}");
+        let s = p.snapshot();
+        assert_eq!(s.phase, "Ansichten suchen");
+        assert_eq!(s.done, 2);
+    }
+
+    #[test]
+    fn gpu_budget_falls_back_or_fails() {
+        let Some(ctx) = test_gpu() else {
+            eprintln!("übersprungen: kein Grafikadapter vorhanden");
+            return;
+        };
+        let (painted, images, poses, cams) = walk_data();
+        let src = source(images, poses, cams);
+        let cfg = SurfaceConfig::default();
+        let mesh = painted_mesh(painted, STEP);
+        let cpu = collect_views(&mesh, &src, &cfg, &Progress::new()).unwrap();
+        // `auto`: the CPU, with the reason.
+        let small = ctx.with_budget(1000).with_fallback(true);
+        let notes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = notes.clone();
+        let p = Progress::with_log(move |l| {
+            if let driftless_io::progress::LogLine::Info(s) = l {
+                log.lock().unwrap().push(s.clone());
+            }
+        });
+        let (table, info) = collect_views_on(&mesh, &src, &cfg, &p, Some((&small, None))).unwrap();
+        assert_eq!(table, cpu);
+        let why = info.gpu_fallback.expect("fallback reason");
+        assert!(why.contains("Grafikspeicher"), "{why}");
+        let notes = notes.lock().unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with("Ansichten auf der CPU:")),
+            "{notes:?}"
+        );
+        // `an`: an error in German.
+        let strict = small.with_fallback(false);
+        let r = collect_views_with(&mesh, &src, &cfg, &Progress::new(), Some(&strict));
+        match r {
+            Err(MapError::Gpu(e)) => assert!(e.contains("Grafikspeicher"), "{e}"),
+            other => panic!("{other:?}"),
         }
     }
 }

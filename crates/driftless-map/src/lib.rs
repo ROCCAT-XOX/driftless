@@ -17,6 +17,7 @@ extern crate self as driftless_map;
 mod clean;
 mod cloud;
 mod color;
+mod color_gpu;
 mod dense;
 mod export;
 mod exposure;
@@ -31,7 +32,10 @@ pub use clean::{
     clean, clean_with, find_ghosts, find_outliers, CleanConfig, CleanStats, RemovalReason,
 };
 pub use cloud::Cloud;
-pub use color::{colorize, colorize_with, ColorCamera, ColorConfig, ColorStats, ImageSource};
+pub use color::{
+    colorize, colorize_gpu_batched, colorize_with, ColorCamera, ColorConfig, ColorStats,
+    ImageSource,
+};
 pub use dense::{build_dense, DenseConfig, DenseStats, RaySource};
 pub use export::{write_las, write_ply, write_removed_las, LAS_SCALE};
 pub use exposure::{
@@ -71,6 +75,9 @@ pub enum MapError {
     },
     #[error("{path}: {source}")]
     Las { path: String, source: las::Error },
+    /// The GPU failed (German, from `driftless_gpu::GpuRunError`).
+    #[error("{0}")]
+    Gpu(String),
     /// The step was cancelled through its [`driftless_io::progress::Progress`].
     #[error("abgebrochen")]
     Cancelled,

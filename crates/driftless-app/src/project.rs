@@ -39,6 +39,7 @@
 
 use crate::surface::SURFACE_GLB;
 use crate::ui::text;
+use driftless_gpu::GpuPref;
 use driftless_io::atomic_write;
 use driftless_io::bag::BagReader;
 use driftless_io::progress::Progress;
@@ -1177,13 +1178,14 @@ pub fn new_surface_dir(map_dir: &Path) -> Result<StepDir, ProjectError> {
     create_numbered(map_dir, SURFACE_NUMBERED)
 }
 
-/// The request of a surface of `map` of `run` with `settings` into `out_dir`: the map as it
-/// was made (its switches from `map.json`), the run with its settings.
+/// The request of a surface of `map` of `run` with `settings` into `out_dir`, computed on
+/// `gpu`: the map as it was made (its switches from `map.json`), the run with its settings.
 fn surface_request(
     scan: &Path,
     run: &RunInfo,
     map: &MapInfo,
     settings: &SurfaceSettings,
+    gpu: GpuPref,
     out_dir: &Path,
 ) -> Result<SurfaceRequest, StepError> {
     let switches = map.settings.clone().ok_or(text::SURFACE_NEEDS_MAP)?;
@@ -1201,6 +1203,7 @@ fn surface_request(
         out_dir: out_dir.to_path_buf(),
         config: settings.config.clone(),
         texture: settings.texture,
+        gpu,
     })
 }
 
@@ -1225,7 +1228,7 @@ pub fn surface_status(
     let stale = report.is_none()
         || (discover_project(scan).is_ok()
             && surface.settings.as_ref().is_none_or(|settings| {
-                surface_request(scan, run, map, settings, &surface.dir)
+                surface_request(scan, run, map, settings, GpuPref::default(), &surface.dir)
                     .is_ok_and(|req| !surface_fits(&req))
             }));
     MapStatus { seconds, stale }
@@ -1250,12 +1253,13 @@ pub fn run_surface_job(
     scan: &Path,
     map: &MapInfo,
     settings: &SurfaceSettings,
+    gpu: GpuPref,
     progress: &Progress,
 ) -> Result<SurfaceDone, StepError> {
     settings.config.check()?;
     map_refusal(run, scan)?;
     for (_, _, dir) in numbered(&map.dir, SURFACE_NUMBERED).iter().rev() {
-        let req = surface_request(scan, run, map, settings, dir)?;
+        let req = surface_request(scan, run, map, settings, gpu, dir)?;
         if surface_fits(&req) {
             progress.info(text::surface_fits(dir));
             let report = fs::read_to_string(dir.join(SURFACE_REPORT))
@@ -1273,7 +1277,7 @@ pub fn run_surface_job(
         }
     }
     let dir = new_surface_dir(&map.dir)?;
-    let req = surface_request(scan, run, map, settings, dir.path())?;
+    let req = surface_request(scan, run, map, settings, gpu, dir.path())?;
     let report = run_surface(&req, progress)?;
     Ok(SurfaceDone {
         dir: dir.keep(),
