@@ -25,6 +25,7 @@
 //! that does not depend on the order (integer counters) or runs in point order, so every run
 //! gives the same result.
 
+use crate::quality::{pass_quality, PassQuality};
 use crate::smooth::{smooth_surfaces, SmoothConfig, SmoothStats};
 use crate::{Cloud, MapError, RaySource};
 use driftless_io::progress::Progress;
@@ -142,6 +143,8 @@ pub struct CleanStats {
     pub outliers: usize,
     pub kept: usize,
     pub smooth: SmoothStats,
+    /// Offset between passes of the input cloud, measured before anything was removed.
+    pub dense_quality: PassQuality,
 }
 
 pub(crate) fn vec3(p: &[f32; 3]) -> Vector3<f64> {
@@ -498,6 +501,8 @@ pub fn clean_with(
     check()?;
     cfg.check()?;
     let n = cloud.len();
+    let dense_quality = pass_quality(&cloud.xyz, &cloud.t);
+    check()?;
     let mut reason: Vec<Option<RemovalReason>> = vec![None; n];
     if cfg.ghosts || cfg.through {
         check_rays(rays);
@@ -557,6 +562,7 @@ pub fn clean_with(
         outliers: count(RemovalReason::Outlier),
         kept: kept.len(),
         smooth,
+        dense_quality,
     };
     Ok((kept, removed, reasons, stats))
 }

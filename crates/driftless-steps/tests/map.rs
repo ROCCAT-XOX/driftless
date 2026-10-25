@@ -124,6 +124,10 @@ fn map_out_dir_separate_from_slam_dir() {
         serde_json::from_str(&fs::read_to_string(map_dir.join("map.json")).unwrap()).unwrap();
     assert_eq!(json, report);
     assert_eq!(report["steps"]["dense"]["reused"], false);
+    assert!(
+        report["steps"]["clean"]["stats"]["dense_quality"]["patches"].is_number(),
+        "{report}"
+    );
     assert!(report["steps"]["color"]["skipped"].is_string(), "{report}");
     // no images: a warning, as on the console
     assert!(p.take_log().iter().any(|l| matches!(

@@ -21,6 +21,7 @@ mod color_gpu;
 mod dense;
 mod export;
 mod exposure;
+mod quality;
 mod sharpness;
 mod smooth;
 mod stage;
@@ -43,6 +44,7 @@ pub use exposure::{
     Vignetting, DARK, SATURATED, VIGNETTE_MIN_OBSERVATIONS, VIGNETTE_MIN_POINT_SPREAD,
     VIGNETTE_MIN_SPREAD, VIGNETTE_ROUNDS,
 };
+pub use quality::{pass_quality, PassQuality};
 pub use sharpness::sharpness;
 pub use smooth::{smooth_surfaces, SmoothConfig, SmoothStats};
 pub use stage::{content_hash, load_stage, save_stage, stage_fits, StageError};
