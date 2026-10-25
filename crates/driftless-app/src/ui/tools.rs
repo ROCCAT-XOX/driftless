@@ -175,10 +175,31 @@ pub fn point_clicked(state: &mut AppState, info: PointInfo) {
 
 /// Esc (while no text field has the keyboard) drops the first end of a measurement.
 pub fn keys(ctx: &Context, state: &mut AppState) {
-    let free = ctx.memory(|m| m.focused()).is_none();
-    if free && state.measure_a.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    let pressed = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    if pressed && keys_free(ctx) && state.measure_a.is_some() {
         state.measure_a = None;
     }
+}
+
+/// Where [`remember_text_focus`] keeps its flag.
+fn text_focus_id() -> Id {
+    Id::new("driftless_text_focus")
+}
+
+/// Remembers, at the end of a pass, whether a text field has the keyboard. egui takes the
+/// focus from a text field on Esc at the start of the next pass, before the keys are read:
+/// without this flag, Esc in a text field would also cancel a measurement.
+pub fn remember_text_focus(ctx: &Context) {
+    let focused = ctx.text_edit_focused();
+    ctx.data_mut(|d| d.insert_temp(text_focus_id(), focused));
+}
+
+/// Whether the keys of the view (Esc, `O`, `F`, flying) are free: no text field has the
+/// keyboard, now or at the end of the last pass. A button or slider with the keyboard (after
+/// Tab, say) does not hold them.
+pub fn keys_free(ctx: &Context) -> bool {
+    let before = ctx.data(|d| d.get_temp::<bool>(text_focus_id()));
+    !before.unwrap_or(false) && !ctx.text_edit_focused()
 }
 
 /// The floating bars over the view `view`, while a cloud or a surface is loaded. Their
@@ -265,6 +286,11 @@ fn info(ctx: &Context, view: Rect, state: &mut AppState) -> Rect {
                     .size(FRAME_LINE_SIZE)
                     .color(DARK.text_dim),
             );
+        }
+        // the cut hides points; while its bar is not shown, say so here
+        if let (Some(cut), false) = (s.view.cut, s.tool == Tool::Cut) {
+            ui.label(RichText::new(text::cut_active(cut)).color(DARK.text_dim))
+                .on_hover_text(text::CUT_ACTIVE_HINT);
         }
         if let Some(hint) = click_hint(s) {
             ui.add(egui::Label::new(RichText::new(hint).color(DARK.measure)).wrap());

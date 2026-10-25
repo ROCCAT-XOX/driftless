@@ -32,7 +32,7 @@ struct Gpu {
 
 fn gpu() -> Option<Gpu> {
     let Some((device, queue, info)) = headless_device() else {
-        eprintln!("kein GPU-Adapter, Test übersprungen");
+        skipped("kein GPU-Adapter");
         return None;
     };
     eprintln!("GPU-Adapter: {} ({:?})", info.name, info.backend);
@@ -451,4 +451,13 @@ fn upload_in_steps_keeps_old_surface() {
     mesh.upload_page(device, queue, &blue, 1);
     mesh.finish_upload();
     assert!(near(centre_of(&gpu, &mesh, &f), BLUE, 2));
+}
+
+/// Says that the running test was skipped, and why. Written past the test harness's capture
+/// (straight to stderr, not with `eprintln!`), so that a run without a GPU – in CI, say –
+/// shows which tests did not test anything instead of passing in silence.
+fn skipped(why: &str) {
+    use std::io::Write;
+    let name = std::thread::current().name().unwrap_or("?").to_string();
+    let _ = writeln!(std::io::stderr(), "ÜBERSPRUNGEN {name}: {why}");
 }

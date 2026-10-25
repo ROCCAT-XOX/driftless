@@ -165,7 +165,7 @@ pub const SURFACE_VOXEL_HINT: &str =
      4 GB Arbeitsspeicher, und dunkle Wände bleiben löchrig";
 pub const SURFACE_NO_PHOTOS: &str = "ohne Fotos (graue Fläche)";
 
-// The 3D view and its properties (right panel)
+// The 3D view and its settings (window ⚙)
 pub const VIEW_NO_GPU: &str = "3D-Ansicht nicht verfügbar: keine wgpu-Grafik";
 pub const COLOR_MODE: &str = "Farbart";
 pub const MODE_RGB: &str = "Farbe";
@@ -197,9 +197,9 @@ pub const LAYER_ODOMETRY: &str = "Odometrie";
 pub const LAYER_LOOPS: &str = "Schleifen";
 pub const LAYER_SUBMAPS: &str = "Teilkarten";
 pub const VIEW_HELP_ORBIT: &str =
-    "Linke Taste: wie das Werkzeug unten · rechte/mittlere Taste oder Shift: verschieben · Rad: Zoom · F oder Doppelklick ins Leere: alles zeigen";
+    "Linke Taste: wie das Werkzeug unten · rechte/mittlere Taste oder Shift: verschieben · Rad: Zoom · F oder Doppelklick ins Leere: alles zeigen · O: Fläche/Punkte/beides · Esc: Messen abbrechen";
 pub const VIEW_HELP_FLY: &str =
-    "W/A/S/D, Q/E: fliegen (Shift schneller) · linke Taste: wie das Werkzeug unten · rechte Taste: umsehen · Rad: vor/zurück · F: alles zeigen";
+    "W/A/S/D, Q/E: fliegen (Shift schneller) · linke Taste: wie das Werkzeug unten · rechte Taste: umsehen · Rad: vor/zurück · F: alles zeigen · O: Fläche/Punkte/beides · Esc: Messen abbrechen";
 pub const LOAD_CLOUD: &str = "Wolke laden";
 pub const LOAD_SURFACE: &str = "Oberfläche laden";
 pub const OPEN_SURFACE: &str = "Oberfläche öffnen …";
@@ -237,6 +237,9 @@ pub const NO_CEILING: &str = "Keine Decke erkannt";
 pub const CUT_RESET: &str = "Zurücksetzen";
 pub const CUT_HINT: &str =
     "Höhen relativ zum Wolkenursprung; Punkte außerhalb werden weder gezeichnet noch angeklickt";
+/// Tooltip of the line „Schnitt aktiv: …“ in the info of the view.
+pub const CUT_ACTIVE_HINT: &str =
+    "Punkte außerhalb dieser Höhen sind ausgeblendet; Werkzeug „Schnitt“ ändert oder setzt zurück";
 /// Tooltip of „Alles“: what it frames.
 pub const FRAME_ALL_HINT: &str = "Alles zeigen (Taste F); ohne die äußersten 0,5 % je Achse \
      (ferne Ausreißer)";
@@ -653,6 +656,16 @@ pub fn frame_line(drawn: Option<usize>, frame_ms: f32, gpu: bool) -> String {
 /// A height of the cut: „2,85 m“.
 pub fn height(z: f32) -> String {
     format!("{} m", decimal(f64::from(z), 2))
+}
+
+/// The line in the info of the view while a height cut hides points and its bar is not shown:
+/// „Schnitt aktiv: z -0,50 bis 2,80 m“.
+pub fn cut_active([lo, hi]: [f32; 2]) -> String {
+    format!(
+        "Schnitt aktiv: z {} bis {}",
+        decimal(f64::from(lo), 2),
+        height(hi)
+    )
 }
 
 /// The name of the synthetic cloud of `n` points.

@@ -274,7 +274,7 @@ fn view_settings_defaults() {
 #[test]
 fn view_shows_point_colours_unchanged() {
     if headless_device().is_none() {
-        eprintln!("kein GPU-Adapter, Test übersprungen");
+        skipped("kein GPU-Adapter");
         return;
     }
     use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
@@ -333,7 +333,7 @@ fn upload_is_spread_over_frames() {
     use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
     use egui_kittest::Harness;
     if headless_device().is_none() {
-        eprintln!("kein GPU-Adapter, Test übersprungen");
+        skipped("kein GPU-Adapter");
         return;
     }
     // 3 million points: 60 MB, more than one slice
@@ -389,7 +389,7 @@ fn synthetic_50m_frame_time() {
     use std::time::Instant;
 
     let Some((_, _, info)) = headless_device() else {
-        eprintln!("kein GPU-Adapter, Test übersprungen");
+        skipped("kein GPU-Adapter");
         return;
     };
     let t = Instant::now();
@@ -488,7 +488,7 @@ fn trajectory_alone_is_drawn_and_its_poses_clicked() {
     use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
     use egui_kittest::Harness;
     if headless_device().is_none() {
-        eprintln!("kein GPU-Adapter, Test übersprungen");
+        skipped("kein GPU-Adapter");
         return;
     }
     let none = BeforeAfter {
@@ -606,4 +606,13 @@ fn show_mode_falls_back_to_what_is_there() {
     assert_eq!(ViewSettings::default().show, Surface, "the surface first");
     // one default for both
     assert_eq!(ShowMode::default(), ViewSettings::default().show);
+}
+
+/// Says that the running test was skipped, and why. Written past the test harness's capture
+/// (straight to stderr, not with `eprintln!`), so that a run without a GPU – in CI, say –
+/// shows which tests did not test anything instead of passing in silence.
+fn skipped(why: &str) {
+    use std::io::Write;
+    let name = std::thread::current().name().unwrap_or("?").to_string();
+    let _ = writeln!(std::io::stderr(), "ÜBERSPRUNGEN {name}: {why}");
 }

@@ -1679,6 +1679,7 @@ impl DriftlessApp {
         for action in actions {
             self.apply(action);
         }
+        tools::remember_text_focus(&ctx);
     }
 }
 
@@ -1693,9 +1694,8 @@ fn file_stamp(path: &Path) -> FileStamp {
 /// The key `O` (while no text field has the keyboard) switches what the view shows:
 /// Oberfläche → Punktwolke → beides; only with a surface and a cloud, like the switch.
 fn show_mode_key(ctx: &egui::Context, state: &mut super::AppState) {
-    let free = ctx.memory(|m| m.focused()).is_none();
     let pressed = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.is_none());
-    if free && pressed && state.surface.is_some() && state.cloud.is_some() {
+    if pressed && tools::keys_free(ctx) && state.surface.is_some() && state.cloud.is_some() {
         state.view.show = state.view.show.next();
     }
 }

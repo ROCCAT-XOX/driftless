@@ -28,7 +28,7 @@ struct Gpu {
 /// The device, or `None` (and a note) when there is no adapter.
 fn gpu() -> Option<Gpu> {
     let Some((device, queue, info)) = headless_device() else {
-        eprintln!("kein GPU-Adapter, Test übersprungen");
+        skipped("kein GPU-Adapter");
         return None;
     };
     eprintln!("GPU-Adapter: {} ({:?})", info.name, info.backend);
@@ -559,7 +559,7 @@ fn gpu_time_comes_back() {
         egui_kittest::wgpu::create_render_state(setup, egui_wgpu::RendererOptions::PREDICTABLE);
     let mut renderer = PointRenderer::new(&rs.device, &rs.queue, FORMAT);
     if !renderer.has_gpu_timer() {
-        eprintln!("keine Zeitstempel, Test übersprungen");
+        skipped("keine GPU-Zeitstempel");
         return;
     }
     let tree = tree(&cloud(vec![[2.0, 0.0, 0.0]], vec![RED]));
@@ -718,4 +718,13 @@ fn point_m_from_map() {
     let loaded = LoadedCloud::build(dir.join("color.las"), points, 0.0, &Progress::new()).unwrap();
     assert!((loaded.point_m - 0.03).abs() < 1e-6, "{}", loaded.point_m);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Says that the running test was skipped, and why. Written past the test harness's capture
+/// (straight to stderr, not with `eprintln!`), so that a run without a GPU – in CI, say –
+/// shows which tests did not test anything instead of passing in silence.
+fn skipped(why: &str) {
+    use std::io::Write;
+    let name = std::thread::current().name().unwrap_or("?").to_string();
+    let _ = writeln!(std::io::stderr(), "ÜBERSPRUNGEN {name}: {why}");
 }

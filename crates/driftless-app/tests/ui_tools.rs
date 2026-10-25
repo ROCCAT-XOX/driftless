@@ -136,11 +136,20 @@ fn plate() -> PathBuf {
     path
 }
 
+/// Says that the running test was skipped, and why. Written past the test harness's capture
+/// (straight to stderr, not with `eprintln!`), so that a run without a GPU – in CI, say –
+/// shows which tests did not test anything instead of passing in silence.
+fn skipped(why: &str) {
+    use std::io::Write;
+    let name = std::thread::current().name().unwrap_or("?").to_string();
+    let _ = writeln!(std::io::stderr(), "ÜBERSPRUNGEN {name}: {why}");
+}
+
 /// The app with the plate loaded and drawn by a GPU, or `None` without an adapter.
 fn plate_window() -> Option<Harness<'static, DriftlessApp>> {
     use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
     if headless_device().is_none() {
-        eprintln!("kein GPU-Adapter, Test übersprungen");
+        skipped("kein GPU-Adapter");
         return None;
     }
     let rs = create_render_state(
@@ -446,4 +455,135 @@ fn surface_alone_shows_triangles() {
     points.click();
     h.run();
     assert_eq!(h.state().state().view.show, ShowMode::default());
+}
+
+/// A drag with the left button from `from` by `by` (points), in small moves.
+fn drag(h: &mut Harness<'_, DriftlessApp>, from: egui::Pos2, by: egui::Vec2) {
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.event(egui::Event::PointerMoved(from));
+    h.step();
+    h.event(button(from, true));
+    h.step();
+    let mut pos = from;
+    for _ in 0..10 {
+        pos += by / 10.0;
+        h.event(egui::Event::PointerMoved(pos));
+        h.step();
+    }
+    h.event(button(pos, false));
+    h.step();
+    h.step();
+}
+
+#[test]
+fn left_drag_orbits_or_pans_by_tool() {
+    let Some(mut h) = plate_window() else {
+        return;
+    };
+    let middle = h.state().layout().view.center();
+    // „Drehen“: the left button turns the camera about its target, which stays
+    assert_eq!(h.state().state().tool, Tool::Orbit);
+    let before = h.state().view().camera().clone();
+    drag(&mut h, middle, egui::vec2(120.0, 0.0));
+    let after = h.state().view().camera().clone();
+    assert!(
+        (after.yaw - before.yaw).abs() > 0.05,
+        "{before:?} → {after:?}"
+    );
+    assert!(
+        (after.target - before.target).norm() < 1e-4,
+        "{before:?} → {after:?}"
+    );
+    // „Verschieben“: the left button moves the target, the direction stays
+    click_button(&mut h, text::TOOL_PAN);
+    let before = h.state().view().camera().clone();
+    drag(&mut h, middle, egui::vec2(120.0, 0.0));
+    let after = h.state().view().camera().clone();
+    assert!(
+        (after.target - before.target).norm() > 0.05,
+        "{before:?} → {after:?}"
+    );
+    assert_eq!(after.yaw, before.yaw);
+    assert_eq!(after.pitch, before.pitch);
+    // a drag is no click: nothing was picked or measured
+    assert_eq!(h.state().state().picked, None);
+}
+
+/// The app with a small text field of its own in a window next to it: the text field takes
+/// the keyboard when focused.
+fn window_with_text_field(app: DriftlessApp) -> Harness<'static, DriftlessApp> {
+    let mut note = String::new();
+    let mut h = Harness::builder()
+        .with_size([1400.0, 900.0])
+        .build_ui_state(
+            move |ui, app: &mut DriftlessApp| {
+                app.show(ui);
+                egui::Window::new("Notiz")
+                    .default_pos([700.0, 300.0])
+                    .show(ui.ctx(), |ui| ui.text_edit_singleline(&mut note));
+            },
+            app,
+        );
+    h.run();
+    h
+}
+
+#[test]
+fn keys_free_unless_a_text_field_has_focus() {
+    let mut app = app();
+    app.state_mut().cloud = Some(cloud_summary());
+    app.state_mut().surface = Some(surface_summary());
+    app.state_mut().tool = Tool::Measure;
+    app.state_mut().measure_a = Some(A);
+    let mut h = window_with_text_field(app);
+    let shown = h.state().state().view.show;
+    // a text field with the keyboard: `O` and Esc are its
+    h.get_by_role(Role::TextInput).focus();
+    h.run();
+    assert!(h.ctx.text_edit_focused());
+    h.key_press(egui::Key::O);
+    h.run();
+    assert_eq!(h.state().state().view.show, shown);
+    h.key_press(egui::Key::Escape);
+    h.run();
+    assert_eq!(h.state().state().measure_a, Some(A));
+    // a button with the keyboard (after Tab, say) holds neither
+    h.get_by_role_and_label(Role::Button, text::FIT_ALL).focus();
+    h.run();
+    assert!(h.ctx.memory(|m| m.focused()).is_some());
+    assert!(!h.ctx.text_edit_focused());
+    h.key_press(egui::Key::O);
+    h.run();
+    assert_eq!(h.state().state().view.show, shown.next());
+    h.key_press(egui::Key::Escape);
+    h.run();
+    assert_eq!(h.state().state().measure_a, None);
+    assert_eq!(h.state().state().tool, Tool::Measure);
+}
+
+#[test]
+fn active_cut_shows_in_info() {
+    let mut app = app();
+    app.state_mut().cloud = Some(cloud_summary());
+    let mut h = window(app, [1400.0, 900.0]);
+    let line = text::cut_active([-0.5, 2.8]);
+    assert_eq!(line, "Schnitt aktiv: z -0,50 bis 2,80 m");
+    assert!(h.query_by_label(&line).is_none());
+    h.state_mut().state_mut().view.cut = Some([-0.5, 2.8]);
+    h.run();
+    h.get_by_label(&line);
+    // with the tool „Schnitt“ its bar shows the cut instead
+    click_button(&mut h, text::TOOL_CUT);
+    assert!(h.query_by_label(&line).is_none());
+    click_button(&mut h, text::TOOL_ORBIT);
+    h.get_by_label(&line);
+    click_button(&mut h, text::TOOL_CUT);
+    click_button(&mut h, text::CUT_RESET);
+    click_button(&mut h, text::TOOL_ORBIT);
+    assert!(h.query_by_label(&line).is_none());
 }

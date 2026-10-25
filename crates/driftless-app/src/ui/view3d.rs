@@ -803,7 +803,7 @@ impl View3d {
         }
 
         // Keys only while no text field has the keyboard.
-        if ctx.memory(|m| m.focused()).is_none() {
+        if super::tools::keys_free(ctx) {
             if ctx.input(|i| i.key_pressed(Key::F)) {
                 self.frame_all = true;
             }
