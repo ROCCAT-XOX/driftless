@@ -3,8 +3,9 @@
 //! So the panels can be tested without a window (`egui_kittest`).
 //!
 //! Layout: the rail at the left edge ([`rail`]: ☰, the three [`Step`]s, ⚙), next to it the
-//! field of the active step ([`steps`]), the 3D view ([`view3d`]) in the rest, the status bar
-//! ([`status`]) at the bottom and the settings window ⚙ ([`settings`]).
+//! field of the active step ([`steps`]), the 3D view ([`view3d`]) in the rest with its floating
+//! bars ([`tools`]: info, the switch Punkte · Fläche · beides, the tools and the cut), the
+//! status bar ([`status`]) at the bottom and the settings window ⚙ ([`settings`]).
 
 pub mod actions;
 mod app;
@@ -16,6 +17,7 @@ pub mod status;
 pub mod steps;
 pub mod text;
 pub mod theme;
+pub mod tools;
 pub mod view3d;
 
 pub use app::{parse_args, Args, DriftlessApp, UI_KEY};
@@ -111,6 +113,8 @@ pub enum Action {
     Cancel,
     /// Clears the messages of the status bar.
     DismissMessages,
+    /// Show everything in the view (the button „Alles“, as the key `F`).
+    FrameAll,
     AddLoop {
         run: PathBuf,
         a: f64,
@@ -336,8 +340,14 @@ pub struct AppState {
     pub loading: Option<JobStatus>,
     /// The last frame of the 3D view.
     pub view_stats: Option<ViewStats>,
-    /// The point clicked in the 3D view.
+    /// The point clicked in the 3D view with the tool „Punkt wählen“.
     pub picked: Option<view3d::PointInfo>,
+    /// The tool of the view; always exactly one.
+    pub tool: tools::Tool,
+    /// The measurements of the tool „Messen“, oldest first (not saved yet: Baustein 5).
+    pub measurements: Vec<tools::Measurement>,
+    /// The first end of a measurement being made (absolute); Esc or another tool drops it.
+    pub measure_a: Option<[f64; 3]>,
     /// The manual corrections of the run the view draws.
     pub correct: correct::CorrectState,
     /// The comparison of two trajectories and of two maps.

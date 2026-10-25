@@ -486,31 +486,3 @@ fn selected_map_shows_its_switches_as_template() {
     h.get_by_label(text::MAP_SWITCHES_UNKNOWN);
     assert!(h.query_by_label(text::USE_AS_TEMPLATE).is_none());
 }
-
-#[test]
-fn surface_alone_shows_triangles() {
-    use driftless_app::ui::{SurfaceSummary, ViewStats};
-    let mut s = run_selected(true);
-    s.surface = Some(SurfaceSummary {
-        path: "oberflaeche.glb".into(),
-        triangles: 712_218,
-        pages: 12,
-        origin: [0.0; 3],
-        z_range: [0.0, 3.0],
-    });
-    s.settings_window.open = true;
-    s.view_stats = Some(ViewStats {
-        drawn: 0,
-        total: 0,
-        triangles: Some(712_218),
-        frame_ms: 8.44,
-        gpu: true,
-    });
-    let h = harness(s);
-    let line = text::surface_stats(712_218, 8.44, true);
-    assert_eq!(line, "Oberfläche: 712.218 Dreiecke · 8,4 ms GPU");
-    h.get_by_label(&line);
-    assert!(h
-        .query_by_label(&text::drawn_stats(0, 0, 8.44, true))
-        .is_none());
-}

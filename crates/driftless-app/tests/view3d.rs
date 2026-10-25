@@ -246,14 +246,14 @@ fn removed_reason_text() {
 }
 
 #[test]
-fn drawn_stats_text() {
+fn frame_line_text() {
     assert_eq!(
-        text::drawn_stats(5_900_000, 15_600_000, 8.44, true),
-        "gezeichnet 5,9 Mio. von 15,6 Mio. Punkten · 8,4 ms GPU"
+        text::frame_line(Some(5_900_000), 8.44, true),
+        "gezeichnet 5,9 Mio. · 8,4 ms GPU"
     );
     assert_eq!(
-        text::drawn_stats(300_000, 300_000, 16.7, false),
-        "gezeichnet 300.000 von 300.000 Punkten · 16,7 ms je Bild"
+        text::frame_line(Some(300_000), 16.7, false),
+        "gezeichnet 300.000 · 16,7 ms je Bild"
     );
     assert_eq!(text::uploading(40.0), "Wolke wird hochgeladen … 40 %");
 }

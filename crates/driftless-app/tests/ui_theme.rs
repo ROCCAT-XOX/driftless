@@ -37,6 +37,7 @@ fn icons_render_in_font() {
         icon::ADD,
         icon::FOLDED,
         icon::UNFOLDED,
+        icon::CLOSE,
     ];
     // Fonts are laid out on the first frame.
     let mut out = ctx.run_ui(Default::default(), |_| {});

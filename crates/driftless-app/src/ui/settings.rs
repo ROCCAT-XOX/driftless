@@ -1,12 +1,11 @@
 //! The settings window ⚙: how the 3D view draws, for the whole program – colour mode, point
-//! size, point budget, camera („Bedienung“), layers –, what it shows while a surface is
-//! loaded, the height cut and the numbers of the last frame.
+//! size, point budget, camera („Bedienung“), layers.
 
 use super::steps::parse_decimal;
 use super::view3d::{color_modes, effective_color_mode};
 use super::{text, AppState, ViewSettings};
 use crate::camera::CameraMode;
-use crate::render::{ColorMode, PointSize, ShowMode};
+use crate::render::{ColorMode, PointSize};
 use eframe::egui::{self, Context, Ui};
 
 /// Width of the window (points).
@@ -26,11 +25,9 @@ pub fn show(ctx: &Context, state: &mut AppState) {
     state.settings_window.open &= open;
 }
 
-/// How the 3D view draws, the height cut and the numbers of the last frame.
+/// How the 3D view draws. The switch Punkte · Fläche · beides, the height cut and the numbers
+/// of the last frame are in the floating bars of the view ([`super::tools`]).
 fn view_section(ui: &mut Ui, state: &mut AppState) {
-    if state.surface.is_some() {
-        show_mode_edit(ui, &mut state.view.show, state.cloud.is_some());
-    }
     let has_rgb = state.cloud.as_ref().is_none_or(|c| c.has_rgb);
     let map_point_m = state
         .cloud
@@ -40,38 +37,6 @@ fn view_section(ui: &mut Ui, state: &mut AppState) {
     if state.cloud.as_ref().is_some_and(|c| !c.quality_known) {
         ui.weak(text::QUALITY_NONE_HINT);
     }
-    // the cut over the cloud, else over the surface alone
-    let cut_over = match (&state.cloud, &state.surface) {
-        (Some(c), _) => Some((c.z_range, c.ceiling)),
-        (None, Some(s)) => Some((s.z_range, None)),
-        (None, None) => None,
-    };
-    if let Some((z_range, ceiling)) = cut_over {
-        ui.separator();
-        cut_edit(ui, &mut state.view.cut, z_range, ceiling);
-    }
-    ui.separator();
-    if let Some(stats) = &state.view_stats {
-        ui.label(match stats.triangles {
-            Some(triangles) => text::surface_stats(triangles, stats.frame_ms, stats.gpu),
-            None => text::drawn_stats(stats.drawn, stats.total, stats.frame_ms, stats.gpu),
-        });
-    }
-    ui.weak(text::FRAME_ALL_HINT);
-}
-
-/// „Anzeige: Oberfläche / Punktwolke / beides“; without a cloud only the surface can be
-/// shown, so the switch is off.
-fn show_mode_edit(ui: &mut Ui, show: &mut ShowMode, has_cloud: bool) {
-    ui.add_enabled_ui(has_cloud, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(text::SHOW_MODE)
-                .on_hover_text(text::SHOW_MODE_KEY_HINT);
-            ui.selectable_value(show, ShowMode::Surface, text::SHOW_SURFACE);
-            ui.selectable_value(show, ShowMode::Cloud, text::SHOW_CLOUD);
-            ui.selectable_value(show, ShowMode::Both, text::SHOW_BOTH);
-        });
-    });
 }
 
 /// How the 3D view draws. `has_rgb`: whether the loaded cloud has colours (offers the
@@ -182,67 +147,5 @@ fn point_size_edit(ui: &mut Ui, view: &mut ViewSettings, map_point_m: f32) {
                 view.point_m = (!from_map).then_some(cm / 100.0);
             }
         });
-    }
-}
-
-/// The height cut: z min / z max over `z_range` (of the cloud, or of the surface alone),
-/// „Decke ausblenden“ (z max just below the estimated `ceiling`) and „Zurücksetzen“.
-fn cut_edit(ui: &mut Ui, cut: &mut Option<[f32; 2]>, z_range: [f32; 2], ceiling: Option<f32>) {
-    let [lo, hi] = z_range;
-    ui.strong(text::CUT).on_hover_text(text::CUT_HINT);
-    let mut range = cut.unwrap_or([lo, hi]);
-    let mut changed = false;
-    for (label, k) in [(text::CUT_Z_MIN, 0), (text::CUT_Z_MAX, 1)] {
-        ui.horizontal(|ui| {
-            ui.label(label);
-            let slider = egui::Slider::new(&mut range[k], lo..=hi.max(lo))
-                .step_by(0.05)
-                .custom_formatter(|v, _| text::height(v as f32))
-                .custom_parser(|s| parse_decimal(s.trim_end_matches('m').trim()));
-            changed |= ui.add(slider).changed();
-        });
-    }
-    if changed {
-        // the other end follows, so that the range never turns over
-        if range[0] > range[1] {
-            range = [range[0].min(range[1]), range[0].max(range[1])];
-        }
-        *cut = Some(range);
-    }
-    ui.horizontal(|ui| {
-        let button = ui.add_enabled(ceiling.is_some(), egui::Button::new(text::HIDE_CEILING));
-        if button.clicked() {
-            if let Some(ceiling) = ceiling {
-                *cut = Some(below_ceiling(range, ceiling, lo));
-            }
-        }
-        button.on_disabled_hover_text(text::NO_CEILING);
-        if ui
-            .add_enabled(cut.is_some(), egui::Button::new(text::CUT_RESET))
-            .clicked()
-        {
-            *cut = None;
-        }
-    });
-}
-
-/// The cut of „Decke ausblenden“: z max at the ceiling (not below the cloud's lowest point
-/// `lo`), z min kept but never above z max, so that the range never turns over.
-fn below_ceiling(range: [f32; 2], ceiling: f32, lo: f32) -> [f32; 2] {
-    let top = ceiling.max(lo);
-    [range[0].min(top), top]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hiding_the_ceiling_never_turns_the_range_over() {
-        assert_eq!(below_ceiling([0.5, 4.0], 2.5, 0.0), [0.5, 2.5]);
-        // z min above the ceiling follows it down
-        assert_eq!(below_ceiling([3.0, 4.0], 2.5, 0.0), [2.5, 2.5]);
-        // a ceiling below the cloud is taken as its lowest point
-        assert_eq!(below_ceiling([0.5, 4.0], -1.0, 0.0), [0.0, 0.0]);
     }
 }

@@ -197,18 +197,21 @@ pub const LAYER_ODOMETRY: &str = "Odometrie";
 pub const LAYER_LOOPS: &str = "Schleifen";
 pub const LAYER_SUBMAPS: &str = "Teilkarten";
 pub const VIEW_HELP_ORBIT: &str =
-    "Linke Taste: umkreisen · rechte/mittlere Taste oder Shift: verschieben · Rad: Zoom · F oder Doppelklick ins Leere: alles zeigen · Klick: Punkt";
+    "Linke Taste: wie das Werkzeug unten · rechte/mittlere Taste oder Shift: verschieben · Rad: Zoom · F oder Doppelklick ins Leere: alles zeigen";
 pub const VIEW_HELP_FLY: &str =
-    "W/A/S/D, Q/E: fliegen (Shift schneller) · rechte Taste: umsehen · Rad: vor/zurück · F: alles zeigen · Klick: Punkt";
+    "W/A/S/D, Q/E: fliegen (Shift schneller) · linke Taste: wie das Werkzeug unten · rechte Taste: umsehen · Rad: vor/zurück · F: alles zeigen";
 pub const LOAD_CLOUD: &str = "Wolke laden";
 pub const LOAD_SURFACE: &str = "Oberfläche laden";
 pub const OPEN_SURFACE: &str = "Oberfläche öffnen …";
 pub const DIALOG_OPEN_SURFACE: &str = "Oberfläche öffnen (oberflaeche.glb)";
-pub const SHOW_MODE: &str = "Anzeige";
-pub const SHOW_SURFACE: &str = "Oberfläche";
-pub const SHOW_CLOUD: &str = "Punktwolke";
+/// The switch at the top right of the view.
+pub const SHOW_MODE: &str = "Ansicht";
+pub const SHOW_SURFACE: &str = "Fläche";
+pub const SHOW_CLOUD: &str = "Punkte";
 pub const SHOW_BOTH: &str = "beides";
-pub const SHOW_MODE_KEY_HINT: &str = "Taste O: Oberfläche → Punktwolke → beides";
+pub const SHOW_MODE_KEY_HINT: &str = "Taste O: Fläche → Punkte → beides";
+/// Why „Punkte“ and „beides“ are locked while only a surface is loaded.
+pub const SHOW_NEEDS_CLOUD: &str = "Keine Punktwolke geladen – nur die Fläche";
 /// A glb that cannot be read from disk because it is not there.
 pub const SURFACE_FILE_MISSING: &str = "Datei nicht gefunden";
 pub const SYNTHETIC_CLOUD: &str = "Testwolke";
@@ -223,20 +226,45 @@ pub const POINT_COLOR: &str = "Farbe";
 pub const POINT_QUALITY: &str = "Güte der Teilkarte";
 pub const POINT_REMOVED: &str = "Entfernt als";
 pub const NO_COLOR: &str = "ohne Farbe";
-pub const NO_POINT: &str = "Kein Punkt angeklickt";
+/// Tooltip of the × of the clicked point.
+pub const CLOSE_POINT: &str = "Punkt schließen";
 /// Point info and quality mode of a cloud without SLAM report.
 pub const QUALITY_UNKNOWN: &str = "unbekannt";
-pub const CUT: &str = "Schnitt";
-pub const CUT_Z_MIN: &str = "z min";
-pub const CUT_Z_MAX: &str = "z max";
+pub const CUT_MIN: &str = "z min";
+pub const CUT_MAX: &str = "z max";
 pub const HIDE_CEILING: &str = "Decke ausblenden";
 pub const NO_CEILING: &str = "Keine Decke erkannt";
 pub const CUT_RESET: &str = "Zurücksetzen";
 pub const CUT_HINT: &str =
     "Höhen relativ zum Wolkenursprung; Punkte außerhalb werden weder gezeichnet noch angeklickt";
-/// Hover text of the view: what „alles zeigen“ frames.
-pub const FRAME_ALL_HINT: &str =
-    "Alles zeigen rahmt die Wolke ohne die äußersten 0,5 % je Achse ein (ferne Ausreißer)";
+/// Tooltip of „Alles“: what it frames.
+pub const FRAME_ALL_HINT: &str = "Alles zeigen (Taste F); ohne die äußersten 0,5 % je Achse \
+     (ferne Ausreißer)";
+
+// The tools at the bottom of the view; exactly one is active. „Alles“ is a button, no tool.
+pub const TOOL_ORBIT: &str = "Drehen";
+pub const TOOL_PAN: &str = "Verschieben";
+pub const TOOL_PICK: &str = "Punkt wählen";
+pub const TOOL_MEASURE: &str = "Messen";
+pub const TOOL_CUT: &str = "Schnitt";
+pub const FIT_ALL: &str = "Alles";
+pub const TOOL_ORBIT_HINT: &str = "Linke Taste dreht die Ansicht um die Mitte";
+pub const TOOL_PAN_HINT: &str = "Linke Taste verschiebt die Ansicht";
+pub const TOOL_PICK_HINT: &str = "Klick auf einen Punkt zeigt seine Werte oben links";
+pub const TOOL_MEASURE_HINT: &str =
+    "Zwei Punkte nacheinander anklicken: ihr Abstand in Metern · Esc bricht ab";
+pub const MEASURE_FIRST: &str = "Messen: ersten Punkt anklicken";
+pub const MEASURE_SECOND: &str = "Messen: zweiten Punkt anklicken · Esc bricht ab";
+pub const PICK_POINT: &str = "Punkt wählen: auf einen Punkt klicken";
+/// Measuring and picking look at points only.
+pub const TOOL_NEEDS_CLOUD: &str = "Messen und Punkt wählen brauchen eine Punktwolke";
+
+// Measurements (field „Planung“)
+pub const MEASUREMENTS: &str = "Messungen";
+pub const NO_MEASUREMENTS: &str =
+    "Noch keine Messungen. Unten in der Ansicht „Messen“ wählen und zwei Punkte anklicken.";
+pub const MEASUREMENTS_NOT_SAVED: &str = "Messungen werden noch nicht gespeichert (Baustein 5).";
+pub const CLEAR_MEASUREMENTS: &str = "Messungen löschen";
 pub const QUALITY_NONE_HINT: &str =
     "Ohne SLAM-Bericht oder ohne Punktzeiten: Güte unbekannt, grau gezeigt";
 
@@ -254,7 +282,7 @@ pub const PLACE_HINT: &str = "Zeit ab Scan-Beginn in s";
 pub const PLACE_A_SHORT: &str = "A";
 pub const PLACE_B_SHORT: &str = "B";
 pub const PICK_NEEDS_TRAJECTORY: &str =
-    "Stellen wählen braucht die Ebene „Laufbahn“ – unter Ansicht einschalten";
+    "Stellen wählen braucht die Ebene „Laufbahn“ – in den Einstellungen einschalten";
 pub const LAYER_REJECTED: &str = "Verworfene Kandidaten";
 pub const NEXT_PLACE_A: &str = "Nächster Klick auf die Laufbahn: Stelle A";
 pub const NEXT_PLACE_B: &str = "Nächster Klick auf die Laufbahn: Stelle B";
@@ -579,21 +607,47 @@ pub fn point_count(n: usize) -> String {
     }
 }
 
-/// „gezeichnet 5,9 Mio. von 15,6 Mio. Punkten · 8,4 ms GPU“; without GPU timer the time
-/// between frames: „… · 16,7 ms je Bild“.
-pub fn drawn_stats(drawn: usize, total: usize, frame_ms: f32, gpu: bool) -> String {
-    format!(
-        "gezeichnet {} von {} Punkten · {} ms {}",
-        point_count(drawn),
-        point_count(total),
-        decimal(f64::from(frame_ms), 1),
-        if gpu { "GPU" } else { "je Bild" }
-    )
-}
-
 /// „Wolke wird hochgeladen … 40 %“.
 pub fn uploading(percent: f32) -> String {
     format!("Wolke wird hochgeladen … {percent:.0} %")
+}
+
+/// A distance: „2,00 m“ (centimetres).
+pub fn meters(d: f64) -> String {
+    format!("{} m", decimal(d, 2))
+}
+
+/// „Messung 1“: the name of a measurement in the field „Planung“ (counted from 1).
+pub fn measurement_name(nr: usize) -> String {
+    format!("Messung {nr}")
+}
+
+/// The info at the top left of the view: „Punktwolke · 6,0 Mio. Punkte“.
+pub fn info_cloud(points: usize) -> String {
+    format!("Punktwolke · {} Punkte", point_count(points))
+}
+
+/// „Oberfläche · 712.218 Dreiecke“.
+pub fn info_surface(triangles: usize) -> String {
+    format!(
+        "Oberfläche · {} Dreiecke",
+        super::status::count(triangles as u64)
+    )
+}
+
+/// The numbers of the last frame below the info: „gezeichnet 5,9 Mio. · 8,4 ms GPU“, for a
+/// surface alone (`drawn` none) only the time; without GPU timer the time between frames
+/// („… ms je Bild“).
+pub fn frame_line(drawn: Option<usize>, frame_ms: f32, gpu: bool) -> String {
+    let time = format!(
+        "{} ms {}",
+        decimal(f64::from(frame_ms), 1),
+        if gpu { "GPU" } else { "je Bild" }
+    );
+    match drawn {
+        Some(n) => format!("gezeichnet {} · {time}", point_count(n)),
+        None => time,
+    }
 }
 
 /// A height of the cut: „2,85 m“.
@@ -643,16 +697,6 @@ pub fn external_buffer(uri: &str) -> String {
     format!(
         "Daten liegen in einer eigenen Datei ({uri}); nur eine glb mit allen Daten in der Datei \
          wird gelesen (wie `driftless surface` sie schreibt)"
-    )
-}
-
-/// „Oberfläche: 712.218 Dreiecke · 8,4 ms GPU“ – the stats line of a surface shown alone.
-pub fn surface_stats(triangles: usize, frame_ms: f32, gpu: bool) -> String {
-    format!(
-        "Oberfläche: {} Dreiecke · {} ms {}",
-        super::status::count(triangles as u64),
-        decimal(f64::from(frame_ms), 1),
-        if gpu { "GPU" } else { "je Bild" }
     )
 }
 

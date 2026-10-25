@@ -3,6 +3,7 @@
 
 use super::compare::{compare_maps, compare_refs, default_refs, TrajRef};
 use super::correct::{Corrected, RunLoaded};
+use super::tools::{self, ScreenLayout};
 use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
     actions, rail, settings, status, steps, text, theme, Action, AppState, CloudSummary,
@@ -38,6 +39,9 @@ const MESSAGE_LIMIT: usize = 100;
 const STEP_WIDTH: f32 = 250.0;
 /// The field of the step never gets narrower than this (names are cut with „…“ instead).
 const STEP_MIN_WIDTH: f32 = 220.0;
+/// The hint „Noch keine Oberfläche“ stands this far below the top of the view (points), under
+/// the floating info.
+const HINT_TOP: f32 = 64.0;
 
 /// Seed of the synthetic cloud of `--synthetic`.
 const SYNTHETIC_SEED: u64 = 1;
@@ -264,6 +268,8 @@ pub struct DriftlessApp {
     forget_last: bool,
     /// [`super::theme::apply`] was called (once, at the first frame or in the creation context).
     themed: bool,
+    /// Where the panels and the floating bars were in the last frame.
+    layout: ScreenLayout,
 }
 
 impl DriftlessApp {
@@ -298,6 +304,7 @@ impl DriftlessApp {
             closing: false,
             forget_last: false,
             themed: false,
+            layout: ScreenLayout::default(),
         }
     }
 
@@ -340,6 +347,11 @@ impl DriftlessApp {
 
     pub fn view(&self) -> &View3d {
         &self.view
+    }
+
+    /// Where the panels and the floating bars were in the last frame.
+    pub fn layout(&self) -> &ScreenLayout {
+        &self.layout
     }
 
     /// The 3D view (tests and tools move its camera).
@@ -1392,6 +1404,7 @@ impl DriftlessApp {
                 self.surface_loader.cancel();
             }
             Action::DismissMessages => self.state.messages.clear(),
+            Action::FrameAll => self.view.frame_all(),
             step @ (Action::Inspect(_)
             | Action::RunSlam(_)
             | Action::Reuse(_)
@@ -1456,6 +1469,9 @@ impl DriftlessApp {
 
     fn set_project(&mut self, project: Project) {
         self.stop_queue();
+        // the measurements belong to the project shown (they are not saved yet)
+        self.state.measurements.clear();
+        self.state.measure_a = None;
         self.info(text::project_opened(&project.name));
         self.drop_surface();
         self.state.set_project(project);
@@ -1522,7 +1538,7 @@ impl DriftlessApp {
         {
             return;
         }
-        let top = view.center_top() + egui::vec2(0.0, 12.0);
+        let top = view.center_top() + egui::vec2(0.0, HINT_TOP);
         egui::Area::new(egui::Id::new("hinweis_oberflaeche"))
             .fixed_pos(top)
             .pivot(egui::Align2::CENTER_TOP)
@@ -1556,26 +1572,38 @@ impl DriftlessApp {
         }
         self.update_title(&ctx);
         show_mode_key(&ctx, &mut self.state);
+        tools::keys(&ctx, &mut self.state);
 
         let mut actions: Vec<Action> = Vec::new();
-        egui::Panel::left("leiste")
+        self.layout.rail = egui::Panel::left("leiste")
             .exact_size(rail::WIDTH)
             .resizable(false)
             .frame(theme::rail_frame())
             .show(ui, |ui| {
                 actions.extend(rail::show(ui, &mut self.state));
-            });
-        egui::Panel::bottom("status").show(ui, |ui| {
-            actions.extend(status::show(ui, &self.state));
-        });
-        egui::Panel::left("schritt")
+            })
+            .response
+            .rect;
+        self.layout.status = egui::Panel::bottom("status")
+            .show(ui, |ui| {
+                actions.extend(status::show(ui, &self.state));
+            })
+            .response
+            .rect;
+        self.layout.step = egui::Panel::left("schritt")
             .default_size(STEP_WIDTH)
             .min_size(STEP_MIN_WIDTH)
             .frame(theme::step_frame())
             .show(ui, |ui| {
                 actions.extend(steps::show(ui, &mut self.state));
-            });
+            })
+            .response
+            .rect;
         settings::show(&ctx, &mut self.state);
+        self.view.set_tool(self.state.tool);
+        self.view
+            .set_picked(self.state.picked.as_ref().map(|p| p.index));
+        let origin = self.view_origin();
         let mut event = None;
         let (places, avoid_submap) = self.places();
         let overlay = self.overlay.as_ref().map(|run| ViewOverlay {
@@ -1589,9 +1617,14 @@ impl DriftlessApp {
         let central =
             egui::CentralPanel::no_frame().show(ui, |ui| match (&self.render_state, shown) {
                 (Some(rs), true) => {
+                    let rect = ui.max_rect();
                     event = self
                         .view
                         .show(ui, rs, self.cloud.as_ref(), overlay, &self.state.view);
+                    if let (Some(origin), false) = (origin, self.view.is_uploading()) {
+                        let camera = self.view.camera();
+                        tools::paint_measurements(ui, rect, camera, origin, &self.state);
+                    }
                 }
                 (None, true) => {
                     ui.centered_and_justified(|ui| ui.weak(text::VIEW_NO_GPU));
@@ -1601,6 +1634,8 @@ impl DriftlessApp {
                 }
             });
         self.no_surface_hint(&ctx, central.response.rect);
+        let view = central.response.rect;
+        actions.extend(tools::floats(&ctx, view, &mut self.state, &mut self.layout));
         match event {
             Some(ViewEvent::PickedPose(i)) => self.pose_picked(i),
             Some(ViewEvent::TrajectoryHidden) => {
@@ -1637,7 +1672,9 @@ impl DriftlessApp {
             ctx.request_repaint();
         }
         if let (Some(cloud), Some(ViewEvent::PickedPoint(i))) = (&self.cloud, event) {
-            self.state.picked = Some(point_info(cloud, i));
+            tools::point_clicked(&mut self.state, point_info(cloud, i));
+            // the marker and the measurement show from the next frame on
+            ctx.request_repaint();
         }
         for action in actions {
             self.apply(action);

@@ -6,7 +6,7 @@
 //! Shared here: the frame of „Daten“ and „Bilder“ (a list that scrolls above the main button
 //! and „▸ Erweitert“), cards with a status, the segment switch, the progress of the running
 //! job, the state of a step button („nicht gerechnet“, „fertig (12,3 s)“, „veraltet“), why a
-//! step is locked, and the clicked point.
+//! step is locked, and the rows of the clicked point.
 
 pub mod bilder;
 pub mod daten;
@@ -306,22 +306,6 @@ pub(super) fn section(ui: &mut Ui, title: &str, body: impl FnOnce(&mut Ui)) {
 /// A number with a decimal comma or point.
 pub(crate) fn parse_decimal(s: &str) -> Option<f64> {
     s.trim().replace(',', ".").parse().ok()
-}
-
-/// The point clicked in the 3D view.
-pub(super) fn point_shown(ui: &mut Ui, picked: Option<&PointInfo>) {
-    ui.strong(text::POINT);
-    let Some(info) = picked else {
-        ui.weak(text::NO_POINT);
-        return;
-    };
-    egui::Grid::new("punkt").num_columns(2).show(ui, |ui| {
-        for (label, value) in point_lines(info) {
-            ui.label(label);
-            ui.label(value);
-            ui.end_row();
-        }
-    });
 }
 
 /// The rows of the point info: label and value.

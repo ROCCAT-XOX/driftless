@@ -9,14 +9,14 @@
 //! (with the voxel size as a number), the layers „Teilkarten“ and „Verworfene Kandidaten“, the
 //! steps of the selection („Prüfen“, „SLAM rechnen“, „Neu rechnen (aus Teilkarten)“, „Karte
 //! rechnen“) with their state, the corrections ([`correct`]), the comparisons ([`compare`]),
-//! what the steps are computed with („Eigenschaften“) and the clicked point. Every step
-//! button is locked while a step runs and while the scan cannot be read; selecting and viewing
-//! stay possible.
+//! what the steps are computed with („Eigenschaften“); the clicked point shows in the view.
+//! Every step button is locked while a step runs and while the scan cannot be read; selecting
+//! and viewing stay possible.
 
 use super::{
     badge, below_lines, blocked, card, error_label, fraction, heading, hint, job_progress,
-    main_button, no_project, pinned, point_shown, quiet_button, section, segments, state_label,
-    step_row, tree, StepState,
+    main_button, no_project, pinned, quiet_button, section, segments, state_label, step_row, tree,
+    StepState,
 };
 use crate::project::{MapInfo, RunInfo, ScanState};
 use crate::ui::status::count;
@@ -356,7 +356,7 @@ fn other_precision(state: &AppState) -> bool {
 }
 
 /// Under „Erweitert“: the map switches, two layers, and for the selection its steps,
-/// corrections, comparisons and settings; at the end the clicked point.
+/// corrections, comparisons and settings (the clicked point shows in the view's info).
 fn advanced_content(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     let mut action = None;
     let no_color = match target(state) {
@@ -375,8 +375,6 @@ fn advanced_content(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     if let Some(a) = steps_and_properties(ui, state) {
         action = Some(a);
     }
-    ui.separator();
-    point_shown(ui, state.picked.as_ref());
     action
 }
 

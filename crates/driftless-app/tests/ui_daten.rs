@@ -275,7 +275,6 @@ fn advanced_holds_switches_compare_correct() {
         text::STEP_MAP,
         text::LAYER_SUBMAPS,
         text::LAYER_REJECTED,
-        text::POINT,
     ] {
         h.get_by_label(label);
     }

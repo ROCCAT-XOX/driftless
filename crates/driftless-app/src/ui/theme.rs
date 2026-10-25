@@ -33,6 +33,8 @@ pub struct Palette {
     pub float_stroke: Color32,
     /// The light middle of the view's gradient; its edges are [`Palette::bg`].
     pub view_glow: Color32,
+    /// Lines and ends of the measurements in the view.
+    pub measure: Color32,
 }
 
 /// The only theme.
@@ -53,6 +55,7 @@ pub const DARK: Palette = Palette {
     // white at 14/255, premultiplied
     float_stroke: Color32::from_rgba_premultiplied(14, 14, 14, 14),
     view_glow: Color32::from_rgb(0x2a, 0x2f, 0x38),
+    measure: Color32::from_rgb(0xf2, 0xc9, 0x4c),
 };
 
 /// Corner radius of buttons and fields.
@@ -81,6 +84,7 @@ pub mod icon {
     pub const ADD: &str = p::PLUS;
     pub const FOLDED: &str = p::CARET_RIGHT;
     pub const UNFOLDED: &str = p::CARET_DOWN;
+    pub const CLOSE: &str = p::X;
 }
 
 /// Size of the heading of a step (the body text is 12.5).

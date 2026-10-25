@@ -13,6 +13,7 @@
 use driftless_app::camera::CameraMode;
 use driftless_app::project::{canonical, Project};
 use driftless_app::render::{headless_device, ColorMode};
+use driftless_app::ui::tools::{self, Tool};
 use driftless_app::ui::{text, Action, DriftlessApp, Selection, Step};
 use eframe::egui;
 use egui_kittest::kittest::Queryable;
@@ -106,7 +107,8 @@ fn ui_screenshots() {
     view.budget = 6_000_000;
     view.point_px = 2.0;
     view.camera_mode = CameraMode::Fly;
-    // a click into the middle of the view picks a point
+    // with the tool „Punkt wählen“ a click into the middle of the view picks a point
+    tools::select(h.state_mut().state_mut(), Tool::Pick);
     click(&mut h, egui::pos2(SIZE[0] * 0.45, SIZE[1] * 0.5));
     shot(&mut h, &dir, "synthetisch_punkt");
 
@@ -710,6 +712,72 @@ fn spot_screenshots() {
     shot(&mut h, &dir, "flecken_pixel");
     h.state_mut().state_mut().view.point_size = PointSize::World;
     shot(&mut h, &dir, "flecken_meter");
+}
+
+/// The floating bars over the real colour cloud of `$DRIFTLESS_CLOUD` (only read): the info,
+/// the tools with „Messen“ active and one measurement between two points of a wall, as
+/// `werkzeuge.png` in `$DRIFTLESS_SHOTS`; then a picked point and the cut as
+/// `werkzeuge_schnitt.png`.
+///
+/// ```text
+/// DRIFTLESS_SHOTS=… DRIFTLESS_CLOUD=…/color.las cargo test -p driftless-app --release \
+///     --test ui_screenshots tools_screenshot -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "writes a picture; needs $DRIFTLESS_SHOTS, $DRIFTLESS_CLOUD and a GPU"]
+fn tools_screenshot() {
+    let (Some(dir), Some(cloud)) = (
+        std::env::var_os("DRIFTLESS_SHOTS").map(PathBuf::from),
+        std::env::var_os("DRIFTLESS_CLOUD").map(PathBuf::from),
+    ) else {
+        eprintln!("DRIFTLESS_SHOTS oder DRIFTLESS_CLOUD nicht gesetzt, Test übersprungen");
+        return;
+    };
+    if headless_device().is_none() {
+        eprintln!("kein GPU-Adapter, Test übersprungen");
+        return;
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let rs = create_render_state(
+        default_wgpu_setup(),
+        egui_wgpu::RendererOptions::PREDICTABLE,
+    );
+    let mut app = DriftlessApp::new(Arc::new(|| {})).with_render_state(rs.clone());
+    app.apply(Action::LoadCloud {
+        path: cloud,
+        run: None,
+    });
+    let mut h = harness(app, rs);
+    wait_loaded(&mut h);
+    to_wall(&mut h, 3.0);
+    tools::select(h.state_mut().state_mut(), Tool::Measure);
+    h.step();
+    let view = h.state().layout().view;
+    let y = view.center().y;
+    for dx in [-260.0, 260.0] {
+        click(&mut h, egui::pos2(view.center().x + dx, y));
+    }
+    let measurements = &h.state().state().measurements;
+    eprintln!("Messungen: {measurements:?}");
+    for m in measurements {
+        eprintln!("Abstand {}", text::meters(m.distance()));
+    }
+    // the pointer off the view, so that no tooltip covers it
+    h.event(egui::Event::PointerGone);
+    for _ in 0..3 {
+        h.step();
+    }
+    shot(&mut h, &dir, "werkzeuge");
+    // a picked point in the info, and the cut above the tools
+    tools::select(h.state_mut().state_mut(), Tool::Pick);
+    h.step();
+    click(&mut h, egui::pos2(view.center().x, y + 40.0));
+    tools::select(h.state_mut().state_mut(), Tool::Cut);
+    h.event(egui::Event::PointerGone);
+    for _ in 0..3 {
+        h.step();
+    }
+    shot(&mut h, &dir, "werkzeuge_schnitt");
 }
 
 /// Orbits around the nearest point straight ahead (+x) of the middle of the cloud, at

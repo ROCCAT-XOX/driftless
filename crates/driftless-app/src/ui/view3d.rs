@@ -4,10 +4,13 @@
 //! ([`select_nodes`]) within the point budget; a frame whose camera, size and settings are
 //! unchanged is not drawn again.
 //!
-//! Mouse and keys: orbiting with the left button, panning with the right or middle button
-//! or Shift, zooming with the wheel; flying with W/A/S/D and Q/E, looking with the right
-//! button, Shift faster; F or a double click into the empty = show everything; a click
-//! without dragging picks a point, or, in the mode „Stellen wählen“, a pose of the trajectory.
+//! Mouse and keys: the left button orbits (in fly mode: looks), with the tool „Verschieben“
+//! ([`Tool::Pan`]) it pans; panning with the right or middle button or Shift, zooming with the
+//! wheel; flying with W/A/S/D and Q/E, looking with the right button, Shift faster; F or a
+//! double click into the empty = show everything. A click without dragging picks a point with
+//! the tools „Punkt wählen“ and „Messen“ ([`Tool::picks_points`]), and in the mode „Stellen
+//! wählen“ a pose of the trajectory whatever the tool. The info, the tools and the
+//! measurements over the view are drawn by [`super::tools`].
 //!
 //! Over the cloud the view draws the run of [`ViewOverlay`] (trajectory, odometry, loops,
 //! anchors, picked places); without a cloud the run alone. The height cut applies to the
@@ -20,6 +23,7 @@
 //! frame (about [`UPLOAD_SLICE_BYTES`]), the surface shown before stays until the last page is
 //! up. Picking still looks at points only.
 
+use super::tools::Tool;
 use super::{text, ViewSettings};
 use crate::camera::{fly_motion, Camera, CameraMode, FlyKeys, ZOOM_FACTOR};
 use crate::cloud::{LoadedCloud, DEFAULT_POINT_M};
@@ -70,6 +74,9 @@ const TIMER_POLL: Duration = Duration::from_millis(16);
 /// [`super::theme::view_background`] shows behind the points.
 const CLEAR: [f32; 4] = [0.0; 4];
 const MARKER_COLOR: u32 = 0xffff_ffff;
+/// The legend of a comparison starts this far below the top of the view (points), under the
+/// floating switch at the top right.
+const LEGEND_TOP: f32 = 56.0;
 
 /// What the view reports from a click.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,13 +122,13 @@ fn paint_legend(painter: &egui::Painter, rect: Rect, run: &RunOverlay, font: egu
     else {
         return;
     };
-    let mut y = rect.top() + 6.0;
+    let mut y = rect.top() + LEGEND_TOP;
     for (name, [r, g, b]) in names.iter().zip([COMPARE_COLOR, COMPARE_B_COLOR]) {
         let color = Color32::from_rgb(r, g, b);
         let galley = painter.layout_no_wrap(name.clone(), font.clone(), color);
         let at = egui::pos2(rect.right() - 8.0 - galley.size().x, y);
         let back = Rect::from_min_size(at, galley.size()).expand(3.0);
-        painter.rect_filled(back, 3.0, Color32::from_black_alpha(200));
+        painter.rect_filled(back, 3.0, super::theme::DARK.float_fill);
         y = back.bottom() + 4.0;
         painter.galley(at, galley, color);
     }
@@ -287,6 +294,8 @@ pub struct View3d {
     press: Option<Press>,
     /// The picked point (index in the point set), marked in the view.
     picked: Option<u32>,
+    /// What the left button and a click do.
+    tool: Tool,
     /// The height cut of this frame (picking uses it too).
     z_range: [f32; 2],
     /// What the overlay on the GPU shows, and how often it was replaced.
@@ -380,6 +389,21 @@ impl View3d {
     /// For tools and measurements that move the camera themselves.
     pub fn camera_mut(&mut self) -> &mut Camera {
         &mut self.camera
+    }
+
+    /// What the left button and a click do from the next frame on.
+    pub fn set_tool(&mut self, tool: Tool) {
+        self.tool = tool;
+    }
+
+    /// Marks point `index` of the cloud (index in the point set), or none.
+    pub fn set_picked(&mut self, index: Option<u32>) {
+        self.picked = index;
+    }
+
+    /// Shows everything at the next frame (the button „Alles“, as the key `F`).
+    pub fn frame_all(&mut self) {
+        self.frame_all = true;
     }
 
     /// Fills `ui` with the view of `cloud` and `overlay` (nothing to draw without either or
@@ -509,9 +533,6 @@ impl View3d {
 
         self.z_range = settings.cut.unwrap_or(NO_CUT);
         let event = self.input(ui, &response, rect, ppp, viewport, cloud, overlay, settings);
-        if let Some(ViewEvent::PickedPoint(i)) = event {
-            self.picked = Some(i);
-        }
         self.update_overlay(device, cloud, overlay, settings);
 
         // The target follows the panel size; egui shows it under one texture id.
@@ -619,45 +640,7 @@ impl View3d {
             super::theme::view_background(ui.painter(), rect);
             ui.painter().image(id, rect, uv, Color32::WHITE);
         }
-        let stats = match self.surface {
-            // the surface alone: its triangles, not „0 von 0 Punkten“
-            Some(s)
-                if self
-                    .last
-                    .as_ref()
-                    .is_some_and(|k| k.show == ShowMode::Surface) =>
-            {
-                text::surface_stats(s.triangles, self.frame_ms, self.gpu_timed)
-            }
-            _ => text::drawn_stats(
-                self.drawn_points,
-                cloud.map_or(0, |c| c.points.len()),
-                self.frame_ms,
-                self.gpu_timed,
-            ),
-        };
-        let help = match settings.camera_mode {
-            _ if overlay.is_some_and(|o| o.pick_places) => text::VIEW_HELP_PICK,
-            CameraMode::Orbit => text::VIEW_HELP_ORBIT,
-            CameraMode::Fly => text::VIEW_HELP_FLY,
-        };
-        let font = egui::TextStyle::Small.resolve(ui.style());
         let painter = ui.painter_at(rect);
-        let corner = rect.left_top() + egui::vec2(8.0, 6.0);
-        let shown = painter.text(
-            corner,
-            egui::Align2::LEFT_TOP,
-            stats,
-            font.clone(),
-            Color32::LIGHT_GRAY,
-        );
-        painter.text(
-            egui::pos2(corner.x, shown.bottom() + 2.0),
-            egui::Align2::LEFT_TOP,
-            help,
-            font,
-            Color32::GRAY,
-        );
         if let Some(o) = overlay {
             let body = egui::TextStyle::Body.resolve(ui.style());
             if settings.show_compare {
@@ -691,7 +674,7 @@ impl View3d {
         let label = |at: egui::Pos2, s: String, color: Color32| {
             let galley = painter.layout_no_wrap(s, font.clone(), color);
             let r = Rect::from_min_size(at, galley.size()).expand(2.0);
-            painter.rect_filled(r, 3.0, Color32::from_black_alpha(200));
+            painter.rect_filled(r, 3.0, super::theme::DARK.float_fill);
             painter.galley(at, galley, color);
         };
         let [r, g, b] = PICK_COLOR;
@@ -716,7 +699,7 @@ impl View3d {
             .pick(&vp, viewport, pixel, PICK_RADIUS * ppp, o.avoid_submap)
         {
             let s = text::pose_hover(o.run.time_of(i), o.run.submap_of(i));
-            label(pos + egui::vec2(14.0, 10.0), s, Color32::WHITE);
+            label(pos + egui::vec2(14.0, 10.0), s, super::theme::DARK.text);
         }
     }
 
@@ -785,9 +768,11 @@ impl View3d {
         let shift = ctx.input(|i| i.modifiers.shift);
         let delta = response.drag_delta() * ppp;
         let by = |b| response.dragged_by(b);
+        // the tool „Verschieben“ pans with the left button; every other tool turns
+        let left_pans = self.tool == Tool::Pan;
         match mode {
             CameraMode::Orbit => {
-                if by(PointerButton::Primary) && !shift {
+                if by(PointerButton::Primary) && !shift && !left_pans {
                     self.camera.orbit(delta.x, delta.y);
                 } else if by(PointerButton::Primary)
                     || by(PointerButton::Secondary)
@@ -797,7 +782,9 @@ impl View3d {
                 }
             }
             CameraMode::Fly => {
-                if by(PointerButton::Primary) || by(PointerButton::Secondary) {
+                if by(PointerButton::Primary) && left_pans {
+                    self.camera.pan(delta.x, delta.y, viewport);
+                } else if by(PointerButton::Primary) || by(PointerButton::Secondary) {
                     self.camera.look(delta.x, delta.y);
                 } else if by(PointerButton::Middle) {
                     self.camera.pan(delta.x, delta.y, viewport);
@@ -869,7 +856,7 @@ impl View3d {
                                 .pick(&vp, viewport, pixel, radius, o.avoid_submap)
                                 .map(ViewEvent::PickedPose)
                         }
-                        (None, Some(cloud)) => pick_point_in(
+                        (None, Some(cloud)) if self.tool.picks_points() => pick_point_in(
                             &cloud.tree,
                             &self.drawn,
                             &self.camera,
@@ -879,7 +866,7 @@ impl View3d {
                             z_range,
                         )
                         .map(|v| ViewEvent::PickedPoint(cloud.tree.source[v as usize])),
-                        (None, None) => None,
+                        (None, _) => None,
                     };
                 }
             }
