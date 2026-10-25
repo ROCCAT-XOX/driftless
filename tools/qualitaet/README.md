@@ -35,7 +35,17 @@ Raummaß-Spanne (Ziel Z5). Die Tabelle zeigt die Spanne auch ohne `cross` (Zeile
 
 Die Zeilen „Programm: …“ der Tabelle sind die Kennwerte, die das Programm selbst berechnet
 (`map.json` → `steps.clean.stats.dense_quality`, `oberflaeche.json` → `stats.accuracy_dense`), die
-Zeilen „dense: …“ derselbe Wert nach der Python-Definition. Beide sollen innerhalb 1 mm liegen.
+Zeilen „dense: …“ der Wert nach der Python-Definition (`refine`). Das sind nicht dieselben Zahlen:
+
+- Grundgesamtheit: Rust misst alle ebenen 30-cm-3D-Zellen der ganzen Wolke (auch Möbel), Python
+  Flecken auf den höchstens 12 größten Raumebenen, nach dem 5°/1-cm-Objektfilter.
+- Aggregation: Rust nimmt das p90 über Zellen, Python den Median über Ebenen des p90 je Ebene.
+  Das Rauschen je Durchgang ist in beiden der Median über Flecken/Zellen.
+- Eine Wand näher als etwa 1 cm an einer Zellfläche wird auf zwei Zellen verteilt; das kann ihren
+  Versatz verdecken und drückt den Rust-Versatz nach unten.
+
+Es gilt die Regel aus der Spezifikation: liegen beide innerhalb 1 mm, passt es, sonst zählt der
+Python-Wert.
 
 ### Löcher (Ziel Z1, `q_images.sh`)
 

@@ -6,6 +6,20 @@
 //! the passes' mean levels over the plane are compared. A single pass is as thick as the
 //! sensor noise; two passes that disagree add their offset on top, which no smoothing of a
 //! single pass can remove.
+//!
+//! # How the figures relate to the campaign's Python analysis
+//! `tools/qualitaet/q_analyze.py` (`refine`) measures patches on the (at most 12) largest room
+//! planes, after a 5 degree / 1 cm filter that drops objects, and takes the per-plane aggregate
+//! (median over planes of the per-plane p90). This module has no planes: it measures every
+//! planar 30 cm cell of the whole cloud, furniture included, and aggregates over cells. So:
+//! - the population differs (all planar cells vs. room-plane patches without objects);
+//! - `pass_offset_p90_mm` is the p90 over cells, not a median over planes of per-plane p90;
+//! - `within_pass_rms_mm` is, as in Python, the median over cells of each cell's within-pass RMS;
+//! - a wall within about 1 cm of a cell face is split over two cells, which can hide its offset
+//!   (each part sees fewer or only one pass), so the offset here is biased downwards.
+//!
+//! The figures are therefore comparable, not identical. The campaign's rule applies: they agree
+//! if within 1 mm, otherwise the Python value counts.
 
 use crate::clean::{spread_axes, Moments};
 use driftless_odom::voxel_map::{FixedState, VoxelKey};
@@ -36,10 +50,12 @@ pub struct PassQuality {
     pub local_rms_mm: Option<f64>,
     /// Median over patches of the span between the 2.5 % and 97.5 % quantile of the distances.
     pub thickness95_mm: Option<f64>,
-    /// RMS distance of the points to their own pass's level, over all counted passes.
+    /// Median over patches of the RMS distance of the points to their own pass's level (only
+    /// passes with enough points count; patches without such a pass do not enter).
     pub within_pass_rms_mm: Option<f64>,
     /// Median and 90 % quantile over multi-pass patches of the distance between the highest
-    /// and the lowest pass level.
+    /// and the lowest pass level. The p90 is taken over cells (there are no planes here), unlike
+    /// Python's median over planes of per-plane p90.
     pub pass_offset_median_mm: Option<f64>,
     pub pass_offset_p90_mm: Option<f64>,
 }
@@ -48,8 +64,8 @@ pub struct PassQuality {
 struct Patch {
     rms: f64,
     thickness95: f64,
-    /// Sum of squares and count of the residuals to the pass levels.
-    within: (f64, usize),
+    /// RMS of the residuals to the pass levels; `None` if no pass was big enough.
+    within: Option<f64>,
     /// Highest minus lowest pass level; needs two passes.
     offset: Option<f64>,
 }
@@ -80,16 +96,13 @@ pub fn pass_quality(xyz: &[[f32; 3]], t: &[f64]) -> PassQuality {
         .collect();
 
     let multi: Vec<f64> = patches.iter().filter_map(|p| p.offset).collect();
-    let (within_sq, within_n) = patches
-        .iter()
-        .fold((0.0, 0usize), |a, p| (a.0 + p.within.0, a.1 + p.within.1));
     let mm = |m: f64| m * 1000.0;
     PassQuality {
         patches: patches.len(),
         patches_multi_pass: multi.len(),
         local_rms_mm: median(patches.iter().map(|p| p.rms).collect()).map(mm),
         thickness95_mm: median(patches.iter().map(|p| p.thickness95).collect()).map(mm),
-        within_pass_rms_mm: (within_n > 0).then(|| mm((within_sq / within_n as f64).sqrt())),
+        within_pass_rms_mm: median(patches.iter().filter_map(|p| p.within).collect()).map(mm),
         pass_offset_median_mm: median(multi.clone()).map(mm),
         pass_offset_p90_mm: quantile_sorted(&sorted(multi), 0.9).map(mm),
     }
@@ -125,7 +138,7 @@ fn patch(xyz: &[[f32; 3]], t: &[f64], key: &VoxelKey, idx: &[u32]) -> Option<Pat
         .map(|(&i, &r)| (t[i as usize], r))
         .collect();
     timed.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-    let mut within = (0.0, 0usize);
+    let (mut within_sq, mut within_n) = (0.0, 0usize);
     let mut levels = Vec::new();
     let mut start = 0;
     for end in 1..=timed.len() {
@@ -138,8 +151,8 @@ fn patch(xyz: &[[f32; 3]], t: &[f64], key: &VoxelKey, idx: &[u32]) -> Option<Pat
             continue;
         }
         let level = median(pass.iter().map(|p| p.1).collect())?;
-        within.0 += pass.iter().map(|p| (p.1 - level).powi(2)).sum::<f64>();
-        within.1 += pass.len();
+        within_sq += pass.iter().map(|p| (p.1 - level).powi(2)).sum::<f64>();
+        within_n += pass.len();
         levels.push(level);
     }
     let offset = (levels.len() >= 2).then(|| {
@@ -150,7 +163,7 @@ fn patch(xyz: &[[f32; 3]], t: &[f64], key: &VoxelKey, idx: &[u32]) -> Option<Pat
     Some(Patch {
         rms,
         thickness95,
-        within,
+        within: (within_n > 0).then(|| (within_sq / within_n as f64).sqrt()),
         offset,
     })
 }
@@ -228,6 +241,30 @@ mod tests {
         assert!((offset - 8.0).abs() < 0.5, "{q:?}");
         assert!(q.patches_multi_pass > 0, "{q:?}");
         assert!(q.within_pass_rms_mm.unwrap() < 1.5, "{q:?}");
+    }
+
+    #[test]
+    fn within_pass_rms_is_median_over_cells() {
+        // Three single-pass cells on a wall at x = 0.1 with jitter of +-1, +-1 and +-9 mm:
+        // per-cell RMS 0.58, 0.58 and 5.2 mm. The median is 0.58; one pooled RMS would be ~3.
+        let (mut xyz, mut t) = (Vec::new(), Vec::new());
+        for (cell, amp) in [(0, 1.0f32), (1, 1.0), (2, 9.0)] {
+            let mut j = Jitter(0x9E37_79B9_7F4A_7C15 + cell as u64);
+            for iy in 0..60 {
+                for iz in 0..60 {
+                    xyz.push([
+                        0.1 + amp * j.next(),
+                        0.01 + cell as f32 * 0.3 + iy as f32 * 0.005,
+                        0.01 + iz as f32 * 0.005,
+                    ]);
+                    t.push(f64::from(iy * 60 + iz) * 1e-3);
+                }
+            }
+        }
+        let q = pass_quality(&xyz, &t);
+        assert_eq!(q.patches, 3, "{q:?}");
+        let w = q.within_pass_rms_mm.unwrap();
+        assert!((w - 0.58).abs() < 0.1, "median expected, got {w} ({q:?})");
     }
 
     #[test]

@@ -773,7 +773,8 @@ mod tests {
 
     #[test]
     fn dense_wall_is_unchanged() {
-        // 4 votes in every fine voxel the wall crosses: the coarse grid is never asked.
+        // 4 votes in every fine voxel the wall crosses, so the fallback adds no face: voxels 4-8 off
+        // the wall do get coarse values, but they yield no faces, so the mesh is unchanged.
         let scan = wall_x(2.003, 1.0, 0.01, |_, _| true);
         let (off, _) = build_mesh(&scan.input(), &one_cm(false), &Progress::new()).unwrap();
         let (on, stats) = build_mesh(&scan.input(), &one_cm(true), &Progress::new()).unwrap();
