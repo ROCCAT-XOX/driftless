@@ -110,8 +110,13 @@ for name, fn, nd in ROWS:
 # Z5: spread of the clean room dimensions over the black-room scans (as `q_analyze.py cross` reports)
 black = [m for s, m in ms.items() if s.startswith("2026102213")]
 if len(black) > 1:
+    # Horizontal axes can be swapped between scans (near-square room): sort short/long per scan
+    dims = []
+    for m in black:
+        d = [g(m, "clean", "dims", ax, "dist_m") for ax in "xyz"]
+        dims.append(None if None in d else (*sorted(d[:2]), d[2]))
     sp = []
-    for ax in "xyz":
-        v = [g(m, "clean", "dims", ax, "dist_m") for m in black]
-        sp.append(f((max(v) - min(v)) * 1e3) if None not in v else "–")
-    print(f"\nRaummaße Spanne der {len(black)} Schwarzraum-Scans x / y / z (mm, clean): " + " / ".join(sp))
+    for i in range(3):
+        v = [d[i] for d in dims if d is not None]
+        sp.append(f((max(v) - min(v)) * 1e3) if v and len(v) == len(dims) else "–")
+    print(f"\nRaummaße Spanne der {len(black)} Schwarzraum-Scans kurz / lang / Höhe (mm, clean): " + " / ".join(sp))
