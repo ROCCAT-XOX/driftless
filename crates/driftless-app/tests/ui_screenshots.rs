@@ -809,3 +809,151 @@ fn to_wall(h: &mut Harness<'_, DriftlessApp>, distance: f32) {
         h.step();
     }
 }
+
+/// The acceptance pictures of Baustein 4 over a real scan in a project, as `daten.png`,
+/// `bilder.png`, `messen.png`, `planung.png`, `flecken.png` and `daten-2x.png` (scale 2) in
+/// `$DRIFTLESS_SHOTS`. `$DRIFTLESS_SCAN` is a scan folder whose run `driftless/` (made with the
+/// CLI) holds a coloured map and its surfaces; the project lives in `$DRIFTLESS_WORK` (default
+/// `$DRIFTLESS_SHOTS`). Nothing is computed and nothing is written into the scan. Run with
+///
+/// ```text
+/// DRIFTLESS_SHOTS=… DRIFTLESS_WORK=… DRIFTLESS_SCAN=…/20261022133554 cargo test \
+///     -p driftless-app --test ui_screenshots acceptance_screenshots -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "writes pictures; needs $DRIFTLESS_SHOTS, $DRIFTLESS_SCAN and a GPU"]
+fn acceptance_screenshots() {
+    let (Some(dir), Some(scan)) = (
+        std::env::var_os("DRIFTLESS_SHOTS").map(PathBuf::from),
+        std::env::var_os("DRIFTLESS_SCAN").map(PathBuf::from),
+    ) else {
+        eprintln!("DRIFTLESS_SHOTS oder DRIFTLESS_SCAN nicht gesetzt, Test übersprungen");
+        return;
+    };
+    if headless_device().is_none() {
+        eprintln!("kein GPU-Adapter, Test übersprungen");
+        return;
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let work = std::env::var_os("DRIFTLESS_WORK").map_or(dir.clone(), PathBuf::from);
+    let project_dir = work.join("projekt-abnahme");
+    let _ = std::fs::remove_dir_all(&project_dir);
+    let mut project = Project::create(&project_dir, "Schwarzer Raum").unwrap();
+    let id = project.add_scan(&scan).unwrap();
+    project.add_run(&id, &scan.join("driftless")).unwrap();
+    project.save().unwrap();
+
+    // The app with the project open and the colour cloud of its map loaded, at `ppp`.
+    // with timestamps, as the program asks for them: the info shows the GPU time of a frame,
+    // not the time between the frames of the harness
+    let open = |ppp: f32| {
+        let setup = match default_wgpu_setup() {
+            egui_wgpu::WgpuSetup::CreateNew(s) => {
+                egui_wgpu::WgpuSetup::CreateNew(driftless_app::render::with_timestamps(s))
+            }
+            other => other,
+        };
+        let rs = create_render_state(setup, egui_wgpu::RendererOptions::PREDICTABLE);
+        let mut app = DriftlessApp::new(Arc::new(|| {})).with_render_state(rs.clone());
+        app.apply(Action::OpenProject(project_dir.clone()));
+        let mut h = Harness::builder()
+            .with_size(SIZE)
+            .with_pixels_per_point(ppp)
+            .renderer(WgpuTestRenderer::from_render_state(rs))
+            .build_ui_state(|ui, app: &mut DriftlessApp| app.show(ui), app);
+        let deadline = Instant::now() + Duration::from_secs(300);
+        while h.state().wants_repaint_while_busy() {
+            h.step();
+            assert!(Instant::now() < deadline, "statuses not read");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let map = h.state().state().scans[0].runs[0].maps[0].clone();
+        let cloud = map
+            .clouds
+            .iter()
+            .find(|c| c.ends_with("color.las"))
+            .expect("color.las in the map")
+            .clone();
+        h.state_mut().apply(Action::Select(Selection::Cloud(cloud)));
+        wait_loaded(&mut h);
+        h.event(egui::Event::PointerGone);
+        // a few frames more: the GPU time shown is read some frames after it was measured
+        for _ in 0..20 {
+            h.state_mut().view_mut().camera_mut().yaw += 1e-4;
+            h.step();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (h, map)
+    };
+    let (mut h, map) = open(1.0);
+    eprintln!("Karte {} ({} Oberflächen)", map.label, map.surfaces.len());
+    shot(&mut h, &dir, "daten");
+
+    // Bilder: the surface of 2 cm from the list, from above with the ceiling cut away
+    h.state_mut().apply(Action::SetStep(Step::Bilder));
+    h.step();
+    let surface = map
+        .surfaces
+        .iter()
+        .rev()
+        .find(|s| s.label.ends_with("2cm"))
+        .or(map.surfaces.last())
+        .expect("a surface in the map")
+        .clone();
+    h.state_mut()
+        .apply(Action::Select(Selection::Surface(surface.dir.clone())));
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while h.state().is_loading_surface() || h.state().view().is_uploading_surface() {
+        h.step();
+        assert!(Instant::now() < deadline, "surface not loaded");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    h.state_mut().apply(Action::SetStep(Step::Bilder));
+    let cloud = h.state().state().cloud.clone().expect("cloud");
+    let ceiling = cloud.ceiling.unwrap_or(cloud.z_range[1]);
+    h.state_mut().state_mut().view.cut = Some([cloud.z_range[0], ceiling]);
+    h.state_mut().apply(Action::FrameAll);
+    let camera = h.state_mut().view_mut().camera_mut();
+    camera.pitch = -70f32.to_radians();
+    for _ in 0..3 {
+        h.step();
+    }
+    shot(&mut h, &dir, "bilder");
+
+    // Messen: in „Planung“, 3 m in front of a wall, two points on it
+    h.state_mut().apply(Action::SetStep(Step::Planung));
+    h.state_mut().state_mut().view.cut = None;
+    to_wall(&mut h, 3.0);
+    tools::select(h.state_mut().state_mut(), Tool::Measure);
+    h.step();
+    let view = h.state().layout().view;
+    let y = view.center().y;
+    for dx in [-260.0, 260.0] {
+        click(&mut h, egui::pos2(view.center().x + dx, y));
+    }
+    for m in &h.state().state().measurements {
+        eprintln!("Messung {}", text::meters(m.distance()));
+    }
+    h.event(egui::Event::PointerGone);
+    shot(&mut h, &dir, "messen");
+
+    // Planung: the list of measurements beside the whole cloud
+    tools::select(h.state_mut().state_mut(), Tool::Orbit);
+    h.state_mut().apply(Action::FrameAll);
+    for _ in 0..3 {
+        h.step();
+    }
+    shot(&mut h, &dir, "planung");
+
+    // Flecken: the points in world size 1.2 m in front of the wall (the measurement cleared)
+    h.state_mut().apply(Action::SetStep(Step::Daten));
+    h.state_mut().state_mut().measurements.clear();
+    h.state_mut().state_mut().view.point_size = driftless_app::render::PointSize::World;
+    to_wall(&mut h, 1.2);
+    shot(&mut h, &dir, "flecken");
+    drop(h);
+
+    // „Daten“ again at scale 2
+    let (mut h, _) = open(2.0);
+    shot(&mut h, &dir, "daten-2x");
+}
