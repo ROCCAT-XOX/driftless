@@ -11,6 +11,13 @@
 //!    shared edges first) if that image sees all its faces with at least [`MERGE_MIN_SCORE`] of
 //!    their best score. ICM alone cannot do this: inside a small chart every face agrees with
 //!    its neighbours. Each chart costs a border on the page and a seam around it.
+//!    Then islands ([`absorb_islands`]): a chart of fewer than [`ISLAND_FACES`] faces takes the
+//!    image of the neighbouring chart with the most shared edges whose camera sees all its faces
+//!    by geometry alone (inside the image rim, within the colour range, facing the camera; no
+//!    depth test, no view scores), where [`merge_small_charts`] finds no image with a recorded
+//!    view of them all. Black room S1 at 1 cm: 221,097 → 79,750 charts, half the seam samples,
+//!    `.glb` 111 → 96 MB; at 2 cm: 59,142 → 35,902 charts; the office at 1 cm: 2,026,134 →
+//!    808,938. The mesh is not touched (wall accuracy the same to the micrometre).
 //! 2. **Charts** ([`bake`]): connected faces (over shared edges) with the same label. A chart is
 //!    the image region its faces project to (full resolution, [`Camera::project`]): the
 //!    smallest rectangle around it ([`best_axis`]: one side along an edge of the region's convex
@@ -76,6 +83,8 @@ pub const MERGE_FACES: usize = 64;
 pub const MERGE_MIN_SCORE: f32 = 0.25;
 /// Rounds of merging.
 pub const MERGE_ROUNDS: usize = 4;
+/// A chart of fewer faces is an island (see [`absorb_islands`]).
+pub const ISLAND_FACES: usize = 8;
 /// Border around every chart (texels), filled by dilation.
 pub const MARGIN: u32 = 2;
 /// Edge of the gray block of the unseen faces (texels), at the origin of page 0.
@@ -149,6 +158,9 @@ pub struct TextureStats {
     pub texels_total: u64,
     /// Share of those texels that triangles cover (before the border is filled).
     pub fill_ratio: f64,
+    /// Tiny label islands (fewer than `ISLAND_FACES` faces) merged into a neighbouring chart
+    /// before baking; set by `texture_mesh`, 0 from `bake`.
+    pub islands_absorbed: usize,
 }
 
 /// Edge neighbours of every face (faces sharing an edge, either winding), in CSR form.
@@ -397,6 +409,133 @@ fn pack(sizes: &[[u32; 2]], page: u32, keep_first: bool) -> (Vec<(u32, [u32; 2])
     }
     let pages = if sizes.is_empty() { 0 } else { pg + 1 };
     (at, pages)
+}
+
+/// Islands take the image of their surroundings: a chart of fewer than [`ISLAND_FACES`] faces
+/// (typically a face without a recorded view of the neighbouring image, or one ICM left alone
+/// between its neighbours; faces without any view are labelled `None` and never absorbed)
+/// takes the image of a neighbouring chart, tried in the order of most shared edges, then lowest
+/// image index.
+///
+/// Two guards were tried and dropped: an enclosure guard (image `l` only if it has at least 2/3
+/// of the island's border edges) and a guard on the island's own summed normal facing the
+/// camera. Measured on the black room S1, charts at 2 cm went 59,142 → 35,902 without guards
+/// against 49,926 with both, and `seam_step` mean 20.5 → 17.9 against 20.0; at 1 cm the guards
+/// made `seam_step` rise 21.9 → 23.6. The enclosure guard alone held back most (38,664 charts
+/// without it); the own-facing guard blocks the noise faces that point away, exactly the
+/// islands at fault. A side-by-side render of the most-changed regions showed no misplaced
+/// colours. Remaining risk: a small separate object (fewer than [`ISLAND_FACES`] faces)
+/// bordering a surface may take that surface's image.
+///
+/// The camera of `l` must see every face of the island geometrically: all corners project into
+/// the image within [`ColorConfig::rim_theta`] of the optical axis, the centroid is within
+/// [`ColorConfig::max_dist`] of the camera, and the area-weighted summed normal of the island
+/// and of the faces around it (other charts) faces the camera. There is no depth test and no
+/// per-face facing test (the views are not read). With `smooth_weight == 0` nothing is changed
+/// and 0 is returned (the labels are then the best view per face). Charts are taken in chart
+/// order, from the labels as they stood at the start of the round; up to [`MERGE_ROUNDS`]
+/// rounds, ending at a round that changes nothing. Returns the number of islands taken over all rounds.
+///
+/// [`ColorConfig::rim_theta`]: crate::ColorConfig::rim_theta
+/// [`ColorConfig::max_dist`]: crate::ColorConfig::max_dist
+pub(crate) fn absorb_islands(
+    mesh: &Mesh,
+    views: &ViewTable,
+    cams: &[crate::ColorCamera],
+    cfg: &SurfaceConfig,
+    labels: &mut [Option<u32>],
+) -> usize {
+    if cfg.smooth_weight == 0.0 {
+        return 0;
+    }
+    let n = labels.len();
+    let nb = Neighbours::new(mesh);
+    let w2c: Vec<Isometry3<f64>> = views
+        .images
+        .iter()
+        .map(|i| i.world_from_cam.inverse())
+        .collect();
+    let mut total = 0;
+    for _ in 0..MERGE_ROUNDS {
+        let (chart_of, start, faces) = connected(&nb, n, |f| labels[f]);
+        let small: Vec<usize> = (0..start.len() - 1)
+            .filter(|&c| start[c + 1] - start[c] < ISLAND_FACES)
+            .collect();
+        let picks: Vec<Option<(usize, u32)>> = small
+            .par_iter()
+            .map(|&c| {
+                let own = &faces[start[c]..start[c + 1]];
+                let label = labels[own[0] as usize];
+                let mut around: Vec<u32> = Vec::new();
+                let mut normal = [0.0f64; 3];
+                let mut add = |f: usize| {
+                    let nn = mesh.face_normal(f);
+                    let a = f64::from(mesh.face_area(f));
+                    for k in 0..3 {
+                        normal[k] += f64::from(nn[k]) * a;
+                    }
+                };
+                for &f in own {
+                    add(f as usize);
+                    for &g in nb.of(f as usize) {
+                        if chart_of[g as usize] != c as u32 {
+                            add(g as usize);
+                            if let Some(l) = labels[g as usize].filter(|&l| Some(l) != label) {
+                                around.push(l);
+                            }
+                        }
+                    }
+                }
+                around.sort_unstable();
+                let mut counted: Vec<(usize, u32)> = around
+                    .chunk_by(|a, b| a == b)
+                    .map(|r| (r.len(), r[0]))
+                    .collect();
+                counted.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                let sees = |l: u32| {
+                    let img = &views.images[l as usize];
+                    let Some(cam) = cams.get(img.camera) else {
+                        return false;
+                    };
+                    let eye = img.world_from_cam.translation.vector;
+                    own.iter().all(|&f| {
+                        let tri = mesh.indices[f as usize];
+                        let mut centre = Vector3::zeros();
+                        for &i in &tri {
+                            let w = Vector3::from(mesh.positions[i as usize]).cast::<f64>();
+                            centre += w / 3.0;
+                            let pc = w2c[l as usize] * Point3::from(w);
+                            if pc.coords.x.hypot(pc.coords.y).atan2(pc.coords.z)
+                                > cfg.color.rim_theta
+                                || cam.camera.project(&pc.coords).is_none()
+                            {
+                                return false;
+                            }
+                        }
+                        let d = eye - centre;
+                        d.norm() <= cfg.color.max_dist
+                            && normal[0] * d.x + normal[1] * d.y + normal[2] * d.z > 0.0
+                    })
+                };
+                counted
+                    .iter()
+                    .find(|&&(_, l)| sees(l))
+                    .map(|&(_, l)| (c, l))
+            })
+            .collect();
+        let mut changed = 0;
+        for (c, l) in picks.into_iter().flatten() {
+            for &f in &faces[start[c]..start[c + 1]] {
+                labels[f as usize] = Some(l);
+            }
+            changed += 1;
+        }
+        total += changed;
+        if changed == 0 {
+            break;
+        }
+    }
+    total
 }
 
 /// Calls `f(i, j, barycentric)` for every texel `(i, j)` of a `width × height` grid whose
@@ -855,6 +994,7 @@ pub(crate) fn bake(
         } else {
             0.0
         },
+        islands_absorbed: 0,
     };
     Ok((
         TexturedMesh {
@@ -1912,5 +2052,228 @@ mod tests {
         gone.images.topics = vec!["/camera_nichts/image_raw".into()];
         let r = bake(&mesh, &labels, &views, &gone, &cfg, &Progress::new());
         assert!(matches!(r, Err(MapError::Images(_))), "{r:?}");
+    }
+
+    /// A 100 × 80 pinhole camera (90° wide) for the island tests.
+    fn island_camera() -> ColorCamera {
+        ColorCamera {
+            camera: Camera {
+                name: "test".into(),
+                width: 100,
+                height: 80,
+                fx: 50.0,
+                fy: 50.0,
+                cx: 49.5,
+                cy: 39.5,
+                model: driftless_io::calib::CameraModel::Pinhole,
+                max_theta: std::f64::consts::FRAC_PI_2,
+            },
+            cam_in_body: Isometry3::identity(),
+        }
+    }
+
+    /// `open_wall(20, 0.1)` is the plane x = 0 over y, z in 0…2, normals along +x. A pose 3 m
+    /// in front of its middle looking at it (`yaw` = −90°), or behind it looking at its back.
+    fn wall_pose(x: f64, yaw: f64, roll: f64) -> Isometry3<f64> {
+        use nalgebra::{Translation3, UnitQuaternion};
+        let r = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), roll)
+            * UnitQuaternion::from_axis_angle(&Vector3::y_axis(), yaw);
+        Isometry3::from_parts(Translation3::new(x, 1.0, 1.0), r)
+    }
+
+    fn island_views(poses: &[Isometry3<f64>], cameras: &[usize]) -> ViewTable {
+        ViewTable {
+            images: poses
+                .iter()
+                .zip(cameras)
+                .enumerate()
+                .map(|(i, (p, &camera))| UsedImage {
+                    camera,
+                    stamp: i as f64,
+                    world_from_cam: *p,
+                })
+                .collect(),
+            per_face: Vec::new(),
+            gains: vec![[1.0; 3]; poses.len()],
+            vignetting: Vignetting::flat(1, 4.0),
+        }
+    }
+
+    /// Face `lower`/`upper` of the cell (`iy`, `iz`) of `open_wall(20, _)`.
+    fn cell_face(iy: usize, iz: usize, upper: bool) -> usize {
+        2 * (iy * 20 + iz) + usize::from(upper)
+    }
+
+    fn in_front() -> Isometry3<f64> {
+        wall_pose(3.0, -std::f64::consts::FRAC_PI_2, 0.0)
+    }
+
+    #[test]
+    fn island_without_view_takes_surrounding_image() {
+        let mesh = open_wall(20, 0.1);
+        let views = island_views(&[in_front(), in_front()], &[0, 0]);
+        let mut labels = vec![Some(0); mesh.indices.len()];
+        let mid = cell_face(10, 10, false);
+        labels[mid] = Some(1);
+        labels[0] = None;
+        labels[1] = None;
+        let cfg = SurfaceConfig::default();
+        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
+        assert_eq!(n, 1);
+        assert_eq!(labels[mid], Some(0));
+        assert_eq!((labels[0], labels[1]), (None, None));
+    }
+
+    #[test]
+    fn large_chart_stays() {
+        let mesh = open_wall(20, 0.1);
+        let views = island_views(&[in_front(), in_front()], &[0, 0]);
+        let mut labels = vec![Some(0); mesh.indices.len()];
+        for (iy, iz) in [(10, 10), (10, 11), (11, 10), (11, 11)] {
+            labels[cell_face(iy, iz, false)] = Some(1);
+            labels[cell_face(iy, iz, true)] = Some(1);
+        }
+        assert_eq!(ISLAND_FACES, 8);
+        let before = labels.clone();
+        let cfg = SurfaceConfig::default();
+        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
+        assert_eq!(n, 0);
+        assert_eq!(labels, before);
+    }
+
+    /// One island (label 1) in a wall of image 0, seen by the poses `poses` (images 0, 1).
+    fn lone_island(poses: [Isometry3<f64>; 2]) -> usize {
+        let mesh = open_wall(20, 0.1);
+        let views = island_views(&poses, &[0, 0]);
+        let mut labels = vec![Some(0); mesh.indices.len()];
+        labels[cell_face(10, 10, false)] = Some(1);
+        let cfg = SurfaceConfig::default();
+        absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels)
+    }
+
+    #[test]
+    fn island_outside_image_stays() {
+        // Image 0 turned 90° about z: the wall lies at 90° from its optical axis.
+        let turned = wall_pose(
+            3.0,
+            -std::f64::consts::FRAC_PI_2,
+            std::f64::consts::FRAC_PI_2,
+        );
+        assert_eq!(lone_island([in_front(), in_front()]), 1, "control");
+        assert_eq!(lone_island([turned, in_front()]), 0);
+    }
+
+    #[test]
+    fn island_facing_away_stays() {
+        let behind = wall_pose(-3.0, std::f64::consts::FRAC_PI_2, 0.0);
+        assert_eq!(lone_island([in_front(), in_front()]), 1, "control");
+        assert_eq!(lone_island([behind, in_front()]), 0);
+    }
+
+    /// A two-face island (cell 10, 10, label 2) in a wall; `label_at(iy, iz)` labels the rest.
+    fn quad_island(
+        label_at: impl Fn(usize, usize) -> u32,
+        smooth_weight: f32,
+    ) -> (usize, Vec<Option<u32>>) {
+        let mesh = open_wall(20, 0.1);
+        let views = island_views(&[in_front(), in_front()], &[0, 0]);
+        let mut labels = vec![Some(0); mesh.indices.len()];
+        for iy in 0..20 {
+            for iz in 0..20 {
+                for up in [false, true] {
+                    labels[cell_face(iy, iz, up)] = Some(label_at(iy, iz));
+                }
+            }
+        }
+        for up in [false, true] {
+            let f = cell_face(10, 10, up);
+            labels[f] = Some(2);
+        }
+        let cfg = SurfaceConfig {
+            smooth_weight,
+            ..SurfaceConfig::default()
+        };
+        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
+        (n, labels)
+    }
+
+    fn both_island_faces(labels: &[Option<u32>]) -> [Option<u32>; 2] {
+        [
+            labels[cell_face(10, 10, false)],
+            labels[cell_face(10, 10, true)],
+        ]
+    }
+
+    /// Image 1 left of / below the island, image 0 right of / above it: 2 + 2 border edges.
+    fn split_labels(iy: usize, iz: usize) -> u32 {
+        u32::from(iy < 10 || (iy == 10 && iz < 10))
+    }
+
+    #[test]
+    fn island_takes_lower_image_on_tie() {
+        // Equal shared edges with image 0 and 1, both cameras see it: the lower index wins.
+        let (n, labels) = quad_island(split_labels, 1.0);
+        assert_eq!(n, 1);
+        assert_eq!(both_island_faces(&labels), [Some(0), Some(0)]);
+    }
+
+    #[test]
+    fn smooth_weight_zero_absorbs_nothing() {
+        let (n, labels) = quad_island(|_, _| 0, 0.0);
+        assert_eq!(n, 0);
+        assert_eq!(both_island_faces(&labels), [Some(2), Some(2)]);
+    }
+
+    #[test]
+    fn island_without_neighbour_image_stays() {
+        let mesh = open_wall(20, 0.1);
+        let views = island_views(&[in_front(), in_front()], &[0, 0]);
+        let mut labels = vec![None; mesh.indices.len()];
+        labels[cell_face(10, 10, false)] = Some(1);
+        let cfg = SurfaceConfig::default();
+        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
+        assert_eq!(n, 0);
+        assert_eq!(labels[cell_face(10, 10, false)], Some(1));
+    }
+
+    #[test]
+    fn island_takes_image_with_most_shared_edges() {
+        // Image 1 on the side z < 1, image 0 beyond; the face (label 2) at the border has two
+        // neighbours of image 1 and one of image 0.
+        let mesh = open_wall(20, 0.1);
+        let views = island_views(&[in_front(), in_front(), in_front()], &[0, 0, 0]);
+        let mut labels: Vec<Option<u32>> = (0..mesh.indices.len())
+            .map(|f| {
+                Some(u32::from(
+                    super::super::testutil::centroid(&mesh, f)[2] < 1.0,
+                ))
+            })
+            .collect();
+        let f = cell_face(10, 9, true);
+        labels[f] = Some(2);
+        let cfg = SurfaceConfig::default();
+        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
+        assert_eq!(n, 1);
+        assert_eq!(labels[f], Some(1));
+    }
+
+    #[test]
+    fn unknown_camera_is_skipped() {
+        let mesh = open_wall(20, 0.1);
+        let views = island_views(&[in_front(), in_front()], &[0, 5]);
+        // The island (image 0) lies in image 1, whose camera does not exist.
+        let mut labels = vec![Some(1); mesh.indices.len()];
+        labels[cell_face(10, 10, false)] = Some(0);
+        let cfg = SurfaceConfig::default();
+        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn empty_input_absorbs_nothing() {
+        let views = island_views(&[], &[]);
+        let cfg = SurfaceConfig::default();
+        let n = absorb_islands(&Mesh::default(), &views, &[], &cfg, &mut []);
+        assert_eq!(n, 0);
     }
 }

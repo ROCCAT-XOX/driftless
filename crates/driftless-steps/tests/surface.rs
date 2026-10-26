@@ -118,6 +118,10 @@ fn surface_end_to_end() {
             > 0,
         "{report}"
     );
+    assert!(
+        report["stats"]["texture"]["islands_absorbed"].is_u64(),
+        "{report}"
+    );
     assert_eq!(report["axes"], "glb: Y oben; obj: Z oben");
     assert_eq!(report["input_id"].as_str().unwrap().len(), 16);
     assert!(report["stats"]["seconds"]["tsdf"].is_number());
