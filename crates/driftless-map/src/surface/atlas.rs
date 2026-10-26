@@ -83,7 +83,6 @@ pub const MERGE_MIN_SCORE: f32 = 0.25;
 /// Rounds of merging.
 pub const MERGE_ROUNDS: usize = 4;
 /// A chart of fewer faces is an island (see [`absorb_islands`]).
-#[cfg_attr(not(test), allow(dead_code))] // until `texture_mesh` calls `absorb_islands`
 pub const ISLAND_FACES: usize = 8;
 /// Border around every chart (texels), filled by dilation.
 pub const MARGIN: u32 = 2;
@@ -158,6 +157,9 @@ pub struct TextureStats {
     pub texels_total: u64,
     /// Share of those texels that triangles cover (before the border is filled).
     pub fill_ratio: f64,
+    /// Tiny label islands (fewer than `ISLAND_FACES` faces) merged into a neighbouring chart
+    /// before baking; set by `texture_mesh`, 0 from `bake`.
+    pub islands_absorbed: usize,
 }
 
 /// Edge neighbours of every face (faces sharing an edge, either winding), in CSR form.
@@ -421,7 +423,6 @@ fn pack(sizes: &[[u32; 2]], page: u32, keep_first: bool) -> (Vec<(u32, [u32; 2])
 ///
 /// [`ColorConfig::rim_theta`]: crate::ColorConfig::rim_theta
 /// [`ColorConfig::max_dist`]: crate::ColorConfig::max_dist
-#[cfg_attr(not(test), allow(dead_code))] // until `texture_mesh` calls it
 pub(crate) fn absorb_islands(
     mesh: &Mesh,
     views: &ViewTable,
@@ -975,6 +976,7 @@ pub(crate) fn bake(
         } else {
             0.0
         },
+        islands_absorbed: 0,
     };
     Ok((
         TexturedMesh {
