@@ -15,8 +15,8 @@
 //!    image of the neighbouring chart with the most shared edges whose camera sees all its faces
 //!    by geometry alone (inside the image rim, within the colour range, facing the camera; no
 //!    depth test, no view scores), where [`merge_small_charts`] finds no image with a recorded
-//!    view of them all. Black room at 1 cm, spike without the two guards: 221,097 → 79,750
-//!    charts, half the seam samples.
+//!    view of them all. Black room at 1 cm, spike: 221,097 → 79,750 charts, half the seam
+//!    samples; at 2 cm (S1): 59,142 → 35,902 charts.
 //! 2. **Charts** ([`bake`]): connected faces (over shared edges) with the same label. A chart is
 //!    the image region its faces project to (full resolution, [`Camera::project`]): the
 //!    smallest rectangle around it ([`best_axis`]: one side along an edge of the region's convex
@@ -414,22 +414,26 @@ fn pack(sizes: &[[u32; 2]], page: u32, keep_first: bool) -> (Vec<(u32, [u32; 2])
 /// (typically a face without a recorded view of the neighbouring image, or one ICM left alone
 /// between its neighbours; faces without any view are labelled `None` and never absorbed)
 /// takes the image of a neighbouring chart, tried in the order of most shared edges, then lowest
-/// image index. Two guards apply:
+/// image index.
 ///
-/// - Enclosure: image `l` is taken only if it has at least 2/3 of all the island's border edges
-///   to labelled faces of other charts (`3 * count_l >= 2 * total`). An island at a silhouette
-///   borders two images; an enclosed one is mesh noise.
-/// - Facing: the island's own area-weighted summed normal must face the camera (positive dot
-///   product with the direction to it), per island, besides the ring test below.
+/// Two guards were tried and dropped: an enclosure guard (image `l` only if it has at least 2/3
+/// of the island's border edges) and a guard on the island's own summed normal facing the
+/// camera. Measured on the black room S1, charts at 2 cm went 59,142 → 35,902 without guards
+/// against 49,926 with both, and `seam_step` mean 20.5 → 17.9 against 20.0; at 1 cm the guards
+/// made `seam_step` rise 21.9 → 23.6. The enclosure guard alone held back most (38,664 charts
+/// without it); the own-facing guard blocks the noise faces that point away, exactly the
+/// islands at fault. A side-by-side render of the most-changed regions showed no misplaced
+/// colours. Remaining risk: a small separate object (fewer than [`ISLAND_FACES`] faces)
+/// bordering a surface may take that surface's image.
 ///
 /// The camera of `l` must see every face of the island geometrically: all corners project into
 /// the image within [`ColorConfig::rim_theta`] of the optical axis, the centroid is within
 /// [`ColorConfig::max_dist`] of the camera, and the area-weighted summed normal of the island
 /// and of the faces around it (other charts) faces the camera. There is no depth test and no
 /// per-face facing test (the views are not read). With `smooth_weight == 0` nothing is changed
-/// and 0 is returned (the labels are then the best view per face). Charts are taken in chart order, from the
-/// labels as they stood at the start of the round; up to [`MERGE_ROUNDS`] rounds, ending at a
-/// round that changes nothing. Returns the number of islands taken over all rounds.
+/// and 0 is returned (the labels are then the best view per face). Charts are taken in chart
+/// order, from the labels as they stood at the start of the round; up to [`MERGE_ROUNDS`]
+/// rounds, ending at a round that changes nothing. Returns the number of islands taken over all rounds.
 ///
 /// [`ColorConfig::rim_theta`]: crate::ColorConfig::rim_theta
 /// [`ColorConfig::max_dist`]: crate::ColorConfig::max_dist
@@ -463,22 +467,18 @@ pub(crate) fn absorb_islands(
                 let label = labels[own[0] as usize];
                 let mut around: Vec<u32> = Vec::new();
                 let mut normal = [0.0f64; 3];
-                let mut own_normal = [0.0f64; 3];
-                let mut add = |f: usize, own_face: bool| {
+                let mut add = |f: usize| {
                     let nn = mesh.face_normal(f);
                     let a = f64::from(mesh.face_area(f));
                     for k in 0..3 {
                         normal[k] += f64::from(nn[k]) * a;
-                        if own_face {
-                            own_normal[k] += f64::from(nn[k]) * a;
-                        }
                     }
                 };
                 for &f in own {
-                    add(f as usize, true);
+                    add(f as usize);
                     for &g in nb.of(f as usize) {
                         if chart_of[g as usize] != c as u32 {
-                            add(g as usize, false);
+                            add(g as usize);
                             if let Some(l) = labels[g as usize].filter(|&l| Some(l) != label) {
                                 around.push(l);
                             }
@@ -491,7 +491,6 @@ pub(crate) fn absorb_islands(
                     .map(|r| (r.len(), r[0]))
                     .collect();
                 counted.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-                let total = around.len();
                 let sees = |l: u32| {
                     let img = &views.images[l as usize];
                     let Some(cam) = cams.get(img.camera) else {
@@ -514,13 +513,11 @@ pub(crate) fn absorb_islands(
                         }
                         let d = eye - centre;
                         d.norm() <= cfg.color.max_dist
-                            && own_normal[0] * d.x + own_normal[1] * d.y + own_normal[2] * d.z > 0.0
                             && normal[0] * d.x + normal[1] * d.y + normal[2] * d.z > 0.0
                     })
                 };
                 counted
                     .iter()
-                    .filter(|&&(count, _)| 3 * count >= 2 * total)
                     .find(|&&(_, l)| sees(l))
                     .map(|&(_, l)| (c, l))
             })
@@ -2175,10 +2172,9 @@ mod tests {
     /// A two-face island (cell 10, 10, label 2) in a wall; `label_at(iy, iz)` labels the rest.
     fn quad_island(
         label_at: impl Fn(usize, usize) -> u32,
-        flip_island: bool,
         smooth_weight: f32,
     ) -> (usize, Vec<Option<u32>>) {
-        let mut mesh = open_wall(20, 0.1);
+        let mesh = open_wall(20, 0.1);
         let views = island_views(&[in_front(), in_front()], &[0, 0]);
         let mut labels = vec![Some(0); mesh.indices.len()];
         for iy in 0..20 {
@@ -2191,9 +2187,6 @@ mod tests {
         for up in [false, true] {
             let f = cell_face(10, 10, up);
             labels[f] = Some(2);
-            if flip_island {
-                mesh.indices[f].swap(1, 2);
-            }
         }
         let cfg = SurfaceConfig {
             smooth_weight,
@@ -2216,30 +2209,16 @@ mod tests {
     }
 
     #[test]
-    fn island_between_two_images_stays() {
-        // Equal shares (below 2/3 for each): a silhouette, not noise. A tie between two images
-        // can never meet the 2/3 rule for both, so the lower-index tie-break is unreachable.
-        let (n, labels) = quad_island(split_labels, false, 1.0);
-        assert_eq!(n, 0);
-        assert_eq!(both_island_faces(&labels), [Some(2), Some(2)]);
-        // Control: enclosed by one image, the same island is taken.
-        let (n, labels) = quad_island(|_, _| 0, false, 1.0);
+    fn island_takes_lower_image_on_tie() {
+        // Equal shared edges with image 0 and 1, both cameras see it: the lower index wins.
+        let (n, labels) = quad_island(split_labels, 1.0);
         assert_eq!(n, 1);
         assert_eq!(both_island_faces(&labels), [Some(0), Some(0)]);
     }
 
     #[test]
-    fn island_facing_away_inside_facing_ring_stays() {
-        // The island's winding flipped: its own normal points away from the camera while the
-        // ring faces it (the ring sum stays positive).
-        let (n, labels) = quad_island(|_, _| 0, true, 1.0);
-        assert_eq!(n, 0);
-        assert_eq!(both_island_faces(&labels), [Some(2), Some(2)]);
-    }
-
-    #[test]
     fn smooth_weight_zero_absorbs_nothing() {
-        let (n, labels) = quad_island(|_, _| 0, false, 0.0);
+        let (n, labels) = quad_island(|_, _| 0, 0.0);
         assert_eq!(n, 0);
         assert_eq!(both_island_faces(&labels), [Some(2), Some(2)]);
     }
