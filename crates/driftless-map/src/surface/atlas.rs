@@ -15,8 +15,9 @@
 //!    image of the neighbouring chart with the most shared edges whose camera sees all its faces
 //!    by geometry alone (inside the image rim, within the colour range, facing the camera; no
 //!    depth test, no view scores), where [`merge_small_charts`] finds no image with a recorded
-//!    view of them all. Black room at 1 cm, spike: 221,097 → 79,750 charts, half the seam
-//!    samples; at 2 cm (S1): 59,142 → 35,902 charts.
+//!    view of them all. Black room S1 at 1 cm: 221,097 → 79,750 charts, half the seam samples,
+//!    `.glb` 111 → 96 MB; at 2 cm: 59,142 → 35,902 charts; the office at 1 cm: 2,026,134 →
+//!    808,938. The mesh is not touched (wall accuracy the same to the micrometre).
 //! 2. **Charts** ([`bake`]): connected faces (over shared edges) with the same label. A chart is
 //!    the image region its faces project to (full resolution, [`Camera::project`]): the
 //!    smallest rectangle around it ([`best_axis`]: one side along an edge of the region's convex
