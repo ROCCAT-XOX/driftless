@@ -342,8 +342,7 @@ pub fn texture_mesh(
             clock.lap(stats, "views");
             check_cancel(progress)?;
             let mut labels = atlas::choose_labels(mesh, &views, cfg);
-            let islands_absorbed =
-                atlas::absorb_islands(mesh, &views, &src.cams, cfg, &mut labels);
+            let islands_absorbed = atlas::absorb_islands(mesh, &views, &src.cams, cfg, &mut labels);
             // Baking needs the images and the exposure, not the views per face (12 bytes per
             // view, `views_per_face` per face): free them before the pages are allocated.
             views.per_face = Vec::new();

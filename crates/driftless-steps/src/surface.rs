@@ -201,7 +201,7 @@ fn stats_json(s: &SurfaceStats) -> Value {
             "texels_total": s.texture.texels_total,
             "fill_ratio": s.texture.fill_ratio,
             "islands_absorbed": s.texture.islands_absorbed,
-                    },
+        },
         "seams": {
             "seam_jump_before": s.seams.seam_jump_before,
             "seam_jump_after": s.seams.seam_jump_after,
