@@ -365,7 +365,10 @@ pub struct LasLimits {
 ///
 /// - LAS: points × record length within the point data; LAZ: the chunk table inside the file
 ///   and with no more chunks than bytes of data, the points plausible for the compressed size;
-/// - every VLR and EVLR inside the file.
+/// - every VLR and EVLR inside the file;
+/// - LAZ 1.4 with layered chunks (point formats 6–10): every chunk's layer sizes inside the
+///   file and its chunk-table entry, its point count plausible for its bytes (see
+///   `check_layered_chunks`).
 ///
 /// A file that fails is a [`ExportError::Format`] in German. Read with
 /// [`LasLimits::batch`] points per `fill_points`.
@@ -431,7 +434,7 @@ fn check_layout<R: io::Read + Seek>(
             && record == LASZIP_RECORD
             && length >= 2
         {
-            laszip = Some(at + VLR_HEADER);
+            laszip = Some((at + VLR_HEADER, length));
         }
         at += VLR_HEADER + length;
         if at > len {
@@ -467,7 +470,7 @@ fn check_layout<R: io::Read + Seek>(
     })?;
     let max_points = if compressed {
         // Without the LASzip VLR `las` refuses the file itself.
-        if let Some(vlr) = laszip {
+        if let Some((vlr, _)) = laszip {
             check_chunk_table(file, vlr, data_start, len).map_err(|e| match e {
                 ChunkError::Io(e) => io_err(e),
                 ChunkError::Outside => ExportError::format(
@@ -491,6 +494,9 @@ fn check_layout<R: io::Read + Seek>(
                 "{kind} gibt {total} Punkte an, die Datei kann höchstens {max_points} enthalten"
             ),
         ));
+    }
+    if let Some(vlr) = laszip.filter(|_| compressed) {
+        check_layered_chunks(path, file, vlr, data_start, len, total, record_len)?;
     }
     let reserve = if compressed {
         data.saturating_mul(LAZ_RESERVE_PER_BYTE)
@@ -585,6 +591,145 @@ fn check_chunk_table<R: io::Read + Seek>(
     let chunks = u64::from(u32::from_le_bytes(u32b));
     if chunks > table - data_start {
         return Err(ChunkError::TooLong);
+    }
+    Ok(())
+}
+
+/// The chunks of a LAZ file whose points `laz` decompresses in layers (LAZ 1.4, point formats
+/// 6–10), walked the way `laz` reads them, before it does. A chunk holds the raw first point,
+/// its point count, one size per layer and then the layers; `laz` zero-fills a buffer of each
+/// layer size before it reads the layer. So the sizes (each, and with them the whole chunk)
+/// must lie inside the file and inside the chunk's entry of the chunk table, and the point
+/// count must be plausible for the chunk's bytes. Point-wise compressed points (formats 0–5)
+/// have no such sizes and are not walked.
+///
+/// `laszip` is the offset and length of the LASzip VLR's data. A VLR that `laz` cannot use is
+/// left to `las`, which refuses the file itself.
+fn check_layered_chunks<R: io::Read + Seek>(
+    path: &Path,
+    file: &mut R,
+    laszip: (u64, u64),
+    data_start: u64,
+    len: u64,
+    total: u64,
+    record_len: u64,
+) -> Result<(), ExportError> {
+    let io_err = |e| las_error(path, "keine lesbare LAZ-Datei", ::las::Error::Io(e));
+    let damaged =
+        |what: String| ExportError::format(path, format!("LAZ-Datei ist beschädigt ({what})"));
+    let (at, length) = laszip;
+    // A VLR is at most 65 535 bytes.
+    let mut data = vec![0u8; length as usize];
+    file.seek(SeekFrom::Start(at)).map_err(io_err)?;
+    file.read_exact(&mut data).map_err(io_err)?;
+    let Ok(vlr) = ::laz::LazVlr::from_buffer(&data) else {
+        return Ok(());
+    };
+    // `laz` picks the layered decompressor by the version of the first item (and panics
+    // without items).
+    let Some(first) = vlr.items().first() else {
+        return Err(damaged("LASzip-Beschreibung ohne Einträge".into()));
+    };
+    if !matches!(first.version(), 3 | 4) {
+        return Ok(());
+    }
+    // Per item: bytes of the raw first point and number of layers.
+    let mut raw = 0u64;
+    let mut layers = 0u64;
+    let mut sizes = 0u64;
+    for item in vlr.items() {
+        use ::laz::LazItemType as T;
+        let (bytes, n) = match item.item_type() {
+            T::Point14 => (30, 9),
+            T::RGB14 => (6, 1),
+            T::RGBNIR14 => (8, 2),
+            T::WavePacket14 => (29, 1),
+            T::Byte14(n) => (u64::from(n), u64::from(n)),
+            // Not decompressed in layers: `laz` refuses the file itself.
+            _ => return Ok(()),
+        };
+        raw += bytes;
+        layers += n;
+        sizes += u64::from(item.size());
+    }
+    if raw != record_len || sizes != record_len {
+        return Err(damaged(format!(
+            "LASzip-Beschreibung passt nicht zur Punktlänge von {record_len} Bytes"
+        )));
+    }
+    let compressor = u16::from_le_bytes([data[0], data[1]]);
+    // Compressor 1 (no chunks) starts right at the point data; with chunks the first 8 bytes
+    // point to the chunk table, which `laz` reads if it can and does without otherwise.
+    let table = if compressor <= 1 {
+        None
+    } else {
+        file.seek(SeekFrom::Start(data_start)).map_err(io_err)?;
+        ::laz::laszip::ChunkTable::read_from(&mut *file, &vlr).ok()
+    };
+    let entries = table.as_ref().map_or(&[][..], |t| t.as_ref());
+    // Points `laz` takes from chunk `index` (before the last); `None`: all that are left.
+    let per_chunk = |index: usize| -> Result<Option<u64>, ExportError> {
+        if compressor <= 1 {
+            Ok(Some(u64::from(u32::MAX)))
+        } else if !vlr.uses_variable_size_chunks() {
+            Ok(Some(u64::from(vlr.chunk_size())))
+        } else if table.is_none() {
+            // Without a table `laz` reads variable chunks as one.
+            Ok(None)
+        } else {
+            // With a table `laz` takes the count of each chunk from it (and panics past it);
+            // a count of 0 never ends the chunk.
+            let entry = entries
+                .get(index)
+                .ok_or_else(|| damaged("Chunk-Tabelle hat zu wenige Einträge".into()))?;
+            Ok((entry.point_count > 0).then_some(entry.point_count))
+        }
+    };
+
+    let head = raw + 4 + 4 * layers;
+    let mut head_bytes = vec![0u8; (4 + 4 * layers) as usize];
+    let mut pos = if compressor <= 1 {
+        data_start
+    } else {
+        data_start + 8
+    };
+    let mut left = total;
+    let mut index = 0usize;
+    while left > 0 {
+        let n = index + 1;
+        let beyond = || damaged(format!("Chunk {n} ist länger als die Datei"));
+        let body_start = pos
+            .checked_add(head)
+            .filter(|&end| end <= len)
+            .ok_or_else(beyond)?;
+        file.seek(SeekFrom::Start(pos + raw)).map_err(io_err)?;
+        file.read_exact(&mut head_bytes).map_err(io_err)?;
+        let u32_at = |i: usize| u32::from_le_bytes(head_bytes[i..i + 4].try_into().expect("4"));
+        let count = u64::from(u32_at(0));
+        // Each layer within the rest of the file follows from the sum within it.
+        let body: u64 = (1..=layers as usize)
+            .map(|k| u64::from(u32_at(4 * k)))
+            .sum();
+        let end = body_start
+            .checked_add(body)
+            .filter(|&end| end <= len)
+            .ok_or_else(beyond)?;
+        let bytes = end - pos;
+        if entries.get(index).is_some_and(|e| bytes > e.byte_count) {
+            return Err(damaged(format!(
+                "Chunk {n} ist länger als in der Chunk-Tabelle angegeben"
+            )));
+        }
+        let points = per_chunk(index)?.map_or(left, |p| p.min(left));
+        let most = bytes.saturating_mul(LAZ_POINTS_PER_BYTE);
+        if let Some(claimed) = [count, points].into_iter().find(|&c| c > most) {
+            return Err(damaged(format!(
+                "Chunk {n} gibt {claimed} Punkte an, mehr als er enthalten kann"
+            )));
+        }
+        left -= points;
+        pos = end;
+        index += 1;
     }
     Ok(())
 }

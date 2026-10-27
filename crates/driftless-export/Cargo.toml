@@ -22,6 +22,9 @@ gltf = { version = "1.4.1", default-features = false, features = ["KHR_materials
 gltf-json = { version = "1.4.1", features = ["KHR_materials_unlit"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 las = { version = "0.11", features = ["laz"] }
+# The LASzip VLR and chunk table, read as `las` reads them, to check layered chunks before
+# reading (the same version `las` uses).
+laz = "0.13"
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }
 thiserror = "2"
 

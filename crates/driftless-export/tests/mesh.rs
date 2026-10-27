@@ -623,6 +623,50 @@ fn mesh_write_cancel_keeps_old_files() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// „Abbrechen“ while the pages are written (after the first page, and after the last one,
+/// just before the rename): the writer says it was cancelled, no `.tmp` is left and every old
+/// file – the glb, or the OBJ with its `.mtl` and page images – keeps its bytes.
+#[test]
+fn mesh_cancel_while_writing_keeps_old_files() {
+    let mesh = small_mesh();
+    let old = [
+        "x.glb",
+        "x.mtl",
+        "x.obj",
+        "x_seite_00.jpg",
+        "x_seite_01.png",
+    ];
+    for glb in [true, false] {
+        for at in [1, 3] {
+            let dir = temp_dir(&format!("mesh-cancel-mid-{glb}-{at}"));
+            for name in old {
+                std::fs::write(dir.join(name), b"alt").unwrap();
+            }
+            let progress = Progress::new();
+            let handle = progress.clone();
+            let progress = progress.with_observer(move |s| {
+                if s.phase == PHASE_WRITE && s.done == at {
+                    handle.cancel();
+                }
+            });
+            let result = if glb {
+                write_glb(&dir.join("x.glb"), &mesh, &progress)
+            } else {
+                write_obj(&dir.join("x.obj"), &mesh, &progress)
+            };
+            assert!(
+                matches!(result, Err(ExportError::Cancelled)),
+                "glb {glb}, page {at}: {result:?}"
+            );
+            assert_eq!(entries(&dir), old, "glb {glb}, page {at}");
+            for name in old {
+                assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"alt", "{name}");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
 #[test]
 fn obj_foreign_quads_negative_indices_missing_texture() {
     let dir = temp_dir("obj-foreign");

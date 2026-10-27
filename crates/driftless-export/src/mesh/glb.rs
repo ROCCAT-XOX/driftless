@@ -15,7 +15,7 @@
 //! `.bin` or image files), images JPEG or PNG.
 
 use super::{check_mesh, ImageKind, Mesh, MeshPage, PageImage, GENERATOR};
-use crate::{check_cancel, ExportError, PHASE_READ};
+use crate::{check_cancel, ExportError, PHASE_READ, PHASE_WRITE};
 use driftless_io::progress::Progress;
 use driftless_io::TempPath;
 use gltf_json as json;
@@ -42,8 +42,9 @@ const BYTES_PER_CORNER: u64 = 24 + 8;
 const BYTES_PER_INDEX: u64 = 4 + 4;
 
 /// Writes `mesh` as one binary glTF through `<name>.tmp` next to `path` (see the module
-/// docs). Pages without triangles are left out. A cancel through `progress` is checked per
-/// page and before the rename; it leaves `path` as it was and no `.tmp`.
+/// docs). Pages without triangles are left out. Progress: phase [`PHASE_WRITE`], one step per
+/// written page. A cancel through `progress` is checked per page and before the rename; it
+/// leaves `path` as it was and no `.tmp`.
 pub fn write_glb(path: &Path, mesh: &Mesh, progress: &Progress) -> Result<(), ExportError> {
     check_cancel(progress)?;
     check_mesh(path, mesh)?;
@@ -255,6 +256,7 @@ pub fn write_glb(path: &Path, mesh: &Mesh, progress: &Progress) -> Result<(), Ex
     let total = u32::try_from(total).map_err(|_| {
         ExportError::format(path, "Oberfläche ist für eine glb-Datei zu groß (> 4 GB)")
     })?;
+    progress.phase(PHASE_WRITE, Some(pages.len() as u64));
     write_atomic(path, progress, |w| {
         w.write_all(b"glTF")?;
         w.write_all(&2u32.to_le_bytes())?;
@@ -285,6 +287,7 @@ pub fn write_glb(path: &Path, mesh: &Mesh, progress: &Progress) -> Result<(), Ex
             part(w, &mut uv.map(|x| x.to_le_bytes()))?;
             let idx = page.indices.iter().flatten();
             part(w, &mut idx.map(|x| x.to_le_bytes()))?;
+            progress.advance(1);
         }
         for image in pages.iter().filter_map(|p| p.image.as_ref()) {
             let bytes = &image.bytes;

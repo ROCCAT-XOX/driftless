@@ -1698,6 +1698,7 @@ dependencies = [
  "gltf-json",
  "image",
  "las",
+ "laz",
  "nalgebra",
  "serde_json",
  "thiserror 2.0.21",

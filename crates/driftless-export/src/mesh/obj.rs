@@ -20,7 +20,7 @@
 
 use super::glb::{stop_if_cancelled, write_temp};
 use super::{check_mesh, page_name, ImageKind, Mesh, MeshPage, PageImage, MISSING_GRAY};
-use crate::{check_cancel, ExportError, PHASE_READ};
+use crate::{check_cancel, ExportError, PHASE_READ, PHASE_WRITE};
 use driftless_io::progress::Progress;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -56,11 +56,13 @@ fn file_name(path: &Path) -> String {
 }
 
 /// Writes `mesh` as `path` (`<stem>.obj`), `<stem>.mtl` and its page images next to it (see
-/// the module docs). An error or a cancel through `progress` (checked per page and before the
-/// renames) leaves no `.tmp`; the old files stay until the renames.
+/// the module docs). Progress: phase [`PHASE_WRITE`], one step per page written into the
+/// `.obj` (after the images and the `.mtl`). An error or a cancel through `progress` (checked
+/// per page and before the renames) leaves no `.tmp`; the old files stay until the renames.
 pub fn write_obj(path: &Path, mesh: &Mesh, progress: &Progress) -> Result<(), ExportError> {
     check_cancel(progress)?;
     check_mesh(path, mesh)?;
+    progress.phase(PHASE_WRITE, Some(mesh.pages.len() as u64));
     let mtl_path = path.with_extension("mtl");
     let mtl_name = file_name(&mtl_path);
     let mut temps = Vec::new();
@@ -120,6 +122,7 @@ pub fn write_obj(path: &Path, mesh: &Mesh, progress: &Progress) -> Result<(), Ex
             }
             base += page.positions.len();
             uv_base += page.uvs.len();
+            progress.advance(1);
         }
         Ok(())
     })?);

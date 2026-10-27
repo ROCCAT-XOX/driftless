@@ -7,6 +7,7 @@ use driftless_export::{
     read_points, write_points, ExportError, Layout, PointFormat, PointSource, Points,
 };
 use driftless_io::progress::Progress;
+use std::io::{self, Seek};
 use std::path::{Path, PathBuf};
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -442,4 +443,220 @@ fn drop_empty_columns_keeps_what_says_something() {
             ..Layout::default()
         }
     );
+}
+
+/// How `laz_by_hand` cuts the points into chunks.
+enum Chunks {
+    /// Every chunk this many points (the last fewer).
+    Fixed(u32),
+    /// Chunks of these sizes, each with its count in the chunk table.
+    Variable(Vec<usize>),
+}
+
+/// `n` points as LAZ in LAS `version` and point format `format` with `extra` extra bytes,
+/// compressed by `laz` itself with `chunks`, as other writers do (`las` and Driftless write
+/// fixed chunks of 50 000). Returns the points written.
+fn laz_by_hand(
+    path: &Path,
+    version: (u8, u8),
+    format: u8,
+    extra: u16,
+    n: usize,
+    chunks: &Chunks,
+) -> Vec<las::Point> {
+    let vlr = match chunks {
+        Chunks::Fixed(size) => laz::LazVlrBuilder::default()
+            .with_point_format(format, extra)
+            .unwrap()
+            .with_fixed_chunk_size(*size),
+        Chunks::Variable(_) => laz::LazVlrBuilder::default()
+            .with_point_format(format, extra)
+            .unwrap()
+            .with_variable_chunk_size(),
+    }
+    .build();
+    let mut data = Vec::new();
+    vlr.write_to(&mut data).unwrap();
+
+    let mut builder = las::Builder::from(version);
+    builder.point_format = las::point::Format::new(format).unwrap();
+    builder.point_format.extra_bytes = extra;
+    builder.vlrs.push(las::Vlr {
+        user_id: laz::LazVlr::USER_ID.into(),
+        record_id: laz::LazVlr::RECORD_ID,
+        description: laz::LazVlr::DESCRIPTION.into(),
+        data,
+    });
+    let format_info = builder.point_format;
+    let points: Vec<las::Point> = (0..n)
+        .map(|i| {
+            let f = i as f64;
+            las::Point {
+                x: 100.0 + f * 0.013,
+                y: -20.0 + (f * 0.7).sin(),
+                z: 3.0 + f * 0.001,
+                intensity: (i * 37 % 65_536) as u16,
+                return_number: 1,
+                number_of_returns: 1,
+                user_data: (i % 7) as u8,
+                point_source_id: (i % 3) as u16,
+                gps_time: format_info.has_gps_time.then_some(1.0e5 + f * 0.01),
+                color: format_info
+                    .has_color
+                    .then(|| las::Color::new((i * 11) as u16, (i * 13) as u16, (i * 17) as u16)),
+                nir: format_info.has_nir.then_some((i * 19) as u16),
+                waveform: format_info.has_waveform.then(Default::default),
+                extra_bytes: vec![i as u8; usize::from(extra)],
+                ..Default::default()
+            }
+        })
+        .collect();
+    // Uncompressed through `las`, then the point records compressed with `laz` behind the
+    // same header and VLRs.
+    let mut writer =
+        las::Writer::new(io::Cursor::new(Vec::new()), builder.into_header().unwrap()).unwrap();
+    for p in &points {
+        writer.write_point(p.clone()).unwrap();
+    }
+    let raw = writer.into_inner().unwrap().into_inner();
+    let start = u32::from_le_bytes(raw[96..100].try_into().unwrap()) as usize;
+    let record = usize::from(u16::from_le_bytes([raw[105], raw[106]]));
+    let records = &raw[start..start + n * record];
+    let mut file = raw[..start].to_vec();
+    file[104] |= 0x80;
+    let mut out = io::Cursor::new(&mut file);
+    out.seek(io::SeekFrom::End(0)).unwrap();
+    let mut compressor = laz::LasZipCompressor::new(&mut out, vlr).unwrap();
+    match chunks {
+        Chunks::Fixed(_) => compressor.compress_many(records).unwrap(),
+        Chunks::Variable(sizes) => {
+            assert_eq!(sizes.iter().sum::<usize>(), n);
+            let mut at = 0;
+            let parts: Vec<&[u8]> = sizes
+                .iter()
+                .map(|&k| {
+                    let part = &records[at * record..(at + k) * record];
+                    at += k;
+                    part
+                })
+                .collect();
+            compressor.compress_chunks(parts).unwrap();
+        }
+    }
+    compressor.done().unwrap();
+    drop(compressor);
+    std::fs::write(path, file).unwrap();
+    points
+}
+
+fn assert_read_back(path: &Path, points: &[las::Point]) {
+    let back =
+        read_las(path, &Progress::new()).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert_eq!(back.len(), points.len(), "{}", path.display());
+    for (i, p) in points.iter().enumerate() {
+        let q = back.xyz[i];
+        for (a, b) in [p.x, p.y, p.z].into_iter().zip(q) {
+            assert!(
+                (a - b).abs() <= 0.001,
+                "{}: {i}: {a} vs {b}",
+                path.display()
+            );
+        }
+        if let Some(t) = p.gps_time {
+            assert_eq!(back.time.as_ref().unwrap()[i], t, "{}", path.display());
+        }
+        assert_eq!(back.intensity.as_ref().unwrap()[i], p.intensity);
+    }
+}
+
+/// Layered LAZ 1.4 (point formats 6–10, with and without extra bytes) of other writers –
+/// fixed chunks of another size, variable chunks of mixed sizes – reads back in full: the
+/// chunk walk before reading refuses none of them.
+#[test]
+fn laz14_chunks_of_other_writers_read_back() {
+    let dir = temp_dir("laz14-chunks");
+    for format in 6..=10 {
+        for extra in [0, 3] {
+            for (name, chunks) in [
+                ("fest", Chunks::Fixed(100)),
+                ("variabel", Chunks::Variable(vec![300, 1, 450, 249])),
+                ("ein", Chunks::Variable(vec![1_000])),
+            ] {
+                let path = dir.join(format!("f{format}-e{extra}-{name}.laz"));
+                let points = laz_by_hand(&path, (1, 4), format, extra, 1_000, &chunks);
+                assert_read_back(&path, &points);
+            }
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Point-wise LAZ 1.2 in point formats 0–3, as `las` writes it and with other chunks.
+#[test]
+fn laz12_formats_read_back() {
+    let dir = temp_dir("laz12");
+    for format in 0..=3 {
+        for (name, chunks) in [
+            ("fest", Chunks::Fixed(100)),
+            ("variabel", Chunks::Variable(vec![300, 1, 450, 249])),
+        ] {
+            let path = dir.join(format!("f{format}-{name}.laz"));
+            let points = laz_by_hand(&path, (1, 2), format, 0, 1_000, &chunks);
+            assert_read_back(&path, &points);
+        }
+        // As `las` writes it.
+        let path = dir.join(format!("f{format}-las.laz"));
+        let mut builder = las::Builder::from((1, 2));
+        builder.point_format = las::point::Format::new(format).unwrap();
+        let mut writer = las::Writer::from_path(&path, builder.into_header().unwrap()).unwrap();
+        let fmt = *writer.header().point_format();
+        let points: Vec<las::Point> = (0..1_000)
+            .map(|i| las::Point {
+                x: f64::from(i) * 0.5,
+                y: 1.0,
+                z: -f64::from(i) * 0.25,
+                intensity: i as u16,
+                gps_time: fmt.has_gps_time.then_some(f64::from(i)),
+                color: fmt.has_color.then(|| las::Color::new(1, 2, 3)),
+                ..Default::default()
+            })
+            .collect();
+        for p in &points {
+            writer.write_point(p.clone()).unwrap();
+        }
+        writer.close().unwrap();
+        assert!(header(&path).point_format().is_compressed);
+        assert_read_back(&path, &points);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Variable chunks with a chunk table that lists fewer chunks than the points need: `laz`
+/// would index past the table and panic, so the file is refused before.
+#[test]
+fn laz_short_chunk_table_refused() {
+    let dir = temp_dir("laz-short-table");
+    let path = dir.join("kurz.laz");
+    laz_by_hand(
+        &path,
+        (1, 4),
+        6,
+        0,
+        1_000,
+        &Chunks::Variable(vec![300, 700]),
+    );
+    let data = std::fs::read(&path).unwrap();
+    let start = u32::from_le_bytes(data[96..100].try_into().unwrap()) as usize;
+    let table = u64::from_le_bytes(data[start..start + 8].try_into().unwrap()) as usize;
+    let mut patched = data.clone();
+    patched[table + 4..table + 8].copy_from_slice(&1u32.to_le_bytes());
+    std::fs::write(&path, patched).unwrap();
+    match read_points(&path, &Progress::new()) {
+        Err(ExportError::Format { msg, .. }) => assert_eq!(
+            msg,
+            "LAZ-Datei ist beschädigt (Chunk-Tabelle hat zu wenige Einträge)"
+        ),
+        other => panic!("{other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }

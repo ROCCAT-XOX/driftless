@@ -348,19 +348,23 @@ fn make_surface(
         "waiting_for_images": v.waiting_for_images,
     });
 
-    // Last chance to stop: from here on files are written.
     check_cancel(progress)?;
-    let out = target.out_dir;
-    fs::create_dir_all(out).map_err(|e| format!("{} nicht anlegbar: {e}", out.display()))?;
-    let report_path = out.join(SURFACE_REPORT);
     let quality = target.config.jpeg_quality;
     let jpegs = encode_pages(&tex, quality)?;
     // One conversion for both writers; the textured mesh and the pages go before writing.
     let pages = tex.pages.len();
     let surface = tex.to_mesh(&jpegs)?;
     drop((tex, jpegs));
-    mesh::write_glb(&out.join(format!("{STEM}.glb")), &surface, progress)?;
-    mesh::write_obj(&out.join(format!("{STEM}.obj")), &surface, progress)?;
+    // Last chance to stop: from here on files are written. The writers get a progress of
+    // their own that cannot be cancelled: a cancel between or in them would leave a new glb
+    // next to the old OBJ and report.
+    check_cancel(progress)?;
+    let out = target.out_dir;
+    fs::create_dir_all(out).map_err(|e| format!("{} nicht anlegbar: {e}", out.display()))?;
+    let report_path = out.join(SURFACE_REPORT);
+    let writing = Progress::new();
+    mesh::write_glb(&out.join(format!("{STEM}.glb")), &surface, &writing)?;
+    mesh::write_obj(&out.join(format!("{STEM}.obj")), &surface, &writing)?;
     drop(surface);
     let mut files = vec![
         format!("{STEM}.glb"),

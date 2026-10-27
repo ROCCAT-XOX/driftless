@@ -111,6 +111,19 @@ fn las14(path: &Path, compress: bool) {
     write_las(path, &pts, compress, &Progress::new()).unwrap();
 }
 
+/// A LAZ 1.4 file of 1000 points in point format 6 (layered chunks, as Driftless writes a
+/// map with times): one chunk, about 7 KB.
+fn laz14_layered(path: &Path) {
+    let layout = Layout {
+        intensity: true,
+        time: true,
+        ..Layout::default()
+    };
+    let pts = synthetic_points(1_000, 9, layout);
+    write_las(path, &pts, true, &Progress::new()).unwrap();
+    assert!(read_points(path, &Progress::new()).is_ok());
+}
+
 /// Byte offsets in the LAS header.
 const OFFSET_TO_POINTS: usize = 96;
 const VLR_COUNT: usize = 100;
@@ -211,6 +224,37 @@ fn crafted_headers_fail_fast() {
     assert!(
         msg.starts_with("LAZ-Datei gibt 1099511627776 Punkte an, die Datei kann höchstens"),
         "{msg}"
+    );
+
+    // LAZ 1.4, layered: the first chunk starts after the 8-byte table offset with the raw first
+    // point (30 bytes), its point count and nine layer sizes. An xy layer of 4 GiB in 7 KB
+    // (1.75 GB zero-filled in 0.26 s before the fix).
+    let path = dir.join("schicht.laz");
+    laz14_layered(&path);
+    let chunk = u32_at(&path, OFFSET_TO_POINTS) as usize + 8;
+    patch(&path, chunk + 30 + 4, &0xFFFF_FFF0u32.to_le_bytes());
+    assert_eq!(
+        refused(&path),
+        "LAZ-Datei ist beschädigt (Chunk 1 ist länger als die Datei)"
+    );
+    // The same with the last layer (times) one byte longer: still inside the file, but longer
+    // than the chunk table says.
+    let path = dir.join("schicht-tabelle.laz");
+    laz14_layered(&path);
+    let last = chunk + 30 + 4 + 8 * 4;
+    patch(&path, last, &(u32_at(&path, last) + 1).to_le_bytes());
+    assert_eq!(
+        refused(&path),
+        "LAZ-Datei ist beschädigt (Chunk 1 ist länger als in der Chunk-Tabelle angegeben)"
+    );
+    // A chunk claiming 2^32 − 1 points.
+    let path = dir.join("schicht-punkte.laz");
+    laz14_layered(&path);
+    patch(&path, chunk + 30, &u32::MAX.to_le_bytes());
+    assert_eq!(
+        refused(&path),
+        "LAZ-Datei ist beschädigt (Chunk 1 gibt 4294967295 Punkte an, mehr als er enthalten \
+         kann)"
     );
 
     std::fs::remove_dir_all(dir).unwrap();
