@@ -120,8 +120,9 @@
 
 use super::{Mesh, SurfaceConfig};
 use crate::color::{
-    frame_camera, keep_best, linear_table, quality_pass, sample_linear, srgb_value, ColorCamera,
-    ColorConfig, ImageRecord, ImageSource, Status, View, SHARPNESS_DOWNSCALE,
+    frame_camera, image_count, keep_best, linear_table, quality_pass, sample_linear, srgb_value,
+    ColorCamera, ColorConfig, ImageRecord, ImageSource, Status, View, PHASE_CHECK_IMAGES,
+    SHARPNESS_DOWNSCALE,
 };
 use crate::color_gpu::GpuStop;
 use crate::exposure::{estimate_exposure, sample_observations, Vignetting};
@@ -930,8 +931,9 @@ pub(crate) fn filter_views(
 }
 
 /// The views of every face of `mesh` in the images of `sources`, and the exposure of the
-/// images (see the module docs). Progress: phase „Bilder prüfen“ (the quality pass, once per
-/// source) and „Ansichten suchen“, one step per image of the streams; a cancel is checked at
+/// images (see the module docs). Progress: phase „Bilder prüfen“ (the quality pass of every
+/// source, counted once over all their images) and „Ansichten suchen“, one step per image of
+/// the streams; a cancel is checked at
 /// every image and returns [`MapError::Cancelled`]. Same input, same result.
 ///
 /// Fails if `cfg` is invalid, two cameras of one source share a name or the images cannot be
@@ -1007,6 +1009,12 @@ pub(crate) fn collect_views_on(
     let mut streams: Vec<Stream> = Vec::with_capacity(sources.len());
     let mut images: Vec<UsedImage> = Vec::new();
     let mut cam_base = 0usize;
+    // One count over the images of all sources (`None` if a bag has no index).
+    let total = sources
+        .iter()
+        .map(|src| image_count(&src.images))
+        .sum::<Option<u64>>();
+    progress.phase(PHASE_CHECK_IMAGES, total);
     for (s, src) in sources.iter().enumerate() {
         let (records, _, _) = quality_pass(&src.images, &src.poses, &src.cams, ccfg, progress)?;
         let rank_base = u32::try_from(images.len()).expect("fewer than 2^32 images");
@@ -2401,7 +2409,23 @@ mod tests {
         let mesh = painted_mesh(&painted, STEP);
         let sources = two_walk_sources("exposure", 1.5);
         let cfg = SurfaceConfig::default();
-        let table = collect_views(&mesh, &sources, &cfg, &Progress::new()).unwrap();
+        // „Bilder prüfen“ counts once over the images of both scans, without starting again.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let progress = Progress::new().with_observer(move |s| {
+            if s.phase == PHASE_CHECK_IMAGES {
+                log.lock().unwrap().push((s.done, s.total));
+            }
+        });
+        let table = collect_views(&mesh, &sources, &cfg, &progress).unwrap();
+        let total: u64 = sources
+            .iter()
+            .map(|s| image_count(&s.images).unwrap())
+            .sum();
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen.iter().all(|&(_, t)| t == Some(total)), "{seen:?}");
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "{seen:?}");
+        assert_eq!(seen.last().map(|s| s.0), Some(total));
         let k = cfg.views_per_face;
         // Ranks: source by source, within one by capture time; each image found by its source.
         assert!(table.images.windows(2).all(|w| w[0].source <= w[1].source));

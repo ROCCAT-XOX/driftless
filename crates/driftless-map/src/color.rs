@@ -441,7 +441,11 @@ pub(crate) fn image_count(images: &ImageSource) -> Option<u64> {
     Some(total)
 }
 
-/// Pass 1: status of every image of the stream, in stream order.
+/// Phase of [`quality_pass`]; the caller sets it, once for all the streams it checks.
+pub(crate) const PHASE_CHECK_IMAGES: &str = "Bilder prüfen";
+
+/// Pass 1: status of every image of the stream, in stream order. Advances `progress` by one
+/// per image, in the phase the caller set ([`PHASE_CHECK_IMAGES`]).
 pub(crate) fn quality_pass(
     images: &ImageSource,
     poses: &[Pose],
@@ -449,7 +453,6 @@ pub(crate) fn quality_pass(
     cfg: &ColorConfig,
     progress: &Progress,
 ) -> Result<(Vec<ImageRecord>, usize, f64), MapError> {
-    progress.phase("Bilder prüfen", image_count(images));
     let mut found: Vec<Measured> = Vec::new();
     let mut cancelled = false;
     let read = for_each_image(&images.bags, &images.topics, SHARPNESS_DOWNSCALE, |frame| {
@@ -1187,6 +1190,7 @@ fn colorize_on(
             )));
         }
     }
+    progress.phase(PHASE_CHECK_IMAGES, image_count(&images));
     let (records, bags_truncated, rank_corr) = quality_pass(&images, poses, cams, cfg, progress)?;
     let count = |f: fn(&Status) -> bool| records.iter().filter(|r| f(&r.status)).count();
     let mut stats = ColorStats {
