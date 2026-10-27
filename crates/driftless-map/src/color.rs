@@ -1070,8 +1070,9 @@ fn seam_jumps(slots: &[View], k: usize, cfg: &ColorConfig, seam: &[SeamSample]) 
     (jump(sums[0], sums[1]), jump(sums[2], sums[3]))
 }
 
-/// Gray from intensity: [`GRAY_MIN`] at 0, 255 at the cloud's 99th percentile and above.
-fn intensity_grays(intensity: &[f32]) -> Vec<u8> {
+/// Gray from intensity, as uncoloured points get it: [`GRAY_MIN`] at 0, 255 at the cloud's
+/// 99th percentile and above.
+pub fn intensity_grays(intensity: &[f32]) -> Vec<u8> {
     let mut sorted: Vec<f32> = intensity
         .iter()
         .copied()

@@ -6,6 +6,7 @@ mod correct;
 mod export_glim;
 mod inspect;
 mod map;
+mod merge;
 mod odom;
 mod slam;
 mod surface;
@@ -53,6 +54,9 @@ enum Command {
     /// Fotoähnliche Oberfläche einer Karte: oberflaeche.glb, oberflaeche.obj (mit .mtl und
     /// Texturseiten) und oberflaeche.json
     Surface(surface::Args),
+    /// Führt mehrere Scans eines Orts zu einem Modell zusammen: modell.las, modell.ply und
+    /// modell.json (Lage und Güte je Scan)
+    Merge(merge::Args),
 }
 
 /// Progress of a step on the console: messages to stdout, warnings as „Warnung: …“ to stderr.
@@ -76,6 +80,7 @@ fn main() -> ExitCode {
         Command::CalibCheck(args) => calib_check::run(&args),
         Command::Map(args) => map::run(&args),
         Command::Surface(args) => surface::run(&args),
+        Command::Merge(args) => merge::run(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

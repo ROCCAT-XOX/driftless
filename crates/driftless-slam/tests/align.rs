@@ -202,6 +202,22 @@ fn symmetric_box_is_unsure() {
     assert_ne!(a.verdict, Verdict::Sure, "{}", describe(&a));
 }
 
+/// The bare shell of a room with one small box fits the target turned by 180° about its
+/// centre as well as in the right pose: the box of the target is missing from the source in
+/// both, and its few edges keep the agreement high. Never sure, whichever of the two the
+/// candidates find first.
+#[test]
+fn bare_room_against_furnished_is_unsure() {
+    let mut furnished = room(0.0, 0.0, 8.0, 5.0, 2.8);
+    furnished.extend(crate_box(2.5, 0.6, 0.6, 0.4, 0.5));
+    let target = sample(&furnished, |_| true, 10);
+    let pose = truth(0.0);
+    let bare = sample(&room(0.0, 0.0, 8.0, 5.0, 2.8), |_| true, 11);
+    let source = transform(&pose.inverse(), &bare);
+    let a = run(&source, &target);
+    assert_ne!(a.verdict, Verdict::Sure, "{}", describe(&a));
+}
+
 /// Room A (8 × 5 m), a corridor (3 × 1.5 m) through a door in its wall `x = 8`, and room B
 /// (8 × 5 m) behind the corridor. Returns (room A, corridor, room B).
 fn suite() -> (Vec<Rect>, Vec<Rect>, Vec<Rect>) {

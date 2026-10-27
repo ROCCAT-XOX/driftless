@@ -18,8 +18,12 @@
 //!    If no feature candidate is plausible (see 4.), the grid runs as well.
 //! 4. The best candidate is the one with the largest overlap among the plausible ones:
 //!    edges agree ([`PairQuality::agreement`] ≥ [`MIN_AGREEMENT`]) and the overlap reaches
-//!    [`AlignConfig::min_overlap`]. Too little overlap or agreement, a large residual or
-//!    tilt, or a different candidate almost as good make the result "unsicher".
+//!    [`AlignConfig::min_overlap`]. It is also refined turned by 90°, 180° and 270° about
+//!    the vertical through the centre of the source ([`SYMMETRY_TURNS`]; once rated as it
+//!    is, once refined), and those join the candidates: a room that looks the same turned
+//!    is caught even if no feature match proposed the turned pose. Too little overlap or
+//!    agreement, a large residual or tilt, or a different candidate almost as good make the
+//!    result "unsicher".
 //!
 //! Why the agreement: walls, floor and ceiling hold most points, and the shell of a
 //! rectangular room fits itself turned by 180°. Two scans that each cover part of a room, or
@@ -196,6 +200,9 @@ pub const COLUMN_CELL: f64 = 0.25;
 /// this far from both; a point at most this far from the lowest (highest) is at the
 /// bottom (top) of the column (m).
 pub const COLUMN_MARGIN: f64 = 0.1;
+/// The best candidate is also tried turned by every `360° / SYMMETRY_TURNS` about the
+/// vertical through the centre of the source (step 4 of the module documentation).
+pub const SYMMETRY_TURNS: usize = 4;
 /// Correspondence distances of the coarse ICP stages on the thinned points (m).
 const STAGES: [f64; 3] = [1.0, 0.5, 0.25];
 /// Neighbours and iterations of the fine ICP stage (it starts within a few centimetres; a
@@ -914,6 +921,20 @@ fn judge(q: &PairQuality, runner_up: Option<&PairQuality>, cfg: &AlignConfig) ->
     }
 }
 
+/// Order of the candidates, best first: plausible first, then the largest overlap; ties keep
+/// the candidate order.
+fn rank(refined: &[(Isometry3<f64>, PairQuality, AlignMethod)], cfg: &AlignConfig) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..refined.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (qa, qb) = (&refined[a].1, &refined[b].1);
+        plausible(qb, cfg)
+            .cmp(&plausible(qa, cfg))
+            .then(qb.overlap.total_cmp(&qa.overlap))
+            .then(a.cmp(&b))
+    });
+    order
+}
+
 /// Aligns `source` to `target` without a start pose (see the module documentation).
 /// `pose` maps source world coordinates to target world coordinates. Returns early with
 /// `Failed("abgebrochen")` when `progress` is cancelled; phase and count are left to the
@@ -972,18 +993,34 @@ pub fn align_pair(
             refined.push((pose, q, AlignMethod::Grid));
         }
     }
-    // Plausible first, then the largest overlap; ties keep the candidate order.
-    let mut order: Vec<usize> = (0..refined.len()).collect();
-    order.sort_by(|&a, &b| {
-        let (qa, qb) = (&refined[a].1, &refined[b].1);
-        plausible(qb, cfg)
-            .cmp(&plausible(qa, cfg))
-            .then(qb.overlap.total_cmp(&qa.overlap))
-            .then(a.cmp(&b))
-    });
-    let Some(&best) = order.first() else {
+    let Some(&first) = rank(&refined, cfg).first() else {
         return failed(AlignMethod::Grid, "keine Lage gefunden");
     };
+    // The best so far turned about the vertical through the centre of the source: a room
+    // that looks the same turned (a rectangle by 180°, a square by 90°) fits as well there,
+    // and the matches need not have proposed it (a feature and its turned twin match only
+    // one of them). As a candidate it makes such a result unsure.
+    let (start, _, method) = refined[first];
+    if let Some(c) = box_centre(p.src.coarse.points()) {
+        for k in 1..SYMMETRY_TURNS {
+            if progress.is_cancelled() {
+                return cancelled(method);
+            }
+            let yaw = std::f64::consts::TAU * k as f64 / SYMMETRY_TURNS as f64;
+            let turn =
+                Translation3::from(c) * yaw_pose(yaw, Vector3::zeros()) * Translation3::from(-c);
+            // A source that looks the same turned is already in place there; it is rated
+            // as it is, since the ICP can drag it away (towards furniture only the target
+            // has, 7–10 cm in the synthetic room of the merge tests). The refined one
+            // covers a source that looks almost the same.
+            let init = start * turn;
+            refined.push((init, quality(&p, &init, cfg), method));
+            let (pose, q) = refine(&p, &icp, &init, cfg);
+            refined.push((pose, q, method));
+        }
+    }
+    let order = rank(&refined, cfg);
+    let best = order[0];
     let (pose, quality, method) = refined[best];
     let runner = order
         .iter()

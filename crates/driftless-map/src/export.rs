@@ -34,9 +34,22 @@ fn las_offset(cloud: &Cloud) -> [f64; 3] {
 /// `user_data` is 1 for points that got no measured colour (`colored == Some(false)`), else 0;
 /// CloudCompare shows it as the scalar field "User Data".
 pub fn write_las(path: &Path, cloud: &Cloud) -> Result<(), MapError> {
-    write_las_with(path, cloud, |i| {
-        u8::from(cloud.colored.as_ref().is_some_and(|c| !c[i]))
-    })
+    write_las_with(path, cloud, |i| uncolored(cloud, i), |_| 0)
+}
+
+/// Like [`write_las`] for a cloud merged from several scans: `point_source_id` holds the
+/// scan of each point (its number in the model).
+///
+/// # Panics
+/// If `sources` does not have one entry per point.
+pub fn write_las_sources(path: &Path, cloud: &Cloud, sources: &[u16]) -> Result<(), MapError> {
+    assert_eq!(sources.len(), cloud.len(), "one source per point");
+    write_las_with(path, cloud, |i| uncolored(cloud, i), |i| sources[i])
+}
+
+/// 1 for a point that got no measured colour, else 0 (`user_data` of [`write_las`]).
+fn uncolored(cloud: &Cloud, i: usize) -> u8 {
+    u8::from(cloud.colored.as_ref().is_some_and(|c| !c[i]))
 }
 
 /// Like [`write_las`] for the removed points: `user_data` holds the [`RemovalReason`] code
@@ -50,13 +63,14 @@ pub fn write_removed_las(
     reasons: &[RemovalReason],
 ) -> Result<(), MapError> {
     assert_eq!(reasons.len(), cloud.len(), "one reason per removed point");
-    write_las_with(path, cloud, |i| reasons[i] as u8)
+    write_las_with(path, cloud, |i| reasons[i] as u8, |_| 0)
 }
 
 fn write_las_with(
     path: &Path,
     cloud: &Cloud,
     user_data: impl Fn(usize) -> u8,
+    source: impl Fn(usize) -> u16,
 ) -> Result<(), MapError> {
     let err = |source| MapError::Las {
         path: path.display().to_string(),
@@ -98,6 +112,7 @@ fn write_las_with(
             gps_time: Some(cloud.t[i]),
             color,
             user_data: user_data(i),
+            point_source_id: source(i),
             ..Default::default()
         })
         .map_err(err)?;
@@ -109,6 +124,20 @@ fn write_las_with(
 /// cloud has colours, then `colored` (uchar, 1 = measured colour, 0 = none) if the cloud
 /// knows which points were coloured.
 pub fn write_ply(path: &Path, cloud: &Cloud) -> Result<(), MapError> {
+    write_ply_with(path, cloud, None)
+}
+
+/// Like [`write_ply`] for a cloud merged from several scans, with one more property `scan`
+/// (ushort): the scan of each point (its number in the model).
+///
+/// # Panics
+/// If `sources` does not have one entry per point.
+pub fn write_ply_sources(path: &Path, cloud: &Cloud, sources: &[u16]) -> Result<(), MapError> {
+    assert_eq!(sources.len(), cloud.len(), "one source per point");
+    write_ply_with(path, cloud, Some(sources))
+}
+
+fn write_ply_with(path: &Path, cloud: &Cloud, sources: Option<&[u16]>) -> Result<(), MapError> {
     let err = |source| MapError::Io {
         path: path.display().to_string(),
         source,
@@ -126,10 +155,13 @@ pub fn write_ply(path: &Path, cloud: &Cloud) -> Result<(), MapError> {
     if cloud.colored.is_some() {
         header += "property uchar colored\n";
     }
+    if sources.is_some() {
+        header += "property ushort scan\n";
+    }
     header += "end_header\n";
     w.write_all(header.as_bytes()).map_err(err)?;
     for i in 0..cloud.len() {
-        let mut v = [0u8; 20];
+        let mut v = [0u8; 22];
         for (k, c) in cloud.xyz[i].iter().chain([&cloud.intensity[i]]).enumerate() {
             v[4 * k..4 * k + 4].copy_from_slice(&c.to_le_bytes());
         }
@@ -144,6 +176,13 @@ pub fn write_ply(path: &Path, cloud: &Cloud) -> Result<(), MapError> {
             Some(c) => {
                 v[n] = u8::from(c[i]);
                 n + 1
+            }
+            None => n,
+        };
+        let n = match sources {
+            Some(s) => {
+                v[n..n + 2].copy_from_slice(&s[i].to_le_bytes());
+                n + 2
             }
             None => n,
         };

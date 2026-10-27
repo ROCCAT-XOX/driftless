@@ -34,11 +34,13 @@ pub use clean::{
 };
 pub use cloud::Cloud;
 pub use color::{
-    colorize, colorize_gpu_batched, colorize_with, ColorCamera, ColorConfig, ColorStats,
-    ImageSource,
+    colorize, colorize_gpu_batched, colorize_with, intensity_grays, ColorCamera, ColorConfig,
+    ColorStats, ImageSource,
 };
 pub use dense::{build_dense, DenseConfig, DenseStats, RaySource};
-pub use export::{write_las, write_ply, write_removed_las, LAS_SCALE};
+pub use export::{
+    write_las, write_las_sources, write_ply, write_ply_sources, write_removed_las, LAS_SCALE,
+};
 pub use exposure::{
     estimate_exposure, estimate_gains, ExposureConfig, ImageGain, Observations, ViewObs,
     Vignetting, DARK, SATURATED, VIGNETTE_MIN_OBSERVATIONS, VIGNETTE_MIN_POINT_SPREAD,

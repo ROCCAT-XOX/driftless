@@ -229,6 +229,26 @@ pub struct MapInput {
     pub map: MapSettings,
 }
 
+/// What the map in `map_dir` was made from: `scan` and the trajectory of `slam_dir` with
+/// `slam`, and the switches of its `map.json` (the defaults of `driftless map` without one).
+/// The step is [`MapStep::All`]; the stage ids do not depend on it.
+pub fn map_input_for(scan: &Path, slam_dir: &Path, map_dir: &Path, slam: SlamSettings) -> MapInput {
+    let switches = fs::read_to_string(map_dir.join(REPORT))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .and_then(|j| MapSwitches::from_map_json(&j))
+        .unwrap_or_default();
+    MapInput {
+        scan: scan.to_path_buf(),
+        slam_dir: slam_dir.to_path_buf(),
+        slam,
+        map: MapSettings {
+            step: MapStep::All,
+            switches,
+        },
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MapRequest {
     pub input: MapInput,

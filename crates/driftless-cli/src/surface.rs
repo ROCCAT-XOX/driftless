@@ -5,7 +5,7 @@
 
 use driftless_gpu::GpuPref;
 use driftless_map::surface::SurfaceConfig;
-use driftless_steps::map::{MapInput, MapSettings, MapStep, MapSwitches, REPORT};
+use driftless_steps::map::map_input_for;
 use driftless_steps::scan::extrinsic_values;
 use driftless_steps::slam::SlamSettings;
 use driftless_steps::surface::{run_surface, SurfaceRequest};
@@ -53,15 +53,6 @@ fn config(args: &Args) -> SurfaceConfig {
     }
 }
 
-/// The switches the map was made with (its `map.json`), else the defaults of `driftless map`.
-fn map_switches(map_dir: &std::path::Path) -> MapSwitches {
-    std::fs::read_to_string(map_dir.join(REPORT))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .and_then(|j| MapSwitches::from_map_json(&j))
-        .unwrap_or_default()
-}
-
 fn request(args: &Args) -> Result<SurfaceRequest, Box<dyn std::error::Error>> {
     let map_dir = args.map.clone().unwrap_or_else(|| args.slam.clone());
     let out_dir = args
@@ -73,17 +64,8 @@ fn request(args: &Args) -> Result<SurfaceRequest, Box<dyn std::error::Error>> {
         lidar_topic: args.lidar_topic.clone(),
         imu_topic: args.imu_topic.clone(),
     };
-    let switches = map_switches(&map_dir);
     Ok(SurfaceRequest {
-        map: MapInput {
-            scan: args.scan.clone(),
-            slam_dir: args.slam.clone(),
-            slam,
-            map: MapSettings {
-                step: MapStep::All,
-                switches,
-            },
-        },
+        map: map_input_for(&args.scan, &args.slam, &map_dir, slam),
         map_dir,
         out_dir,
         config: config(args),
