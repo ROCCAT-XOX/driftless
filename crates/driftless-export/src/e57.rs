@@ -351,7 +351,10 @@ fn failed(path: &Path, e: e57::Error) -> ExportError {
 ///
 /// - The pose of each entry is applied; spherical coordinates become cartesian. Points that
 ///   are invalid or only a direction are skipped. An entry with records but no point with a
-///   position is an error: `E57: Scan „<name>“ hat keine kartesischen Punkte`.
+///   position (or no cartesian or spherical coordinates at all) is an error:
+///   `E57: Scan „<name>“ hat keine kartesischen Punkte`.
+/// - Entries the library could not decode within bounds are refused before decoding: a
+///   coordinate with 0 bit, or no value with at least 1 bit.
 /// - Colour and intensity (normalised to 0–1 by their limits) become `round(v × 65535)`;
 ///   intensity is not turned into colour. A point without one of them gets 0 when the column
 ///   exists for another entry.
@@ -442,12 +445,27 @@ fn read(
                 ),
             ));
         }
-        let bits = pc
+        let raw_bits = pc
             .prototype
             .iter()
             .map(|r| record_bits(&r.data_type))
-            .sum::<u64>()
-            .max(MIN_POINT_BITS);
+            .sum::<u64>();
+        // Checked before the library decodes anything: with no bit in a record it fills its
+        // queue without end (an allocation failure, not a panic), and without coordinates the
+        // entry has nothing to show anyway.
+        if pc.records > 0 && raw_bits == 0 {
+            return Err(ExportError::format(
+                path,
+                format!(
+                    "E57: Scan „{name}“ speichert keinen Wert mit mindestens 1 Bit je Punkt – \
+                     solche Dateien werden nicht gelesen"
+                ),
+            ));
+        }
+        if pc.records > 0 && !pc.has_cartesian() && !pc.has_spherical() {
+            return Err(no_points(path, &name));
+        }
+        let bits = raw_bits.max(MIN_POINT_BITS);
         let cap = budget.saturating_sub(claimed) / bits;
         if pc.records > cap {
             return Err(too_many(path, &name, pc.records, cap));
@@ -531,10 +549,7 @@ fn read(
             }
             progress.advance(pending);
             if valid == 0 {
-                return Err(ExportError::format(
-                    path,
-                    format!("E57: Scan „{name}“ hat keine kartesischen Punkte"),
-                ));
+                return Err(no_points(path, &name));
             }
         }
         scans.push(ScanInfo {
@@ -558,6 +573,13 @@ fn entry_name(pc: &e57::PointCloud, k: usize) -> String {
         .clone()
         .filter(|n| !n.trim().is_empty())
         .unwrap_or_else(|| format!("Scan {}", k + 1))
+}
+
+fn no_points(path: &Path, name: &str) -> ExportError {
+    ExportError::format(
+        path,
+        format!("E57: Scan „{name}“ hat keine kartesischen Punkte"),
+    )
 }
 
 fn too_many(path: &Path, name: &str, records: u64, cap: u64) -> ExportError {

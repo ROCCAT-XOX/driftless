@@ -269,14 +269,13 @@ pub fn read_las_into(
 ) -> Result<ReadEnd, ExportError> {
     check_cancel(progress)?;
     let err = |e| las_error(path, "keine lesbare LAS-Datei", e);
-    let mut reader = ::las::Reader::from_path(path).map_err(err)?;
+    let (mut reader, limits) = open_las(path)?;
     let header = reader.header();
     let total = header.number_of_points();
     let format = *header.point_format();
     let b = header.bounds();
-    // A broken header must not reserve memory for points the file cannot hold.
-    let file_len = std::fs::metadata(path).map_or(0, |m| m.len());
-    let capacity = usize::try_from(total.min(file_len.saturating_mul(8))).unwrap_or(0);
+    // Only what the file can hold (the count is checked against it, see `open_las`).
+    let capacity = usize::try_from(total.min(limits.reserve)).unwrap_or(0);
     let layout = Layout {
         rgb: format.has_color,
         intensity: true,
@@ -297,7 +296,7 @@ pub fn read_las_into(
         .build();
     loop {
         check_cancel(progress)?;
-        let read = reader.fill_points(BLOCK as u64, &mut batch).map_err(err)?;
+        let read = reader.fill_points(limits.batch, &mut batch).map_err(err)?;
         if read == 0 {
             break;
         }
@@ -334,4 +333,251 @@ pub fn read_las_into(
         rgb_eight_bit: format.has_color && max_rgb <= 255,
         intensity_eight_bit: max_intensity <= 255,
     })
+}
+
+/// Most bytes one batch of `las` may take: it sizes its buffer as points × record length.
+const BATCH_BYTES: u64 = 64 << 20;
+/// Most points a LAZ file is believed to hold per byte of compressed data. Real files hold
+/// fewer than two; a chunk of identical points stores its first point raw and then very
+/// little, so this is generous.
+const LAZ_POINTS_PER_BYTE: u64 = 1024;
+/// Most points reserved per byte of LAZ data before reading (the vectors grow beyond).
+const LAZ_RESERVE_PER_BYTE: u64 = 8;
+/// Bytes of a VLR and of an EVLR header.
+const VLR_HEADER: u64 = 54;
+const EVLR_HEADER: u64 = 60;
+/// The `laszip` VLR: user id, record id.
+const LASZIP_USER: &[u8] = b"laszip encoded";
+const LASZIP_RECORD: u16 = 22204;
+
+/// What a checked header allows.
+#[derive(Clone, Copy, Debug)]
+pub struct LasLimits {
+    /// Points to ask `las` for per `fill_points` (at most [`BLOCK`], at most 64 MB of records).
+    pub batch: u64,
+    /// Most points to reserve memory for before reading: what an uncompressed file can hold,
+    /// 8 per byte of LAZ data.
+    pub reserve: u64,
+}
+
+/// Opens a LAS or LAZ file for reading after checking its header against the file, so that no
+/// claimed count or length makes `las` reserve memory for data the file does not have:
+///
+/// - LAS: points × record length within the point data; LAZ: the chunk table inside the file
+///   and with no more chunks than bytes of data, the points plausible for the compressed size;
+/// - every VLR and EVLR inside the file.
+///
+/// A file that fails is a [`ExportError::Format`] in German. Read with
+/// [`LasLimits::batch`] points per `fill_points`.
+pub fn open_las(path: &Path) -> Result<(::las::Reader, LasLimits), ExportError> {
+    let err = |e| las_error(path, "keine lesbare LAS-Datei", e);
+    let limits = {
+        let mut file = io::BufReader::new(File::open(path).map_err(|e| ExportError::io(path, e))?);
+        let len = file
+            .get_ref()
+            .metadata()
+            .map_err(|e| ExportError::io(path, e))?
+            .len();
+        check_layout(path, &mut file, len)?
+    };
+    let reader = ::las::Reader::from_path(path).map_err(err)?;
+    Ok((reader, limits))
+}
+
+/// The checks of [`open_las`] on the open file of `len` bytes.
+fn check_layout<R: io::Read + Seek>(
+    path: &Path,
+    file: &mut R,
+    len: u64,
+) -> Result<LasLimits, ExportError> {
+    let err = |e| las_error(path, "keine lesbare LAS-Datei", e);
+    let io_err = |e| err(::las::Error::Io(e));
+    let raw = ::las::raw::Header::read_from(&mut *file).map_err(err)?;
+    let compressed = ::las::point::Format::new(raw.point_data_record_format)
+        .map_err(err)?
+        .is_compressed;
+    let kind = if compressed { "LAZ-Datei" } else { "LAS-Datei" };
+    let total = match raw.large_file {
+        Some(lf) if raw.number_of_point_records == 0 => lf.number_of_point_records,
+        _ => u64::from(raw.number_of_point_records),
+    };
+    let record_len = u64::from(raw.point_data_record_length);
+    if record_len == 0 {
+        return Err(ExportError::format(
+            path,
+            format!("{kind} ist beschädigt (Punkte ohne Länge)"),
+        ));
+    }
+    let data_start = u64::from(raw.offset_to_point_data);
+
+    // VLRs, one after the other from the end of the header.
+    let mut at = u64::from(raw.header_size);
+    let mut laszip = None;
+    let vlr_beyond = || {
+        ExportError::format(
+            path,
+            format!("{kind} ist beschädigt (VLR reicht über das Dateiende)"),
+        )
+    };
+    for _ in 0..raw.number_of_variable_length_records {
+        let (length, user, record) = record_header(file, at, len, false)
+            .map_err(io_err)?
+            .ok_or_else(vlr_beyond)?;
+        if user.starts_with(LASZIP_USER) && record == LASZIP_RECORD && length >= 2 {
+            laszip = Some(at + VLR_HEADER);
+        }
+        at += VLR_HEADER + length;
+        if at > len {
+            return Err(vlr_beyond());
+        }
+    }
+    // EVLRs.
+    if let Some(evlr) = raw.evlr {
+        let mut at = evlr.start_of_first_evlr;
+        for _ in 0..evlr.number_of_evlrs {
+            let beyond = || {
+                ExportError::format(
+                    path,
+                    format!("{kind} ist beschädigt (EVLR reicht über das Dateiende)"),
+                )
+            };
+            let (length, _, _) = record_header(file, at, len, true)
+                .map_err(io_err)?
+                .ok_or_else(beyond)?;
+            at = at
+                .checked_add(EVLR_HEADER)
+                .and_then(|a| a.checked_add(length))
+                .filter(|&a| a <= len)
+                .ok_or_else(beyond)?;
+        }
+    }
+
+    let data = len.checked_sub(data_start).ok_or_else(|| {
+        ExportError::format(
+            path,
+            format!("{kind} ist beschädigt (Punkte beginnen hinter dem Dateiende)"),
+        )
+    })?;
+    let max_points = if compressed {
+        // Without the LASzip VLR `las` refuses the file itself.
+        if let Some(vlr) = laszip {
+            check_chunk_table(file, vlr, data_start, len).map_err(|e| match e {
+                ChunkError::Io(e) => io_err(e),
+                ChunkError::Outside => ExportError::format(
+                    path,
+                    "LAZ-Datei ist beschädigt (Chunk-Tabelle liegt außerhalb der Datei)",
+                ),
+                ChunkError::TooLong => ExportError::format(
+                    path,
+                    "LAZ-Datei ist beschädigt (Chunk-Tabelle passt nicht in die Datei)",
+                ),
+            })?;
+        }
+        data.saturating_mul(LAZ_POINTS_PER_BYTE)
+    } else {
+        data / record_len
+    };
+    if total > max_points {
+        return Err(ExportError::format(
+            path,
+            format!(
+                "{kind} gibt {total} Punkte an, die Datei kann höchstens {max_points} enthalten"
+            ),
+        ));
+    }
+    let reserve = if compressed {
+        data.saturating_mul(LAZ_RESERVE_PER_BYTE)
+    } else {
+        max_points
+    };
+    Ok(LasLimits {
+        batch: (BATCH_BYTES / record_len).clamp(1, BLOCK as u64),
+        reserve,
+    })
+}
+
+/// Length, user id and record id of the (E)VLR at `at`; `None` if its header does not fit
+/// into the file.
+fn record_header<R: io::Read + Seek>(
+    file: &mut R,
+    at: u64,
+    len: u64,
+    extended: bool,
+) -> io::Result<Option<(u64, [u8; 16], u16)>> {
+    let size = if extended { EVLR_HEADER } else { VLR_HEADER };
+    if at.checked_add(size).is_none_or(|end| end > len) {
+        return Ok(None);
+    }
+    let mut head = [0u8; 28];
+    file.seek(SeekFrom::Start(at))?;
+    file.read_exact(&mut head[..if extended { 28 } else { 22 }])?;
+    let mut user = [0u8; 16];
+    user.copy_from_slice(&head[2..18]);
+    let record = u16::from_le_bytes([head[18], head[19]]);
+    let length = if extended {
+        u64::from_le_bytes(head[20..28].try_into().expect("8 bytes"))
+    } else {
+        u64::from(u16::from_le_bytes([head[20], head[21]]))
+    };
+    Ok(Some((length, user, record)))
+}
+
+enum ChunkError {
+    Io(io::Error),
+    Outside,
+    TooLong,
+}
+
+impl From<io::Error> for ChunkError {
+    fn from(e: io::Error) -> Self {
+        ChunkError::Io(e)
+    }
+}
+
+/// The LAZ chunk table as `laz` finds it: its offset at the start of the point data (or, if
+/// the writer could not set it, in the last 8 bytes of the file). It must lie inside the file
+/// and have no more chunks than bytes of compressed data (every chunk takes some). A file
+/// compressed point-wise (no chunks) has no table.
+fn check_chunk_table<R: io::Read + Seek>(
+    file: &mut R,
+    laszip: u64,
+    data_start: u64,
+    len: u64,
+) -> Result<(), ChunkError> {
+    let mut u16b = [0u8; 2];
+    file.seek(SeekFrom::Start(laszip))?;
+    file.read_exact(&mut u16b)?;
+    // Compressor 1: point-wise, one stream without chunks.
+    if u16::from_le_bytes(u16b) <= 1 {
+        return Ok(());
+    }
+    let read_i64 = |file: &mut R, at: SeekFrom| -> io::Result<i64> {
+        let mut b = [0u8; 8];
+        file.seek(at)?;
+        file.read_exact(&mut b)?;
+        Ok(i64::from_le_bytes(b))
+    };
+    if data_start.checked_add(8).is_none_or(|end| end > len) {
+        return Err(ChunkError::Outside);
+    }
+    let mut table = read_i64(file, SeekFrom::Start(data_start))?;
+    if table <= data_start as i64 {
+        table = read_i64(file, SeekFrom::End(-8))?;
+        if table <= data_start as i64 {
+            // No table: `laz` reads on without one (or says so itself).
+            return Ok(());
+        }
+    }
+    let table = table as u64;
+    if table.checked_add(8).is_none_or(|end| end > len) {
+        return Err(ChunkError::Outside);
+    }
+    let mut u32b = [0u8; 4];
+    file.seek(SeekFrom::Start(table + 4))?;
+    file.read_exact(&mut u32b)?;
+    let chunks = u64::from(u32::from_le_bytes(u32b));
+    if chunks > table - data_start {
+        return Err(ChunkError::TooLong);
+    }
+    Ok(())
 }

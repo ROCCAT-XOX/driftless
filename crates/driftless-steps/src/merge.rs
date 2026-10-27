@@ -78,8 +78,6 @@ pub const MIN_COLOR_VOXELS: usize = 100;
 const MIN_CHANNEL: f64 = 8.0;
 /// `color.las` belongs to `clean.bin` if every point lies this close (m); LAS keeps 0.1 mm.
 const COLOR_MATCH: f64 = 0.001;
-/// Points read from `color.las` per batch (a cancel check each).
-const COLOR_BATCH: u64 = 1 << 20;
 /// Phase of the alignment.
 const PHASE_ALIGN: &str = "Ausrichten";
 
@@ -371,7 +369,8 @@ fn attach_color(
         Ok(false)
     };
     let err = |e: las::Error| StepError::Failed(format!("{}: {e}", path.display()));
-    let mut reader = las::Reader::from_path(&path).map_err(err)?;
+    let (mut reader, limits) =
+        driftless_export::las::open_las(&path).map_err(|e| StepError::Failed(e.to_string()))?;
     let header = reader.header();
     if !header.point_format().has_color {
         return unfit("keine Farben".into());
@@ -387,7 +386,7 @@ fn attach_color(
         .build();
     loop {
         check_cancel(progress)?;
-        if reader.fill_points(COLOR_BATCH, &mut batch).map_err(err)? == 0 {
+        if reader.fill_points(limits.batch, &mut batch).map_err(err)? == 0 {
             break;
         }
         for p in batch.points() {

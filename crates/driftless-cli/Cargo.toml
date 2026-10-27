@@ -21,6 +21,7 @@ winresource = { version = "0.1.34", default-features = false }
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+driftless-export = { path = "../driftless-export" }
 driftless-gpu = { path = "../driftless-gpu" }
 driftless-io = { path = "../driftless-io" }
 driftless-map = { path = "../driftless-map" }
