@@ -379,6 +379,26 @@ fn align_with_pairs_refines() {
     // The marks are 2 cm off the right pose the ICP found.
     let rms = a.pair_rms_mm.expect("pair fit");
     assert!(rms > 15.0 && rms < 25.0, "{}", describe(&a));
+    // All marks 8 cm off the same way: the ICP still finds the place, the pairs no longer fit
+    // it closely enough.
+    let shifted: Vec<_> = pairs
+        .iter()
+        .map(|(s, t)| (*s, t + v3(0.08, 0.0, 0.0)))
+        .collect();
+    let b = align_with_pairs(
+        &source,
+        &target,
+        &shifted,
+        &AlignConfig::default(),
+        &Progress::new(),
+    );
+    let (dt, dr) = pose_error(&b.pose, &pose, &source);
+    assert!(dt < 0.01 && dr < 0.3, "error {dt:.4} m {dr:.3}°");
+    assert!(
+        matches!(&b.verdict, Verdict::Unsure(w) if w.contains("Punktpaare")),
+        "{}",
+        describe(&b)
+    );
 }
 
 /// Room A and the first 0.5 m of the corridor as the target, the corridor and room B as the

@@ -259,6 +259,11 @@ pub const FAILED_AGREEMENT: f64 = 0.3;
 pub const SYMMETRY_TURNS: usize = 4;
 /// Correspondence distances of the coarse ICP stages on the thinned points (m).
 const STAGES: [f64; 3] = [1.0, 0.5, 0.25];
+/// The same from point pairs ([`align_with_pairs`]): they put the source within centimetres,
+/// and where the scans share only a narrow strip the stages of 1 m and 0.5 m pull the parts
+/// the target never saw onto its surfaces (the office cut with a 2 % strip: from right pairs
+/// 1.3 m and 20° away). A start up to about 10 cm off still comes back.
+const PAIR_STAGES: [f64; 1] = [0.25];
 /// Neighbours and iterations of the fine ICP stage (it starts within a few centimetres; a
 /// candidate that still slides after 10 iterations is a wrong one). On 2 cm points 5
 /// neighbours span too little for the plane tests of the coarse stages. 20 (until the wall
@@ -812,7 +817,18 @@ fn refine(
     init: &Isometry3<f64>,
     cfg: &AlignConfig,
 ) -> (Isometry3<f64>, PairQuality) {
-    let (coarse, _, _) = register(p.src.coarse.points(), &icp.coarse_target, init, &STAGES);
+    refine_in(p, icp, init, &STAGES, cfg)
+}
+
+/// [`refine`] with the coarse stages `stages`.
+fn refine_in(
+    p: &Pair,
+    icp: &Icp,
+    init: &Isometry3<f64>,
+    stages: &[f64],
+    cfg: &AlignConfig,
+) -> (Isometry3<f64>, PairQuality) {
+    let (coarse, _, _) = register(p.src.coarse.points(), &icp.coarse_target, init, stages);
     let fine = align(
         &icp.fine_source,
         &icp.fine_target,
@@ -1232,7 +1248,8 @@ pub fn align_pair(
 }
 
 /// Aligns `source` to `target` from point pairs marked by hand (source point, target point):
-/// [`pose_from_pairs`] as start, then ICP as in [`align_pair`], rated by how well the pairs
+/// [`pose_from_pairs`] as start, then ICP as in [`align_pair`] but without its widest
+/// stages ([`PAIR_STAGES`]), rated by how well the pairs
 /// fit the refined pose ([`Alignment::pair_rms_mm`]) and by the residuals and the tilt;
 /// overlap, agreement and ambiguity do not count (the user chose the place; see the module
 /// documentation).
@@ -1263,7 +1280,7 @@ pub fn align_with_pairs(
     if progress.is_cancelled() {
         return cancelled(method);
     }
-    let (pose, quality) = refine(&p, &icp, &init, cfg);
+    let (pose, quality) = refine_in(&p, &icp, &init, &PAIR_STAGES, cfg);
     let rms = pair_rms_mm(pairs, &pose);
     Alignment {
         pose,
