@@ -10,6 +10,8 @@
 *.ply
 *.amap
 *.amx
+# …except the small synthetic samples of foreign writers (tools/export/make_foreign.py)
+!crates/driftless-export/tests/fixtures/foreign/*
 /data/
 /testdata/local/
 
