@@ -1,6 +1,7 @@
 //! `run_merge` on synthetic scans of one room with two boxes: scan A at the origin, scan B
 //! from (0.8, 0.5, 0) turned by 30°, scan C of the bare room from its centre (it fits turned
 //! by 180° as well). A has a `color.las` coloured by the place in the room, B and C have none.
+//! Point pairs marked by hand place C.
 
 use driftless_io::progress::{Progress, ProgressSnapshot};
 use driftless_io::testscan::{empty_room_bag, furnished_room_bag, tmp};
@@ -11,6 +12,7 @@ use driftless_steps::merge::{
     member_transform, merge_input_id, read_model, run_merge, MergeMember, MergeRequest,
     ModelReport, MODEL_LAS, MODEL_PLY, MODEL_REPORT,
 };
+use driftless_steps::pairs::{PointPairEntry, PointPairs, POINT_PAIRS_FILE};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::StepError;
 use driftless_traj::nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, Vector3};
@@ -379,4 +381,174 @@ fn unsure_member_left_out() {
         (dt < 0.05 && dr < 1.0) || (tt < 0.05 && tr < 1.0),
         "C at neither pose: {dt:.3} m {dr:.2}° / {tt:.3} m {tr:.2}°"
     );
+}
+
+/// Three places seen by scan C, in its own frame and in the frame of scan A.
+fn pairs_c_in_a() -> (Vec<[f64; 3]>, Vec<[f64; 3]>) {
+    let in_c = vec![[-0.8, -0.6, 0.3], [0.9, -0.4, 1.2], [0.3, 0.9, 0.6]];
+    let in_a = in_c
+        .iter()
+        .map(|p| {
+            let q = truth_c() * Point3::from(*p);
+            [q.x, q.y, q.z]
+        })
+        .collect();
+    (in_c, in_a)
+}
+
+fn pair_entry(
+    a: &Path,
+    b: &Path,
+    points_a: Vec<[f64; 3]>,
+    points_b: Vec<[f64; 3]>,
+) -> PointPairEntry {
+    PointPairEntry {
+        a: a.to_path_buf(),
+        b: b.to_path_buf(),
+        points_a,
+        points_b,
+        enabled: true,
+        note: String::new(),
+        added: "2026-10-27T12:00:00Z".into(),
+    }
+}
+
+#[test]
+fn pairs_rescue_unsure_member() {
+    let s = scene();
+    let out = out_dir("punktpaare");
+    let (in_c, in_a) = pairs_c_in_a();
+    let mut req = request(vec![member(&s.a), member(&s.b), member(&s.c)], &out);
+    // Marked from A to C: the merge, aligning C to A, turns them round.
+    req.pairs = vec![pair_entry(
+        &s.a.join("driftless"),
+        &s.c.join("driftless"),
+        in_a,
+        in_c,
+    )];
+    let report = run_merge(&req, &Progress::new()).unwrap();
+    let c = &report.members[2];
+    assert_eq!(c.verdict, "sicher", "{}", describe(&report));
+    assert_eq!(c.method, "punktpaare");
+    assert_eq!(c.placed_against, Some(0));
+    assert!(c.included && c.points > 0);
+    let (dt, dr) = pose_error(&member_transform(c), &truth_c());
+    assert!(dt < 0.02 && dr < 0.5, "error {dt:.4} m {dr:.3}°");
+    assert_eq!(report.members[1].verdict, "sicher");
+    assert_ne!(report.members[1].method, "punktpaare");
+    assert_eq!(sources(&out), BTreeSet::from([0, 1, 2]));
+    assert_eq!(
+        read_model(&out).unwrap().input_id,
+        merge_input_id(&req).unwrap()
+    );
+}
+
+#[test]
+fn disabled_pairs_are_ignored() {
+    let s = scene();
+    let out = out_dir("punktpaare-aus");
+    let plain = request(vec![member(&s.a), member(&s.b), member(&s.c)], &out);
+    let (in_c, in_a) = pairs_c_in_a();
+    // Wrong by 2 m: used, they would put C elsewhere.
+    let wrong: Vec<[f64; 3]> = in_a.iter().map(|p| [p[0] + 2.0, p[1], p[2]]).collect();
+    let mut off = pair_entry(
+        &s.c.join("driftless"),
+        &s.a.join("driftless"),
+        in_c.clone(),
+        wrong,
+    );
+    off.enabled = false;
+    // Switched on, but for a scan that is not in the model.
+    let elsewhere = pair_entry(&s.c.join("driftless"), &s.a.join("anderswo"), in_c, in_a);
+    let req = MergeRequest {
+        pairs: vec![off, elsewhere],
+        ..plain.clone()
+    };
+    let id = merge_input_id(&req).unwrap();
+    assert_eq!(id, merge_input_id(&plain).unwrap());
+    let report = run_merge(&req, &Progress::new()).unwrap();
+    let c = &report.members[2];
+    assert_eq!(c.verdict, "unsicher", "{}", describe(&report));
+    assert_ne!(c.method, "punktpaare");
+    assert!(!c.included);
+    assert_eq!(report.input_id, id);
+
+    // Switched on, the pairs count.
+    let mut on = req.clone();
+    on.pairs[0].enabled = true;
+    assert_ne!(merge_input_id(&on).unwrap(), id);
+}
+
+#[test]
+fn pairs_round_trip_and_reject_two_points() {
+    let dir = tmp("punktpaare-datei");
+    let path = dir.join("modelle").join(POINT_PAIRS_FILE);
+    assert_eq!(PointPairs::load(&path).unwrap(), PointPairs::default());
+
+    let (in_c, in_a) = pairs_c_in_a();
+    let (a, b) = (
+        Path::new("scans/a/driftless"),
+        Path::new("scans/c/driftless"),
+    );
+    let mut pairs = PointPairs::default();
+    let mut first = pair_entry(a, b, in_a.clone(), in_c.clone());
+    first.note = "Ecken".into();
+    assert_eq!(pairs.add(first).unwrap(), 0);
+    assert_eq!(
+        pairs
+            .add(pair_entry(b, a, in_c.clone(), in_a.clone()))
+            .unwrap(),
+        1
+    );
+    pairs.set_enabled(0, false).unwrap();
+    assert!(pairs.set_enabled(2, true).is_err());
+
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    pairs.save(&path).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("[[paar]]"), "{text}");
+    assert!(text.contains("a = \"scans/a/driftless\""), "{text}");
+    let back = PointPairs::load(&path).unwrap();
+    assert_eq!(back, pairs);
+    assert!(!back.entries[0].enabled && back.entries[1].enabled);
+
+    // Relative to a base folder, with `/` or `\`; absolute paths stay.
+    let resolved = back.resolved(&dir);
+    assert_eq!(resolved[0].a, dir.join("scans").join("a").join("driftless"));
+    let mut abs = back.clone();
+    abs.entries[0].b = dir.join("woanders");
+    abs.entries[1].a = PathBuf::from("./scans\\c//driftless");
+    let resolved = abs.resolved(&dir);
+    assert_eq!(resolved[0].b, dir.join("woanders"));
+    assert_eq!(resolved[1].a, dir.join("scans").join("c").join("driftless"));
+
+    let rejected = |e: PointPairEntry, what: &str| {
+        let mut p = back.clone();
+        match p.add(e) {
+            Err(StepError::Failed(m)) => assert!(m.contains(what), "{m}"),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert_eq!(p.entries.len(), 2, "nothing added");
+    };
+    rejected(
+        pair_entry(a, b, in_a[..2].to_vec(), in_c[..2].to_vec()),
+        "mindestens drei",
+    );
+    rejected(
+        pair_entry(a, b, in_a.clone(), in_c[..2].to_vec()),
+        "gleich viele",
+    );
+    let line = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
+    rejected(pair_entry(a, b, line.clone(), line), "Linie");
+    rejected(
+        pair_entry(a, a, in_a.clone(), in_c.clone()),
+        "zwei verschiedene",
+    );
+
+    // A broken file is an error, not an empty list.
+    fs::write(&path, "[[paar]]\na = 1\n").unwrap();
+    assert!(PointPairs::load(&path).is_err());
+    fs::write(&path, "[[paar]]\na = \"x\"\nb = \"y\"\npoints_a = [[0.0, 0.0, 0.0]]\npoints_b = []\nenabled = true\n").unwrap();
+    let e = PointPairs::load(&path).unwrap_err();
+    assert!(e.to_string().contains("Eintrag 1"), "{e}");
 }

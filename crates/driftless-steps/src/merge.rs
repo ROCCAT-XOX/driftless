@@ -13,6 +13,11 @@
 //!    overlap, then the smaller numbers. `T_i = T_j · pose`. An unsure or failed member is
 //!    entered with its best result; it is in the model (and an anchor for the others) only
 //!    with [`MergeRequest::include_unsure`] and if not failed.
+//!
+//!    Two members with switched-on point pairs ([`MergeRequest::pairs`], in either
+//!    direction) are aligned through them ([`align_with_pairs`]) instead of [`align_pair`];
+//!    the pairs of all such entries of the two count together. A sure result of point pairs
+//!    goes before every sure automatic one.
 //! 2. **Colour**: per member in the model after the reference, the median ratio per channel
 //!    between the colour of the earlier members and its own, over the 1 cm voxels both
 //!    coloured ([`COLOR_VOXEL`]), clamped to [[`MIN_GAIN`], [`MAX_GAIN`]]; 1 with fewer than
@@ -39,7 +44,7 @@ use driftless_map::{
 };
 use driftless_odom::voxel_map::{voxel_key, FixedState, VoxelKey};
 use driftless_slam::align::{
-    align_pair, AlignConfig, AlignMethod, Alignment, Verdict, MIN_AGREEMENT,
+    align_pair, align_with_pairs, AlignConfig, AlignMethod, Alignment, Verdict, MIN_AGREEMENT,
 };
 use driftless_traj::nalgebra::{
     Isometry3, Matrix3, Matrix4, Point3, Rotation3, Translation3, UnitQuaternion, Vector3,
@@ -99,7 +104,9 @@ pub struct MergeRequest {
     pub smooth: bool,
     /// Take unsure members into the model as well.
     pub include_unsure: bool,
-    /// Point pairs marked by hand (not used yet).
+    /// Point pairs marked by hand, `a` and `b` as paths of the file system
+    /// ([`crate::pairs::PointPairs::resolved`]). An entry counts if it is switched on and
+    /// names the map folders ([`MergeMember::map_dir`]) of two members; others are ignored.
     pub pairs: Vec<PointPairEntry>,
 }
 
@@ -189,6 +196,62 @@ fn color_part(map_dir: &Path) -> String {
     format!("color {}\n", id.as_deref().unwrap_or("none"))
 }
 
+/// The numbers of the two members whose map folders `e` names (`a`, then `b`), compared as
+/// the file system resolves them; `None` if it names another folder or one member twice.
+/// Whether it is switched on does not matter.
+pub fn pair_members(req: &MergeRequest, e: &PointPairEntry) -> Option<(usize, usize)> {
+    let index = |p: &Path| {
+        let p = canonical(p);
+        req.members.iter().position(|m| canonical(&m.map_dir) == p)
+    };
+    let (i, j) = (index(&e.a)?, index(&e.b)?);
+    (i != j).then_some((i, j))
+}
+
+/// Point pairs of two members: (point in the first, point in the second).
+type HandPairs = Vec<(Vector3<f64>, Vector3<f64>)>;
+
+/// The point pairs that count ([`MergeRequest::pairs`]) by members (smaller, larger number),
+/// those of several entries one after another in their order. Fails if one of them cannot be
+/// used ([`PointPairEntry::check`]).
+fn hand_pairs(req: &MergeRequest) -> Result<BTreeMap<(usize, usize), HandPairs>, StepError> {
+    let mut out: BTreeMap<(usize, usize), HandPairs> = BTreeMap::new();
+    for e in req.pairs.iter().filter(|e| e.enabled) {
+        let Some((i, j)) = pair_members(req, e) else {
+            continue;
+        };
+        e.check().map_err(|m| {
+            format!(
+                "{m} ({} – {})",
+                req.members[i].map_dir.display(),
+                req.members[j].map_dir.display()
+            )
+        })?;
+        let pairs = e.pairs();
+        let slot = out.entry((i.min(j), i.max(j))).or_default();
+        if i < j {
+            slot.extend(pairs);
+        } else {
+            slot.extend(pairs.into_iter().map(|(p, q)| (q, p)));
+        }
+    }
+    Ok(out)
+}
+
+/// The point pairs of members `i` and `j` ([`hand_pairs`]) as (point in `i`, point in `j`).
+fn pairs_between(
+    by_hand: &BTreeMap<(usize, usize), HandPairs>,
+    i: usize,
+    j: usize,
+) -> Option<HandPairs> {
+    let pairs = by_hand.get(&(i.min(j), i.max(j)))?;
+    Some(if i < j {
+        pairs.clone()
+    } else {
+        pairs.iter().map(|&(p, q)| (q, p)).collect()
+    })
+}
+
 /// Full text of the input id and the clean id of every member.
 fn input_text(req: &MergeRequest) -> Result<(String, Vec<String>), StepError> {
     let mut id = format!(
@@ -206,17 +269,19 @@ fn input_text(req: &MergeRequest) -> Result<(String, Vec<String>), StepError> {
         "{:?}\nvoxel {:?}\nsmooth {}\ninclude_unsure {}\n",
         req.align, req.voxel, req.smooth, req.include_unsure
     );
-    for p in req.pairs.iter().filter(|p| p.enabled) {
-        id += &format!(
-            "pairs {:?} {:?} {:?} {:?}\n",
-            p.a, p.b, p.points_a, p.points_b
-        );
+    for ((i, j), pairs) in hand_pairs(req)? {
+        let pairs: Vec<_> = pairs
+            .iter()
+            .map(|(p, q)| (p.as_slice(), q.as_slice()))
+            .collect();
+        id += &format!("pairs {i} {j} {pairs:?}\n");
     }
     Ok((id, clean_ids))
 }
 
 /// Input id of a merge: [`MERGE_VERSION`], the clean stage id and the colouring of every
-/// member in order, the settings and the switched-on point pairs.
+/// member in order, the settings and the point pairs that count (by member numbers, not
+/// paths).
 pub fn merge_input_id(req: &MergeRequest) -> Result<String, StepError> {
     Ok(hex(&input_text(req)?.0))
 }
@@ -351,7 +416,7 @@ struct Placement {
 }
 
 /// Rank of an alignment in the chain; larger is better.
-fn rank(a: &Alignment) -> (u8, bool, f64) {
+fn rank(a: &Alignment) -> (u8, bool, bool, f64) {
     let verdict = match a.verdict {
         Verdict::Sure => 2,
         Verdict::Unsure(_) => 1,
@@ -359,6 +424,7 @@ fn rank(a: &Alignment) -> (u8, bool, f64) {
     };
     (
         verdict,
+        a.verdict == Verdict::Sure && a.method == AlignMethod::PointPairs,
         a.quality.agreement >= MIN_AGREEMENT,
         a.quality.overlap,
     )
@@ -366,9 +432,9 @@ fn rank(a: &Alignment) -> (u8, bool, f64) {
 
 fn better(a: &Alignment, b: &Alignment) -> bool {
     let (ra, rb) = (rank(a), rank(b));
-    (ra.0, ra.1)
-        .cmp(&(rb.0, rb.1))
-        .then(ra.2.total_cmp(&rb.2))
+    (ra.0, ra.1, ra.2)
+        .cmp(&(rb.0, rb.1, rb.2))
+        .then(ra.3.total_cmp(&rb.3))
         .is_gt()
 }
 
@@ -387,6 +453,7 @@ fn chain(
         included: true,
     });
     let mut cache: BTreeMap<(usize, usize), Alignment> = BTreeMap::new();
+    let by_hand = hand_pairs(req)?;
     progress.phase(PHASE_ALIGN, Some(n as u64 - 1));
     loop {
         let open: Vec<usize> = (0..n).filter(|&i| placed[i].is_none()).collect();
@@ -402,7 +469,12 @@ fn chain(
                 if let Entry::Vacant(slot) = cache.entry((i, j)) {
                     check_cancel(progress)?;
                     let start = Instant::now();
-                    let a = align_pair(&pts[i], &pts[j], &req.align, progress);
+                    let a = match pairs_between(&by_hand, i, j) {
+                        Some(pairs) => {
+                            align_with_pairs(&pts[i], &pts[j], &pairs, &req.align, progress)
+                        }
+                        None => align_pair(&pts[i], &pts[j], &req.align, progress),
+                    };
                     // A cancelled alignment comes back as failed.
                     check_cancel(progress)?;
                     let (mi, mj) = (&req.members[i], &req.members[j]);
@@ -852,6 +924,66 @@ mod tests {
             colored: rgb.as_ref().map(|_| vec![true; n]),
             rgb,
         }
+    }
+
+    #[test]
+    fn hand_pairs_by_member_and_direction() {
+        let member = |dir: &str| MergeMember {
+            scan: dir.into(),
+            slam_dir: dir.into(),
+            map_dir: format!("{dir}/karte").into(),
+            slam: SlamSettings::default(),
+        };
+        let entry = |a: &str, b: &str, from: f64, n: usize| PointPairEntry {
+            a: format!("{a}/karte").into(),
+            b: format!("{b}/karte").into(),
+            points_a: (0..n).map(|k| [from + k as f64, 0.0, 0.0]).collect(),
+            points_b: (0..n).map(|k| [0.0, from + k as f64, 0.0]).collect(),
+            enabled: true,
+            note: String::new(),
+            added: String::new(),
+        };
+        let mut off = entry("s1", "s0", 50.0, 3);
+        off.enabled = false;
+        let req = MergeRequest {
+            members: vec![member("s0"), member("s1"), member("s2")],
+            out_dir: "m".into(),
+            align: AlignConfig::default(),
+            voxel: 0.01,
+            smooth: false,
+            include_unsure: false,
+            pairs: vec![
+                entry("s2", "s0", 0.0, 3),
+                entry("s1", "s1", 10.0, 3),
+                entry("s0", "s9", 20.0, 3),
+                off,
+                entry("s0", "s2", 30.0, 4),
+                // Not about two members: not checked.
+                entry("s9", "s0", 40.0, 2),
+            ],
+        };
+        let by_hand = hand_pairs(&req).unwrap();
+        assert_eq!(by_hand.keys().copied().collect::<Vec<_>>(), vec![(0, 2)]);
+        let x = |v: f64| Vector3::new(v, 0.0, 0.0);
+        let y = |v: f64| Vector3::new(0.0, v, 0.0);
+        // Member 2 as source, member 0 as target: as the first entry was marked.
+        let from_2 = pairs_between(&by_hand, 2, 0).unwrap();
+        assert_eq!(from_2.len(), 7);
+        assert_eq!(from_2[0], (x(0.0), y(0.0)));
+        assert_eq!(from_2[3], (y(30.0), x(30.0)));
+        let from_0 = pairs_between(&by_hand, 0, 2).unwrap();
+        assert_eq!(from_0[0], (y(0.0), x(0.0)));
+        assert_eq!(from_0[6], (x(33.0), y(33.0)));
+        assert!(pairs_between(&by_hand, 0, 1).is_none());
+
+        // A switched-on entry of two members that cannot be used is an error.
+        let mut bad = req.clone();
+        bad.pairs.push(entry("s1", "s2", 60.0, 2));
+        let e = hand_pairs(&bad).unwrap_err().to_string();
+        assert!(
+            e.contains("mindestens drei") && e.contains("s1/karte"),
+            "{e}"
+        );
     }
 
     #[test]

@@ -347,7 +347,8 @@ struct Ids {
     color: Option<String>,
 }
 
-pub(crate) fn hex(id: &str) -> String {
+/// The short text form of an input id: its content hash, 16 hex digits.
+pub fn hex(id: &str) -> String {
     format!("{:016x}", content_hash(id.as_bytes()))
 }
 

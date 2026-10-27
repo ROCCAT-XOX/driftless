@@ -1,9 +1,13 @@
 //! `driftless merge <scan>... -o <ziel>`: several scans of one place merged into one model
 //! (`modell.las`, `modell.ply`, `modell.json`). The first scan is the reference; its frame is
 //! the model frame. The run itself is [`driftless_steps::merge::run_merge`].
+//!
+//! `--punktpaare <datei>` takes point pairs marked by hand (a file like `punktpaare.toml`,
+//! [`driftless_steps::pairs`]); its map folders are relative to the folder of the file.
 
 use driftless_slam::align::AlignConfig;
-use driftless_steps::merge::{run_merge, MergeMember, MergeRequest, ModelReport};
+use driftless_steps::merge::{pair_members, run_merge, MergeMember, MergeRequest, ModelReport};
+use driftless_steps::pairs::PointPairs;
 use driftless_steps::scan::extrinsic_values;
 use driftless_steps::slam::SlamSettings;
 use std::path::{Path, PathBuf};
@@ -24,6 +28,10 @@ pub struct Args {
     /// in derselben Reihenfolge; Standard: der Lauf-Ordner
     #[arg(long, value_name = "KARTE")]
     map: Vec<PathBuf>,
+    /// Punktpaare von Hand (TOML wie punktpaare.toml, Kartenordner relativ zur Datei): ersetzen
+    /// die automatische Ausrichtung der genannten Scans
+    #[arg(long, value_name = "DATEI")]
+    punktpaare: Option<PathBuf>,
     /// Auch unsicher ausgerichtete Scans ins Modell nehmen (gescheiterte nie)
     #[arg(long)]
     auch_unsichere: bool,
@@ -85,6 +93,16 @@ fn request(args: &Args) -> Result<MergeRequest, Box<dyn std::error::Error>> {
             slam: slam.clone(),
         })
         .collect();
+    let pairs = match &args.punktpaare {
+        None => Vec::new(),
+        Some(file) => {
+            if !file.is_file() {
+                return Err(format!("Punktpaare: {} nicht gefunden", file.display()).into());
+            }
+            let base = file.parent().unwrap_or(Path::new(""));
+            PointPairs::load(file)?.resolved(base)
+        }
+    };
     Ok(MergeRequest {
         members,
         out_dir: args.out.clone(),
@@ -92,8 +110,27 @@ fn request(args: &Args) -> Result<MergeRequest, Box<dyn std::error::Error>> {
         voxel: args.voxel,
         smooth: !args.ohne_glaetten,
         include_unsure: args.auch_unsichere,
-        pairs: Vec::new(),
+        pairs,
     })
+}
+
+/// A warning for every switched-on entry of the point pairs that names no two scans of
+/// `req` (a mistyped folder would otherwise be ignored silently).
+fn unused_pairs(req: &MergeRequest) -> Vec<String> {
+    req.pairs
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.enabled && pair_members(req, e).is_none())
+        .map(|(k, e)| {
+            format!(
+                "Punktpaare Eintrag {}: {} und {} sind nicht zwei der gewählten Karten, nicht \
+                 genutzt",
+                k + 1,
+                e.a.display(),
+                e.b.display()
+            )
+        })
+        .collect()
 }
 
 fn folder_name(p: &Path) -> String {
@@ -113,8 +150,13 @@ fn lines(report: &ModelReport) -> Vec<String> {
             if m.placed_against.is_none() {
                 return format!("{name}: Bezug");
             }
+            let by_hand = if m.method == "punktpaare" {
+                " (Punktpaare)"
+            } else {
+                ""
+            };
             let mut line = format!(
-                "{name}: {}, Überlappung {:.0} %, Restfehler {:.1} mm",
+                "{name}: {}{by_hand}, Überlappung {:.0} %, Restfehler {:.1} mm",
                 m.verdict,
                 100.0 * m.overlap,
                 m.residual_median_mm
@@ -136,7 +178,11 @@ fn lines(report: &ModelReport) -> Vec<String> {
 
 pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let req = request(args)?;
-    let report = run_merge(&req, &crate::console())?;
+    let console = crate::console();
+    for w in unused_pairs(&req) {
+        console.warn(w);
+    }
+    let report = run_merge(&req, &console)?;
     for line in lines(&report) {
         println!("{line}");
     }
@@ -206,6 +252,54 @@ mod tests {
         // Only --slam: the map is in the given run folder.
         let r = parse(&["a", "b", "-o", "m", "--slam", "s1", "--slam", "s2"]).unwrap();
         assert_eq!(r.members[1].map_dir, PathBuf::from("s2"));
+    }
+
+    #[test]
+    fn point_pairs_relative_to_their_file() {
+        let dir =
+            std::env::temp_dir().join(format!("driftless-merge-paare-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("paare.toml");
+        let pts = "[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]";
+        let entry = |a: &str, b: &str, enabled: bool| {
+            format!(
+                "[[paar]]\na = \"{a}\"\nb = \"{b}\"\npoints_a = {pts}\npoints_b = {pts}\n\
+                 enabled = {enabled}\n"
+            )
+        };
+        let text = [
+            entry("a/driftless", "b/driftless", true),
+            entry("a/driftless", "c/driftless", true),
+            entry("a/driftless", "c/driftless", false),
+        ]
+        .concat();
+        std::fs::write(&file, text).unwrap();
+        let a = dir.join("a");
+        let b = dir.join("b");
+        let f = file.to_str().unwrap();
+        let r = parse(&[
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "-o",
+            "m",
+            "--punktpaare",
+            f,
+        ])
+        .unwrap();
+        assert_eq!(r.pairs.len(), 3);
+        assert_eq!(r.pairs[0].a, dir.join("a").join("driftless"));
+        assert_eq!(r.pairs[0].b, r.members[1].map_dir);
+        // Only the second names a folder that is not a map of the merge.
+        let w = unused_pairs(&r);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("Eintrag 2"), "{w:?}");
+
+        let e = parse(&["a", "b", "-o", "m", "--punktpaare", "fehlt.toml"]).unwrap_err();
+        assert!(e.contains("fehlt.toml nicht gefunden"), "{e}");
+        std::fs::write(&file, "[[paar]]\na = 1\n").unwrap();
+        let e = parse(&["a", "b", "-o", "m", "--punktpaare", f]).unwrap_err();
+        assert!(e.contains("nicht lesbar"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

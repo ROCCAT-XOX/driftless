@@ -72,6 +72,39 @@ fn merges_two_scans_and_checks_the_folders() {
     assert!(out.join("modell.las").is_file());
     assert!(out.join("modell.ply").is_file());
 
+    // Point pairs marked by hand place B: three places in B and the same in A.
+    let (sin, cos) = 30f64.to_radians().sin_cos();
+    let in_b = [[0.5, -0.4, 0.3], [-0.6, 0.7, 1.1], [0.9, 0.8, 0.6]];
+    let in_a = in_b.map(|[x, y, z]| [cos * x - sin * y + 0.8, sin * x + cos * y + 0.5, z]);
+    let file = dir.join("paare.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[[paar]]\na = \"raum-b/driftless\"\nb = \"raum-a/driftless\"\npoints_a = {in_b:?}\n\
+             points_b = {in_a:?}\nenabled = true\n\n\
+             [[paar]]\na = \"raum-b/driftless\"\nb = \"raum-c/driftless\"\npoints_a = {in_b:?}\n\
+             points_b = {in_a:?}\nenabled = true\n"
+        ),
+    )
+    .unwrap();
+    let by_hand = dir.join("modell-paare");
+    driftless(&[
+        "merge".as_ref(),
+        a.as_os_str(),
+        b.as_os_str(),
+        "-o".as_ref(),
+        by_hand.as_os_str(),
+        "--punktpaare".as_ref(),
+        file.as_os_str(),
+    ])
+    .success()
+    .stdout(predicate::str::contains("raum-b: sicher (Punktpaare)"))
+    .stderr(predicate::str::contains("Warnung: Punktpaare Eintrag 2"));
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(by_hand.join("modell.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["members"][1]["method"], "punktpaare");
+
     // Nothing is overwritten.
     driftless(&[
         "merge".as_ref(),

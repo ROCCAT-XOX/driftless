@@ -48,16 +48,16 @@ use driftless_io::atomic_write;
 use driftless_io::bag::BagReader;
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
-use driftless_map::content_hash;
 use driftless_map::surface::SurfaceConfig;
 use driftless_slam::align::AlignConfig;
 use driftless_steps::correct::utc_now;
 use driftless_steps::history::{self, HistoryEntry};
 use driftless_steps::map::{
-    clean_stage_id, fitting_stages, folder_fits, map_input_for, run_map, MapInput, MapRequest,
+    clean_stage_id, fitting_stages, folder_fits, hex, map_input_for, run_map, MapInput, MapRequest,
     MapSettings, MapStep, MapSwitches, CLEAN_BIN, DENSE_BIN, REPORT,
 };
 use driftless_steps::merge::{read_model, run_merge, MergeMember, MergeRequest, ModelReport};
+use driftless_steps::pairs::stored_path as from_stored;
 use driftless_steps::slam::{
     cache_fits, run_slam, SlamOutcome, SlamRequest, SlamSettings, CACHE_FILE, CORRECTIONS_FILE,
 };
@@ -375,31 +375,6 @@ fn to_stored(base: &Path, path: &Path) -> Result<String, ProjectError> {
         _ => path.to_str().map(str::to_string),
     };
     text.ok_or_else(|| ProjectError(format!("Pfad {} ist kein gültiger Text", path.display())))
-}
-
-/// Absolute on Windows: `C:\…`, `C:/…` or `\\server\…` (also read on another system, where
-/// such a path is just not found instead of being taken as relative).
-fn windows_absolute(text: &str) -> bool {
-    let b = text.as_bytes();
-    let drive =
-        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\');
-    drive || text.starts_with("\\\\") || text.starts_with("//")
-}
-
-/// A path from a project file: absolute as written, relative (with `/` or `\`) to `base`.
-fn from_stored(base: &Path, text: &str) -> PathBuf {
-    let p = Path::new(text);
-    if p.is_absolute() || windows_absolute(text) {
-        return p.to_path_buf();
-    }
-    let mut out = base.to_path_buf();
-    for part in text
-        .split(['/', '\\'])
-        .filter(|s| !s.is_empty() && *s != ".")
-    {
-        out.push(part);
-    }
-    out
 }
 
 /// Windows device names, which name no folder whatever the extension.
@@ -1434,9 +1409,7 @@ pub fn model_status(model: &ModelInfo) -> MapStatus {
             return false;
         };
         let input = map_input_for(&m.scan, &m.slam_dir, &m.map_dir, m.slam.clone());
-        clean_stage_id(&input).map_or(true, |now| {
-            format!("{:016x}", content_hash(now.as_bytes())) != *id
-        })
+        clean_stage_id(&input).map_or(true, |now| hex(&now) != *id)
     };
     let stale = !model_scan_missing(model)
         && model
