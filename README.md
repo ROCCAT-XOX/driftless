@@ -125,6 +125,8 @@ driftless export buero.laz -o buero.e57 --ueberschreiben    # convert a file, re
   and `;` as the separator (German spreadsheets).
 - Every file is written to `<name>.tmp` and renamed at the end: an error or a cancel leaves no half
   file and the old one unchanged. The same input gives the same bytes (no date in any header).
+  Stopping `driftless export` with Ctrl-C also leaves the old file unchanged, but its `<name>.tmp`
+  stays behind; delete it by hand.
 
 In the desktop program: right click on a run, map, model or surface in the tree → „Exportieren …“, or
 ☰ → „Exportieren …“ for what the 3D view shows. The window „Exportieren“ offers the formats of the
@@ -139,7 +141,9 @@ programs too, also without a project: ☰ → „Datei öffnen …“ or drop th
 - An E57 with several scans keeps them apart: the colour mode „je Scan“ colours by scan.
 - Colours and intensities of 8-bit files (some foreign LAS, PLY with `uchar`, PCD) are read as such.
 - A PCD in an organised grid skips its empty (NaN) rows; an OBJ with quads, negative indices or a
-  missing texture opens (a missing texture is gray, with „Textur fehlt“ in the log); a glb with node
+  missing texture opens (a missing texture is gray, with „Textur fehlt“ in the log; a texture or
+  `.mtl` outside the OBJ's folder, e.g. `../textures/x.png`, is not read: „… außerhalb des Ordners
+  wird nicht gelesen“ – copy it next to the OBJ); a glb with node
   transforms or PNG textures opens.
 - What cannot be read gives a German message in the status bar instead of a crash: a PCD saved
   „binary_compressed“ (save it as „binary“ in CloudCompare or PCL), a glb compressed with Draco, a
@@ -153,8 +157,10 @@ both files (`.github/workflows/release.yml`); once it is published they are unde
 Releases.
 
 - **macOS (Apple Silicon):** `Driftless-<version>-macos-arm64.dmg`. Open it and drag `Driftless.app`
-  onto the `Applications` link. The app is signed ad hoc, not notarised: on the first start macOS refuses a double
-  click, so right-click the app → „Öffnen“ → „Öffnen“ once. The command line is inside the app:
+  onto the `Applications` link. The app is signed ad hoc, not notarised, so macOS blocks the first
+  start. After that first try, open System Settings → „Datenschutz & Sicherheit“, scroll down and
+  click „Dennoch öffnen“ next to the note about Driftless (once). Or, in Terminal:
+  `xattr -dr com.apple.quarantine /Applications/Driftless.app`. The command line is inside the app:
   `/Applications/Driftless.app/Contents/MacOS/driftless`.
 - **Windows (x64):** `Driftless-<version>-setup.exe`. It installs for the current user without admin
   rights (to `%LOCALAPPDATA%\Programs\Driftless` unless chosen otherwise) with a start menu entry.
@@ -162,7 +168,9 @@ Releases.
   Informationen“ → „Trotzdem ausführen“. The command line `driftless.exe` is in the installation
   folder next to `driftless-app.exe`; uninstall through „Apps“ in the Windows settings.
 - „Über Driftless …“ in ☰ shows the version, the commit and the path of the command line;
-  `driftless --version` and `driftless-app --version` print the same.
+  `driftless --version` and `driftless-app --version` print the same. On Windows the desktop
+  program has no console of its own: `driftless-app --version` shows its line only with the output
+  redirected, e.g. `driftless-app --version | more`.
 
 Build them yourself (version from `Cargo.toml`, result in `target/package/`):
 

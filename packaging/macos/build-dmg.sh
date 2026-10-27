@@ -4,8 +4,10 @@
 #   packaging/macos/build-dmg.sh [--ohne-bauen]
 #
 # --ohne-bauen: take the release programs already in target/release (no cargo build).
-# The bundle gets an ad-hoc signature only (no Apple account): Gatekeeper asks once, right
-# click → „Öffnen“ starts it. Check the result with packaging/macos/check-dmg.sh.
+# The bundle gets an ad-hoc signature only (no Apple account): Gatekeeper blocks the first start;
+# then System Settings → „Datenschutz & Sicherheit“ → „Dennoch öffnen“, or
+# `xattr -dr com.apple.quarantine /Applications/Driftless.app`. Check the result with
+# packaging/macos/check-dmg.sh.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"

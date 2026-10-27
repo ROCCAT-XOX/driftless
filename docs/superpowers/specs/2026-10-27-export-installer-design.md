@@ -71,7 +71,9 @@ Der Installer soll Driftless ohne Rust und ohne Kommandozeile auf einen fremden 
   - Windows: Code-Signing-Zertifikat
 
   Beides braucht Zugangsdaten, die es noch nicht gibt. Die README sagt, wie man die Warnung beim ersten Start
-  bestätigt: macOS Rechtsklick → Öffnen, Windows „Weitere Informationen → Trotzdem ausführen“.
+  bestätigt: macOS nach dem ersten, blockierten Start Systemeinstellungen → „Datenschutz & Sicherheit“ →
+  „Dennoch öffnen“ (oder `xattr -dr com.apple.quarantine /Applications/Driftless.app`), Windows
+  „Weitere Informationen → Trotzdem ausführen“.
 - Intel-Macs, Linux-Pakete, automatische Updates.
 - Dateizuordnungen im System (Doppelklick auf `.las` öffnet Driftless). Sie würden CloudCompare und andere
   verdrängen.
