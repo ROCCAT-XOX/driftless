@@ -1,6 +1,6 @@
 //! Triangle reduction: flat walls become a few big triangles, the shape stays within a tight error.
-//! Then edges longer than [`SurfaceConfig::max_edge`] or [`TEXTURE_EDGE_VOXELS`] voxels are
-//! split, so that every face fits into a camera image and is small enough for the texture's
+//! Then edges longer than [`texture_edge`] (a few voxels, at most [`SurfaceConfig::max_edge`])
+//! are split, so that every face fits into a camera image and is small enough for the texture's
 //! seam levelling, and slivers on flat parts are turned into rounder faces by
 //! edge flips ([`improve_triangles`]). Finally every vertex of the input is checked against the
 //! result ([`far_vertices`]); those too far away are locked and the reduction runs again.
@@ -18,22 +18,37 @@ const MAX_SPLIT_ROUNDS: usize = 40;
 /// left further than [`SurfaceConfig::simplify_error`] from the result.
 const MAX_LOCK_ROUNDS: usize = 4;
 
-/// Edges of the textured mesh are at most this many voxels long (and at most
-/// [`SurfaceConfig::max_edge`], the bound for coarse voxels): the seam levelling has one gain
-/// per vertex and the labels are per face, so large flat triangles (a merged model's floor,
-/// fused from several scans and simplified further than a single scan's) cannot follow the
-/// brightness that changes from image to image and show polygonal blotches. Black room model
-/// at 1 cm: `seam_step` 23.31 → 19.24 with 4 voxels (together with 16 views per face and the
-/// gray fill), faces 1.97 → 2.92 M.
-pub const TEXTURE_EDGE_VOXELS: f64 = 4.0;
+/// Edges of the textured mesh are at most this many voxels long, but may always reach
+/// [`TEXTURE_EDGE_MIN`], and never more than [`SurfaceConfig::max_edge`] (the bound for coarse
+/// voxels); see [`texture_edge`]. The seam levelling has one gain per vertex and the labels are
+/// per face, so large flat triangles (a merged model's floor, fused from several scans and
+/// simplified further than a single scan's) cannot follow the brightness that changes from
+/// image to image and show polygonal blotches.
+///
+/// Black room model (three scans), with 16 views per face and the gray fill: at 2 cm
+/// `seam_step` 21.72 → 15.64 with 3 voxels (6 cm), 17.73 with 4 (8 cm); `.glb` 35 → 50 MB
+/// (42 with 4). At 1 cm 23.31 → 19.24 with 4 cm, 17.14 with 3 cm, but `.glb` 83 → 104 MB
+/// against 133 MB and simplification 123 against 194 s; 4 cm already beats the single scan
+/// as it was (20.64).
+pub const TEXTURE_EDGE_VOXELS: f64 = 3.0;
+
+/// Texture edges may always be this long (m), however fine the voxel (see
+/// [`TEXTURE_EDGE_VOXELS`]).
+pub const TEXTURE_EDGE_MIN: f64 = 0.04;
+
+/// The longest edge of the textured mesh for `cfg` (m): [`TEXTURE_EDGE_VOXELS`] voxels, at
+/// least [`TEXTURE_EDGE_MIN`], at most [`SurfaceConfig::max_edge`].
+pub fn texture_edge(cfg: &SurfaceConfig) -> f64 {
+    cfg.max_edge
+        .min((TEXTURE_EDGE_VOXELS * cfg.voxel).max(TEXTURE_EDGE_MIN))
+}
 
 /// Reduces the triangles of `mesh` with meshoptimizer.
 ///
 /// The vertices of `mesh` stay within `cfg.simplify_error` (m) of the result (see below), and the
 /// vertices on the border of the mesh stay where they are, so open edges keep their length.
 /// Vertices no face uses after the reduction are dropped; the order of the rest is kept. Every
-/// edge longer than `cfg.max_edge` or [`TEXTURE_EDGE_VOXELS`] · `cfg.voxel` is split at its
-/// midpoint (see [`split_long_edges`]), slivers are flipped (see [`improve_triangles`]).
+/// edge longer than [`texture_edge`] is split at its midpoint (see [`split_long_edges`]), slivers are flipped (see [`improve_triangles`]).
 ///
 /// meshoptimizer's error limit alone does not give that bound: its error is a weighted mean of
 /// the squared distances to the planes merged into a vertex, so where a thin part (a rod, a
@@ -54,7 +69,7 @@ pub fn simplify(mesh: &Mesh, cfg: &SurfaceConfig) -> Mesh {
     let adapter = VertexDataAdapter::new(bytes, 12, 0).expect("Eckpunkte sind drei f32 je Punkt");
     let mut lock = vec![false; mesh.positions.len()];
     let mut round = 0;
-    let max_edge = cfg.max_edge.min(TEXTURE_EDGE_VOXELS * cfg.voxel);
+    let max_edge = texture_edge(cfg);
     loop {
         // Target count 0: reduce as far as the error allows. The error is absolute (m), which
         // is the same as the relative error of the brief scaled by the extent of the mesh.
@@ -665,23 +680,26 @@ mod tests {
 
     #[test]
     fn max_edge_is_capped_by_the_voxel() {
+        let at = |voxel: f64| texture_edge(&SurfaceConfig { voxel, ..cfg() });
+        assert_eq!(at(0.02), TEXTURE_EDGE_VOXELS * 0.02);
+        assert_eq!(at(0.01), TEXTURE_EDGE_MIN);
+        assert_eq!(at(0.005), TEXTURE_EDGE_MIN);
+        assert_eq!(at(1.0), cfg().max_edge);
         let mesh = grid_wall(300, 250, 0.01); // 3 × 2.5 m
         for voxel in [0.01, 0.02] {
             let cfg = SurfaceConfig { voxel, ..cfg() };
-            assert!(TEXTURE_EDGE_VOXELS * voxel < cfg.max_edge);
+            let edge = texture_edge(&cfg);
+            assert!(edge < cfg.max_edge);
             let out = simplify(&mesh, &cfg);
             let longest = longest_edge(&out);
-            assert!(longest <= TEXTURE_EDGE_VOXELS * voxel, "{voxel}: {longest}");
-            assert!(
-                longest > 0.5 * TEXTURE_EDGE_VOXELS * voxel,
-                "{voxel}: {longest}"
-            );
+            assert!(longest <= edge, "{voxel}: {longest}");
+            assert!(longest > 0.5 * edge, "{voxel}: {longest}");
             assert!(out.positions.iter().all(|p| (p[0] - 0.5).abs() <= 0.001));
         }
         // A coarse voxel: `max_edge` is the bound.
         let out = simplify(&mesh, &coarse(0.3));
         assert!(longest_edge(&out) <= 0.3);
-        assert!(longest_edge(&out) > TEXTURE_EDGE_VOXELS * cfg().voxel);
+        assert!(longest_edge(&out) > texture_edge(&cfg()));
     }
 
     /// [`far_vertices`] against a search over all faces.
