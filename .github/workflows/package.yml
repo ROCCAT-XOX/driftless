@@ -11,8 +11,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # The commit shown by `--version` and „Über Driftless“ (packaging/build_commit.rs).
-  DRIFTLESS_COMMIT: ${{ github.sha }}
+  # The commit shown by `--version` and „Über Driftless“ (packaging/build_commit.rs, cut to
+  # 9 characters there): for a pull request its head commit, not GitHub's merge commit.
+  DRIFTLESS_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   macos:

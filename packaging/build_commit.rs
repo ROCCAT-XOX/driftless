@@ -2,8 +2,19 @@
 // `include!("../../packaging/build_commit.rs")`: sets `DRIFTLESS_COMMIT` for `env!`.
 //
 // The commit is the environment variable `DRIFTLESS_COMMIT` if set (CI, builds from a source
-// archive), else `git rev-parse --short=9 HEAD`, else „unbekannt“. Cargo runs the script again
-// when the variable changes or when `HEAD`, the branch it points to or `packed-refs` change.
+// archive; a full hash is cut to 9 characters), else `git rev-parse --short=9 HEAD`, else
+// „unbekannt“. Cargo runs the script again when the variable changes or when `HEAD`, the
+// branch it points to or `packed-refs` change.
+
+/// `commit` trimmed; a hash longer than 9 hex digits cut to 9, as `git rev-parse --short=9`.
+fn short_commit(commit: &str) -> String {
+    let commit = commit.trim();
+    if commit.len() > 9 && commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        commit[..9].to_string()
+    } else {
+        commit.to_string()
+    }
+}
 
 /// Sets `DRIFTLESS_COMMIT` and tells Cargo when to run the build script again.
 fn emit_commit() {
@@ -42,7 +53,7 @@ fn emit_commit() {
     }
     let commit = std::env::var("DRIFTLESS_COMMIT")
         .ok()
-        .map(|c| c.trim().to_string())
+        .map(|c| short_commit(&c))
         .filter(|c| !c.is_empty())
         .or_else(|| git(&["rev-parse", "--short=9", "HEAD"]))
         .unwrap_or_else(|| "unbekannt".to_string());

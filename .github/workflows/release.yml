@@ -6,8 +6,9 @@ on:
   push:
     tags: ['v*']
 
+# Read only by default; only the job that makes the draft may write.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # First, so that a wrong tag fails in seconds and not after both builds.
@@ -39,6 +40,8 @@ jobs:
   draft:
     needs: [version, package]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       # Checked again here: the draft never goes out under a tag that does not match.
