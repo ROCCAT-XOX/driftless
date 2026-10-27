@@ -238,7 +238,7 @@ const SWAP_MAX_ROT: f64 = 1.0 * std::f64::consts::PI / 180.0;
 /// ICP parameters of one verification stage. The prior is weak (1/1000 of the odometry
 /// default): the anchors may be off by the whole drift, so the start pose must not hold the
 /// solution back; it only keeps the normal equations solvable.
-fn stage_params(max_corr_dist: f64) -> IcpParams {
+pub(crate) fn stage_params(max_corr_dist: f64) -> IcpParams {
     let d = IcpParams::default();
     IcpParams {
         max_corr_dist,
@@ -307,7 +307,7 @@ fn to_f64(points: &[[f32; 3]]) -> Vec<Vector3<f64>> {
 
 /// Coarse-to-fine ICP of `source` against `target` from `init`. Returns the final pose, its
 /// convergence in the finest stage and the metrics evaluated at that pose.
-fn register(
+pub(crate) fn register(
     source: &[Vector3<f64>],
     target: &IcpTarget,
     init: &Isometry3<f64>,
