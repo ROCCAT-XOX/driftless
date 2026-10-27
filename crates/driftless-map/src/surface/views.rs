@@ -970,6 +970,9 @@ pub(crate) struct ViewsInfo {
     pub views_seconds: f64,
     /// Of `views_seconds`, how long the GPU waited for decoded images.
     pub decode_wait_seconds: f64,
+    /// Passes of the GPU over the images (ranges of faces within its budget, see
+    /// [`super::views_gpu`]); 0 on the CPU.
+    pub gpu_passes: usize,
 }
 
 /// [`collect_views_with`] with the GPU's batch size (faces per batch; `None`: as large as the
@@ -1076,9 +1079,10 @@ pub(crate) fn collect_views_on(
         let on_gpu = match gpu {
             None => None,
             Some((ctx, batch)) => match super::views_gpu::gpu_views(&pass, ctx, batch, progress) {
-                Ok((views, wait)) => {
-                    info.decode_wait_seconds = wait;
-                    Some(views)
+                Ok(found) => {
+                    info.decode_wait_seconds = found.waited;
+                    info.gpu_passes = found.passes;
+                    Some((found.per_face, found.samples))
                 }
                 Err(GpuStop::Fail(e)) => return Err(e),
                 Err(GpuStop::Fallback(why)) => {
@@ -1184,7 +1188,7 @@ pub(crate) struct Stream {
 
 impl Stream {
     /// Images of the stream the pass reads: up to the last used one.
-    fn walked(&self) -> u64 {
+    pub(crate) fn walked(&self) -> u64 {
         self.last_used.map_or(0, |l| l as u64 + 1)
     }
 
@@ -2659,6 +2663,81 @@ mod tests {
     }
 
     #[test]
+    fn gpu_views_in_passes_within_the_budget_match_one_pass() {
+        let Some(ctx) = test_gpu() else {
+            eprintln!("übersprungen: kein Grafikadapter vorhanden");
+            return;
+        };
+        let (painted, images, poses, cams) = walk_data();
+        let src = source(images, poses, cams);
+        let cfg = SurfaceConfig::default();
+        let k = cfg.views_per_face;
+        let mesh = painted_mesh(painted, STEP);
+        let count = mesh.indices.len();
+        let run = |cfg: &SurfaceConfig, ctx: &GpuContext, batch: Option<usize>| {
+            collect_views_on(
+                &mesh,
+                std::slice::from_ref(&src),
+                cfg,
+                &Progress::new(),
+                Some((ctx, batch)),
+            )
+            .unwrap()
+        };
+        let (one, info) = run(&cfg, &ctx, None);
+        assert_eq!(info.gpu_passes, 1);
+        let mut sparse = cfg.clone();
+        sparse.color.exposure.samples = count / 7;
+        let (sparse_one, _) = run(&sparse, &ctx, None);
+        let (image, depth) = super::super::views_gpu::stream_sizes(
+            &all_cameras(std::slice::from_ref(&src)),
+            &cfg.color,
+        );
+        // Room for the slots of a quarter of the faces (and no exposure samples): at least
+        // four passes.
+        let budget = driftless_gpu::faces_pass_bytes(count, count / 4, k, 0, image, depth);
+        let small = ctx.with_budget(budget);
+        let notes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = notes.clone();
+        let p = Progress::with_log(move |l| {
+            if let driftless_io::progress::LogLine::Info(s) = l {
+                log.lock().unwrap().push(s.clone());
+            }
+        });
+        let (many, info) = collect_views_on(
+            &mesh,
+            std::slice::from_ref(&src),
+            &cfg,
+            &p,
+            Some((&small, None)),
+        )
+        .unwrap();
+        assert!(info.gpu_passes >= 4, "{}", info.gpu_passes);
+        assert_eq!(info.gpu_fallback, None);
+        assert_eq!(one.per_face, many.per_face);
+        assert_eq!(one, many);
+        let notes = notes.lock().unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains(&format!("in {} Durchläufen", info.gpu_passes))),
+            "{notes:?}"
+        );
+        // The progress counts every pass: one step per image and pass.
+        let s = p.snapshot();
+        assert_eq!(s.phase, "Ansichten suchen");
+        assert_eq!(s.total, Some(s.done));
+        // Passes that cut through the device's batches too.
+        let (cut, info) = run(&cfg, &small, Some(777));
+        assert!(info.gpu_passes >= 4, "{}", info.gpu_passes);
+        assert_eq!(one, cut);
+        // Exposure samples on every 7th face only: the passes do not start on a sampled face.
+        let (sparse_many, info) = run(&sparse, &small, None);
+        assert!(info.gpu_passes >= 4, "{}", info.gpu_passes);
+        assert_eq!(sparse_one, sparse_many);
+    }
+
+    #[test]
     fn cancel_during_gpu_views() {
         let Some(ctx) = test_gpu() else {
             eprintln!("übersprungen: kein Grafikadapter vorhanden");
@@ -2711,6 +2790,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(table, cpu);
+        assert_eq!(info.gpu_passes, 0);
         let why = info.gpu_fallback.expect("fallback reason");
         assert!(why.contains("Grafikspeicher"), "{why}");
         let notes = notes.lock().unwrap();

@@ -7,6 +7,11 @@
 //! half octave of score, then a hash of sample and image), like the CPU pass of
 //! `driftless_map::surface::views`. The slots stay on the GPU until
 //! [`FaceViews::read_views`] / [`FaceViews::read_samples`].
+//!
+//! Every face goes into the depth buffer, but only the faces of one contiguous range keep
+//! views ([`FaceViews::keep`]): a mesh whose slots do not fit the budget runs in several
+//! passes over the images ([`face_passes`]), each with the same depth buffers and so the same
+//! views of its faces as one pass over all of them.
 
 use crate::views::{failed, wait, READ_CHUNK};
 use crate::visibility::{entry, read_buffer_at};
@@ -14,6 +19,7 @@ use crate::{GpuCamera, GpuContext, GpuRunError, ViewSlot, VisParams, CAMERA_WGSL
 use bytemuck::{Pod, Zeroable};
 use nalgebra::{Isometry3, Translation3, Vector3};
 use std::collections::VecDeque;
+use std::ops::Range;
 
 const WORKGROUP: u32 = 64;
 /// Faces per batch so that one dispatch stays within 65535 workgroups.
@@ -129,9 +135,8 @@ pub fn faces_batch(ctx: &GpuContext, views_per_face: usize) -> usize {
         .clamp(1, MAX_DISPATCH_FACES)
 }
 
-/// GPU memory of [`FaceViews`] (bytes): faces (96 B), slots (12 B per view), exposure
-/// samples (16 B per view), the image and depth buffers ([`stream_bytes`]) and the readback
-/// chunk.
+/// GPU memory of [`FaceViews`] keeping the views of all `faces` (bytes): see
+/// [`faces_pass_bytes`].
 pub fn faces_bytes(
     faces: usize,
     views_per_face: usize,
@@ -139,12 +144,97 @@ pub fn faces_bytes(
     image_bytes: usize,
     depth_cells: usize,
 ) -> u64 {
+    faces_pass_bytes(
+        faces,
+        faces,
+        views_per_face,
+        sample_faces,
+        image_bytes,
+        depth_cells,
+    )
+}
+
+/// GPU memory of [`FaceViews`] with `faces` faces of which `kept` keep views (bytes): every
+/// face (96 B, the depth buffer needs them all), the slots of the kept ones (12 B per view),
+/// `sample_kept` exposure samples (16 B per view), the image and depth buffers
+/// ([`stream_bytes`]) and the readback chunk.
+pub fn faces_pass_bytes(
+    faces: usize,
+    kept: usize,
+    views_per_face: usize,
+    sample_kept: usize,
+    image_bytes: usize,
+    depth_cells: usize,
+) -> u64 {
     let k = views_per_face as u64;
-    faces as u64 * (FACE_BYTES as u64 + SLOT_BYTES as u64 * k)
-        + sample_faces as u64 * SAMPLE_BYTES as u64 * k
+    faces as u64 * FACE_BYTES as u64
+        + kept as u64 * SLOT_BYTES as u64 * k
+        + sample_kept as u64 * SAMPLE_BYTES as u64 * k
         + stream_bytes(image_bytes, depth_cells, IN_FLIGHT)
         + READ_CHUNK
         + 4096
+}
+
+/// The passes of `faces` faces within the context's budget: the fewest contiguous ranges of
+/// about equal size, in order, whose [`faces_pass_bytes`] each fit (one range `0..faces` if
+/// all of them fit at once). `sample_stride`: every `stride`-th face keeps exposure samples.
+/// Fails ([`GpuRunError::Budget`]) if not even a pass of one face fits: the faces, images
+/// and depth buffers alone exceed the budget.
+pub fn face_passes(
+    ctx: &GpuContext,
+    faces: usize,
+    views_per_face: usize,
+    sample_stride: Option<usize>,
+    image_bytes: usize,
+    depth_cells: usize,
+) -> Result<Vec<Range<usize>>, GpuRunError> {
+    let need = |kept: usize| {
+        faces_pass_bytes(
+            faces,
+            kept,
+            views_per_face,
+            sample_stride.map_or(0, |s| kept.div_ceil(s.max(1))),
+            image_bytes,
+            depth_cells,
+        )
+    };
+    passes_within(ctx.budget(), faces, need).ok_or_else(|| GpuRunError::Budget {
+        need_mb: need(1).div_ceil(1_000_000),
+        budget_mb: ctx.budget() / 1_000_000,
+    })
+}
+
+/// [`face_passes`] for a budget of `budget` bytes; `need(n)`: the memory of a pass keeping
+/// `n` faces (at most, wherever the range starts), growing with `n`. `None` if one face does
+/// not fit.
+fn passes_within(
+    budget: u64,
+    faces: usize,
+    need: impl Fn(usize) -> u64,
+) -> Option<Vec<Range<usize>>> {
+    if need(faces) <= budget {
+        return Some(std::iter::once(0..faces).collect());
+    }
+    if need(1) > budget {
+        return None;
+    }
+    // The most faces a pass may keep: need(lo) fits, need(hi) does not.
+    let (mut lo, mut hi) = (1, faces);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if need(mid) <= budget {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let count = faces.div_ceil(lo);
+    let size = faces.div_ceil(count);
+    Some(
+        (0..count)
+            .map(|p| p * size..((p + 1) * size).min(faces))
+            .collect(),
+    )
 }
 
 /// Memory of an image stream with images of at most `image_bytes` and depth buffers of at
@@ -215,11 +305,22 @@ struct FacesUniform {
     _pad: [u32; 2],
 }
 
-/// One batch of faces on the GPU.
+/// One batch of faces on the GPU (all of them go into the depth buffer).
 struct FaceBatch {
     start: usize,
     len: usize,
     faces: wgpu::Buffer,
+    info: wgpu::Buffer,
+    group: Option<wgpu::BindGroup>,
+}
+
+/// The kept faces of one [`FaceBatch`] and their slots.
+struct ViewBatch {
+    /// Index of the first face in the mesh, and the face count.
+    start: usize,
+    len: usize,
+    /// Index into `FaceViews::batches`.
+    batch: usize,
     slots: wgpu::Buffer,
     info: wgpu::Buffer,
     group: Option<wgpu::BindGroup>,
@@ -231,8 +332,15 @@ pub struct FaceViews<'a> {
     params: FaceParams,
     origin: Vector3<f64>,
     batches: Vec<FaceBatch>,
-    sample_faces: usize,
+    views: Vec<ViewBatch>,
+    /// The faces whose views are kept.
+    kept: Range<usize>,
+    /// The exposure samples of the kept faces: from sample `sample_base`, `sample_kept` of them.
+    sample_base: usize,
+    sample_kept: usize,
     samples: wgpu::Buffer,
+    /// Bound as the slots of the depth buffer's batches (they keep no views).
+    no_slots: wgpu::Buffer,
     uniform: wgpu::Buffer,
     depth: wgpu::Buffer,
     depth_capacity: usize,
@@ -244,8 +352,9 @@ pub struct FaceViews<'a> {
 
 impl<'a> FaceViews<'a> {
     /// Uploads `count` faces (`face(i)`, world coordinates) in batches of at most
-    /// `batch_faces`, with empty slots; `linear` maps sRGB bytes to linear values. Fails
-    /// without views per face, with 2³² faces or more, or when a buffer cannot be written.
+    /// `batch_faces`, with empty slots for the faces of `keep` (see [`FaceViews::keep`]);
+    /// `linear` maps sRGB bytes to linear values. Fails without views per face, with 2³²
+    /// faces or more, with `keep` not within the faces, or when a buffer cannot be written.
     pub fn new(
         ctx: &'a GpuContext,
         count: usize,
@@ -253,6 +362,7 @@ impl<'a> FaceViews<'a> {
         linear: &[f32; 256],
         params: FaceParams,
         batch_faces: usize,
+        keep: Range<usize>,
     ) -> Result<FaceViews<'a>, GpuRunError> {
         let k = params.views_per_face;
         if k == 0 {
@@ -287,41 +397,15 @@ impl<'a> FaceViews<'a> {
                         v(f.smooth),
                     ]
                 })?;
-                // All zero = empty slot (score 0, image !0 = u32::MAX).
-                let slots = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Flächen Ansichten"),
-                    size: (len * k * SLOT_BYTES).max(4) as u64,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                    mapped_at_creation: false,
-                });
-                let info = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Flächen Stapel"),
-                    size: 16,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                ctx.queue().write_buffer(
-                    &info,
-                    0,
-                    bytemuck::cast_slice(&[start as u32, len as u32, 0, 0]),
-                );
                 Ok(FaceBatch {
                     start,
                     len,
                     faces,
-                    slots,
-                    info,
+                    info: batch_info(ctx, [start, len, 0, 0]),
                     group: None,
                 })
             })
             .collect::<Result<_, GpuRunError>>()?;
-        let sample_faces = params.sample_stride.map_or(0, |s| count.div_ceil(s.max(1)));
-        let samples = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Flächen Belichtung"),
-            size: (sample_faces * k * SAMPLE_BYTES).max(SAMPLE_BYTES) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
         let lin = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Linear-Tabelle"),
             size: 256 * 4,
@@ -341,8 +425,12 @@ impl<'a> FaceViews<'a> {
             params,
             origin,
             batches,
-            sample_faces,
-            samples,
+            views: Vec::new(),
+            kept: 0..0,
+            sample_base: 0,
+            sample_kept: 0,
+            samples: storage(device, "Flächen Belichtung", SAMPLE_BYTES as u64),
+            no_slots: storage(device, "Flächen ohne Ansichten", 4),
             uniform,
             depth: storage(device, "Tiefenpuffer", 4),
             depth_capacity: 1,
@@ -351,29 +439,108 @@ impl<'a> FaceViews<'a> {
             lin,
             in_flight: VecDeque::new(),
         };
-        views.bind();
+        views.keep(keep)?;
         Ok(views)
+    }
+
+    /// From now on keeps the views of the faces of `keep` (and their exposure samples), in
+    /// empty slots; the faces' views so far are dropped. All faces stay on the GPU and in the
+    /// depth buffer, so a face's views do not depend on `keep`. Fails with `keep` not within
+    /// the faces.
+    pub fn keep(&mut self, keep: Range<usize>) -> Result<(), GpuRunError> {
+        let count: usize = self.batches.iter().map(|b| b.len).sum();
+        if keep.start > keep.end || keep.end > count {
+            return Err(GpuRunError::Input(format!(
+                "Flächen {}..{} von {count}",
+                keep.start, keep.end
+            )));
+        }
+        let ctx = self.ctx;
+        let device = ctx.device();
+        let k = self.params.views_per_face;
+        // Free the slots of the last range first.
+        self.views.clear();
+        self.samples = storage(device, "Flächen Belichtung", SAMPLE_BYTES as u64);
+        let (sample_base, sample_end) = match self.params.sample_stride {
+            Some(s) => (keep.start.div_ceil(s.max(1)), keep.end.div_ceil(s.max(1))),
+            None => (0, 0),
+        };
+        for (i, b) in self.batches.iter().enumerate() {
+            let start = keep.start.max(b.start);
+            let end = keep.end.min(b.start + b.len);
+            if start >= end {
+                continue;
+            }
+            let len = end - start;
+            // All zero = empty slot (score 0, image !0 = u32::MAX).
+            let slots = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Flächen Ansichten"),
+                size: (len * k * SLOT_BYTES).max(4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            self.views.push(ViewBatch {
+                start,
+                len,
+                batch: i,
+                slots,
+                info: batch_info(ctx, [start, len, start - b.start, sample_base]),
+                group: None,
+            });
+        }
+        self.sample_base = sample_base;
+        self.sample_kept = sample_end - sample_base;
+        self.samples = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Flächen Belichtung"),
+            size: (self.sample_kept * k * SAMPLE_BYTES).max(SAMPLE_BYTES) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.kept = keep;
+        self.bind();
+        Ok(())
     }
 
     fn bind(&mut self) {
         let device = self.ctx.device();
         let layout = &pipelines(self.ctx).layout;
-        for b in &mut self.batches {
-            b.group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let group = |info: &wgpu::Buffer, faces: &wgpu::Buffer, slots: &wgpu::Buffer| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Flächen"),
                 layout,
                 entries: &[
                     entry(0, &self.uniform),
-                    entry(1, &b.info),
-                    entry(2, &b.faces),
+                    entry(1, info),
+                    entry(2, faces),
                     entry(3, &self.depth),
-                    entry(4, &b.slots),
+                    entry(4, slots),
                     entry(5, &self.samples),
                     entry(6, &self.image),
                     entry(7, &self.lin),
                 ],
-            }));
+            })
+        };
+        let geometry: Vec<_> = self
+            .batches
+            .iter()
+            .map(|b| group(&b.info, &b.faces, &self.no_slots))
+            .collect();
+        let views: Vec<_> = self
+            .views
+            .iter()
+            .map(|v| group(&v.info, &self.batches[v.batch].faces, &v.slots))
+            .collect();
+        for (b, g) in self.batches.iter_mut().zip(geometry) {
+            b.group = Some(g);
         }
+        for (v, g) in self.views.iter_mut().zip(views) {
+            v.group = Some(g);
+        }
+    }
+
+    /// The faces whose views are kept.
+    pub fn kept(&self) -> Range<usize> {
+        self.kept.clone()
     }
 
     /// Checks the device before the first image: one dispatch with an all-zero uniform (a
@@ -491,8 +658,8 @@ impl<'a> FaceViews<'a> {
         failed(ctx)
     }
 
-    /// Clears `cells` of the depth buffer, splats every batch, then finds the views of every
-    /// batch.
+    /// Clears `cells` of the depth buffer, splats every batch, then finds the views of the
+    /// kept faces.
     fn dispatch(&self, cells: usize) -> wgpu::SubmissionIndex {
         let ctx = self.ctx;
         let pipes = pipelines(ctx);
@@ -504,29 +671,45 @@ impl<'a> FaceViews<'a> {
         if cells > 0 {
             encoder.clear_buffer(&self.depth, 0, Some(cells as u64 * 4));
         }
-        for (label, pipeline) in [("Tiefenpuffer", &pipes.splat), ("Ansichten", &pipes.views)] {
+        let splat = self.batches.iter().map(|b| (b.group.as_ref(), b.len));
+        let views = self.views.iter().map(|v| (v.group.as_ref(), v.len));
+        for (label, pipeline, groups) in [
+            ("Tiefenpuffer", &pipes.splat, splat.collect::<Vec<_>>()),
+            ("Ansichten", &pipes.views, views.collect()),
+        ] {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(label),
                 timestamp_writes: None,
             });
             pass.set_pipeline(pipeline);
-            for b in &self.batches {
-                pass.set_bind_group(0, b.group.as_ref(), &[]);
-                pass.dispatch_workgroups((b.len as u32).div_ceil(WORKGROUP), 1, 1);
+            for (group, len) in groups {
+                pass.set_bind_group(0, group, &[]);
+                pass.dispatch_workgroups((len as u32).div_ceil(WORKGROUP), 1, 1);
             }
         }
         ctx.queue().submit([encoder.finish()])
     }
 
-    /// The kept views of every face, `views_per_face` per face, best first, each converted
-    /// by `f` (waits for the GPU; read back chunk by chunk).
+    /// The kept views of every kept face ([`FaceViews::kept`]), `views_per_face` per face,
+    /// best first, each converted by `f` (waits for the GPU; read back chunk by chunk).
     pub fn read_views<T>(&self, f: impl Fn(FaceSlot) -> T) -> Result<Vec<T>, GpuRunError> {
+        let mut out = Vec::with_capacity(self.kept.len() * self.params.views_per_face);
+        self.read_views_into(&mut out, f)?;
+        Ok(out)
+    }
+
+    /// [`FaceViews::read_views`] appended to `out` (the views of several ranges in one
+    /// vector without a copy).
+    pub fn read_views_into<T>(
+        &self,
+        out: &mut Vec<T>,
+        f: impl Fn(FaceSlot) -> T,
+    ) -> Result<(), GpuRunError> {
         failed(self.ctx)?;
         let k = self.params.views_per_face;
-        let total: usize = self.batches.iter().map(|b| b.len).sum();
-        let mut out = Vec::with_capacity(total * k);
+        out.reserve(self.kept.len() * k);
         let chunk = READ_CHUNK / SLOT_BYTES as u64 * SLOT_BYTES as u64;
-        for b in &self.batches {
+        for b in &self.views {
             let bytes = (b.len * k * SLOT_BYTES) as u64;
             let mut offset = 0;
             while offset < bytes {
@@ -537,18 +720,18 @@ impl<'a> FaceViews<'a> {
             }
         }
         debug_assert!(self
-            .batches
+            .views
             .windows(2)
             .all(|w| w[0].start + w[0].len == w[1].start));
-        Ok(out)
+        Ok(())
     }
 
-    /// The exposure samples, `views_per_face` per sampled face (face `s · stride`), best
-    /// first, each converted by `f`.
+    /// The exposure samples of the kept faces, `views_per_face` per sampled face (face
+    /// `s · stride`, in order of `s`), best first, each converted by `f`.
     pub fn read_samples<T>(&self, f: impl Fn(ViewSlot) -> T) -> Result<Vec<T>, GpuRunError> {
         failed(self.ctx)?;
-        let bytes = (self.sample_faces * self.params.views_per_face * SAMPLE_BYTES) as u64;
-        let mut out = Vec::with_capacity(self.sample_faces * self.params.views_per_face);
+        let bytes = (self.sample_kept * self.params.views_per_face * SAMPLE_BYTES) as u64;
+        let mut out = Vec::with_capacity(self.sample_kept * self.params.views_per_face);
         let mut offset = 0;
         while offset < bytes {
             let n = READ_CHUNK.min(bytes - offset);
@@ -558,6 +741,19 @@ impl<'a> FaceViews<'a> {
         }
         Ok(out)
     }
+}
+
+/// The uniform block `Batch` of `faces.wgsl`.
+fn batch_info(ctx: &GpuContext, words: [usize; 4]) -> wgpu::Buffer {
+    let info = ctx.device().create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Flächen Stapel"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    ctx.queue()
+        .write_buffer(&info, 0, bytemuck::cast_slice(&words.map(|w| w as u32)));
+    info
 }
 
 fn storage(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {
@@ -699,6 +895,35 @@ mod tests {
         // Two cameras (48 B each), three rows and the camera position (16 B each), then
         // seven blocks of four words.
         assert_eq!(size_of::<FacesUniform>(), 96 + 64 + 7 * 16);
+    }
+
+    #[test]
+    fn passes_are_the_fewest_that_fit() {
+        // 10 bytes per kept face on top of 100.
+        let need = |n: usize| 100 + 10 * n as u64;
+        assert_eq!(
+            passes_within(1000, 90, need),
+            Some(std::iter::once(0..90).collect())
+        );
+        // 90 kept faces fit, 100 do not: 2 passes of 50.
+        assert_eq!(passes_within(1000, 100, need), Some(vec![0..50, 50..100]));
+        // 30 fit: 4 passes of 26 (the last one shorter), contiguous and in order.
+        let p = passes_within(400, 101, need).unwrap();
+        assert_eq!(p, vec![0..26, 26..52, 52..78, 78..101]);
+        // Not even one face fits.
+        assert_eq!(passes_within(105, 100, need), None);
+        assert_eq!(passes_within(110, 100, need).map(|p| p.len()), Some(100));
+    }
+
+    #[test]
+    fn a_pass_counts_every_face_but_only_its_slots() {
+        let all = faces_bytes(1000, 16, 10, 0, 0);
+        let half = faces_pass_bytes(1000, 500, 16, 5, 0, 0);
+        assert_eq!(all - half, 500 * 12 * 16 + 5 * 16 * 16);
+        assert_eq!(
+            faces_pass_bytes(1000, 0, 16, 0, 0, 0) - faces_pass_bytes(0, 0, 16, 0, 0, 0),
+            1000 * 96
+        );
     }
 
     #[test]

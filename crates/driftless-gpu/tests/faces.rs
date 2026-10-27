@@ -81,14 +81,14 @@ fn bad_input_is_an_error_not_a_panic() {
     let lin = [0.5f32; 256];
     // No views per face.
     let none = guarded(&ctx, || {
-        FaceViews::new(&ctx, 4, face, &lin, params(0, 1), 4)
+        FaceViews::new(&ctx, 4, face, &lin, params(0, 1), 4, 0..4)
     })
     .unwrap();
     let err = none.err().expect("k = 0 is refused").to_string();
     assert!(err.contains("Grafikkarte"), "{err}");
 
     let mut views = guarded(&ctx, || {
-        FaceViews::new(&ctx, 4, face, &lin, params(2, 1), 4)
+        FaceViews::new(&ctx, 4, face, &lin, params(2, 1), 4, 0..4)
     })
     .unwrap()
     .unwrap();
@@ -110,7 +110,7 @@ fn bad_input_is_an_error_not_a_panic() {
 
     // A depth buffer of scale 0.
     let mut zero = guarded(&ctx, || {
-        FaceViews::new(&ctx, 4, face, &lin, params(2, 0), 4)
+        FaceViews::new(&ctx, 4, face, &lin, params(2, 0), 4, 0..4)
     })
     .unwrap()
     .unwrap();

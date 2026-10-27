@@ -239,6 +239,7 @@ fn stats_json(s: &SurfaceStats) -> Value {
         "accuracy": accuracy_split_json(&s.accuracy),
         "accuracy_dense": s.accuracy_dense.as_ref().map(accuracy_split_json),
         "seconds": s.seconds,
+        "gpu_batches": s.gpu_batches,
     })
 }
 

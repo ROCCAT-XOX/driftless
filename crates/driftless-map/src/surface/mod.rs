@@ -218,6 +218,9 @@ pub struct SurfaceStats {
     /// A GPU was given to [`texture_mesh`] but could not start (`--gpu auto`): the views were
     /// found on the CPU, for this reason (German).
     pub gpu_fallback: Option<String>,
+    /// Passes of the GPU over the images: more than 1 when the views of all faces do not fit
+    /// its memory budget at once (the same views either way); 0 on the CPU.
+    pub gpu_batches: usize,
 }
 
 /// Where the time of the views went (wall clock, s).
@@ -332,6 +335,7 @@ pub fn texture_mesh(
                     .then_some(info.decode_wait_seconds),
             };
             stats.gpu_fallback = info.gpu_fallback;
+            stats.gpu_batches = info.gpu_passes;
             clock.lap(stats, "views");
             check_cancel(progress)?;
             let mut labels = atlas::choose_labels(mesh, &views, cfg);

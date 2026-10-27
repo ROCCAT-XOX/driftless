@@ -19,8 +19,8 @@ pub use device::{
     MAX_GPU_BYTES,
 };
 pub use faces::{
-    faces_batch, faces_bytes, local_origin, CarrierRule, FaceData, FaceImage, FaceParams, FaceSlot,
-    FaceViews,
+    face_passes, faces_batch, faces_bytes, faces_pass_bytes, local_origin, CarrierRule, FaceData,
+    FaceImage, FaceParams, FaceSlot, FaceViews,
 };
 pub use project::{project_points, GpuCamera, CAMERA_WGSL};
 pub use views::{
