@@ -29,6 +29,11 @@ pub const PHASE_LOAD_SURFACE: &str = "Oberfläche laden";
 pub const SURFACE_GLB: &str = "oberflaeche.glb";
 /// Texture coordinate of the corners of a page without any (a plain colour).
 const NO_UV: [f32; 2] = [0.5, 0.5];
+/// Most pixels the page images of one surface decode to together: 64 per byte of image data
+/// in the file (photos as JPEG hold far fewer), at least [`PIXELS_FLOOR`] (2^29, 32 pages of
+/// 4096²). Decoded they take 4 bytes each, a third more with the mipmaps.
+const PIXELS_PER_IMAGE_BYTE: u64 = 64;
+const PIXELS_FLOOR: u64 = 1 << 29;
 
 /// A surface ready for the GPU.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -86,6 +91,7 @@ pub fn load_mesh(path: &Path, progress: &Progress) -> Result<LoadedSurface, Step
     let origin = origin_of(mesh.pages.iter().flat_map(|p| &p.positions));
     progress.phase(PHASE_LOAD_SURFACE, Some(mesh.pages.len() as u64));
     let fail = |e: String| StepError::Failed(format!("{}: {e}", path.display()));
+    check_pixels(&mesh.pages).map_err(fail)?;
     let pages = mesh
         .pages
         .into_par_iter()
@@ -105,6 +111,32 @@ pub fn load_mesh(path: &Path, progress: &Progress) -> Result<LoadedSurface, Step
         pages,
         mips,
     })
+}
+
+/// Refuses pages whose images claim more pixels together than the images' bytes can
+/// plausibly hold (see [`PIXELS_PER_IMAGE_BYTE`]), read from their headers before anything is
+/// decoded: a small file must not decode to gigabytes, several pages at once. A header that
+/// cannot be read is left to the decoder and its message.
+fn check_pixels(pages: &[MeshPage]) -> Result<(), String> {
+    let (mut pixels, mut bytes) = (0u64, 0u64);
+    for img in pages.iter().filter_map(|p| p.image.as_ref()) {
+        bytes += img.bytes.len() as u64;
+        let format = match img.kind {
+            ImageKind::Jpeg => image::ImageFormat::Jpeg,
+            ImageKind::Png => image::ImageFormat::Png,
+        };
+        let reader = image::ImageReader::with_format(std::io::Cursor::new(&img.bytes[..]), format);
+        if let Ok((w, h)) = reader.into_dimensions() {
+            pixels = pixels.saturating_add(u64::from(w) * u64::from(h));
+        }
+    }
+    let max = bytes
+        .saturating_mul(PIXELS_PER_IMAGE_BYTE)
+        .max(PIXELS_FLOOR);
+    if pixels > max {
+        return Err(text::textures_too_large(pixels, max));
+    }
+    Ok(())
 }
 
 /// One page for the GPU, with its mipmaps: corners relative to `origin`, the image decoded

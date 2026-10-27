@@ -5,7 +5,8 @@
 //! Before anything is read, in this order: the format must fit the source
 //! ([`ExportFormat::kind`]), the target must not be a file of the source (compared as the
 //! file system resolves them), and without [`ExportRequest::overwrite`] none of the targets
-//! ([`export_targets`]: for OBJ also the `.mtl` and every `<stem>_seite_*` there) may exist.
+//! ([`export_targets`]: for OBJ also the `.mtl` and every page `<stem>_seite_NN.jpg|png`
+//! there) may exist.
 //! Every file is written through `<name>.tmp` and renamed at the end; a cancel or an error
 //! leaves the old files as they were. An OBJ written over an older one removes the older
 //! one's pages that it does not write itself.
@@ -331,15 +332,27 @@ pub struct ExportReport {
     pub seconds: f64,
 }
 
-/// Whether `name` is a page of the OBJ with file stem `stem`: `<stem>_seite_…`.
+/// Whether `name` is a page of the OBJ with file stem `stem`: `<stem>_seite_<digits>.jpg`
+/// or `.png` (any other file with that start is not ours and stays).
 fn is_page_of(name: &std::ffi::OsStr, stem: &std::ffi::OsStr) -> bool {
     let mut prefix: OsString = stem.to_os_string();
     prefix.push("_seite_");
-    name.as_encoded_bytes()
-        .starts_with(prefix.as_encoded_bytes())
+    let Some(rest) = name
+        .as_encoded_bytes()
+        .strip_prefix(prefix.as_encoded_bytes())
+    else {
+        return false;
+    };
+    let Some(digits) = rest
+        .strip_suffix(b".jpg")
+        .or_else(|| rest.strip_suffix(b".png"))
+    else {
+        return false;
+    };
+    !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
 }
 
-/// The pages `<stem>_seite_*` next to the OBJ `out` that exist now, sorted.
+/// The pages `<stem>_seite_<digits>.jpg|png` next to the OBJ `out` that exist now, sorted.
 fn existing_pages(out: &Path) -> Vec<PathBuf> {
     let (Some(stem), dir) = (out.file_stem(), out.parent().unwrap_or(Path::new(""))) else {
         return Vec::new();
@@ -362,7 +375,7 @@ fn existing_pages(out: &Path) -> Vec<PathBuf> {
 }
 
 /// The files an export may write or replace: the target; for OBJ also its `.mtl` and every
-/// `<stem>_seite_*` there now (a new page, or an old one the export removes).
+/// `<stem>_seite_<digits>.jpg|png` there now (a new page, or an old one the export removes).
 pub fn export_targets(req: &ExportRequest) -> Vec<PathBuf> {
     let mut files = vec![req.out.clone()];
     if req.format == ExportFormat::Obj {
@@ -500,12 +513,12 @@ pub fn run_export(req: &ExportRequest, progress: &Progress) -> Result<ExportRepo
             (vec![out.clone()], points.len() as u64)
         }
         (Data::Mesh(m), ExportFormat::Glb) => {
-            mesh::write_glb(out, m)?;
+            mesh::write_glb(out, m, progress)?;
             (vec![out.clone()], m.triangles() as u64)
         }
         (Data::Mesh(m), ExportFormat::Obj) => {
             let old_pages = existing_pages(out);
-            mesh::write_obj(out, m)?;
+            mesh::write_obj(out, m, progress)?;
             let files = obj_files(out, m);
             for stale in old_pages.iter().filter(|p| !files.contains(p)) {
                 fs::remove_file(stale)

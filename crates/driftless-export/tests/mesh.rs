@@ -210,7 +210,7 @@ fn glb_read_write_identical() {
     let mut mesh = small_mesh();
     mesh.pages.insert(1, MeshPage::default()); // empty: left out of the glb
     let (a, b) = (dir.join("a.glb"), dir.join("b.glb"));
-    write_glb(&a, &mesh).unwrap();
+    write_glb(&a, &mesh, &Progress::new()).unwrap();
     assert!(!dir.join("a.glb.tmp").exists());
     let read = read_mesh(&a, &Progress::new()).unwrap();
     // The empty page is not in the file; the others come back unchanged (positions are
@@ -218,7 +218,7 @@ fn glb_read_write_identical() {
     mesh.pages.remove(1);
     assert_eq!(read, mesh);
     assert_eq!(read.triangles(), 6);
-    write_glb(&b, &read).unwrap();
+    write_glb(&b, &read, &Progress::new()).unwrap();
     assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
 
     let bytes = std::fs::read(&a).unwrap();
@@ -233,7 +233,7 @@ fn glb_read_write_identical() {
 
     // An empty mesh is a valid glb and reads back empty.
     let empty = dir.join("leer.glb");
-    write_glb(&empty, &Mesh::default()).unwrap();
+    write_glb(&empty, &Mesh::default(), &Progress::new()).unwrap();
     gltf::Gltf::from_slice(&std::fs::read(&empty).unwrap()).unwrap();
     assert_eq!(
         read_mesh(&empty, &Progress::new()).unwrap(),
@@ -331,7 +331,7 @@ fn glb_instances_share_images_and_are_bounded() {
         }
     }
     let path = dir.join("viele.glb");
-    write_glb(&path, &Mesh { pages: vec![page] }).unwrap();
+    write_glb(&path, &Mesh { pages: vec![page] }, &Progress::new()).unwrap();
     let (json, bin) = glb_parts(&std::fs::read(&path).unwrap());
     let instanced = |k: usize| {
         let mut json = json.clone();
@@ -383,7 +383,7 @@ fn glb_png_texture() {
     );
     let mesh = Mesh { pages: vec![page] };
     let path = dir.join("png.glb");
-    write_glb(&path, &mesh).unwrap();
+    write_glb(&path, &mesh, &Progress::new()).unwrap();
     let bytes = std::fs::read(&path).unwrap();
     let gltf = gltf::Gltf::from_slice(&bytes).unwrap();
     let img = gltf.images().next().unwrap();
@@ -529,7 +529,7 @@ fn obj_round_trip() {
         ]
     );
     assert!(files.iter().all(|f| f.parent() == Some(dir.as_path())));
-    write_obj(&path, &mesh).unwrap();
+    write_obj(&path, &mesh, &Progress::new()).unwrap();
     let mut want = names.clone();
     want.sort();
     assert_eq!(entries(&dir), want, "no .tmp, nothing else");
@@ -562,7 +562,7 @@ fn obj_round_trip() {
 
     // Written twice, the same bytes.
     let again = temp_dir("obj-round-again");
-    write_obj(&again.join("Prüfung ä.obj"), &mesh).unwrap();
+    write_obj(&again.join("Prüfung ä.obj"), &mesh, &Progress::new()).unwrap();
     for name in &names {
         assert_eq!(
             std::fs::read(dir.join(name)).unwrap(),
@@ -581,7 +581,7 @@ fn obj_failed_write_leaves_no_tmp() {
     let path = dir.join("x.obj");
     std::fs::create_dir_all(dir.join("x.mtl")).unwrap();
     std::fs::write(&path, b"alt").unwrap();
-    assert!(write_obj(&path, &mesh).is_err());
+    assert!(write_obj(&path, &mesh, &Progress::new()).is_err());
     assert!(
         !entries(&dir).iter().any(|e| e.ends_with(".tmp")),
         "{:?}",
@@ -592,9 +592,35 @@ fn obj_failed_write_leaves_no_tmp() {
     let mut bad = small_mesh();
     bad.pages[0].indices[0][2] = 9;
     let other = dir.join("y.obj");
-    assert!(write_obj(&other, &bad).is_err());
-    assert!(write_glb(&dir.join("y.glb"), &bad).is_err());
+    assert!(write_obj(&other, &bad, &Progress::new()).is_err());
+    assert!(write_glb(&dir.join("y.glb"), &bad, &Progress::new()).is_err());
     assert!(!entries(&dir).iter().any(|e| e.starts_with('y')));
+}
+
+/// „Abbrechen“ while a glb or OBJ is written: the old files stay, no `.tmp` is left, and the
+/// writer says it was cancelled (it no longer reports success after a cancel).
+#[test]
+fn mesh_write_cancel_keeps_old_files() {
+    let dir = temp_dir("mesh-cancel");
+    let mesh = small_mesh();
+    let obj = dir.join("x.obj");
+    let glb = dir.join("x.glb");
+    std::fs::write(&obj, b"alt").unwrap();
+    std::fs::write(&glb, b"alt").unwrap();
+    let progress = Progress::new();
+    progress.cancel();
+    assert!(matches!(
+        write_obj(&obj, &mesh, &progress),
+        Err(ExportError::Cancelled)
+    ));
+    assert!(matches!(
+        write_glb(&glb, &mesh, &progress),
+        Err(ExportError::Cancelled)
+    ));
+    assert_eq!(entries(&dir), ["x.glb", "x.obj"]);
+    assert_eq!(std::fs::read(&obj).unwrap(), b"alt");
+    assert_eq!(std::fs::read(&glb).unwrap(), b"alt");
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -692,7 +718,7 @@ fn obj_foreign_quads_negative_indices_missing_texture() {
 
 /// Names in `mtllib` and `map_Kd` of a foreign OBJ never reach outside the OBJ's folder:
 /// absolute names, `..`, Windows drive and share names (a share would be contacted) and links
-/// that point outside are taken as missing.
+/// that point outside are not read, with their own warning.
 #[test]
 fn obj_names_stay_inside_the_folder() {
     let dir = temp_dir("obj-escape");
@@ -715,7 +741,9 @@ fn obj_names_stay_inside_the_folder() {
         let mesh = read_mesh(&inner.join("x.obj"), &progress).unwrap();
         assert_eq!(
             warnings(&progress),
-            [format!("Textur fehlt: {lib}")],
+            [format!(
+                "Materialdatei außerhalb des Ordners wird nicht gelesen: {lib}"
+            )],
             "{lib}"
         );
         assert_eq!(mesh.pages[0].color, [128; 3], "{lib}");
@@ -745,11 +773,18 @@ fn obj_names_stay_inside_the_folder() {
         let mesh = read_mesh(&inner.join("x.obj"), &progress).unwrap();
         assert_eq!(
             warnings(&progress),
-            [format!("Textur fehlt: {name}")],
+            [format!(
+                "Textur außerhalb des Ordners wird nicht gelesen: {name}"
+            )],
             "{name}"
         );
         assert!(mesh.pages[0].image.is_none(), "{name}");
     }
+    // Inside but not there: missing, as before.
+    std::fs::write(inner.join("x.mtl"), "newmtl a\nmap_Kd bilder/fehlt.png\n").unwrap();
+    let progress = Progress::new();
+    read_mesh(&inner.join("x.obj"), &progress).unwrap();
+    assert_eq!(warnings(&progress), ["Textur fehlt: bilder/fehlt.png"]);
 
     // Inside the folder (also below it, also with `\\`) it is read.
     std::fs::write(inner.join("bilder/gut.png"), &secret.bytes).unwrap();

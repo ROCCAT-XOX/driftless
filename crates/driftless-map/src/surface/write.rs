@@ -83,7 +83,11 @@ impl TexturedMesh {
 /// Writes `tex` with its encoded pages `jpegs` as one binary glTF (Y up, see
 /// [`driftless_export::mesh::write_glb`]).
 pub fn write_glb(path: &Path, tex: &TexturedMesh, jpegs: &PageJpegs) -> Result<(), MapError> {
-    Ok(mesh::write_glb(path, &tex.to_mesh(jpegs)?)?)
+    Ok(mesh::write_glb(
+        path,
+        &tex.to_mesh(jpegs)?,
+        &driftless_io::progress::Progress::new(),
+    )?)
 }
 
 /// Writes `tex` as `stem.obj`, `stem.mtl` and its encoded pages `jpegs` as one
@@ -96,7 +100,11 @@ pub fn write_obj(
     jpegs: &PageJpegs,
 ) -> Result<(), MapError> {
     let path = dir.join(format!("{stem}.obj"));
-    Ok(mesh::write_obj(&path, &tex.to_mesh(jpegs)?)?)
+    Ok(mesh::write_obj(
+        &path,
+        &tex.to_mesh(jpegs)?,
+        &driftless_io::progress::Progress::new(),
+    )?)
 }
 
 /// Baseline JPEG of `image` (`image` crate encoder: pure Rust, MIT/Apache, deterministic,

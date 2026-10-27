@@ -507,7 +507,7 @@ fn loads_obj_with_png_page() {
     let dir = temp_dir("obj").join("Büro Scan");
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("Prüfung ä.obj");
-    write_obj(&path, &mesh).unwrap();
+    write_obj(&path, &mesh, &Progress::new()).unwrap();
     let loaded = load_mesh(&path, &Progress::new()).unwrap();
     assert_eq!(loaded.pages.len(), 2);
     assert_eq!(loaded.triangles(), 2);
@@ -646,5 +646,66 @@ fn draco_glb_shows_message() {
     assert!(
         e.contains("glTF mit Draco-Kompression wird nicht unterstützt"),
         "{e}"
+    );
+}
+
+/// CRC-32 (as in every PNG chunk).
+fn crc32(data: &[u8]) -> u32 {
+    !data.iter().fold(!0u32, |crc, &b| {
+        (0..8).fold(crc ^ u32::from(b), |c, _| {
+            if c & 1 == 1 {
+                (c >> 1) ^ 0xEDB8_8320
+            } else {
+                c >> 1
+            }
+        })
+    })
+}
+
+/// A PNG of a few bytes whose header claims `w × h` pixels (a stub of image data).
+fn png_claiming(w: u32, h: u32) -> Vec<u8> {
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut chunk = |kind: &[u8], data: &[u8]| {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc32(&body).to_be_bytes());
+    };
+    let mut ihdr = w.to_be_bytes().to_vec();
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    chunk(b"IHDR", &ihdr);
+    chunk(b"IDAT", &[0x78, 0x9c]);
+    chunk(b"IEND", &[]);
+    out
+}
+
+/// A small file whose pages claim more pixels together than it can plausibly hold is refused
+/// before any page is decoded (each page alone would be within the decoder's limit).
+#[test]
+fn load_mesh_refuses_oversized_textures() {
+    use driftless_export::mesh::{write_glb, ImageKind, Mesh, MeshPage, PageImage};
+    let page = |z: f64| MeshPage {
+        positions: vec![[0.0, 0.0, z], [1.0, 0.0, z], [0.0, 1.0, z]],
+        uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+        indices: vec![[0, 1, 2]],
+        image: Some(PageImage {
+            kind: ImageKind::Png,
+            bytes: png_claiming(11_000, 11_000).into(),
+        }),
+        color: [255; 3],
+    };
+    let mesh = Mesh {
+        pages: (0..5).map(|k| page(f64::from(k))).collect(),
+    };
+    let path = temp_dir("textures-too-large").join("gross.glb");
+    write_glb(&path, &mesh, &Progress::new()).unwrap();
+    let start = std::time::Instant::now();
+    let err = load_mesh(&path, &Progress::new()).unwrap_err().to_string();
+    assert!(start.elapsed().as_secs_f64() < 1.0, "{:?}", start.elapsed());
+    assert!(
+        err.contains("Texturen zu groß: 605 Mio. Pixel, höchstens 536 Mio."),
+        "{err}"
     );
 }

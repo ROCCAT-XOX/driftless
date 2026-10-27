@@ -164,7 +164,7 @@ fn mesh() -> Mesh {
 fn glb_source(dir: &Path) -> PathBuf {
     let glb = dir.join("quelle").join("netz.glb");
     fs::create_dir_all(glb.parent().unwrap()).unwrap();
-    write_glb(&glb, &mesh()).unwrap();
+    write_glb(&glb, &mesh(), &driftless_io::progress::Progress::new()).unwrap();
     glb
 }
 
@@ -380,7 +380,7 @@ fn menu_export_needs_view() {
     let surface_dir = dir.join("oberflaeche-001");
     fs::create_dir_all(&surface_dir).unwrap();
     let glb = surface_dir.join("oberflaeche.glb");
-    write_glb(&glb, &mesh()).unwrap();
+    write_glb(&glb, &mesh(), &driftless_io::progress::Progress::new()).unwrap();
     let state = AppState {
         cloud: Some(cloud(&las)),
         surface: Some(surface(&glb)),

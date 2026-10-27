@@ -666,7 +666,7 @@ fn dropped_obj_loads_surface() {
     let mesh = Mesh {
         pages: vec![page(0.0, Some(image.clone())), page(2.0, Some(image))],
     };
-    write_obj(&obj, &mesh).unwrap();
+    write_obj(&obj, &mesh, &driftless_io::progress::Progress::new()).unwrap();
     fs::remove_file(dir.join("Netz_seite_01.jpg")).unwrap();
     let mut h = window(app());
     drop_files(&mut h, &[dir.join("notiz.txt"), obj.clone()]);

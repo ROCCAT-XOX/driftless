@@ -42,8 +42,10 @@ const BYTES_PER_CORNER: u64 = 24 + 8;
 const BYTES_PER_INDEX: u64 = 4 + 4;
 
 /// Writes `mesh` as one binary glTF through `<name>.tmp` next to `path` (see the module
-/// docs). Pages without triangles are left out.
-pub fn write_glb(path: &Path, mesh: &Mesh) -> Result<(), ExportError> {
+/// docs). Pages without triangles are left out. A cancel through `progress` is checked per
+/// page and before the rename; it leaves `path` as it was and no `.tmp`.
+pub fn write_glb(path: &Path, mesh: &Mesh, progress: &Progress) -> Result<(), ExportError> {
+    check_cancel(progress)?;
     check_mesh(path, mesh)?;
     let pages: Vec<&MeshPage> = mesh
         .pages
@@ -253,7 +255,7 @@ pub fn write_glb(path: &Path, mesh: &Mesh) -> Result<(), ExportError> {
     let total = u32::try_from(total).map_err(|_| {
         ExportError::format(path, "Oberfläche ist für eine glb-Datei zu groß (> 4 GB)")
     })?;
-    write_atomic(path, |w| {
+    write_atomic(path, progress, |w| {
         w.write_all(b"glTF")?;
         w.write_all(&2u32.to_le_bytes())?;
         w.write_all(&total.to_le_bytes())?;
@@ -276,6 +278,7 @@ pub fn write_glb(path: &Path, mesh: &Mesh) -> Result<(), ExportError> {
             Ok::<u64, io::Error>(n)
         };
         for page in &pages {
+            stop_if_cancelled(progress)?;
             let pos = page.positions.iter().flat_map(|&v| to_gltf(v));
             part(w, &mut pos.map(f32::to_le_bytes))?;
             let uv = page.uvs.iter().flatten();
@@ -322,14 +325,38 @@ fn padded(len: u64) -> u64 {
     len.div_ceil(4) * 4
 }
 
-/// Writes through `write` to `<path>.tmp` and renames it to `path` when complete; on an
-/// error the `.tmp` is removed.
+/// Writes through `write` to `<path>.tmp` and renames it to `path` when complete and not
+/// cancelled; on an error or a cancel the `.tmp` is removed.
 pub(crate) fn write_atomic(
     path: &Path,
+    progress: &Progress,
     write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
 ) -> Result<(), ExportError> {
     let temp = write_temp(path, write)?;
+    check_cancel(progress)?;
     temp.commit().map_err(|e| ExportError::io(path, e))
+}
+
+/// What a writing closure returns once the export was asked to stop; [`write_temp`] turns it
+/// into [`ExportError::Cancelled`].
+#[derive(Debug)]
+struct Stopped;
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("abgebrochen")
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+/// Inside a writing closure: `Err` once `progress` was cancelled.
+pub(crate) fn stop_if_cancelled(progress: &Progress) -> io::Result<()> {
+    if progress.is_cancelled() {
+        Err(io::Error::other(Stopped))
+    } else {
+        Ok(())
+    }
 }
 
 /// Writes through `write` to `<path>.tmp` and closes it, without the rename.
@@ -340,7 +367,13 @@ pub(crate) fn write_temp(
     let io = |e| ExportError::io(path, e);
     let temp = TempPath::new(path);
     let mut w = BufWriter::new(File::create(temp.tmp()).map_err(io)?);
-    write(&mut w).map_err(io)?;
+    write(&mut w).map_err(|e: io::Error| {
+        if e.get_ref().is_some_and(|inner| inner.is::<Stopped>()) {
+            ExportError::Cancelled
+        } else {
+            io(e)
+        }
+    })?;
     let file = w.into_inner().map_err(|e| io(e.into_error()))?;
     drop(file);
     Ok(temp)

@@ -18,7 +18,7 @@
 //! and a link that leads outside count as missing, so the file never makes the program read
 //! elsewhere or contact a share.
 
-use super::glb::write_temp;
+use super::glb::{stop_if_cancelled, write_temp};
 use super::{check_mesh, page_name, ImageKind, Mesh, MeshPage, PageImage, MISSING_GRAY};
 use crate::{check_cancel, ExportError, PHASE_READ};
 use driftless_io::progress::Progress;
@@ -56,14 +56,17 @@ fn file_name(path: &Path) -> String {
 }
 
 /// Writes `mesh` as `path` (`<stem>.obj`), `<stem>.mtl` and its page images next to it (see
-/// the module docs). An error leaves no `.tmp`; the old files stay until the renames.
-pub fn write_obj(path: &Path, mesh: &Mesh) -> Result<(), ExportError> {
+/// the module docs). An error or a cancel through `progress` (checked per page and before the
+/// renames) leaves no `.tmp`; the old files stay until the renames.
+pub fn write_obj(path: &Path, mesh: &Mesh, progress: &Progress) -> Result<(), ExportError> {
+    check_cancel(progress)?;
     check_mesh(path, mesh)?;
     let mtl_path = path.with_extension("mtl");
     let mtl_name = file_name(&mtl_path);
     let mut temps = Vec::new();
     for (p, page) in mesh.pages.iter().enumerate() {
         if let Some(image) = &page.image {
+            check_cancel(progress)?;
             let file = image_path(path, p, image.kind);
             temps.push(write_temp(&file, |w| w.write_all(&image.bytes))?);
         }
@@ -96,6 +99,7 @@ pub fn write_obj(path: &Path, mesh: &Mesh) -> Result<(), ExportError> {
         writeln!(w, "o oberflaeche")?;
         let (mut base, mut uv_base) = (1usize, 1usize);
         for (p, page) in mesh.pages.iter().enumerate() {
+            stop_if_cancelled(progress)?;
             for v in &page.positions {
                 let [x, y, z] = v.map(Short);
                 writeln!(w, "v {x} {y} {z}")?;
@@ -120,6 +124,7 @@ pub fn write_obj(path: &Path, mesh: &Mesh) -> Result<(), ExportError> {
         Ok(())
     })?);
     // All written: rename, the .obj last. A failed rename drops (removes) the other .tmp.
+    check_cancel(progress)?;
     for temp in temps {
         let target = temp.path().to_path_buf();
         temp.commit().map_err(|e| ExportError::io(&target, e))?;
@@ -277,13 +282,16 @@ pub(crate) fn read_obj(path: &Path, progress: &Progress) -> Result<Mesh, ExportE
     };
     let mut materials: HashMap<String, Material> = HashMap::new();
     for lib in &libs {
-        match root.and_then(|root| read_mtl(root, lib)) {
-            Some(found) => {
+        match read_mtl(root, lib) {
+            Ok(found) => {
                 for (name, m) in found {
                     materials.entry(name).or_insert(m);
                 }
             }
-            None => warn(format!("Textur fehlt: {lib}")),
+            Err(NotFound::Missing) => warn(format!("Textur fehlt: {lib}")),
+            Err(NotFound::Outside) => warn(format!(
+                "Materialdatei außerhalb des Ordners wird nicht gelesen: {lib}"
+            )),
         }
     }
 
@@ -349,9 +357,10 @@ fn corner(token: &str, nv: usize, nt: usize) -> Result<(usize, Option<usize>), S
 
 /// The materials of the `.mtl` `name` (relative to the OBJ's canonical folder `root`);
 /// `None` if it cannot be read or lies outside.
-fn read_mtl(root: &Path, name: &str) -> Option<Vec<(String, Material)>> {
+fn read_mtl(root: Option<&Path>, name: &str) -> Result<Vec<(String, Material)>, NotFound> {
+    let root = root.ok_or(NotFound::Missing)?;
     let path = find(root, root, name)?;
-    let bytes = std::fs::read(&path).ok()?;
+    let bytes = std::fs::read(&path).map_err(|_| NotFound::Missing)?;
     let base = path.parent().unwrap_or(Path::new("")).to_path_buf();
     let mut out: Vec<(String, Material)> = Vec::new();
     for raw in String::from_utf8_lossy(&bytes).lines() {
@@ -384,7 +393,7 @@ fn read_mtl(root: &Path, name: &str) -> Option<Vec<(String, Material)>> {
             _ => {}
         }
     }
-    Some(out)
+    Ok(out)
 }
 
 /// The file name of a `map_Kd` value, after its options (`-s 1 1 1`, `-clamp on`, …).
@@ -415,23 +424,44 @@ fn strip_map_options(mut rest: &str) -> &str {
     rest.trim()
 }
 
+/// Why a named file of an OBJ is not read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotFound {
+    /// Not there (inside the folder).
+    Missing,
+    /// It would be outside the OBJ's folder.
+    Outside,
+}
+
 /// The file `name` relative to `base`, if it exists inside `root` (the OBJ's canonical
-/// folder; `base` lies in it); a Windows path with `\` is tried with `/` as well. `None` for
-/// a name that is absolute, has a drive or share prefix or a `..`, and for one whose real
-/// place (links followed) is outside `root`.
-fn find(root: &Path, base: &Path, name: &str) -> Option<PathBuf> {
+/// folder; `base` lies in it); a Windows path with `\` is tried with `/` as well.
+/// [`NotFound::Outside`] for a name that is absolute, has a drive or share prefix or a `..`,
+/// and for one whose real place (links followed) is outside `root`.
+fn find(root: &Path, base: &Path, name: &str) -> Result<PathBuf, NotFound> {
     let escapes = name.starts_with(['/', '\\'])
         || name.contains(':')
         || Path::new(name).has_root()
         || Path::new(name).is_absolute()
         || name.split(['/', '\\']).any(|part| part == "..");
     if escapes {
-        return None;
+        return Err(NotFound::Outside);
     }
-    [base.join(name), base.join(name.replace('\\', "/"))]
-        .into_iter()
-        .filter_map(|p| std::fs::canonicalize(p).ok())
-        .find(|p| p.starts_with(root) && p.is_file())
+    let mut outside = false;
+    for p in [base.join(name), base.join(name.replace('\\', "/"))] {
+        let Ok(p) = std::fs::canonicalize(p) else {
+            continue;
+        };
+        if !p.starts_with(root) {
+            outside = true;
+        } else if p.is_file() {
+            return Ok(p);
+        }
+    }
+    Err(if outside {
+        NotFound::Outside
+    } else {
+        NotFound::Missing
+    })
 }
 
 /// The page image `name` relative to `base` (see [`find`]) if it exists and is a JPEG or PNG,
@@ -443,9 +473,15 @@ fn load_image(
     images: &mut HashMap<PathBuf, PageImage>,
 ) -> Result<PageImage, String> {
     let missing = || format!("Textur fehlt: {name}");
-    let file = root
-        .and_then(|root| find(root, base, name))
-        .ok_or_else(missing)?;
+    let file = match root.map(|root| find(root, base, name)) {
+        Some(Ok(file)) => file,
+        Some(Err(NotFound::Outside)) => {
+            return Err(format!(
+                "Textur außerhalb des Ordners wird nicht gelesen: {name}"
+            ))
+        }
+        None | Some(Err(NotFound::Missing)) => return Err(missing()),
+    };
     if let Some(image) = images.get(&file) {
         return Ok(image.clone());
     }

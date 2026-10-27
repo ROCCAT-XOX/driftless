@@ -171,7 +171,7 @@ fn mesh(pages: usize) -> Mesh {
 fn surface_dir(name: &str, pages: usize) -> PathBuf {
     let dir = tmp(name).join("oberflaeche");
     fs::create_dir_all(&dir).unwrap();
-    write_glb(&dir.join("oberflaeche.glb"), &mesh(pages)).unwrap();
+    write_glb(&dir.join("oberflaeche.glb"), &mesh(pages), &Progress::new()).unwrap();
     fs::write(dir.join("oberflaeche.json"), "{}").unwrap();
     dir
 }
@@ -677,8 +677,10 @@ fn obj_overwrite_removes_stale_pages() {
         fs::write(base.join(format!("x_seite_{p:02}.jpg")), b"alt").unwrap();
     }
     fs::write(base.join("x_seite_01.png"), b"alt").unwrap();
-    // Not a page of x: kept.
+    // Not pages of x: kept.
     fs::write(base.join("xy_seite_00.jpg"), b"fremd").unwrap();
+    fs::write(base.join("x_seite_notizen.txt"), b"fremd").unwrap();
+    fs::write(base.join("x_seite_02.jpg.bak"), b"fremd").unwrap();
     let req = request(
         ExportSource::Surface(surface),
         &out,
@@ -699,6 +701,8 @@ fn obj_overwrite_removes_stale_pages() {
             "x.obj",
             "x_seite_00.jpg",
             "x_seite_01.jpg",
+            "x_seite_02.jpg.bak",
+            "x_seite_notizen.txt",
             "xy_seite_00.jpg"
         ]
     );
@@ -819,7 +823,7 @@ fn empty_source_every_format() {
         );
     }
     let glb = dir.join("leer_netz.glb");
-    write_glb(&glb, &Mesh::default()).unwrap();
+    write_glb(&glb, &Mesh::default(), &Progress::new()).unwrap();
     for f in MESH_FORMATS {
         let out = dir.join(format!("leer_aus_netz.{}", f.extension()));
         let report = export(ExportSource::MeshFile(glb.clone()), &out, f);
@@ -855,7 +859,7 @@ fn umlaut_paths_every_format() {
         assert_eq!(read_points(&again, &Progress::new()).unwrap().len(), 2_000);
     }
     let glb = dir.join("Fläche ö.glb");
-    write_glb(&glb, &mesh(2)).unwrap();
+    write_glb(&glb, &mesh(2), &Progress::new()).unwrap();
     for f in MESH_FORMATS {
         let out = dir.join(format!("Prüfung ä.{}", f.extension()));
         let out = if f == ExportFormat::PlyMesh {

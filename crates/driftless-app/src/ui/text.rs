@@ -993,6 +993,15 @@ pub fn surface_fits(dir: &std::path::Path) -> String {
     format!("{name} passt schon zu Karte und Einstellungen; nichts zu rechnen")
 }
 
+/// The page images of a surface claim more pixels than are loaded (both in pixels).
+pub fn textures_too_large(pixels: u64, max: u64) -> String {
+    format!(
+        "Texturen zu groß: {} Mio. Pixel, höchstens {} Mio. werden geladen",
+        pixels / 1_000_000,
+        max / 1_000_000
+    )
+}
+
 /// A page whose image could not be decoded (`page` counts from 0).
 pub fn bad_texture(page: usize, error: &str) -> String {
     format!("Seite {page}: Textur nicht lesbar ({error})")
