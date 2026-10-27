@@ -669,6 +669,7 @@ impl DriftlessApp {
                         path: cloud.path.clone(),
                         points: cloud.points.len(),
                         has_rgb: cloud.points.rgb.is_some(),
+                        has_scans: !cloud.points.source.is_empty(),
                         quality_known: cloud.points.quality_known,
                         z_range: cloud.z_range,
                         ceiling: cloud.ceiling,
@@ -1431,6 +1432,15 @@ impl DriftlessApp {
                 self.hand_loads += 1;
                 self.load(CloudSource::File { path, run })
             }
+            Action::PickOpenCloud => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title(text::DIALOG_OPEN_CLOUD)
+                    .add_filter(text::FILTER_CLOUD, &["las", "ply"])
+                    .pick_file()
+                {
+                    self.apply(Action::LoadCloud { path, run: None });
+                }
+            }
             Action::PickOpenSurface => {
                 if let Some(path) = rfd::FileDialog::new()
                     .set_title(text::DIALOG_OPEN_SURFACE)
@@ -1615,6 +1625,21 @@ impl DriftlessApp {
             });
     }
 
+    /// A file dragged over the window: a hint over its middle that letting go opens it.
+    fn drop_hint(&self, ctx: &egui::Context) {
+        if ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            return;
+        }
+        egui::Area::new(egui::Id::new("hinweis_loslassen"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(ctx.content_rect().center())
+            .pivot(egui::Align2::CENTER_CENTER)
+            .interactable(false)
+            .show(ctx, |ui| {
+                theme::float_frame().show(ui, |ui| ui.heading(text::DROP_HERE));
+            });
+    }
+
     /// One frame of the window (what [`eframe::App::ui`] does; without eframe for tests).
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
@@ -1701,6 +1726,12 @@ impl DriftlessApp {
                 }
             });
         self.no_surface_hint(&ctx, central.response.rect);
+        self.drop_hint(&ctx);
+        match ctx.input(|i| dropped(&i.raw.dropped_files)) {
+            Some(Ok(action)) => actions.push(action),
+            Some(Err(hint)) => self.info(hint),
+            None => {}
+        }
         let view = central.response.rect;
         actions.extend(tools::floats(&ctx, view, &mut self.state, &mut self.layout));
         match event {
@@ -1748,6 +1779,34 @@ impl DriftlessApp {
         }
         tools::remember_text_focus(&ctx);
     }
+}
+
+/// What files dropped onto the window ask for: the first LAS or PLY is shown as a cloud
+/// (without a run, with or without a project), the first GLB as a surface; of other files
+/// only a hint (`Err`). Nothing without files.
+fn dropped(files: &[egui::DroppedFileHandle]) -> Option<Result<Action, String>> {
+    let first = files.first()?;
+    let has = |p: &Path, ext: &[&str]| {
+        p.extension()
+            .is_some_and(|e| ext.iter().any(|x| e.eq_ignore_ascii_case(x)))
+    };
+    let action = files.iter().find_map(|f| {
+        let path = f.path();
+        if has(path, &["las", "ply"]) {
+            Some(Action::LoadCloud {
+                path: path.to_path_buf(),
+                run: None,
+            })
+        } else if has(path, &["glb"]) {
+            Some(Action::LoadSurface(path.to_path_buf()))
+        } else {
+            None
+        }
+    });
+    Some(action.ok_or_else(|| {
+        let name = first.path().file_name().unwrap_or_default();
+        text::drop_unsupported(&name.to_string_lossy())
+    }))
 }
 
 /// When a file was last written, and its size; `None` if it cannot be read.

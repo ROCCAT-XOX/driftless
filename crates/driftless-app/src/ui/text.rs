@@ -30,6 +30,16 @@ pub const EMPTY_NO_MAPS: &str = "Noch keine Karte. Zuerst in „Daten“ eine Ka
 pub const GO_TO_DATA: &str = "Zu „Daten“";
 /// Over the view in „Bilder“ while no surface is shown.
 pub const NO_SURFACE_YET: &str = "Noch keine Oberfläche – im Feld „Bilder“ rechnen";
+/// Over the window while a file is dragged over it.
+pub const DROP_HERE: &str = "Loslassen zum Öffnen";
+/// A file dropped onto the window that is no LAS, PLY or GLB.
+pub const DROP_UNSUPPORTED: &str = "Dateiformat nicht unterstützt";
+
+/// [`DROP_UNSUPPORTED`] with the name of the (first) file dropped.
+pub fn drop_unsupported(name: &str) -> String {
+    format!("{DROP_UNSUPPORTED}: {name} (LAS, PLY oder GLB)")
+}
+
 pub const PLAN_COMING: &str = "Hier entstehen Grundriss, Maße und der DWG-Export. Das folgt in \
      einem späteren Baustein.";
 pub const ADD_RUN_NEEDS_SCAN: &str = "Zuerst im Feld „Daten“ einen Scan wählen";
@@ -171,6 +181,7 @@ pub const COLOR_MODE: &str = "Farbart";
 pub const MODE_RGB: &str = "Farbe";
 pub const MODE_INTENSITY: &str = "Intensität";
 pub const MODE_QUALITY: &str = "Güte";
+pub const MODE_SCAN: &str = "je Scan";
 pub const POINT_SIZE: &str = "Punktgröße (px)";
 pub const ROUND_POINTS: &str = "rund";
 pub const POINT_SIZE_MODE: &str = "Punkte";
@@ -210,6 +221,10 @@ pub const VIEW_HELP_FLY: &str =
     "W/A/S/D, Q/E: fliegen (Shift schneller) · linke Taste: wie das Werkzeug unten · rechte Taste: umsehen · Rad: vor/zurück · F: alles zeigen · O: Fläche/Punkte/beides · Esc: Messen abbrechen";
 pub const LOAD_CLOUD: &str = "Wolke laden";
 pub const LOAD_SURFACE: &str = "Oberfläche laden";
+pub const OPEN_CLOUD: &str = "Punktwolke öffnen …";
+pub const DIALOG_OPEN_CLOUD: &str = "Punktwolke öffnen (LAS oder PLY)";
+/// Filter of the dialog „Punktwolke öffnen …“.
+pub const FILTER_CLOUD: &str = "Punktwolke";
 pub const OPEN_SURFACE: &str = "Oberfläche öffnen …";
 pub const DIALOG_OPEN_SURFACE: &str = "Oberfläche öffnen (oberflaeche.glb)";
 /// The switch at the top right of the view.

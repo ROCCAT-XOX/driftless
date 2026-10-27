@@ -181,6 +181,7 @@ fn summaries(state: &mut AppState) {
         path: "wolke.las".into(),
         points: 10,
         has_rgb: true,
+        has_scans: false,
         quality_known: false,
         z_range: [0.0, 1.0],
         ceiling: None,

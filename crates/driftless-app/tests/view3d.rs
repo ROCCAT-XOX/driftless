@@ -63,21 +63,55 @@ fn fly_keys_map_to_motion() {
 #[test]
 fn color_mode_falls_back_without_rgb() {
     assert_eq!(
-        color_modes(true),
+        color_modes(true, false),
         vec![ColorMode::Rgb, ColorMode::Intensity, ColorMode::Quality]
     );
     assert_eq!(
-        color_modes(false),
+        color_modes(false, false),
         vec![ColorMode::Intensity, ColorMode::Quality]
     );
     assert_eq!(
-        effective_color_mode(ColorMode::Rgb, false),
+        effective_color_mode(ColorMode::Rgb, false, false),
         ColorMode::Intensity
     );
-    assert_eq!(effective_color_mode(ColorMode::Rgb, true), ColorMode::Rgb);
     assert_eq!(
-        effective_color_mode(ColorMode::Quality, false),
+        effective_color_mode(ColorMode::Rgb, true, false),
+        ColorMode::Rgb
+    );
+    assert_eq!(
+        effective_color_mode(ColorMode::Quality, false, false),
         ColorMode::Quality
+    );
+}
+
+/// „je Scan“ only for a cloud of several scans; set for another cloud, it shows what that
+/// cloud has.
+#[test]
+fn scan_mode_only_with_scans() {
+    assert_eq!(
+        color_modes(true, true),
+        vec![
+            ColorMode::Rgb,
+            ColorMode::Intensity,
+            ColorMode::Quality,
+            ColorMode::Scan
+        ]
+    );
+    assert_eq!(
+        color_modes(false, true),
+        vec![ColorMode::Intensity, ColorMode::Quality, ColorMode::Scan]
+    );
+    assert_eq!(
+        effective_color_mode(ColorMode::Scan, true, true),
+        ColorMode::Scan
+    );
+    assert_eq!(
+        effective_color_mode(ColorMode::Scan, true, false),
+        ColorMode::Rgb
+    );
+    assert_eq!(
+        effective_color_mode(ColorMode::Scan, false, false),
+        ColorMode::Intensity
     );
 }
 

@@ -182,21 +182,26 @@ pub fn fly_keys(down: impl Fn(Key) -> bool) -> FlyKeys {
     }
 }
 
-/// The colour modes a cloud offers: without colours no [`ColorMode::Rgb`].
-pub fn color_modes(has_rgb: bool) -> Vec<ColorMode> {
+/// The colour modes a cloud offers: without colours no [`ColorMode::Rgb`], „je Scan“
+/// ([`ColorMode::Scan`]) only for a cloud of several scans.
+pub fn color_modes(has_rgb: bool, has_scans: bool) -> Vec<ColorMode> {
     let mut modes = vec![ColorMode::Intensity, ColorMode::Quality];
     if has_rgb {
         modes.insert(0, ColorMode::Rgb);
     }
+    if has_scans {
+        modes.push(ColorMode::Scan);
+    }
     modes
 }
 
-/// The mode drawn: [`ColorMode::Rgb`] on a cloud without colours shows the intensity.
-pub fn effective_color_mode(mode: ColorMode, has_rgb: bool) -> ColorMode {
-    if mode == ColorMode::Rgb && !has_rgb {
-        ColorMode::Intensity
-    } else {
-        mode
+/// The mode drawn: [`ColorMode::Rgb`] on a cloud without colours shows the intensity,
+/// [`ColorMode::Scan`] on a cloud of one scan what [`ColorMode::Rgb`] would.
+pub fn effective_color_mode(mode: ColorMode, has_rgb: bool, has_scans: bool) -> ColorMode {
+    match mode {
+        ColorMode::Scan if !has_scans => effective_color_mode(ColorMode::Rgb, has_rgb, false),
+        ColorMode::Rgb if !has_rgb => ColorMode::Intensity,
+        _ => mode,
     }
 }
 
@@ -576,12 +581,13 @@ impl View3d {
         }
 
         let has_rgb = cloud.is_some_and(|c| c.points.rgb.is_some());
+        let has_scans = cloud.is_some_and(|c| !c.points.source.is_empty());
         let point_px = (settings.point_px * ppp).max(1.0);
         let key = FrameKey {
             view_proj: self.camera.view_proj(aspect).into(),
             size: px,
             point_px,
-            color_mode: effective_color_mode(settings.color_mode, has_rgb),
+            color_mode: effective_color_mode(settings.color_mode, has_rgb, has_scans),
             round: settings.round,
             budget: settings.budget,
             picked: self.picked,

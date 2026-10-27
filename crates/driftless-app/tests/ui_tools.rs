@@ -48,6 +48,7 @@ fn cloud_summary() -> CloudSummary {
         path: PathBuf::from("/k/color.las"),
         points: 6_000_000,
         has_rgb: true,
+        has_scans: false,
         quality_known: false,
         z_range: [-0.5, 3.0],
         ceiling: Some(2.8),

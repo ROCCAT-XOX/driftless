@@ -7,7 +7,7 @@ use driftless_app::lod::{build_octree, build_octree_with, Octree, PointVertex, L
 use driftless_app::pick::project;
 use driftless_app::render::{
     headless_device, ColorMode, FrameParams, LineVertex, PointRenderer, PointSize, RenderTarget,
-    ShowMode, NO_CUT,
+    ShowMode, NO_CUT, SCAN_COLORS,
 };
 use driftless_app::synthetic::Rng;
 use driftless_io::progress::Progress;
@@ -241,6 +241,29 @@ fn quality_mode_uses_ramp() {
     }
     assert_eq!(quality_color(0.0), RED);
     assert_eq!(quality_color(1.0), [0, 255, 0]);
+}
+
+/// „je Scan“: the scan modulo 8 picks a colour of the palette.
+#[test]
+fn scan_mode_uses_palette() {
+    let Some(gpu) = gpu() else { return };
+    let cam = camera([0.0; 3], 0.0);
+    for scan in [0u16, 1, 5, 7, 9, 65_535] {
+        let mut points = cloud(vec![[2.0, 0.0, 0.0]], vec![BLUE]);
+        points.source = vec![scan];
+        let tree = tree(&points);
+        let image = render(&gpu, &tree, &frame(&cam, ColorMode::Scan), &[], &[]);
+        let expected = SCAN_COLORS[usize::from(scan) % SCAN_COLORS.len()];
+        let c = image.centre();
+        assert!(near(c, expected, 1), "scan {scan}: {c:?} vs {expected:?}");
+    }
+    // eight colours that differ clearly from each other
+    for (i, a) in SCAN_COLORS.iter().enumerate() {
+        for b in &SCAN_COLORS[i + 1..] {
+            let d: u32 = (0..3).map(|k| u32::from(a[k].abs_diff(b[k]))).sum();
+            assert!(d >= 80, "{a:?} vs {b:?}");
+        }
+    }
 }
 
 #[test]

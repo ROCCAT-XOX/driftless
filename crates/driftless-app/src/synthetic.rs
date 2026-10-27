@@ -104,5 +104,6 @@ pub fn synthetic_cloud(n: usize, seed: u64) -> PointSet {
         quality,
         quality_known: true,
         flags,
+        source: Vec::new(),
     }
 }

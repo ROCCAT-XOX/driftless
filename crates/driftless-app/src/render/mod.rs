@@ -27,7 +27,24 @@ pub enum ColorMode {
     Intensity = 1,
     /// The submap quality, with the ramp of `driftless_steps::overlay::quality_color`.
     Quality = 2,
+    /// The scan of a merged model ([`crate::cloud::PointSet::source`]): its number modulo 8
+    /// picks a colour of [`SCAN_COLORS`].
+    Scan = 3,
 }
+
+/// The colours of [`ColorMode::Scan`], as `SCAN_COLORS` in `points.wgsl`: the palette of
+/// Okabe and Ito (told apart also with a colour vision deficiency), its black as light gray
+/// so that it shows on the dark background.
+pub const SCAN_COLORS: [[u8; 3]; 8] = [
+    [230, 159, 0],
+    [86, 180, 233],
+    [0, 158, 115],
+    [240, 228, 66],
+    [0, 114, 178],
+    [213, 94, 0],
+    [204, 121, 167],
+    [200, 200, 200],
+];
 
 /// How big a point is drawn: a fixed number of pixels, or a spot of a fixed diameter in
 /// metres that shrinks with distance (within [`FrameParams::point_px_range`]).

@@ -4,7 +4,7 @@ struct Frame {
     view_proj: mat4x4<f32>,
     viewport_px: vec2<f32>,
     point_px: f32,
-    // 0 = RGB, 1 = intensity, 2 = quality (see `ColorMode`).
+    // 0 = RGB, 1 = intensity, 2 = quality, 3 = scan (see `ColorMode`).
     color_mode: u32,
     // 1 = discard outside the circle.
     round: u32,
@@ -37,6 +37,22 @@ fn quality_color(q: f32) -> vec3<f32> {
         return vec3<f32>(1.0, q * 2.0, 0.0);
     }
     return vec3<f32>(2.0 - q * 2.0, 1.0, 0.0);
+}
+
+// The colour of scan `scan` (bits 16–31 of `extra`): `SCAN_COLORS` of `render/mod.rs`,
+// modulo 8.
+fn scan_color(scan: u32) -> vec3<f32> {
+    var colors = array<vec3<f32>, 8>(
+        vec3<f32>(230.0, 159.0, 0.0),
+        vec3<f32>(86.0, 180.0, 233.0),
+        vec3<f32>(0.0, 158.0, 115.0),
+        vec3<f32>(240.0, 228.0, 66.0),
+        vec3<f32>(0.0, 114.0, 178.0),
+        vec3<f32>(213.0, 94.0, 0.0),
+        vec3<f32>(204.0, 121.0, 167.0),
+        vec3<f32>(200.0, 200.0, 200.0),
+    );
+    return colors[scan % 8u] / 255.0;
 }
 
 fn byte(v: u32, shift: u32) -> f32 {
@@ -119,6 +135,9 @@ fn vs_main(
             } else {
                 out.color = vec3<f32>(0.5);
             }
+        }
+        case 3u: {
+            out.color = scan_color(extra >> 16u);
         }
         default: {
             out.color = vec3<f32>(byte(rgbi, 0u), byte(rgbi, 8u), byte(rgbi, 16u));

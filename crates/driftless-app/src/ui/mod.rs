@@ -94,6 +94,8 @@ pub enum Action {
         path: PathBuf,
         run: Option<PathBuf>,
     },
+    /// Choose a cloud (LAS or PLY) to show, without a run.
+    PickOpenCloud,
     /// Choose a surface (`oberflaeche.glb`) to show.
     PickOpenSurface,
     /// Show the surface of a `.glb`, or of the `oberflaeche.glb` in a folder; the one shown
@@ -234,6 +236,8 @@ pub struct CloudSummary {
     pub path: PathBuf,
     pub points: usize,
     pub has_rgb: bool,
+    /// Whether the cloud is made of several scans ([`crate::cloud::PointSet::source`]).
+    pub has_scans: bool,
     /// Whether the cloud has submap qualities (a SLAM report).
     pub quality_known: bool,
     /// Lowest and highest relative z.

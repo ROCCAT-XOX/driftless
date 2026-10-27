@@ -1,9 +1,9 @@
-//! Loading a LAS cloud into a [`PointSet`].
+//! Loading a LAS or PLY cloud into a [`PointSet`].
 
-use driftless_app::cloud::{load_las, PointSet};
+use driftless_app::cloud::{load_cloud, load_las, load_ply, PointSet, MID_GRAY};
 use driftless_io::progress::Progress;
 use driftless_io::testscan::tmp;
-use driftless_map::{write_las, Cloud};
+use driftless_map::{write_las, write_las_sources, write_ply, write_ply_sources, Cloud};
 use driftless_slam::report::{BeforeAfter, SlamReport, SubmapReport};
 use driftless_steps::StepError;
 use std::path::Path;
@@ -342,5 +342,391 @@ fn sixteen_bit_dark_points_stay_dark() {
     let p = load_las(&path, None, &Progress::new()).unwrap();
     assert_eq!(p.rgb, Some(vec![[0, 0, 0], [255, 100, 1]]));
     assert_eq!(p.intensity, vec![0, 200]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn las_point_source_becomes_scan() {
+    let dir = tmp("app-cloud-sources");
+    let path = dir.join("modell.las");
+    write_las_sources(&path, &small_cloud(true), &[0, 1, 1, 0]).unwrap();
+    let p = load_las(&path, None, &Progress::new()).unwrap();
+    assert_eq!(p.source, vec![0, 1, 1, 0]);
+    // one scan only: no scans to tell apart
+    write_las_sources(&path, &small_cloud(true), &[0; 4]).unwrap();
+    let p = load_las(&path, None, &Progress::new()).unwrap();
+    assert!(p.source.is_empty());
+    write_las(&path, &small_cloud(false)).unwrap();
+    assert!(load_las(&path, None, &Progress::new())
+        .unwrap()
+        .source
+        .is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `message` of a failed load, or a panic naming what came instead.
+fn failed(r: Result<PointSet, StepError>) -> String {
+    match r {
+        Err(StepError::Failed(m)) => m,
+        other => panic!("expected an error, got {other:?}"),
+    }
+}
+
+fn ply_error(dir: &Path, name: &str, bytes: &[u8]) -> String {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    let m = failed(load_ply(&path, &Progress::new()));
+    assert!(m.starts_with("PLY nicht lesbar: "), "{name}: {m}");
+    m
+}
+
+#[test]
+fn ply_round_trip_from_write_ply() {
+    let dir = tmp("app-ply-roundtrip");
+    let path = dir.join("color.ply");
+    let cloud = small_cloud(true);
+    write_ply(&path, &cloud).unwrap();
+    let p = load_ply(&path, &Progress::new()).unwrap();
+    assert_eq!(p.len(), 4);
+    // the first point in whole metres
+    assert_eq!(p.origin, [10.0, 20.0, 1.0]);
+    for i in 0..4 {
+        let a = absolute(&p, i);
+        for k in 0..3 {
+            let want = f64::from(cloud.xyz[i][k]);
+            assert!((a[k] - want).abs() <= 1e-5, "point {i} axis {k}: {a:?}");
+        }
+    }
+    assert_eq!(p.rgb.as_deref(), cloud.rgb.as_deref());
+    assert_eq!(p.intensity, vec![0, 100, 200, 255]);
+    // `colored` 0 → flag 1, as `user_data` of the LAS
+    assert_eq!(p.flags, vec![0, 1, 0, 1]);
+    assert_eq!(p.t, vec![0.0; 4]);
+    assert_eq!(p.quality, vec![255; 4]);
+    assert!(!p.quality_known);
+    assert!(p.source.is_empty());
+
+    write_ply_sources(&path, &cloud, &[0, 1, 2, 1]).unwrap();
+    let p = load_ply(&path, &Progress::new()).unwrap();
+    assert_eq!(p.source, vec![0, 1, 2, 1]);
+    assert_eq!(p.rgb.as_deref(), cloud.rgb.as_deref());
+    assert_eq!(p.flags, vec![0, 1, 0, 1]);
+    write_ply_sources(&path, &cloud, &[3; 4]).unwrap();
+    assert!(load_ply(&path, &Progress::new()).unwrap().source.is_empty());
+
+    // `load_cloud` takes the reader by the extension, in any case
+    let upper = dir.join("MODELL.PLY");
+    std::fs::copy(&path, &upper).unwrap();
+    let c = load_cloud(&upper, None, &Progress::new()).unwrap();
+    assert_eq!(c.points.len(), 4);
+    assert_eq!(c.tree.vertices.len(), 4);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn ply_ascii_with_float_color() {
+    let dir = tmp("app-ply-ascii");
+    let path = dir.join("fremd.ply");
+    let text = "ply\r\nformat ascii 1.0\r\ncomment von Hand\r\nobj_info test\r\n\
+                element vertex 3\r\nproperty float32 x\r\nproperty float32 y\r\n\
+                property float32 z\r\nproperty float nx\r\nproperty float red\r\n\
+                property float green\r\nproperty float blue\r\n\
+                property float scalar_Intensity\r\nend_header\r\n\
+                1.5 2 -3 0.1 1 0 0 10\r\n\
+                -1e-1 0.25 4 0 0 0.5 0 20.5\r\n\
+                7 8 9 0 0 0 1.5 255\r\n";
+    std::fs::write(&path, text).unwrap();
+    let p = load_ply(&path, &Progress::new()).unwrap();
+    assert_eq!(p.len(), 3);
+    assert_eq!(p.origin, [2.0, 2.0, -3.0]);
+    let want = [[1.5, 2.0, -3.0], [-0.1, 0.25, 4.0], [7.0, 8.0, 9.0]];
+    for (i, w) in want.iter().enumerate() {
+        let a = absolute(&p, i);
+        for k in 0..3 {
+            assert!((a[k] - w[k]).abs() < 1e-6, "point {i}: {a:?}");
+        }
+    }
+    // 0–1 scaled to 0–255, beyond 1 clamped
+    assert_eq!(p.rgb, Some(vec![[255, 0, 0], [0, 128, 0], [0, 0, 255]]));
+    assert_eq!(p.intensity, vec![10, 21, 255]);
+    assert_eq!(p.flags, vec![0; 3]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Binary PLY data of `rows`, each value written big- or little-endian as its type says.
+fn binary_rows(rows: &[Vec<Value>], big: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    for row in rows {
+        for v in row {
+            match (*v, big) {
+                (Value::F64(x), true) => out.extend(x.to_be_bytes()),
+                (Value::F64(x), false) => out.extend(x.to_le_bytes()),
+                (Value::F32(x), true) => out.extend(x.to_be_bytes()),
+                (Value::F32(x), false) => out.extend(x.to_le_bytes()),
+                (Value::U16(x), true) => out.extend(x.to_be_bytes()),
+                (Value::U16(x), false) => out.extend(x.to_le_bytes()),
+                (Value::I32(x), true) => out.extend(x.to_be_bytes()),
+                (Value::I32(x), false) => out.extend(x.to_le_bytes()),
+                (Value::U8(x), _) => out.push(x),
+            }
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Value {
+    F64(f64),
+    F32(f32),
+    U16(u16),
+    I32(i32),
+    U8(u8),
+}
+
+#[test]
+fn ply_big_endian_double() {
+    use Value::*;
+    let dir = tmp("app-ply-be");
+    let path = dir.join("utm.ply");
+    let base = [512_345.678, 5_412_345.678, 312.345];
+    let header = "ply\nformat binary_big_endian 1.0\nelement vertex 3\n\
+                  property double x\nproperty float64 y\nproperty double z\n\
+                  property uchar red\nproperty uint8 green\nproperty uchar blue\n\
+                  property ushort intensity\nproperty ushort scan\nend_header\n";
+    let rows: Vec<Vec<Value>> = (0..3)
+        .map(|i| {
+            let f = f64::from(i);
+            vec![
+                F64(base[0] + f * 0.731),
+                F64(base[1] - f * 0.417),
+                F64(base[2] + f * 0.013),
+                U8(10 * i as u8),
+                U8(20),
+                U8(30),
+                U16(1000 * (i as u16 + 1)),
+                U16(i as u16 % 2),
+            ]
+        })
+        .collect();
+    let mut bytes = header.as_bytes().to_vec();
+    bytes.extend(binary_rows(&rows, true));
+    std::fs::write(&path, bytes).unwrap();
+    let p = load_ply(&path, &Progress::new()).unwrap();
+    assert_eq!(p.len(), 3);
+    for i in 0..3 {
+        let f = i as f64;
+        let want = [
+            base[0] + f * 0.731,
+            base[1] - f * 0.417,
+            base[2] + f * 0.013,
+        ];
+        let a = absolute(&p, i);
+        for k in 0..3 {
+            assert!((a[k] - want[k]).abs() <= 0.001, "point {i} axis {k}");
+        }
+    }
+    assert_eq!(p.rgb, Some(vec![[0, 20, 30], [10, 20, 30], [20, 20, 30]]));
+    // above 255: scaled so that the brightest is 255
+    assert_eq!(p.intensity, vec![85, 170, 255]);
+    assert_eq!(p.source, vec![0, 1, 0]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn ply_without_color() {
+    use Value::*;
+    let dir = tmp("app-ply-nocolor");
+    let path = dir.join("grau.ply");
+    let mut bytes = b"ply\nformat binary_little_endian 1.0\nelement vertex 2\n\
+                      property float x\nproperty float y\nproperty float z\nend_header\n"
+        .to_vec();
+    bytes.extend(binary_rows(
+        &[
+            vec![F32(1.0), F32(2.0), F32(3.0)],
+            vec![F32(4.0), F32(5.0), F32(6.0)],
+        ],
+        false,
+    ));
+    std::fs::write(&path, bytes).unwrap();
+    let p = load_ply(&path, &Progress::new()).unwrap();
+    assert_eq!(p.len(), 2);
+    assert!(p.rgb.is_none());
+    assert_eq!(p.intensity, vec![MID_GRAY; 2]);
+    assert!(p.source.is_empty());
+    assert_eq!(absolute(&p, 1), [4.0, 5.0, 6.0]);
+
+    // no points at all
+    std::fs::write(
+        &path,
+        "ply\nformat ascii 1.0\nelement vertex 0\nproperty float x\nproperty float y\n\
+         property float z\nend_header\n",
+    )
+    .unwrap();
+    let p = load_ply(&path, &Progress::new()).unwrap();
+    assert!(p.is_empty());
+    assert_eq!(p.origin, [0.0; 3]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn ply_skips_faces() {
+    use Value::*;
+    let dir = tmp("app-ply-faces");
+    // a mesh as many programs write it: vertices, then faces
+    let path = dir.join("netz.ply");
+    std::fs::write(
+        &path,
+        "ply\nformat ascii 1.0\nelement vertex 3\nproperty float x\nproperty float y\n\
+         property float z\nproperty list uchar int vertex_indices\nelement face 1\n\
+         property list uchar int vertex_indices\nend_header\n\
+         0 0 0 2 7 8\n1 0 0 0\n0 1 0 1 5\n3 0 1 2\n",
+    )
+    .unwrap();
+    let p = load_ply(&path, &Progress::new()).unwrap();
+    assert_eq!(p.len(), 3);
+    assert_eq!(absolute(&p, 2), [0.0, 1.0, 0.0]);
+
+    // binary, faces (with a list) and another element before the vertices
+    let path = dir.join("vorne.ply");
+    let mut bytes = b"ply\nformat binary_little_endian 1.0\nelement face 2\n\
+                      property list uchar int vertex_indices\nproperty uchar flag\n\
+                      element material 1\nproperty float shine\n\
+                      element vertex 2\nproperty float x\nproperty float y\n\
+                      property float z\nproperty uchar colored\nend_header\n"
+        .to_vec();
+    bytes.extend(binary_rows(
+        &[
+            vec![U8(3), I32(0), I32(1), I32(2), U8(9)],
+            vec![U8(0), U8(9)],
+            vec![F32(0.5)],
+            vec![F32(1.0), F32(2.0), F32(3.0), U8(1)],
+            vec![F32(-1.0), F32(-2.0), F32(-3.0), U8(0)],
+        ],
+        false,
+    ));
+    std::fs::write(&path, bytes).unwrap();
+    let p = load_ply(&path, &Progress::new()).unwrap();
+    assert_eq!(p.len(), 2);
+    assert_eq!(absolute(&p, 0), [1.0, 2.0, 3.0]);
+    assert_eq!(absolute(&p, 1), [-1.0, -2.0, -3.0]);
+    assert_eq!(p.flags, vec![0, 1]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn ply_broken_header_is_error() {
+    let dir = tmp("app-ply-broken");
+    let good = "ply\nformat binary_little_endian 1.0\nelement vertex 2\n\
+                property float x\nproperty float y\nproperty float z\nend_header\n";
+    let mut valid = good.as_bytes().to_vec();
+    valid.extend([0u8; 24]);
+    // every cut of a valid file: an error (or the points), never a panic
+    for n in 0..valid.len() {
+        let path = dir.join("cut.ply");
+        std::fs::write(&path, &valid[..n]).unwrap();
+        assert!(load_ply(&path, &Progress::new()).is_err(), "cut at {n}");
+    }
+    ply_error(&dir, "leer.ply", b"");
+    ply_error(&dir, "kopf.ply", &good.as_bytes()[..good.len() - 12]);
+    ply_error(&dir, "fremd.ply", b"PK\x03\x04 zip");
+    ply_error(
+        &dir,
+        "format.ply",
+        good.replace("binary_little_endian", "binary_middle")
+            .as_bytes(),
+    );
+    ply_error(&dir, "version.ply", good.replace("1.0", "2.0").as_bytes());
+    ply_error(
+        &dir,
+        "typ.ply",
+        good.replace("float y", "quad y").as_bytes(),
+    );
+    ply_error(
+        &dir,
+        "ohne-z.ply",
+        good.replace("property float z\n", "").as_bytes(),
+    );
+    ply_error(
+        &dir,
+        "ohne-punkte.ply",
+        good.replace("vertex", "face").as_bytes(),
+    );
+    ply_error(
+        &dir,
+        "zeile.ply",
+        good.replace("element vertex 2", "element vertex")
+            .as_bytes(),
+    );
+    ply_error(
+        &dir,
+        "vor-element.ply",
+        b"ply\nformat ascii 1.0\nproperty float x\nend_header\n",
+    );
+    // a count larger than the data, also a huge one: an error, no allocation of it
+    let mut more = good.replace("vertex 2", "vertex 3").into_bytes();
+    more.extend([0u8; 24]);
+    let m = ply_error(&dir, "mehr.ply", &more);
+    assert!(m.contains("Anzahl"), "{m}");
+    for count in ["18446744073709551615", "99999999999999999999999", "-1"] {
+        let mut huge = good
+            .replace("vertex 2", &format!("vertex {count}"))
+            .into_bytes();
+        huge.extend([0u8; 24]);
+        ply_error(&dir, "riesig.ply", &huge);
+        let ascii = format!(
+            "ply\nformat ascii 1.0\nelement vertex {count}\nproperty float x\n\
+             property float y\nproperty float z\nend_header\n1 2 3\n"
+        );
+        ply_error(&dir, "riesig-ascii.ply", ascii.as_bytes());
+    }
+    // too few values in ASCII, or one that is no number
+    ply_error(
+        &dir,
+        "kurz.ply",
+        b"ply\nformat ascii 1.0\nelement vertex 2\nproperty float x\nproperty float y\n\
+          property float z\nend_header\n1 2 3\n4 5\n",
+    );
+    ply_error(
+        &dir,
+        "wort.ply",
+        b"ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\n\
+          property float z\nend_header\n1 zwei 3\n",
+    );
+    // a face list longer than the file before the vertices
+    let mut list = b"ply\nformat binary_little_endian 1.0\nelement face 1\n\
+                     property list uint int vertex_indices\nelement vertex 1\n\
+                     property float x\nproperty float y\nproperty float z\nend_header\n"
+        .to_vec();
+    list.extend(u32::MAX.to_le_bytes());
+    list.extend([0u8; 12]);
+    ply_error(&dir, "liste.ply", &list);
+    // a missing file names it
+    let m = failed(load_ply(&dir.join("weg.ply"), &Progress::new()));
+    assert!(
+        m.starts_with("PLY nicht lesbar: ") && m.contains("weg.ply"),
+        "{m}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn ply_load_reports_phase_and_cancels() {
+    let dir = tmp("app-ply-cancel");
+    let path = dir.join("color.ply");
+    write_ply(&path, &small_cloud(true)).unwrap();
+    let progress = Progress::new();
+    load_ply(&path, &progress).unwrap();
+    let s = progress.snapshot();
+    assert_eq!(s.phase, "Wolke laden");
+    assert_eq!((s.total, s.done), (Some(4), 4));
+
+    let progress = Progress::new();
+    let handle = progress.clone();
+    let progress = progress.with_observer(move |s| {
+        if s.phase == "Wolke laden" {
+            handle.cancel();
+        }
+    });
+    assert_eq!(load_ply(&path, &progress).err(), Some(StepError::Cancelled));
     std::fs::remove_dir_all(dir).unwrap();
 }

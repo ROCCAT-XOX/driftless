@@ -1,5 +1,6 @@
-//! A point cloud loaded from LAS for the 3D view: columns relative to an origin in whole
-//! metres, so that `f32` keeps millimetres even for coordinates of ~10⁶ m.
+//! A point cloud loaded from LAS or PLY ([`crate::ply`]) for the 3D view: columns relative
+//! to an origin in whole metres, so that `f32` keeps millimetres even for coordinates of
+//! ~10⁶ m.
 
 use crate::lod::{build_octree, Octree};
 use driftless_io::progress::Progress;
@@ -8,6 +9,8 @@ use driftless_steps::overlay::submap_at;
 use driftless_steps::StepError;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+pub use crate::ply::load_ply;
 
 /// Points read per batch (one cancel check and one progress step each).
 const BATCH: usize = 1 << 20;
@@ -36,6 +39,9 @@ pub struct PointSet {
     pub quality_known: bool,
     /// LAS `user_data`: 1 = without measured colour, or the removal reason.
     pub flags: Vec<u8>,
+    /// The scan of each point in a model merged from several (LAS `point_source_id`, PLY
+    /// `scan`); empty if unknown or if all points have the same.
+    pub source: Vec<u16>,
 }
 
 impl PointSet {
@@ -51,6 +57,7 @@ impl PointSet {
             quality: vec![255; n],
             quality_known: false,
             flags: vec![0; n],
+            source: Vec::new(),
         }
     }
 
@@ -110,7 +117,8 @@ fn origin_of(bounds: &las::Bounds, first: &[[f64; 3]]) -> [f64; 3] {
 /// its submap ([`submap_at`]) and so its quality. LAS intensity 0–65535 becomes `>> 8`; a
 /// file whose intensities are all 0 (none recorded) is shown [`MID_GRAY`]. Files whose
 /// colours (or intensities) never exceed 255 store 8-bit values; those are taken as they are.
-/// The origin comes from the header bounds unless they do not fit the first points.
+/// The origin comes from the header bounds unless they do not fit the first points. The
+/// `point_source_id` becomes [`PointSet::source`] if it differs between points.
 pub fn load_las(
     path: &Path,
     slam: Option<&SlamReport>,
@@ -132,6 +140,7 @@ pub fn load_las(
         quality: Vec::with_capacity(capacity),
         quality_known: slam.is_some(),
         flags: Vec::with_capacity(capacity),
+        source: Vec::with_capacity(capacity),
     };
     // Time zero: the scan start of the report, else the first point's time.
     let mut t0 = slam.map(|s| s.scan_start);
@@ -187,6 +196,7 @@ pub fn load_las(
             max_intensity = max_intensity.max(p.intensity);
             low.push([c.red, c.green, c.blue, p.intensity].map(|v| v as u8));
             out.flags.push(p.user_data);
+            out.source.push(p.point_source_id);
             match p.gps_time {
                 Some(g) => {
                     timed = true;
@@ -220,6 +230,9 @@ pub fn load_las(
     out.quality_known &= timed;
     if out.intensity.iter().all(|&i| i == 0) {
         out.intensity.fill(MID_GRAY);
+    }
+    if out.source.windows(2).all(|w| w[0] == w[1]) {
+        out.source = Vec::new();
     }
     Ok(out)
 }
@@ -300,8 +313,10 @@ impl LoadedCloud {
 }
 
 /// Reads `path` and builds its levels of detail: phase [`PHASE_LOAD`], then
-/// [`crate::lod::PHASE_BUILD`]. With `run`, the `slam.json` of that run folder gives each
-/// point the quality of its submap; without it (or unreadable) the quality is 255.
+/// [`crate::lod::PHASE_BUILD`]. A file ending in `.ply` (any case) is read by [`load_ply`],
+/// any other as LAS. With `run`, the `slam.json` of that run folder gives each point of a
+/// LAS the quality of its submap; without it (or unreadable, or for a PLY, which has no
+/// point times) the quality is 255.
 pub fn load_cloud(
     path: &Path,
     run: Option<&Path>,
@@ -311,13 +326,23 @@ pub fn load_cloud(
         .and_then(|dir| std::fs::read_to_string(dir.join("slam.json")).ok())
         .and_then(|t| serde_json::from_str(&t).ok());
     let t = Instant::now();
-    let points = load_las(path, report.as_ref(), progress)?;
+    let points = if is_ply(path) {
+        load_ply(path, progress)?
+    } else {
+        load_las(path, report.as_ref(), progress)?
+    };
     LoadedCloud::build(
         path.to_path_buf(),
         points,
         t.elapsed().as_secs_f64(),
         progress,
     )
+}
+
+/// Whether `path` ends in `.ply`, in any case.
+pub fn is_ply(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("ply"))
 }
 
 /// Points looked at by [`view_bounds`] at most.
