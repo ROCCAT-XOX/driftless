@@ -6,6 +6,8 @@
 //! ([`driftless_io::TempPath`]), so an error or a cancel never leaves half a file behind.
 
 pub mod las;
+pub mod pcd;
+pub mod ply;
 mod points;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testutil;

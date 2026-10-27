@@ -1,16 +1,15 @@
-//! A point cloud loaded from LAS or PLY ([`crate::ply`]) for the 3D view: columns relative
-//! to an origin in whole metres, so that `f32` keeps millimetres even for coordinates of
-//! ~10⁶ m.
+//! A point cloud loaded from LAS or PLY ([`driftless_export::ply`]) for the 3D view: columns
+//! relative to an origin in whole metres, so that `f32` keeps millimetres even for
+//! coordinates of ~10⁶ m.
 
 use crate::lod::{build_octree, Octree};
+use driftless_export::Points;
 use driftless_io::progress::Progress;
 use driftless_slam::report::SlamReport;
 use driftless_steps::overlay::submap_at;
 use driftless_steps::StepError;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-
-pub use crate::ply::load_ply;
 
 /// Points read per batch (one cancel check and one progress step each).
 const BATCH: usize = 1 << 20;
@@ -145,11 +144,7 @@ pub fn load_las(
     // Time zero: the scan start of the report, else the first point's time.
     let mut t0 = slam.map(|s| s.scan_start);
     let submaps = slam.map_or(&[][..], |s| &s.submaps[..]);
-    let quality_of = |t: f64| {
-        submaps
-            .get(submap_at(submaps, t))
-            .map_or(255, |m| (m.quality.clamp(0.0, 1.0) * 255.0).round() as u8)
-    };
+    let quality_of = |t: f64| quality_at(submaps, t);
 
     // The point format of a file has times for all points or for none.
     let mut timed = false;
@@ -237,6 +232,106 @@ pub fn load_las(
     Ok(out)
 }
 
+/// The quality × 255 of the submap of the time `t` (seconds since the scan start); 255
+/// without submaps.
+fn quality_at(submaps: &[driftless_slam::report::SubmapReport], t: f64) -> u8 {
+    submaps
+        .get(submap_at(submaps, t))
+        .map_or(255, |m| (m.quality.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// The [`PointSet`] of `points` read by [`driftless_export`], for every format alike:
+/// - origin = per axis `round((min + max) / 2)` of the points' bounds (0 without points);
+/// - colour and intensity `>> 8`; without intensity, or all 0, [`MID_GRAY`];
+/// - with times: `t` since the scan start of `slam` (else since the first point), and with
+///   `slam` the quality of each point's submap ([`submap_at`]); without times `t` = 0 and the
+///   quality unknown (255);
+/// - flags as they are (0 without), the scan number if it differs between points.
+///
+/// The columns are converted one after the other and each is freed right after.
+pub fn point_set(points: Points, slam: Option<&SlamReport>) -> PointSet {
+    let n = points.len();
+    let origin = points
+        .bounds()
+        .map(|(min, max)| std::array::from_fn(|k| ((min[k] + max[k]) / 2.0).round()))
+        .filter(|o: &[f64; 3]| o.iter().all(|v| v.is_finite()))
+        .unwrap_or([0.0; 3]);
+    let Points {
+        xyz,
+        rgb,
+        intensity,
+        source,
+        time,
+        flags,
+        scans: _,
+    } = points;
+    // `iter` and `drop`, not `into_iter`: a collect in place could keep the larger buffer.
+    let rel: Vec<[f32; 3]> = xyz
+        .iter()
+        .map(|p| std::array::from_fn(|k| (p[k] - origin[k]) as f32))
+        .collect();
+    drop(xyz);
+    let rgb = rgb.map(|c| {
+        let eight: Vec<[u8; 3]> = c.iter().map(|v| v.map(|c| (c >> 8) as u8)).collect();
+        drop(c);
+        eight
+    });
+    let intensity = match intensity {
+        Some(i) if i.iter().any(|&v| v != 0) => {
+            let eight: Vec<u8> = i.iter().map(|&v| (v >> 8) as u8).collect();
+            drop(i);
+            eight
+        }
+        _ => vec![MID_GRAY; n],
+    };
+    let (t, quality, quality_known) = match time {
+        Some(time) => {
+            let t0 = slam
+                .map(|s| s.scan_start)
+                .or_else(|| time.first().copied())
+                .unwrap_or(0.0);
+            let submaps = slam.map_or(&[][..], |s| &s.submaps[..]);
+            let quality = time
+                .iter()
+                .map(|&g| {
+                    if slam.is_some() {
+                        quality_at(submaps, g - t0)
+                    } else {
+                        255
+                    }
+                })
+                .collect();
+            let t = time.iter().map(|&g| (g - t0) as f32).collect();
+            drop(time);
+            (t, quality, slam.is_some())
+        }
+        None => (vec![0.0; n], vec![255; n], false),
+    };
+    let flags = flags.unwrap_or_else(|| vec![0; n]);
+    let source = source
+        .filter(|s| s.windows(2).any(|w| w[0] != w[1]))
+        .unwrap_or_default();
+    PointSet {
+        origin,
+        xyz: rel,
+        rgb,
+        intensity,
+        t,
+        quality,
+        quality_known,
+        flags,
+        source,
+    }
+}
+
+/// Reads a PLY file ([`driftless_export::ply::read_ply`]: phase
+/// [`driftless_export::PHASE_READ`], a cancel check per block) as a [`PointSet`]
+/// ([`point_set`]). PLY has no point times: `t` is 0 and the quality unknown (255).
+pub fn load_ply(path: &Path, progress: &Progress) -> Result<PointSet, StepError> {
+    let points = driftless_export::ply::read_ply(path, progress)?;
+    Ok(point_set(points, None))
+}
+
 /// A cloud ready for the 3D view: its points and their levels of detail.
 ///
 /// The [`PointSet`] stays in memory next to the octree: the point info reads its columns
@@ -312,8 +407,8 @@ impl LoadedCloud {
     }
 }
 
-/// Reads `path` and builds its levels of detail: phase [`PHASE_LOAD`], then
-/// [`crate::lod::PHASE_BUILD`]. A file ending in `.ply` (any case) is read by [`load_ply`],
+/// Reads `path` and builds its levels of detail: phase [`PHASE_LOAD`] (for a PLY
+/// [`driftless_export::PHASE_READ`]), then [`crate::lod::PHASE_BUILD`]. A file ending in `.ply` (any case) is read by [`load_ply`],
 /// any other as LAS. With `run`, the `slam.json` of that run folder gives each point of a
 /// LAS the quality of its submap; without it (or unreadable, or for a PLY, which has no
 /// point times) the quality is 255.

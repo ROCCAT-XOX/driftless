@@ -1,77 +1,173 @@
-//! A reader for PLY point clouds (`format ascii 1.0`, `binary_little_endian 1.0` and
-//! `binary_big_endian 1.0`) into a [`PointSet`].
+//! PLY point clouds: a writer (binary little-endian, the layout of `color.ply` and
+//! `modell.ply`) and a reader for `format ascii 1.0`, `binary_little_endian 1.0` and
+//! `binary_big_endian 1.0`.
 //!
-//! Of the element `vertex` it takes `x y z` (any scalar type, usually `float` or `double`),
-//! the colour `red green blue` (`uchar`, or a float in 0–1 or 0–255), `intensity` or
-//! `scalar_intensity`, `scan` (the scan of a merged model) and `colored` (0 = without
-//! measured colour, as [`driftless_map::write_ply`] writes it). Other properties and other
+//! Of the element `vertex` the reader takes `x y z` (any scalar type, usually `float` or
+//! `double`), the colour `red green blue` (`uchar`, `ushort`, or a float in 0–1 or 0–255),
+//! `intensity` or `scalar_intensity`, `scan` (the scan of a merged model) and `colored`
+//! (0 = without measured colour, as [`write_ply`] writes it). Other properties and other
 //! elements (e.g. `face`) are skipped, elements after `vertex` are not read at all.
 //!
 //! A file that does not fit its header – a cut header, an unknown type, more points than the
 //! file can hold – is an error, never a panic. No buffer is sized by a count of the header
 //! alone: the counts of the elements read are checked against the size of the file first.
 
-use crate::cloud::{PointSet, MID_GRAY, PHASE_LOAD};
+use crate::{
+    check_cancel, needs_double, ExportError, PointSource, Points, BLOCK, PHASE_READ, PHASE_WRITE,
+};
 use driftless_io::progress::Progress;
-use driftless_steps::StepError;
+use driftless_io::TempPath;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-/// Points read per batch (one cancel check and one progress step each).
-const BATCH: u64 = 1 << 20;
 /// Longest header (bytes).
 const MAX_HEADER: u64 = 1 << 20;
 /// Longest value of an ASCII file (bytes).
-const MAX_TOKEN: usize = 64;
+pub(crate) const MAX_TOKEN: usize = 64;
 /// Characters of a header line quoted in an error.
 const QUOTE: usize = 40;
 /// Buffer of the file reader (bytes).
-const READ_BUFFER: usize = 1 << 16;
+pub(crate) const READ_BUFFER: usize = 1 << 16;
 
-/// Reads a PLY file in batches of 2²⁰ points (phase [`PHASE_LOAD`], total from the header,
-/// a cancel check per batch). The origin is the first point in whole metres; points with a
-/// coordinate that is not finite are left out. Float colours are 0–1 (×255), unless one of
-/// them is above 1: then the file holds 0–255 (as some programs write it) and they are taken
-/// as they are. Intensities in 0–255 are taken as they are,
-/// floats in 0–1 ×255, larger ones scaled so that the brightest is 255; without any (or
-/// all 0) the points are [`MID_GRAY`]. Without point times the time is 0 and the quality
-/// unknown (255). A `scan` of only one value gives no [`PointSet::source`].
+/// Writes `src` as binary little-endian PLY through `<name>.tmp` next to `path`. Progress:
+/// phase [`PHASE_WRITE`] counting points, a cancel check per [`BLOCK`]; an error or a cancel
+/// leaves `path` as it was and no `.tmp`.
 ///
-/// Errors are `StepError::Failed("PLY nicht lesbar: <file>: <reason>")`.
-pub fn load_ply(path: &Path, progress: &Progress) -> Result<PointSet, StepError> {
+/// Properties of `vertex`, in this order and only those of the layout:
+/// - `x y z`: `float`, or `double` once a coordinate reaches [`crate::MAX_FLOAT_COORD`];
+/// - `intensity`: `float` 0–255;
+/// - `red green blue`: `uchar`, `round(v / 257)`;
+/// - `colored`: `uchar`, 1 where the flags are 0 (measured colour), else 0;
+/// - `scan`: `ushort`, the scan number.
+pub fn write_ply(
+    path: &Path,
+    src: &dyn PointSource,
+    progress: &Progress,
+) -> Result<(), ExportError> {
+    check_cancel(progress)?;
+    let layout = src.layout();
+    let double = needs_double(src);
+    let coord = if double { "double" } else { "float" };
+    let mut header = format!(
+        "ply\nformat binary_little_endian 1.0\nelement vertex {}\n\
+         property {coord} x\nproperty {coord} y\nproperty {coord} z\n",
+        src.len()
+    );
+    if layout.intensity {
+        header += "property float intensity\n";
+    }
+    if layout.rgb {
+        header += "property uchar red\nproperty uchar green\nproperty uchar blue\n";
+    }
+    if layout.flags {
+        header += "property uchar colored\n";
+    }
+    if layout.source {
+        header += "property ushort scan\n";
+    }
+    header += "end_header\n";
+
+    let temp = TempPath::new(path);
+    let io = |e| ExportError::io(path, e);
+    let file = File::create(temp.tmp()).map_err(io)?;
+    let mut w = BufWriter::new(file);
+    w.write_all(header.as_bytes()).map_err(io)?;
+    let n = src.len();
+    progress.phase(PHASE_WRITE, Some(n as u64));
+    // 3 × 8 (xyz) + 4 + 3 + 1 + 2
+    let mut row = Vec::with_capacity(34);
+    for start in (0..n).step_by(BLOCK) {
+        check_cancel(progress)?;
+        let end = (start + BLOCK).min(n);
+        for i in start..end {
+            row.clear();
+            for v in src.xyz(i) {
+                if double {
+                    row.extend(v.to_le_bytes());
+                } else {
+                    row.extend((v as f32).to_le_bytes());
+                }
+            }
+            if layout.intensity {
+                row.extend(src.intensity(i).to_le_bytes());
+            }
+            if layout.rgb {
+                row.extend(src.rgb(i).map(to_8bit));
+            }
+            if layout.flags {
+                row.push(u8::from(src.flags(i) == 0));
+            }
+            if layout.source {
+                row.extend(src.source(i).to_le_bytes());
+            }
+            w.write_all(&row).map_err(io)?;
+        }
+        progress.advance((end - start) as u64);
+    }
+    check_cancel(progress)?;
+    let file = w.into_inner().map_err(|e| io(e.into_error()))?;
+    drop(file);
+    temp.commit().map_err(io)
+}
+
+/// A 16-bit colour channel as 8 bit: `round(v / 257)`.
+pub(crate) fn to_8bit(v: u16) -> u8 {
+    // (v + 128) / 257 rounds; at most 65663 / 257 = 255
+    ((u32::from(v) + 128) / 257) as u8
+}
+
+/// Reads a PLY file into [`Points`] in blocks of [`BLOCK`] points (phase [`PHASE_READ`],
+/// total from the header, a cancel check per block). Points with a coordinate that is not
+/// finite are left out.
+///
+/// - Colour: `uchar` (and other integers) 0–255 ×257, `ushort` as 16 bit; float colours are
+///   0–1 (×255), unless one of them is above 1: then the file holds 0–255 (as some programs
+///   write it) and they are taken as they are; then ×257.
+/// - Intensity: 0–255 is taken as it is, floats in 0–1 ×255, larger ones are scaled so that
+///   the brightest is 255; then ×257.
+/// - `scan` becomes [`Points::source`], `colored` = 0 becomes flag 1 (no measured colour).
+/// - No times, no scans.
+///
+/// Errors: [`ExportError::Format`] with `PLY nicht lesbar: <reason>`, [`ExportError::Io`]
+/// for a file that cannot be opened.
+pub fn read_ply(path: &Path, progress: &Progress) -> Result<Points, ExportError> {
+    check_cancel(progress)?;
     read(path, progress).map_err(|e| match e {
-        Fail::Cancelled => StepError::Cancelled,
-        Fail::Bad(m) => StepError::Failed(format!("PLY nicht lesbar: {}: {m}", path.display())),
+        Fail::Cancelled => ExportError::Cancelled,
+        Fail::Io(e) => ExportError::io(path, e),
+        Fail::Bad(m) => ExportError::format(path, format!("PLY nicht lesbar: {m}")),
     })
 }
 
 /// Why a read stopped.
 #[derive(Debug)]
-enum Fail {
+pub(crate) enum Fail {
     Cancelled,
+    /// The file could not be read.
+    Io(io::Error),
     /// The reason, German.
     Bad(String),
 }
 
 /// The file ended before the elements of its header.
-const SHORT: &str = "Datei endet früher, als die Anzahl im Kopf sagt";
+pub(crate) const SHORT: &str = "Datei endet früher, als die Anzahl im Kopf sagt";
 
 impl From<io::Error> for Fail {
     fn from(e: io::Error) -> Self {
         match e.kind() {
             io::ErrorKind::UnexpectedEof => Fail::Bad(SHORT.into()),
-            _ => Fail::Bad(e.to_string()),
+            _ => Fail::Io(e),
         }
     }
 }
 
-fn bad<T>(m: impl Into<String>) -> Result<T, Fail> {
+pub(crate) fn bad<T>(m: impl Into<String>) -> Result<T, Fail> {
     Err(Fail::Bad(m.into()))
 }
 
 /// The first [`QUOTE`] characters of `s`.
-fn quote(s: &str) -> String {
+pub(crate) fn quote(s: &str) -> String {
     s.chars().take(QUOTE).collect()
 }
 
@@ -413,7 +509,7 @@ impl Rows {
         }
         let mut out = vec![0.0; e.props.len()];
         for i in 0..e.count {
-            if i % BATCH == 0 && progress.is_cancelled() {
+            if i % BLOCK as u64 == 0 && progress.is_cancelled() {
                 return Err(Fail::Cancelled);
             }
             self.row(e, stride, &mut out)?;
@@ -432,7 +528,7 @@ fn list_len(v: f64) -> Result<u64, Fail> {
 }
 
 /// The next whitespace-separated value of an ASCII file, in `token`.
-fn next_token(r: &mut impl BufRead, token: &mut Vec<u8>) -> Result<(), Fail> {
+pub(crate) fn next_token(r: &mut impl BufRead, token: &mut Vec<u8>) -> Result<(), Fail> {
     token.clear();
     loop {
         let buf = r.fill_buf()?;
@@ -466,35 +562,36 @@ fn next_token(r: &mut impl BufRead, token: &mut Vec<u8>) -> Result<(), Fail> {
     }
 }
 
-fn number(r: &mut impl BufRead, token: &mut Vec<u8>) -> Result<f64, Fail> {
+/// The next value of an ASCII file as a number.
+pub(crate) fn number(r: &mut impl BufRead, token: &mut Vec<u8>) -> Result<f64, Fail> {
     next_token(r, token)?;
     let text = String::from_utf8_lossy(token);
     text.parse::<f64>()
         .or_else(|_| bad(format!("Wert „{}“ ist keine Zahl", quote(&text))))
 }
 
-/// A colour channel of type `s` as 0–255: floats are 0–1 (×`float_scale`: 255, or 1 for a
-/// file of float colours in 0–255), `ushort` 16 bit, other types 0–255 (clamped).
-fn channel(v: f64, s: Scalar, float_scale: f64) -> u8 {
-    let v = match s {
-        _ if s.is_float() => (v * float_scale).round(),
-        // the high byte, as LAS colours are read
-        Scalar::U16 => (v / 256.0).floor(),
-        _ => v,
-    };
+/// A colour channel of type `s` as 16 bit: floats are 0–1 (×`float_scale`: 255, or 1 for a
+/// file of float colours in 0–255), `ushort` 16 bit, other types 0–255 (clamped); 8-bit
+/// values are widened ×257.
+fn channel(v: f64, s: Scalar, float_scale: f64) -> u16 {
     // NaN becomes 0
-    v.clamp(0.0, 255.0) as u8
+    let eight = |v: f64| (v.clamp(0.0, 255.0) as u16) * 257;
+    match s {
+        _ if s.is_float() => eight((v * float_scale).round()),
+        Scalar::U16 => v.clamp(0.0, 65535.0) as u16,
+        _ => eight(v),
+    }
 }
 
-/// The intensities as 0–255: float ones up to 1 ×255, up to 255 as they are, larger ones
-/// scaled so that the brightest is 255; none or all 0 is [`MID_GRAY`].
-fn intensities(raw: &[f32], float: bool) -> Vec<u8> {
+/// The intensities as 16 bit: float ones up to 1 ×255, up to 255 as they are, larger ones
+/// scaled so that the brightest is 255, then ×257; all 0 (or none finite above 0) stays 0.
+pub(crate) fn intensities(raw: &[f32], float: bool) -> Vec<u16> {
     let max = raw
         .iter()
         .filter(|v| v.is_finite())
         .fold(0.0f32, |a, &b| a.max(b));
     if max <= 0.0 {
-        return vec![MID_GRAY; raw.len()];
+        return vec![0; raw.len()];
     }
     let scale = if float && max <= 1.0 {
         255.0
@@ -506,7 +603,7 @@ fn intensities(raw: &[f32], float: bool) -> Vec<u8> {
     raw.iter()
         .map(|&v| {
             if v.is_finite() {
-                (v * scale).round().clamp(0.0, 255.0) as u8
+                ((v * scale).round().clamp(0.0, 255.0) as u16) * 257
             } else {
                 0
             }
@@ -514,9 +611,9 @@ fn intensities(raw: &[f32], float: bool) -> Vec<u8> {
         .collect()
 }
 
-fn read(path: &Path, progress: &Progress) -> Result<PointSet, Fail> {
-    let file = File::open(path)?;
-    let file_len = file.metadata()?.len();
+fn read(path: &Path, progress: &Progress) -> Result<Points, Fail> {
+    let file = File::open(path).map_err(Fail::Io)?;
+    let file_len = file.metadata().map_err(Fail::Io)?.len();
     let mut r = BufReader::with_capacity(READ_BUFFER, file);
     let header = parse_header(&mut r)?;
     let Some(vi) = header.elements.iter().position(|e| e.name == "vertex") else {
@@ -580,27 +677,21 @@ fn read(path: &Path, progress: &Progress) -> Result<PointSet, Fail> {
     let total = vertex.count;
     // bounded by the file size above
     let capacity = total as usize;
-    let mut out = PointSet {
-        origin: [0.0; 3],
-        xyz: Vec::with_capacity(capacity),
-        rgb: color.map(|_| Vec::with_capacity(capacity)),
-        intensity: Vec::new(),
-        t: Vec::new(),
-        quality: Vec::new(),
-        quality_known: false,
-        flags: Vec::with_capacity(capacity),
-        source: Vec::with_capacity(if scan.is_some() { capacity } else { 0 }),
-    };
-    let mut raw_intensity: Vec<f32> =
-        Vec::with_capacity(if intensity.is_some() { capacity } else { 0 });
+    let with = |on: bool| if on { capacity } else { 0 };
     // Float colours are kept as read until the range is known (0–1 or 0–255).
     let float_color = color.filter(|c| c.iter().any(|(_, s)| s.is_float()));
-    let mut raw_rgb: Vec<[f32; 3]> =
-        Vec::with_capacity(if float_color.is_some() { capacity } else { 0 });
-    let mut origin = None;
+    let mut rgb: Vec<[u16; 3]> = Vec::with_capacity(with(color.is_some() && float_color.is_none()));
+    let mut raw_rgb: Vec<[f32; 3]> = Vec::with_capacity(with(float_color.is_some()));
+    let mut raw_intensity: Vec<f32> = Vec::with_capacity(with(intensity.is_some()));
+    let mut out = Points {
+        xyz: Vec::with_capacity(capacity),
+        source: scan.map(|_| Vec::with_capacity(capacity)),
+        flags: colored.map(|_| Vec::with_capacity(capacity)),
+        ..Points::default()
+    };
     let stride = vertex.stride();
     let mut row = vec![0.0f64; vertex.props.len()];
-    progress.phase(PHASE_LOAD, Some(total));
+    progress.phase(PHASE_READ, Some(total));
     let mut done = 0u64;
     loop {
         if progress.is_cancelled() {
@@ -609,55 +700,44 @@ fn read(path: &Path, progress: &Progress) -> Result<PointSet, Fail> {
         if done == total {
             break;
         }
-        let n = BATCH.min(total - done);
+        let n = (BLOCK as u64).min(total - done);
         for _ in 0..n {
             rows.row(vertex, stride, &mut row)?;
             let p = [row[x.0], row[y.0], row[z.0]];
             if !p.iter().all(|v| v.is_finite()) {
                 continue;
             }
-            let o = *origin.get_or_insert_with(|| p.map(f64::round));
-            out.xyz.push([0, 1, 2].map(|k| (p[k] - o[k]) as f32));
+            out.xyz.push(p);
             if let Some(c) = float_color {
                 raw_rgb.push(c.map(|(i, _)| row[i] as f32));
-            } else if let (Some(rgb), Some(c)) = (&mut out.rgb, color) {
+            } else if let Some(c) = color {
                 rgb.push(c.map(|(i, s)| channel(row[i], s, 255.0)));
             }
             if let Some((i, _)) = intensity {
                 raw_intensity.push(row[i] as f32);
             }
-            if let Some((i, _)) = scan {
-                out.source
-                    .push(row[i].clamp(0.0, f64::from(u16::MAX)) as u16);
+            if let (Some(source), Some((i, _))) = (&mut out.source, scan) {
+                source.push(row[i].clamp(0.0, f64::from(u16::MAX)) as u16);
             }
-            out.flags
-                .push(u8::from(colored.is_some_and(|(i, _)| row[i] == 0.0)));
+            if let (Some(flags), Some((i, _))) = (&mut out.flags, colored) {
+                flags.push(u8::from(row[i] == 0.0));
+            }
         }
         done += n;
         progress.advance(n);
     }
-    let n = out.xyz.len();
-    out.origin = origin.unwrap_or([0.0; 3]);
-    if let (Some(rgb), Some(c)) = (&mut out.rgb, float_color) {
+    if let Some(c) = float_color {
         // a float colour above 1 anywhere: the file holds 0–255
         let above_one = raw_rgb
             .iter()
             .any(|v| v.iter().zip(&c).any(|(x, (_, s))| s.is_float() && *x > 1.0));
         let scale = if above_one { 1.0 } else { 255.0 };
-        rgb.extend(
-            raw_rgb
-                .iter()
-                .map(|v| std::array::from_fn(|k| channel(f64::from(v[k]), c[k].1, scale))),
-        );
+        rgb = raw_rgb
+            .iter()
+            .map(|v| std::array::from_fn(|k| channel(f64::from(v[k]), c[k].1, scale)))
+            .collect();
     }
-    out.intensity = match intensity {
-        Some((_, s)) => intensities(&raw_intensity, s.is_float()),
-        None => vec![MID_GRAY; n],
-    };
-    out.t = vec![0.0; n];
-    out.quality = vec![255; n];
-    if out.source.windows(2).all(|w| w[0] == w[1]) {
-        out.source = Vec::new();
-    }
+    out.rgb = color.map(|_| rgb);
+    out.intensity = intensity.map(|(_, s)| intensities(&raw_intensity, s.is_float()));
     Ok(out)
 }

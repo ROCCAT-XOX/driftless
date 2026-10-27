@@ -211,3 +211,27 @@ fn sources_go_to_point_source_id_and_scan() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The PLY bytes of `color.ply` and `modell.ply` stay as they were before the writer moved
+/// to `driftless-export` (hashes taken from the writer of `driftless-map` before the move).
+#[test]
+fn color_ply_unchanged_by_move() {
+    let dir = temp_dir("ply-move");
+    let path = dir.join("color.ply");
+    let hash = |path: &std::path::Path| driftless_map::content_hash(&std::fs::read(path).unwrap());
+    write_ply(&path, &cloud(true)).unwrap();
+    let plain = hash(&path);
+    write_ply_sources(&path, &cloud(true), &[0, 2, 65535]).unwrap();
+    let sources = hash(&path);
+    write_ply(&path, &cloud(false)).unwrap();
+    let gray = hash(&path);
+    assert_eq!(
+        (plain, sources, gray),
+        (
+            0x04f1_c6b7_2722_ce22,
+            0x4df6_fd05_dd01_4823,
+            0x4f16_34ba_8b77_f1b2
+        )
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

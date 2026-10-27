@@ -1,11 +1,10 @@
 //! Writing a [`Cloud`] as LAS or binary PLY. Both files are byte-identical for the same cloud
-//! (no creation date or random id in the header). LAS goes through the one writer in
-//! [`driftless_export::las`].
+//! (no creation date or random id in the header). Both go through the one writer of their
+//! format in [`driftless_export`].
 
 use crate::{Cloud, MapError, RemovalReason};
 use driftless_export::{Layout, PointSource, ScanInfo};
 use driftless_io::progress::Progress;
-use std::io::Write;
 use std::path::Path;
 
 pub use driftless_export::las::LAS_SCALE;
@@ -141,9 +140,17 @@ pub fn write_removed_las(
 
 /// Binary little-endian PLY: `x y z intensity` as float, `red green blue` as uchar if the
 /// cloud has colours, then `colored` (uchar, 1 = measured colour, 0 = none) if the cloud
-/// knows which points were coloured.
+/// knows which points were coloured. Goes through [`driftless_export::ply::write_ply`]
+/// (`double` for xyz once a coordinate reaches [`driftless_export::MAX_FLOAT_COORD`]).
 pub fn write_ply(path: &Path, cloud: &Cloud) -> Result<(), MapError> {
-    write_ply_with(path, cloud, None)
+    write_cloud_ply(
+        path,
+        &CloudPoints {
+            cloud,
+            sources: None,
+            flags: Flags::Uncolored,
+        },
+    )
 }
 
 /// Like [`write_ply`] for a cloud merged from several scans, with one more property `scan`
@@ -153,59 +160,16 @@ pub fn write_ply(path: &Path, cloud: &Cloud) -> Result<(), MapError> {
 /// If `sources` does not have one entry per point.
 pub fn write_ply_sources(path: &Path, cloud: &Cloud, sources: &[u16]) -> Result<(), MapError> {
     assert_eq!(sources.len(), cloud.len(), "one source per point");
-    write_ply_with(path, cloud, Some(sources))
+    write_cloud_ply(
+        path,
+        &CloudPoints {
+            cloud,
+            sources: Some(sources),
+            flags: Flags::Uncolored,
+        },
+    )
 }
 
-fn write_ply_with(path: &Path, cloud: &Cloud, sources: Option<&[u16]>) -> Result<(), MapError> {
-    let err = |source| MapError::Io {
-        path: path.display().to_string(),
-        source,
-    };
-    let file = std::fs::File::create(path).map_err(err)?;
-    let mut w = std::io::BufWriter::new(file);
-    let mut header = format!(
-        "ply\nformat binary_little_endian 1.0\nelement vertex {}\n\
-         property float x\nproperty float y\nproperty float z\nproperty float intensity\n",
-        cloud.len()
-    );
-    if cloud.rgb.is_some() {
-        header += "property uchar red\nproperty uchar green\nproperty uchar blue\n";
-    }
-    if cloud.colored.is_some() {
-        header += "property uchar colored\n";
-    }
-    if sources.is_some() {
-        header += "property ushort scan\n";
-    }
-    header += "end_header\n";
-    w.write_all(header.as_bytes()).map_err(err)?;
-    for i in 0..cloud.len() {
-        let mut v = [0u8; 22];
-        for (k, c) in cloud.xyz[i].iter().chain([&cloud.intensity[i]]).enumerate() {
-            v[4 * k..4 * k + 4].copy_from_slice(&c.to_le_bytes());
-        }
-        let n = match &cloud.rgb {
-            Some(rgb) => {
-                v[16..19].copy_from_slice(&rgb[i]);
-                19
-            }
-            None => 16,
-        };
-        let n = match &cloud.colored {
-            Some(c) => {
-                v[n] = u8::from(c[i]);
-                n + 1
-            }
-            None => n,
-        };
-        let n = match sources {
-            Some(s) => {
-                v[n..n + 2].copy_from_slice(&s[i].to_le_bytes());
-                n + 2
-            }
-            None => n,
-        };
-        w.write_all(&v[..n]).map_err(err)?;
-    }
-    w.flush().map_err(err)
+fn write_cloud_ply(path: &Path, points: &CloudPoints) -> Result<(), MapError> {
+    driftless_export::ply::write_ply(path, points, &Progress::new()).map_err(MapError::from)
 }

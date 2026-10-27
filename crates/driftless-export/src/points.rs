@@ -1,7 +1,7 @@
 //! The point model: [`Points`] as columns, and [`PointSource`], through which every writer
 //! reads points without a copy.
 
-use crate::{las, ExportError, MAX_FLOAT_COORD};
+use crate::{las, pcd, ply, ExportError, MAX_FLOAT_COORD};
 use driftless_io::progress::Progress;
 use nalgebra::Isometry3;
 use std::path::Path;
@@ -177,6 +177,8 @@ pub fn needs_double(src: &dyn PointSource) -> bool {
 pub enum PointFormat {
     Las,
     Laz,
+    Ply,
+    Pcd,
 }
 
 impl PointFormat {
@@ -186,6 +188,8 @@ impl PointFormat {
         match ext.as_str() {
             "las" => Some(PointFormat::Las),
             "laz" => Some(PointFormat::Laz),
+            "ply" => Some(PointFormat::Ply),
+            "pcd" => Some(PointFormat::Pcd),
             _ => None,
         }
     }
@@ -195,6 +199,8 @@ impl PointFormat {
         match self {
             PointFormat::Las => "las",
             PointFormat::Laz => "laz",
+            PointFormat::Ply => "ply",
+            PointFormat::Pcd => "pcd",
         }
     }
 }
@@ -204,10 +210,12 @@ impl PointFormat {
 pub fn read_points(path: &Path, progress: &Progress) -> Result<Points, ExportError> {
     let mut points = match PointFormat::from_path(path) {
         Some(PointFormat::Las | PointFormat::Laz) => las::read_las(path, progress)?,
+        Some(PointFormat::Ply) => ply::read_ply(path, progress)?,
+        Some(PointFormat::Pcd) => pcd::read_pcd(path, progress)?,
         None => {
             return Err(ExportError::format(
                 path,
-                "unbekanntes Punktwolken-Format (erwartet: .las, .laz)",
+                "unbekanntes Punktwolken-Format (erwartet: .las, .laz, .ply, .pcd)",
             ))
         }
     };
@@ -225,5 +233,7 @@ pub fn write_points(
     match format {
         PointFormat::Las => las::write_las(path, src, false, progress),
         PointFormat::Laz => las::write_las(path, src, true, progress),
+        PointFormat::Ply => ply::write_ply(path, src, progress),
+        PointFormat::Pcd => pcd::write_pcd(path, src, progress),
     }
 }

@@ -18,6 +18,8 @@ path = "src/main.rs"
 bytemuck = { version = "1.25", features = ["derive"] }
 # Times of the history in local time.
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+# Reading point clouds in open formats (PLY, …).
+driftless-export = { path = "../driftless-export" }
 driftless-io = { path = "../driftless-io" }
 # „Grafikkarte nutzen“ (`GpuPref`) in ⚙.
 driftless-gpu = { path = "../driftless-gpu" }
