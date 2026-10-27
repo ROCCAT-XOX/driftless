@@ -797,6 +797,28 @@ fn merge_dialog_start_needs_two_ticks() {
     h.get_by_label(text::MERGE_OPEN);
 }
 
+/// At the width of the program's field (250 points), the map choice of a ticked scan takes
+/// the width of the field, so that „SLAM 002 · Karte 001“ is not cut.
+#[test]
+fn merge_dialog_shows_the_whole_map_name() {
+    let mut state = mergeable();
+    state.open_merge();
+    let mut h = Harness::builder()
+        .with_size([250.0, 1200.0])
+        .build_ui_state(
+            |ui, state: &mut AppState| {
+                steps::show(ui, state);
+            },
+            state,
+        );
+    h.run();
+    for name in ["SLAM 001 · Karte 001", "SLAM 002 · Karte 001"] {
+        let combo = h.get_by_value(name).rect();
+        assert!(combo.width() > 170.0, "{name}: {combo:?}");
+        assert!(combo.right() <= 250.0, "{name}: {combo:?}");
+    }
+}
+
 fn member(scan: &str, verdict: &str, included: bool) -> ModelMember {
     let run = PathBuf::from(format!("/p/scans/{scan}/slam-001"));
     ModelMember {

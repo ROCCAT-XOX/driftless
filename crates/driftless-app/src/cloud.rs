@@ -428,3 +428,129 @@ pub fn estimate_ceiling(points: &PointSet) -> Option<f32> {
     }
     Some(lo + bottom as f32 * width - CEILING_MARGIN)
 }
+
+/// Gap (m) along x between the model and the scan shown beside it for point pairs.
+pub const PAIR_GAP: f64 = 1.0;
+
+/// The cloud of „Von Hand ausrichten“: the model and, beside it, one of its scans.
+#[derive(Debug, Clone)]
+pub struct PairCloud {
+    pub cloud: LoadedCloud,
+    /// Added to the points of the scan (absolute, in the frame of that scan) to place them
+    /// beside the model: a point of the scan shown at `p` lies at `p − shift` in its frame.
+    pub shift: [f64; 3],
+}
+
+/// Keeps the entries of `v` whose `keep` is true.
+fn retain_by<T>(v: &mut Vec<T>, keep: &[bool]) {
+    let mut k = keep.iter();
+    v.retain(|_| *k.next().unwrap_or(&true));
+}
+
+/// Gray colours from intensities, for one part of a cloud whose other part has colours.
+fn grays(intensity: &[u8]) -> impl Iterator<Item = [u8; 3]> + '_ {
+    intensity.iter().map(|&i| [i; 3])
+}
+
+/// One point set of the points of a `model` (in the model frame, [`PointSet::source`] = the
+/// number of their scan, all `lone` if the model has none) without those of scan `member`,
+/// and of `scan` (in its own frame, from its map) shifted along x until its box starts
+/// [`PAIR_GAP`] beyond the box of the rest of the model (both boxes as [`view_bounds`] frames
+/// them, so that a few far points do not push the scan away); its points get `member` as
+/// their scan. The origin is that of the model. Colours of only one part are completed with
+/// grays of the intensity; times and flags are kept, qualities are unknown (255). Returns the
+/// set and the shift ([`PairCloud::shift`]).
+pub fn combine_pair_points(
+    mut model: PointSet,
+    lone: u16,
+    mut scan: PointSet,
+    member: u16,
+) -> (PointSet, [f64; 3]) {
+    if model.source.is_empty() {
+        model.source = vec![lone; model.len()];
+    }
+    if model.source.contains(&member) {
+        let keep: Vec<bool> = model.source.iter().map(|&s| s != member).collect();
+        retain_by(&mut model.xyz, &keep);
+        if let Some(rgb) = &mut model.rgb {
+            retain_by(rgb, &keep);
+        }
+        retain_by(&mut model.intensity, &keep);
+        retain_by(&mut model.t, &keep);
+        retain_by(&mut model.quality, &keep);
+        retain_by(&mut model.flags, &keep);
+        retain_by(&mut model.source, &keep);
+    }
+    if model.is_empty() {
+        model.origin = scan.origin;
+    }
+    let mut shift = [0.0; 3];
+    if let (Some((_, max)), Some((min, _))) = (view_bounds(&model), view_bounds(&scan)) {
+        let model_end = model.origin[0] + f64::from(max[0]);
+        let scan_start = scan.origin[0] + f64::from(min[0]);
+        shift[0] = model_end + PAIR_GAP - scan_start;
+    }
+    let rel: [f64; 3] = [0, 1, 2].map(|k| scan.origin[k] + shift[k] - model.origin[k]);
+    let n = scan.len();
+    let mut out = model;
+    out.xyz.reserve_exact(n);
+    out.xyz.extend(
+        scan.xyz
+            .iter()
+            .map(|p| [0, 1, 2].map(|k| (f64::from(p[k]) + rel[k]) as f32)),
+    );
+    scan.xyz = Vec::new();
+    out.rgb = match (out.rgb.take(), scan.rgb.take()) {
+        (None, None) => None,
+        (Some(mut a), b) => {
+            a.reserve_exact(n);
+            match b {
+                Some(b) => a.extend(b),
+                None => a.extend(grays(&scan.intensity)),
+            }
+            Some(a)
+        }
+        (None, Some(b)) => {
+            let mut a: Vec<[u8; 3]> = Vec::with_capacity(out.intensity.len() + n);
+            a.extend(grays(&out.intensity));
+            a.extend(b);
+            Some(a)
+        }
+    };
+    out.intensity.reserve_exact(n);
+    out.intensity.extend(&scan.intensity);
+    out.t.reserve_exact(n);
+    out.t.extend(&scan.t);
+    out.quality = vec![255; out.len()];
+    out.quality_known = false;
+    out.flags.reserve_exact(n);
+    out.flags.extend(&scan.flags);
+    out.source.reserve_exact(n);
+    out.source.resize(out.len(), member);
+    (out, shift)
+}
+
+/// Reads the `modell.las` of a model and the cloud `scan_cloud` of its scan `member` (LAS or
+/// PLY, in the frame of that scan), sets them side by side ([`combine_pair_points`]; `lone`
+/// is the scan of a model with points of only one) and builds the levels of detail; `name`
+/// names the cloud. In a job: phases [`PHASE_LOAD`] (twice) and
+/// [`crate::lod::PHASE_BUILD`], each with cancel checks.
+pub fn load_pair_cloud(
+    name: PathBuf,
+    model_las: &Path,
+    lone: u16,
+    scan_cloud: &Path,
+    member: u16,
+    progress: &Progress,
+) -> Result<PairCloud, StepError> {
+    let t = Instant::now();
+    let model = load_las(model_las, None, progress)?;
+    let scan = if is_ply(scan_cloud) {
+        load_ply(scan_cloud, progress)?
+    } else {
+        load_las(scan_cloud, None, progress)?
+    };
+    let (points, shift) = combine_pair_points(model, lone, scan, member);
+    let cloud = LoadedCloud::build(name, points, t.elapsed().as_secs_f64(), progress)?;
+    Ok(PairCloud { cloud, shift })
+}

@@ -150,6 +150,93 @@ pub fn unknown_model(dir: &std::path::Path) -> String {
     format!("{UNKNOWN_MODEL}: {}", dir.display())
 }
 
+pub fn scan_not_in_project(scan: &std::path::Path) -> String {
+    format!("Scan {} ist nicht mehr im Projekt", scan.display())
+}
+
+// Point pairs by hand („Von Hand ausrichten“)
+/// Under an unsure or failed scan of a model.
+pub const PAIRS_START: &str = "Von Hand ausrichten";
+pub const PAIRS_START_HINT: &str = "Drei gleiche Stellen im Modell und in diesem Scan \
+     anklicken; danach wird neu zusammengeführt";
+pub const PAIRS_TITLE: &str = "Von Hand ausrichten";
+pub const PAIRS_HINT: &str = "Je Paar zuerst eine Stelle im Modell anklicken, dann dieselbe \
+     Stelle im Scan rechts daneben. Mindestens drei Paare, weit auseinander und nicht auf einer \
+     Linie.";
+pub const PAIRS_LOADING: &str = "Modell und Scan werden geladen …";
+pub const PAIRS_WANTS_MODEL: &str =
+    "Das ist ein Punkt im Scan – zuerst die Stelle im Modell anklicken";
+pub const PAIRS_WANTS_SCAN: &str =
+    "Das ist ein Punkt im Modell – jetzt dieselbe Stelle im Scan anklicken";
+pub const PAIRS_NOT_SHOWN: &str = "Die Ansicht zeigt nicht Modell und Scan – neu beginnen";
+pub const PAIRS_UNDO: &str = "Letzten Punkt zurück";
+pub const PAIRS_CANCEL: &str = "Abbrechen";
+pub const PAIRS_APPLY: &str = "Übernehmen und neu zusammenführen";
+pub const PAIRS_APPLY_HINT: &str =
+    "Speichert die Paare in modelle/punktpaare.toml und legt mit denselben Scans ein neues \
+     Modell an";
+pub const PAIRS_NEED_THREE: &str = "Mindestens drei Paare setzen";
+pub const PAIRS_HALF: &str = "Zuerst dieselbe Stelle im Scan anklicken";
+pub const PAIRS_NO_CLOUD: &str = "Der Scan hat keine Punktwolke (color.las oder clean.las)";
+pub const PAIRS_SAVED: &str = "Punktpaare gespeichert";
+/// The tool of the view while pairs are set.
+pub const TOOL_PAIRS: &str = "Punktpaare";
+pub const TOOL_PAIRS_HINT: &str =
+    "Klick setzt abwechselnd einen Punkt im Modell und denselben im Scan";
+/// Above the list of the point pairs of a model.
+pub const PAIRS_LIST: &str = "Punktpaare";
+pub const PAIR_SWITCH_HINT: &str =
+    "Abgeschaltete Paare bleiben gespeichert und zählen ab dem nächsten Zusammenführen nicht";
+/// The label of the job that switches a pair.
+pub const PAIRS_JOB: &str = "Punktpaar speichern";
+
+/// „Scan 3 · Scan 13:35 an Modell 001“.
+pub fn pairs_subject(member: &str, model: &str) -> String {
+    format!("{member} an {model}")
+}
+
+/// What the next click of the tool „Punktpaare“ sets: „Paar 2: Stelle im Modell anklicken“.
+pub fn pair_next(nr: usize, in_model: bool) -> String {
+    if in_model {
+        format!("Paar {nr}: Stelle im Modell anklicken")
+    } else {
+        format!("Paar {nr}: dieselbe Stelle im Scan anklicken")
+    }
+}
+
+/// „3 Paare gesetzt“.
+pub fn pairs_set(n: usize) -> String {
+    match n {
+        1 => "1 Paar gesetzt".into(),
+        n => format!("{n} Paare gesetzt"),
+    }
+}
+
+/// The cloud of model and scan side by side, named in the view and the messages.
+pub fn pair_cloud_name(member: &str) -> String {
+    format!("Modell und {member}")
+}
+
+/// A point pair of a model: „Paar 1 · 1 ↔ 3 · 4 Punkte“ (the numbers of its scans).
+pub fn pair_row(nr: usize, a: usize, b: usize, points: usize) -> String {
+    format!("Paar {nr} · {a} ↔ {b} · {points} Punkte")
+}
+
+/// The name of the switch of point pair `nr` (from 1), for screen readers and tests.
+pub fn pair_switch(nr: usize) -> String {
+    format!("Punktpaar {nr} an")
+}
+
+/// „Punktpaar 2 abgeschaltet – zählt ab dem nächsten Zusammenführen“.
+pub fn pair_switched(nr: usize, enabled: bool) -> String {
+    let what = if enabled {
+        "eingeschaltet"
+    } else {
+        "abgeschaltet"
+    };
+    format!("Punktpaar {nr} {what} – zählt ab dem nächsten Zusammenführen")
+}
+
 // Step 2 „Bilder“
 /// The main button without a selected map: every map without a current surface, one after
 /// the other.

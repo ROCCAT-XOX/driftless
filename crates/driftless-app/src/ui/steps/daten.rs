@@ -191,6 +191,12 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
                     **action = Some(a);
                 }
             }
+            if state.pairs.is_some() {
+                ui.add_space(4.0);
+                if let Some(a) = merge::pairs_card(ui, state) {
+                    **action = Some(a);
+                }
+            }
             model_list(ui, state, action);
             ui.add_space(6.0);
             precision_switch(ui, state);
@@ -263,6 +269,10 @@ fn model_list(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
     }
     ui.add_space(6.0);
     ui.label(RichText::new(text::MODELS).strong());
+    if let Some(e) = &state.point_pairs_error {
+        let color = ui.visuals().error_fg_color;
+        ui.add(egui::Label::new(RichText::new(e).color(color)).wrap());
+    }
     for model in &state.models {
         tree::model_node(ui, state, model, action);
     }

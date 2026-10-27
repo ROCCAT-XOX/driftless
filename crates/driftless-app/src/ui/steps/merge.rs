@@ -6,6 +6,11 @@
 //!
 //! A scan can be merged once a map of it is finished: it has cleaned points (`clean.las`, or
 //! `color.las` made from them) and still fits its run ([`AppState::map_status`]).
+//!
+//! „Von Hand ausrichten“ ([`pairs_card`]) shows, while point pairs are set
+//! ([`crate::ui::tools::PairSession`]), what the next click sets, how many pairs there are,
+//! „Letzten Punkt zurück“, „Übernehmen und neu zusammenführen“ (from three pairs on) and
+//! „Abbrechen“.
 
 use super::main_button;
 use crate::project::{MapInfo, MergePick};
@@ -187,7 +192,7 @@ fn scan_row(
     }
     let current = merge.pick_of(state, scan);
     let id = format!("zusammenfuehren-{}", scan.id);
-    let picked = compare::choose(ui, &id, text::MERGE_MAP, current.as_ref(), &options);
+    let picked = compare::choose_wide(ui, &id, text::MERGE_MAP, current.as_ref(), &options);
     if let Some((_, map)) = picked {
         merge.chosen.insert(scan.id.clone(), map);
     }
@@ -203,4 +208,59 @@ pub(super) fn open_button(ui: &mut Ui, state: &AppState) -> bool {
     ui.button(text::MERGE_OPEN)
         .on_hover_text(text::MERGE_OPEN_HINT)
         .clicked()
+}
+
+/// „Von Hand ausrichten“ while point pairs are set, in a card. Returns
+/// [`Action::ApplyPairs`] when „Übernehmen und neu zusammenführen“ is clicked; „Letzten Punkt
+/// zurück“ and „Abbrechen“ change the session itself.
+pub fn pairs_card(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
+    let mut action = None;
+    let busy = state.job.as_ref().map(|j| text::busy(&j.label));
+    let session = state.pairs.as_mut()?;
+    let mut cancel = false;
+    crate::ui::theme::card_frame(true).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.strong(text::PAIRS_TITLE);
+        let subject = text::pairs_subject(&session.member_name, &session.model_label);
+        ui.add(egui::Label::new(subject).wrap());
+        ui.add(egui::Label::new(RichText::new(text::PAIRS_HINT).color(DARK.text_dim)).wrap());
+        ui.add_space(4.0);
+        if session.shift.is_none() {
+            ui.label(RichText::new(text::PAIRS_LOADING).color(DARK.text_dim));
+        } else {
+            ui.label(text::pairs_set(session.pairs()));
+            ui.add(egui::Label::new(RichText::new(session.prompt()).color(DARK.measure)).wrap());
+        }
+        if let Some(why) = &session.message {
+            ui.add(egui::Label::new(RichText::new(why).color(DARK.warn)).wrap());
+        }
+        let any = !session.in_model.is_empty() || !session.in_scan.is_empty();
+        if ui
+            .add_enabled(any, egui::Button::new(text::PAIRS_UNDO))
+            .clicked()
+        {
+            session.undo();
+        }
+        ui.add_space(4.0);
+        let locked = busy.or(session.blocked().map(str::to_string));
+        if main_button(ui, text::PAIRS_APPLY, locked, text::PAIRS_APPLY_HINT) {
+            match session.entry() {
+                Ok(entry) => {
+                    action = Some(Action::ApplyPairs {
+                        model: session.model.clone(),
+                        entry,
+                    })
+                }
+                Err(why) => session.message = Some(why),
+            }
+        }
+        ui.vertical_centered(|ui| {
+            let label = RichText::new(text::PAIRS_CANCEL).color(DARK.text_dim);
+            cancel = ui.add(egui::Button::new(label).frame(false)).clicked();
+        });
+    });
+    if cancel {
+        crate::ui::tools::end_pairs(state);
+    }
+    action
 }

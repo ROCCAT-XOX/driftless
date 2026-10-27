@@ -552,3 +552,61 @@ fn pairs_round_trip_and_reject_two_points() {
     let e = PointPairs::load(&path).unwrap_err();
     assert!(e.to_string().contains("Eintrag 1"), "{e}");
 }
+
+/// What the app writes into `<projekt>/modelle/punktpaare.toml`: a map folder of the project
+/// relative to the folder of the file (`../scans/…`), one outside it absolute; reading the
+/// file as `driftless merge --punktpaare` does (relative to the file) gives the same folders.
+#[test]
+fn stored_text_round_trips_with_file_resolution() {
+    use driftless_steps::pairs::stored_text;
+    let dir = tmp("punktpaare-pfade");
+    let project = fs::canonicalize(&dir).unwrap().join("projekt");
+    let models = project.join("modelle");
+    let inside = project
+        .join("scans")
+        .join("raum-1")
+        .join("slam-001")
+        .join("karte-001");
+    let below = models.join("eigene-karte");
+    let outside = fs::canonicalize(&dir)
+        .unwrap()
+        .join("woanders")
+        .join("karte");
+    for d in [&models, &inside, &below, &outside] {
+        fs::create_dir_all(d).unwrap();
+    }
+    assert_eq!(
+        stored_text(&models, &inside).unwrap(),
+        "../scans/raum-1/slam-001/karte-001"
+    );
+    assert_eq!(stored_text(&models, &below).unwrap(), "eigene-karte");
+    let abs = stored_text(&models, &outside).unwrap();
+    assert_eq!(Path::new(&abs), outside);
+
+    let (in_c, in_a) = pairs_c_in_a();
+    let mut pairs = PointPairs::default();
+    for (a, b) in [(&inside, &outside), (&below, &inside)] {
+        let e = pair_entry(
+            Path::new(&stored_text(&models, a).unwrap()),
+            Path::new(&stored_text(&models, b).unwrap()),
+            in_a.clone(),
+            in_c.clone(),
+        );
+        pairs.add(e).unwrap();
+    }
+    let file = models.join(POINT_PAIRS_FILE);
+    pairs.save(&file).unwrap();
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(
+        text.contains("a = \"../scans/raum-1/slam-001/karte-001\""),
+        "{text}"
+    );
+    let back = PointPairs::load(&file)
+        .unwrap()
+        .resolved(file.parent().unwrap());
+    let canon = |p: &Path| fs::canonicalize(p).unwrap();
+    assert_eq!(canon(&back[0].a), inside);
+    assert_eq!(canon(&back[0].b), outside);
+    assert_eq!(canon(&back[1].a), below);
+    assert_eq!(canon(&back[1].b), inside);
+}

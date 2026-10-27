@@ -39,7 +39,9 @@
 //! surface is only computed if no `oberflaeche-NNN` of the map fits the request, and then into a
 //! new one ([`run_surface_job`]). Every merge gets a new `modell-NNN` ([`run_merge_job`]); a
 //! folder without `modell.json` is no model (the report is written last). `project.toml`
-//! does not list the models: [`Project::models`] reads the folder.
+//! does not list the models: [`Project::models`] reads the folder. Point pairs marked by hand
+//! are kept in `modelle/punktpaare.toml` ([`driftless_steps::pairs`], paths relative to that
+//! folder) and count in every merge of the project.
 
 use crate::surface::SURFACE_GLB;
 use crate::ui::text;
@@ -57,7 +59,9 @@ use driftless_steps::map::{
     MapSettings, MapStep, MapSwitches, CLEAN_BIN, DENSE_BIN, REPORT,
 };
 use driftless_steps::merge::{read_model, run_merge, MergeMember, MergeRequest, ModelReport};
-use driftless_steps::pairs::stored_path as from_stored;
+use driftless_steps::pairs::{
+    stored_path as from_stored, stored_text, PointPairEntry, PointPairs, POINT_PAIRS_FILE,
+};
 use driftless_steps::slam::{
     cache_fits, run_slam, SlamOutcome, SlamRequest, SlamSettings, CACHE_FILE, CORRECTIONS_FILE,
 };
@@ -1324,17 +1328,9 @@ pub fn run_surface_job(
     })
 }
 
-/// Merges the scans `picks` (the first is the reference) into a new `modelle/modell-NNN`, as
-/// `driftless merge` does with its defaults; `include_unsure` takes unsure scans in as well.
-/// Each run is taken with the settings of its `lauf.toml`. Fewer than two scans, a scan, run
-/// or map not of the project are refused before a folder is made; the new folder is removed
-/// again if the merge is cancelled or fails. Returns the model folder.
-pub fn run_merge_job(
-    project: &Project,
-    picks: &[MergePick],
-    include_unsure: bool,
-    progress: &Progress,
-) -> Result<PathBuf, StepError> {
+/// The members of a merge of `picks`: fewer than two, or a scan, run or map not of the
+/// project, are refused.
+fn merge_members(project: &Project, picks: &[MergePick]) -> Result<Vec<MergeMember>, StepError> {
     if picks.len() < 2 {
         return Err(text::MERGE_NEEDS_TWO.into());
     }
@@ -1358,7 +1354,26 @@ pub fn run_merge_job(
             slam: run.settings,
         });
     }
-    let dir = create_numbered(&project.dir.join(MODELS_DIR), MODEL_PREFIX)?;
+    Ok(members)
+}
+
+/// Merges the scans `picks` (the first is the reference) into a new `modelle/modell-NNN`, as
+/// `driftless merge` does with its defaults; `include_unsure` takes unsure scans in as well.
+/// Each run is taken with the settings of its `lauf.toml`, and the switched-on point pairs of
+/// `modelle/punktpaare.toml` that name two of the maps replace their automatic alignment.
+/// Fewer than two scans, a scan, run or map not of the project, or a pair file that cannot be
+/// read are refused before a folder is made; the new folder is removed again if the merge is
+/// cancelled or fails. Returns the model folder.
+pub fn run_merge_job(
+    project: &Project,
+    picks: &[MergePick],
+    include_unsure: bool,
+    progress: &Progress,
+) -> Result<PathBuf, StepError> {
+    let members = merge_members(project, picks)?;
+    let models = project.dir.join(MODELS_DIR);
+    let pairs = PointPairs::load(&point_pairs_file(project))?.resolved(&models);
+    let dir = create_numbered(&models, MODEL_PREFIX)?;
     let req = MergeRequest {
         members,
         out_dir: dir.path().to_path_buf(),
@@ -1366,10 +1381,106 @@ pub fn run_merge_job(
         voxel: MODEL_VOXEL,
         smooth: true,
         include_unsure,
-        pairs: Vec::new(),
+        pairs,
     };
     run_merge(&req, progress)?;
     Ok(dir.keep())
+}
+
+/// `modelle/punktpaare.toml` of the project.
+pub fn point_pairs_file(project: &Project) -> PathBuf {
+    project.dir.join(MODELS_DIR).join(POINT_PAIRS_FILE)
+}
+
+/// The point pairs of the project in file order, `a` and `b` as resolved folders (where they
+/// exist), so that they compare equal to [`driftless_steps::merge::ModelMember::map_dir`].
+/// No file means none. Reads the file: call it when the tree is read, not every frame.
+pub fn point_pairs(project: &Project) -> Result<Vec<PointPairEntry>, String> {
+    let models = project.dir.join(MODELS_DIR);
+    let pairs = PointPairs::load(&point_pairs_file(project)).map_err(|e| e.to_string())?;
+    let resolve = |p: &Path| canonical(p).unwrap_or_else(|_| p.to_path_buf());
+    Ok(pairs
+        .resolved(&models)
+        .into_iter()
+        .map(|e| PointPairEntry {
+            a: resolve(&e.a),
+            b: resolve(&e.b),
+            ..e
+        })
+        .collect())
+}
+
+/// Switches entry `index` (0-based) of `modelle/punktpaare.toml` on or off and saves the
+/// file; the entry itself stays. Counts from the next merge on.
+pub fn set_point_pair_enabled(
+    project: &Project,
+    index: usize,
+    enabled: bool,
+) -> Result<(), StepError> {
+    let file = point_pairs_file(project);
+    let mut pairs = PointPairs::load(&file)?;
+    pairs.set_enabled(index, enabled)?;
+    pairs.save(&file)
+}
+
+/// The scans of `report` as picks of the project, in its order (the first is the reference),
+/// each with the run and map it was merged from. Fails for a scan no longer in the project.
+pub fn model_picks(project: &Project, report: &ModelReport) -> Result<Vec<MergePick>, StepError> {
+    report
+        .members
+        .iter()
+        .map(|m| {
+            let scan = project
+                .scans
+                .iter()
+                .find(|s| same_dir(&s.path, &m.scan))
+                .ok_or_else(|| text::scan_not_in_project(&m.scan))?;
+            Ok(MergePick {
+                scan_id: scan.id.clone(),
+                run: m.slam_dir.clone(),
+                map: m.map_dir.clone(),
+            })
+        })
+        .collect()
+}
+
+/// „Übernehmen und neu zusammenführen“: adds `entry` (map folders absolute, points in the
+/// frame of each scan) to `modelle/punktpaare.toml`, its folders relative to that file and
+/// with the time it was added, then merges the scans of `model` again as they were merged
+/// ([`model_picks`], unsure ones taken in if the model took one in) into a new `modell-NNN`
+/// ([`run_merge_job`]). An entry that cannot be used ([`PointPairs::add`]) adds nothing and
+/// makes no model; the entry stays saved if the merge then fails or is cancelled (it can be
+/// switched off).
+pub fn run_pairs_merge_job(
+    project: &Project,
+    model: &ModelInfo,
+    entry: PointPairEntry,
+    progress: &Progress,
+) -> Result<PathBuf, StepError> {
+    let picks = model_picks(project, &model.report)?;
+    merge_members(project, &picks)?;
+    let include_unsure = model
+        .report
+        .members
+        .iter()
+        .any(|m| m.included && m.verdict == "unsicher");
+    let file = point_pairs_file(project);
+    let models = project.dir.join(MODELS_DIR);
+    let mut pairs = PointPairs::load(&file)?;
+    pairs.add(PointPairEntry {
+        a: PathBuf::from(stored_text(&models, &entry.a)?),
+        b: PathBuf::from(stored_text(&models, &entry.b)?),
+        added: utc_now(),
+        ..entry
+    })?;
+    if progress.is_cancelled() {
+        return Err(StepError::Cancelled);
+    }
+    fs::create_dir_all(&models)
+        .map_err(|e| ProjectError(format!("{} nicht anlegbar: {e}", models.display())))?;
+    pairs.save(&file)?;
+    progress.info(text::PAIRS_SAVED.to_string());
+    run_merge_job(project, &picks, include_unsure, progress)
 }
 
 /// The request of a surface of `model` with `settings` into `out_dir`, computed on `gpu`.

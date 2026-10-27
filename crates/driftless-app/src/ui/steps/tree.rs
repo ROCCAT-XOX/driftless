@@ -3,8 +3,10 @@
 //! per run its history („Verlauf“: each state with number, kind, time and start↔end gap). Below
 //! the scans the models („Modell 001“): per scan of a model its number, name and how surely it
 //! was placed (✓ sicher, ⚠ unsicher, ✗ gescheitert, the reason on hover) with overlap and
-//! residual, then `modell.las` and the surfaces of the model. Names too long for the field
-//! end in „…“; the full name and the folder show on hover.
+//! residual, under an unsure or failed one „Von Hand ausrichten“ ([`Action::StartPairs`]);
+//! then the point pairs of the model („Punktpaare“, each with its switch, as the loops of a
+//! run), `modell.las` and the surfaces of the model. Names too long for the field end in „…“;
+//! the full name and the folder show on hover.
 
 use super::badge;
 use crate::project::{MapInfo, ModelInfo, RunInfo, SurfaceInfo};
@@ -123,7 +125,21 @@ pub(super) fn model_node(
     let header = branch(ui, Id::new(("model", &model.dir)), header, |ui| {
         for (k, member) in model.report.members.iter().enumerate() {
             member_rows(ui, state, k, member);
+            if member.placed_against.is_some() && member.verdict != "sicher" {
+                let r = ui.horizontal(|ui| {
+                    ui.add_space(ui.spacing().indent + DOT + ui.spacing().item_spacing.x);
+                    ui.small_button(text::PAIRS_START)
+                        .on_hover_text(text::PAIRS_START_HINT)
+                });
+                if r.inner.clicked() {
+                    *action = Some(Action::StartPairs {
+                        model: model.dir.clone(),
+                        member: k,
+                    });
+                }
+            }
         }
+        pair_list(ui, state, model, action);
         cloud_leaf(ui, state, &model.dir.join(MODEL_LAS), action);
         for surface in &model.surfaces {
             surface_leaf(ui, state, surface, action);
@@ -195,6 +211,56 @@ fn member_rows(ui: &mut Ui, state: &AppState, k: usize, m: &ModelMember) {
     }
     let id = ui.id().with(("modell_scan", k, &m.scan));
     ui.interact(rect, id, Sense::hover()).on_hover_text(hover);
+}
+
+/// „Punktpaare“: the point pairs that name two scans of `model`, each with its switch
+/// ([`Action::SetPairEnabled`], locked while a switch is written), its scans and how many
+/// points it has; its note and when it was added on hover. Nothing without pairs.
+fn pair_list(ui: &mut Ui, state: &AppState, model: &ModelInfo, action: &mut Option<Action>) {
+    let pairs: Vec<_> = state.pairs_of(model).collect();
+    if pairs.is_empty() {
+        return;
+    }
+    egui::CollapsingHeader::new(text::PAIRS_LIST)
+        .id_salt(("punktpaare", &model.dir))
+        .default_open(true)
+        .show(ui, |ui| {
+            for (index, e, [a, b]) in pairs {
+                let nr = index + 1;
+                ui.horizontal(|ui| {
+                    let mut on = e.enabled;
+                    let can = !state.pairs_writing;
+                    let switch = ui.add_enabled(can, egui::Checkbox::without_text(&mut on));
+                    switch.widget_info(|| {
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::Checkbox,
+                            can,
+                            on,
+                            text::pair_switch(nr),
+                        )
+                    });
+                    if switch.changed() {
+                        *action = Some(Action::SetPairEnabled { index, enabled: on });
+                    }
+                    switch.on_hover_text(text::PAIR_SWITCH_HINT);
+                    let row = text::pair_row(nr, a + 1, b + 1, e.points_a.len());
+                    let color = if e.enabled { DARK.text } else { DARK.text_dim };
+                    let hover = [e.note.as_str(), e.added.as_str()]
+                        .into_iter()
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let label = ui.add(
+                        egui::Label::new(RichText::new(row).color(color))
+                            .truncate()
+                            .selectable(false),
+                    );
+                    if !hover.is_empty() {
+                        label.on_hover_text(hover);
+                    }
+                });
+            }
+        });
 }
 
 fn cloud_leaf(ui: &mut Ui, state: &AppState, cloud: &Path, action: &mut Option<Action>) {

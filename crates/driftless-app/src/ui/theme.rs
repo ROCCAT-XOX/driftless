@@ -77,6 +77,7 @@ pub mod icon {
     pub const PICK: &str = p::CROSSHAIR;
     pub const MEASURE: &str = p::RULER;
     pub const CUT: &str = p::SCISSORS;
+    pub const PAIRS: &str = p::LINK;
     pub const FIT: &str = p::CORNERS_OUT;
     pub const CHECK: &str = p::CHECK_CIRCLE;
     pub const RUNNING: &str = p::CIRCLE_NOTCH;

@@ -2,8 +2,9 @@
 //! folders added as runs, missing scan folders, models merged from several scans.
 
 use driftless_app::project::{
-    map_dir_for, model_status, model_surface_status, run_map_job, run_merge_job,
-    run_model_surface_job, run_slam_job, MergePick, Project, ScanState, SlamJob, SurfaceSettings,
+    map_dir_for, model_picks, model_status, model_surface_status, point_pairs, run_map_job,
+    run_merge_job, run_model_surface_job, run_pairs_merge_job, run_slam_job,
+    set_point_pair_enabled, MergePick, Project, ScanState, SlamJob, SurfaceSettings,
 };
 use driftless_gpu::GpuPref;
 use driftless_io::progress::{Progress, ProgressSnapshot};
@@ -14,7 +15,8 @@ use driftless_steps::history::HistoryKind;
 use driftless_steps::map::{
     map_input_for, run_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches,
 };
-use driftless_steps::merge::{MODEL_LAS, MODEL_REPORT};
+use driftless_steps::merge::{member_transform, read_model, MODEL_LAS, MODEL_REPORT};
+use driftless_steps::pairs::{PointPairEntry, PointPairs, POINT_PAIRS_FILE};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::StepError;
 use std::collections::BTreeMap;
@@ -988,4 +990,72 @@ fn model_surface_job_reuses_a_fitting_surface() {
     let mut broken = model.surfaces[0].clone();
     broken.dir = model.dir.join("oberflaeche-009");
     assert!(model_surface_status(&model, &broken).stale);
+}
+
+/// „Übernehmen und neu zusammenführen“: the pairs are added to `modelle/punktpaare.toml` and
+/// the same scans are merged again into the next model, the scan placed by the pairs. A
+/// switched-off entry no longer counts; an entry that cannot be used adds nothing.
+#[test]
+fn pairs_rerun_creates_next_model() {
+    use driftless_traj::nalgebra::Point3;
+    let dir = tmp("app-merge-pairs");
+    let p = merge_project(&dir);
+    let first = run_merge_job(&p, &picks(&p), false, &Progress::new()).unwrap();
+    let model = p.models().remove(0);
+    let members = &model.report.members;
+    assert_eq!(model_picks(&p, &model.report).unwrap(), picks(&p));
+    let before = files(&first);
+    // three places of the room in the model frame (= frame of A), and where B sees them
+    let in_model = [[0.5, 0.5, 0.3], [2.5, 0.8, 1.2], [1.0, 2.5, 2.0]];
+    let t_b = member_transform(&members[1]);
+    let in_b = in_model.map(|q| {
+        let r = t_b.inverse() * Point3::from(q);
+        [r.x, r.y, r.z]
+    });
+    let entry = PointPairEntry {
+        a: members[0].map_dir.clone(),
+        b: members[1].map_dir.clone(),
+        points_a: in_model.to_vec(),
+        points_b: in_b.to_vec(),
+        enabled: true,
+        note: "Ecken".into(),
+        added: String::new(),
+    };
+    let second = run_pairs_merge_job(&p, &model, entry.clone(), &Progress::new()).unwrap();
+    assert_eq!(second, models_dir(&p).join("modell-002"));
+    assert_eq!(files(&first), before, "modell-001 untouched");
+    let file = models_dir(&p).join(POINT_PAIRS_FILE);
+    let saved = PointPairs::load(&file).unwrap();
+    assert_eq!(saved.entries.len(), 1);
+    // the scans lie outside the project: absolute
+    assert_eq!(saved.entries[0].a, members[0].map_dir);
+    assert!(!saved.entries[0].added.is_empty());
+    assert_eq!(point_pairs(&p).unwrap()[0].b, members[1].map_dir);
+    let report = read_model(&second).unwrap();
+    let dirs = |r: &driftless_steps::merge::ModelReport| -> Vec<PathBuf> {
+        r.members.iter().map(|m| m.map_dir.clone()).collect()
+    };
+    assert_eq!(
+        dirs(&report),
+        dirs(&model.report),
+        "same scans, same reference"
+    );
+    assert_eq!(report.members[1].method, "punktpaare");
+    assert_eq!(report.members[1].verdict, "sicher");
+
+    // switched off: the next merge aligns B by itself again
+    set_point_pair_enabled(&p, 0, false).unwrap();
+    assert!(!PointPairs::load(&file).unwrap().entries[0].enabled);
+    let third = run_merge_job(&p, &picks(&p), false, &Progress::new()).unwrap();
+    assert_ne!(read_model(&third).unwrap().members[1].method, "punktpaare");
+    assert!(set_point_pair_enabled(&p, 5, true).is_err());
+
+    // points on a line fix no turn: refused, nothing saved, no new model
+    let mut line = entry;
+    line.points_a = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
+    line.points_b = line.points_a.clone();
+    let err = run_pairs_merge_job(&p, &model, line, &Progress::new()).unwrap_err();
+    assert!(err.to_string().contains("Linie"), "{err}");
+    assert_eq!(PointPairs::load(&file).unwrap().entries.len(), 1);
+    assert_eq!(p.models().len(), 3);
 }

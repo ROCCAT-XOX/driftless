@@ -25,14 +25,15 @@ pub use app::{parse_args, Args, DriftlessApp, UI_KEY};
 use crate::camera::CameraMode;
 use crate::jobs::JobStatus;
 use crate::project::{
-    map_status, model_status, model_surface_status, state_gap, surface_status, MapStatus,
-    MergePick, ModelInfo, Project, RunInfo, ScanState, SurfaceSettings,
+    map_status, model_status, model_surface_status, point_pairs, state_gap, surface_status,
+    MapStatus, MergePick, ModelInfo, Project, RunInfo, ScanState, SurfaceSettings,
 };
 use crate::render::{ColorMode, PointSize, ShowMode};
 use driftless_gpu::GpuPref;
 use driftless_io::progress::LogLine;
 use driftless_steps::inspect;
 use driftless_steps::map::MapSettings;
+use driftless_steps::pairs::PointPairEntry;
 use driftless_steps::slam::SlamSettings;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -126,6 +127,23 @@ pub enum Action {
     /// A surface of the model (folder) from the images of all its scans.
     RunModelSurface {
         model: PathBuf,
+    },
+    /// „Von Hand ausrichten“ of scan `member` (from 0) of the model (folder): shows the
+    /// model and that scan side by side and opens the tool „Punktpaare“.
+    StartPairs {
+        model: PathBuf,
+        member: usize,
+    },
+    /// Saves `entry` in `modelle/punktpaare.toml` and merges the scans of the model (folder)
+    /// again into a new model ([`crate::project::run_pairs_merge_job`]).
+    ApplyPairs {
+        model: PathBuf,
+        entry: PointPairEntry,
+    },
+    /// Switches entry `index` (from 0) of `modelle/punktpaare.toml` on or off.
+    SetPairEnabled {
+        index: usize,
+        enabled: bool,
     },
     Cancel,
     /// Clears the messages of the status bar.
@@ -317,6 +335,14 @@ pub struct AppState {
     pub models: Vec<ModelInfo>,
     /// The field „Scans zusammenführen“.
     pub merge: steps::merge::MergeState,
+    /// „Von Hand ausrichten“, while it is open.
+    pub pairs: Option<tools::PairSession>,
+    /// The point pairs of the project ([`point_pairs`]), as last read from disk …
+    pub point_pairs: Vec<PointPairEntry>,
+    /// … or why `modelle/punktpaare.toml` cannot be read.
+    pub point_pairs_error: Option<String>,
+    /// A switch of a point pair is being written.
+    pub pairs_writing: bool,
     pub selection: Selection,
     pub map_settings: MapSettings,
     pub slam_settings: SlamSettings,
@@ -387,7 +413,33 @@ impl AppState {
         self.selection = Selection::None;
         self.inspect = None;
         self.merge = steps::merge::MergeState::default();
+        tools::end_pairs(self);
         self.refresh();
+    }
+
+    /// Reads `modelle/punktpaare.toml` again ([`AppState::point_pairs`]).
+    pub fn refresh_pairs(&mut self) {
+        let read = self.project.as_ref().map_or(Ok(Vec::new()), point_pairs);
+        (self.point_pairs, self.point_pairs_error) = match read {
+            Ok(pairs) => (pairs, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+    }
+
+    /// The point pairs (index from 0, entry) that name two scans of `model`, with their
+    /// numbers in it (from 0).
+    pub fn pairs_of<'a>(
+        &'a self,
+        model: &'a ModelInfo,
+    ) -> impl Iterator<Item = (usize, &'a PointPairEntry, [usize; 2])> + 'a {
+        let nr = |dir: &std::path::Path| model.report.members.iter().position(|m| m.map_dir == dir);
+        self.point_pairs
+            .iter()
+            .enumerate()
+            .filter_map(move |(k, e)| {
+                let (a, b) = (nr(&e.a)?, nr(&e.b)?);
+                (a != b).then_some((k, e, [a, b]))
+            })
     }
 
     /// Reads the scans' state and runs again (after opening, adding, and after each step).
@@ -405,6 +457,15 @@ impl AppState {
                 .collect()
         });
         self.models = self.project.as_ref().map_or_else(Vec::new, Project::models);
+        self.refresh_pairs();
+        // „Von Hand ausrichten“ of a model that is gone ends
+        let gone = self
+            .pairs
+            .as_ref()
+            .is_some_and(|s| self.model(&s.model).is_none());
+        if gone {
+            tools::end_pairs(self);
+        }
         // Statuses of maps, models and surfaces still in the tree stay shown until the
         // background job replaces them.
         let maps = self

@@ -4,8 +4,8 @@
 //!
 //! ```toml
 //! [[paar]]
-//! a = "scans/raum-1/driftless"
-//! b = "scans/raum-2/driftless"
+//! a = "../scans/raum-1/slam-001/karte-001"
+//! b = "../scans/raum-2/slam-001/karte-001"
 //! points_a = [[0.1, 2.0, 0.5], [3.2, 2.1, 0.4], [1.5, 0.2, 2.3]]
 //! points_b = [[1.9, 0.3, 0.5], [2.0, 3.4, 0.4], [0.1, 1.7, 2.3]]
 //! enabled = true
@@ -13,10 +13,11 @@
 //! added = "2026-10-27T14:03:12Z"
 //! ```
 //!
-//! `a` and `b` are map folders, relative to the project with `/` as in `project.toml`
-//! (absolute if outside it); [`PointPairs::resolved`] makes them paths of the file system
-//! for [`crate::merge::MergeRequest::pairs`]. A switched-on entry replaces the automatic
-//! alignment of its two scans in the merge.
+//! `a` and `b` are map folders, relative to the folder of the file with `/` (so
+//! `../scans/<id>/slam-001/karte-001` in `<projekt>/modelle/`, written by [`stored_text`]),
+//! absolute if outside the project; [`PointPairs::resolved`] with the folder of the file
+//! makes them paths of the file system for [`crate::merge::MergeRequest::pairs`]. A
+//! switched-on entry replaces the automatic alignment of its two scans in the merge.
 
 use crate::StepError;
 use driftless_slam::align::pose_from_pairs;
@@ -34,7 +35,7 @@ pub const MIN_POINT_PAIRS: usize = 3;
 
 /// Comment at the top of the file.
 const HEADER: &str = "# Driftless-Punktpaare: gleiche Stellen in zwei Scans, Punkte in Metern im \
-Rahmen des jeweiligen Scans.\n# Pfade relativ zum Projekt; Einträge werden nur angehängt oder \
+Rahmen des jeweiligen Scans.\n# Pfade relativ zu diesem Ordner; Einträge werden nur angehängt oder \
 abgeschaltet.\n\n";
 
 /// Points marked by hand on two scans that show the same places.
@@ -187,7 +188,7 @@ fn windows_absolute(text: &str) -> bool {
 }
 
 /// A path from a project file (`project.toml`, `punktpaare.toml`): absolute as written,
-/// relative (with `/` or `\`) to `base`.
+/// relative (with `/` or `\`, `..` for the folder above) to `base`.
 pub fn stored_path(base: &Path, text: &str) -> PathBuf {
     let p = Path::new(text);
     if p.is_absolute() || windows_absolute(text) {
@@ -201,4 +202,28 @@ pub fn stored_path(base: &Path, text: &str) -> PathBuf {
         out.push(part);
     }
     out
+}
+
+/// `path` (absolute, resolved) as [`stored_path`] reads it back for a file in `dir`: below
+/// `dir` relative with `/`, below the folder above `dir` (the project, for
+/// `<projekt>/modelle/punktpaare.toml`) as `../…`, anywhere else absolute. Fails for a path
+/// that is no valid text.
+pub fn stored_text(dir: &Path, path: &Path) -> Result<String, StepError> {
+    let joined = |rel: &Path, up: bool| {
+        let parts = rel
+            .components()
+            .map(|c| c.as_os_str().to_str())
+            .collect::<Option<Vec<_>>>()?;
+        let mut text = if up { "../".to_string() } else { String::new() };
+        text += &parts.join("/");
+        Some(text)
+    };
+    let text = match path.strip_prefix(dir) {
+        Ok(rel) if !rel.as_os_str().is_empty() => joined(rel, false),
+        _ => match dir.parent().map(|up| path.strip_prefix(up)) {
+            Some(Ok(rel)) if !rel.as_os_str().is_empty() => joined(rel, true),
+            _ => path.to_str().map(str::to_string),
+        },
+    };
+    text.ok_or_else(|| format!("Pfad {} ist kein gültiger Text", path.display()).into())
 }

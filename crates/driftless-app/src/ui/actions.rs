@@ -6,14 +6,14 @@
 use super::{text, Action, AppState};
 use crate::jobs::{JobOutput, JobRunner};
 use crate::project::{
-    restore_job, run_map_job, run_merge_job, run_model_surface_job, run_slam_job, run_surface_job,
-    ScanState, SlamJob,
+    restore_job, run_map_job, run_merge_job, run_model_surface_job, run_pairs_merge_job,
+    run_slam_job, run_surface_job, ScanState, SlamJob,
 };
 use driftless_steps::inspect;
 use driftless_steps::map::MapStep;
 
 /// Starts the job of a step action (`Inspect`, `RunSlam`, `Reuse`, `RestoreHistory`,
-/// `RunMap`, `RunSurface`, `RunMerge`, `RunModelSurface`) and records it in
+/// `RunMap`, `RunSurface`, `RunMerge`, `ApplyPairs`, `RunModelSurface`) and records it in
 /// [`AppState::running`]. Refused with a German message while a job runs, for a scan that
 /// cannot be read, a run without `submaps.bin` (reuse, restore), while a change of the
 /// corrections is being written (reuse, restore), for invalid map or surface settings, a map
@@ -136,6 +136,22 @@ pub fn start_step(
             let (picks, include_unsure) = (picks.clone(), *include_unsure);
             runner.start(text::MERGE_START, move |p| {
                 let dir = run_merge_job(&project, &picks, include_unsure, p)?;
+                Ok(JobOutput::Model(dir))
+            })
+        }
+        Action::ApplyPairs { model, entry } => {
+            let model = state
+                .model(model)
+                .cloned()
+                .ok_or_else(|| text::unknown_model(model))?;
+            for m in &model.report.members {
+                if let Some(scan) = state.scan_at(&m.scan) {
+                    ready_scan(state, &scan.id)?;
+                }
+            }
+            let entry = entry.clone();
+            runner.start(text::MERGE_START, move |p| {
+                let dir = run_pairs_merge_job(&project, &model, entry, p)?;
                 Ok(JobOutput::Model(dir))
             })
         }

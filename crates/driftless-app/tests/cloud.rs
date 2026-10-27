@@ -1,6 +1,9 @@
 //! Loading a LAS or PLY cloud into a [`PointSet`].
 
-use driftless_app::cloud::{load_cloud, load_las, load_ply, PointSet, MID_GRAY};
+use driftless_app::cloud::{
+    combine_pair_points, load_cloud, load_las, load_pair_cloud, load_ply, PointSet, MID_GRAY,
+    PAIR_GAP,
+};
 use driftless_io::progress::Progress;
 use driftless_io::testscan::tmp;
 use driftless_map::{write_las, write_las_sources, write_ply, write_ply_sources, Cloud};
@@ -751,4 +754,72 @@ fn ply_load_reports_phase_and_cancels() {
     });
     assert_eq!(load_ply(&path, &progress).err(), Some(StepError::Cancelled));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// „Von Hand ausrichten“: the model without the points of the scan to place, the scan beside
+/// it along x; its points carry its number, and the shift turns a shown point back into the
+/// frame of the scan.
+#[test]
+fn pair_cloud_side_by_side() {
+    // model: scans 0 and 2 over x 0…4 m, a point of scan 1 (misplaced) at x = 2
+    let mut model = PointSet::from_xyz(
+        [100.0, 50.0, 0.0],
+        vec![
+            [0.0, 0.0, 0.0],
+            [4.0, 1.0, 1.0],
+            [2.0, 0.5, 0.5],
+            [1.0, 2.0, 2.0],
+        ],
+    );
+    model.rgb = Some(vec![[10, 20, 30]; 4]);
+    model.source = vec![0, 2, 1, 0];
+    // the scan in its own frame: x from 99 m on
+    let scan = PointSet::from_xyz([99.0, 50.0, 0.0], vec![[0.0, 0.0, 0.0], [3.0, 1.0, 0.0]]);
+    let (set, shift) = combine_pair_points(model.clone(), 0, scan.clone(), 1);
+    assert_eq!(set.len(), 5);
+    assert_eq!(set.origin, [100.0, 50.0, 0.0]);
+    assert_eq!(set.source, vec![0, 2, 0, 1, 1]);
+    // the scan starts 1 m beyond the model's end (104 m)
+    assert!(
+        (shift[0] - (104.0 + PAIR_GAP - 99.0)).abs() < 1e-9,
+        "{shift:?}"
+    );
+    assert_eq!(&shift[1..], &[0.0, 0.0]);
+    let shown = |i: usize| [0, 1, 2].map(|k| set.origin[k] + f64::from(set.xyz[i][k]));
+    let back = |i: usize| [0, 1, 2].map(|k| shown(i)[k] - shift[k]);
+    assert_eq!(shown(3)[0], 104.0 + PAIR_GAP);
+    assert_eq!(back(4), [102.0, 51.0, 0.0]);
+    // the scan has no colours: grays of its intensity
+    let rgb = set.rgb.as_ref().unwrap();
+    assert_eq!(rgb.len(), 5);
+    assert_eq!(rgb[4], [MID_GRAY; 3]);
+    assert!(set.quality.iter().all(|&q| q == 255) && !set.quality_known);
+    assert_eq!(set.flags.len(), 5);
+    // a model of one scan has no sources: all its points are `lone`
+    model.source = Vec::new();
+    let (set, _) = combine_pair_points(model, 0, scan, 1);
+    assert_eq!(set.source, vec![0, 0, 0, 0, 1, 1]);
+}
+
+/// The pair cloud from files: `modell.las` with its sources and the scan's cloud.
+#[test]
+fn pair_cloud_loads_from_files() {
+    let dir = tmp("app-pair-cloud");
+    let model = dir.join("modell.las");
+    let mut cloud = small_cloud(true);
+    write_las_sources(&model, &cloud, &[0, 1, 1, 0]).unwrap();
+    cloud.rgb = None;
+    cloud.colored = None;
+    let scan = dir.join("clean.las");
+    write_las(&scan, &cloud).unwrap();
+    let done = load_pair_cloud(dir.join("paar"), &model, 0, &scan, 1, &Progress::new()).unwrap();
+    let points = &done.cloud.points;
+    assert_eq!(points.len(), 2 + 4);
+    assert_eq!(points.source, vec![0, 0, 1, 1, 1, 1]);
+    assert!(done.shift[0] > 0.0);
+    assert_eq!(done.cloud.tree.vertices.len(), 6);
+    let progress = Progress::new();
+    progress.cancel();
+    let err = load_pair_cloud(dir.join("paar"), &model, 0, &scan, 1, &progress).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
 }

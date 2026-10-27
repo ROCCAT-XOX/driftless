@@ -3,16 +3,16 @@
 
 use super::compare::{compare_maps, compare_refs, default_refs, TrajRef};
 use super::correct::{Corrected, RunLoaded};
-use super::tools::{self, ScreenLayout};
+use super::tools::{self, PairSession, ScreenLayout, Tool};
 use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
     actions, rail, settings, status, steps, text, theme, Action, AppState, CloudSummary,
     InspectResult, Queued, Selection, Step, SurfaceSummary, UiMessage, ViewSettings, ViewStats,
 };
-use crate::cloud::{load_cloud, LoadedCloud};
+use crate::cloud::{load_cloud, load_pair_cloud, LoadedCloud};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
 use crate::overlay::RunOverlay;
-use crate::project::{canonical, Project};
+use crate::project::{canonical, set_point_pair_enabled, Project};
 use crate::render::ShowMode;
 use crate::surface::{load_glb, surface_glb};
 use crate::synthetic::synthetic_cloud;
@@ -180,6 +180,16 @@ enum CloudSource {
         run: Option<PathBuf>,
     },
     Synthetic(usize),
+    /// A model with its scan `member` beside it, for point pairs
+    /// ([`crate::cloud::load_pair_cloud`]); `name` names the cloud
+    /// ([`PairSession::cloud`]), `lone` is the scan of a model with points of only one.
+    Pairs {
+        name: PathBuf,
+        model_las: PathBuf,
+        lone: u16,
+        map_dir: PathBuf,
+        member: u16,
+    },
 }
 
 impl CloudSource {
@@ -187,8 +197,17 @@ impl CloudSource {
         match self {
             CloudSource::File { path, .. } => path.clone(),
             CloudSource::Synthetic(n) => PathBuf::from(text::synthetic_name(*n)),
+            CloudSource::Pairs { name, .. } => name.clone(),
         }
     }
+}
+
+/// The cloud of the map folder `dir` to set point pairs on: `color.las`, else `clean.las`.
+fn pair_scan_cloud(dir: &Path) -> Option<PathBuf> {
+    ["color.las", "clean.las"]
+        .into_iter()
+        .map(|f| dir.join(f))
+        .find(|p| p.is_file())
 }
 
 /// Quick work of the helper runner, one at a time.
@@ -206,6 +225,8 @@ enum HelperTask {
     Compare(TrajRef, TrajRef),
     /// Two `map.json` side by side.
     CompareMaps(PathBuf, PathBuf),
+    /// [`Action::SetPairEnabled`]: entry (from 0), on or off.
+    SwitchPair(usize, bool),
 }
 
 /// What a „compute all“ button puts into the queue.
@@ -611,7 +632,7 @@ impl DriftlessApp {
         }
         self.next_load = None;
         let label = match &source {
-            CloudSource::File { .. } => text::LOAD_CLOUD,
+            CloudSource::File { .. } | CloudSource::Pairs { .. } => text::LOAD_CLOUD,
             CloudSource::Synthetic(_) => text::SYNTHETIC_CLOUD,
         };
         let job = source.clone();
@@ -624,6 +645,17 @@ impl DriftlessApp {
                     let points = synthetic_cloud(n, SYNTHETIC_SEED);
                     let seconds = t.elapsed().as_secs_f64();
                     LoadedCloud::build(PathBuf::from(text::synthetic_name(n)), points, seconds, p)?
+                }
+                CloudSource::Pairs {
+                    name,
+                    model_las,
+                    lone,
+                    map_dir,
+                    member,
+                } => {
+                    let scan = pair_scan_cloud(&map_dir).ok_or(text::PAIRS_NO_CLOUD)?;
+                    let done = load_pair_cloud(name, &model_las, lone, &scan, member, p)?;
+                    return Ok(JobOutput::PairCloud(Box::new(done)));
                 }
             };
             Ok(JobOutput::Cloud(Box::new(cloud)))
@@ -639,54 +671,34 @@ impl DriftlessApp {
     fn tick_loader(&mut self) {
         if let Some(f) = self.loader.poll() {
             let source = self.loading.take();
+            let pairs_load = matches!(source, Some(CloudSource::Pairs { .. }));
             match f.result {
                 Ok(JobOutput::Cloud(cloud)) => {
-                    // a surface of another map would hide this cloud: it goes; one of the
-                    // same map stays, and the cloud just picked is what is drawn
-                    let map = match &source {
-                        Some(CloudSource::File { path, .. }) => path.parent(),
-                        _ => None,
-                    };
-                    if self.surface_of(map) {
-                        self.state.view.show = ShowMode::Cloud;
-                    } else {
-                        self.drop_surface();
+                    // another cloud in the view ends setting point pairs
+                    tools::end_pairs(&mut self.state);
+                    self.show_cloud(source, *cloud);
+                }
+                Ok(JobOutput::PairCloud(done)) => {
+                    let name = done.cloud.path.clone();
+                    self.show_cloud(source, done.cloud);
+                    match &mut self.state.pairs {
+                        Some(s) if s.cloud == name => s.shift = Some(done.shift),
+                        _ => {}
                     }
-                    self.cloud_run = match source {
-                        Some(CloudSource::File { run, .. }) => run,
-                        _ => None,
-                    };
-                    if let Some(o) = &mut self.overlay {
-                        o.set_origin(Some(cloud.tree.origin));
-                        self.overlay_version += 1;
-                    }
-                    self.info(text::cloud_loaded(
-                        &cloud.path,
-                        cloud.points.len(),
-                        cloud.load_seconds,
-                        cloud.build_seconds,
-                    ));
-                    self.state.cloud = Some(CloudSummary {
-                        path: cloud.path.clone(),
-                        points: cloud.points.len(),
-                        has_rgb: cloud.points.rgb.is_some(),
-                        has_scans: !cloud.points.source.is_empty(),
-                        quality_known: cloud.points.quality_known,
-                        z_range: cloud.z_range,
-                        ceiling: cloud.ceiling,
-                        point_m: cloud.point_m,
-                    });
-                    self.state.view.cut = None;
-                    self.state.picked = None;
-                    self.state.view_stats = None;
-                    self.cloud = Some(*cloud);
-                    self.view.cloud_replaced();
                 }
                 Ok(_) => {}
                 // a cancel for the next load needs no message
                 Err(StepError::Cancelled) if self.next_load.is_some() => {}
-                Err(StepError::Cancelled) => self.info(text::job_cancelled(&f.label)),
-                Err(e) => self.error(text::job_failed(&f.label, &text::step_error(&e))),
+                Err(e) => {
+                    // model and scan cannot be shown: no pairs can be set
+                    if pairs_load {
+                        tools::end_pairs(&mut self.state);
+                    }
+                    match e {
+                        StepError::Cancelled => self.info(text::job_cancelled(&f.label)),
+                        e => self.error(text::job_failed(&f.label, &text::step_error(&e))),
+                    }
+                }
             }
         }
         if !self.loader.is_busy() {
@@ -695,6 +707,93 @@ impl DriftlessApp {
             }
         }
         self.state.loading = self.loader.status();
+    }
+
+    /// Shows `cloud`, loaded from `source`, in the view in place of the one shown.
+    fn show_cloud(&mut self, source: Option<CloudSource>, cloud: LoadedCloud) {
+        // a surface of another map would hide this cloud: it goes; one of the same map (or
+        // model) stays, and the cloud just picked is what is drawn
+        let map = match &source {
+            Some(CloudSource::File { path, .. }) => path.parent(),
+            Some(CloudSource::Pairs { name, .. }) => name.parent(),
+            _ => None,
+        };
+        if self.surface_of(map) {
+            self.state.view.show = ShowMode::Cloud;
+        } else {
+            self.drop_surface();
+        }
+        self.cloud_run = match source {
+            Some(CloudSource::File { run, .. }) => run,
+            _ => None,
+        };
+        if let Some(o) = &mut self.overlay {
+            o.set_origin(Some(cloud.tree.origin));
+            self.overlay_version += 1;
+        }
+        self.info(text::cloud_loaded(
+            &cloud.path,
+            cloud.points.len(),
+            cloud.load_seconds,
+            cloud.build_seconds,
+        ));
+        self.state.cloud = Some(CloudSummary {
+            path: cloud.path.clone(),
+            points: cloud.points.len(),
+            has_rgb: cloud.points.rgb.is_some(),
+            has_scans: !cloud.points.source.is_empty(),
+            quality_known: cloud.points.quality_known,
+            z_range: cloud.z_range,
+            ceiling: cloud.ceiling,
+            point_m: cloud.point_m,
+        });
+        self.state.view.cut = None;
+        self.state.picked = None;
+        self.state.view_stats = None;
+        self.cloud = Some(cloud);
+        self.view.cloud_replaced();
+    }
+
+    /// „Von Hand ausrichten“ of scan `member` of the model in `dir`: model and scan are
+    /// loaded side by side, coloured by scan, and the tool „Punktpaare“ is chosen. The
+    /// session starts anew, its cloud is loaded anew.
+    fn start_pairs(&mut self, dir: &Path, member: usize) {
+        let Some(model) = self.state.model(dir).cloned() else {
+            self.error(text::unknown_model(dir));
+            return;
+        };
+        let session = model.report.members.get(member).and_then(|m| {
+            let name = text::model_member(member + 1, &self.state.scan_name(&m.scan));
+            PairSession::new(&model, member, name)
+        });
+        let (Some(session), Ok(nr)) = (session, u16::try_from(member)) else {
+            self.error(text::unknown_model(dir));
+            return;
+        };
+        let lone = model.report.members.iter().position(|m| m.included);
+        let source = CloudSource::Pairs {
+            name: session.cloud.clone(),
+            model_las: model.dir.join(MODEL_LAS),
+            lone: lone.and_then(|k| u16::try_from(k).ok()).unwrap_or(0),
+            map_dir: model.report.members[member].map_dir.clone(),
+            member: nr,
+        };
+        self.hand_loads += 1;
+        self.state.selection = Selection::Model(model.dir.clone());
+        self.state.view.color_mode = crate::render::ColorMode::Scan;
+        self.state.pairs = Some(session);
+        tools::select(&mut self.state, Tool::Pairs);
+        self.load_with(source, true);
+    }
+
+    /// Queues the switch of a point pair (one at a time).
+    fn switch_pair(&mut self, index: usize, enabled: bool) {
+        if self.state.pairs_writing {
+            return;
+        }
+        self.state.pairs_writing = true;
+        self.helper_queue
+            .push_back(HelperTask::SwitchPair(index, enabled));
     }
 
     /// The origin the view draws in: the cloud's, else the surface's (`None`: the run's own).
@@ -1030,6 +1129,9 @@ impl DriftlessApp {
                         self.compare_overlay();
                     }
                 }
+                (Some(HelperTask::SwitchPair(index, enabled)), result) => {
+                    self.pair_switched(index, enabled, result.map(|_| ()));
+                }
                 (Some(HelperTask::CompareMaps(a, b)), result) => {
                     let c = &mut self.state.compare;
                     if c.map_a.as_ref() == Some(&a) && c.map_b.as_ref() == Some(&b) {
@@ -1101,6 +1203,14 @@ impl DriftlessApp {
                     Ok(JobOutput::MapCompare(Box::new(compare_maps(&a, &b)?)))
                 })
             }
+            &HelperTask::SwitchPair(index, enabled) => {
+                let project = self.state.project.clone();
+                self.helper.start(text::PAIRS_JOB, move |_| {
+                    let project = project.ok_or(text::NO_PROJECT)?;
+                    set_point_pair_enabled(&project, index, enabled)?;
+                    Ok(JobOutput::Done)
+                })
+            }
         };
         match started {
             Ok(()) => {
@@ -1119,8 +1229,22 @@ impl DriftlessApp {
                 }
                 HelperTask::Compare(..) => self.state.compare.result = Some(Err(e.to_string())),
                 HelperTask::CompareMaps(..) => self.state.compare.maps = Some(Err(e.to_string())),
+                &HelperTask::SwitchPair(index, enabled) => {
+                    self.pair_switched(index, enabled, Err(StepError::Failed(e.to_string())))
+                }
                 _ => self.error(e.to_string()),
             },
+        }
+    }
+
+    /// A switch of point pair `index` ended: the pairs are read again, the answer goes into
+    /// the status bar.
+    fn pair_switched(&mut self, index: usize, enabled: bool, result: Result<(), StepError>) {
+        self.state.pairs_writing = false;
+        self.state.refresh_pairs();
+        match result {
+            Ok(()) => self.info(text::pair_switched(index + 1, enabled)),
+            Err(e) => self.error(e.to_string()),
         }
     }
 
@@ -1190,6 +1314,10 @@ impl DriftlessApp {
                 true
             }
         };
+        // the pairs are saved and the model is merged anew: setting them is done
+        if output.is_some() && matches!(step, Some(Action::ApplyPairs { .. })) {
+            tools::end_pairs(&mut self.state);
+        }
         match (output, step) {
             (Some(JobOutput::Slam(done)), _) => {
                 // computed with the corrections as they are now, unless one was written since
@@ -1507,6 +1635,7 @@ impl DriftlessApp {
             | Action::RunMap(_)
             | Action::RunSurface(_)
             | Action::RunMerge { .. }
+            | Action::ApplyPairs { .. }
             | Action::RunModelSurface { .. }) => {
                 match actions::start_step(&mut self.state, &mut self.jobs, &step) {
                     // the merge runs: its field closes, the model shows when it is done
@@ -1518,6 +1647,8 @@ impl DriftlessApp {
                 }
             }
             Action::OpenMerge => self.state.open_merge(),
+            Action::StartPairs { model, member } => self.start_pairs(&model, member),
+            Action::SetPairEnabled { index, enabled } => self.switch_pair(index, enabled),
             change @ (Action::AddLoop { .. } | Action::SetLoopEnabled { .. }) => {
                 self.change_corrections(change)
             }
@@ -1746,6 +1877,7 @@ impl DriftlessApp {
                     if let (Some(origin), false) = (origin, self.view.is_uploading()) {
                         let camera = self.view.camera();
                         tools::paint_measurements(ui, rect, camera, origin, &self.state);
+                        tools::paint_pairs(ui, rect, camera, origin, &self.state);
                     }
                 }
                 (None, true) => {
