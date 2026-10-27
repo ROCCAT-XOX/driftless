@@ -303,7 +303,7 @@ fn args_take_one_project_folder() {
     let args = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
     let project = |p: &str| Args {
         project: Some(PathBuf::from(p)),
-        synthetic: None,
+        ..Args::default()
     };
     assert_eq!(args(&[]), Ok(Args::default()));
     assert_eq!(args(&["/p"]), Ok(project("/p")));
@@ -315,8 +315,8 @@ fn args_take_one_project_folder() {
 fn args_take_synthetic_count() {
     let args = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
     let synthetic = |n| Args {
-        project: None,
         synthetic: Some(n),
+        ..Args::default()
     };
     assert_eq!(args(&["--synthetic", "5"]), Ok(synthetic(5)));
     assert_eq!(
@@ -328,6 +328,7 @@ fn args_take_synthetic_count() {
         Ok(Args {
             project: Some(PathBuf::from("/p")),
             synthetic: Some(1000),
+            ..Args::default()
         })
     );
     for bad in [
@@ -342,6 +343,20 @@ fn args_take_synthetic_count() {
     ] {
         assert!(args(bad).is_err(), "{bad:?}");
     }
+}
+
+#[test]
+fn parse_args_version() {
+    let args = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
+    let version = Args {
+        version: true,
+        ..Args::default()
+    };
+    assert_eq!(args(&["--version"]), Ok(version));
+    assert!(!args(&[]).unwrap().version);
+    assert!(!args(&["/p"]).unwrap().version);
+    // not a project folder
+    assert_eq!(args(&["--version"]).unwrap().project, None);
 }
 
 /// `--synthetic` generates the cloud in the background; the window stays usable and the

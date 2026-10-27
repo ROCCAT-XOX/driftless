@@ -49,8 +49,9 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
 }
 
 /// The entries of ☰: what the old menu bar „Projekt“ had, „Lauf hinzufügen“ for the scan of
-/// the selection, and „Exportieren …“ for what the view shows.
-fn project_menu(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
+/// the selection, „Exportieren …“ for what the view shows, and „Über Driftless …“ (opens its
+/// window itself).
+fn project_menu(ui: &mut Ui, state: &mut AppState, action: &mut Option<Action>) {
     let has_project = state.project.is_some();
     if ui.button(text::NEW_PROJECT).clicked() {
         *action = Some(Action::PickNewProject);
@@ -80,6 +81,10 @@ fn project_menu(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
         *action = Some(Action::OpenExportShown);
     }
     r.on_disabled_hover_text(text::EXPORT_NEEDS_VIEW);
+    ui.separator();
+    if ui.button(text::ABOUT).clicked() {
+        state.about_open = true;
+    }
 }
 
 /// The scan of the selection: the scan itself, or the scan of a selected run, map, cloud,

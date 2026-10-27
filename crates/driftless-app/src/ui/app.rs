@@ -50,20 +50,26 @@ const HINT_TOP: f32 = 64.0;
 /// Seed of the synthetic cloud of `--synthetic`.
 const SYNTHETIC_SEED: u64 = 1;
 
-/// The arguments of `driftless-app [--synthetic N] [projekt-ordner]`.
+/// The arguments of `driftless-app [--version] [--synthetic N] [projekt-ordner]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Args {
     pub project: Option<PathBuf>,
     /// Show a synthetic cloud of this many points (to try the view without a scan).
     pub synthetic: Option<usize>,
+    /// `--version`: print version and commit, open no window.
+    pub version: bool,
 }
 
 /// Reads the arguments: at most one project folder, `--synthetic N` with 1 ≤ N < 2³²
-/// written as digits, optionally grouped with '_' (`50_000_000`).
+/// written as digits, optionally grouped with '_' (`50_000_000`), and `--version`.
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut out = Args::default();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
+        if arg == "--version" {
+            out.version = true;
+            continue;
+        }
         if arg == "--synthetic" {
             let value = args.next();
             // digits, optionally grouped with '_' (no signs, no decimal points)
@@ -1913,6 +1919,7 @@ impl DriftlessApp {
             .response
             .rect;
         settings::show(&ctx, &mut self.state);
+        super::about::show(&ctx, &mut self.state.about_open);
         actions.extend(export::show(&ctx, &mut self.state));
         self.view.set_tool(self.state.tool);
         self.view

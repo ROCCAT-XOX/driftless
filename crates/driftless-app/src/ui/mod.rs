@@ -5,9 +5,10 @@
 //! Layout: the rail at the left edge ([`rail`]: ☰, the three [`Step`]s, ⚙), next to it the
 //! field of the active step ([`steps`]), the 3D view ([`view3d`]) in the rest with its floating
 //! bars ([`tools`]: info, the switch Punkte · Fläche · beides, the tools and the cut), the
-//! status bar ([`status`]) at the bottom, the settings window ⚙ ([`settings`]) and the window
-//! „Exportieren“ ([`export`]).
+//! status bar ([`status`]) at the bottom, the settings window ⚙ ([`settings`]), the window
+//! „Exportieren“ ([`export`]) and the window „Über Driftless“ ([`about`]).
 
+pub mod about;
 pub mod actions;
 mod app;
 pub mod compare;
@@ -385,6 +386,8 @@ pub struct AppState {
     pub map_status_pending: bool,
     /// The settings window ⚙.
     pub settings_window: SettingsWindow,
+    /// The window „Über Driftless“ is open (☰ opens it, its × closes it).
+    pub about_open: bool,
     /// The window „Exportieren“, while it is open.
     pub export: Option<export::ExportDialog>,
     /// The last check of a scan, shown under „Eigenschaften“ while that scan is selected.

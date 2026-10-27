@@ -22,8 +22,21 @@ use std::process::ExitCode;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// `driftless --version`: the version and the commit it was built from (`build.rs`).
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("DRIFTLESS_COMMIT"),
+    ")"
+);
+
 #[derive(Parser)]
-#[command(name = "driftless", version, about = "Driftless: Handheld-LiDAR-Scans")]
+#[command(
+    name = "driftless",
+    version,
+    long_version = LONG_VERSION,
+    about = "Driftless: Handheld-LiDAR-Scans"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

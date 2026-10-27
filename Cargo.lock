@@ -1650,6 +1650,7 @@ dependencies = [
  "las",
  "mimalloc",
  "nalgebra",
+ "png",
  "pollster 0.4.0",
  "rayon",
  "rfd",

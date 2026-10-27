@@ -425,6 +425,27 @@ pub const EXPORT_REPLACE: &str = "Ersetzen";
 /// Why „Exportieren …“ in ☰ is locked.
 pub const EXPORT_NEEDS_VIEW: &str = "Zuerst eine Punktwolke oder Oberfläche anzeigen";
 
+// The window „Über Driftless“ (☰)
+pub const ABOUT: &str = "Über Driftless …";
+pub const ABOUT_TITLE: &str = "Über Driftless";
+pub const ABOUT_LICENSE: &str = "Lizenz: Apache-2.0 OR MIT";
+pub const ABOUT_CLI_MISSING: &str = "Kommandozeile: nicht im Paket (cargo run -p driftless-cli)";
+
+/// „Driftless 0.1.0“.
+pub fn about_version(version: &str) -> String {
+    format!("{APP_TITLE} {version}")
+}
+
+/// „Commit abc123def“.
+pub fn about_commit(commit: &str) -> String {
+    format!("Commit {commit}")
+}
+
+/// „Kommandozeile: /Applications/Driftless.app/Contents/MacOS/driftless“.
+pub fn about_cli(path: &str) -> String {
+    format!("Kommandozeile: {path}")
+}
+
 /// A source in the window: „Karte 001 – color.las“ (its name and the file that is read).
 pub fn export_choice(name: &str, file: &str) -> String {
     format!("{name} – {file}")

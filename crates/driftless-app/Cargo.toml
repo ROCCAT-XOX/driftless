@@ -36,6 +36,8 @@ egui-phosphor = "0.14"
 # Decoding the JPEG and PNG pages of a surface.
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 mimalloc = { version = "0.1", default-features = false }
+# Writing the program symbol (`icon`) as PNG, also inside the .ico and .icns.
+png = "0.18"
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }
 pollster = "0.4"
 rfd = "0.17"
