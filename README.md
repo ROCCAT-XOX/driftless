@@ -86,10 +86,10 @@ Read the times for `correct loop` in the viewer on the timeline `ab_scan_beginn`
 ## Desktop program
 
 `cargo build --release -p driftless-app`, then `target/release/driftless-app` (Windows:
-`driftless-app.exe`; every pull request also builds it as the CI artifact `driftless-app-windows`). The
-interface is German. It runs the same steps as the command line (`inspect`, `slam`, `slam --reuse`,
-`correct`, `map`, `surface`, `compare`) through the shared crate `driftless-steps`, and writes the same
-files.
+`driftless-app.exe`; every pull request also builds the installers as the CI artifacts `driftless-windows`
+and `driftless-macos`, see `.github/workflows/package.yml`). The interface is German. It runs the same
+steps as the command line (`inspect`, `slam`, `slam --reuse`, `correct`, `map`, `surface`, `compare`)
+through the shared crate `driftless-steps`, and writes the same files.
 
 The window has a rail at the left edge, the field of the chosen step next to it, the 3D view and a
 slim status bar:
