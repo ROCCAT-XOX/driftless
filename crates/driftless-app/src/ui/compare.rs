@@ -406,7 +406,7 @@ impl CompareState {
 }
 
 /// A choice among `options`; the new one when it was changed.
-fn choose<T: Clone + PartialEq>(
+pub(crate) fn choose<T: Clone + PartialEq>(
     ui: &mut Ui,
     id: &str,
     label: &str,

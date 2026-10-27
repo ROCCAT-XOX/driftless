@@ -25,7 +25,8 @@ pub use app::{parse_args, Args, DriftlessApp, UI_KEY};
 use crate::camera::CameraMode;
 use crate::jobs::JobStatus;
 use crate::project::{
-    map_status, state_gap, surface_status, MapStatus, Project, RunInfo, ScanState, SurfaceSettings,
+    map_status, model_status, model_surface_status, state_gap, surface_status, MapStatus,
+    MergePick, ModelInfo, Project, RunInfo, ScanState, SurfaceSettings,
 };
 use crate::render::{ColorMode, PointSize, ShowMode};
 use driftless_gpu::GpuPref;
@@ -73,6 +74,8 @@ pub enum Selection {
     Surface(PathBuf),
     /// A state in the history of a run.
     History { run: PathBuf, nr: u32 },
+    /// A model folder (`modelle/modell-NNN`).
+    Model(PathBuf),
 }
 
 /// What a panel asks for. `Pick…` open a dialog first.
@@ -113,6 +116,17 @@ pub enum Action {
     RunMap(PathBuf),
     /// A surface of the map (folder).
     RunSurface(PathBuf),
+    /// Open the field „Scans zusammenführen“ in „Daten“.
+    OpenMerge,
+    /// Merge the scans into a new model; the first pick is the reference.
+    RunMerge {
+        picks: Vec<MergePick>,
+        include_unsure: bool,
+    },
+    /// A surface of the model (folder) from the images of all its scans.
+    RunModelSurface {
+        model: PathBuf,
+    },
     Cancel,
     /// Clears the messages of the status bar.
     DismissMessages,
@@ -299,6 +313,10 @@ pub struct AppState {
     pub project: Option<Project>,
     /// The scans of [`AppState::project`] with their runs, as last read from disk.
     pub scans: Vec<ScanNode>,
+    /// The models of the project ([`Project::models`]), as last read from disk.
+    pub models: Vec<ModelInfo>,
+    /// The field „Scans zusammenführen“.
+    pub merge: steps::merge::MergeState,
     pub selection: Selection,
     pub map_settings: MapSettings,
     pub slam_settings: SlamSettings,
@@ -368,6 +386,7 @@ impl AppState {
         self.project = Some(project);
         self.selection = Selection::None;
         self.inspect = None;
+        self.merge = steps::merge::MergeState::default();
         self.refresh();
     }
 
@@ -385,15 +404,19 @@ impl AppState {
                 })
                 .collect()
         });
-        // Statuses of maps and surfaces still in the tree stay shown until the background job
-        // replaces them.
+        self.models = self.project.as_ref().map_or_else(Vec::new, Project::models);
+        // Statuses of maps, models and surfaces still in the tree stay shown until the
+        // background job replaces them.
         let maps = self
             .scans
             .iter()
             .flat_map(|s| &s.runs)
-            .flat_map(|r| &r.maps);
+            .flat_map(|r| &r.maps)
+            .map(|m| (&m.dir, &m.surfaces));
+        let models = self.models.iter().map(|m| (&m.dir, &m.surfaces));
         let dirs: std::collections::BTreeSet<PathBuf> = maps
-            .flat_map(|m| std::iter::once(&m.dir).chain(m.surfaces.iter().map(|s| &s.dir)))
+            .chain(models)
+            .flat_map(|(dir, surfaces)| std::iter::once(dir).chain(surfaces.iter().map(|s| &s.dir)))
             .cloned()
             .collect();
         self.map_status.retain(|dir, _| dirs.contains(dir));
@@ -414,15 +437,18 @@ impl AppState {
             .scans
             .iter_mut()
             .flat_map(|s| &mut s.runs)
-            .flat_map(|r| &mut r.maps);
-        for surface in maps.flat_map(|m| &mut m.surfaces) {
+            .flat_map(|r| &mut r.maps)
+            .flat_map(|m| &mut m.surfaces);
+        let models = self.models.iter_mut().flat_map(|m| &mut m.surfaces);
+        for surface in maps.chain(models) {
             surface.stale = status.get(&surface.dir).is_some_and(|s| s.stale);
         }
     }
 
     /// The work of computing [`AppState::map_status`] for the current tree, to run off the
-    /// UI thread: it reads `traj.tum` and the bag list of every map ([`map_status`]) and of
-    /// every surface ([`surface_status`]).
+    /// UI thread: it reads `traj.tum` and the bag list of every map ([`map_status`]), every
+    /// model ([`model_status`]) and every surface ([`surface_status`],
+    /// [`model_surface_status`]).
     pub fn map_status_job(&self) -> impl FnOnce() -> BTreeMap<PathBuf, MapStatus> + Send + 'static {
         let mut maps = Vec::new();
         if let Some(project) = &self.project {
@@ -437,8 +463,15 @@ impl AppState {
                 }
             }
         }
+        let models = self.models.clone();
         move || {
             let mut out = BTreeMap::new();
+            for model in models {
+                for surface in &model.surfaces {
+                    out.insert(surface.dir.clone(), model_surface_status(&model, surface));
+                }
+                out.insert(model.dir.clone(), model_status(&model));
+            }
             for (scan, run, map) in maps {
                 for surface in &map.surfaces {
                     let status = surface_status(&scan, &run, &map, surface);
@@ -482,6 +515,42 @@ impl AppState {
                 .find(|m| m.surfaces.iter().any(|s| s.dir == *d)),
             _ => None,
         }
+    }
+
+    /// The model of the selection: the selected model, or the model of a selected surface.
+    pub fn selected_model(&self) -> Option<&ModelInfo> {
+        match &self.selection {
+            Selection::Model(d) => self.model(d),
+            Selection::Surface(d) => self
+                .models
+                .iter()
+                .find(|m| m.surfaces.iter().any(|s| s.dir == *d)),
+            _ => None,
+        }
+    }
+
+    /// The model in folder `dir`.
+    pub fn model(&self, dir: &std::path::Path) -> Option<&ModelInfo> {
+        self.models.iter().find(|m| m.dir == dir)
+    }
+
+    /// The name of the scan in folder `path` as the project names it, else its folder name.
+    pub fn scan_name(&self, path: &std::path::Path) -> String {
+        match self.scan_at(path) {
+            Some(node) => node.name.clone(),
+            None => path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            ),
+        }
+    }
+
+    /// Opens the field „Scans zusammenführen“; the first time with every scan ticked that
+    /// has a finished map ([`steps::merge::MergeState::open`]).
+    pub fn open_merge(&mut self) {
+        let mut merge = std::mem::take(&mut self.merge);
+        merge.open(self);
+        self.merge = merge;
     }
 
     /// The run and map of the map folder `dir`, with its scan.
@@ -638,7 +707,7 @@ impl AppState {
                 .iter()
                 .any(|m| m.surfaces.iter().any(|s| s.dir == *d)),
             Selection::History { run, .. } => r.dir == *run,
-            Selection::None | Selection::Scan(_) => false,
+            Selection::None | Selection::Scan(_) | Selection::Model(_) => false,
         };
         self.scans
             .iter()

@@ -5,12 +5,18 @@
 //! of the running job, and at the bottom the main button: „Alle Oberflächen rechnen“ queues
 //! every map without a current surface ([`Action::ComputeAllSurfaces`]), „Oberfläche
 //! rechnen“ only the selected map. „ohne Fotos“ lies under „▸ Erweitert“.
+//!
+//! Below the maps a card per model („Modell 001 · 3 Scans“) with its surfaces; selected, the
+//! main button computes the surface of the model from the images of all its scans
+//! ([`Action::RunModelSurface`]). A surface that no longer fits its model
+//! ([`driftless_steps::surface::model_surface_fits`], checked in the background) is marked
+//! stale, and a model whose maps were computed anew since the merge waits for „Daten“.
 
 use super::{
     badge, below_lines, blocked, card, fraction, heading, hint, job_progress, main_button,
     no_project, pinned, quiet_button, segments, state_label, tree, StepState,
 };
-use crate::project::{MapInfo, ScanState, SurfaceInfo, SurfaceSettings};
+use crate::project::{MapInfo, ModelInfo, ScanState, SurfaceInfo, SurfaceSettings};
 use crate::ui::theme::{icon, DARK};
 use crate::ui::{text, Action, AppState, Queued, Selection, Step};
 use eframe::egui::{self, RichText, Ui};
@@ -35,6 +41,9 @@ pub enum SurfaceStatus {
     MapNotReady,
     /// The folder of its scan cannot be read: left out as well.
     ScanMissing,
+    /// A model whose maps were computed anew since the merge: it is merged anew in „Daten“
+    /// first.
+    ModelStale,
 }
 
 /// The status of the surfaces of `map`: a running step or the queue first, then its scan and
@@ -62,6 +71,22 @@ pub fn surface_status(state: &AppState, map: &MapInfo) -> SurfaceStatus {
     } else if map.surfaces.iter().any(|s| !s.stale) {
         SurfaceStatus::Done
     } else if !map.surfaces.is_empty() {
+        SurfaceStatus::Stale
+    } else {
+        SurfaceStatus::New
+    }
+}
+
+/// The status of the surfaces of `model`, as [`surface_status`] for a map.
+pub fn model_surface_status(state: &AppState, model: &ModelInfo) -> SurfaceStatus {
+    if matches!(&state.running, Some(Action::RunModelSurface { model: d }) if *d == model.dir) {
+        return SurfaceStatus::Running(state.job.as_ref().and_then(fraction));
+    }
+    if state.map_status.get(&model.dir).is_some_and(|s| s.stale) {
+        SurfaceStatus::ModelStale
+    } else if model.surfaces.iter().any(|s| !s.stale) {
+        SurfaceStatus::Done
+    } else if !model.surfaces.is_empty() {
         SurfaceStatus::Stale
     } else {
         SurfaceStatus::New
@@ -109,6 +134,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
         |ui, (state, action), advanced| {
             ui.add_space(4.0);
             map_list(ui, state, action);
+            model_list(ui, state, action);
             ui.add_space(6.0);
             fineness_switch(ui, &mut state.surface_settings);
             selection_state(ui, state);
@@ -171,6 +197,46 @@ fn map_list(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
     }
 }
 
+/// A card per model, its surfaces below it, as [`map_list`] does for the maps.
+fn model_list(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
+    for model in &state.models {
+        let selected = state.selection == Selection::Model(model.dir.clone());
+        let name = text::model_card(&model.label, model.report.members.len());
+        let status = model_surface_status(state, model);
+        let hover = match status {
+            SurfaceStatus::ModelStale => format!(
+                "{name}\n{}\n{}",
+                text::STATUS_MODEL_STALE_HINT,
+                model.dir.display()
+            ),
+            _ => format!("{name}\n{}", model.dir.display()),
+        };
+        let r = card(
+            ui,
+            ("modell", &model.dir),
+            selected,
+            RichText::new(name),
+            &hover,
+            |ui| status_label(ui, status),
+        );
+        if r.clicked() {
+            let selection = if selected {
+                Selection::None
+            } else {
+                Selection::Model(model.dir.clone())
+            };
+            *action = Some(Action::Select(selection));
+        }
+        if !model.surfaces.is_empty() {
+            ui.indent(("oberflaechen", &model.dir), |ui| {
+                for surface in &model.surfaces {
+                    tree::surface_leaf(ui, state, surface, action);
+                }
+            });
+        }
+    }
+}
+
 /// The status at the right of a card.
 fn status_label(ui: &mut Ui, status: SurfaceStatus) {
     let (symbol, word, color) = match status {
@@ -182,6 +248,7 @@ fn status_label(ui: &mut Ui, status: SurfaceStatus) {
         SurfaceStatus::MapStale => (Some(icon::STALE), text::STATUS_MAP_STALE, DARK.text_dim),
         SurfaceStatus::MapNotReady => (None, text::STATUS_MAP_NOT_READY, DARK.text_dim),
         SurfaceStatus::ScanMissing => (Some(icon::STALE), text::STATUS_SCAN_MISSING, DARK.text_dim),
+        SurfaceStatus::ModelStale => (Some(icon::STALE), text::STATUS_MODEL_STALE, DARK.text_dim),
     };
     badge(ui, symbol, word, color);
 }
@@ -209,17 +276,19 @@ fn fineness_switch(ui: &mut Ui, settings: &mut SurfaceSettings) {
 /// For a selected map: the state of its surface with the settings chosen now; for a
 /// selected surface also its own state.
 fn selection_state(ui: &mut Ui, state: &AppState) {
-    let Some(map) = state.selected_map() else {
-        return;
+    let surfaces = match (state.selected_map(), state.selected_model()) {
+        (Some(map), _) => &map.surfaces,
+        (None, Some(model)) => &model.surfaces,
+        (None, None) => return,
     };
     ui.add_space(4.0);
     // wrapped: a long state („veraltet – …“) must not widen the field
     ui.horizontal_wrapped(|ui| {
         ui.label(text::WITH_THIS_FINENESS);
-        state_label(ui, surface_state(state, map, &state.surface_settings));
+        state_label(ui, surface_state(state, surfaces, &state.surface_settings));
     });
     if let Selection::Surface(dir) = &state.selection {
-        if let Some(surface) = map.surfaces.iter().find(|s| s.dir == *dir) {
+        if let Some(surface) = surfaces.iter().find(|s| s.dir == *dir) {
             ui.horizontal_wrapped(|ui| {
                 ui.label(text::THIS_SURFACE);
                 state_label(ui, own_surface_state(state, surface));
@@ -228,11 +297,14 @@ fn selection_state(ui: &mut Ui, state: &AppState) {
     }
 }
 
-/// The state of a surface of `map` with `settings`: done if one made with them still fits,
-/// stale if all such ones no longer fit.
-fn surface_state(state: &AppState, map: &MapInfo, settings: &SurfaceSettings) -> StepState {
-    let mut same = map
-        .surfaces
+/// The state of a surface among `surfaces` (of a map or a model) with `settings`: done if
+/// one made with them still fits, stale if all such ones no longer fit.
+fn surface_state(
+    state: &AppState,
+    surfaces: &[SurfaceInfo],
+    settings: &SurfaceSettings,
+) -> StepState {
+    let mut same = surfaces
         .iter()
         .rev()
         .filter(|s| s.settings.as_ref() == Some(settings))
@@ -277,6 +349,26 @@ fn compute_buttons(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
             .unwrap_or_else(|| text::ALL_SURFACED.to_string())
     });
     let all_locked = busy.clone().or(invalid.clone()).or(nothing.clone());
+    if let Some(model) = state.selected_model() {
+        let model_stale = (model_surface_status(state, model) == SurfaceStatus::ModelStale)
+            .then(|| text::STATUS_MODEL_STALE_HINT.to_string());
+        let locked = busy.clone().or(invalid.clone()).or(model_stale.clone());
+        let hover = text::COMPUTE_MODEL_SURFACE_HINT;
+        if main_button(ui, text::STEP_SURFACE, locked, hover) {
+            *action = Some(Action::RunModelSurface {
+                model: model.dir.clone(),
+            });
+        }
+        if quiet_button(ui, text::COMPUTE_ALL_SURFACES, all_locked) {
+            *action = Some(Action::ComputeAllSurfaces);
+        }
+        let below = match busy {
+            Some(_) => None,
+            None => invalid.map(|e| text::cannot_compute(&e)).or(model_stale),
+        };
+        below_lines(ui, below);
+        return;
+    }
     let selected = state.selected_map();
     let below = match selected {
         Some(map) => {

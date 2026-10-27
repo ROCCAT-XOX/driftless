@@ -231,6 +231,9 @@ pub struct PointInfo {
     pub quality: Option<u8>,
     /// The removal reason of a point of `removed.las` (its flags), else `None`.
     pub removed: Option<u8>,
+    /// The scan of a point of a merged model ([`crate::cloud::PointSet::source`], from 0);
+    /// `None` for a cloud of one scan.
+    pub scan: Option<u16>,
 }
 
 /// The info of point `index` (of the point set, not a vertex) of `cloud`.
@@ -248,6 +251,7 @@ pub fn point_info(cloud: &LoadedCloud, index: u32) -> PointInfo {
         rgb: p.rgb.as_ref().map(|c| c[i]).filter(|_| coloured),
         quality: p.quality_known.then_some(p.quality[i]),
         removed,
+        scan: p.source.get(i).copied(),
     }
 }
 

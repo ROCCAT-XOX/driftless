@@ -81,6 +81,10 @@ pub mod icon {
     pub const CHECK: &str = p::CHECK_CIRCLE;
     pub const RUNNING: &str = p::CIRCLE_NOTCH;
     pub const STALE: &str = p::WARNING_CIRCLE;
+    /// A scan placed in a model, but not surely.
+    pub const UNSURE: &str = p::WARNING;
+    /// A scan that could not be placed in a model.
+    pub const FAILED: &str = p::X_CIRCLE;
     pub const ADD: &str = p::PLUS;
     pub const FOLDED: &str = p::CARET_RIGHT;
     pub const UNFOLDED: &str = p::CARET_DOWN;

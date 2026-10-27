@@ -46,6 +46,8 @@ pub enum JobOutput {
     Slam(Box<SlamDone>),
     /// With the map folder.
     Map(Box<MapDone>),
+    /// The step „Zusammenführen“, with the new model folder.
+    Model(PathBuf),
     /// The step „Oberfläche rechnen“, with the surface folder.
     SurfaceStep(Box<SurfaceDone>),
     /// A cloud with its levels of detail (loader runner).

@@ -339,6 +339,7 @@ fn point() -> PointInfo {
         rgb: Some([200, 120, 40]),
         quality: None,
         removed: None,
+        scan: None,
     }
 }
 

@@ -650,3 +650,23 @@ fn skipped(why: &str) {
     let name = std::thread::current().name().unwrap_or("?").to_string();
     let _ = writeln!(std::io::stderr(), "ÜBERSPRUNGEN {name}: {why}");
 }
+
+/// A point of a merged model names its scan (counted from 1, as the model in the tree); a
+/// cloud of one scan does not.
+#[test]
+fn pick_info_names_scan_of_model() {
+    let mut points = PointSet::from_xyz([0.0; 3], vec![[1.0, 2.0, 3.0]; 2]);
+    let c = cloud("/k/clean.las", points.clone());
+    assert_eq!(point_info(&c, 0).scan, None);
+    assert!(steps::point_lines(&point_info(&c, 0))
+        .iter()
+        .all(|(l, _)| *l != text::POINT_SCAN));
+    points.source = vec![0, 2];
+    let c = cloud("/m/modell.las", points);
+    assert_eq!(point_info(&c, 1).scan, Some(2));
+    let lines = steps::point_lines(&point_info(&c, 1));
+    assert!(
+        lines.contains(&(text::POINT_SCAN, "3".to_string())),
+        "{lines:?}"
+    );
+}

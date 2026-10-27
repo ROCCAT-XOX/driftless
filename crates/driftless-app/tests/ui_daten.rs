@@ -2,16 +2,20 @@
 //! its queue (one job at a time), a job that keeps running across a change of step, and
 //! „Erweitert“ with the switches, corrections and comparisons.
 
-use driftless_app::project::{MapInfo, MapStatus, Project, RunInfo, ScanEntry, ScanState};
+use driftless_app::project::{
+    MapInfo, MapStatus, MergePick, ModelInfo, Project, RunInfo, ScanEntry, ScanState, SurfaceInfo,
+};
+use driftless_app::render::ColorMode;
 use driftless_app::ui::steps::daten::{precision_of, scan_status, voxel_of, Precision, ScanStatus};
 use driftless_app::ui::{
     steps, text, Action, AppState, DriftlessApp, Queued, ScanNode, Selection, Step,
 };
 use driftless_io::testscan::{room_bag_secs, tmp};
 use driftless_steps::map::MapSwitches;
+use driftless_steps::merge::{ModelMember, ModelReport, MODEL_LAS, MODEL_REPORT};
 use driftless_steps::slam::SlamSettings;
 use eframe::egui::accesskit::Role;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -666,4 +670,307 @@ fn no_colour_locks_compute_when_colouring() {
         click(&mut h, text::COMPUTE_ALL),
         Some(Action::ComputeAllMaps)
     );
+}
+
+/// [`map`] with a cleaned cloud: a map that scans can be merged from.
+fn clean_map(dir: &str) -> MapInfo {
+    MapInfo {
+        clouds: vec![PathBuf::from(dir).join("clean.las")],
+        ..map(dir)
+    }
+}
+
+const MAP_1330: &str = "/p/scans/scan-1330/slam-001/karte-001";
+const MAP_1335: &str = "/p/scans/scan-1335/slam-001/karte-001";
+const MAP_1335_2: &str = "/p/scans/scan-1335/slam-002/karte-001";
+
+fn fresh() -> MapStatus {
+    MapStatus {
+        seconds: Some(10.0),
+        stale: false,
+    }
+}
+
+/// [`three_scans`] with cleaned maps: „Scan 13:30“ with one run, „Scan 13:35“ with a second
+/// run „SLAM 002“ whose map fits (the older one no longer does); „Scan 13:25“ has none.
+fn mergeable() -> AppState {
+    let mut state = three_scans();
+    state.scans[1].runs[0].maps[0] = clean_map(MAP_1330);
+    state.scans[2].runs[0].maps[0] = clean_map(MAP_1335);
+    let mut second = run("/p/scans/scan-1335/slam-002", vec![clean_map(MAP_1335_2)]);
+    second.label = "SLAM 002".into();
+    state.scans[2].runs.push(second);
+    let stale = MapStatus {
+        seconds: Some(10.0),
+        stale: true,
+    };
+    state.set_map_status(
+        [
+            (MAP_1330.into(), fresh()),
+            (MAP_1335.into(), stale),
+            (MAP_1335_2.into(), fresh()),
+        ]
+        .into(),
+    );
+    state
+}
+
+#[test]
+fn merge_button_needs_two_maps() {
+    // „Scan 13:30“ has a map, the map of „Scan 13:35“ no longer fits: one scan to merge
+    let mut state = three_scans();
+    state.scans[1].runs[0].maps[0] = clean_map(MAP_1330);
+    state.scans[2].runs[0].maps[0] = clean_map(MAP_1335);
+    let h = panel(state.clone());
+    assert!(h.query_by_label(text::MERGE_OPEN).is_none());
+    // a fitting map without cleaned points (only the dense step) does not count either
+    let mut dense = state.clone();
+    dense.scans[2].runs[0].maps[0] = map(MAP_1335);
+    dense.set_map_status([(MAP_1330.into(), fresh()), (MAP_1335.into(), fresh())].into());
+    let h = panel(dense);
+    assert!(h.query_by_label(text::MERGE_OPEN).is_none());
+    // both fit: two scans
+    state.set_map_status([(MAP_1330.into(), fresh()), (MAP_1335.into(), fresh())].into());
+    let mut h = panel(state);
+    assert_eq!(click(&mut h, text::MERGE_OPEN), Some(Action::OpenMerge));
+}
+
+#[test]
+fn merge_dialog_start_needs_two_ticks() {
+    let mut state = mergeable();
+    state.open_merge();
+    let mut h = panel(state);
+    assert!(
+        h.query_by_label(text::MERGE_OPEN).is_none(),
+        "the field replaces the button"
+    );
+    let checkbox = |h: &H, name: &str| {
+        h.get_by_role_and_label(Role::CheckBox, name)
+            .accesskit_node()
+            .is_disabled()
+    };
+    // a scan without a map cannot be ticked; the others are, the first is the reference
+    assert!(checkbox(&h, "Scan 13:25"));
+    assert!(!checkbox(&h, "Scan 13:30"));
+    assert_eq!(h.get_all_by_label(text::MERGE_REFERENCE).count(), 1);
+    // the newest map of the newest run is preset
+    h.get_by_value("SLAM 002 · Karte 001");
+    h.get_by_value("SLAM 001 · Karte 001");
+    let start_locked = |h: &H| {
+        h.get_by_label(text::MERGE_START)
+            .accesskit_node()
+            .is_disabled()
+    };
+    assert!(!start_locked(&h));
+    let want = |include_unsure| Action::RunMerge {
+        picks: vec![
+            MergePick {
+                scan_id: "scan-1330".into(),
+                run: "/p/scans/scan-1330/slam-001".into(),
+                map: MAP_1330.into(),
+            },
+            MergePick {
+                scan_id: "scan-1335".into(),
+                run: "/p/scans/scan-1335/slam-002".into(),
+                map: MAP_1335_2.into(),
+            },
+        ],
+        include_unsure,
+    };
+    assert_eq!(click(&mut h, text::MERGE_START), Some(want(false)));
+    // one tick: locked
+    h.get_by_role_and_label(Role::CheckBox, "Scan 13:30")
+        .click();
+    h.run();
+    assert!(start_locked(&h));
+    assert!(h.state().0.merge.picks(&h.state().0).len() == 1);
+    // the reference is now the first ticked one
+    h.get_by_role_and_label(Role::CheckBox, "Scan 13:30")
+        .click();
+    h.run();
+    h.get_by_label(text::MERGE_UNSURE).click();
+    h.run();
+    assert_eq!(click(&mut h, text::MERGE_START), Some(want(true)));
+    // closed: the button again
+    click(&mut h, text::MERGE_CLOSE);
+    assert!(!h.state().0.merge.open);
+    h.get_by_label(text::MERGE_OPEN);
+}
+
+fn member(scan: &str, verdict: &str, included: bool) -> ModelMember {
+    let run = PathBuf::from(format!("/p/scans/{scan}/slam-001"));
+    ModelMember {
+        scan: PathBuf::from(format!("/daten/{scan}")),
+        slam_dir: run.clone(),
+        map_dir: run.join("karte-001"),
+        slam: SlamSettings::default(),
+        transform: [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ],
+        placed_against: (verdict != "bezug").then_some(0),
+        method: if verdict == "bezug" {
+            "bezug"
+        } else {
+            "merkmale"
+        }
+        .into(),
+        verdict: if verdict == "bezug" {
+            "sicher"
+        } else {
+            verdict
+        }
+        .into(),
+        reason: (verdict == "unsicher").then(|| "zwei Lagen passen fast gleich gut".into()),
+        overlap: 0.98,
+        residual_median_mm: 1.84,
+        residual_rms_mm: 2.5,
+        agreement: 0.95,
+        included,
+        color_gain: [1.0; 3],
+        points: if included { 1000 } else { 0 },
+        clean_id: None,
+    }
+}
+
+fn report(members: Vec<ModelMember>) -> ModelReport {
+    ModelReport {
+        version: 1,
+        input_id: "0".into(),
+        points: members.iter().map(|m| m.points).sum(),
+        members,
+        seconds_total: 12.0,
+        peak_rss_bytes: 0,
+    }
+}
+
+const MODEL: &str = "/p/modelle/modell-001";
+
+/// [`three_scans`] with „Modell 001“ of all three: 13:25 the reference, 13:30 sure, 13:35
+/// unsure and left out; with a surface.
+fn with_model() -> AppState {
+    let mut state = three_scans();
+    state.models = vec![ModelInfo {
+        dir: MODEL.into(),
+        label: "Modell 001".into(),
+        report: report(vec![
+            member("scan-1325", "bezug", true),
+            member("scan-1330", "sicher", true),
+            member("scan-1335", "unsicher", false),
+        ]),
+        surfaces: vec![SurfaceInfo {
+            dir: format!("{MODEL}/oberflaeche-001").into(),
+            label: "Oberfläche 001".into(),
+            stale: false,
+            settings: None,
+        }],
+    }];
+    state
+}
+
+#[test]
+fn model_node_shows_verdicts() {
+    let mut h = panel(with_model());
+    h.get_by_label("Modell 001");
+    // per scan its name (from the project), the verdict, overlap and residual
+    for name in ["1 · Scan 13:25", "2 · Scan 13:30", "3 · Scan 13:35"] {
+        h.get_by_label(name);
+    }
+    h.get_by_label(text::MERGE_REFERENCE);
+    h.get_by_label(text::VERDICT_SURE);
+    h.get_by_label(text::VERDICT_UNSURE);
+    assert_eq!(
+        h.get_all_by_label(&text::member_numbers(0.98, 1.84))
+            .count(),
+        2
+    );
+    assert_eq!(
+        text::member_numbers(0.98, 1.84),
+        "Überlappung 98 % · Restversatz 1,8 mm"
+    );
+    h.get_by_label(text::NOT_IN_MODEL);
+    h.get_by_label(MODEL_LAS);
+    h.get_by_label("Oberfläche 001");
+    assert_eq!(
+        click(&mut h, "Modell 001"),
+        Some(Action::Select(Selection::Model(MODEL.into())))
+    );
+    assert_eq!(
+        click(&mut h, MODEL_LAS),
+        Some(Action::Select(Selection::Cloud(
+            PathBuf::from(MODEL).join(MODEL_LAS)
+        )))
+    );
+    // a failed scan
+    let mut state = with_model();
+    state.models[0].report.members[2].verdict = "gescheitert".into();
+    let h = panel(state);
+    h.get_by_label(text::VERDICT_FAILED);
+    // a model whose map was computed anew since
+    let mut state = with_model();
+    state.set_map_status(
+        [(
+            PathBuf::from(MODEL),
+            MapStatus {
+                seconds: None,
+                stale: true,
+            },
+        )]
+        .into(),
+    );
+    let h = panel(state);
+    h.get_by_label(&text::model_stale("Modell 001"));
+}
+
+#[test]
+fn selecting_model_loads_it_coloured_by_scan() {
+    use driftless_map::{write_las_sources, Cloud};
+    let dir = tmp("app-model-select");
+    let mut app = app();
+    app.apply(Action::NewProject {
+        dir: dir.join("projekt"),
+        name: "Halle".into(),
+    });
+    let model = app
+        .state()
+        .project
+        .as_ref()
+        .unwrap()
+        .dir
+        .join("modelle")
+        .join("modell-001");
+    std::fs::create_dir_all(&model).unwrap();
+    let n = 200;
+    let cloud = Cloud {
+        xyz: (0..n).map(|i| [i as f32 * 0.01, 0.0, 1.0]).collect(),
+        intensity: vec![0.5; n],
+        t: vec![0.0; n],
+        frame: vec![0; n],
+        rgb: None,
+        colored: None,
+    };
+    let sources: Vec<u16> = (0..n).map(|i| (i % 2) as u16).collect();
+    write_las_sources(&model.join(MODEL_LAS), &cloud, &sources).unwrap();
+    let r = report(vec![
+        member("a", "bezug", true),
+        member("b", "sicher", true),
+    ]);
+    std::fs::write(model.join(MODEL_REPORT), serde_json::to_string(&r).unwrap()).unwrap();
+    // the tree is read again when the project is opened again
+    let project = app.state().project.as_ref().unwrap().dir.clone();
+    app.apply(Action::OpenProject(project));
+    settle(&mut app);
+    let models = &app.state().models;
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].dir, model);
+    app.state_mut().view.color_mode = ColorMode::Rgb;
+    app.apply(Action::Select(Selection::Model(model.clone())));
+    settle(&mut app);
+    let cloud = app.state().cloud.as_ref().expect("model loaded");
+    assert_eq!(cloud.path, model.join(MODEL_LAS));
+    assert!(cloud.has_scans);
+    assert_eq!(app.state().view.color_mode, ColorMode::Scan);
+    // switched once: another mode chosen afterwards stays
+    app.state_mut().view.color_mode = ColorMode::Intensity;
+    settle(&mut app);
+    assert_eq!(app.state().view.color_mode, ColorMode::Intensity);
 }

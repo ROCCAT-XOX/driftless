@@ -5,7 +5,9 @@
 //! every new or stale scan ([`Action::ComputeAllMaps`]), „Rechnen“ only the selected scan.
 //!
 //! The runs and maps of a scan unfold below its card while it, or something of it, is
-//! selected. Everything else of the former panel lies under „▸ Erweitert“: the map switches
+//! selected. Once two scans have a finished map, „Zusammenführen …“ opens the field that
+//! merges them into a model ([`merge`]); the models follow below the scans with their scans,
+//! cloud and surfaces. Everything else of the former panel lies under „▸ Erweitert“: the map switches
 //! (with the voxel size as a number), the layers „Teilkarten“ and „Verworfene Kandidaten“, the
 //! steps of the selection („Prüfen“, „SLAM rechnen“, „Neu rechnen (aus Teilkarten)“, „Karte
 //! rechnen“) with their state, the corrections ([`correct`]), the comparisons ([`compare`]),
@@ -15,8 +17,8 @@
 
 use super::{
     badge, below_lines, blocked, card, error_label, fraction, heading, hint, job_progress,
-    main_button, no_project, pinned, quiet_button, section, segments, state_label, step_row, tree,
-    StepState,
+    main_button, merge, no_project, pinned, quiet_button, section, segments, state_label, step_row,
+    tree, StepState,
 };
 use crate::project::{MapInfo, RunInfo, ScanState};
 use crate::ui::status::count;
@@ -180,6 +182,16 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
             if add_scan_link(ui) {
                 **action = Some(Action::PickAddScan);
             }
+            if merge::open_button(ui, state) {
+                **action = Some(Action::OpenMerge);
+            }
+            if state.merge.open {
+                ui.add_space(4.0);
+                if let Some(a) = merge::show(ui, state) {
+                    **action = Some(a);
+                }
+            }
+            model_list(ui, state, action);
             ui.add_space(6.0);
             precision_switch(ui, state);
             job_progress(ui, state);
@@ -241,6 +253,18 @@ fn scan_card(ui: &mut Ui, state: &AppState, scan: &ScanNode, action: &mut Option
                 *action = Some(Action::PickAddRun(scan.id.clone()));
             }
         });
+    }
+}
+
+/// „Modelle“ with each model of the project, if there are any.
+fn model_list(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
+    if state.models.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    ui.label(RichText::new(text::MODELS).strong());
+    for model in &state.models {
+        tree::model_node(ui, state, model, action);
     }
 }
 

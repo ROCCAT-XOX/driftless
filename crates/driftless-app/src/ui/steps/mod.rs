@@ -10,6 +10,7 @@
 
 pub mod bilder;
 pub mod daten;
+pub mod merge;
 pub mod planung;
 mod tree;
 
@@ -335,6 +336,10 @@ pub fn point_lines(info: &PointInfo) -> Vec<(&'static str, String)> {
             ),
         ),
     ];
+    if let Some(scan) = info.scan {
+        // counted from 1, as the scans of a model in the tree
+        lines.push((text::POINT_SCAN, (u32::from(scan) + 1).to_string()));
+    }
     if let Some(code) = info.removed {
         let reason = text::removal_reason(code).map_or_else(|| code.to_string(), str::to_string);
         lines.push((text::POINT_REMOVED, reason));

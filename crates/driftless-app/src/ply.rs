@@ -2,7 +2,7 @@
 //! `binary_big_endian 1.0`) into a [`PointSet`].
 //!
 //! Of the element `vertex` it takes `x y z` (any scalar type, usually `float` or `double`),
-//! the colour `red green blue` (`uchar`, or a float in 0–1), `intensity` or
+//! the colour `red green blue` (`uchar`, or a float in 0–1 or 0–255), `intensity` or
 //! `scalar_intensity`, `scan` (the scan of a merged model) and `colored` (0 = without
 //! measured colour, as [`driftless_map::write_ply`] writes it). Other properties and other
 //! elements (e.g. `face`) are skipped, elements after `vertex` are not read at all.
@@ -31,7 +31,9 @@ const READ_BUFFER: usize = 1 << 16;
 
 /// Reads a PLY file in batches of 2²⁰ points (phase [`PHASE_LOAD`], total from the header,
 /// a cancel check per batch). The origin is the first point in whole metres; points with a
-/// coordinate that is not finite are left out. Intensities in 0–255 are taken as they are,
+/// coordinate that is not finite are left out. Float colours are 0–1 (×255), unless one of
+/// them is above 1: then the file holds 0–255 (as some programs write it) and they are taken
+/// as they are. Intensities in 0–255 are taken as they are,
 /// floats in 0–1 ×255, larger ones scaled so that the brightest is 255; without any (or
 /// all 0) the points are [`MID_GRAY`]. Without point times the time is 0 and the quality
 /// unknown (255). A `scan` of only one value gives no [`PointSet::source`].
@@ -471,11 +473,11 @@ fn number(r: &mut impl BufRead, token: &mut Vec<u8>) -> Result<f64, Fail> {
         .or_else(|_| bad(format!("Wert „{}“ ist keine Zahl", quote(&text))))
 }
 
-/// A colour channel of type `s` as 0–255: floats are 0–1, `ushort` 16 bit, other types
-/// 0–255 (clamped).
-fn channel(v: f64, s: Scalar) -> u8 {
+/// A colour channel of type `s` as 0–255: floats are 0–1 (×`float_scale`: 255, or 1 for a
+/// file of float colours in 0–255), `ushort` 16 bit, other types 0–255 (clamped).
+fn channel(v: f64, s: Scalar, float_scale: f64) -> u8 {
     let v = match s {
-        _ if s.is_float() => (v * 255.0).round(),
+        _ if s.is_float() => (v * float_scale).round(),
         // the high byte, as LAS colours are read
         Scalar::U16 => (v / 256.0).floor(),
         _ => v,
@@ -591,6 +593,10 @@ fn read(path: &Path, progress: &Progress) -> Result<PointSet, Fail> {
     };
     let mut raw_intensity: Vec<f32> =
         Vec::with_capacity(if intensity.is_some() { capacity } else { 0 });
+    // Float colours are kept as read until the range is known (0–1 or 0–255).
+    let float_color = color.filter(|c| c.iter().any(|(_, s)| s.is_float()));
+    let mut raw_rgb: Vec<[f32; 3]> =
+        Vec::with_capacity(if float_color.is_some() { capacity } else { 0 });
     let mut origin = None;
     let stride = vertex.stride();
     let mut row = vec![0.0f64; vertex.props.len()];
@@ -612,8 +618,10 @@ fn read(path: &Path, progress: &Progress) -> Result<PointSet, Fail> {
             }
             let o = *origin.get_or_insert_with(|| p.map(f64::round));
             out.xyz.push([0, 1, 2].map(|k| (p[k] - o[k]) as f32));
-            if let (Some(rgb), Some(c)) = (&mut out.rgb, color) {
-                rgb.push(c.map(|(i, s)| channel(row[i], s)));
+            if let Some(c) = float_color {
+                raw_rgb.push(c.map(|(i, _)| row[i] as f32));
+            } else if let (Some(rgb), Some(c)) = (&mut out.rgb, color) {
+                rgb.push(c.map(|(i, s)| channel(row[i], s, 255.0)));
             }
             if let Some((i, _)) = intensity {
                 raw_intensity.push(row[i] as f32);
@@ -630,6 +638,18 @@ fn read(path: &Path, progress: &Progress) -> Result<PointSet, Fail> {
     }
     let n = out.xyz.len();
     out.origin = origin.unwrap_or([0.0; 3]);
+    if let (Some(rgb), Some(c)) = (&mut out.rgb, float_color) {
+        // a float colour above 1 anywhere: the file holds 0–255
+        let above_one = raw_rgb
+            .iter()
+            .any(|v| v.iter().zip(&c).any(|(x, (_, s))| s.is_float() && *x > 1.0));
+        let scale = if above_one { 1.0 } else { 255.0 };
+        rgb.extend(
+            raw_rgb
+                .iter()
+                .map(|v| std::array::from_fn(|k| channel(f64::from(v[k]), c[k].1, scale))),
+        );
+    }
     out.intensity = match intensity {
         Some((_, s)) => intensities(&raw_intensity, s.is_float()),
         None => vec![MID_GRAY; n],

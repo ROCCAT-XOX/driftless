@@ -434,7 +434,7 @@ fn ply_ascii_with_float_color() {
                 property float scalar_Intensity\r\nend_header\r\n\
                 1.5 2 -3 0.1 1 0 0 10\r\n\
                 -1e-1 0.25 4 0 0 0.5 0 20.5\r\n\
-                7 8 9 0 0 0 1.5 255\r\n";
+                7 8 9 0 0 0 1 255\r\n";
     std::fs::write(&path, text).unwrap();
     let p = load_ply(&path, &Progress::new()).unwrap();
     assert_eq!(p.len(), 3);
@@ -446,10 +446,32 @@ fn ply_ascii_with_float_color() {
             assert!((a[k] - w[k]).abs() < 1e-6, "point {i}: {a:?}");
         }
     }
-    // 0–1 scaled to 0–255, beyond 1 clamped
+    // all within 0–1: scaled to 0–255
     assert_eq!(p.rgb, Some(vec![[255, 0, 0], [0, 128, 0], [0, 0, 255]]));
     assert_eq!(p.intensity, vec![10, 21, 255]);
     assert_eq!(p.flags, vec![0; 3]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Float colours of a foreign file in 0–255: one value above 1 tells the range, so they are
+/// taken as they are (rounded, clamped), not ×255.
+#[test]
+fn ply_float_color_0_255() {
+    let dir = tmp("app-ply-float-255");
+    let path = dir.join("fremd.ply");
+    let text = "ply\nformat ascii 1.0\nelement vertex 4\nproperty float x\nproperty float y\n\
+                property float z\nproperty double red\nproperty double green\n\
+                property double blue\nend_header\n\
+                0 0 0 255 128.4 0\n\
+                1 0 0 1 0.6 0\n\
+                2 0 0 300 -4 nan\n\
+                3 0 0 0.2 0 1\n";
+    std::fs::write(&path, text).unwrap();
+    let p = load_ply(&path, &Progress::new()).unwrap();
+    assert_eq!(
+        p.rgb,
+        Some(vec![[255, 128, 0], [1, 1, 0], [255, 0, 0], [0, 0, 1]])
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 

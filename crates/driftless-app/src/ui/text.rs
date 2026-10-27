@@ -75,6 +75,81 @@ pub const RECOMPUTE_HINT: &str = "Scan wählen und „Rechnen“ drücken";
 pub const MAP_STATUS_PENDING: &str = "Karten werden geprüft …";
 pub const ADVANCED: &str = "Erweitert";
 
+// Merging scans into a model („Daten“)
+/// Opens the field that merges scans; shown once two scans have a finished map.
+pub const MERGE_OPEN: &str = "Zusammenführen …";
+pub const MERGE_OPEN_HINT: &str = "Mehrere Scans desselben Orts zu einem Modell vereinen";
+pub const MERGE_TITLE: &str = "Scans zusammenführen";
+pub const MERGE_HINT: &str =
+    "Der erste angehakte Scan ist der Bezug: die anderen werden an ihm ausgerichtet.";
+/// Beside the first ticked scan, and in the model for the scan the others were placed at.
+pub const MERGE_REFERENCE: &str = "Bezug";
+pub const MERGE_NO_MAP: &str = "Noch keine fertige Karte – zuerst rechnen";
+pub const MERGE_MAP: &str = "Karte";
+pub const MERGE_UNSURE: &str = "Auch unsichere übernehmen";
+pub const MERGE_UNSURE_HINT: &str = "Nimmt auch Scans ins Modell, deren Lage nicht sicher \
+     gefunden wurde. Gescheiterte nie.";
+/// The start button of the field, and the label of the job.
+pub const MERGE_START: &str = "Zusammenführen";
+pub const MERGE_START_HINT: &str = "Richtet die Scans aneinander aus und legt ein neues Modell an";
+pub const MERGE_CLOSE: &str = "Schließen";
+pub const MERGE_NEEDS_TWO: &str = "Mindestens zwei Scans anhaken";
+/// Above the models in „Daten“.
+pub const MODELS: &str = "Modelle";
+/// How surely a scan was placed in a model (the words of `modell.json`).
+pub const VERDICT_SURE: &str = "sicher";
+pub const VERDICT_UNSURE: &str = "unsicher";
+pub const VERDICT_FAILED: &str = "gescheitert";
+/// A scan of a model whose points are not in it.
+pub const NOT_IN_MODEL: &str = "nicht im Modell";
+pub const NOT_IN_MODEL_UNSURE: &str = "„Auch unsichere übernehmen“ nimmt ihn auf";
+pub const VERDICT_HINT: &str = "Überlappung: welcher Teil des Scans im Modell wiederkehrt. \
+     Restversatz: wie weit seine Punkte im Mittel neben denen der anderen liegen.";
+/// A model whose maps were computed anew since the merge.
+pub const MODEL_STALE: &str = "veraltet – Karte eines Scans neu gerechnet";
+pub const STATUS_MODEL_STALE: &str = "Modell veraltet";
+pub const STATUS_MODEL_STALE_HINT: &str =
+    "Eine Karte des Modells wurde neu gerechnet – in „Daten“ neu zusammenführen";
+pub const COMPUTE_MODEL_SURFACE_HINT: &str =
+    "Rechnet die Oberfläche des Modells aus den Bildern aller seiner Scans";
+pub const UNKNOWN_MODEL: &str = "Modell nicht im Projekt";
+
+/// „Modell 001“: a model folder `modell-001`.
+pub fn model_label(digits: &str) -> String {
+    format!("Modell {digits}")
+}
+
+/// A model in „Bilder“: „Modell 001 · 3 Scans“.
+pub fn model_card(label: &str, scans: usize) -> String {
+    match scans {
+        1 => format!("{label} · 1 Scan"),
+        n => format!("{label} · {n} Scans"),
+    }
+}
+
+/// A stale model in the tree: „Modell 001 · veraltet – Karte eines Scans neu gerechnet“.
+pub fn model_stale(label: &str) -> String {
+    format!("{label} · {MODEL_STALE}")
+}
+
+/// A scan of a model: „2 · Scan 13:30“ (its number, as the point info names it).
+pub fn model_member(nr: usize, name: &str) -> String {
+    format!("{nr} · {name}")
+}
+
+/// Under a scan of a model: „Überlappung 98 % · Restversatz 1,8 mm“.
+pub fn member_numbers(overlap: f64, residual_mm: f64) -> String {
+    format!(
+        "Überlappung {} % · Restversatz {} mm",
+        (overlap * 100.0).round() as i64,
+        decimal(residual_mm, 1)
+    )
+}
+
+pub fn unknown_model(dir: &std::path::Path) -> String {
+    format!("{UNKNOWN_MODEL}: {}", dir.display())
+}
+
 // Step 2 „Bilder“
 /// The main button without a selected map: every map without a current surface, one after
 /// the other.
@@ -248,6 +323,8 @@ pub const POINT_INTENSITY: &str = "Intensität";
 pub const POINT_COLOR: &str = "Farbe";
 pub const POINT_QUALITY: &str = "Güte der Teilkarte";
 pub const POINT_REMOVED: &str = "Entfernt als";
+/// The scan of a point of a merged model, counted from 1 as in the model's list.
+pub const POINT_SCAN: &str = "Scan";
 pub const NO_COLOR: &str = "ohne Farbe";
 /// Tooltip of the × of the clicked point.
 pub const CLOSE_POINT: &str = "Punkt schließen";

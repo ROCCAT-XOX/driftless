@@ -18,6 +18,7 @@ use crate::surface::{load_glb, surface_glb};
 use crate::synthetic::synthetic_cloud;
 use driftless_gpu::GpuPref;
 use driftless_io::progress::Progress;
+use driftless_steps::merge::MODEL_LAS;
 use driftless_steps::{correct, StepError};
 use eframe::egui;
 use std::collections::VecDeque;
@@ -832,13 +833,30 @@ impl DriftlessApp {
     /// its run.
     fn load_selected(&mut self) {
         match self.state.selection.clone() {
+            Selection::Cloud(path) if self.is_model_cloud(&path) => self.load_model_cloud(path),
             Selection::Cloud(path) => {
                 let run = self.state.selected_run().map(|(_, r)| r.dir.clone());
                 self.load(CloudSource::File { path, run });
             }
             Selection::Surface(dir) => self.load_surface(&dir),
+            Selection::Model(dir) => self.load_model_cloud(dir.join(MODEL_LAS)),
             _ => {}
         }
+    }
+
+    /// Whether `path` is the `modell.las` of a model of the project.
+    fn is_model_cloud(&self, path: &Path) -> bool {
+        self.state
+            .models
+            .iter()
+            .any(|m| m.dir.join(MODEL_LAS) == path)
+    }
+
+    /// Loads the `modell.las` of a model and colours it by scan, once: another colour chosen
+    /// afterwards stays until a model is picked again.
+    fn load_model_cloud(&mut self, path: PathBuf) {
+        self.state.view.color_mode = crate::render::ColorMode::Scan;
+        self.load(CloudSource::File { path, run: None });
     }
 
     /// Loads the best cloud of the map in `dir` (colour, else clean, else dense), with the
@@ -1200,6 +1218,10 @@ impl DriftlessApp {
                 self.state.selection = Selection::Map(done.dir.clone());
                 self.load_best_of_map(&done.dir);
             }
+            (Some(JobOutput::Model(dir)), _) if show => {
+                self.state.selection = Selection::Model(dir.clone());
+                self.load_model_cloud(dir.join(MODEL_LAS));
+            }
             (Some(JobOutput::SurfaceStep(done)), _) => {
                 if done.reused {
                     self.info(text::surface_fits(&done.dir));
@@ -1483,11 +1505,19 @@ impl DriftlessApp {
             | Action::Reuse(_)
             | Action::RestoreHistory { .. }
             | Action::RunMap(_)
-            | Action::RunSurface(_)) => {
-                if let Err(e) = actions::start_step(&mut self.state, &mut self.jobs, &step) {
-                    self.error(e);
+            | Action::RunSurface(_)
+            | Action::RunMerge { .. }
+            | Action::RunModelSurface { .. }) => {
+                match actions::start_step(&mut self.state, &mut self.jobs, &step) {
+                    // the merge runs: its field closes, the model shows when it is done
+                    Ok(()) if matches!(step, Action::RunMerge { .. }) => {
+                        self.state.merge.open = false
+                    }
+                    Ok(()) => {}
+                    Err(e) => self.error(e),
                 }
             }
+            Action::OpenMerge => self.state.open_merge(),
             change @ (Action::AddLoop { .. } | Action::SetLoopEnabled { .. }) => {
                 self.change_corrections(change)
             }
