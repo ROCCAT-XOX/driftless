@@ -406,7 +406,7 @@ impl CompareState {
 }
 
 /// A choice among `options`; the new one when it was changed.
-fn choose<T: Clone + PartialEq>(
+pub(crate) fn choose<T: Clone + PartialEq>(
     ui: &mut Ui,
     id: &str,
     label: &str,
@@ -432,6 +432,37 @@ fn choose<T: Clone + PartialEq>(
             .response
             .labelled_by(shown.id);
     });
+    picked
+}
+
+/// [`choose`] with the label on its own line and the choice as wide as the field, its full
+/// text on hover: for long names in a narrow field („SLAM 001 · Karte 001“).
+pub(crate) fn choose_wide<T: Clone + PartialEq>(
+    ui: &mut Ui,
+    id: &str,
+    label: &str,
+    current: Option<&T>,
+    options: &[(T, String)],
+) -> Option<T> {
+    let mut picked = None;
+    let shown = ui.label(label);
+    let text = current
+        .and_then(|c| options.iter().find(|(o, _)| o == c))
+        .map_or(text::CHOOSE.to_string(), |(_, l)| l.clone());
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(text.clone())
+        .width(ui.available_width())
+        .truncate()
+        .show_ui(ui, |ui| {
+            for (o, l) in options {
+                if ui.selectable_label(current == Some(o), l).clicked() && current != Some(o) {
+                    picked = Some(o.clone());
+                }
+            }
+        })
+        .response
+        .labelled_by(shown.id)
+        .on_hover_text(text);
     picked
 }
 

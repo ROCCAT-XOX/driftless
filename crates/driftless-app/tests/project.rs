@@ -1,17 +1,28 @@
 //! The project model on synthetic scans: `project.toml`, run folders, map folders, CLI
-//! folders added as runs, missing scan folders.
+//! folders added as runs, missing scan folders, models merged from several scans.
 
-use driftless_app::project::{map_dir_for, run_map_job, run_slam_job, Project, ScanState, SlamJob};
+use driftless_app::project::{
+    map_dir_for, model_picks, model_status, model_surface_status, point_pairs, run_map_job,
+    run_merge_job, run_model_surface_job, run_pairs_merge_job, run_slam_job,
+    set_point_pair_enabled, MergePick, Project, ScanState, SlamJob, SurfaceSettings,
+};
+use driftless_gpu::GpuPref;
 use driftless_io::progress::{Progress, ProgressSnapshot};
-use driftless_io::testscan::{room_bag_at, room_bag_secs, tmp};
+use driftless_io::testscan::{furnished_room_bag, room_bag_at, room_bag_secs, tmp};
+use driftless_map::surface::SurfaceConfig;
 use driftless_steps::correct;
 use driftless_steps::history::HistoryKind;
-use driftless_steps::map::{run_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches};
+use driftless_steps::map::{
+    map_input_for, run_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches,
+};
+use driftless_steps::merge::{member_transform, read_model, MODEL_LAS, MODEL_REPORT};
+use driftless_steps::pairs::{PointPairEntry, PointPairs, POINT_PAIRS_FILE};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::StepError;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 fn canon(p: &Path) -> PathBuf {
     driftless_app::project::canonical(p).unwrap()
@@ -776,4 +787,315 @@ fn add_run_checks_the_scan() {
     assert!(err.contains("gehört nicht zum Scan"), "{err}");
     assert!(p.scans[1].extra_runs.is_empty());
     p.add_run(&id_a, &lauf).unwrap();
+}
+
+/// Two synthetic scans of one furnished room – B from (0.8, 0.5, 0) turned by 30° – each with
+/// a run and a cleaned map in `<scan>/driftless` as the CLI makes them. Made once for the
+/// merge tests, which only read them.
+struct MergeScans {
+    a: PathBuf,
+    b: PathBuf,
+}
+
+fn merge_scans() -> &'static MergeScans {
+    static SCANS: OnceLock<MergeScans> = OnceLock::new();
+    SCANS.get_or_init(|| {
+        let root = tmp("app-merge-scans");
+        let (a, b) = (root.join("a"), root.join("b"));
+        for d in [&a, &b] {
+            fs::create_dir_all(d).unwrap();
+        }
+        furnished_room_bag(&a, true, [0.0; 3], 0.0);
+        furnished_room_bag(&b, true, [0.8, 0.5, 0.0], 30f64.to_radians());
+        for d in [&a, &b] {
+            let out = d.join("driftless");
+            cli_slam(d, &out, false);
+            let input = map_input_for(d, &out, &out, SlamSettings::default());
+            run_map(
+                &MapRequest {
+                    input,
+                    out_dir: out,
+                },
+                &Progress::new(),
+            )
+            .unwrap();
+        }
+        MergeScans {
+            a: canon(&a),
+            b: canon(&b),
+        }
+    })
+}
+
+/// A project in `dir/projekt` with both scans of [`merge_scans`], their runs added.
+fn merge_project(dir: &Path) -> Project {
+    let s = merge_scans();
+    let mut p = Project::create(&dir.join("projekt"), "Modell").unwrap();
+    for scan in [&s.a, &s.b] {
+        let id = p.add_scan(scan).unwrap();
+        p.add_run(&id, &scan.join("driftless")).unwrap();
+    }
+    p.save().unwrap();
+    p
+}
+
+/// Every scan of `p` with the map in the folder of its run.
+fn picks(p: &Project) -> Vec<MergePick> {
+    p.scans
+        .iter()
+        .map(|s| {
+            let run = p.runs(&s.id).remove(0);
+            assert_eq!(run.maps.len(), 1, "{}", run.label);
+            MergePick {
+                scan_id: s.id.clone(),
+                map: run.maps[0].dir.clone(),
+                run: run.dir,
+            }
+        })
+        .collect()
+}
+
+fn models_dir(p: &Project) -> PathBuf {
+    p.dir.join("modelle")
+}
+
+#[test]
+fn merge_job_creates_model_dir() {
+    let dir = tmp("app-merge-job");
+    let p = merge_project(&dir);
+    let picks = picks(&p);
+    let first = run_merge_job(&p, &picks, false, &Progress::new()).unwrap();
+    assert_eq!(first, models_dir(&p).join("modell-001"));
+    assert!(first.join(MODEL_REPORT).is_file());
+    assert!(first.join(MODEL_LAS).is_file());
+    let before = files(&first);
+    // nothing is overwritten: a second merge is a new folder
+    let second = run_merge_job(&p, &picks, false, &Progress::new()).unwrap();
+    assert_eq!(second, models_dir(&p).join("modell-002"));
+    assert_eq!(files(&first), before, "modell-001 untouched");
+    // one scan only: refused, no folder
+    let err = run_merge_job(&p, &picks[..1], false, &Progress::new()).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("mindestens zwei"),
+        "{err}"
+    );
+    assert_eq!(names(&models_dir(&p)), ["modell-001", "modell-002"]);
+    // a scan not in the project
+    let mut wrong = picks.clone();
+    wrong[1].scan_id = "gibt-es-nicht".into();
+    assert!(run_merge_job(&p, &wrong, false, &Progress::new()).is_err());
+    assert_eq!(names(&models_dir(&p)), ["modell-001", "modell-002"]);
+}
+
+#[test]
+fn cancelled_merge_job_leaves_no_dir() {
+    let dir = tmp("app-merge-cancel");
+    let p = merge_project(&dir);
+    let picks = picks(&p);
+    let progress = Progress::new();
+    let handle = progress.clone();
+    let progress = progress.with_observer(move |s: &ProgressSnapshot| {
+        if s.phase == "Ausrichten" {
+            handle.cancel();
+        }
+    });
+    let err = run_merge_job(&p, &picks, false, &progress).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    let left: Vec<String> = fs::read_dir(models_dir(&p))
+        .map(|e| {
+            e.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}");
+    // a failing merge too: the same run twice
+    let twice = vec![picks[0].clone(), picks[0].clone()];
+    assert!(run_merge_job(&p, &twice, false, &Progress::new()).is_err());
+    assert!(p.models().is_empty());
+    assert!(!models_dir(&p).join("modell-001").exists());
+}
+
+#[test]
+fn models_listed_with_verdicts() {
+    let dir = tmp("app-merge-list");
+    let p = merge_project(&dir);
+    assert!(p.models().is_empty());
+    let made = run_merge_job(&p, &picks(&p), false, &Progress::new()).unwrap();
+    // a folder without a report (a merge still running, or stopped) and others are no model
+    fs::create_dir_all(models_dir(&p).join("modell-002")).unwrap();
+    fs::create_dir_all(models_dir(&p).join("anderes")).unwrap();
+    let models = p.models();
+    assert_eq!(models.len(), 1);
+    let m = &models[0];
+    assert_eq!(m.dir, made);
+    assert_eq!(m.label, "Modell 001");
+    assert!(m.surfaces.is_empty());
+    let verdicts: Vec<&str> = m
+        .report
+        .members
+        .iter()
+        .map(|x| x.verdict.as_str())
+        .collect();
+    assert_eq!(verdicts, ["sicher", "sicher"]);
+    assert_eq!(m.report.members[0].method, "bezug");
+    assert!(m.report.members.iter().all(|x| x.included));
+    assert_eq!(m.report.members[1].scan, merge_scans().b);
+    assert!(!model_status(m).stale);
+}
+
+#[test]
+fn model_surface_job_reuses_a_fitting_surface() {
+    let dir = tmp("app-merge-surface");
+    let p = merge_project(&dir);
+    run_merge_job(&p, &picks(&p), false, &Progress::new()).unwrap();
+    let model = p.models().remove(0);
+    let settings = SurfaceSettings {
+        config: SurfaceConfig {
+            voxel: 0.05,
+            min_weight: 1,
+            min_component_faces: 10,
+            page_size: 256,
+            simplify_error: 0.01,
+            ..SurfaceConfig::default()
+        },
+        texture: false,
+    };
+    let done = run_model_surface_job(&model, &settings, GpuPref::Off, &Progress::new()).unwrap();
+    assert!(!done.reused);
+    assert_eq!(done.dir, model.dir.join("oberflaeche-001"));
+    let model = p.models().remove(0);
+    assert_eq!(model.surfaces.len(), 1);
+    assert_eq!(model.surfaces[0].label, "Oberfläche 001");
+    assert_eq!(model.surfaces[0].settings.as_ref(), Some(&settings));
+    let status = model_surface_status(&model, &model.surfaces[0]);
+    assert!(!status.stale && status.seconds.is_some(), "{status:?}");
+    // the same again: kept, nothing computed
+    let again = run_model_surface_job(&model, &settings, GpuPref::Off, &Progress::new()).unwrap();
+    assert!(again.reused);
+    assert_eq!(again.dir, done.dir);
+    // with other settings, cancelled: no new folder
+    let other = SurfaceSettings {
+        config: SurfaceConfig {
+            voxel: 0.04,
+            ..settings.config.clone()
+        },
+        texture: false,
+    };
+    let progress = Progress::new();
+    progress.cancel();
+    let err = run_model_surface_job(&model, &other, GpuPref::Off, &progress).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    assert!(!model.dir.join("oberflaeche-002").exists());
+    // a surface without its report is stale
+    let mut broken = model.surfaces[0].clone();
+    broken.dir = model.dir.join("oberflaeche-009");
+    assert!(model_surface_status(&model, &broken).stale);
+}
+
+/// „Übernehmen und neu zusammenführen“: the pairs are added to `modelle/punktpaare.toml` and
+/// the same scans are merged again into the next model, the scan placed by the pairs. A
+/// switched-off entry no longer counts; an entry that cannot be used adds nothing.
+#[test]
+fn pairs_rerun_creates_next_model() {
+    use driftless_traj::nalgebra::Point3;
+    let dir = tmp("app-merge-pairs");
+    let p = merge_project(&dir);
+    let first = run_merge_job(&p, &picks(&p), false, &Progress::new()).unwrap();
+    let model = p.models().remove(0);
+    let members = &model.report.members;
+    assert_eq!(model_picks(&p, &model.report).unwrap(), picks(&p));
+    let before = files(&first);
+    // three places of the room in the model frame (= frame of A), and where B sees them
+    let in_model = [[0.5, 0.5, 0.3], [2.5, 0.8, 1.2], [1.0, 2.5, 2.0]];
+    let t_b = member_transform(&members[1]);
+    let in_b = in_model.map(|q| {
+        let r = t_b.inverse() * Point3::from(q);
+        [r.x, r.y, r.z]
+    });
+    let entry = PointPairEntry {
+        a: members[0].map_dir.clone(),
+        b: members[1].map_dir.clone(),
+        points_a: in_model.to_vec(),
+        points_b: in_b.to_vec(),
+        enabled: true,
+        note: "Ecken".into(),
+        added: String::new(),
+        unknown: Default::default(),
+    };
+    let second = run_pairs_merge_job(&p, &model, entry.clone(), &Progress::new()).unwrap();
+    assert_eq!(second, models_dir(&p).join("modell-002"));
+    assert_eq!(files(&first), before, "modell-001 untouched");
+    let file = models_dir(&p).join(POINT_PAIRS_FILE);
+    let saved = PointPairs::load(&file).unwrap();
+    assert_eq!(saved.entries.len(), 1);
+    // the scans lie outside the project: absolute
+    assert_eq!(saved.entries[0].a, members[0].map_dir);
+    assert!(!saved.entries[0].added.is_empty());
+    assert_eq!(point_pairs(&p).unwrap()[0].b, members[1].map_dir);
+    let report = read_model(&second).unwrap();
+    let dirs = |r: &driftless_steps::merge::ModelReport| -> Vec<PathBuf> {
+        r.members.iter().map(|m| m.map_dir.clone()).collect()
+    };
+    assert_eq!(
+        dirs(&report),
+        dirs(&model.report),
+        "same scans, same reference"
+    );
+    assert_eq!(report.members[1].method, "punktpaare");
+    assert_eq!(report.members[1].verdict, "sicher");
+
+    // switched off: the next merge aligns B by itself again
+    set_point_pair_enabled(&p, 0, false).unwrap();
+    assert!(!PointPairs::load(&file).unwrap().entries[0].enabled);
+    let third = run_merge_job(&p, &picks(&p), false, &Progress::new()).unwrap();
+    assert_ne!(read_model(&third).unwrap().members[1].method, "punktpaare");
+    assert!(set_point_pair_enabled(&p, 5, true).is_err());
+
+    // points on a line fix no turn: refused, nothing saved, no new model
+    let mut line = entry;
+    line.points_a = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
+    line.points_b = line.points_a.clone();
+    let err = run_pairs_merge_job(&p, &model, line, &Progress::new()).unwrap_err();
+    assert!(err.to_string().contains("Linie"), "{err}");
+    assert_eq!(PointPairs::load(&file).unwrap().entries.len(), 1);
+    assert_eq!(p.models().len(), 3);
+    assert!(!report.include_unsure, "merged without unsure ones");
+
+    // „Auch unsichere übernehmen“ is stored in the model, and the rerun with point pairs keeps
+    // it although no member is unsure
+    let fourth = run_merge_job(&p, &picks(&p), true, &Progress::new()).unwrap();
+    let unsure = read_model(&fourth).unwrap();
+    assert!(unsure.include_unsure);
+    assert!(unsure.members.iter().all(|m| m.verdict != "unsicher"));
+    let model = p
+        .models()
+        .into_iter()
+        .find(|m| m.dir == fourth)
+        .expect("the fourth model");
+    let fifth = run_pairs_merge_job(&p, &model, entry_again(&model), &Progress::new()).unwrap();
+    assert!(read_model(&fifth).unwrap().include_unsure);
+}
+
+/// A point pair entry between the first two members of `model` (the same room corners as
+/// above, by its transforms).
+fn entry_again(model: &driftless_app::project::ModelInfo) -> PointPairEntry {
+    use driftless_traj::nalgebra::Point3;
+    let members = &model.report.members;
+    let in_model = [[0.5, 0.5, 0.3], [2.5, 0.8, 1.2], [1.0, 2.5, 2.0]];
+    let t_b = member_transform(&members[1]);
+    PointPairEntry {
+        a: members[0].map_dir.clone(),
+        b: members[1].map_dir.clone(),
+        points_a: in_model.to_vec(),
+        points_b: in_model
+            .map(|q| {
+                let r = t_b.inverse() * Point3::from(q);
+                [r.x, r.y, r.z]
+            })
+            .to_vec(),
+        enabled: true,
+        note: "Ecken".into(),
+        added: String::new(),
+        unknown: Default::default(),
+    }
 }

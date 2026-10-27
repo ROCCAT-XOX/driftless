@@ -1,5 +1,6 @@
-//! A point cloud loaded from LAS for the 3D view: columns relative to an origin in whole
-//! metres, so that `f32` keeps millimetres even for coordinates of ~10⁶ m.
+//! A point cloud loaded from LAS or PLY ([`crate::ply`]) for the 3D view: columns relative
+//! to an origin in whole metres, so that `f32` keeps millimetres even for coordinates of
+//! ~10⁶ m.
 
 use crate::lod::{build_octree, Octree};
 use driftless_io::progress::Progress;
@@ -8,6 +9,8 @@ use driftless_steps::overlay::submap_at;
 use driftless_steps::StepError;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+pub use crate::ply::load_ply;
 
 /// Points read per batch (one cancel check and one progress step each).
 const BATCH: usize = 1 << 20;
@@ -36,6 +39,9 @@ pub struct PointSet {
     pub quality_known: bool,
     /// LAS `user_data`: 1 = without measured colour, or the removal reason.
     pub flags: Vec<u8>,
+    /// The scan of each point in a model merged from several (LAS `point_source_id`, PLY
+    /// `scan`); empty if unknown or if all points have the same.
+    pub source: Vec<u16>,
 }
 
 impl PointSet {
@@ -51,6 +57,7 @@ impl PointSet {
             quality: vec![255; n],
             quality_known: false,
             flags: vec![0; n],
+            source: Vec::new(),
         }
     }
 
@@ -110,7 +117,8 @@ fn origin_of(bounds: &las::Bounds, first: &[[f64; 3]]) -> [f64; 3] {
 /// its submap ([`submap_at`]) and so its quality. LAS intensity 0–65535 becomes `>> 8`; a
 /// file whose intensities are all 0 (none recorded) is shown [`MID_GRAY`]. Files whose
 /// colours (or intensities) never exceed 255 store 8-bit values; those are taken as they are.
-/// The origin comes from the header bounds unless they do not fit the first points.
+/// The origin comes from the header bounds unless they do not fit the first points. The
+/// `point_source_id` becomes [`PointSet::source`] if it differs between points.
 pub fn load_las(
     path: &Path,
     slam: Option<&SlamReport>,
@@ -132,6 +140,7 @@ pub fn load_las(
         quality: Vec::with_capacity(capacity),
         quality_known: slam.is_some(),
         flags: Vec::with_capacity(capacity),
+        source: Vec::with_capacity(capacity),
     };
     // Time zero: the scan start of the report, else the first point's time.
     let mut t0 = slam.map(|s| s.scan_start);
@@ -187,6 +196,7 @@ pub fn load_las(
             max_intensity = max_intensity.max(p.intensity);
             low.push([c.red, c.green, c.blue, p.intensity].map(|v| v as u8));
             out.flags.push(p.user_data);
+            out.source.push(p.point_source_id);
             match p.gps_time {
                 Some(g) => {
                     timed = true;
@@ -220,6 +230,9 @@ pub fn load_las(
     out.quality_known &= timed;
     if out.intensity.iter().all(|&i| i == 0) {
         out.intensity.fill(MID_GRAY);
+    }
+    if out.source.windows(2).all(|w| w[0] == w[1]) {
+        out.source = Vec::new();
     }
     Ok(out)
 }
@@ -300,8 +313,10 @@ impl LoadedCloud {
 }
 
 /// Reads `path` and builds its levels of detail: phase [`PHASE_LOAD`], then
-/// [`crate::lod::PHASE_BUILD`]. With `run`, the `slam.json` of that run folder gives each
-/// point the quality of its submap; without it (or unreadable) the quality is 255.
+/// [`crate::lod::PHASE_BUILD`]. A file ending in `.ply` (any case) is read by [`load_ply`],
+/// any other as LAS. With `run`, the `slam.json` of that run folder gives each point of a
+/// LAS the quality of its submap; without it (or unreadable, or for a PLY, which has no
+/// point times) the quality is 255.
 pub fn load_cloud(
     path: &Path,
     run: Option<&Path>,
@@ -311,13 +326,23 @@ pub fn load_cloud(
         .and_then(|dir| std::fs::read_to_string(dir.join("slam.json")).ok())
         .and_then(|t| serde_json::from_str(&t).ok());
     let t = Instant::now();
-    let points = load_las(path, report.as_ref(), progress)?;
+    let points = if is_ply(path) {
+        load_ply(path, progress)?
+    } else {
+        load_las(path, report.as_ref(), progress)?
+    };
     LoadedCloud::build(
         path.to_path_buf(),
         points,
         t.elapsed().as_secs_f64(),
         progress,
     )
+}
+
+/// Whether `path` ends in `.ply`, in any case.
+pub fn is_ply(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("ply"))
 }
 
 /// Points looked at by [`view_bounds`] at most.
@@ -402,4 +427,130 @@ pub fn estimate_ceiling(points: &PointSet) -> Option<f32> {
         return None;
     }
     Some(lo + bottom as f32 * width - CEILING_MARGIN)
+}
+
+/// Gap (m) along x between the model and the scan shown beside it for point pairs.
+pub const PAIR_GAP: f64 = 1.0;
+
+/// The cloud of „Von Hand ausrichten“: the model and, beside it, one of its scans.
+#[derive(Debug, Clone)]
+pub struct PairCloud {
+    pub cloud: LoadedCloud,
+    /// Added to the points of the scan (absolute, in the frame of that scan) to place them
+    /// beside the model: a point of the scan shown at `p` lies at `p − shift` in its frame.
+    pub shift: [f64; 3],
+}
+
+/// Keeps the entries of `v` whose `keep` is true.
+fn retain_by<T>(v: &mut Vec<T>, keep: &[bool]) {
+    let mut k = keep.iter();
+    v.retain(|_| *k.next().unwrap_or(&true));
+}
+
+/// Gray colours from intensities, for one part of a cloud whose other part has colours.
+fn grays(intensity: &[u8]) -> impl Iterator<Item = [u8; 3]> + '_ {
+    intensity.iter().map(|&i| [i; 3])
+}
+
+/// One point set of the points of a `model` (in the model frame, [`PointSet::source`] = the
+/// number of their scan, all `lone` if the model has none) without those of scan `member`,
+/// and of `scan` (in its own frame, from its map) shifted along x until its box starts
+/// [`PAIR_GAP`] beyond the box of the rest of the model (both boxes as [`view_bounds`] frames
+/// them, so that a few far points do not push the scan away); its points get `member` as
+/// their scan. The origin is that of the model. Colours of only one part are completed with
+/// grays of the intensity; times and flags are kept, qualities are unknown (255). Returns the
+/// set and the shift ([`PairCloud::shift`]).
+pub fn combine_pair_points(
+    mut model: PointSet,
+    lone: u16,
+    mut scan: PointSet,
+    member: u16,
+) -> (PointSet, [f64; 3]) {
+    if model.source.is_empty() {
+        model.source = vec![lone; model.len()];
+    }
+    if model.source.contains(&member) {
+        let keep: Vec<bool> = model.source.iter().map(|&s| s != member).collect();
+        retain_by(&mut model.xyz, &keep);
+        if let Some(rgb) = &mut model.rgb {
+            retain_by(rgb, &keep);
+        }
+        retain_by(&mut model.intensity, &keep);
+        retain_by(&mut model.t, &keep);
+        retain_by(&mut model.quality, &keep);
+        retain_by(&mut model.flags, &keep);
+        retain_by(&mut model.source, &keep);
+    }
+    if model.is_empty() {
+        model.origin = scan.origin;
+    }
+    let mut shift = [0.0; 3];
+    if let (Some((_, max)), Some((min, _))) = (view_bounds(&model), view_bounds(&scan)) {
+        let model_end = model.origin[0] + f64::from(max[0]);
+        let scan_start = scan.origin[0] + f64::from(min[0]);
+        shift[0] = model_end + PAIR_GAP - scan_start;
+    }
+    let rel: [f64; 3] = [0, 1, 2].map(|k| scan.origin[k] + shift[k] - model.origin[k]);
+    let n = scan.len();
+    let mut out = model;
+    out.xyz.reserve_exact(n);
+    out.xyz.extend(
+        scan.xyz
+            .iter()
+            .map(|p| [0, 1, 2].map(|k| (f64::from(p[k]) + rel[k]) as f32)),
+    );
+    scan.xyz = Vec::new();
+    out.rgb = match (out.rgb.take(), scan.rgb.take()) {
+        (None, None) => None,
+        (Some(mut a), b) => {
+            a.reserve_exact(n);
+            match b {
+                Some(b) => a.extend(b),
+                None => a.extend(grays(&scan.intensity)),
+            }
+            Some(a)
+        }
+        (None, Some(b)) => {
+            let mut a: Vec<[u8; 3]> = Vec::with_capacity(out.intensity.len() + n);
+            a.extend(grays(&out.intensity));
+            a.extend(b);
+            Some(a)
+        }
+    };
+    out.intensity.reserve_exact(n);
+    out.intensity.extend(&scan.intensity);
+    out.t.reserve_exact(n);
+    out.t.extend(&scan.t);
+    out.quality = vec![255; out.len()];
+    out.quality_known = false;
+    out.flags.reserve_exact(n);
+    out.flags.extend(&scan.flags);
+    out.source.reserve_exact(n);
+    out.source.resize(out.len(), member);
+    (out, shift)
+}
+
+/// Reads the `modell.las` of a model and the cloud `scan_cloud` of its scan `member` (LAS or
+/// PLY, in the frame of that scan), sets them side by side ([`combine_pair_points`]; `lone`
+/// is the scan of a model with points of only one) and builds the levels of detail; `name`
+/// names the cloud. In a job: phases [`PHASE_LOAD`] (twice) and
+/// [`crate::lod::PHASE_BUILD`], each with cancel checks.
+pub fn load_pair_cloud(
+    name: PathBuf,
+    model_las: &Path,
+    lone: u16,
+    scan_cloud: &Path,
+    member: u16,
+    progress: &Progress,
+) -> Result<PairCloud, StepError> {
+    let t = Instant::now();
+    let model = load_las(model_las, None, progress)?;
+    let scan = if is_ply(scan_cloud) {
+        load_ply(scan_cloud, progress)?
+    } else {
+        load_las(scan_cloud, None, progress)?
+    };
+    let (points, shift) = combine_pair_points(model, lone, scan, member);
+    let cloud = LoadedCloud::build(name, points, t.elapsed().as_secs_f64(), progress)?;
+    Ok(PairCloud { cloud, shift })
 }

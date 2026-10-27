@@ -161,6 +161,7 @@ fn menu_has_all_project_actions() {
         (text::OPEN_PROJECT, Action::PickOpenProject),
         (text::ADD_SCAN, Action::PickAddScan),
         (text::ADD_RUN, Action::PickAddRun("buero".into())),
+        (text::OPEN_CLOUD, Action::PickOpenCloud),
         (text::OPEN_SURFACE, Action::PickOpenSurface),
     ];
     let mut h = panel(project_state(), rail::show);
@@ -176,6 +177,7 @@ fn menu_has_all_project_actions() {
             (text::OPEN_PROJECT, ()),
             (text::ADD_SCAN, ()),
             (text::ADD_RUN, ()),
+            (text::OPEN_CLOUD, ()),
             (text::OPEN_SURFACE, ()),
         ] {
             h.get_by_label(l);
@@ -202,6 +204,7 @@ fn menu_without_project_or_scan_explains_locked_entries() {
     assert!(!disabled(&h, text::OPEN_PROJECT));
     assert!(disabled(&h, text::ADD_SCAN));
     assert!(disabled(&h, text::ADD_RUN));
+    assert!(!disabled(&h, text::OPEN_CLOUD));
     assert!(!disabled(&h, text::OPEN_SURFACE));
 }
 
@@ -283,6 +286,34 @@ fn settings_window_has_view_settings() {
     h.run();
     assert!(!h.state().state().settings_window.open);
     assert!(h.query_by_label(text::POINT_SIZE).is_none());
+}
+
+/// „je Scan“ is offered for a cloud of several scans only.
+#[test]
+fn settings_offer_scan_mode_only_for_models() {
+    for has_scans in [false, true] {
+        let mut app = app();
+        app.state_mut().cloud = Some(driftless_app::ui::CloudSummary {
+            path: PathBuf::from("modell.las"),
+            points: 10,
+            has_rgb: true,
+            has_scans,
+            quality_known: false,
+            z_range: [0.0, 1.0],
+            ceiling: None,
+            point_m: 0.015,
+        });
+        app.state_mut().settings_window.open = true;
+        let mut h = window(app);
+        h.get_by_label(text::MODE_RGB);
+        if !has_scans {
+            assert!(h.query_by_label(text::MODE_SCAN).is_none());
+            continue;
+        }
+        h.get_by_label(text::MODE_SCAN).click();
+        h.run();
+        assert_eq!(h.state().state().view.color_mode, ColorMode::Scan);
+    }
 }
 
 #[test]

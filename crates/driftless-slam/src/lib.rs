@@ -1,13 +1,19 @@
 //! SLAM on top of the odometry: submaps, loop detection and the pose graph over submap
-//! anchors.
+//! anchors, and the alignment of two scans for merging them.
 
+pub mod align;
 pub mod cache;
 pub mod corrections;
+pub mod features;
 pub mod loops;
 pub mod pipeline;
 pub mod report;
 pub mod submap;
 
+pub use align::{
+    align_pair, align_with_pairs, pair_quality, pose_from_pairs, AlignConfig, AlignMethod,
+    Alignment, PairQuality, Verdict,
+};
 pub use cache::{cache_fits, load_cache, read_cache, save_cache, CacheContents, CacheError};
 pub use corrections::{Corrections, LoopEntry};
 pub use loops::{

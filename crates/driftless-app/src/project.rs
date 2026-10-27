@@ -7,6 +7,8 @@
 //!                          slam-001/verlauf/   states of the run (driftless_steps::history)
 //!                          slam-001/karte-001/ a map of the run, one folder per set of switches
 //!                karte-001/oberflaeche-001/    a surface of the map (`driftless surface -o`)
+//! <projekt>/modelle/modell-001/                 scans merged into one model (`driftless merge -o`)
+//!                  modell-001/oberflaeche-001/  a surface of the model (`driftless surface --model`)
 //! ```
 //!
 //! `project.toml`:
@@ -35,7 +37,11 @@
 //! full SLAM run always gets a new `slam-NNN` (so no earlier `traj.tum` is replaced), and a map
 //! is written only into a `karte-NNN` whose `map.json` fits the request, or into a new one. A
 //! surface is only computed if no `oberflaeche-NNN` of the map fits the request, and then into a
-//! new one ([`run_surface_job`]).
+//! new one ([`run_surface_job`]). Every merge gets a new `modell-NNN` ([`run_merge_job`]); a
+//! folder without `modell.json` is no model (the report is written last). `project.toml`
+//! does not list the models: [`Project::models`] reads the folder. Point pairs marked by hand
+//! are kept in `modelle/punktpaare.toml` ([`driftless_steps::pairs`], paths relative to that
+//! folder) and count in every merge of the project.
 
 use crate::surface::SURFACE_GLB;
 use crate::ui::text;
@@ -45,16 +51,24 @@ use driftless_io::bag::BagReader;
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_map::surface::SurfaceConfig;
+use driftless_slam::align::AlignConfig;
 use driftless_steps::correct::utc_now;
 use driftless_steps::history::{self, HistoryEntry};
 use driftless_steps::map::{
-    fitting_stages, folder_fits, run_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches,
-    CLEAN_BIN, DENSE_BIN, REPORT,
+    clean_stage_id, fitting_stages, folder_fits, hex, map_input_for, run_map, MapInput, MapRequest,
+    MapSettings, MapStep, MapSwitches, CLEAN_BIN, DENSE_BIN, REPORT,
+};
+use driftless_steps::merge::{read_model, run_merge, MergeMember, MergeRequest, ModelReport};
+use driftless_steps::pairs::{
+    stored_path as from_stored, stored_text, PointPairEntry, PointPairs, POINT_PAIRS_FILE,
 };
 use driftless_steps::slam::{
     cache_fits, run_slam, SlamOutcome, SlamRequest, SlamSettings, CACHE_FILE, CORRECTIONS_FILE,
 };
-use driftless_steps::surface::{run_surface, surface_fits, SurfaceRequest, SURFACE_REPORT};
+use driftless_steps::surface::{
+    model_surface_fits, run_model_surface, run_surface, surface_fits, ModelSurfaceRequest,
+    SurfaceRequest, SURFACE_REPORT,
+};
 use driftless_steps::StepError;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -65,6 +79,11 @@ use std::path::{Component, Path, PathBuf};
 pub const PROJECT_FILE: &str = "project.toml";
 pub const RUN_FILE: &str = "lauf.toml";
 pub const SCANS_DIR: &str = "scans";
+/// The models of the project: `modelle/modell-NNN`.
+pub const MODELS_DIR: &str = "modelle";
+pub const MODEL_PREFIX: &str = "modell-";
+/// One point per cell of this size (m) in a model, as `driftless merge` does by default.
+pub const MODEL_VOXEL: f64 = 0.01;
 const FORMAT: i64 = 1;
 const RUN_PREFIX: &str = "slam-";
 const MAP_PREFIX: &str = "karte-";
@@ -174,6 +193,26 @@ pub struct SurfaceInfo {
     /// What it was made with, from its `oberflaeche.json` ([`SurfaceSettings::from_report`]);
     /// `None` without a readable one.
     pub settings: Option<SurfaceSettings>,
+}
+
+/// A model of the project: scans merged into one (`modelle/modell-NNN` with `modell.json`).
+#[derive(Clone, Debug)]
+pub struct ModelInfo {
+    pub dir: PathBuf,
+    /// „Modell 001“.
+    pub label: String,
+    /// Its `modell.json`: where each scan sits and how sure that is.
+    pub report: ModelReport,
+    /// Its surfaces: subfolders `oberflaeche…` with an `oberflaeche.glb`.
+    pub surfaces: Vec<SurfaceInfo>,
+}
+
+/// A scan chosen for a model, with the run and the map of it to merge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergePick {
+    pub scan_id: String,
+    pub run: PathBuf,
+    pub map: PathBuf,
 }
 
 /// What the next surface is computed with: the settings of `driftless surface` (the program
@@ -340,31 +379,6 @@ fn to_stored(base: &Path, path: &Path) -> Result<String, ProjectError> {
         _ => path.to_str().map(str::to_string),
     };
     text.ok_or_else(|| ProjectError(format!("Pfad {} ist kein gültiger Text", path.display())))
-}
-
-/// Absolute on Windows: `C:\…`, `C:/…` or `\\server\…` (also read on another system, where
-/// such a path is just not found instead of being taken as relative).
-fn windows_absolute(text: &str) -> bool {
-    let b = text.as_bytes();
-    let drive =
-        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\');
-    drive || text.starts_with("\\\\") || text.starts_with("//")
-}
-
-/// A path from a project file: absolute as written, relative (with `/` or `\`) to `base`.
-fn from_stored(base: &Path, text: &str) -> PathBuf {
-    let p = Path::new(text);
-    if p.is_absolute() || windows_absolute(text) {
-        return p.to_path_buf();
-    }
-    let mut out = base.to_path_buf();
-    for part in text
-        .split(['/', '\\'])
-        .filter(|s| !s.is_empty() && *s != ".")
-    {
-        out.push(part);
-    }
-    out
 }
 
 /// Windows device names, which name no folder whatever the extension.
@@ -879,6 +893,24 @@ impl Project {
         own.chain(extra).collect()
     }
 
+    /// The models of the project: `modelle/modell-NNN` with a readable `modell.json`, by
+    /// number (a folder without one is a merge still running, stopped or broken). Reads each
+    /// report; call it when the tree is read, not every frame.
+    pub fn models(&self) -> Vec<ModelInfo> {
+        numbered(&self.dir.join(MODELS_DIR), MODEL_PREFIX)
+            .into_iter()
+            .filter_map(|(_, digits, dir)| {
+                let report = read_model(&dir).ok()?;
+                Some(ModelInfo {
+                    label: text::model_label(&digits),
+                    surfaces: surfaces_of(&dir),
+                    report,
+                    dir,
+                })
+            })
+            .collect()
+    }
+
     /// Creates the next `scans/<id>/slam-NNN` with its `lauf.toml`. For a job: the folder goes
     /// again when the guard is dropped without [`StepDir::keep`].
     pub fn new_run_dir(
@@ -1289,6 +1321,264 @@ pub fn run_surface_job(
     let dir = new_surface_dir(&map.dir)?;
     let req = surface_request(scan, run, map, settings, gpu, dir.path())?;
     let report = run_surface(&req, progress)?;
+    Ok(SurfaceDone {
+        dir: dir.keep(),
+        report,
+        reused: false,
+    })
+}
+
+/// The members of a merge of `picks`: fewer than two, or a scan, run or map not of the
+/// project, are refused.
+fn merge_members(project: &Project, picks: &[MergePick]) -> Result<Vec<MergeMember>, StepError> {
+    if picks.len() < 2 {
+        return Err(text::MERGE_NEEDS_TWO.into());
+    }
+    let mut members = Vec::with_capacity(picks.len());
+    for pick in picks {
+        let scan = project
+            .scan(&pick.scan_id)
+            .ok_or_else(|| Project::unknown(&pick.scan_id))?;
+        let run = project
+            .runs(&pick.scan_id)
+            .into_iter()
+            .find(|r| same_dir(&r.dir, &pick.run))
+            .ok_or_else(|| text::unknown_run(&pick.run))?;
+        if !run.maps.iter().any(|m| same_dir(&m.dir, &pick.map)) {
+            return Err(text::unknown_map(&pick.map).into());
+        }
+        members.push(MergeMember {
+            scan: scan.path.clone(),
+            slam_dir: run.dir.clone(),
+            map_dir: pick.map.clone(),
+            slam: run.settings,
+        });
+    }
+    Ok(members)
+}
+
+/// Merges the scans `picks` (the first is the reference) into a new `modelle/modell-NNN`, as
+/// `driftless merge` does with its defaults; `include_unsure` takes unsure scans in as well.
+/// Each run is taken with the settings of its `lauf.toml`, and the switched-on point pairs of
+/// `modelle/punktpaare.toml` that name two of the maps replace their automatic alignment.
+/// Fewer than two scans, a scan, run or map not of the project, or a pair file that cannot be
+/// read are refused before a folder is made; the new folder is removed again if the merge is
+/// cancelled or fails. Returns the model folder.
+pub fn run_merge_job(
+    project: &Project,
+    picks: &[MergePick],
+    include_unsure: bool,
+    progress: &Progress,
+) -> Result<PathBuf, StepError> {
+    let members = merge_members(project, picks)?;
+    let models = project.dir.join(MODELS_DIR);
+    let pairs = PointPairs::load(&point_pairs_file(project))?.resolved(&models);
+    let dir = create_numbered(&models, MODEL_PREFIX)?;
+    let req = MergeRequest {
+        members,
+        out_dir: dir.path().to_path_buf(),
+        align: AlignConfig::default(),
+        voxel: MODEL_VOXEL,
+        smooth: true,
+        include_unsure,
+        pairs,
+    };
+    run_merge(&req, progress)?;
+    Ok(dir.keep())
+}
+
+/// `modelle/punktpaare.toml` of the project.
+pub fn point_pairs_file(project: &Project) -> PathBuf {
+    project.dir.join(MODELS_DIR).join(POINT_PAIRS_FILE)
+}
+
+/// The point pairs of the project in file order, `a` and `b` as resolved folders (where they
+/// exist), so that they compare equal to [`driftless_steps::merge::ModelMember::map_dir`].
+/// No file means none. Reads the file: call it when the tree is read, not every frame.
+pub fn point_pairs(project: &Project) -> Result<Vec<PointPairEntry>, String> {
+    let models = project.dir.join(MODELS_DIR);
+    let pairs = PointPairs::load(&point_pairs_file(project)).map_err(|e| e.to_string())?;
+    let resolve = |p: &Path| canonical(p).unwrap_or_else(|_| p.to_path_buf());
+    Ok(pairs
+        .resolved(&models)
+        .into_iter()
+        .map(|e| PointPairEntry {
+            a: resolve(&e.a),
+            b: resolve(&e.b),
+            ..e
+        })
+        .collect())
+}
+
+/// Switches entry `index` (0-based) of `modelle/punktpaare.toml` on or off and saves the
+/// file; the entry itself stays. Counts from the next merge on.
+pub fn set_point_pair_enabled(
+    project: &Project,
+    index: usize,
+    enabled: bool,
+) -> Result<(), StepError> {
+    let file = point_pairs_file(project);
+    let mut pairs = PointPairs::load(&file)?;
+    pairs.set_enabled(index, enabled)?;
+    pairs.save(&file)
+}
+
+/// The scans of `report` as picks of the project, in its order (the first is the reference),
+/// each with the run and map it was merged from. Fails for a scan no longer in the project.
+pub fn model_picks(project: &Project, report: &ModelReport) -> Result<Vec<MergePick>, StepError> {
+    report
+        .members
+        .iter()
+        .map(|m| {
+            let scan = project
+                .scans
+                .iter()
+                .find(|s| same_dir(&s.path, &m.scan))
+                .ok_or_else(|| text::scan_not_in_project(&m.scan))?;
+            Ok(MergePick {
+                scan_id: scan.id.clone(),
+                run: m.slam_dir.clone(),
+                map: m.map_dir.clone(),
+            })
+        })
+        .collect()
+}
+
+/// „Übernehmen und neu zusammenführen“: adds `entry` (map folders absolute, points in the
+/// frame of each scan) to `modelle/punktpaare.toml`, its folders relative to that file and
+/// with the time it was added, then merges the scans of `model` again as they were merged
+/// ([`model_picks`], unsure ones taken in if the model was merged so) into a new `modell-NNN`
+/// ([`run_merge_job`]). An entry that cannot be used ([`PointPairs::add`]) adds nothing and
+/// makes no model; the entry stays saved if the merge then fails or is cancelled (it can be
+/// switched off).
+pub fn run_pairs_merge_job(
+    project: &Project,
+    model: &ModelInfo,
+    entry: PointPairEntry,
+    progress: &Progress,
+) -> Result<PathBuf, StepError> {
+    let picks = model_picks(project, &model.report)?;
+    merge_members(project, &picks)?;
+    let include_unsure = model.report.include_unsure;
+    let file = point_pairs_file(project);
+    let models = project.dir.join(MODELS_DIR);
+    let mut pairs = PointPairs::load(&file)?;
+    pairs.add(PointPairEntry {
+        a: PathBuf::from(stored_text(&models, &entry.a)?),
+        b: PathBuf::from(stored_text(&models, &entry.b)?),
+        added: utc_now(),
+        ..entry
+    })?;
+    if progress.is_cancelled() {
+        return Err(StepError::Cancelled);
+    }
+    fs::create_dir_all(&models)
+        .map_err(|e| ProjectError(format!("{} nicht anlegbar: {e}", models.display())))?;
+    pairs.save(&file)?;
+    progress.info(text::PAIRS_SAVED.to_string());
+    run_merge_job(project, &picks, include_unsure, progress)
+}
+
+/// The request of a surface of `model` with `settings` into `out_dir`, computed on `gpu`.
+fn model_surface_request(
+    model: &ModelInfo,
+    settings: &SurfaceSettings,
+    gpu: GpuPref,
+    out_dir: &Path,
+) -> ModelSurfaceRequest {
+    ModelSurfaceRequest {
+        model_dir: model.dir.clone(),
+        out_dir: out_dir.to_path_buf(),
+        config: settings.config.clone(),
+        texture: settings.texture,
+        gpu,
+    }
+}
+
+/// Whether a scan folder of `model` cannot be read (an unplugged drive): then nothing of the
+/// model can be told stale.
+fn model_scan_missing(model: &ModelInfo) -> bool {
+    model
+        .report
+        .members
+        .iter()
+        .filter(|m| m.included)
+        .any(|m| discover_project(&m.scan).is_err())
+}
+
+/// The status of `model` itself: its runtime, and stale if the map of a scan in it was
+/// computed anew since the merge (the place of the scan in the model may not fit it any
+/// more: merge anew). Reads `traj.tum` and the bag lists of its scans: call it off the UI
+/// thread. A model whose scan cannot be read is never stale (that cannot be told).
+pub fn model_status(model: &ModelInfo) -> MapStatus {
+    let changed = |m: &driftless_steps::merge::ModelMember| {
+        let Some(id) = &m.clean_id else {
+            return false;
+        };
+        let input = map_input_for(&m.scan, &m.slam_dir, &m.map_dir, m.slam.clone());
+        clean_stage_id(&input).map_or(true, |now| hex(&now) != *id)
+    };
+    let stale = !model_scan_missing(model)
+        && model
+            .report
+            .members
+            .iter()
+            .filter(|m| m.included)
+            .any(changed);
+    MapStatus {
+        seconds: Some(model.report.seconds_total),
+        stale,
+    }
+}
+
+/// The status of `surface` of `model`, as [`surface_status`] for a map: stale if it no
+/// longer fits the model ([`model_surface_fits`]), without a readable report or with
+/// settings an earlier program wrote. Call it off the UI thread.
+pub fn model_surface_status(model: &ModelInfo, surface: &SurfaceInfo) -> MapStatus {
+    let report = fs::read_to_string(surface.dir.join(SURFACE_REPORT))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+    let seconds = report.as_ref().and_then(|v| v["seconds_total"].as_f64());
+    let stale = report.is_none()
+        || (!model_scan_missing(model)
+            && surface.settings.as_ref().is_none_or(|settings| {
+                let req = model_surface_request(model, settings, GpuPref::default(), &surface.dir);
+                !model_surface_fits(&req)
+            }));
+    MapStatus { seconds, stale }
+}
+
+/// Makes a surface of `model` with `settings` from the points and images of all its scans,
+/// as `driftless surface --model` does: if an `oberflaeche-NNN` of the model already fits,
+/// that one is kept and nothing is computed; else into a new `oberflaeche-NNN`, removed
+/// again if the step is cancelled or fails.
+pub fn run_model_surface_job(
+    model: &ModelInfo,
+    settings: &SurfaceSettings,
+    gpu: GpuPref,
+    progress: &Progress,
+) -> Result<SurfaceDone, StepError> {
+    settings.config.check()?;
+    for (_, _, dir) in numbered(&model.dir, SURFACE_NUMBERED).iter().rev() {
+        if model_surface_fits(&model_surface_request(model, settings, gpu, dir)) {
+            progress.info(text::surface_fits(dir));
+            let report = fs::read_to_string(dir.join(SURFACE_REPORT))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default();
+            return Ok(SurfaceDone {
+                dir: dir.clone(),
+                report,
+                reused: true,
+            });
+        }
+        if progress.is_cancelled() {
+            return Err(StepError::Cancelled);
+        }
+    }
+    let dir = new_surface_dir(&model.dir)?;
+    let req = model_surface_request(model, settings, gpu, dir.path());
+    let report = run_model_surface(&req, progress)?;
     Ok(SurfaceDone {
         dir: dir.keep(),
         report,

@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use crate::cloud::LoadedCloud;
+use crate::cloud::{LoadedCloud, PairCloud};
 use crate::project::{MapDone, MapStatus, SlamDone, SurfaceDone};
 use crate::surface::LoadedSurface;
 use crate::ui::compare::{Comparison, MapComparison};
@@ -46,10 +46,14 @@ pub enum JobOutput {
     Slam(Box<SlamDone>),
     /// With the map folder.
     Map(Box<MapDone>),
+    /// The step „Zusammenführen“, with the new model folder.
+    Model(PathBuf),
     /// The step „Oberfläche rechnen“, with the surface folder.
     SurfaceStep(Box<SurfaceDone>),
     /// A cloud with its levels of detail (loader runner).
     Cloud(Box<LoadedCloud>),
+    /// A model with one of its scans beside it, for point pairs (loader runner).
+    PairCloud(Box<PairCloud>),
     /// A surface with its pages (surface loader).
     Surface(Box<LoadedSurface>),
     /// The status of every map folder of the tree (helper runner).

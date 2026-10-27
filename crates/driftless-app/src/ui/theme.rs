@@ -77,10 +77,15 @@ pub mod icon {
     pub const PICK: &str = p::CROSSHAIR;
     pub const MEASURE: &str = p::RULER;
     pub const CUT: &str = p::SCISSORS;
+    pub const PAIRS: &str = p::LINK;
     pub const FIT: &str = p::CORNERS_OUT;
     pub const CHECK: &str = p::CHECK_CIRCLE;
     pub const RUNNING: &str = p::CIRCLE_NOTCH;
     pub const STALE: &str = p::WARNING_CIRCLE;
+    /// A scan placed in a model, but not surely.
+    pub const UNSURE: &str = p::WARNING;
+    /// A scan that could not be placed in a model.
+    pub const FAILED: &str = p::X_CIRCLE;
     pub const ADD: &str = p::PLUS;
     pub const FOLDED: &str = p::CARET_RIGHT;
     pub const UNFOLDED: &str = p::CARET_DOWN;

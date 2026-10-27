@@ -85,6 +85,9 @@ pub const MERGE_MIN_SCORE: f32 = 0.25;
 pub const MERGE_ROUNDS: usize = 4;
 /// A chart of fewer faces is an island (see [`absorb_islands`]).
 pub const ISLAND_FACES: usize = 8;
+/// A patch of fewer connected faces without a view is filled from a neighbouring chart (see
+/// [`absorb_islands`]).
+pub const GRAY_PATCH_FACES: usize = 64;
 /// Border around every chart (texels), filled by dilation.
 pub const MARGIN: u32 = 2;
 /// Edge of the gray block of the unseen faces (texels), at the origin of page 0.
@@ -161,6 +164,11 @@ pub struct TextureStats {
     /// Tiny label islands (fewer than `ISLAND_FACES` faces) merged into a neighbouring chart
     /// before baking; set by `texture_mesh`, 0 from `bake`.
     pub islands_absorbed: usize,
+    /// Faces without a view in small patches (fewer than `GRAY_PATCH_FACES`) that took a
+    /// neighbouring image before baking; set by `texture_mesh`, 0 from `bake`.
+    pub gray_filled: usize,
+    /// Area of the gray faces over the area of all faces (0 without faces).
+    pub untextured_area_share: f64,
 }
 
 /// Edge neighbours of every face (faces sharing an edge, either winding), in CSR form.
@@ -411,11 +419,20 @@ fn pack(sizes: &[[u32; 2]], page: u32, keep_first: bool) -> (Vec<(u32, [u32; 2])
     (at, pages)
 }
 
+/// What [`absorb_islands`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Absorbed {
+    /// Islands that took a neighbouring image, over all rounds.
+    pub islands: usize,
+    /// Faces without a view that took a neighbouring image (small gray patches).
+    pub gray_filled: usize,
+}
+
 /// Islands take the image of their surroundings: a chart of fewer than [`ISLAND_FACES`] faces
 /// (typically a face without a recorded view of the neighbouring image, or one ICM left alone
-/// between its neighbours; faces without any view are labelled `None` and never absorbed)
-/// takes the image of a neighbouring chart, tried in the order of most shared edges, then lowest
-/// image index.
+/// between its neighbours; faces without any view are labelled `None` and never absorbed as
+/// an island) takes the image of a neighbouring chart, tried in the order of most shared edges,
+/// then lowest image index.
 ///
 /// Two guards were tried and dropped: an enclosure guard (image `l` only if it has at least 2/3
 /// of the island's border edges) and a guard on the island's own summed normal facing the
@@ -427,14 +444,27 @@ fn pack(sizes: &[[u32; 2]], page: u32, keep_first: bool) -> (Vec<(u32, [u32; 2])
 /// colours. Remaining risk: a small separate object (fewer than [`ISLAND_FACES`] faces)
 /// bordering a surface may take that surface's image.
 ///
-/// The camera of `l` must see every face of the island geometrically: all corners project into
-/// the image within [`ColorConfig::rim_theta`] of the optical axis, the centroid is within
+/// Then small gray patches are filled the same way: connected faces without a view, fewer than
+/// [`GRAY_PATCH_FACES`] of them, take the image of the neighbouring chart with the most shared
+/// edges whose camera sees all of them by the same geometric test, up to [`MERGE_ROUNDS`]
+/// rounds. Every gray face had no view left after the pass over the images; on the merged
+/// black room (three scans, 2 cm) two thirds of the gray area is seen by used images but fails
+/// the depth test (occluded, or one corner hidden), the rest faces away from every camera or
+/// lies outside every image. Model at 1 cm: gray 1.50 → 0.52 % of the faces (0.49 → 0.18 % of
+/// the area), `seam_step` +0.35. Remaining risk, as for the islands: a patch hidden behind
+/// something takes the colour of what hides it. In the renders the filled spots did not show
+/// (mostly undersides of furniture and of the fused floor's thin double layers).
+///
+/// `cams` are the cameras of all sources in turn ([`super::views::all_cameras`], numbered as
+/// [`super::views::UsedImage::exposure_camera`]). The camera of `l` must see every face of the
+/// island (or patch) geometrically: all corners project into the image within
+/// [`ColorConfig::rim_theta`] of the optical axis, the centroid is within
 /// [`ColorConfig::max_dist`] of the camera, and the area-weighted summed normal of the island
 /// and of the faces around it (other charts) faces the camera. There is no depth test and no
 /// per-face facing test (the views are not read). With `smooth_weight == 0` nothing is changed
-/// and 0 is returned (the labels are then the best view per face). Charts are taken in chart
-/// order, from the labels as they stood at the start of the round; up to [`MERGE_ROUNDS`]
-/// rounds, ending at a round that changes nothing. Returns the number of islands taken over all rounds.
+/// (the labels are then the best view per face). Charts are taken in chart order, from the
+/// labels as they stood at the start of the round; up to [`MERGE_ROUNDS`] rounds each, ending
+/// at a round that changes nothing.
 ///
 /// [`ColorConfig::rim_theta`]: crate::ColorConfig::rim_theta
 /// [`ColorConfig::max_dist`]: crate::ColorConfig::max_dist
@@ -444,22 +474,53 @@ pub(crate) fn absorb_islands(
     cams: &[crate::ColorCamera],
     cfg: &SurfaceConfig,
     labels: &mut [Option<u32>],
-) -> usize {
+) -> Absorbed {
     if cfg.smooth_weight == 0.0 {
-        return 0;
+        return Absorbed::default();
     }
-    let n = labels.len();
     let nb = Neighbours::new(mesh);
     let w2c: Vec<Isometry3<f64>> = views
         .images
         .iter()
         .map(|i| i.world_from_cam.inverse())
         .collect();
-    let mut total = 0;
+    let take = |labels: &mut [Option<u32>], gray: bool| {
+        take_over_small(mesh, views, cams, cfg, &nb, &w2c, labels, gray)
+    };
+    let (islands, _) = take(labels, false);
+    let (_, gray_filled) = take(labels, true);
+    Absorbed {
+        islands,
+        gray_filled,
+    }
+}
+
+/// The rounds of [`absorb_islands`]: islands (charts of fewer than [`ISLAND_FACES`] faces),
+/// or with `gray` patches of faces without a label (fewer than [`GRAY_PATCH_FACES`]). Returns
+/// the charts and the faces that took another image.
+#[allow(clippy::too_many_arguments)]
+fn take_over_small(
+    mesh: &Mesh,
+    views: &ViewTable,
+    cams: &[crate::ColorCamera],
+    cfg: &SurfaceConfig,
+    nb: &Neighbours,
+    w2c: &[Isometry3<f64>],
+    labels: &mut [Option<u32>],
+    gray: bool,
+) -> (usize, usize) {
+    let n = labels.len();
+    let limit = if gray { GRAY_PATCH_FACES } else { ISLAND_FACES };
+    let (mut charts, mut faces_taken) = (0, 0);
     for _ in 0..MERGE_ROUNDS {
-        let (chart_of, start, faces) = connected(&nb, n, |f| labels[f]);
+        // Gray faces form patches of their own: label 0 for them, none for the others.
+        let (chart_of, start, faces) = if gray {
+            connected(nb, n, |f| labels[f].is_none().then_some(0))
+        } else {
+            connected(nb, n, |f| labels[f])
+        };
         let small: Vec<usize> = (0..start.len() - 1)
-            .filter(|&c| start[c + 1] - start[c] < ISLAND_FACES)
+            .filter(|&c| start[c + 1] - start[c] < limit)
             .collect();
         let picks: Vec<Option<(usize, u32)>> = small
             .par_iter()
@@ -494,7 +555,7 @@ pub(crate) fn absorb_islands(
                 counted.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
                 let sees = |l: u32| {
                     let img = &views.images[l as usize];
-                    let Some(cam) = cams.get(img.camera) else {
+                    let Some(cam) = cams.get(img.exposure_camera) else {
                         return false;
                     };
                     let eye = img.world_from_cam.translation.vector;
@@ -527,15 +588,16 @@ pub(crate) fn absorb_islands(
         for (c, l) in picks.into_iter().flatten() {
             for &f in &faces[start[c]..start[c + 1]] {
                 labels[f as usize] = Some(l);
+                faces_taken += 1;
             }
             changed += 1;
         }
-        total += changed;
+        charts += changed;
         if changed == 0 {
             break;
         }
     }
-    total
+    (charts, faces_taken)
 }
 
 /// Calls `f(i, j, barycentric)` for every texel `(i, j)` of a `width × height` grid whose
@@ -644,9 +706,11 @@ impl Chart {
     }
 }
 
-/// Bakes the texture: charts, pages and their images (see the module docs). Progress: phase
-/// „Textur backen“, one step per image of the stream; a cancel is checked at every image and
-/// returns [`MapError::Cancelled`]. Same input, byte-identical pages.
+/// Bakes the texture: charts, pages and their images (see the module docs); `views` were found
+/// in the images of `sources`. Progress: phase „Textur backen“, one step per image of the
+/// streams of the sources that texture a chart (read one after the other); a cancel is
+/// checked at every image and returns [`MapError::Cancelled`]. Same input, byte-identical
+/// pages.
 ///
 /// Fails if `cfg` is invalid, `labels` does not fit the mesh or the images cannot be read
 /// or have changed since the views were found.
@@ -654,7 +718,7 @@ pub(crate) fn bake(
     mesh: &Mesh,
     labels: &[Option<u32>],
     views: &ViewTable,
-    src: &TextureSource,
+    sources: &[TextureSource],
     cfg: &SurfaceConfig,
     progress: &Progress,
 ) -> Result<(TexturedMesh, TextureStats), MapError> {
@@ -681,7 +745,8 @@ pub(crate) fn bake(
         .into_par_iter()
         .map(|f| {
             let r = labels[f]? as usize;
-            let cam = &src.cams.get(views.images.get(r)?.camera)?.camera;
+            let img = views.images.get(r)?;
+            let cam = &sources.get(img.source)?.cams.get(img.camera)?.camera;
             let mut p = Projected {
                 uv: [[0.0; 2]; 3],
                 theta: [0.0; 3],
@@ -777,6 +842,14 @@ pub(crate) fn bake(
 
     // Packing; the gray block first if any face is unseen.
     let unseen = proj.iter().filter(|p| p.is_none()).count();
+    let (area_unseen, area_all) = proj
+        .iter()
+        .enumerate()
+        .map(|(f, p)| {
+            let a = f64::from(mesh.face_area(f));
+            (if p.is_none() { a } else { 0.0 }, a)
+        })
+        .fold((0.0, 0.0), |(u, t), (a, b)| (u + a, t + b));
     let gray = usize::from(unseen > 0);
     let sizes: Vec<[u32; 2]> = (0..gray)
         .map(|_| [GRAY_BLOCK; 2])
@@ -858,14 +931,28 @@ pub(crate) fn bake(
         }
     }
 
-    // Charts of every image (by rank).
+    // Charts of every image (by rank), and per source the images that texture a chart.
     let mut by_rank: Vec<Vec<u32>> = vec![Vec::new(); views.images.len()];
     for (c, chart) in charts.iter().enumerate() {
         by_rank[chart.rank as usize].push(c as u32);
     }
-    let mut remaining = by_rank.iter().filter(|c| !c.is_empty()).count();
+    let mut needed = vec![0usize; sources.len()];
+    for (r, c) in by_rank.iter().enumerate() {
+        if let Some(n) = needed
+            .get_mut(views.images[r].source)
+            .filter(|_| !c.is_empty())
+        {
+            *n += 1;
+        }
+    }
+    let remaining: usize = needed.iter().sum();
     let total = if remaining > 0 {
-        image_count(&src.images)
+        sources
+            .iter()
+            .zip(&needed)
+            .filter(|&(_, &n)| n > 0)
+            .map(|(s, _)| image_count(&s.images))
+            .sum::<Option<u64>>()
     } else {
         Some(0)
     };
@@ -874,88 +961,97 @@ pub(crate) fn bake(
     if remaining > 0 {
         let d = cfg.color.downscale;
         let lin = linear_table();
-        let mut cancelled = false;
-        // Images that could not be decoded, and images of a known camera at the wrong size.
-        let (mut unreadable, mut wrong_size) = (0usize, 0usize);
-        let read = for_each_image(&src.images.bags, &src.images.topics, d, |frame| {
-            if progress.is_cancelled() {
-                cancelled = true;
-                return false;
+        for (s, src) in sources.iter().enumerate() {
+            let mut remaining = needed[s];
+            if remaining == 0 {
+                continue;
             }
-            progress.advance(1);
-            let Ok(frame) = frame else {
-                unreadable += 1;
-                return true;
-            };
-            let Some(camera) = frame_camera(&frame, &src.cams, d) else {
-                if src.cams.iter().any(|c| c.camera.name == frame.camera) {
-                    wrong_size += 1;
+            let mut cancelled = false;
+            // Images that could not be decoded, and images of a known camera at the wrong size.
+            let (mut unreadable, mut wrong_size) = (0usize, 0usize);
+            let read = for_each_image(&src.images.bags, &src.images.topics, d, |frame| {
+                if progress.is_cancelled() {
+                    cancelled = true;
+                    return false;
                 }
-                return true;
-            };
-            let Some(rank) = views.rank_of(camera, frame.stamp) else {
-                return true;
-            };
-            let todo = std::mem::take(&mut by_rank[rank as usize]);
-            if todo.is_empty() {
-                return true;
-            }
-            let shot = Shot {
-                rgb: &frame.rgb,
-                downscale: d,
-                gain: views.gains[rank as usize],
-                vignetting: &views.vignetting,
-                camera,
-                lin: &lin,
-            };
-            // In batches of at most FILL_BATCH_TEXELS, so that the large charts of one image
-            // are not all held at once.
-            let mut from = 0;
-            while from < todo.len() {
-                let mut to = from;
-                let mut texels = 0u64;
-                while to < todo.len() && (to == from || texels < FILL_BATCH_TEXELS) {
-                    let size = charts[todo[to] as usize].size;
-                    texels += u64::from(size[0]) * u64::from(size[1]);
-                    to += 1;
-                }
-                let batch = &todo[from..to];
-                let filled: Vec<(Vec<u8>, u64)> = batch
-                    .par_iter()
-                    .map(|&c| fill_chart(&charts[c as usize], faces_of(c as usize), &proj, &shot))
-                    .collect();
-                for (&c, (buf, inside)) in batch.iter().zip(&filled) {
-                    covered += inside;
-                    let chart = &charts[c as usize];
-                    let image = &mut pages[chart.page as usize].image.data;
-                    let row = chart.size[0] as usize * 3;
-                    for (y, src_row) in buf.chunks_exact(row).enumerate() {
-                        let start =
-                            ((chart.origin[1] as usize + y) * side + chart.origin[0] as usize) * 3;
-                        image[start..start + row].copy_from_slice(src_row);
+                progress.advance(1);
+                let Ok(frame) = frame else {
+                    unreadable += 1;
+                    return true;
+                };
+                let Some(camera) = frame_camera(&frame, &src.cams, d) else {
+                    if src.cams.iter().any(|c| c.camera.name == frame.camera) {
+                        wrong_size += 1;
                     }
+                    return true;
+                };
+                let Some(rank) = views.rank_of(s, camera, frame.stamp) else {
+                    return true;
+                };
+                let todo = std::mem::take(&mut by_rank[rank as usize]);
+                if todo.is_empty() {
+                    return true;
                 }
-                from = to;
+                let shot = Shot {
+                    rgb: &frame.rgb,
+                    downscale: d,
+                    gain: views.gains[rank as usize],
+                    vignetting: &views.vignetting,
+                    camera: views.images[rank as usize].exposure_camera,
+                    lin: &lin,
+                };
+                // In batches of at most FILL_BATCH_TEXELS, so that the large charts of one
+                // image are not all held at once.
+                let mut from = 0;
+                while from < todo.len() {
+                    let mut to = from;
+                    let mut texels = 0u64;
+                    while to < todo.len() && (to == from || texels < FILL_BATCH_TEXELS) {
+                        let size = charts[todo[to] as usize].size;
+                        texels += u64::from(size[0]) * u64::from(size[1]);
+                        to += 1;
+                    }
+                    let batch = &todo[from..to];
+                    let filled: Vec<(Vec<u8>, u64)> = batch
+                        .par_iter()
+                        .map(|&c| {
+                            fill_chart(&charts[c as usize], faces_of(c as usize), &proj, &shot)
+                        })
+                        .collect();
+                    for (&c, (buf, inside)) in batch.iter().zip(&filled) {
+                        covered += inside;
+                        let chart = &charts[c as usize];
+                        let image = &mut pages[chart.page as usize].image.data;
+                        let row = chart.size[0] as usize * 3;
+                        for (y, src_row) in buf.chunks_exact(row).enumerate() {
+                            let start = ((chart.origin[1] as usize + y) * side
+                                + chart.origin[0] as usize)
+                                * 3;
+                            image[start..start + row].copy_from_slice(src_row);
+                        }
+                    }
+                    from = to;
+                }
+                remaining -= 1;
+                remaining > 0
+            });
+            if cancelled {
+                return Err(MapError::Cancelled);
             }
-            remaining -= 1;
-            remaining > 0
-        });
-        if cancelled {
-            return Err(MapError::Cancelled);
+            read.map_err(|e| MapError::Images(e.to_string()))?;
+            if remaining > 0 && unreadable + wrong_size > 0 {
+                return Err(MapError::Images(format!(
+                    "{remaining} für die Textur nötige Bilder fehlen: {unreadable} Bilder \
+                     unlesbar, {wrong_size} in falscher Größe"
+                )));
+            }
+            if remaining > 0 {
+                return Err(MapError::Images(
+                    "Bilder haben sich zwischen zwei Durchläufen geändert".into(),
+                ));
+            }
         }
-        read.map_err(|e| MapError::Images(e.to_string()))?;
-        if remaining > 0 && unreadable + wrong_size > 0 {
-            return Err(MapError::Images(format!(
-                "{remaining} für die Textur nötige Bilder fehlen: {unreadable} Bilder \
-                 unlesbar, {wrong_size} in falscher Größe"
-            )));
-        }
-        if remaining > 0 {
-            return Err(MapError::Images(
-                "Bilder haben sich zwischen zwei Durchläufen geändert".into(),
-            ));
-        }
-        // The stream stops after the last needed image: the phase is complete.
+        // Each stream stops after its last needed image: the phase is complete.
         if let Some(total) = total {
             let done = progress.snapshot().done;
             progress.advance(total.saturating_sub(done));
@@ -995,6 +1091,12 @@ pub(crate) fn bake(
             0.0
         },
         islands_absorbed: 0,
+        gray_filled: 0,
+        untextured_area_share: if area_all > 0.0 {
+            area_unseen / area_all
+        } else {
+            0.0
+        },
     };
     Ok((
         TexturedMesh {
@@ -1607,7 +1709,9 @@ mod tests {
             per_face[f * k..f * k + 2].copy_from_slice(&v);
         }
         let image = |stamp: f64| UsedImage {
+            source: 0,
             camera: 0,
+            exposure_camera: 0,
             stamp,
             world_from_cam: Isometry3::identity(),
         };
@@ -1641,10 +1745,18 @@ mod tests {
         let (mesh, src, front) = fixture("atlas-checker", &[0.0], false);
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
         assert!(labels.iter().all(Option::is_some));
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         println!("{stats:?}");
         let snap = progress.snapshot();
         assert_eq!(snap.phase, "Textur backen");
@@ -1668,14 +1780,30 @@ mod tests {
         assert_pages_sane(&tm, cfg.page_size, mesh.indices.len());
         assert_checker(&mesh, &tm, front);
         // Same input, byte-identical pages.
-        let (again, _) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (again, _) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         assert_eq!(again, tm);
         // Coarser than the image: the chart is scaled down to 15 mm texels and averaged.
         let coarse = SurfaceConfig {
             min_texel: 0.015,
             ..cfg.clone()
         };
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &coarse, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &coarse,
+            &progress,
+        )
+        .unwrap();
         assert!((stats.texel_median_mm - 15.0).abs() < 0.5, "{stats:?}");
         assert_checker(&mesh, &tm, front);
     }
@@ -1686,10 +1814,18 @@ mod tests {
         let back = mesh.indices.len() - front;
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
         assert!(labels[front..].iter().all(Option::is_none));
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         assert_eq!(stats.faces_untextured, back);
         assert_eq!(stats.faces_textured, front);
         assert_charts(&tm, cfg.page_size);
@@ -1770,7 +1906,7 @@ mod tests {
             ..SurfaceConfig::default()
         };
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         assert_eq!(views.images.len(), 2);
         let k = cfg.views_per_face;
         let labels: Vec<Option<u32>> = (0..front)
@@ -1781,7 +1917,15 @@ mod tests {
                 Some(want)
             })
             .collect();
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         println!("{stats:?}");
         assert!(stats.charts > 100, "{stats:?}");
         assert!(
@@ -1803,10 +1947,18 @@ mod tests {
         let faces = mesh.indices.len();
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
         assert!(labels.iter().all(|&l| l == Some(0)));
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         println!("{stats:?}");
         assert!(stats.charts > 1, "{stats:?}");
         assert!(stats.fill_ratio >= 0.5, "{stats:?}");
@@ -1815,7 +1967,15 @@ mod tests {
         assert_charts(&tm, cfg.page_size);
         assert!(check_fields(&mesh, &tm, faces) >= 10);
         // Deterministic.
-        let (again, _) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (again, _) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         assert_eq!(again, tm);
     }
 
@@ -1828,9 +1988,17 @@ mod tests {
         let faces = mesh.indices.len();
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         println!("{stats:?}");
         assert_eq!(stats.charts, 1);
         assert!(stats.fill_ratio < 0.95, "{stats:?}");
@@ -1855,9 +2023,17 @@ mod tests {
         keep_faces(&mut mesh, |c| c[0] < -0.7 || c[2] < -0.3);
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         println!("{stats:?}");
         assert_charts(&tm, cfg.page_size);
         assert!(stats.fill_ratio > 0.75, "{stats:?}");
@@ -1886,7 +2062,9 @@ mod tests {
             }
         }
         let image = |stamp: f64| UsedImage {
+            source: 0,
             camera: 0,
+            exposure_camera: 0,
             stamp,
             world_from_cam: Isometry3::identity(),
         };
@@ -1951,9 +2129,17 @@ mod tests {
             ..SurfaceConfig::default()
         };
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         println!("{} faces: {stats:?}", mesh.indices.len());
         assert_charts(&tm, cfg.page_size);
         assert_pages_sane(&tm, cfg.page_size, mesh.indices.len());
@@ -1990,10 +2176,18 @@ mod tests {
         };
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
         assert!(labels.iter().all(|&l| l == Some(0)));
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         println!("{stats:?}");
         assert_eq!(stats.charts, 1, "{stats:?}");
         assert!(stats.fill_ratio > 0.75, "{stats:?}");
@@ -2007,11 +2201,27 @@ mod tests {
         let (mesh, src, _) = fixture("atlas-noviews", &[-0.15, 0.15], false);
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
-        let mut views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let mut views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
-        let with = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let with = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         views.per_face = Vec::new();
-        let without = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let without = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         assert_eq!(with, without);
     }
 
@@ -2019,7 +2229,8 @@ mod tests {
     fn bake_cancellable_and_checked() {
         let (mesh, src, _) = fixture("atlas-cancel", &[0.0], false);
         let cfg = SurfaceConfig::default();
-        let views = collect_views(&mesh, &src, &cfg, &Progress::new()).unwrap();
+        let views =
+            collect_views(&mesh, std::slice::from_ref(&src), &cfg, &Progress::new()).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
         let p = Progress::new();
         let q = p.clone();
@@ -2028,10 +2239,17 @@ mod tests {
                 q.cancel();
             }
         });
-        let r = bake(&mesh, &labels, &views, &src, &cfg, &p);
+        let r = bake(&mesh, &labels, &views, std::slice::from_ref(&src), &cfg, &p);
         assert!(matches!(r, Err(MapError::Cancelled)), "{r:?}");
         // Labels that do not fit the mesh are refused.
-        let r = bake(&mesh, &labels[1..], &views, &src, &cfg, &Progress::new());
+        let r = bake(
+            &mesh,
+            &labels[1..],
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &Progress::new(),
+        );
         assert!(matches!(r, Err(MapError::Config(_))), "{r:?}");
         // A page too small for the gray block and a chart's border.
         let tiny = SurfaceConfig {
@@ -2042,7 +2260,14 @@ mod tests {
         // A needed image of the wrong size has its own message.
         let mut resized = src.clone();
         resized.cams[0].camera.width *= 2;
-        let r = bake(&mesh, &labels, &views, &resized, &cfg, &Progress::new());
+        let r = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&resized),
+            &cfg,
+            &Progress::new(),
+        );
         match r {
             Err(MapError::Images(m)) => assert!(m.contains("falscher Größe"), "{m}"),
             other => panic!("{other:?}"),
@@ -2050,7 +2275,14 @@ mod tests {
         // Images that went missing since the views were found.
         let mut gone = src.clone();
         gone.images.topics = vec!["/camera_nichts/image_raw".into()];
-        let r = bake(&mesh, &labels, &views, &gone, &cfg, &Progress::new());
+        let r = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&gone),
+            &cfg,
+            &Progress::new(),
+        );
         assert!(matches!(r, Err(MapError::Images(_))), "{r:?}");
     }
 
@@ -2088,7 +2320,9 @@ mod tests {
                 .zip(cameras)
                 .enumerate()
                 .map(|(i, (p, &camera))| UsedImage {
+                    source: 0,
                     camera,
+                    exposure_camera: camera,
                     stamp: i as f64,
                     world_from_cam: *p,
                 })
@@ -2119,9 +2353,11 @@ mod tests {
         labels[1] = None;
         let cfg = SurfaceConfig::default();
         let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
-        assert_eq!(n, 1);
+        assert_eq!(n.islands, 1);
         assert_eq!(labels[mid], Some(0));
-        assert_eq!((labels[0], labels[1]), (None, None));
+        // The faces without a view are no island; as a small gray patch they are filled.
+        assert_eq!(n.gray_filled, 2);
+        assert_eq!((labels[0], labels[1]), (Some(0), Some(0)));
     }
 
     #[test]
@@ -2136,7 +2372,7 @@ mod tests {
         assert_eq!(ISLAND_FACES, 8);
         let before = labels.clone();
         let cfg = SurfaceConfig::default();
-        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
+        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels).islands;
         assert_eq!(n, 0);
         assert_eq!(labels, before);
     }
@@ -2148,7 +2384,7 @@ mod tests {
         let mut labels = vec![Some(0); mesh.indices.len()];
         labels[cell_face(10, 10, false)] = Some(1);
         let cfg = SurfaceConfig::default();
-        absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels)
+        absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels).islands
     }
 
     #[test]
@@ -2193,7 +2429,7 @@ mod tests {
             smooth_weight,
             ..SurfaceConfig::default()
         };
-        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
+        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels).islands;
         (n, labels)
     }
 
@@ -2231,7 +2467,7 @@ mod tests {
         let mut labels = vec![None; mesh.indices.len()];
         labels[cell_face(10, 10, false)] = Some(1);
         let cfg = SurfaceConfig::default();
-        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
+        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels).islands;
         assert_eq!(n, 0);
         assert_eq!(labels[cell_face(10, 10, false)], Some(1));
     }
@@ -2252,7 +2488,7 @@ mod tests {
         let f = cell_face(10, 9, true);
         labels[f] = Some(2);
         let cfg = SurfaceConfig::default();
-        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
+        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels).islands;
         assert_eq!(n, 1);
         assert_eq!(labels[f], Some(1));
     }
@@ -2265,7 +2501,7 @@ mod tests {
         let mut labels = vec![Some(1); mesh.indices.len()];
         labels[cell_face(10, 10, false)] = Some(0);
         let cfg = SurfaceConfig::default();
-        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
+        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels).islands;
         assert_eq!(n, 0);
     }
 
@@ -2274,6 +2510,85 @@ mod tests {
         let views = island_views(&[], &[]);
         let cfg = SurfaceConfig::default();
         let n = absorb_islands(&Mesh::default(), &views, &[], &cfg, &mut []);
-        assert_eq!(n, 0);
+        assert_eq!(n, Absorbed::default());
+    }
+
+    /// A wall of image 0 (seen by `pose`) with the cells `(iy, iz)` of `gray` without a view.
+    fn gray_patch(pose: Isometry3<f64>, gray: &[(usize, usize)]) -> (Absorbed, Vec<Option<u32>>) {
+        let mesh = open_wall(20, 0.1);
+        let views = island_views(&[pose], &[0]);
+        let mut labels = vec![Some(0); mesh.indices.len()];
+        for &(iy, iz) in gray {
+            labels[cell_face(iy, iz, false)] = None;
+            labels[cell_face(iy, iz, true)] = None;
+        }
+        let cfg = SurfaceConfig::default();
+        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
+        (n, labels)
+    }
+
+    /// `cells` cells of row-major order in the block `iy` 4…11, `iz` from 4.
+    fn block(cells: usize) -> Vec<(usize, usize)> {
+        (0..cells).map(|k| (4 + k % 8, 4 + k / 8)).collect()
+    }
+
+    #[test]
+    fn small_gray_patch_is_filled() {
+        assert_eq!(GRAY_PATCH_FACES, 64);
+        // 31 cells: 62 faces, one connected patch.
+        let (n, labels) = gray_patch(in_front(), &block(31));
+        assert_eq!(n.gray_filled, 62);
+        assert_eq!(n.islands, 0);
+        assert!(labels.iter().all(|l| *l == Some(0)));
+    }
+
+    #[test]
+    fn gray_patch_of_limit_stays() {
+        // 32 cells: 64 faces.
+        let (n, labels) = gray_patch(in_front(), &block(32));
+        assert_eq!(n.gray_filled, 0);
+        assert_eq!(labels.iter().filter(|l| l.is_none()).count(), 64);
+        let (n, _) = gray_patch(in_front(), &block(40));
+        assert_eq!(n.gray_filled, 0);
+    }
+
+    #[test]
+    fn gray_patch_the_camera_cannot_see_stays() {
+        let behind = wall_pose(-3.0, std::f64::consts::FRAC_PI_2, 0.0);
+        let (n, labels) = gray_patch(behind, &[(10, 10)]);
+        assert_eq!(n.gray_filled, 0);
+        assert_eq!(labels.iter().filter(|l| l.is_none()).count(), 2);
+        // Outside the image (turned 90° about z).
+        let turned = wall_pose(
+            3.0,
+            -std::f64::consts::FRAC_PI_2,
+            std::f64::consts::FRAC_PI_2,
+        );
+        let (n, _) = gray_patch(turned, &[(10, 10)]);
+        assert_eq!(n.gray_filled, 0);
+        let (n, _) = gray_patch(in_front(), &[(10, 10)]);
+        assert_eq!(n.gray_filled, 2, "control");
+    }
+
+    #[test]
+    fn separate_gray_patches_are_counted_by_face() {
+        let (n, labels) = gray_patch(in_front(), &[(2, 2), (15, 15), (16, 15)]);
+        assert_eq!(n.gray_filled, 6);
+        assert!(labels.iter().all(|l| *l == Some(0)));
+    }
+
+    #[test]
+    fn smooth_weight_zero_fills_no_gray() {
+        let mesh = open_wall(20, 0.1);
+        let views = island_views(&[in_front()], &[0]);
+        let mut labels = vec![Some(0); mesh.indices.len()];
+        labels[cell_face(10, 10, false)] = None;
+        let cfg = SurfaceConfig {
+            smooth_weight: 0.0,
+            ..SurfaceConfig::default()
+        };
+        let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
+        assert_eq!(n, Absorbed::default());
+        assert_eq!(labels[cell_face(10, 10, false)], None);
     }
 }

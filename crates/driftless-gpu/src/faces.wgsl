@@ -60,8 +60,10 @@ struct Batch {
     // Index of the batch's first face in the mesh, and its face count.
     start: u32,
     len: u32,
-    _pad0: u32,
-    _pad1: u32,
+    // Index of its first face in `faces`, and of the first exposure sample in `samples`
+    // (the views pass keeps the views of one range of the faces; see `FaceViews::keep`).
+    first: u32,
+    sample_base: u32,
 }
 
 struct Face {
@@ -81,11 +83,11 @@ struct Face {
 @group(0) @binding(2) var<storage, read> faces: array<Face>;
 // Per cell the bitwise complement of the minimum range's f32 bits; 0 = empty.
 @group(0) @binding(3) var<storage, read_write> depth: array<atomic<u32>>;
-// k slots per face of the batch, three words each: score bits, !image (0 = empty),
-// r | g << 8 | b << 16 | tag << 24. All zero is an empty slot.
+// k slots per face of the batch (none in the depth pass), three words each: score bits,
+// !image (0 = empty), r | g << 8 | b << 16 | tag << 24. All zero is an empty slot.
 @group(0) @binding(4) var<storage, read_write> slots: array<u32>;
-// k exposure samples per sampled face of the mesh: weight bits, !rank, r | g << 16,
-// b | theta << 16 (as `View`). All zero is empty.
+// k exposure samples per sampled face of the kept range (from sample `batch.sample_base`):
+// weight bits, !rank, r | g << 16, b | theta << 16 (as `View`). All zero is empty.
 @group(0) @binding(5) var<storage, read_write> samples: array<vec4<u32>>;
 // The decoded image, RGB8 row by row, four bytes per word (little end first).
 @group(0) @binding(6) var<storage, read> image: array<u32>;
@@ -180,7 +182,7 @@ fn splat_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if i >= batch.len {
         return;
     }
-    let f = faces[i];
+    let f = faces[batch.first + i];
     if too_far(f) {
         return;
     }
@@ -355,7 +357,7 @@ fn views_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if i >= batch.len {
         return;
     }
-    let f = faces[i];
+    let f = faces[batch.first + i];
     if too_far(f) {
         return;
     }
@@ -451,6 +453,6 @@ fn views_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             pack16(centre_rgb.x, RGB_RANGE) | (pack16(centre_rgb.y, RGB_RANGE) << 16u),
             pack16(centre_rgb.z, RGB_RANGE) | (pack16(theta / PI, 1.0) << 16u),
         );
-        keep_sample(s, v);
+        keep_sample(s - batch.sample_base, v);
     }
 }

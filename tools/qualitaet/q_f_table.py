@@ -1,5 +1,7 @@
 """Texture figures of surface runs side by side: q_f_table.py <label>=<dir> ...  where each dir
 holds <scan>/oberflaeche/oberflaeche.{json,glb}. Prints one markdown table per scan set.
+`seam_step je m Naht` and `ohne Textur % Fläche` (surface v13) weigh by edge length and face
+area; they show "–" for older reports.
 """
 import json
 import os
@@ -7,6 +9,11 @@ import sys
 
 SCANS = ["20261022133554", "20261022132520", "20261022133028", "20261020173822"]
 NAMES = {"20261022133554": "S1", "20261022132520": "S2", "20261022133028": "S3", "20261020173822": "B"}
+
+
+def opt(x, fmt):
+    """`fmt(x)`, or "–" for a report written before the field."""
+    return "–" if x is None else fmt(x)
 
 
 def row(d):
@@ -24,8 +31,11 @@ def row(d):
         "Seiten": t["pages"],
         ".glb MB": round(os.path.getsize(os.path.join(o, "oberflaeche.glb")) / 1e6),
         "seam_step Mittel / Median": f'{m["seam_step_after"]:.1f} / {m["seam_step_median_after"]:.1f}',
+        "seam_step je m Naht": opt(m.get("seam_step_per_m"), lambda x: f"{x:.1f}"),
         "seam_jump": f'{m["seam_jump_after"]:.1f}',
         "ohne Textur %": f'{100 * t["faces_untextured"] / faces:.2f}',
+        "ohne Textur % Fläche": opt(t.get("untextured_area_share"), lambda x: f"{100 * x:.2f}"),
+        "Grau gefüllt": f'{t.get("gray_filled", 0):,}'.replace(",", "."),
         "Wände Median mm": f'{s["accuracy"]["walls"]["median_mm"]:.2f}',
         "Zeit s": round(j.get("seconds_total", 0)),
     }

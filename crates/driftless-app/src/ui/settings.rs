@@ -35,27 +35,36 @@ pub fn show(ctx: &Context, state: &mut AppState) {
 /// of the last frame are in the floating bars of the view ([`super::tools`]).
 fn view_section(ui: &mut Ui, state: &mut AppState) {
     let has_rgb = state.cloud.as_ref().is_none_or(|c| c.has_rgb);
+    let has_scans = state.cloud.as_ref().is_some_and(|c| c.has_scans);
     let map_point_m = state
         .cloud
         .as_ref()
         .map_or(crate::cloud::DEFAULT_POINT_M, |c| c.point_m);
-    view_settings_edit(ui, &mut state.view, has_rgb, map_point_m);
+    view_settings_edit(ui, &mut state.view, has_rgb, has_scans, map_point_m);
     if state.cloud.as_ref().is_some_and(|c| !c.quality_known) {
         ui.weak(text::QUALITY_NONE_HINT);
     }
 }
 
 /// How the 3D view draws. `has_rgb`: whether the loaded cloud has colours (offers the
-/// colour mode „Farbe“); `map_point_m`: the spot size of the loaded map.
-fn view_settings_edit(ui: &mut Ui, view: &mut ViewSettings, has_rgb: bool, map_point_m: f32) {
-    let shown = effective_color_mode(view.color_mode, has_rgb);
+/// colour mode „Farbe“); `has_scans`: whether it is made of several scans (offers „je
+/// Scan“); `map_point_m`: the spot size of the loaded map.
+fn view_settings_edit(
+    ui: &mut Ui,
+    view: &mut ViewSettings,
+    has_rgb: bool,
+    has_scans: bool,
+    map_point_m: f32,
+) {
+    let shown = effective_color_mode(view.color_mode, has_rgb, has_scans);
     ui.horizontal_wrapped(|ui| {
         ui.label(text::COLOR_MODE);
-        for mode in color_modes(has_rgb) {
+        for mode in color_modes(has_rgb, has_scans) {
             let label = match mode {
                 ColorMode::Rgb => text::MODE_RGB,
                 ColorMode::Intensity => text::MODE_INTENSITY,
                 ColorMode::Quality => text::MODE_QUALITY,
+                ColorMode::Scan => text::MODE_SCAN,
             };
             if ui.selectable_label(shown == mode, label).clicked() {
                 view.color_mode = mode;

@@ -71,10 +71,23 @@ pub fn room_bag_secs(dir: &Path, imu: bool, secs: f64) {
 
 /// [`room_bag_secs`] starting at bag time `start` (s).
 pub fn room_bag_at(dir: &Path, imu: bool, start: f64, secs: f64) {
+    let scan = room_scan();
+    static_bag(dir, imu, start, secs, |_| scan.clone());
+}
+
+/// Bag of a device standing still for `secs` seconds from bag time `start`: frame `k` is
+/// `scan(k)`, one every 0.1 s on `/lidar`, IMU at 200 Hz on `/imu` (if `imu`, level: gravity
+/// along +z).
+fn static_bag(
+    dir: &Path,
+    imu: bool,
+    start: f64,
+    secs: f64,
+    scan: impl Fn(usize) -> Vec<LidarPoint>,
+) {
     let mut w = BagWriter::new(Compression::None);
     let lc = w.add_connection("/lidar", "sensor_msgs/PointCloud2");
     let ic = w.add_connection("/imu", "sensor_msgs/Imu");
-    let scan = room_scan();
     let n = (secs * 200.0).round() as usize;
     for i in 0..=n {
         let s = start + i as f64 * 0.005;
@@ -87,10 +100,104 @@ pub fn room_bag_at(dir: &Path, imu: bool, start: f64, secs: f64) {
             w.write_message(ic, time(s), &encode_imu(&m));
         }
         if i % 20 == 0 && i < n {
-            w.write_message(lc, time(s), &encode_pointcloud2(s, "l", &scan));
+            w.write_message(lc, time(s), &encode_pointcloud2(s, "l", &scan(i / 20)));
         }
     }
     fs::write(dir.join("LIDAR_0.bag"), w.finish()).unwrap();
+}
+
+// The room of `room_scan` with furniture, scanned from another place.
+
+/// Axis-aligned box `[lo, hi]` in the room frame.
+pub type Block = ([f64; 3], [f64; 3]);
+
+/// Two boxes on the floor of the room of [`room_scan`], at places without symmetry: a low
+/// one near the −y wall and a high one in the +y half near the −x wall.
+pub const FURNITURE: [Block; 2] = [
+    ([1.8, -2.6, -1.5], [2.8, -1.8, -0.7]),
+    ([-3.2, 2.2, -1.5], [-2.4, 3.4, -0.3]),
+];
+
+/// Distance along `d` from `o` (inside the room) to the first surface: a wall, the floor,
+/// the ceiling or one of `blocks`.
+fn first_hit(o: &Vector3<f64>, d: &Vector3<f64>, blocks: &[Block]) -> f64 {
+    let mut r = (0..3)
+        .filter(|&i| d[i].abs() > 1e-9)
+        .map(|i| {
+            let bound = if d[i] > 0.0 { HI[i] } else { LO[i] };
+            (bound - o[i]) / d[i]
+        })
+        .fold(f64::INFINITY, f64::min);
+    for (blo, bhi) in blocks {
+        // Slab test: entry is the largest near distance, exit the smallest far distance.
+        let (mut near, mut far) = (0.0f64, f64::INFINITY);
+        for i in 0..3 {
+            if d[i].abs() < 1e-12 {
+                if o[i] < blo[i] || o[i] > bhi[i] {
+                    far = -1.0;
+                }
+                continue;
+            }
+            let (a, b) = ((blo[i] - o[i]) / d[i], (bhi[i] - o[i]) / d[i]);
+            near = near.max(a.min(b));
+            far = far.min(a.max(b));
+        }
+        if near <= far && near > 0.0 {
+            r = r.min(near);
+        }
+    }
+    r
+}
+
+/// Frame `k` of a static scan of the room of [`room_scan`] with `blocks`, from a device at
+/// `offset` turned by `yaw` (rad) about the vertical, in the device frame: 71 rings from
+/// −35° to +35° elevation, every 1° in azimuth, the pattern shifted by `k mod 3` thirds of a
+/// degree in azimuth and `(k / 3) mod 5` fifths in elevation. Like a non-repeating scan
+/// pattern, 15 frames fill a grid of ⅓° × ⅕°: a cloud as dense as a real handheld scan
+/// (a point every ≈ 3 cm at 8 m), so that two scans from different places overlap
+/// everywhere and their edges agree.
+pub fn room_scan_from(offset: [f64; 3], yaw: f64, blocks: &[Block], k: usize) -> Vec<LidarPoint> {
+    const RINGS: u16 = 71;
+    const STEPS: usize = 360;
+    let az0 = (k % 3) as f64 / 3.0;
+    let el0 = ((k / 3) % 5) as f64 / 5.0;
+    let o = Vector3::from(offset);
+    let turn = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), yaw);
+    let mut out = Vec::with_capacity(STEPS * usize::from(RINGS));
+    for j in 0..STEPS {
+        let az = (j as f64 + az0).to_radians();
+        for ring in 0..RINGS {
+            let el = (-35.0 + f64::from(ring) + el0).to_radians();
+            let d = Vector3::new(el.cos() * az.cos(), el.cos() * az.sin(), el.sin());
+            let r = first_hit(&o, &(turn * d), blocks);
+            let p = d * r;
+            out.push(LidarPoint {
+                xyz: [p.x as f32, p.y as f32, p.z as f32],
+                intensity: 5.0,
+                ring,
+                t_rel: 0.1 * j as f64 / STEPS as f64,
+            });
+        }
+    }
+    out
+}
+
+/// Scan folder: the room of [`room_scan`] with the two boxes of [`FURNITURE`], scanned for
+/// 1.5 s by a device standing still at `offset` in the room, turned by `yaw` (rad) about the
+/// vertical. The map of the scan is in the device frame, so the pose of this scan in the
+/// frame of a scan at the origin with `yaw = 0` is `offset`, `yaw`.
+pub fn furnished_room_bag(dir: &Path, imu: bool, offset: [f64; 3], yaw: f64) {
+    static_bag(dir, imu, 1000.0, 1.5, |k| {
+        room_scan_from(offset, yaw, &FURNITURE, k)
+    });
+}
+
+/// [`furnished_room_bag`] without the boxes: the bare room, which looks the same turned by
+/// 180° about its centre.
+pub fn empty_room_bag(dir: &Path, imu: bool, offset: [f64; 3], yaw: f64) {
+    static_bag(dir, imu, 1000.0, 1.5, |k| {
+        room_scan_from(offset, yaw, &[], k)
+    });
 }
 
 // A room with camera images and a calibration.
@@ -159,34 +266,46 @@ fn write_calib(dir: &Path) {
     fs::write(dir.join("calibration/calib.json"), json.to_string()).unwrap();
 }
 
-/// Stored image of the static device (at the origin) through the calibration of `dir` as
-/// Driftless reads it.
-fn render_from(dir: &Path) -> Vec<u8> {
+/// Colour of a box of [`FURNITURE`] in the images of [`furnished_scan_with_images`].
+pub const BLOCK_COLOR: [u8; 3] = [220, 120, 40];
+
+/// Colour where the ray from `o` along `d` first meets the room with `blocks`: [`cast`] on
+/// a wall, [`BLOCK_COLOR`] on a box.
+fn cast_in(o: &Vector3<f64>, d: &Vector3<f64>, blocks: &[Block]) -> [u8; 3] {
+    if !blocks.is_empty() && first_hit(o, d, blocks) < first_hit(o, d, &[]) - 1e-9 {
+        return BLOCK_COLOR;
+    }
+    cast(o, d)
+}
+
+/// Stored image of the static device at `device` (device → room) in the room with
+/// `blocks`, through the calibration of `dir` as Driftless reads it.
+fn render_from(dir: &Path, device: &Isometry3<f64>, blocks: &[Block]) -> Vec<u8> {
     let calib = load_calibration(&dir.join("calibration/calib.json")).unwrap();
     let c = &calib.cameras["left"];
     let cam = Camera::from_calib("left", c).unwrap();
-    let world_cam = c.lidar_to_cam.unwrap().inverse();
+    let world_cam = device * c.lidar_to_cam.unwrap().inverse();
     let o = world_cam.translation.vector;
     let mut rgb = Vec::new();
     for y in 0..cam.height {
         for x in 0..cam.width {
             let px = cam
                 .unproject([f64::from(x), f64::from(y)])
-                .map_or([0; 3], |d| cast(&o, &(world_cam.rotation * d)));
+                .map_or([0; 3], |d| cast_in(&o, &(world_cam.rotation * d), blocks));
             rgb.extend(px);
         }
     }
     rgb
 }
 
-/// Scan folder: static room (LiDAR + IMU), `IMAGES` camera images, calibration.
-pub fn scan_with_images(dir: &Path) {
-    room_bag(dir, true);
+/// Writes the calibration and `IMAGES` camera images of the static device at `device` in
+/// the room with `blocks` into the scan folder `dir`.
+fn write_images(dir: &Path, device: &Isometry3<f64>, blocks: &[Block]) {
     write_calib(dir);
     let mut jpeg = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
         .encode(
-            &render_from(dir),
+            &render_from(dir, device, blocks),
             u32::from(IMAGE_W),
             u32::from(IMAGE_H),
             image::ExtendedColorType::Rgb8,
@@ -204,4 +323,22 @@ pub fn scan_with_images(dir: &Path) {
         w.write_message(ic, time(s), &encode_compressed_image(&img));
     }
     fs::write(dir.join("IMAGE_0.bag"), w.finish()).unwrap();
+}
+
+/// Scan folder: static room (LiDAR + IMU), `IMAGES` camera images, calibration.
+pub fn scan_with_images(dir: &Path) {
+    room_bag(dir, true);
+    write_images(dir, &Isometry3::identity(), &[]);
+}
+
+/// [`furnished_room_bag`] with the calibration and `IMAGES` camera images of the device at
+/// `offset`, turned by `yaw` (rad): the camera looks along the device's +x, the boxes are
+/// [`BLOCK_COLOR`].
+pub fn furnished_scan_with_images(dir: &Path, offset: [f64; 3], yaw: f64) {
+    furnished_room_bag(dir, true, offset, yaw);
+    let device = Isometry3::from_parts(
+        Translation3::from(Vector3::from(offset)),
+        UnitQuaternion::from_axis_angle(&Vector3::z_axis(), yaw),
+    );
+    write_images(dir, &device, &FURNITURE);
 }

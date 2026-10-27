@@ -376,6 +376,22 @@ fn build_reports_phase() {
     assert_eq!(s.done, 100_000);
 }
 
+/// The scan of a point of a model goes into bits 16–31 of `extra`.
+#[test]
+fn vertex_carries_scan() {
+    let mut points = PointSet::from_xyz([0.0; 3], vec![[0.0; 3], [1.0, 1.0, 1.0], [2.0; 3]]);
+    points.quality = vec![30, 40, 50];
+    points.flags = vec![1, 0, 1];
+    points.source = vec![0, 7, 65_535];
+    let tree = build(&points);
+    for (v, &s) in tree.vertices.iter().zip(&tree.source) {
+        let s = s as usize;
+        assert_eq!(v.extra & 0xff, u32::from(points.quality[s]));
+        assert_eq!(v.extra >> 8 & 0xff, u32::from(points.flags[s]));
+        assert_eq!(v.extra >> 16, u32::from(points.source[s]));
+    }
+}
+
 #[test]
 fn vertex_packs_colour_intensity_quality_and_flags() {
     let mut points = PointSet::from_xyz([0.0; 3], vec![[0.0; 3], [1.0, 1.0, 1.0]]);

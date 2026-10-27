@@ -63,21 +63,55 @@ fn fly_keys_map_to_motion() {
 #[test]
 fn color_mode_falls_back_without_rgb() {
     assert_eq!(
-        color_modes(true),
+        color_modes(true, false),
         vec![ColorMode::Rgb, ColorMode::Intensity, ColorMode::Quality]
     );
     assert_eq!(
-        color_modes(false),
+        color_modes(false, false),
         vec![ColorMode::Intensity, ColorMode::Quality]
     );
     assert_eq!(
-        effective_color_mode(ColorMode::Rgb, false),
+        effective_color_mode(ColorMode::Rgb, false, false),
         ColorMode::Intensity
     );
-    assert_eq!(effective_color_mode(ColorMode::Rgb, true), ColorMode::Rgb);
     assert_eq!(
-        effective_color_mode(ColorMode::Quality, false),
+        effective_color_mode(ColorMode::Rgb, true, false),
+        ColorMode::Rgb
+    );
+    assert_eq!(
+        effective_color_mode(ColorMode::Quality, false, false),
         ColorMode::Quality
+    );
+}
+
+/// „je Scan“ only for a cloud of several scans; set for another cloud, it shows what that
+/// cloud has.
+#[test]
+fn scan_mode_only_with_scans() {
+    assert_eq!(
+        color_modes(true, true),
+        vec![
+            ColorMode::Rgb,
+            ColorMode::Intensity,
+            ColorMode::Quality,
+            ColorMode::Scan
+        ]
+    );
+    assert_eq!(
+        color_modes(false, true),
+        vec![ColorMode::Intensity, ColorMode::Quality, ColorMode::Scan]
+    );
+    assert_eq!(
+        effective_color_mode(ColorMode::Scan, true, true),
+        ColorMode::Scan
+    );
+    assert_eq!(
+        effective_color_mode(ColorMode::Scan, true, false),
+        ColorMode::Rgb
+    );
+    assert_eq!(
+        effective_color_mode(ColorMode::Scan, false, false),
+        ColorMode::Intensity
     );
 }
 
@@ -615,4 +649,24 @@ fn skipped(why: &str) {
     use std::io::Write;
     let name = std::thread::current().name().unwrap_or("?").to_string();
     let _ = writeln!(std::io::stderr(), "ÜBERSPRUNGEN {name}: {why}");
+}
+
+/// A point of a merged model names its scan (counted from 1, as the model in the tree); a
+/// cloud of one scan does not.
+#[test]
+fn pick_info_names_scan_of_model() {
+    let mut points = PointSet::from_xyz([0.0; 3], vec![[1.0, 2.0, 3.0]; 2]);
+    let c = cloud("/k/clean.las", points.clone());
+    assert_eq!(point_info(&c, 0).scan, None);
+    assert!(steps::point_lines(&point_info(&c, 0))
+        .iter()
+        .all(|(l, _)| *l != text::POINT_SCAN));
+    points.source = vec![0, 2];
+    let c = cloud("/m/modell.las", points);
+    assert_eq!(point_info(&c, 1).scan, Some(2));
+    let lines = steps::point_lines(&point_info(&c, 1));
+    assert!(
+        lines.contains(&(text::POINT_SCAN, "3".to_string())),
+        "{lines:?}"
+    );
 }

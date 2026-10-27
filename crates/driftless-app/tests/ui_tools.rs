@@ -1,24 +1,29 @@
 //! The floating bars over the 3D view – the info at the top left, the switch Punkte · Fläche ·
-//! beides at the top right, the tools at the bottom centre and the cut above them – and
-//! measuring between two points.
+//! beides at the top right, the tools at the bottom centre and the cut above them – measuring
+//! between two points, and setting point pairs by hand („Von Hand ausrichten“).
 
 use driftless_app::pick::{project, relative_to};
-use driftless_app::project::{Project, ScanEntry, ScanState};
+use driftless_app::project::{ModelInfo, Project, ScanEntry, ScanState};
 use driftless_app::render::{headless_device, ShowMode};
-use driftless_app::ui::tools::{Measurement, Tool};
+use driftless_app::ui::tools::{self, Measurement, PairSession, Tool};
 use driftless_app::ui::view3d::PointInfo;
 use driftless_app::ui::{
-    text, Action, AppState, CloudSummary, DriftlessApp, ScanNode, Selection, Step, SurfaceSummary,
+    steps, text, Action, AppState, CloudSummary, DriftlessApp, ScanNode, Selection, Step,
+    SurfaceSummary,
 };
 use driftless_io::testscan::tmp;
 use driftless_map::{write_las, Cloud};
+use driftless_steps::merge::{ModelMember, ModelReport, MODEL_LAS, MODEL_REPORT};
+use driftless_steps::pairs::{stored_text, PointPairEntry, PointPairs, POINT_PAIRS_FILE};
+use driftless_steps::slam::SlamSettings;
+use driftless_traj::nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, Vector3};
 use eframe::egui::{
     self,
     accesskit::{Role, Toggled},
 };
 use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -48,6 +53,7 @@ fn cloud_summary() -> CloudSummary {
         path: PathBuf::from("/k/color.las"),
         points: 6_000_000,
         has_rgb: true,
+        has_scans: false,
         quality_known: false,
         z_range: [-0.5, 3.0],
         ceiling: Some(2.8),
@@ -338,6 +344,7 @@ fn point() -> PointInfo {
         rgb: Some([200, 120, 40]),
         quality: None,
         removed: None,
+        scan: None,
     }
 }
 
@@ -650,4 +657,467 @@ fn measuring_over_the_surface_says_it_uses_the_cloud() {
     h.state_mut().state_mut().tool = Tool::Orbit;
     h.run();
     assert!(h.query_by_label(text::PICKS_ON_CLOUD).is_none());
+}
+
+/// `T_1` of the model of the pair tests: turned by 90° about z, then moved.
+fn t_second() -> Isometry3<f64> {
+    Isometry3::from_parts(
+        Translation3::new(2.0, 1.0, 0.5),
+        UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 90f64.to_radians()),
+    )
+}
+
+/// `pose` as `modell.json` stores it: 4 × 4, row by row.
+fn rows(pose: &Isometry3<f64>) -> [f64; 16] {
+    let h = pose.to_homogeneous();
+    std::array::from_fn(|k| h[(k / 4, k % 4)])
+}
+
+/// Scan `nr` of a model, its map in `<root>/<name>/karte`.
+fn model_member(root: &Path, name: &str, pose: &Isometry3<f64>, verdict: &str) -> ModelMember {
+    let run = root.join(name);
+    ModelMember {
+        scan: PathBuf::from(format!("/daten/{name}")),
+        slam_dir: run.clone(),
+        map_dir: run.join("karte"),
+        slam: SlamSettings::default(),
+        transform: rows(pose),
+        placed_against: (verdict != "bezug").then_some(0),
+        method: if verdict == "bezug" {
+            "bezug"
+        } else {
+            "merkmale"
+        }
+        .into(),
+        verdict: if verdict == "bezug" {
+            "sicher"
+        } else {
+            verdict
+        }
+        .into(),
+        reason: None,
+        overlap: 0.5,
+        residual_median_mm: 3.0,
+        residual_rms_mm: 4.0,
+        agreement: 0.9,
+        wall_residual_mm: 3.0,
+        pair_rms_mm: None,
+        included: verdict != "unsicher",
+        color_gain: [1.0; 3],
+        points: 100,
+        clean_id: None,
+    }
+}
+
+/// „Modell 001“ in `dir` of three scans: a (the reference), b (sure, at [`t_second`]) and c
+/// (unsure, left out).
+fn pair_model(dir: &Path, root: &Path) -> ModelInfo {
+    let members = vec![
+        model_member(root, "a", &Isometry3::identity(), "bezug"),
+        model_member(root, "b", &t_second(), "sicher"),
+        model_member(root, "c", &Isometry3::identity(), "unsicher"),
+    ];
+    ModelInfo {
+        dir: dir.to_path_buf(),
+        label: "Modell 001".into(),
+        report: ModelReport {
+            version: 1,
+            input_id: "0".into(),
+            points: 200,
+            members,
+            seconds_total: 3.0,
+            peak_rss_bytes: 0,
+            include_unsure: false,
+        },
+        surfaces: Vec::new(),
+    }
+}
+
+/// The shift of the scan in the pair cloud of the tests.
+const SHIFT: [f64; 3] = [7.5, 0.0, 0.0];
+
+/// A project with one scan and [`pair_model`], pairs being set for scan c, its cloud shown.
+fn pair_state() -> AppState {
+    let model = pair_model(Path::new("/p/modelle/modell-001"), Path::new("/p/scans"));
+    let mut session = PairSession::new(&model, 2, "3 · c".into()).unwrap();
+    session.shift = Some(SHIFT);
+    let mut cloud = cloud_summary();
+    cloud.path = session.cloud.clone();
+    cloud.has_scans = true;
+    AppState {
+        project: Some(Project {
+            dir: PathBuf::from("/p"),
+            name: "Halle".into(),
+            scans: vec![ScanEntry {
+                id: "s".into(),
+                path: PathBuf::from("/daten/s"),
+                name: "s".into(),
+                extra_runs: Vec::new(),
+            }],
+        }),
+        scans: vec![ScanNode {
+            id: "s".into(),
+            name: "s".into(),
+            state: ScanState::Ready,
+            no_color: None,
+            runs: Vec::new(),
+        }],
+        models: vec![model],
+        cloud: Some(cloud),
+        pairs: Some(session),
+        tool: Tool::Pairs,
+        ..AppState::default()
+    }
+}
+
+/// A click of the tool on `position` (absolute, as shown), a point of scan `scan`.
+fn hit(position: [f64; 3], scan: u16) -> PointInfo {
+    PointInfo {
+        position,
+        scan: Some(scan),
+        ..point()
+    }
+}
+
+type Panel = Harness<'static, (AppState, Option<Action>)>;
+
+/// The field „Daten“ of `state` at the width of the program's field, keeping the last action.
+fn daten_panel(state: AppState) -> Panel {
+    let mut h = Harness::builder()
+        .with_size([250.0, 1200.0])
+        .build_ui_state(
+            |ui, (state, action): &mut (AppState, Option<Action>)| {
+                if let Some(a) = steps::show(ui, state) {
+                    *action = Some(a);
+                }
+            },
+            (state, None),
+        );
+    h.run();
+    h
+}
+
+fn locked(h: &Panel, label: &str) -> bool {
+    h.get_by_label(label).accesskit_node().is_disabled()
+}
+
+#[test]
+fn pair_tool_alternates_and_needs_three() {
+    // in the window: the tool „Punktpaare“ is in the bar (and on), the info says what to click
+    let mut app = app();
+    *app.state_mut() = pair_state();
+    let mut h = window(app, [1400.0, 900.0]);
+    let pairs = h.get_by_role_and_label(Role::Button, text::TOOL_PAIRS);
+    assert_eq!(pairs.accesskit_node().toggled(), Some(Toggled::True));
+    assert!(h.query_all_by_label(&text::pair_next(1, true)).count() >= 1);
+    // another tool: the session stays, the tool can be chosen again
+    click_button(&mut h, text::TOOL_ORBIT);
+    click_button(&mut h, text::TOOL_PAIRS);
+    assert_eq!(h.state().state().tool, Tool::Pairs);
+    // without a session the tool is not offered
+    tools::end_pairs(h.state_mut().state_mut());
+    h.run();
+    assert!(h.query_by_label(text::TOOL_PAIRS).is_none());
+    assert_eq!(h.state().state().tool, Tool::Orbit);
+
+    let mut h = daten_panel(pair_state());
+    h.get_by_label(&text::pairs_subject("3 · c", "Modell 001"));
+    let click = |h: &mut Panel, p: [f64; 3], scan: u16| {
+        tools::point_clicked(&mut h.state_mut().0, hit(p, scan));
+        h.run();
+    };
+    let session = |h: &Panel| h.state().0.pairs.clone().unwrap();
+    h.get_by_label(&text::pair_next(1, true));
+    assert!(locked(&h, text::PAIRS_APPLY));
+    // a point of the scan first: refused, the model is wanted
+    click(&mut h, [10.0, 0.0, 0.0], 2);
+    assert!(session(&h).in_scan.is_empty());
+    h.get_by_label(text::PAIRS_WANTS_MODEL);
+    click(&mut h, [0.0, 0.0, 0.0], 0);
+    h.get_by_label(&text::pair_next(1, false));
+    // now a point of the model is refused
+    click(&mut h, [1.0, 0.0, 0.0], 1);
+    h.get_by_label(text::PAIRS_WANTS_SCAN);
+    assert_eq!(session(&h).in_model.len(), 1);
+    click(&mut h, [7.5, 0.0, 0.0], 2);
+    h.get_by_label(&text::pairs_set(1));
+    h.get_by_label(&text::pair_next(2, true));
+    for (m, q) in [
+        ([1.0, 0.0, 0.0], [8.5, 0.0, 0.0]),
+        ([0.0, 1.0, 0.0], [7.5, 1.0, 0.0]),
+    ] {
+        assert!(locked(&h, text::PAIRS_APPLY), "fewer than three pairs");
+        click(&mut h, m, 0);
+        click(&mut h, q, 2);
+    }
+    h.get_by_label(&text::pairs_set(3));
+    assert!(!locked(&h, text::PAIRS_APPLY));
+    // a place in the model without its place in the scan locks again; „zurück“ drops it
+    click(&mut h, [0.0, 0.0, 1.0], 0);
+    assert!(locked(&h, text::PAIRS_APPLY));
+    h.get_by_label(text::PAIRS_UNDO).click();
+    h.run();
+    assert_eq!(session(&h).in_model.len(), 3);
+    assert!(!locked(&h, text::PAIRS_APPLY));
+    h.state_mut().1 = None;
+    h.get_by_label(text::PAIRS_APPLY).click();
+    h.run();
+    let Some(Action::ApplyPairs { model, entry }) = h.state_mut().1.take() else {
+        panic!("no ApplyPairs");
+    };
+    assert_eq!(model, PathBuf::from("/p/modelle/modell-001"));
+    assert_eq!((entry.points_a.len(), entry.points_b.len()), (3, 3));
+    assert!(entry.enabled);
+    // „Abbrechen“ ends it
+    h.get_by_label(text::PAIRS_CANCEL).click();
+    h.run();
+    assert!(h.state().0.pairs.is_none());
+    assert!(h.query_by_label(text::PAIRS_APPLY).is_none());
+}
+
+#[test]
+fn pair_points_mapped_back_to_member_frames() {
+    let root = Path::new("/p/scans");
+    let model = pair_model(Path::new("/p/modelle/modell-001"), root);
+    let mut s = PairSession::new(&model, 2, "3 · c".into()).unwrap();
+    assert!(
+        PairSession::new(&model, 0, "1 · a".into()).is_none(),
+        "not the reference"
+    );
+    assert!(PairSession::new(&model, 3, "4".into()).is_none());
+    assert!(s.entry().is_err(), "not shown yet");
+    s.shift = Some(SHIFT);
+    // places on scan b in the model frame, and where b has them
+    let in_b = [[0.5, 0.0, 0.0], [1.0, 2.0, 0.0], [0.0, 1.0, 1.5]];
+    let in_model = in_b.map(|p| {
+        let q = t_second() * Point3::from(p);
+        [q.x, q.y, q.z]
+    });
+    // the same places in c (its own frame), shown shifted
+    let in_c = [[3.0, 4.0, 0.25], [1.0, 1.0, 1.0], [2.0, 0.5, 2.0]];
+    for k in 0..3 {
+        s.click(&hit(in_model[k], 1));
+        s.click(&hit([0, 1, 2].map(|i| in_c[k][i] + SHIFT[i]), 2));
+    }
+    let e: PointPairEntry = s.entry().unwrap();
+    assert_eq!(e.a, root.join("b").join("karte"));
+    assert_eq!(e.b, root.join("c").join("karte"));
+    let close = |a: &[[f64; 3]], b: &[[f64; 3]]| {
+        a.iter()
+            .zip(b)
+            .all(|(p, q)| (0..3).all(|k| (p[k] - q[k]).abs() < 1e-9))
+    };
+    assert!(close(&e.points_a, &in_b), "{:?}", e.points_a);
+    assert!(close(&e.points_b, &in_c), "{:?}", e.points_b);
+    assert!(e.added.is_empty() && e.enabled);
+    assert_eq!(e.note, text::pairs_subject("3 · c", "Modell 001"));
+
+    // most places on the reference: all of them in its frame (identity), the one on b too
+    let mut s = PairSession::new(&model, 2, "3 · c".into()).unwrap();
+    s.shift = Some(SHIFT);
+    let places = [
+        ([0.0, 0.0, 0.0], 0),
+        ([4.0, 0.0, 0.0], 1),
+        ([0.0, 3.0, 0.0], 0),
+    ];
+    for (p, scan) in places {
+        s.click(&hit(p, scan));
+        s.click(&hit([9.0, 9.0, 9.0], 2));
+    }
+    let e = s.entry().unwrap();
+    assert_eq!(e.a, root.join("a").join("karte"));
+    assert!(close(&e.points_a, &places.map(|(p, _)| p)));
+    assert!(close(&e.points_b, &[[1.5, 9.0, 9.0]; 3]));
+}
+
+/// A project on disk with [`pair_model`] (its maps inside the project, `modell.las` with
+/// points of a and b, a `clean.las` for c) and `punktpaare.toml` with two entries between a
+/// and b, the second switched off; opened in the program.
+fn pair_project(name: &str) -> (DriftlessApp, PathBuf) {
+    let dir = tmp(name);
+    let mut app = app();
+    app.apply(Action::NewProject {
+        dir: dir.join("projekt"),
+        name: "Halle".into(),
+    });
+    let project = app.state().project.as_ref().unwrap().dir.clone();
+    let model_dir = project.join("modelle").join("modell-001");
+    let model = pair_model(&model_dir, &project.join("scans"));
+    for m in &model.report.members {
+        std::fs::create_dir_all(&m.map_dir).unwrap();
+    }
+    std::fs::create_dir_all(&model_dir).unwrap();
+    let report = serde_json::to_string(&model.report).unwrap();
+    std::fs::write(model_dir.join(MODEL_REPORT), report).unwrap();
+    let n = 40;
+    let cloud = |x0: f32| Cloud {
+        xyz: (0..n)
+            .map(|i| [x0 + (i % 10) as f32 * 0.1, (i / 10) as f32 * 0.1, 1.0])
+            .collect(),
+        intensity: vec![0.5; n],
+        t: vec![0.0; n],
+        frame: vec![0; n],
+        rgb: None,
+        colored: None,
+    };
+    let sources: Vec<u16> = (0..n).map(|i| (i % 2) as u16).collect();
+    driftless_map::write_las_sources(&model_dir.join(MODEL_LAS), &cloud(0.0), &sources).unwrap();
+    write_las(
+        &model.report.members[2].map_dir.join("clean.las"),
+        &cloud(-3.0),
+    )
+    .unwrap();
+    let models = project.join("modelle");
+    let rel =
+        |k: usize| PathBuf::from(stored_text(&models, &model.report.members[k].map_dir).unwrap());
+    let points = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    let mut pairs = PointPairs::default();
+    for enabled in [true, false] {
+        pairs
+            .add(PointPairEntry {
+                a: rel(0),
+                b: rel(1),
+                points_a: points.clone(),
+                points_b: points.clone(),
+                enabled,
+                note: "Ecken".into(),
+                added: "2026-10-27T10:00:00Z".into(),
+                unknown: Default::default(),
+            })
+            .unwrap();
+    }
+    pairs.save(&models.join(POINT_PAIRS_FILE)).unwrap();
+    app.apply(Action::OpenProject(project.clone()));
+    (app, project)
+}
+
+/// Ticks the program until its work has ended.
+fn settle(app: &mut DriftlessApp) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        app.tick();
+        if !app.wants_repaint_while_busy() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "work did not end");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn pair_toggle_saves() {
+    let (mut app, project) = pair_project("app-pair-toggle");
+    settle(&mut app);
+    let state = app.state();
+    assert_eq!(state.point_pairs.len(), 2, "{:?}", state.point_pairs_error);
+    let model = state.models[0].clone();
+    let listed: Vec<(usize, [usize; 2])> =
+        state.pairs_of(&model).map(|(k, _, ab)| (k, ab)).collect();
+    assert_eq!(listed, [(0, [0, 1]), (1, [0, 1])]);
+    // the list under the model with a switch each (the field needs a scan to show)
+    let mut shown = state.clone();
+    shown.scans = pair_state().scans;
+    let mut h = daten_panel(shown);
+    h.get_by_label(text::PAIRS_LIST);
+    h.get_by_label(&text::pair_row(1, 1, 2, 3));
+    let switch = |h: &Panel, nr: usize| {
+        h.get_by_role_and_label(Role::CheckBox, &text::pair_switch(nr))
+            .accesskit_node()
+            .toggled()
+    };
+    assert_eq!(switch(&h, 1), Some(Toggled::True));
+    assert_eq!(switch(&h, 2), Some(Toggled::False));
+    // under the unsure scan „Von Hand ausrichten“, not under the others
+    assert_eq!(h.get_all_by_label(text::PAIRS_START).count(), 1);
+    h.state_mut().1 = None;
+    h.get_by_role_and_label(Role::CheckBox, &text::pair_switch(1))
+        .click();
+    h.run();
+    let action = h.state_mut().1.take().unwrap();
+    assert_eq!(
+        action,
+        Action::SetPairEnabled {
+            index: 0,
+            enabled: false
+        }
+    );
+    // written by the helper: the entry stays, switched off; the other is untouched
+    app.apply(action);
+    assert!(app.state().pairs_writing);
+    settle(&mut app);
+    assert!(!app.state().pairs_writing);
+    let file = project.join("modelle").join(POINT_PAIRS_FILE);
+    let saved = PointPairs::load(&file).unwrap();
+    assert_eq!(saved.entries.len(), 2);
+    assert!(!saved.entries[0].enabled && !saved.entries[1].enabled);
+    assert_eq!(saved.entries[0].note, "Ecken");
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("a = \"../scans/a/karte\""), "{text}");
+    assert!(!app.state().point_pairs[0].enabled);
+    assert!(app
+        .state()
+        .messages
+        .iter()
+        .any(|m| matches!(m, driftless_app::ui::UiMessage::Info(t) if *t == text::pair_switched(1, false))));
+    // on again
+    app.apply(Action::SetPairEnabled {
+        index: 0,
+        enabled: true,
+    });
+    settle(&mut app);
+    assert!(PointPairs::load(&file).unwrap().entries[0].enabled);
+}
+
+#[test]
+fn start_pairs_shows_model_and_scan() {
+    let (mut app, _) = pair_project("app-pair-start");
+    settle(&mut app);
+    let model = app.state().models[0].dir.clone();
+    app.state_mut().view.color_mode = driftless_app::render::ColorMode::Rgb;
+    app.apply(Action::StartPairs {
+        model: model.clone(),
+        member: 2,
+    });
+    assert_eq!(app.state().tool, Tool::Pairs);
+    settle(&mut app);
+    let state = app.state();
+    let session = state.pairs.as_ref().expect("pairs being set");
+    let shift = session.shift.expect("shown");
+    assert_eq!(
+        state.view.color_mode,
+        driftless_app::render::ColorMode::Scan
+    );
+    assert_eq!(state.selection, Selection::Model(model));
+    let cloud = app.cloud().unwrap();
+    assert_eq!(cloud.path, session.cloud);
+    // a and b of the model, c beside it: 1 m beyond the model's end (x 0…0,9 m)
+    assert_eq!(cloud.points.len(), 80);
+    let c: Vec<usize> = (0..80).filter(|&i| cloud.points.source[i] == 2).collect();
+    assert_eq!(c.len(), 40);
+    let x = |i: usize| cloud.points.origin[0] + f64::from(cloud.points.xyz[i][0]);
+    let start = c.iter().map(|&i| x(i)).fold(f64::INFINITY, f64::min);
+    assert!((start - 1.9).abs() < 1e-3, "{start}");
+    assert!((start - shift[0] - -3.0).abs() < 1e-3, "{shift:?}");
+    // a scan without a cloud: the session ends with the reason
+    app.apply(Action::StartPairs {
+        model: app.state().models[0].dir.clone(),
+        member: 1,
+    });
+    settle(&mut app);
+    assert!(app.state().pairs.is_none());
+    assert!(app.state().messages.iter().any(
+        |m| matches!(m, driftless_app::ui::UiMessage::Error(t) if t.contains(text::PAIRS_NO_CLOUD))
+    ));
+    // another cloud ends it
+    app.apply(Action::StartPairs {
+        model: app.state().models[0].dir.clone(),
+        member: 2,
+    });
+    settle(&mut app);
+    assert!(app.state().pairs.as_ref().unwrap().shift.is_some());
+    let las = app.state().models[0].dir.join(MODEL_LAS);
+    app.apply(Action::Select(Selection::Cloud(las)));
+    settle(&mut app);
+    assert!(app.state().pairs.is_none());
+    assert_eq!(app.state().tool, Tool::Orbit);
 }

@@ -30,6 +30,16 @@ pub const EMPTY_NO_MAPS: &str = "Noch keine Karte. Zuerst in „Daten“ eine Ka
 pub const GO_TO_DATA: &str = "Zu „Daten“";
 /// Over the view in „Bilder“ while no surface is shown.
 pub const NO_SURFACE_YET: &str = "Noch keine Oberfläche – im Feld „Bilder“ rechnen";
+/// Over the window while a file is dragged over it.
+pub const DROP_HERE: &str = "Loslassen zum Öffnen";
+/// A file dropped onto the window that is no LAS, PLY or GLB.
+pub const DROP_UNSUPPORTED: &str = "Dateiformat nicht unterstützt";
+
+/// [`DROP_UNSUPPORTED`] with the name of the (first) file dropped.
+pub fn drop_unsupported(name: &str) -> String {
+    format!("{DROP_UNSUPPORTED}: {name} (LAS, PLY oder GLB)")
+}
+
 pub const PLAN_COMING: &str = "Hier entstehen Grundriss, Maße und der DWG-Export. Das folgt in \
      einem späteren Baustein.";
 pub const ADD_RUN_NEEDS_SCAN: &str = "Zuerst im Feld „Daten“ einen Scan wählen";
@@ -64,6 +74,192 @@ pub const RECOMPUTE_HINT: &str = "Scan wählen und „Rechnen“ drücken";
 /// While the background check of the maps runs: „Alle rechnen“ starts once it is done.
 pub const MAP_STATUS_PENDING: &str = "Karten werden geprüft …";
 pub const ADVANCED: &str = "Erweitert";
+
+// Merging scans into a model („Daten“)
+/// Opens the field that merges scans; shown once two scans have a finished map.
+pub const MERGE_OPEN: &str = "Zusammenführen …";
+pub const MERGE_OPEN_HINT: &str = "Mehrere Scans desselben Orts zu einem Modell vereinen";
+pub const MERGE_TITLE: &str = "Scans zusammenführen";
+pub const MERGE_HINT: &str =
+    "Der erste angehakte Scan ist der Bezug: die anderen werden an ihm ausgerichtet.";
+/// Beside the first ticked scan, and in the model for the scan the others were placed at.
+pub const MERGE_REFERENCE: &str = "Bezug";
+pub const MERGE_NO_MAP: &str = "Noch keine fertige Karte – zuerst rechnen";
+pub const MERGE_MAP: &str = "Karte";
+pub const MERGE_UNSURE: &str = "Auch unsichere übernehmen";
+pub const MERGE_UNSURE_HINT: &str = "Nimmt auch Scans ins Modell, deren Lage nicht sicher \
+     gefunden wurde. Gescheiterte nie.";
+/// The start button of the field, and the label of the job.
+pub const MERGE_START: &str = "Zusammenführen";
+pub const MERGE_START_HINT: &str = "Richtet die Scans aneinander aus und legt ein neues Modell an";
+pub const MERGE_CLOSE: &str = "Schließen";
+pub const MERGE_NEEDS_TWO: &str = "Mindestens zwei Scans anhaken";
+/// Above the models in „Daten“.
+pub const MODELS: &str = "Modelle";
+/// How surely a scan was placed in a model (the words of `modell.json`).
+pub const VERDICT_SURE: &str = "sicher";
+pub const VERDICT_UNSURE: &str = "unsicher";
+pub const VERDICT_FAILED: &str = "gescheitert";
+/// A scan of a model whose points are not in it.
+pub const NOT_IN_MODEL: &str = "nicht im Modell";
+pub const NOT_IN_MODEL_UNSURE: &str = "„Auch unsichere übernehmen“ nimmt ihn auf";
+pub const VERDICT_HINT: &str = "Überlappung: welcher Teil des Scans im Modell wiederkehrt. \
+     Restversatz: wie weit seine Punkte im Mittel neben denen der anderen liegen. Wände: \
+     derselbe Versatz an der schlechtesten Wandrichtung.";
+/// A model whose maps were computed anew since the merge.
+pub const MODEL_STALE: &str = "veraltet – Karte eines Scans neu gerechnet";
+pub const STATUS_MODEL_STALE: &str = "Modell veraltet";
+pub const STATUS_MODEL_STALE_HINT: &str =
+    "Eine Karte des Modells wurde neu gerechnet – in „Daten“ neu zusammenführen";
+pub const COMPUTE_MODEL_SURFACE_HINT: &str =
+    "Rechnet die Oberfläche des Modells aus den Bildern aller seiner Scans";
+pub const UNKNOWN_MODEL: &str = "Modell nicht im Projekt";
+
+/// „Modell 001“: a model folder `modell-001`.
+pub fn model_label(digits: &str) -> String {
+    format!("Modell {digits}")
+}
+
+/// A model in „Bilder“: „Modell 001 · 3 Scans“.
+pub fn model_card(label: &str, scans: usize) -> String {
+    match scans {
+        1 => format!("{label} · 1 Scan"),
+        n => format!("{label} · {n} Scans"),
+    }
+}
+
+/// A stale model in the tree: „Modell 001 · veraltet – Karte eines Scans neu gerechnet“.
+pub fn model_stale(label: &str) -> String {
+    format!("{label} · {MODEL_STALE}")
+}
+
+/// A scan of a model: „2 · Scan 13:30“ (its number, as the point info names it).
+pub fn model_member(nr: usize, name: &str) -> String {
+    format!("{nr} · {name}")
+}
+
+/// Under a scan of a model: „Überlappung 98 % · Restversatz 1,8 mm“.
+pub fn member_numbers(overlap: f64, residual_mm: f64) -> String {
+    format!(
+        "Überlappung {} % · Restversatz {} mm",
+        (overlap * 100.0).round() as i64,
+        decimal(residual_mm, 1)
+    )
+}
+
+/// Under a scan of a model placed by point pairs: „Punktpaare · Überlappung 10 % · Restversatz
+/// 0,5 mm“.
+pub fn member_numbers_pairs(overlap: f64, residual_mm: f64) -> String {
+    format!("{PAIRS_LIST} · {}", member_numbers(overlap, residual_mm))
+}
+
+/// On hover over a scan placed by point pairs: „Von Hand über Punktpaare ausgerichtet, sie
+/// liegen im Mittel 1,2 cm neben der Lage“.
+pub fn member_pairs_fit(rms_mm: f64) -> String {
+    format!(
+        "Von Hand über Punktpaare ausgerichtet, sie liegen im Mittel {} cm neben der Lage",
+        decimal(rms_mm / 10.0, 1)
+    )
+}
+
+/// On hover over a scan of a model: „Wände 1,9 mm“ (the worst wall orientation).
+pub fn member_walls(wall_mm: f64) -> String {
+    format!("Wände {} mm", decimal(wall_mm, 1))
+}
+
+pub fn unknown_model(dir: &std::path::Path) -> String {
+    format!("{UNKNOWN_MODEL}: {}", dir.display())
+}
+
+pub fn scan_not_in_project(scan: &std::path::Path) -> String {
+    format!("Scan {} ist nicht mehr im Projekt", scan.display())
+}
+
+// Point pairs by hand („Von Hand ausrichten“)
+/// Under an unsure or failed scan of a model.
+pub const PAIRS_START: &str = "Von Hand ausrichten";
+pub const PAIRS_START_HINT: &str = "Drei gleiche Stellen im Modell und in diesem Scan \
+     anklicken; danach wird neu zusammengeführt";
+pub const PAIRS_TITLE: &str = "Von Hand ausrichten";
+pub const PAIRS_HINT: &str = "Je Paar zuerst eine Stelle im Modell anklicken, dann dieselbe \
+     Stelle im Scan rechts daneben. Mindestens drei Paare, weit auseinander und nicht auf einer \
+     Linie.";
+pub const PAIRS_LOADING: &str = "Modell und Scan werden geladen …";
+pub const PAIRS_WANTS_MODEL: &str =
+    "Das ist ein Punkt im Scan – zuerst die Stelle im Modell anklicken";
+pub const PAIRS_WANTS_SCAN: &str =
+    "Das ist ein Punkt im Modell – jetzt dieselbe Stelle im Scan anklicken";
+pub const PAIRS_NOT_SHOWN: &str = "Die Ansicht zeigt nicht Modell und Scan – neu beginnen";
+pub const PAIRS_UNDO: &str = "Letzten Punkt zurück";
+pub const PAIRS_CANCEL: &str = "Abbrechen";
+pub const PAIRS_APPLY: &str = "Übernehmen und neu zusammenführen";
+pub const PAIRS_APPLY_HINT: &str =
+    "Speichert die Paare in modelle/punktpaare.toml und legt mit denselben Scans ein neues \
+     Modell an";
+pub const PAIRS_NEED_THREE: &str = "Mindestens drei Paare setzen";
+pub const PAIRS_HALF: &str = "Zuerst dieselbe Stelle im Scan anklicken";
+pub const PAIRS_NO_CLOUD: &str = "Der Scan hat keine Punktwolke (color.las oder clean.las)";
+pub const PAIRS_SAVED: &str = "Punktpaare gespeichert";
+/// The tool of the view while pairs are set.
+pub const TOOL_PAIRS: &str = "Punktpaare";
+pub const TOOL_PAIRS_HINT: &str =
+    "Klick setzt abwechselnd einen Punkt im Modell und denselben im Scan";
+/// Above the list of the point pairs of a model.
+pub const PAIRS_LIST: &str = "Punktpaare";
+pub const PAIR_SWITCH_HINT: &str =
+    "Abgeschaltete Paare bleiben gespeichert und zählen ab dem nächsten Zusammenführen nicht";
+/// The label of the job that switches a pair.
+pub const PAIRS_JOB: &str = "Punktpaar speichern";
+
+/// „Scan 3 · Scan 13:35 an Modell 001“.
+pub fn pairs_subject(member: &str, model: &str) -> String {
+    format!("{member} an {model}")
+}
+
+/// What the next click of the tool „Punktpaare“ sets: „Paar 2: Stelle im Modell anklicken“.
+pub fn pair_next(nr: usize, in_model: bool) -> String {
+    if in_model {
+        format!("Paar {nr}: Stelle im Modell anklicken")
+    } else {
+        format!("Paar {nr}: dieselbe Stelle im Scan anklicken")
+    }
+}
+
+/// „3 Paare gesetzt“.
+pub fn pairs_set(n: usize) -> String {
+    match n {
+        1 => "1 Paar gesetzt".into(),
+        n => format!("{n} Paare gesetzt"),
+    }
+}
+
+/// The cloud of model and scan side by side, named in the view and the messages.
+pub fn pair_cloud_name(member: &str) -> String {
+    format!("Modell und {member}")
+}
+
+/// A point pair of a model: „Paar 1 · 1 ↔ 3 · 4 Punkte“ (the numbers of its scans).
+pub fn pair_row(nr: usize, a: usize, b: usize, points: usize) -> String {
+    format!("Paar {nr} · {a} ↔ {b} · {points} Punkte")
+}
+
+/// Beside a point pair the merge cannot use (a hand edit of the file); the reason on hover.
+pub const PAIR_UNUSABLE: &str = "nicht nutzbar";
+
+/// The name of the switch of point pair `nr` (from 1), for screen readers and tests.
+pub fn pair_switch(nr: usize) -> String {
+    format!("Punktpaar {nr} an")
+}
+
+/// „Punktpaar 2 abgeschaltet – zählt ab dem nächsten Zusammenführen“.
+pub fn pair_switched(nr: usize, enabled: bool) -> String {
+    let what = if enabled {
+        "eingeschaltet"
+    } else {
+        "abgeschaltet"
+    };
+    format!("Punktpaar {nr} {what} – zählt ab dem nächsten Zusammenführen")
+}
 
 // Step 2 „Bilder“
 /// The main button without a selected map: every map without a current surface, one after
@@ -171,6 +367,7 @@ pub const COLOR_MODE: &str = "Farbart";
 pub const MODE_RGB: &str = "Farbe";
 pub const MODE_INTENSITY: &str = "Intensität";
 pub const MODE_QUALITY: &str = "Güte";
+pub const MODE_SCAN: &str = "je Scan";
 pub const POINT_SIZE: &str = "Punktgröße (px)";
 pub const ROUND_POINTS: &str = "rund";
 pub const POINT_SIZE_MODE: &str = "Punkte";
@@ -210,6 +407,10 @@ pub const VIEW_HELP_FLY: &str =
     "W/A/S/D, Q/E: fliegen (Shift schneller) · linke Taste: wie das Werkzeug unten · rechte Taste: umsehen · Rad: vor/zurück · F: alles zeigen · O: Fläche/Punkte/beides · Esc: Messen abbrechen";
 pub const LOAD_CLOUD: &str = "Wolke laden";
 pub const LOAD_SURFACE: &str = "Oberfläche laden";
+pub const OPEN_CLOUD: &str = "Punktwolke öffnen …";
+pub const DIALOG_OPEN_CLOUD: &str = "Punktwolke öffnen (LAS oder PLY)";
+/// Filter of the dialog „Punktwolke öffnen …“.
+pub const FILTER_CLOUD: &str = "Punktwolke";
 pub const OPEN_SURFACE: &str = "Oberfläche öffnen …";
 pub const DIALOG_OPEN_SURFACE: &str = "Oberfläche öffnen (oberflaeche.glb)";
 /// The switch at the top right of the view.
@@ -233,6 +434,8 @@ pub const POINT_INTENSITY: &str = "Intensität";
 pub const POINT_COLOR: &str = "Farbe";
 pub const POINT_QUALITY: &str = "Güte der Teilkarte";
 pub const POINT_REMOVED: &str = "Entfernt als";
+/// The scan of a point of a merged model, counted from 1 as in the model's list.
+pub const POINT_SCAN: &str = "Scan";
 pub const NO_COLOR: &str = "ohne Farbe";
 /// Tooltip of the × of the clicked point.
 pub const CLOSE_POINT: &str = "Punkt schließen";

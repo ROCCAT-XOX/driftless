@@ -3,10 +3,11 @@
 
 use driftless_app::jobs::JobOutput;
 use driftless_app::project::{canonical, Project};
-use driftless_app::ui::{parse_args, Action, Args, DriftlessApp, Selection, UiMessage};
+use driftless_app::ui::{parse_args, text, Action, Args, DriftlessApp, Selection, UiMessage};
 use driftless_io::progress::LogLine;
 use driftless_io::testscan::{room_bag_secs, tmp};
 use driftless_steps::StepError;
+use egui_kittest::kittest::Queryable;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
@@ -431,4 +432,116 @@ fn reselecting_a_cancelled_cloud_loads_it() {
     tick_until(&mut app, |app| !app.is_loading());
     assert_eq!(errors(&app), Vec::<String>::new());
     assert_eq!(app.cloud().map(|c| c.path.clone()), Some(a));
+}
+
+/// A file dropped onto the window, as the windowing backend hands it over.
+#[derive(Debug)]
+struct Dropped(PathBuf);
+
+impl eframe::egui::DroppedFile for Dropped {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        fs::read(&self.0).map_err(|e| e.to_string())
+    }
+}
+
+fn window(app: DriftlessApp) -> egui_kittest::Harness<'static, DriftlessApp> {
+    egui_kittest::Harness::builder()
+        .with_size([1000.0, 700.0])
+        .build_ui_state(|ui, app: &mut DriftlessApp| app.show(ui), app)
+}
+
+fn drop_files(h: &mut egui_kittest::Harness<'_, DriftlessApp>, paths: &[PathBuf]) {
+    h.input_mut().dropped_files = paths
+        .iter()
+        .map(|p| Arc::new(Dropped(p.clone())) as eframe::egui::DroppedFileHandle)
+        .collect();
+    h.step();
+}
+
+/// A LAS or PLY dropped onto the window is shown, without a project; of several files the
+/// first one that can be opened.
+#[test]
+fn dropped_las_loads_cloud() {
+    let dir = tmp("ui-hineinziehen");
+    let las = dir.join("wolke.las");
+    let mut builder = las::Builder::from((1, 2));
+    builder.point_format = las::point::Format::new(1).unwrap();
+    let mut w = las::Writer::from_path(&las, builder.into_header().unwrap()).unwrap();
+    for i in 0..500 {
+        w.write_point(las::Point {
+            x: f64::from(i) * 0.01,
+            y: 1.0,
+            z: 2.0,
+            gps_time: Some(f64::from(i)),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    w.close().unwrap();
+    let mut h = window(app());
+    drop_files(&mut h, &[dir.join("notiz.txt"), las.clone()]);
+    assert!(h.state().is_loading());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while h.state().cloud().is_none() {
+        assert!(Instant::now() < deadline, "cloud not loaded");
+        std::thread::sleep(Duration::from_millis(2));
+        h.step();
+    }
+    assert_eq!(h.state().cloud().unwrap().path, las);
+    assert_eq!(h.state().cloud().unwrap().points.len(), 500);
+    assert!(h.state().state().project.is_none());
+    assert_eq!(errors(h.state()), Vec::<String>::new());
+
+    // a PLY the same way
+    let ply = dir.join("modell.PLY");
+    fs::write(
+        &ply,
+        "ply\nformat ascii 1.0\nelement vertex 2\nproperty float x\nproperty float y\n\
+         property float z\nend_header\n0 0 0\n1 1 1\n",
+    )
+    .unwrap();
+    drop_files(&mut h, std::slice::from_ref(&ply));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while h.state().cloud().is_none_or(|c| c.path != ply) {
+        assert!(Instant::now() < deadline, "PLY not loaded");
+        std::thread::sleep(Duration::from_millis(2));
+        h.step();
+    }
+    assert_eq!(h.state().cloud().unwrap().points.len(), 2);
+    assert_eq!(errors(h.state()), Vec::<String>::new());
+
+    // a surface starts its load
+    drop_files(&mut h, &[dir.join("oberflaeche.glb")]);
+    assert!(h.state().is_loading_surface());
+}
+
+#[test]
+fn dropped_unknown_shows_hint() {
+    let dir = tmp("ui-hineinziehen-fremd");
+    let mut h = window(app());
+    // while a file hovers over the window
+    h.input_mut().hovered_files = vec![eframe::egui::HoveredFile {
+        path: Some(dir.join("notiz.txt")),
+        mime: String::new(),
+    }];
+    h.step();
+    h.step();
+    h.get_by_label(text::DROP_HERE);
+    h.input_mut().hovered_files.clear();
+    drop_files(&mut h, &[dir.join("notiz.txt"), dir.join("bild.jpg")]);
+    h.step();
+    assert!(h.query_by_label(text::DROP_HERE).is_none());
+    assert!(!h.state().is_loading());
+    assert!(!h.state().is_loading_surface());
+    let shown: Vec<_> = h.state().state().messages.clone();
+    assert!(
+        shown
+            .iter()
+            .any(|m| matches!(m, UiMessage::Info(t) if t.starts_with(text::DROP_UNSUPPORTED))),
+        "{shown:?}"
+    );
 }

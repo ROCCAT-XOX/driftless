@@ -1,4 +1,4 @@
-use driftless_map::{write_las, write_ply, Cloud};
+use driftless_map::{write_las, write_las_sources, write_ply, write_ply_sources, Cloud};
 use las::Reader;
 use std::path::PathBuf;
 
@@ -154,5 +154,57 @@ fn las_user_data_marks_uncolored() {
         .unwrap()
         .points()
         .all(|p| p.unwrap().user_data == 0));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn sources_go_to_point_source_id_and_scan() {
+    let dir = temp_dir("sources");
+    let c = cloud(true);
+    let sources = [0u16, 2, 65535];
+    let las = dir.join("modell.las");
+    write_las_sources(&las, &c, &sources).unwrap();
+    let mut r = Reader::from_path(&las).unwrap();
+    let points: Vec<las::Point> = r.read_all().unwrap().points().map(Result::unwrap).collect();
+    assert_eq!(
+        points.iter().map(|p| p.point_source_id).collect::<Vec<_>>(),
+        sources
+    );
+    assert_eq!(
+        points.iter().map(|p| p.user_data).collect::<Vec<_>>(),
+        vec![0, 0, 1],
+        "user data as in write_las"
+    );
+    // Without sources every point has source 0.
+    write_las(&las, &c).unwrap();
+    let mut r = Reader::from_path(&las).unwrap();
+    assert!(r
+        .read_all()
+        .unwrap()
+        .points()
+        .all(|p| p.unwrap().point_source_id == 0));
+
+    let ply = dir.join("modell.ply");
+    write_ply_sources(&ply, &c, &sources).unwrap();
+    let bytes = std::fs::read(&ply).unwrap();
+    let end = b"end_header\n";
+    let header_len = bytes.windows(end.len()).position(|w| w == end).unwrap() + end.len();
+    let header = std::str::from_utf8(&bytes[..header_len]).unwrap();
+    assert!(header.ends_with("property uchar colored\nproperty ushort scan\nend_header\n"));
+    let stride = 22;
+    assert_eq!(bytes.len(), header_len + 3 * stride);
+    for (k, s) in sources.iter().enumerate() {
+        let v = &bytes[header_len + k * stride..header_len + (k + 1) * stride];
+        assert_eq!(u16::from_le_bytes([v[20], v[21]]), *s);
+    }
+    // Without colours the scan follows the intensity.
+    write_ply_sources(&ply, &cloud(false), &sources).unwrap();
+    let bytes = std::fs::read(&ply).unwrap();
+    let header_len = bytes.windows(end.len()).position(|w| w == end).unwrap() + end.len();
+    assert_eq!(bytes.len(), header_len + 3 * 18);
+    assert_eq!(
+        u16::from_le_bytes([bytes[header_len + 16], bytes[header_len + 17]]),
+        0
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }

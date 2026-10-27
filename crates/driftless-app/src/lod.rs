@@ -41,7 +41,7 @@ pub struct PointVertex {
     pub pos: [f32; 3],
     /// `r | g << 8 | b << 16 | intensity << 24`; without colours r = g = b = intensity.
     pub rgbi: u32,
-    /// `quality | flags << 8`.
+    /// `quality | flags << 8 | scan << 16` (scan 0 without [`PointSet::source`]).
     pub extra: u32,
 }
 
@@ -236,7 +236,9 @@ fn vertex(points: &PointSet, i: usize) -> PointVertex {
     PointVertex {
         pos: points.xyz[i],
         rgbi: r | g << 8 | b << 16 | it << 24,
-        extra: u32::from(points.quality[i]) | u32::from(points.flags[i]) << 8,
+        extra: u32::from(points.quality[i])
+            | u32::from(points.flags[i]) << 8
+            | u32::from(points.source.get(i).copied().unwrap_or(0)) << 16,
     }
 }
 

@@ -11,6 +11,10 @@
 //! Measuring: the first click on a point sets its first end, the second the other and adds the
 //! [`Measurement`]; Esc or another tool drops a first end. The view draws the lines with their
 //! distance ([`paint_measurements`]), the field „Planung“ lists them.
+//!
+//! Point pairs („Von Hand ausrichten“, [`PairSession`]): the view shows a model and beside it
+//! one of its scans; the tool „Punktpaare“ (in the bar only then) takes a place in the model
+//! and the same place in the scan by turns, each with a numbered marker ([`paint_pairs`]).
 
 use super::steps::{parse_decimal, point_lines};
 use super::theme::{self, icon, DARK};
@@ -18,11 +22,16 @@ use super::view3d::{effective_show, target_size, PointInfo};
 use super::{text, Action, AppState};
 use crate::camera::{Camera, CameraMode};
 use crate::pick::{project, relative_to};
+use crate::project::ModelInfo;
 use crate::render::ShowMode;
+use driftless_steps::merge::member_transform;
+use driftless_steps::pairs::{PointPairEntry, MIN_POINT_PAIRS};
+use driftless_traj::nalgebra::{Isometry3, Point3};
 use eframe::egui::{
     self, Align2, Area, Context, CornerRadius, FontId, Id, Order, Rect, RichText, Sense, Stroke,
     Ui, WidgetInfo, WidgetType,
 };
+use std::path::PathBuf;
 
 /// The tool of the view: what the left mouse button does.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -38,13 +47,15 @@ pub enum Tool {
     Measure,
     /// The height cut; its bar shows above the tools.
     Cut,
+    /// Clicks set point pairs of a [`PairSession`]; only in the bar while one is open.
+    Pairs,
 }
 
 impl Tool {
     /// Whether a click picks a point of the cloud (else it does nothing; dragging turns the
     /// view as with [`Tool::Orbit`], except with [`Tool::Pan`]).
     pub fn picks_points(self) -> bool {
-        matches!(self, Tool::Pick | Tool::Measure)
+        matches!(self, Tool::Pick | Tool::Measure | Tool::Pairs)
     }
 }
 
@@ -174,7 +185,198 @@ pub fn point_clicked(state: &mut AppState, info: PointInfo) {
             }
             None => state.measure_a = Some(info.position),
         },
+        Tool::Pairs => {
+            let shown = state.cloud.as_ref().map(|c| &c.path);
+            if let Some(session) = &mut state.pairs {
+                if session.shift.is_some() && shown == Some(&session.cloud) {
+                    session.click(&info);
+                } else {
+                    session.message = Some(text::PAIRS_NOT_SHOWN.into());
+                }
+            }
+        }
         Tool::Orbit | Tool::Pan | Tool::Cut => {}
+    }
+}
+
+/// A place clicked with the tool „Punktpaare“: absolute, as shown, and the scan of the model
+/// it belongs to ([`crate::cloud::PointSet::source`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PairPoint {
+    pub position: [f64; 3],
+    pub scan: u16,
+}
+
+/// „Von Hand ausrichten“ of scan `member` of a model: the places clicked so far, by pairs (a
+/// place in the model, then the same place in the scan), and what is needed to turn them
+/// into an entry of `punktpaare.toml` ([`PairSession::entry`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairSession {
+    /// The model folder, and its name („Modell 001“).
+    pub model: PathBuf,
+    pub model_label: String,
+    /// The scan to place: its number in the model (from 0), and its name („3 · Scan 13:35“).
+    pub member: usize,
+    pub member_name: String,
+    /// `T_i` of every scan of the model, and its map folder.
+    transforms: Vec<Isometry3<f64>>,
+    map_dirs: Vec<PathBuf>,
+    /// The name of the cloud of model and scan ([`text::pair_cloud_name`]).
+    pub cloud: PathBuf,
+    /// The shift of the scan in that cloud ([`crate::cloud::PairCloud::shift`]); `None`
+    /// until it is shown.
+    pub shift: Option<[f64; 3]>,
+    pub in_model: Vec<PairPoint>,
+    /// Absolute, as shown.
+    pub in_scan: Vec<[f64; 3]>,
+    /// Why the last click set nothing (German).
+    pub message: Option<String>,
+}
+
+impl PairSession {
+    /// For scan `member` of `model`, named `member_name`; `None` for the reference or a
+    /// number the model does not have.
+    pub fn new(model: &ModelInfo, member: usize, member_name: String) -> Option<Self> {
+        // not the reference
+        model.report.members.get(member)?.placed_against?;
+        Some(PairSession {
+            cloud: model.dir.join(text::pair_cloud_name(&member_name)),
+            model: model.dir.clone(),
+            model_label: model.label.clone(),
+            member,
+            member_name,
+            transforms: model.report.members.iter().map(member_transform).collect(),
+            map_dirs: model
+                .report
+                .members
+                .iter()
+                .map(|m| m.map_dir.clone())
+                .collect(),
+            shift: None,
+            in_model: Vec::new(),
+            in_scan: Vec::new(),
+            message: None,
+        })
+    }
+
+    /// Complete pairs.
+    pub fn pairs(&self) -> usize {
+        self.in_model.len().min(self.in_scan.len())
+    }
+
+    /// Whether the next click is for a place in the model (else in the scan).
+    pub fn wants_model(&self) -> bool {
+        self.in_model.len() <= self.in_scan.len()
+    }
+
+    /// What the next click sets: „Paar 2: Stelle im Modell anklicken“.
+    pub fn prompt(&self) -> String {
+        text::pair_next(self.pairs() + 1, self.wants_model())
+    }
+
+    /// Takes the clicked point: a point of the scan when a place in the scan is wanted, else
+    /// of the model; the other kind, or the place just set again, sets nothing.
+    pub fn click(&mut self, info: &PointInfo) {
+        let Some(scan) = info.scan else {
+            self.message = Some(text::PAIRS_NOT_SHOWN.into());
+            return;
+        };
+        let in_scan = usize::from(scan) == self.member;
+        match (self.wants_model(), in_scan) {
+            (true, true) => self.message = Some(text::PAIRS_WANTS_MODEL.into()),
+            (false, false) => self.message = Some(text::PAIRS_WANTS_SCAN.into()),
+            (true, false) => {
+                if self.in_model.last().map(|p| p.position) != Some(info.position) {
+                    self.in_model.push(PairPoint {
+                        position: info.position,
+                        scan,
+                    });
+                }
+                self.message = None;
+            }
+            (false, true) => {
+                self.in_scan.push(info.position);
+                self.message = None;
+            }
+        }
+    }
+
+    /// Drops the last place set.
+    pub fn undo(&mut self) {
+        if self.in_model.len() > self.in_scan.len() {
+            self.in_model.pop();
+        } else {
+            self.in_scan.pop();
+        }
+        self.message = None;
+    }
+
+    /// Why „Übernehmen und neu zusammenführen“ is locked: the cloud is not shown yet, fewer
+    /// than three pairs, or a place in the model without its place in the scan.
+    pub fn blocked(&self) -> Option<&'static str> {
+        if self.shift.is_none() {
+            Some(text::PAIRS_LOADING)
+        } else if self.in_model.len() > self.in_scan.len() {
+            Some(text::PAIRS_HALF)
+        } else if self.pairs() < MIN_POINT_PAIRS {
+            Some(text::PAIRS_NEED_THREE)
+        } else {
+            None
+        }
+    }
+
+    /// The pairs as an entry of `punktpaare.toml` (map folders absolute, `added` empty: the
+    /// job sets it). `a` is the scan of the model most places lie on (the first of equals),
+    /// its points the places in the model taken back into its frame by `T_a⁻¹`; `b` is the
+    /// scan to place, its points the places in the scan minus the shift. Every place in the
+    /// model is in the model frame, so `T_a⁻¹` takes also one on another scan of the model to
+    /// where that scan has it in the frame of `a`.
+    pub fn entry(&self) -> Result<PointPairEntry, String> {
+        if let Some(why) = self.blocked() {
+            return Err(why.into());
+        }
+        let shift = self.shift.unwrap_or_default();
+        let n = self.pairs();
+        let mut count = vec![0usize; self.transforms.len()];
+        for p in &self.in_model[..n] {
+            if let Some(c) = count.get_mut(usize::from(p.scan)) {
+                *c += 1;
+            }
+        }
+        let a = (0..count.len())
+            .max_by_key(|&i| (count[i], std::cmp::Reverse(i)))
+            .filter(|&i| count[i] > 0)
+            .ok_or(text::PAIRS_NOT_SHOWN)?;
+        let back = self.transforms[a].inverse();
+        let points_a = self.in_model[..n]
+            .iter()
+            .map(|p| {
+                let q = back * Point3::from(p.position);
+                [q.x, q.y, q.z]
+            })
+            .collect();
+        let points_b = self.in_scan[..n]
+            .iter()
+            .map(|q| [0, 1, 2].map(|k| q[k] - shift[k]))
+            .collect();
+        Ok(PointPairEntry {
+            a: self.map_dirs[a].clone(),
+            b: self.map_dirs[self.member].clone(),
+            points_a,
+            points_b,
+            enabled: true,
+            note: text::pairs_subject(&self.member_name, &self.model_label),
+            added: String::new(),
+            unknown: Default::default(),
+        })
+    }
+}
+
+/// Ends „Von Hand ausrichten“: the session goes, and the tool „Punktpaare“ with it.
+pub fn end_pairs(state: &mut AppState) {
+    state.pairs = None;
+    if state.tool == Tool::Pairs {
+        state.tool = Tool::Orbit;
     }
 }
 
@@ -299,6 +501,10 @@ fn info(ctx: &Context, view: Rect, state: &mut AppState) -> Rect {
         }
         if let Some(hint) = click_hint(s) {
             ui.add(egui::Label::new(RichText::new(hint).color(DARK.measure)).wrap());
+            let why = s.pairs.as_ref().and_then(|p| p.message.as_ref());
+            if let (Some(why), Tool::Pairs) = (why, s.tool) {
+                ui.add(egui::Label::new(RichText::new(why).color(DARK.warn)).wrap());
+            }
             // the clicks hit the points, also while only the surface is seen
             if s.tool.picks_points() && s.cloud.is_some() && shown == ShowMode::Surface {
                 ui.add(
@@ -320,17 +526,21 @@ fn info(ctx: &Context, view: Rect, state: &mut AppState) -> Rect {
 }
 
 /// What a click into the view does now, if it is more than turning it.
-fn click_hint(s: &AppState) -> Option<&'static str> {
+pub fn click_hint(s: &AppState) -> Option<String> {
     if s.correct.picking {
-        return Some(text::VIEW_HELP_PICK);
+        return Some(text::VIEW_HELP_PICK.into());
     }
     if s.tool.picks_points() && s.cloud.is_none() {
-        return Some(text::TOOL_NEEDS_CLOUD);
+        return Some(text::TOOL_NEEDS_CLOUD.into());
     }
     match s.tool {
-        Tool::Measure if s.measure_a.is_some() => Some(text::MEASURE_SECOND),
-        Tool::Measure => Some(text::MEASURE_FIRST),
-        Tool::Pick if s.picked.is_none() => Some(text::PICK_POINT),
+        Tool::Measure if s.measure_a.is_some() => Some(text::MEASURE_SECOND.into()),
+        Tool::Measure => Some(text::MEASURE_FIRST.into()),
+        Tool::Pick if s.picked.is_none() => Some(text::PICK_POINT.into()),
+        Tool::Pairs => s.pairs.as_ref().map(|p| match p.shift {
+            None => text::PAIRS_LOADING.into(),
+            Some(_) => p.prompt(),
+        }),
         _ => None,
     }
 }
@@ -401,7 +611,14 @@ fn toolbar(ctx: &Context, view: Rect, state: &mut AppState) -> (Rect, Option<Act
     let pos = view.center_bottom() - egui::vec2(0.0, BOTTOM_MARGIN);
     let rect = float(ctx, "werkzeuge", view, pos, Align2::CENTER_BOTTOM, |ui| {
         ui.horizontal(|ui| {
-            for (tool, symbol, name, hint) in TOOLS {
+            let pairs = (
+                Tool::Pairs,
+                icon::PAIRS,
+                text::TOOL_PAIRS,
+                text::TOOL_PAIRS_HINT,
+            );
+            let extra = state.pairs.is_some().then_some(pairs);
+            for (tool, symbol, name, hint) in TOOLS.into_iter().chain(extra) {
                 let r = bar_button(ui, Some(symbol), Some(name), name, Some(tool == active));
                 if r.on_hover_text(hint).clicked() {
                     chosen = Some(tool);
@@ -609,6 +826,46 @@ pub fn paint_measurements(
         if let Some(hover) = ui.ctx().pointer_hover_pos().filter(|p| rect.contains(*p)) {
             painter.extend(egui::Shape::dashed_line(&[a, hover], stroke, 6.0, 4.0));
         }
+    }
+}
+
+/// Radius of the numbered markers of the point pairs (points).
+const PAIR_MARKER: f32 = 8.0;
+
+/// Draws the places of the point pairs over the view in `rect`, seen by `camera` in the frame
+/// at `origin`: a dot with the number of its pair at each, in the model and in the scan alike.
+pub fn paint_pairs(ui: &mut Ui, rect: Rect, camera: &Camera, origin: [f64; 3], state: &AppState) {
+    let Some(session) = &state.pairs else {
+        return;
+    };
+    if state.cloud.as_ref().map(|c| &c.path) != Some(&session.cloud) {
+        return;
+    }
+    let ppp = ui.ctx().pixels_per_point();
+    let px = target_size(rect.size(), ppp);
+    let viewport = [px[0] as f32, px[1] as f32];
+    let vp = camera.view_proj(viewport[0] / viewport[1]);
+    let painter = ui.painter_at(rect);
+    let font = FontId::proportional(11.0);
+    let places = session.in_model.iter().map(|p| p.position).enumerate();
+    for (k, p) in places.chain(session.in_scan.iter().copied().enumerate()) {
+        let Some(q) = project(&vp, relative_to(origin, p), viewport).filter(|q| q[2] <= 1.0) else {
+            continue;
+        };
+        let at = rect.min + egui::vec2(q[0], q[1]) / ppp;
+        painter.circle(
+            at,
+            PAIR_MARKER,
+            DARK.measure,
+            Stroke::new(1.5, DARK.float_fill),
+        );
+        painter.text(
+            at,
+            Align2::CENTER_CENTER,
+            (k + 1).to_string(),
+            font.clone(),
+            DARK.on_accent,
+        );
     }
 }
 

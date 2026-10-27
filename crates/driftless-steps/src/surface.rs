@@ -7,12 +7,19 @@
 //! the surface would not fit the map. A scan without images or calibration gets a gray
 //! surface and a warning. A cancel before the files are written leaves the folder untouched;
 //! the JSON is written last, so a folder with a report holds a complete surface.
+//!
+//! The surface of a merged model ([`run_model_surface`]) is made the same way from the
+//! `clean.bin` of every scan in the model, moved by its `T_i`, with the LiDAR positions and
+//! the camera images of every such scan (one texture source each). Its input id is the
+//! model's id, the clean id and images of every scan in it, the settings and
+//! [`SURFACE_VERSION`].
 
 use crate::error::{check_cancel, failed, StepError};
 use crate::map::{
-    clean_stage_id, color_input, dense_stage_id, fallback_reason, gpu_json, hex, peak_rss_bytes,
-    read_traj, MapInput, CLEAN_BIN, DENSE_BIN,
+    clean_stage_id, color_input, dense_stage_id, fallback_reason, gpu_json, hex, map_input_for,
+    peak_rss_bytes, read_traj, ColorInput, MapInput, CLEAN_BIN, DENSE_BIN,
 };
+use crate::merge::{member_transform, read_model, ModelMember};
 use driftless_gpu::{GpuChoice, GpuContext, GpuPref};
 use driftless_io::atomic_write;
 use driftless_io::progress::Progress;
@@ -22,6 +29,8 @@ use driftless_map::surface::{
     AccuracySplit, SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
 };
 use driftless_map::{load_stage, stage_fits};
+use driftless_traj::nalgebra::{Isometry3, Point3};
+use driftless_traj::Pose;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,7 +39,7 @@ use std::time::Instant;
 pub const SURFACE_REPORT: &str = "oberflaeche.json";
 /// Part of the input id: raised whenever the surface gives another result for the same
 /// settings, so an older folder counts as stale.
-const SURFACE_VERSION: u32 = 12;
+const SURFACE_VERSION: u32 = 13;
 /// File stem of the glb and the obj.
 const STEM: &str = "oberflaeche";
 const AXES: &str = "glb: Y oben; obj: Z oben";
@@ -61,16 +70,25 @@ struct Plan {
     clean_id: String,
 }
 
+/// The camera images of `scan` for the texture, or why it has none (German).
+fn images_of(
+    scan: &Path,
+    lidar_to_imu: &Isometry3<f64>,
+    progress: &Progress,
+) -> Result<Result<ColorInput, String>, StepError> {
+    let project = discover_project(scan).map_err(failed)?;
+    Ok(color_input(scan, &project, lidar_to_imu, progress))
+}
+
 fn images_part(
     req: &SurfaceRequest,
     progress: &Progress,
-) -> Result<(String, Option<crate::map::ColorInput>), StepError> {
+) -> Result<(String, Option<ColorInput>), StepError> {
     if !req.texture {
         return Ok(("texture off\n".into(), None));
     }
     let odom = req.map.slam.config()?.odom;
-    let project = discover_project(&req.map.scan).map_err(failed)?;
-    match color_input(&req.map.scan, &project, &odom.lidar_to_imu, progress) {
+    match images_of(&req.map.scan, &odom.lidar_to_imu, progress)? {
         Ok(c) => Ok((c.id.clone(), Some(c))),
         Err(why) => {
             progress.warn(format!("Oberfläche ohne Textur, {why}"));
@@ -82,7 +100,7 @@ fn images_part(
 fn plan(
     req: &SurfaceRequest,
     progress: &Progress,
-) -> Result<(Plan, Option<crate::map::ColorInput>), StepError> {
+) -> Result<(Plan, Option<ColorInput>), StepError> {
     let clean_id = clean_stage_id(&req.map)?;
     let (images, color) = images_part(req, progress)?;
     let id = format!(
@@ -201,6 +219,8 @@ fn stats_json(s: &SurfaceStats) -> Value {
             "texels_total": s.texture.texels_total,
             "fill_ratio": s.texture.fill_ratio,
             "islands_absorbed": s.texture.islands_absorbed,
+            "gray_filled": s.texture.gray_filled,
+            "untextured_area_share": s.texture.untextured_area_share,
         },
         "seams": {
             "seam_jump_before": s.seams.seam_jump_before,
@@ -209,6 +229,7 @@ fn stats_json(s: &SurfaceStats) -> Value {
             "seam_step_after": s.seams.seam_step_after,
             "seam_step_median_before": s.seams.seam_step_median_before,
             "seam_step_median_after": s.seams.seam_step_median_after,
+            "seam_step_per_m": s.seams.seam_step_per_m,
             "corrections": s.seams.corrections,
             "clamped": s.seams.clamped,
             "content_pairs": s.seams.content_pairs,
@@ -218,6 +239,7 @@ fn stats_json(s: &SurfaceStats) -> Value {
         "accuracy": accuracy_split_json(&s.accuracy),
         "accuracy_dense": s.accuracy_dense.as_ref().map(accuracy_split_json),
         "seconds": s.seconds,
+        "gpu_batches": s.gpu_batches,
     })
 }
 
@@ -237,73 +259,79 @@ fn stale_pages(dir: &Path, keep: &[String]) -> Vec<String> {
     stale
 }
 
-/// Runs the surface as `driftless surface` does; every console line goes to `progress`.
-/// Returns the `oberflaeche.json` written to [`SurfaceRequest::out_dir`].
-///
-/// Fails with „Karte fehlt oder ist veraltet“ if `clean.bin` does not fit the map. A cancel
-/// before the files are written leaves everything as it was.
-pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, StepError> {
-    let start = Instant::now();
-    req.config.check()?;
-    req.map.map.check()?;
-    let odom = req.map.slam.config()?.odom;
-    let (plan, color) = plan(req, progress)?;
-    // The device is opened before any work, so `--gpu an` without a GPU fails at once.
-    let mut no_device = None;
-    let gpu = match &color {
-        None => None,
-        Some(_) => match GpuContext::open(req.gpu).map_err(|e| e.to_string())? {
-            GpuChoice::Gpu(ctx) => {
-                let i = ctx.info();
-                progress.info(format!(
-                    "Ansichten auf der Grafikkarte: {} ({})",
-                    i.name, i.backend
-                ));
-                Some(ctx)
-            }
-            GpuChoice::Cpu(why) => {
-                no_device = fallback_reason(req.gpu, &why);
-                if let Some(why) = &no_device {
-                    progress.info(format!("Ansichten auf der CPU: {why}"));
-                }
-                None
-            }
-        },
-    };
-    let (_, poses) = read_traj(&req.map.slam_dir)?;
-
-    let clean_path = req.map_dir.join(CLEAN_BIN);
-    let (cloud, _) = load_stage(&clean_path, &plan.clean_id).map_err(|e| {
-        progress.info(format!("{CLEAN_BIN}: {e}"));
-        stale_map()
-    })?;
-    if cloud.frame.iter().any(|&f| f as usize >= poses.len()) {
-        return Err(stale_map());
+/// Opens the device for the views per face if images are to be read (`wanted`), so that
+/// `--gpu an` without a GPU fails before any work. Returns it, or why the CPU is used.
+fn open_gpu(
+    pref: GpuPref,
+    wanted: bool,
+    progress: &Progress,
+) -> Result<(Option<GpuContext>, Option<String>), StepError> {
+    if !wanted {
+        return Ok((None, None));
     }
-    progress.info(format!("Karte: {} Punkte aus {CLEAN_BIN}", cloud.len()));
-    let sensors = sensors_for_frames(&poses, &odom.lidar_to_imu);
-    let dense = load_dense(req, progress);
+    match GpuContext::open(pref).map_err(|e| e.to_string())? {
+        GpuChoice::Gpu(ctx) => {
+            let i = ctx.info();
+            progress.info(format!(
+                "Ansichten auf der Grafikkarte: {} ({})",
+                i.name, i.backend
+            ));
+            Ok((Some(ctx), None))
+        }
+        GpuChoice::Cpu(why) => {
+            let no_device = fallback_reason(pref, &why);
+            if let Some(why) = &no_device {
+                progress.info(format!("Ansichten auf der CPU: {why}"));
+            }
+            Ok((None, no_device))
+        }
+    }
+}
+
+/// Points with the positions they were measured from, owned: [`SurfaceInput`] of
+/// [`make_surface`], freed before the texture pages are made.
+struct Points {
+    xyz: Vec<[f32; 3]>,
+    sensor_of_point: Vec<u32>,
+    sensors: Vec<[f32; 3]>,
+    dense: Option<Vec<[f32; 3]>>,
+}
+
+/// What [`make_surface`] writes and reports.
+struct Target<'a> {
+    out_dir: &'a Path,
+    config: &'a SurfaceConfig,
+    texture: bool,
+    /// Full text of the input id.
+    id: &'a str,
+    /// One more entry of the report (key, value).
+    extra: Option<(&'static str, Value)>,
+}
+
+/// Mesh, texture, files and report of a surface: the part shared by [`run_surface`] and
+/// [`run_model_surface`]. Returns the report as written.
+fn make_surface(
+    points: Points,
+    sources: Vec<TextureSource>,
+    gpu: (Option<GpuContext>, Option<String>),
+    target: Target,
+    start: Instant,
+    progress: &Progress,
+) -> Result<Value, StepError> {
+    let (gpu, no_device) = gpu;
     let input = SurfaceInput {
-        xyz: &cloud.xyz,
-        sensor_of_point: &cloud.frame,
-        sensors: &sensors,
-        dense_xyz: dense.as_deref(),
+        xyz: &points.xyz,
+        sensor_of_point: &points.sensor_of_point,
+        sensors: &points.sensors,
+        dense_xyz: points.dense.as_deref(),
     };
-    let sources: Vec<TextureSource> = color
-        .map(|c| TextureSource {
-            images: c.images,
-            poses,
-            cams: c.cams,
-        })
-        .into_iter()
-        .collect();
-    let (mesh, mut stats) = build_mesh(&input, &req.config, progress)?;
+    let (mesh, mut stats) = build_mesh(&input, target.config, progress)?;
     // The points are not needed for the texture: free them before the pages are made.
-    drop((cloud, dense));
+    drop(points);
     let tex = texture_mesh(
         &mesh,
         &sources,
-        &req.config,
+        target.config,
         progress,
         &mut stats,
         gpu.as_ref(),
@@ -321,10 +349,10 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
 
     // Last chance to stop: from here on files are written.
     check_cancel(progress)?;
-    let out = &req.out_dir;
+    let out = target.out_dir;
     fs::create_dir_all(out).map_err(|e| format!("{} nicht anlegbar: {e}", out.display()))?;
     let report_path = out.join(SURFACE_REPORT);
-    let quality = req.config.jpeg_quality;
+    let quality = target.config.jpeg_quality;
     let jpegs = encode_pages(&tex, quality)?;
     write_glb(&out.join(format!("{STEM}.glb")), &tex, &jpegs)?;
     write_obj(out, STEM, &tex, &jpegs)?;
@@ -345,9 +373,9 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
     }
 
     let peak = peak_rss_bytes();
-    let report = json!({
-        "input_id": hex(&plan.id),
-        "settings": settings_json(&req.config, req.texture),
+    let mut report = json!({
+        "input_id": hex(target.id),
+        "settings": settings_json(target.config, target.texture),
         "stats": stats_json(&stats),
         "seconds_total": (start.elapsed().as_secs_f64() * 1000.0).round() / 1000.0,
         "peak_rss_bytes": peak,
@@ -356,6 +384,9 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
         "files": files,
         "stale": stale,
     });
+    if let Some((key, value)) = target.extra {
+        report[key] = value;
+    }
     let text = serde_json::to_string_pretty(&report).map_err(failed)? + "\n";
     atomic_write(&report_path, text.as_bytes())
         .map_err(|e| format!("{} nicht schreibbar: {e}", report_path.display()))?;
@@ -384,4 +415,277 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
     ));
     // The value as it reads back from the file (floats lose their last bit in the text).
     serde_json::from_str(&text).map_err(failed)
+}
+
+/// Runs the surface as `driftless surface` does; every console line goes to `progress`.
+/// Returns the `oberflaeche.json` written to [`SurfaceRequest::out_dir`].
+///
+/// Fails with „Karte fehlt oder ist veraltet“ if `clean.bin` does not fit the map. A cancel
+/// before the files are written leaves everything as it was.
+pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, StepError> {
+    let start = Instant::now();
+    req.config.check()?;
+    req.map.map.check()?;
+    let odom = req.map.slam.config()?.odom;
+    let (plan, color) = plan(req, progress)?;
+    let gpu = open_gpu(req.gpu, color.is_some(), progress)?;
+    let (_, poses) = read_traj(&req.map.slam_dir)?;
+
+    let clean_path = req.map_dir.join(CLEAN_BIN);
+    let (mut cloud, _) = load_stage(&clean_path, &plan.clean_id).map_err(|e| {
+        progress.info(format!("{CLEAN_BIN}: {e}"));
+        stale_map()
+    })?;
+    if cloud.frame.iter().any(|&f| f as usize >= poses.len()) {
+        return Err(stale_map());
+    }
+    progress.info(format!("Karte: {} Punkte aus {CLEAN_BIN}", cloud.len()));
+    let sensors = sensors_for_frames(&poses, &odom.lidar_to_imu);
+    let dense = load_dense(req, progress);
+    let points = Points {
+        xyz: std::mem::take(&mut cloud.xyz),
+        sensor_of_point: std::mem::take(&mut cloud.frame),
+        sensors,
+        dense,
+    };
+    // The rest of the cloud is not needed.
+    drop(cloud);
+    let sources: Vec<TextureSource> = color
+        .map(|c| TextureSource {
+            images: c.images,
+            poses,
+            cams: c.cams,
+        })
+        .into_iter()
+        .collect();
+    let target = Target {
+        out_dir: &req.out_dir,
+        config: &req.config,
+        texture: req.texture,
+        id: &plan.id,
+        extra: None,
+    };
+    make_surface(points, sources, gpu, target, start, progress)
+}
+
+/// The surface of a merged model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelSurfaceRequest {
+    /// Folder of the model: `modell.json` of `driftless merge` is read from it.
+    pub model_dir: PathBuf,
+    /// Where the surface files go.
+    pub out_dir: PathBuf,
+    pub config: SurfaceConfig,
+    /// Texture the surface from the camera images of the scans (`false`: gray).
+    pub texture: bool,
+    /// As [`SurfaceRequest::gpu`].
+    pub gpu: GpuPref,
+}
+
+/// A scan of the model whose points are in it.
+struct PlannedMember {
+    /// Scan folder name, for messages and the report.
+    name: String,
+    input: MapInput,
+    map_dir: PathBuf,
+    clean_id: String,
+    /// `T_i`: world of the scan → model.
+    transform: Isometry3<f64>,
+    lidar_to_imu: Isometry3<f64>,
+    /// Its camera images, if the texture is on and it has any.
+    color: Option<ColorInput>,
+}
+
+/// The input id (full text) of a model surface and the members in the model.
+struct ModelPlan {
+    id: String,
+    members: Vec<PlannedMember>,
+}
+
+fn member_name(m: &ModelMember) -> String {
+    m.scan.file_name().map_or_else(
+        || m.scan.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+fn stale_member(name: &str) -> StepError {
+    format!("Karte von {name} fehlt oder ist veraltet: erst Karte rechnen, dann neu zusammenführen")
+        .into()
+}
+
+fn model_plan(req: &ModelSurfaceRequest, progress: &Progress) -> Result<ModelPlan, StepError> {
+    let model = read_model(&req.model_dir)?;
+    let mut id = format!("model {}\nsurface v{SURFACE_VERSION}\n", model.input_id);
+    let mut members = Vec::new();
+    for (k, m) in model.members.iter().enumerate().filter(|(_, m)| m.included) {
+        let name = member_name(m);
+        let input = map_input_for(&m.scan, &m.slam_dir, &m.map_dir, m.slam.clone());
+        input.map.check()?;
+        let clean_id = clean_stage_id(&input)?;
+        // The map was computed anew after the merge: `T_i` may not fit it any more.
+        if m.clean_id.as_ref().is_some_and(|c| *c != hex(&clean_id)) {
+            return Err(stale_member(&name));
+        }
+        let lidar_to_imu = m.slam.config()?.odom.lidar_to_imu;
+        let (images, color) = if !req.texture {
+            ("texture off\n".to_string(), None)
+        } else {
+            match images_of(&m.scan, &lidar_to_imu, progress)? {
+                Ok(c) => (c.id.clone(), Some(c)),
+                Err(why) => {
+                    progress.warn(format!("{name} trägt nichts zur Textur bei, {why}"));
+                    ("no images\n".to_string(), None)
+                }
+            }
+        };
+        id += &format!("member {k}\n{clean_id}{images}");
+        members.push(PlannedMember {
+            name,
+            input,
+            map_dir: m.map_dir.clone(),
+            clean_id,
+            transform: member_transform(m),
+            lidar_to_imu,
+            color,
+        });
+    }
+    if members.is_empty() {
+        return Err(format!("Modell {} enthält keinen Scan", req.model_dir.display()).into());
+    }
+    id += &format!("{:?}\n", req.config);
+    Ok(ModelPlan { id, members })
+}
+
+/// Whether `out_dir` holds the surface of this model request: its report has the current
+/// input id and the `clean.bin` of every scan in the model still fits its map.
+pub fn model_surface_fits(req: &ModelSurfaceRequest) -> bool {
+    let fits = || -> Option<bool> {
+        let text = fs::read_to_string(req.out_dir.join(SURFACE_REPORT)).ok()?;
+        let report: Value = serde_json::from_str(&text).ok()?;
+        // Warnings are of no interest here.
+        let plan = model_plan(req, &Progress::new()).ok()?;
+        Some(
+            report["input_id"].as_str() == Some(hex(&plan.id).as_str())
+                && plan
+                    .members
+                    .iter()
+                    .all(|m| stage_fits(&m.map_dir.join(CLEAN_BIN), &m.clean_id)),
+        )
+    };
+    fits().unwrap_or(false)
+}
+
+/// `t · pose`: a pose of a scan's world in the model.
+fn moved_pose(t: &Isometry3<f64>, pose: &Pose) -> Pose {
+    Pose {
+        t: pose.t,
+        p: t.rotation * pose.p + t.translation.vector,
+        q: t.rotation * pose.q,
+    }
+}
+
+/// The points of every member moved to the model, their LiDAR positions (the sensors of a
+/// member after those of the members before it) and a texture source per member with
+/// images, its poses in the model.
+fn model_points(
+    plan: ModelPlan,
+    progress: &Progress,
+) -> Result<(Points, Vec<TextureSource>), StepError> {
+    let n = plan.members.len();
+    progress.phase("Oberfläche: Karten laden", Some(n as u64));
+    let mut xyz = Vec::new();
+    let mut sensor_of_point = Vec::new();
+    let mut sensors: Vec<[f32; 3]> = Vec::new();
+    let mut sources = Vec::new();
+    for m in plan.members {
+        check_cancel(progress)?;
+        let (_, poses) = read_traj(&m.input.slam_dir).map_err(|e| {
+            progress.info(format!("{}: {e}", m.name));
+            stale_member(&m.name)
+        })?;
+        let clean_path = m.map_dir.join(CLEAN_BIN);
+        let (cloud, _) = load_stage(&clean_path, &m.clean_id).map_err(|e| {
+            progress.info(format!("{}: {e}", clean_path.display()));
+            stale_member(&m.name)
+        })?;
+        if cloud.frame.iter().any(|&f| f as usize >= poses.len()) {
+            return Err(stale_member(&m.name));
+        }
+        // Every sensor index of the model has to fit `u32`.
+        let offset = u32::try_from(sensors.len() + poses.len())
+            .map(|_| sensors.len() as u32)
+            .map_err(|_| "Zu viele Frames für eine Oberfläche")?;
+        progress.info(format!(
+            "{}: {} Punkte aus {CLEAN_BIN}",
+            m.name,
+            cloud.len()
+        ));
+        let t = &m.transform;
+        xyz.reserve(cloud.len());
+        xyz.extend(cloud.xyz.iter().map(|p| {
+            let w = t * Point3::new(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]));
+            [w.x as f32, w.y as f32, w.z as f32]
+        }));
+        sensor_of_point.extend(cloud.frame.iter().map(|&f| f + offset));
+        drop(cloud);
+        let poses: Vec<Pose> = poses.iter().map(|p| moved_pose(t, p)).collect();
+        sensors.extend(sensors_for_frames(&poses, &m.lidar_to_imu));
+        if let Some(c) = m.color {
+            sources.push(TextureSource {
+                images: c.images,
+                poses,
+                cams: c.cams,
+            });
+        }
+        progress.advance(1);
+    }
+    progress.info(format!(
+        "Modell: {} Punkte aus {n} Scan(s), {} davon mit Bildern",
+        xyz.len(),
+        sources.len()
+    ));
+    let points = Points {
+        xyz,
+        sensor_of_point,
+        sensors,
+        dense: None,
+    };
+    Ok((points, sources))
+}
+
+/// Runs the surface of the model in [`ModelSurfaceRequest::model_dir`] as
+/// `driftless surface --model` does: the points, LiDAR positions and camera images of every
+/// scan in the model (`included`), in the model frame. Without `dense.bin` the accuracy is
+/// measured against the merged points only. Returns the `oberflaeche.json` written to
+/// [`ModelSurfaceRequest::out_dir`]; it holds `model` (the folder and the scans in it).
+///
+/// Fails if `modell.json` is missing or the map of a scan in it is missing or was computed
+/// anew after the merge. A cancel before the files are written leaves everything as it was.
+pub fn run_model_surface(
+    req: &ModelSurfaceRequest,
+    progress: &Progress,
+) -> Result<Value, StepError> {
+    let start = Instant::now();
+    req.config.check()?;
+    let plan = model_plan(req, progress)?;
+    let id = plan.id.clone();
+    let names: Vec<String> = plan.members.iter().map(|m| m.name.clone()).collect();
+    let with_images = plan.members.iter().any(|m| m.color.is_some());
+    let gpu = open_gpu(req.gpu, with_images, progress)?;
+    let (points, sources) = model_points(plan, progress)?;
+    let target = Target {
+        out_dir: &req.out_dir,
+        config: &req.config,
+        texture: req.texture,
+        id: &id,
+        extra: Some((
+            "model",
+            json!({
+                "dir": req.model_dir.display().to_string(),
+                "members": names,
+            }),
+        )),
+    };
+    make_surface(points, sources, gpu, target, start, progress)
 }

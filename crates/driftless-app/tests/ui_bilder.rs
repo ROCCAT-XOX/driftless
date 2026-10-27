@@ -4,10 +4,10 @@
 //! „Erweitert“, and the placeholder of „Planung“.
 
 use driftless_app::project::{
-    canonical, MapInfo, MapStatus, Project, RunInfo, ScanEntry, ScanState, SurfaceInfo,
+    canonical, MapInfo, MapStatus, ModelInfo, Project, RunInfo, ScanEntry, ScanState, SurfaceInfo,
     SurfaceSettings,
 };
-use driftless_app::ui::steps::bilder::{surface_status, SurfaceStatus};
+use driftless_app::ui::steps::bilder::{model_surface_status, surface_status, SurfaceStatus};
 use driftless_app::ui::{
     steps, text, Action, AppState, DriftlessApp, Queued, ScanNode, Selection, Step, UiMessage,
 };
@@ -15,8 +15,9 @@ use driftless_io::images::RgbImage;
 use driftless_io::testscan::{room_bag_secs, tmp};
 use driftless_map::surface::{encode_pages, write_glb, SurfaceConfig, TexturePage, TexturedMesh};
 use driftless_steps::map::{MapStep, MapSwitches};
+use driftless_steps::merge::ModelReport;
 use driftless_steps::slam::SlamSettings;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -812,4 +813,131 @@ fn queue_loads_nothing_after_a_load_by_hand() {
     assert!(has_surface(&maps[0]) && has_surface(&maps[1]));
     assert_eq!(app.state().selection, Selection::Map(maps[0].clone()));
     assert!(app.state().surface.is_none());
+}
+
+const MODEL: &str = "/p/modelle/modell-001";
+
+/// [`four_maps`] with „Modell 001“ of scans a and b (its report read from JSON, as on disk).
+fn with_model(surfaces: Vec<SurfaceInfo>) -> AppState {
+    let member = |id: &str| {
+        serde_json::json!({
+            "scan": format!("/daten/{id}"),
+            "slam_dir": format!("/p/scans/{id}/slam-001"),
+            "map_dir": format!("/p/scans/{id}/slam-001/karte-001"),
+            "slam": SlamSettings::default(),
+            "transform": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            "placed_against": null,
+            "method": "bezug",
+            "verdict": "sicher",
+            "reason": null,
+            "overlap": 1.0,
+            "residual_median_mm": 0.0,
+            "residual_rms_mm": 0.0,
+            "agreement": 1.0,
+            "included": true,
+            "color_gain": [1.0, 1.0, 1.0],
+            "points": 10,
+        })
+    };
+    let report: ModelReport = serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "input_id": "0",
+        "members": [member("a"), member("b")],
+        "points": 20,
+        "seconds_total": 3.0,
+        "peak_rss_bytes": 0,
+    }))
+    .unwrap();
+    let mut state = four_maps();
+    state.models = vec![ModelInfo {
+        dir: MODEL.into(),
+        label: "Modell 001".into(),
+        report,
+        surfaces,
+    }];
+    state
+}
+
+#[test]
+fn model_card_computes_its_surface() {
+    let name = text::model_card("Modell 001", 2);
+    assert_eq!(name, "Modell 001 · 2 Scans");
+    let state = with_model(Vec::new());
+    let model = state.models[0].clone();
+    assert_eq!(model_surface_status(&state, &model), SurfaceStatus::New);
+    let mut h = panel(state);
+    // selected with a click; the main button then computes its surface
+    assert_eq!(
+        click(&mut h, &name),
+        Some(Action::Select(Selection::Model(MODEL.into())))
+    );
+    h.state_mut().0.selection = Selection::Model(MODEL.into());
+    h.run();
+    assert_eq!(
+        click(&mut h, text::STEP_SURFACE),
+        Some(Action::RunModelSurface {
+            model: MODEL.into()
+        })
+    );
+    // also with a surface of the model selected
+    let surface = format!("{MODEL}/oberflaeche-001");
+    let mut state = with_model(vec![surface_info(&surface)]);
+    state.selection = Selection::Surface(surface.clone().into());
+    let mut h = panel(state);
+    assert_eq!(
+        click(&mut h, text::STEP_SURFACE),
+        Some(Action::RunModelSurface {
+            model: MODEL.into()
+        })
+    );
+}
+
+fn surface_info(dir: &str) -> SurfaceInfo {
+    surface(dir, "Oberfläche 001")
+}
+
+#[test]
+fn model_surface_states() {
+    let surface = format!("{MODEL}/oberflaeche-001");
+    let status = |stale| MapStatus {
+        seconds: Some(1.0),
+        stale,
+    };
+    // a current surface: done
+    let mut state = with_model(vec![surface_info(&surface)]);
+    let model = state.models[0].clone();
+    assert_eq!(model_surface_status(&state, &model), SurfaceStatus::Done);
+    // it no longer fits (model_surface_fits): stale, marked in the list
+    let mut map_status = state.map_status.clone();
+    map_status.insert(surface.clone().into(), status(true));
+    state.set_map_status(map_status.clone());
+    let model = state.models[0].clone();
+    assert!(model.surfaces[0].stale);
+    assert_eq!(model_surface_status(&state, &model), SurfaceStatus::Stale);
+    let h = panel(state.clone());
+    h.get_by_label(&text::surface_stale("Oberfläche 001"));
+    // being computed
+    state.running = Some(Action::RunModelSurface {
+        model: MODEL.into(),
+    });
+    assert!(matches!(
+        model_surface_status(&state, &model),
+        SurfaceStatus::Running(_)
+    ));
+    // the model itself no longer fits its maps: locked with the reason
+    state.running = None;
+    map_status.insert(MODEL.into(), status(true));
+    state.set_map_status(map_status);
+    let model = state.models[0].clone();
+    assert_eq!(
+        model_surface_status(&state, &model),
+        SurfaceStatus::ModelStale
+    );
+    state.selection = Selection::Model(MODEL.into());
+    let h = panel(state);
+    assert!(h
+        .get_by_label(text::STEP_SURFACE)
+        .accesskit_node()
+        .is_disabled());
+    h.get_by_label(text::STATUS_MODEL_STALE);
 }
