@@ -723,6 +723,7 @@ fn obj_names_stay_inside_the_folder() {
 
     // A material inside, its image named outside.
     let outside_png = dir.join("geheim.png").display().to_string();
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut names = vec![
         "../geheim.png".to_string(),
         "bilder/../../geheim.png".to_string(),
