@@ -18,7 +18,7 @@ path = "src/main.rs"
 bytemuck = { version = "1.25", features = ["derive"] }
 # Times of the history in local time.
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-# Reading point clouds in open formats (PLY, …).
+# Reading point clouds and meshes in open formats (LAS, LAZ, E57, PLY, PCD, glb, OBJ).
 driftless-export = { path = "../driftless-export" }
 driftless-io = { path = "../driftless-io" }
 # „Grafikkarte nutzen“ (`GpuPref`) in ⚙.
@@ -33,10 +33,8 @@ eframe = { version = "0.36", default-features = false, features = ["wgpu", "defa
 egui-wgpu = "0.36"
 # Icon font (Phosphor, MIT) for the rail and the toolbars.
 egui-phosphor = "0.14"
-# Reading the surface (`oberflaeche.glb`) and its JPEG pages.
-gltf = { version = "1.4.1", default-features = false, features = ["KHR_materials_unlit", "utils"] }
-image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
-las = "0.11"
+# Decoding the JPEG and PNG pages of a surface.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 mimalloc = { version = "0.1", default-features = false }
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }
 pollster = "0.4"
@@ -49,3 +47,5 @@ toml = "1"
 [dev-dependencies]
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
+# Foreign LAS files in the tests.
+las = "0.11"

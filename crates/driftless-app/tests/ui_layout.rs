@@ -161,8 +161,7 @@ fn menu_has_all_project_actions() {
         (text::OPEN_PROJECT, Action::PickOpenProject),
         (text::ADD_SCAN, Action::PickAddScan),
         (text::ADD_RUN, Action::PickAddRun("buero".into())),
-        (text::OPEN_CLOUD, Action::PickOpenCloud),
-        (text::OPEN_SURFACE, Action::PickOpenSurface),
+        (text::OPEN_FILE, Action::PickOpenFile),
     ];
     let mut h = panel(project_state(), rail::show);
     for (label, _) in &entries {
@@ -177,17 +176,19 @@ fn menu_has_all_project_actions() {
             (text::OPEN_PROJECT, ()),
             (text::ADD_SCAN, ()),
             (text::ADD_RUN, ()),
-            (text::OPEN_CLOUD, ()),
-            (text::OPEN_SURFACE, ()),
+            (text::OPEN_FILE, ()),
         ] {
             h.get_by_label(l);
         }
+        // one entry opens every format: no separate ones for clouds and surfaces
+        assert!(h.query_by_label("Oberfläche öffnen …").is_none());
+        assert!(h.query_by_label("Punktwolke öffnen …").is_none());
         h.state_mut().1 = None;
         h.get_by_label(label).click();
         h.run();
         assert_eq!(h.state().1, Some(expected), "{label}");
         // the menu closes after a choice
-        assert!(h.query_by_label(text::OPEN_SURFACE).is_none(), "{label}");
+        assert!(h.query_by_label(text::OPEN_FILE).is_none(), "{label}");
     }
 }
 
@@ -204,8 +205,7 @@ fn menu_without_project_or_scan_explains_locked_entries() {
     assert!(!disabled(&h, text::OPEN_PROJECT));
     assert!(disabled(&h, text::ADD_SCAN));
     assert!(disabled(&h, text::ADD_RUN));
-    assert!(!disabled(&h, text::OPEN_CLOUD));
-    assert!(!disabled(&h, text::OPEN_SURFACE));
+    assert!(!disabled(&h, text::OPEN_FILE));
 }
 
 #[test]

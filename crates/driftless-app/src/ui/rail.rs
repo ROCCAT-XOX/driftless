@@ -71,11 +71,8 @@ fn project_menu(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
         }
     }
     r.on_disabled_hover_text(text::ADD_RUN_NEEDS_SCAN);
-    if ui.button(text::OPEN_CLOUD).clicked() {
-        *action = Some(Action::PickOpenCloud);
-    }
-    if ui.button(text::OPEN_SURFACE).clicked() {
-        *action = Some(Action::PickOpenSurface);
+    if ui.button(text::OPEN_FILE).clicked() {
+        *action = Some(Action::PickOpenFile);
     }
 }
 

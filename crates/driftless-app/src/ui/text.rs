@@ -32,12 +32,12 @@ pub const GO_TO_DATA: &str = "Zu „Daten“";
 pub const NO_SURFACE_YET: &str = "Noch keine Oberfläche – im Feld „Bilder“ rechnen";
 /// Over the window while a file is dragged over it.
 pub const DROP_HERE: &str = "Loslassen zum Öffnen";
-/// A file dropped onto the window that is no LAS, PLY or GLB.
+/// A file dropped onto the window (or picked) that Driftless cannot open.
 pub const DROP_UNSUPPORTED: &str = "Dateiformat nicht unterstützt";
 
 /// [`DROP_UNSUPPORTED`] with the name of the (first) file dropped.
 pub fn drop_unsupported(name: &str) -> String {
-    format!("{DROP_UNSUPPORTED}: {name} (LAS, PLY oder GLB)")
+    format!("{DROP_UNSUPPORTED}: {name} (LAS, LAZ, E57, PLY, PCD, GLB oder OBJ)")
 }
 
 pub const PLAN_COMING: &str = "Hier entstehen Grundriss, Maße und der DWG-Export. Das folgt in \
@@ -407,12 +407,13 @@ pub const VIEW_HELP_FLY: &str =
     "W/A/S/D, Q/E: fliegen (Shift schneller) · linke Taste: wie das Werkzeug unten · rechte Taste: umsehen · Rad: vor/zurück · F: alles zeigen · O: Fläche/Punkte/beides · Esc: Messen abbrechen";
 pub const LOAD_CLOUD: &str = "Wolke laden";
 pub const LOAD_SURFACE: &str = "Oberfläche laden";
-pub const OPEN_CLOUD: &str = "Punktwolke öffnen …";
-pub const DIALOG_OPEN_CLOUD: &str = "Punktwolke öffnen (LAS oder PLY)";
-/// Filter of the dialog „Punktwolke öffnen …“.
+/// ☰: open a point cloud or a mesh (surface) file.
+pub const OPEN_FILE: &str = "Datei öffnen …";
+pub const DIALOG_OPEN_FILE: &str = "Datei öffnen (LAS, LAZ, E57, PLY, PCD, GLB, OBJ)";
+/// Filters of the dialog „Datei öffnen …“: everything, point clouds, meshes.
+pub const FILTER_ALL: &str = "Punktwolken und Netze";
 pub const FILTER_CLOUD: &str = "Punktwolke";
-pub const OPEN_SURFACE: &str = "Oberfläche öffnen …";
-pub const DIALOG_OPEN_SURFACE: &str = "Oberfläche öffnen (oberflaeche.glb)";
+pub const FILTER_MESH: &str = "Netz";
 /// The switch at the top right of the view.
 pub const SHOW_MODE: &str = "Ansicht";
 pub const SHOW_SURFACE: &str = "Fläche";
@@ -914,17 +915,9 @@ pub fn surface_fits(dir: &std::path::Path) -> String {
     format!("{name} passt schon zu Karte und Einstellungen; nichts zu rechnen")
 }
 
-/// A file that is no glb (or is cut off).
-pub fn bad_glb(error: &str) -> String {
-    format!("keine gültige glb-Datei ({error})")
-}
-
-/// A glTF whose data lie in a file of their own.
-pub fn external_buffer(uri: &str) -> String {
-    format!(
-        "Daten liegen in einer eigenen Datei ({uri}); nur eine glb mit allen Daten in der Datei \
-         wird gelesen (wie `driftless surface` sie schreibt)"
-    )
+/// A page whose image could not be decoded (`page` counts from 0).
+pub fn bad_texture(page: usize, error: &str) -> String {
+    format!("Seite {page}: Textur nicht lesbar ({error})")
 }
 
 /// „Oberfläche geladen: oberflaeche-001/oberflaeche.glb (712.218 Dreiecke, 12 Seite(n),

@@ -98,12 +98,11 @@ pub enum Action {
         path: PathBuf,
         run: Option<PathBuf>,
     },
-    /// Choose a cloud (LAS or PLY) to show, without a run.
-    PickOpenCloud,
-    /// Choose a surface (`oberflaeche.glb`) to show.
-    PickOpenSurface,
-    /// Show the surface of a `.glb`, or of the `oberflaeche.glb` in a folder; the one shown
-    /// is loaded again only if its file changed since.
+    /// Choose a file to show: a cloud (LAS, LAZ, E57, PLY, PCD; without a run) or a surface
+    /// (glb, OBJ), told apart by the extension.
+    PickOpenFile,
+    /// Show the surface of a `.glb` or `.obj`, or of the `oberflaeche.glb` in a folder; the
+    /// one shown is loaded again only if its file changed since.
     LoadSurface(PathBuf),
     /// [`Action::LoadSurface`], also when the surface is shown and unchanged (picked again).
     ReloadSurface(PathBuf),

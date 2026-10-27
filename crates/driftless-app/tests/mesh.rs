@@ -1,5 +1,6 @@
 //! The textured surface: drawn offscreen into 64 × 64 pixels and read back (without a GPU
-//! adapter those tests are skipped), and the glb written by `driftless-map` read back.
+//! adapter those tests are skipped), and the glb written by `driftless-map`, OBJ and foreign
+//! glb read back.
 
 use driftless_app::camera::{Camera, CameraMode};
 use driftless_app::cloud::PointSet;
@@ -9,7 +10,7 @@ use driftless_app::render::{
     headless_device, ColorMode, FrameParams, PointRenderer, PointSize, RenderTarget, ShowMode,
     NO_CUT,
 };
-use driftless_app::surface::{load_glb, LoadedSurface};
+use driftless_app::surface::{load_mesh, LoadedSurface};
 use driftless_io::images::RgbImage;
 use driftless_io::progress::Progress;
 use driftless_map::surface::{encode_pages, write_glb, TexturePage, TexturedMesh};
@@ -280,7 +281,7 @@ fn page_image(n: u32, rgb: [u8; 3]) -> RgbImage {
 }
 
 #[test]
-fn load_glb_matches_written() {
+fn load_mesh_matches_written_glb() {
     // Far from 0 like real coordinates, so that the origin matters.
     let base = [1000.25f32, -2000.5, 7.0];
     let at = |x: f32, y: f32, z: f32| [base[0] + x, base[1] + y, base[2] + z];
@@ -310,7 +311,7 @@ fn load_glb_matches_written() {
     let path = dir.join("oberflaeche.glb");
     write_glb(&path, &tex, &encode_pages(&tex, 90).unwrap()).unwrap();
 
-    let loaded = load_glb(&path, &Progress::new()).unwrap();
+    let loaded = load_mesh(&path, &Progress::new()).unwrap();
     assert_eq!(loaded.pages.len(), tex.pages.len());
     let tris = |s: &LoadedSurface| s.pages.iter().map(|p| p.1.len() / 3).sum::<usize>();
     assert_eq!(tris(&loaded), 3);
@@ -343,7 +344,7 @@ fn load_glb_matches_written() {
 }
 
 #[test]
-fn load_glb_builds_mips() {
+fn load_mesh_builds_mips() {
     let mut tex = TexturedMesh::default();
     tex.pages = vec![TexturePage {
         positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -354,7 +355,7 @@ fn load_glb_builds_mips() {
     let dir = temp_dir("mips");
     let path = dir.join("oberflaeche.glb");
     write_glb(&path, &tex, &encode_pages(&tex, 90).unwrap()).unwrap();
-    let loaded = load_glb(&path, &Progress::new()).unwrap();
+    let loaded = load_mesh(&path, &Progress::new()).unwrap();
     // made in the loader (off the UI thread): only copied when uploaded
     assert_eq!(loaded.mips.len(), 1);
     let sizes: Vec<_> = loaded.mips[0].iter().map(|l| l.dimensions()).collect();
@@ -365,7 +366,7 @@ fn load_error(name: &str, bytes: &[u8]) -> String {
     let dir = temp_dir(name);
     let path = dir.join("oberflaeche.glb");
     fs::write(&path, bytes).unwrap();
-    let e = load_glb(&path, &Progress::new()).unwrap_err().to_string();
+    let e = load_mesh(&path, &Progress::new()).unwrap_err().to_string();
     assert!(e.contains(&path.display().to_string()), "{e}");
     e
 }
@@ -373,7 +374,7 @@ fn load_error(name: &str, bytes: &[u8]) -> String {
 #[test]
 fn missing_glb_is_a_german_error() {
     let path = temp_dir("fehlt").join("oberflaeche.glb");
-    let e = load_glb(&path, &Progress::new()).unwrap_err().to_string();
+    let e = load_mesh(&path, &Progress::new()).unwrap_err().to_string();
     assert!(e.contains(&path.display().to_string()), "{e}");
     assert!(e.contains("nicht gefunden"), "{e}");
 }
@@ -465,4 +466,185 @@ fn skipped(why: &str) {
     use std::io::Write;
     let name = std::thread::current().name().unwrap_or("?").to_string();
     let _ = writeln!(std::io::stderr(), "ÜBERSPRUNGEN {name}: {why}");
+}
+
+/// `w × h` texels of `rgb`, encoded as PNG.
+fn png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(w, h, image::Rgb(rgb));
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+/// An OBJ with a PNG page and a page of plain colour: the PNG is decoded, the colour page
+/// becomes 1 × 1 in its colour; a missing texture gives a gray page and a warning.
+#[test]
+fn loads_obj_with_png_page() {
+    use driftless_export::mesh::{write_obj, ImageKind, Mesh, MeshPage, PageImage};
+    let base = [500_000.0, 5_400_000.0, 300.0];
+    let at = |x: f64, y: f64, z: f64| [base[0] + x, base[1] + y, base[2] + z];
+    let mesh = Mesh {
+        pages: vec![
+            MeshPage {
+                positions: vec![at(0.0, 0.0, 0.0), at(2.0, 0.0, 0.0), at(0.0, 1.0, 0.0)],
+                uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                indices: vec![[0, 1, 2]],
+                image: Some(PageImage {
+                    kind: ImageKind::Png,
+                    bytes: png(4, 2, GREEN).into(),
+                }),
+                color: [255; 3],
+            },
+            MeshPage {
+                positions: vec![at(0.0, 0.0, 2.0), at(1.0, 0.0, 2.0), at(0.0, 1.0, 2.0)],
+                uvs: Vec::new(),
+                indices: vec![[0, 1, 2]],
+                image: None,
+                color: [200, 10, 30],
+            },
+        ],
+    };
+    let dir = temp_dir("obj").join("Büro Scan");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Prüfung ä.obj");
+    write_obj(&path, &mesh).unwrap();
+    let loaded = load_mesh(&path, &Progress::new()).unwrap();
+    assert_eq!(loaded.pages.len(), 2);
+    assert_eq!(loaded.triangles(), 2);
+    // origin: rounded centre of x 0…2, y 0…1, z 0…2 around `base`
+    assert_eq!(loaded.origin, [500_001.0, 5_400_001.0, 301.0]);
+    for ((verts, idx, _), page) in loaded.pages.iter().zip(&mesh.pages) {
+        assert_eq!(idx, &[0, 1, 2]);
+        for (v, want) in verts.iter().zip(&page.positions) {
+            for (k, w) in want.iter().enumerate() {
+                let got = loaded.origin[k] + f64::from(v.pos[k]);
+                assert!((got - w).abs() <= 1e-6, "{got} vs {w}");
+            }
+        }
+    }
+    let (_, _, image) = &loaded.pages[0];
+    assert_eq!(image.dimensions(), (4, 2));
+    assert_eq!(image.get_pixel(1, 1).0, [0, 255, 0, 255]);
+    assert_eq!(loaded.pages[0].0[1].uv, [1.0, 0.0]);
+    let (_, _, colour) = &loaded.pages[1];
+    assert_eq!(colour.dimensions(), (1, 1));
+    assert_eq!(colour.get_pixel(0, 0).0, [200, 10, 30, 255]);
+    assert_eq!(loaded.mips.len(), 2);
+    let sizes: Vec<_> = loaded.mips[0].iter().map(|l| l.dimensions()).collect();
+    assert_eq!(sizes, [(2, 1), (1, 1)]);
+
+    // the image is gone: a gray page, and the reader's warning
+    fs::remove_file(dir.join("Prüfung ä_seite_00.png")).unwrap();
+    let progress = Progress::new();
+    let loaded = load_mesh(&path, &progress).unwrap();
+    assert_eq!(loaded.pages[0].2.dimensions(), (1, 1));
+    assert_eq!(loaded.pages[0].2.get_pixel(0, 0).0, [128, 128, 128, 255]);
+    let log = progress.take_log();
+    assert!(
+        log.iter().any(|l| matches!(
+            l,
+            driftless_io::progress::LogLine::Warning(w) if w.contains("Textur fehlt")
+        )),
+        "{log:?}"
+    );
+}
+
+/// A glb as foreign programs write it: binary chunk `bin`, JSON `json`.
+fn glb_bytes(json: &str, bin: &[u8]) -> Vec<u8> {
+    let mut text = json.as_bytes().to_vec();
+    while !text.len().is_multiple_of(4) {
+        text.push(b' ');
+    }
+    let mut bin = bin.to_vec();
+    while !bin.len().is_multiple_of(4) {
+        bin.push(0);
+    }
+    let total = 12 + 8 + text.len() + 8 + bin.len();
+    let mut out = Vec::new();
+    out.extend(b"glTF");
+    out.extend(2u32.to_le_bytes());
+    out.extend((total as u32).to_le_bytes());
+    out.extend((text.len() as u32).to_le_bytes());
+    out.extend(b"JSON");
+    out.extend(&text);
+    out.extend((bin.len() as u32).to_le_bytes());
+    out.extend(b"BIN\0");
+    out.extend(&bin);
+    out
+}
+
+/// glTF JSON with one triangle (glTF (0,0,0), (1,0,0), (0,1,0)) as mesh 0 and `extra` in the
+/// root object; its buffer is [`triangle_bin`].
+fn triangle_json(extra: &str) -> String {
+    format!(
+        r#"{{"asset":{{"version":"2.0","generator":"fremd"}},
+        "buffers":[{{"byteLength":44}}],
+        "bufferViews":[{{"buffer":0,"byteOffset":0,"byteLength":36}},
+                       {{"buffer":0,"byteOffset":36,"byteLength":6}}],
+        "accessors":[{{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3",
+                        "min":[0,0,0],"max":[1,1,0]}},
+                     {{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"}}],
+        "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1}}]}}]
+        {extra}}}"#
+    )
+}
+
+fn triangle_bin() -> Vec<u8> {
+    let mut bin = Vec::new();
+    for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+        for c in p {
+            bin.extend(c.to_le_bytes());
+        }
+    }
+    for i in [0u16, 1, 2] {
+        bin.extend(i.to_le_bytes());
+    }
+    bin
+}
+
+/// A foreign glb whose mesh hangs under moved and turned nodes: the view shows it where the
+/// nodes put it (Z up), the page without texture white.
+#[test]
+fn loads_glb_with_node_transform() {
+    let s = std::f32::consts::FRAC_1_SQRT_2;
+    // parent 2 m up (glTF +y) and 100 m along x, child turned 90° about glTF +y
+    let json = triangle_json(&format!(
+        r#","scene":0,"scenes":[{{"nodes":[0]}}],
+        "nodes":[{{"translation":[100,2,0],"children":[1]}},
+                 {{"rotation":[0,{s},0,{s}],"mesh":0}}]"#
+    ));
+    let dir = temp_dir("glb-knoten");
+    let path = dir.join("fremd.glb");
+    fs::write(&path, glb_bytes(&json, &triangle_bin())).unwrap();
+    let loaded = load_mesh(&path, &Progress::new()).unwrap();
+    assert_eq!(loaded.pages.len(), 1);
+    // glTF (1,0,0) turned → (0,0,−1), moved → (100,2,−1) = Driftless (100, 1, 2); glTF
+    // (0,1,0) → (100,3,0) = (100, 0, 3)
+    let want = [[100.0, 0.0, 2.0], [100.0, 1.0, 2.0], [100.0, 0.0, 3.0]];
+    assert!(loaded.origin.iter().all(|v| v.fract() == 0.0));
+    assert_eq!(loaded.origin[0], 100.0);
+    let (verts, idx, image) = &loaded.pages[0];
+    assert_eq!(idx, &[0, 1, 2]);
+    for (v, want) in verts.iter().zip(want) {
+        for (k, w) in want.iter().enumerate() {
+            let got = loaded.origin[k] + f64::from(v.pos[k]);
+            assert!((got - w).abs() < 1e-5, "{got} vs {w}");
+        }
+    }
+    assert_eq!(image.dimensions(), (1, 1));
+    assert_eq!(image.get_pixel(0, 0).0, [255; 4]);
+}
+
+/// A glb compressed with Draco is not read: the reader's German message, naming the file.
+#[test]
+fn draco_glb_shows_message() {
+    let json = triangle_json(
+        r#","extensionsUsed":["KHR_draco_mesh_compression"],
+        "extensionsRequired":["KHR_draco_mesh_compression"]"#,
+    );
+    let e = load_error("draco", &glb_bytes(&json, &triangle_bin()));
+    assert!(
+        e.contains("glTF mit Draco-Kompression wird nicht unterstützt"),
+        "{e}"
+    );
 }

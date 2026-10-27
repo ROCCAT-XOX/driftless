@@ -1646,7 +1646,6 @@ dependencies = [
  "egui-phosphor",
  "egui-wgpu",
  "egui_kittest",
- "gltf",
  "image",
  "las",
  "mimalloc",

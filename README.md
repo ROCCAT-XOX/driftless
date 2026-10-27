@@ -96,7 +96,8 @@ slim status bar:
 
 - **Rail:** ☰ opens the project menu („Neues Projekt …“ in an empty folder, „Projekt öffnen …“,
   „Scan hinzufügen …“ for a scan folder as above, „Lauf hinzufügen …“ for a run made with the command
-  line, „Oberfläche öffnen …“ for any `oberflaeche.glb`). Below it the three steps, and ⚙ at the bottom.
+  line, „Datei öffnen …“ for any point cloud or surface file, see below). Below it the three steps, and
+  ⚙ at the bottom.
 - **1 Daten:** a card per scan with its state (neu, wartet, rechnet, fertig ✓, veraltet) and „+ Scan
   hinzufügen“; the precision Schnell · Genau · Maximal sets only the voxel size of the map (0.02 /
   0.01 / 0.005 m; Maximal needs over 4 GB of memory on large scans, another voxel shows „Eigene“). „Alle
@@ -115,8 +116,10 @@ slim status bar:
   the model and in the scan beside it, „Übernehmen und neu zusammenführen“ saves them in
   `modelle/punktpaare.toml` and merges again into a new model. Point pairs can be switched off and on,
   never deleted; one the merge cannot use is marked „nicht nutzbar“. A model's surface is computed in „2 Bilder“ like that of a map, from the images of all
-  its scans; the colour mode „je Scan“ colours a model by scan. „Punktwolke öffnen …“ and dropping a
-  file show any LAS or PLY, also without a project.
+  its scans; the colour mode „je Scan“ colours a model by scan. „Datei öffnen …“ and dropping a
+  file show a point cloud (LAS, LAZ, E57, PLY, PCD; an E57 with several scans can be coloured „je
+  Scan“) or a surface (glb, OBJ), also without a project. A variant that cannot be read (a PCD saved
+  „binary_compressed“, a glb with Draco) gives a German message in the status bar.
 - **2 Bilder:** a card per map with its surfaces below it (one that no longer fits its map is marked
   „veraltet – Karte oder Lauf neu gerechnet“); a click shows it. The fineness 1 · 1,5 · 2 cm applies to
   the next surface; „Alle Oberflächen rechnen“ queues every map without a current surface, „Oberfläche

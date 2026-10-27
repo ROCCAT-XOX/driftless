@@ -538,10 +538,134 @@ fn dropped_unknown_shows_hint() {
     assert!(!h.state().is_loading());
     assert!(!h.state().is_loading_surface());
     let shown: Vec<_> = h.state().state().messages.clone();
+    let hint = text::drop_unsupported("notiz.txt");
+    assert_eq!(
+        hint,
+        "Dateiformat nicht unterstützt: notiz.txt (LAS, LAZ, E57, PLY, PCD, GLB oder OBJ)"
+    );
     assert!(
         shown
             .iter()
-            .any(|m| matches!(m, UiMessage::Info(t) if t.starts_with(text::DROP_UNSUPPORTED))),
+            .any(|m| matches!(m, UiMessage::Info(t) if *t == hint)),
         "{shown:?}"
+    );
+}
+
+/// Waits (frames of `h`) until `done` holds.
+fn step_until(
+    h: &mut egui_kittest::Harness<'_, DriftlessApp>,
+    what: &str,
+    mut done: impl FnMut(&DriftlessApp) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done(h.state()) {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(2));
+        h.step();
+    }
+}
+
+/// An E57 dropped onto the window is shown as a cloud of its scans; a file the reader
+/// refuses gives its message in the status bar.
+#[test]
+fn dropped_e57_loads_cloud() {
+    use driftless_export::{write_points, PointFormat, Points, ScanInfo};
+    let dir = tmp("ui-hineinziehen-e57");
+    let e57 = dir.join("Büro Scan.E57");
+    let n = 300;
+    let points = Points {
+        xyz: (0..n).map(|i| [i as f64 * 0.01, 1.0, 2.0]).collect(),
+        source: Some((0..n).map(|i| (i % 2) as u16).collect()),
+        scans: ["Erdgeschoss", "Keller"]
+            .iter()
+            .enumerate()
+            .map(|(k, name)| ScanInfo {
+                source: k as u16,
+                name: (*name).into(),
+                pose: nalgebra::Isometry3::identity(),
+            })
+            .collect(),
+        ..Points::default()
+    };
+    write_points(
+        &e57,
+        PointFormat::E57,
+        &points,
+        &driftless_io::progress::Progress::new(),
+    )
+    .unwrap();
+    let mut h = window(app());
+    drop_files(&mut h, &[dir.join("notiz.txt"), e57.clone()]);
+    assert!(h.state().is_loading());
+    step_until(&mut h, "E57 not loaded", |a| a.cloud().is_some());
+    let cloud = h.state().cloud().unwrap();
+    assert_eq!(cloud.path, e57);
+    assert_eq!(cloud.points.len(), n);
+    assert!(!cloud.points.source.is_empty());
+    assert!(h.state().state().project.is_none());
+    assert_eq!(errors(h.state()), Vec::<String>::new());
+
+    // a compressed PCD: the reader's message
+    let pcd = dir.join("gepackt.pcd");
+    fs::write(
+        &pcd,
+        "VERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\nWIDTH 1\nHEIGHT 1\n\
+         POINTS 1\nDATA binary_compressed\n",
+    )
+    .unwrap();
+    drop_files(&mut h, std::slice::from_ref(&pcd));
+    step_until(&mut h, "no message", |a| !errors(a).is_empty());
+    let shown = errors(h.state());
+    assert!(
+        shown
+            .iter()
+            .any(|e| e.contains("gepackt.pcd") && e.contains("„binary_compressed“")),
+        "{shown:?}"
+    );
+}
+
+/// An OBJ dropped onto the window is shown as a surface; a texture it names but that is
+/// missing gives a warning in the log.
+#[test]
+fn dropped_obj_loads_surface() {
+    use driftless_export::mesh::{write_obj, ImageKind, Mesh, MeshPage, PageImage};
+    let dir = tmp("ui-hineinziehen-obj");
+    let obj = dir.join("Netz.obj");
+    let jpeg = {
+        let img = image::RgbImage::from_pixel(2, 2, image::Rgb([10, 200, 10]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Jpeg).unwrap();
+        out.into_inner()
+    };
+    let page = |z: f64, image: Option<PageImage>| MeshPage {
+        positions: vec![[0.0, 0.0, z], [1.0, 0.0, z], [0.0, 1.0, z]],
+        uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+        indices: vec![[0, 1, 2]],
+        image,
+        color: [90, 90, 90],
+    };
+    let image = PageImage {
+        kind: ImageKind::Jpeg,
+        bytes: jpeg.into(),
+    };
+    let mesh = Mesh {
+        pages: vec![page(0.0, Some(image.clone())), page(2.0, Some(image))],
+    };
+    write_obj(&obj, &mesh).unwrap();
+    fs::remove_file(dir.join("Netz_seite_01.jpg")).unwrap();
+    let mut h = window(app());
+    drop_files(&mut h, &[dir.join("notiz.txt"), obj.clone()]);
+    assert!(h.state().is_loading_surface());
+    step_until(&mut h, "OBJ not loaded", |a| a.state().surface.is_some());
+    let surface = h.state().state().surface.clone().unwrap();
+    assert_eq!(surface.path, obj);
+    assert_eq!((surface.triangles, surface.pages), (2, 2));
+    assert_eq!(errors(h.state()), Vec::<String>::new());
+    let log = &h.state().state().log;
+    assert!(
+        log.iter().any(
+            |l| matches!(l, LogLine::Warning(w) if w.contains("Textur fehlt") && w.contains("Netz_seite_01.jpg"))
+        ),
+        "{log:?}"
     );
 }

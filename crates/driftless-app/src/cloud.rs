@@ -1,6 +1,6 @@
-//! A point cloud loaded from LAS or PLY ([`driftless_export::ply`]) for the 3D view: columns
-//! relative to an origin in whole metres, so that `f32` keeps millimetres even for
-//! coordinates of ~10⁶ m.
+//! A point cloud loaded from LAS, LAZ, E57, PLY or PCD ([`driftless_export::read_points`]) for
+//! the 3D view: columns relative to an origin in whole metres, so that `f32` keeps millimetres
+//! even for coordinates of ~10⁶ m.
 
 use crate::lod::{build_octree, Octree};
 use driftless_export::Points;
@@ -11,14 +11,8 @@ use driftless_steps::StepError;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Points read per batch (one cancel check and one progress step each).
-const BATCH: usize = 1 << 20;
-
 /// Intensity shown when a file carries none (all zero, as `map.las` of a SLAM run).
 pub const MID_GRAY: u8 = 128;
-
-/// Phase name while a cloud is read.
-pub const PHASE_LOAD: &str = "Wolke laden";
 
 /// The points of a cloud, one entry per point in every column.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -38,8 +32,9 @@ pub struct PointSet {
     pub quality_known: bool,
     /// LAS `user_data`: 1 = without measured colour, or the removal reason.
     pub flags: Vec<u8>,
-    /// The scan of each point in a model merged from several (LAS `point_source_id`, PLY
-    /// `scan`); empty if unknown or if all points have the same.
+    /// The scan of each point in a model merged from several (LAS `point_source_id`, PLY and
+    /// PCD `scan`, the `data3D` entry of an E57); empty if unknown or if all points have the
+    /// same.
     pub source: Vec<u16>,
 }
 
@@ -83,153 +78,6 @@ impl PointSet {
         }
         (min, max)
     }
-}
-
-/// Points checked against the header bounds before trusting them for the origin.
-const ORIGIN_SAMPLE: usize = 16;
-
-/// Centre of the header bounds in whole metres, or the first point in whole metres if the
-/// bounds are not finite, all zero, or miss one of the `first` points (stale header of a
-/// foreign writer); 0 without points.
-fn origin_of(bounds: &las::Bounds, first: &[[f64; 3]]) -> [f64; 3] {
-    let Some(p0) = first.first() else {
-        return [0.0; 3];
-    };
-    let min = [bounds.min.x, bounds.min.y, bounds.min.z];
-    let max = [bounds.max.x, bounds.max.y, bounds.max.z];
-    // Slack for the LAS coordinate rounding.
-    const SLACK: f64 = 0.01;
-    let usable = min.iter().chain(&max).all(|v| v.is_finite())
-        && min.iter().chain(&max).any(|&v| v != 0.0)
-        && first
-            .iter()
-            .all(|p| (0..3).all(|k| p[k] >= min[k] - SLACK && p[k] <= max[k] + SLACK));
-    if usable {
-        [0, 1, 2].map(|k| ((min[k] + max[k]) / 2.0).round())
-    } else {
-        p0.map(f64::round)
-    }
-}
-
-/// Reads a LAS file in batches of 2²⁰ points (phase [`PHASE_LOAD`], total from the header,
-/// a cancel check per batch). With `slam`, each point's time `gps_time − scan_start` picks
-/// its submap ([`submap_at`]) and so its quality. LAS intensity 0–65535 becomes `>> 8`; a
-/// file whose intensities are all 0 (none recorded) is shown [`MID_GRAY`]. Files whose
-/// colours (or intensities) never exceed 255 store 8-bit values; those are taken as they are.
-/// The origin comes from the header bounds unless they do not fit the first points. The
-/// `point_source_id` becomes [`PointSet::source`] if it differs between points.
-pub fn load_las(
-    path: &Path,
-    slam: Option<&SlamReport>,
-    progress: &Progress,
-) -> Result<PointSet, StepError> {
-    let err = |e: las::Error| StepError::Failed(format!("{}: {e}", path.display()));
-    let mut reader = las::Reader::from_path(path).map_err(err)?;
-    let header = reader.header();
-    let total = header.number_of_points();
-    let has_color = header.point_format().has_color;
-    let bounds = header.bounds();
-    let capacity = usize::try_from(total).unwrap_or(0);
-    let mut out = PointSet {
-        origin: [0.0; 3],
-        xyz: Vec::with_capacity(capacity),
-        rgb: has_color.then(|| Vec::with_capacity(capacity)),
-        intensity: Vec::with_capacity(capacity),
-        t: Vec::with_capacity(capacity),
-        quality: Vec::with_capacity(capacity),
-        quality_known: slam.is_some(),
-        flags: Vec::with_capacity(capacity),
-        source: Vec::with_capacity(capacity),
-    };
-    // Time zero: the scan start of the report, else the first point's time.
-    let mut t0 = slam.map(|s| s.scan_start);
-    let submaps = slam.map_or(&[][..], |s| &s.submaps[..]);
-    let quality_of = |t: f64| quality_at(submaps, t);
-
-    // The point format of a file has times for all points or for none.
-    let mut timed = false;
-    progress.phase(PHASE_LOAD, Some(total));
-    let mut batch = las::PointDataBuilder::new()
-        .for_header(reader.header())
-        .build();
-    // Low bytes of colour and intensity, kept until the whole file shows whether it stores
-    // 16-bit values (as the LAS spec says) or 8-bit ones (as some foreign writers do).
-    let mut low: Vec<[u8; 4]> = Vec::with_capacity(capacity);
-    let (mut max_rgb, mut max_intensity) = (0u16, 0u16);
-    let mut first_batch = true;
-    loop {
-        if progress.is_cancelled() {
-            return Err(StepError::Cancelled);
-        }
-        let read = reader.fill_points(BATCH as u64, &mut batch).map_err(err)?;
-        if read == 0 {
-            break;
-        }
-        if first_batch {
-            first_batch = false;
-            let mut first = Vec::with_capacity(ORIGIN_SAMPLE);
-            for p in batch.points().take(ORIGIN_SAMPLE) {
-                let p = p.map_err(err)?;
-                first.push([p.x, p.y, p.z]);
-            }
-            out.origin = origin_of(&bounds, &first);
-        }
-        let origin = out.origin;
-        for p in batch.points() {
-            let p = p.map_err(err)?;
-            out.xyz.push([
-                (p.x - origin[0]) as f32,
-                (p.y - origin[1]) as f32,
-                (p.z - origin[2]) as f32,
-            ]);
-            let c = p.color.unwrap_or_default();
-            if let Some(rgb) = &mut out.rgb {
-                rgb.push([c.red, c.green, c.blue].map(|v| (v >> 8) as u8));
-                max_rgb = max_rgb.max(c.red).max(c.green).max(c.blue);
-            }
-            out.intensity.push((p.intensity >> 8) as u8);
-            max_intensity = max_intensity.max(p.intensity);
-            low.push([c.red, c.green, c.blue, p.intensity].map(|v| v as u8));
-            out.flags.push(p.user_data);
-            out.source.push(p.point_source_id);
-            match p.gps_time {
-                Some(g) => {
-                    timed = true;
-                    let start = *t0.get_or_insert(g);
-                    let t = g - start;
-                    out.t.push(t as f32);
-                    out.quality
-                        .push(if slam.is_some() { quality_of(t) } else { 255 });
-                }
-                None => {
-                    out.t.push(0.0);
-                    out.quality.push(255);
-                }
-            }
-        }
-        progress.advance(read);
-    }
-    // 8-bit values: scaled ×257 to 16 bits and back, i.e. taken as they are.
-    if let Some(rgb) = out.rgb.as_mut().filter(|_| max_rgb <= 255) {
-        for (c, l) in rgb.iter_mut().zip(&low) {
-            *c = [l[0], l[1], l[2]];
-        }
-    }
-    if max_intensity <= 255 {
-        for (i, l) in out.intensity.iter_mut().zip(&low) {
-            *i = l[3];
-        }
-    }
-    drop(low);
-    // without times the report cannot pick a submap
-    out.quality_known &= timed;
-    if out.intensity.iter().all(|&i| i == 0) {
-        out.intensity.fill(MID_GRAY);
-    }
-    if out.source.windows(2).all(|w| w[0] == w[1]) {
-        out.source = Vec::new();
-    }
-    Ok(out)
 }
 
 /// The quality × 255 of the submap of the time `t` (seconds since the scan start); 255
@@ -324,12 +172,17 @@ pub fn point_set(points: Points, slam: Option<&SlamReport>) -> PointSet {
     }
 }
 
-/// Reads a PLY file ([`driftless_export::ply::read_ply`]: phase
-/// [`driftless_export::PHASE_READ`], a cancel check per block) as a [`PointSet`]
-/// ([`point_set`]). PLY has no point times: `t` is 0 and the quality unknown (255).
-pub fn load_ply(path: &Path, progress: &Progress) -> Result<PointSet, StepError> {
-    let points = driftless_export::ply::read_ply(path, progress)?;
-    Ok(point_set(points, None))
+/// Reads the cloud at `path` in any format [`driftless_export::read_points`] knows, by its
+/// extension (LAS, LAZ, E57, PLY, PCD; phase [`driftless_export::PHASE_READ`], a cancel check
+/// per block), as a [`PointSet`] ([`point_set`]). With `slam`, points with times get the
+/// quality of their submap. Errors carry the reader's German message and name the file.
+pub fn load_points(
+    path: &Path,
+    slam: Option<&SlamReport>,
+    progress: &Progress,
+) -> Result<PointSet, StepError> {
+    let points = driftless_export::read_points(path, progress)?;
+    Ok(point_set(points, slam))
 }
 
 /// A cloud ready for the 3D view: its points and their levels of detail.
@@ -407,11 +260,10 @@ impl LoadedCloud {
     }
 }
 
-/// Reads `path` and builds its levels of detail: phase [`PHASE_LOAD`] (for a PLY
-/// [`driftless_export::PHASE_READ`]), then [`crate::lod::PHASE_BUILD`]. A file ending in `.ply` (any case) is read by [`load_ply`],
-/// any other as LAS. With `run`, the `slam.json` of that run folder gives each point of a
-/// LAS the quality of its submap; without it (or unreadable, or for a PLY, which has no
-/// point times) the quality is 255.
+/// Reads `path` ([`load_points`]) and builds its levels of detail: phase
+/// [`driftless_export::PHASE_READ`], then [`crate::lod::PHASE_BUILD`]. With `run`, the
+/// `slam.json` of that run folder gives each point with a time the quality of its submap;
+/// without it (or unreadable, or for a file without point times) the quality is 255.
 pub fn load_cloud(
     path: &Path,
     run: Option<&Path>,
@@ -421,23 +273,13 @@ pub fn load_cloud(
         .and_then(|dir| std::fs::read_to_string(dir.join("slam.json")).ok())
         .and_then(|t| serde_json::from_str(&t).ok());
     let t = Instant::now();
-    let points = if is_ply(path) {
-        load_ply(path, progress)?
-    } else {
-        load_las(path, report.as_ref(), progress)?
-    };
+    let points = load_points(path, report.as_ref(), progress)?;
     LoadedCloud::build(
         path.to_path_buf(),
         points,
         t.elapsed().as_secs_f64(),
         progress,
     )
-}
-
-/// Whether `path` ends in `.ply`, in any case.
-pub fn is_ply(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("ply"))
 }
 
 /// Points looked at by [`view_bounds`] at most.
@@ -625,11 +467,12 @@ pub fn combine_pair_points(
     (out, shift)
 }
 
-/// Reads the `modell.las` of a model and the cloud `scan_cloud` of its scan `member` (LAS or
-/// PLY, in the frame of that scan), sets them side by side ([`combine_pair_points`]; `lone`
-/// is the scan of a model with points of only one) and builds the levels of detail; `name`
-/// names the cloud. In a job: phases [`PHASE_LOAD`] (twice) and
-/// [`crate::lod::PHASE_BUILD`], each with cancel checks.
+/// Reads the `modell.las` of a model and the cloud `scan_cloud` of its scan `member` (any
+/// format of [`load_points`], in the frame of that scan), sets them side by side
+/// ([`combine_pair_points`]; `lone` is the scan of a model with points of only one) and builds
+/// the levels of detail; `name` names the cloud. In a job: phases
+/// [`driftless_export::PHASE_READ`] (twice) and [`crate::lod::PHASE_BUILD`], each with cancel
+/// checks.
 pub fn load_pair_cloud(
     name: PathBuf,
     model_las: &Path,
@@ -639,12 +482,8 @@ pub fn load_pair_cloud(
     progress: &Progress,
 ) -> Result<PairCloud, StepError> {
     let t = Instant::now();
-    let model = load_las(model_las, None, progress)?;
-    let scan = if is_ply(scan_cloud) {
-        load_ply(scan_cloud, progress)?
-    } else {
-        load_las(scan_cloud, None, progress)?
-    };
+    let model = load_points(model_las, None, progress)?;
+    let scan = load_points(scan_cloud, None, progress)?;
     let (points, shift) = combine_pair_points(model, lone, scan, member);
     let cloud = LoadedCloud::build(name, points, t.elapsed().as_secs_f64(), progress)?;
     Ok(PairCloud { cloud, shift })

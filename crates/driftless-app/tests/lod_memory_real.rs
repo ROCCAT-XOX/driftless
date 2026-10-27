@@ -6,7 +6,7 @@
 #[global_allocator]
 static ALLOC: driftless_io::testalloc::Counting = driftless_io::testalloc::Counting;
 
-use driftless_app::cloud::load_las;
+use driftless_app::cloud::load_points;
 use driftless_app::lod::build_octree;
 use driftless_io::progress::Progress;
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ fn buero_scan_octree_live_heap() {
         );
         return;
     }
-    let points = load_las(&path, None, &Progress::new()).unwrap();
+    let points = load_points(&path, None, &Progress::new()).unwrap();
     let n = points.len();
     let (peak, tree) =
         driftless_io::testalloc::peak_during(|| build_octree(&points, &Progress::new()).unwrap());
