@@ -5,6 +5,7 @@
 //! The IMU is read first (small), the LiDAR frames are then streamed from a reader thread.
 
 use crate::error::{check_cancel, StepError};
+use driftless_export::{Layout, PointSource, ScanInfo};
 use driftless_io::bag::{BagError, BagReader};
 use driftless_io::msg::{decode_imu, decode_pointcloud2, ImuSample, LidarFrame};
 use driftless_io::progress::Progress;
@@ -322,19 +323,51 @@ pub fn warn_if_not_static(stats: &OdomStats, progress: &Progress) {
     }
 }
 
-pub fn write_las(path: &Path, points: &[[f32; 3]]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut builder = las::Builder::from((1, 2));
-    builder.point_format = las::point::Format::new(0)?;
-    let mut w = las::Writer::from_path(path, builder.into_header()?)?;
-    for p in points {
-        w.write_point(las::Point {
-            x: f64::from(p[0]),
-            y: f64::from(p[1]),
-            z: f64::from(p[2]),
-            ..Default::default()
-        })?;
+/// The points of a LiDAR map (`map.las` of `driftless odom`), xyz only.
+struct XyzPoints<'a>(&'a [[f32; 3]]);
+
+impl PointSource for XyzPoints<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
     }
-    w.close()?;
+
+    fn layout(&self) -> Layout {
+        Layout::default()
+    }
+
+    fn xyz(&self, i: usize) -> [f64; 3] {
+        self.0[i].map(f64::from)
+    }
+
+    fn rgb(&self, _: usize) -> [u16; 3] {
+        [0; 3]
+    }
+
+    fn intensity(&self, _: usize) -> f32 {
+        0.0
+    }
+
+    fn source(&self, _: usize) -> u16 {
+        0
+    }
+
+    fn time(&self, _: usize) -> f64 {
+        0.0
+    }
+
+    fn flags(&self, _: usize) -> u8 {
+        0
+    }
+
+    fn scans(&self) -> &[ScanInfo] {
+        &[]
+    }
+}
+
+/// Writes points as LAS 1.4, point format 0 (xyz only), through the one LAS writer
+/// ([`driftless_export::las::write_las`]).
+pub fn write_las(path: &Path, points: &[[f32; 3]]) -> Result<(), Box<dyn std::error::Error>> {
+    driftless_export::las::write_las(path, &XyzPoints(points), false, &Progress::new())?;
     Ok(())
 }
 

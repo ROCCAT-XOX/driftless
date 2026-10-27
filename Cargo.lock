@@ -1683,6 +1683,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "driftless-export"
+version = "0.1.0"
+dependencies = [
+ "driftless-export",
+ "driftless-io",
+ "driftless-traj",
+ "las",
+ "nalgebra",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "driftless-gpu"
 version = "0.1.0"
 dependencies = [
@@ -1722,6 +1734,7 @@ dependencies = [
 name = "driftless-map"
 version = "0.1.0"
 dependencies = [
+ "driftless-export",
  "driftless-gpu",
  "driftless-io",
  "driftless-odom",
@@ -1771,6 +1784,7 @@ dependencies = [
 name = "driftless-steps"
 version = "0.1.0"
 dependencies = [
+ "driftless-export",
  "driftless-gpu",
  "driftless-io",
  "driftless-map",
@@ -3247,10 +3261,21 @@ checksum = "987ee68552c50b61259b693e8b4f57b948990754d9ac401ea33cf392b551a018"
 dependencies = [
  "byteorder",
  "chrono",
+ "laz",
  "log",
  "num-traits",
  "thiserror 2.0.21",
  "uuid",
+]
+
+[[package]]
+name = "laz"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a1bd8242fad6a61a7520b73d072ddf63dff1f3680e3f5c157b1dc6e8e5ab2ec"
+dependencies = [
+ "byteorder",
+ "num-traits",
 ]
 
 [[package]]

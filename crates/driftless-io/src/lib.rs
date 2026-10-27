@@ -12,4 +12,4 @@ pub mod testdata;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testscan;
 
-pub use atomic::atomic_write;
+pub use atomic::{atomic_write, TempPath};

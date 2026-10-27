@@ -28,13 +28,16 @@ fn las_round_trip_with_rgb() {
 
     let mut r = Reader::from_path(&path).unwrap();
     let h = r.header().clone();
-    assert_eq!(h.point_format().to_u8().unwrap(), 3);
+    assert_eq!((h.version().major, h.version().minor), (1, 4));
+    assert_eq!(h.point_format().to_u8().unwrap(), 7);
     assert_eq!(h.number_of_points(), 3);
     assert_eq!(h.transforms().x.scale, 0.0001);
+    // x from -0.5 to 101.3, y from -2.5 to 7.75, z from -3.2 to 12.0.
+    let t = h.transforms();
     assert_eq!(
-        h.transforms().x.offset,
-        -1.0,
-        "offset = rounded-down minimum"
+        [t.x.offset, t.y.offset, t.z.offset],
+        [50.0, 3.0, 4.0],
+        "offset = rounded middle"
     );
     let points: Vec<las::Point> = r.read_all().unwrap().points().map(Result::unwrap).collect();
     for (i, p) in points.iter().enumerate() {
@@ -64,12 +67,12 @@ fn las_round_trip_with_rgb() {
 }
 
 #[test]
-fn las_without_rgb_is_format_1() {
+fn las_without_rgb_is_format_6() {
     let dir = temp_dir("las-plain");
     let path = dir.join("dense.las");
     write_las(&path, &cloud(false)).unwrap();
     let mut r = Reader::from_path(&path).unwrap();
-    assert_eq!(r.header().point_format().to_u8().unwrap(), 1);
+    assert_eq!(r.header().point_format().to_u8().unwrap(), 6);
     let points: Vec<las::Point> = r.read_all().unwrap().points().map(Result::unwrap).collect();
     assert_eq!(points.len(), 3);
     assert!(points
