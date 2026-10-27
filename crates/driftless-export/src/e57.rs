@@ -3,13 +3,15 @@
 //!
 //! The writer stores the points of a scan in that scan's own frame (`pose⁻¹ · p`, xyz as
 //! `double`) and the pose next to them, so that programs which show scans separately put each
-//! one where it belongs. Colour is `0–255` when every value came from 8 bit (a multiple of
-//! 257), else `0–65535`; intensity is `0–65535`. There is no creation date, and the GUIDs
+//! one where it belongs. Colour is always 8 bit (`0–255`, `round(v / 257)`): camera colours
+//! are of 8-bit origin, and tools built on libE57 (pye57, …) expect 8 bit. Intensity is
+//! `0–65535`. There is no creation date, and the GUIDs
 //! come from the file name, so the same cloud gives the same bytes.
 //!
 //! The reader applies the poses, turns spherical coordinates into cartesian ones and skips
 //! points without a position (invalid, or only a direction). Images are not read.
 
+use crate::ply::to_8bit;
 use crate::{
     check_cancel, ExportError, PointSource, Points, ScanInfo, BLOCK, PHASE_READ, PHASE_WRITE,
 };
@@ -66,7 +68,6 @@ pub fn write_e57(
         ));
     }
     let layout = src.layout();
-    let mut eight_bit = true;
     for i in 0..n {
         let p = src.xyz(i);
         if !p.iter().all(|v| v.is_finite()) {
@@ -74,9 +75,6 @@ pub fn write_e57(
                 path,
                 format!("Punkt {} hat keine gültige Lage ({p:?})", i + 1),
             ));
-        }
-        if layout.rgb && eight_bit {
-            eight_bit = src.rgb(i).iter().all(|c| c % 257 == 0);
         }
     }
     let file_name = path
@@ -89,7 +87,7 @@ pub fn write_e57(
         .unwrap_or_default();
     let (entries, order) = plan(src, &stem);
 
-    let colour_max: i64 = if eight_bit { 255 } else { 65_535 };
+    let colour_max: i64 = 255;
     let mut prototype = [
         RecordName::CartesianX,
         RecordName::CartesianY,
@@ -182,13 +180,10 @@ pub fn write_e57(
                 let mut values = Vec::with_capacity(prototype.len());
                 values.extend(local.coords.iter().map(|&v| RecordValue::Double(v)));
                 if layout.rgb {
-                    values.extend(src.rgb(i).map(|c| {
-                        RecordValue::Integer(if eight_bit {
-                            i64::from(c / 257)
-                        } else {
-                            i64::from(c)
-                        })
-                    }));
+                    values.extend(
+                        src.rgb(i)
+                            .map(|c| RecordValue::Integer(i64::from(to_8bit(c)))),
+                    );
                 }
                 if layout.intensity {
                     let v = (f64::from(src.intensity(i)) * 257.0).round();

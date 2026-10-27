@@ -36,8 +36,9 @@ deviates.
   LAS columns read × 257).
 - E57: the points in the order of the reference sorted stably by `point_source_id`, one
   entry per scan, compared after the pose of each entry.
-- pye57 reads colours into 8-bit buffers. The script widens them, because Driftless writes
-  E57 colours with limits 0–65535 when they are not of 8-bit origin.
+- E57 colours are written as 8 bit (limits 0–255), as pye57 and other libE57-based tools
+  expect. They are compared as `round(v / 257)`. The script still widens pye57's colour
+  buffers, so that foreign E57 files with 16-bit colours can be read too.
 
 ### `check_mesh.py`
 

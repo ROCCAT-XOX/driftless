@@ -149,8 +149,8 @@ def open3d_count(path):
 def read_e57(path):
     import pye57
 
-    # pye57 reads colours into 8-bit buffers; 16-bit colours (limits 0–65535, which E57
-    # allows and Driftless writes for colours not of 8-bit origin) need wider ones.
+    # pye57 reads colours into 8-bit buffers. Driftless writes 8-bit colours (limits 0–255);
+    # wider buffers keep foreign 16-bit colours (limits 0–65535) readable too.
     for c in ("colorRed", "colorGreen", "colorBlue"):
         pye57.e57.SUPPORTED_POINT_FIELDS[c] = "H"
     e57 = pye57.E57(str(path))
@@ -171,9 +171,12 @@ def read_e57(path):
          "header": f"E57 {e57.scan_count} Scans"}
     if rgb:
         rgb = np.concatenate(rgb).astype(np.float64)
-        # pye57 gives the stored integers; their limits are 0–255 or 0–65535.
+        # pye57 gives the stored integers; Driftless writes them as 0–255.
         limit = header.node["colorLimits"]["colorRedMaximum"].value()
-        d["rgb16"] = rgb * (65535.0 / limit)
+        if limit == 255:
+            d["rgb8"] = rgb
+        else:
+            d["rgb16"] = rgb * (65535.0 / limit)
     if inten:
         inten = np.concatenate(inten)
         limit = header.node["intensityLimits"]["intensityMaximum"].value()

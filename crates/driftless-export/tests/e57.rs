@@ -1,4 +1,4 @@
-//! E57: one `data3D` entry per scan with name and pose, colour limits that follow the data,
+//! E57: one `data3D` entry per scan with name and pose, colour always 8 bit,
 //! foreign files with spherical or invalid coordinates, far coordinates and the atomic write.
 
 use driftless_export::e57::{read_e57, write_e57};
@@ -160,22 +160,68 @@ fn e57_round_trip_two_scans() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Colour is always stored as 8 bit (limits 0–255, `round(v / 257)`), also when it is not
+/// of 8-bit origin: tools built on libE57 (pye57, …) expect 8-bit colours.
 #[test]
-fn e57_sixteen_bit_colour() {
+fn e57_colour_always_eight_bit() {
     let dir = temp_dir("sixteen");
     let path = dir.join("farbe.e57");
     let pts = Points {
-        xyz: vec![[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]],
-        rgb: Some(vec![[1000, 257, 0], [65_535, 514, 12_345]]),
+        xyz: vec![[0.0, 0.0, 0.0], [1.0, 2.0, 3.0], [2.0, 0.0, 1.0]],
+        rgb: Some(vec![
+            [1000, 257, 0],
+            [65_535, 514, 12_345],
+            [128, 129, 65_400],
+        ]),
         ..Points::default()
     };
     write_e57(&path, &pts, &Progress::new()).unwrap();
-    let reader = E57Reader::from_file(&path).unwrap();
-    let limits = reader.pointclouds()[0].color_limits.clone().unwrap();
-    assert_eq!(limits.red_min, Some(RecordValue::Integer(0)));
-    assert_eq!(limits.red_max, Some(RecordValue::Integer(65_535)));
+    let mut reader = E57Reader::from_file(&path).unwrap();
+    let cloud = reader.pointclouds()[0].clone();
+    let limits = cloud.color_limits.clone().unwrap();
+    for (min, max) in [
+        (&limits.red_min, &limits.red_max),
+        (&limits.green_min, &limits.green_max),
+        (&limits.blue_min, &limits.blue_max),
+    ] {
+        assert_eq!(min, &Some(RecordValue::Integer(0)));
+        assert_eq!(max, &Some(RecordValue::Integer(255)));
+    }
+    let red = cloud
+        .prototype
+        .iter()
+        .find(|r| r.name == RecordName::ColorRed)
+        .unwrap();
+    assert!(
+        matches!(red.data_type, RecordDataType::Integer { min: 0, max: 255 }),
+        "{:?}",
+        red.data_type
+    );
+    // stored round(v / 257): 1000 → 4, 12 345 → 48, 128 → 0, 129 → 1, 65 400 → 254
+    let mut raw = Vec::new();
+    for p in reader.pointcloud_raw(&cloud).unwrap() {
+        let p = p.unwrap();
+        raw.push(
+            p[3..6]
+                .iter()
+                .map(|v| match v {
+                    RecordValue::Integer(i) => *i,
+                    other => panic!("{other:?}"),
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(raw, vec![vec![4, 1, 0], vec![255, 2, 48], vec![0, 1, 254]]);
+    // read back × 257
     let back = read_e57(&path, &Progress::new()).unwrap();
-    assert_eq!(back.rgb, pts.rgb);
+    let want: Vec<[u16; 3]> = pts
+        .rgb
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|c| c.map(|v| ((u32::from(v) + 128) / 257 * 257) as u16))
+        .collect();
+    assert_eq!(back.rgb, Some(want));
     assert_eq!(back.intensity, None);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -614,7 +660,15 @@ fn e57_foreign_garbage_and_dispatch() {
     write_points(&via, PointFormat::E57, &pts, &Progress::new()).unwrap();
     let back = read_points(&via, &Progress::new()).unwrap();
     assert_eq!(back.len(), 20);
-    assert_eq!(back.rgb, pts.rgb);
+    // 8 bit in the file, × 257 back
+    let eight: Vec<[u16; 3]> = pts
+        .rgb
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|c| c.map(|v| ((u32::from(v) + 128) / 257 * 257) as u16))
+        .collect();
+    assert_eq!(back.rgb, Some(eight));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
