@@ -1,7 +1,7 @@
 //! The point model: [`Points`] as columns, and [`PointSource`], through which every writer
 //! reads points without a copy.
 
-use crate::{las, pcd, ply, ExportError, MAX_FLOAT_COORD};
+use crate::{e57, las, pcd, ply, ExportError, MAX_FLOAT_COORD};
 use driftless_io::progress::Progress;
 use nalgebra::Isometry3;
 use std::path::Path;
@@ -179,6 +179,7 @@ pub enum PointFormat {
     Laz,
     Ply,
     Pcd,
+    E57,
 }
 
 impl PointFormat {
@@ -190,6 +191,7 @@ impl PointFormat {
             "laz" => Some(PointFormat::Laz),
             "ply" => Some(PointFormat::Ply),
             "pcd" => Some(PointFormat::Pcd),
+            "e57" => Some(PointFormat::E57),
             _ => None,
         }
     }
@@ -201,6 +203,7 @@ impl PointFormat {
             PointFormat::Laz => "laz",
             PointFormat::Ply => "ply",
             PointFormat::Pcd => "pcd",
+            PointFormat::E57 => "e57",
         }
     }
 }
@@ -212,10 +215,11 @@ pub fn read_points(path: &Path, progress: &Progress) -> Result<Points, ExportErr
         Some(PointFormat::Las | PointFormat::Laz) => las::read_las(path, progress)?,
         Some(PointFormat::Ply) => ply::read_ply(path, progress)?,
         Some(PointFormat::Pcd) => pcd::read_pcd(path, progress)?,
+        Some(PointFormat::E57) => e57::read_e57(path, progress)?,
         None => {
             return Err(ExportError::format(
                 path,
-                "unbekanntes Punktwolken-Format (erwartet: .las, .laz, .ply, .pcd)",
+                "unbekanntes Punktwolken-Format (erwartet: .las, .laz, .ply, .pcd, .e57)",
             ))
         }
     };
@@ -235,5 +239,6 @@ pub fn write_points(
         PointFormat::Laz => las::write_las(path, src, true, progress),
         PointFormat::Ply => ply::write_ply(path, src, progress),
         PointFormat::Pcd => pcd::write_pcd(path, src, progress),
+        PointFormat::E57 => e57::write_e57(path, src, progress),
     }
 }

@@ -5,6 +5,7 @@
 //! inside; every file is written to `<name>.tmp` next to its target and renamed at the end
 //! ([`driftless_io::TempPath`]), so an error or a cancel never leaves half a file behind.
 
+pub mod e57;
 pub mod las;
 pub mod pcd;
 pub mod ply;
