@@ -194,6 +194,14 @@ fn crafted_headers_fail_fast() {
         refused(&path),
         "LAZ-Datei ist beschädigt (Chunk-Tabelle liegt außerhalb der Datei)"
     );
+    // LAZ: a user id that only starts with „laszip encoded“ is not the LASzip VLR for `las`
+    // either, so the file is refused instead of checked against the wrong table.
+    let path = dir.join("fremd-vlr.laz");
+    las14(&path, true);
+    let header_size = u16::from_le_bytes(std::fs::read(&path).unwrap()[94..96].try_into().unwrap());
+    patch(&path, header_size as usize + 2, b"laszip encodedX\0");
+    assert!(read_points(&path, &Progress::new()).is_err());
+
     // LAZ: a trillion points in a few kilobytes.
     let path = dir.join("viele.laz");
     las14(&path, true);

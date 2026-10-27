@@ -423,7 +423,14 @@ fn check_layout<R: io::Read + Seek>(
         let (length, user, record) = record_header(file, at, len, false)
             .map_err(io_err)?
             .ok_or_else(vlr_beyond)?;
-        if user.starts_with(LASZIP_USER) && record == LASZIP_RECORD && length >= 2 {
+        // The same rule as `las::laz::is_laszip_vlr` (user id up to the first NUL, the first
+        // match wins), so the table checked here is the one the decompressor will use.
+        let user_end = user.iter().position(|&b| b == 0).unwrap_or(user.len());
+        if laszip.is_none()
+            && &user[..user_end] == LASZIP_USER
+            && record == LASZIP_RECORD
+            && length >= 2
+        {
             laszip = Some(at + VLR_HEADER);
         }
         at += VLR_HEADER + length;
