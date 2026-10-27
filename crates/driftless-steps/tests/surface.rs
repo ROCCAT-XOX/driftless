@@ -1,14 +1,24 @@
-//! `run_surface` on the synthetic room scan (with camera images where noted).
+//! `run_surface` on the synthetic room scan (with camera images where noted), and
+//! `run_model_surface` on models of two scans of the furnished room.
 
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
-use driftless_io::testscan::{room_bag, scan_with_images, tmp};
+use driftless_io::testscan::{
+    furnished_room_bag, furnished_scan_with_images, room_bag, scan_with_images, tmp,
+};
 use driftless_map::surface::SurfaceConfig;
-use driftless_steps::map::{run_map, MapInput, MapRequest, MapSettings, MapStep};
+use driftless_slam::align::AlignConfig;
+use driftless_steps::map::{map_input_for, run_map, MapInput, MapRequest, MapSettings, MapStep};
+use driftless_steps::merge::{run_merge, MergeMember, MergeRequest, MODEL_REPORT};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
-use driftless_steps::surface::{run_surface, surface_fits, SurfaceRequest, SURFACE_REPORT};
+use driftless_steps::surface::{
+    model_surface_fits, run_model_surface, run_surface, surface_fits, ModelSurfaceRequest,
+    SurfaceRequest, SURFACE_REPORT,
+};
 use driftless_steps::StepError;
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 fn slam(scan: &Path, out: &Path) {
     let req = SlamRequest {
@@ -278,4 +288,257 @@ fn old_pages_are_listed_as_stale_not_deleted() {
     );
     assert!(warnings(&p).iter().any(|w| w.contains("früheren Lauf")));
     assert!(!dest.join("oberflaeche.json.tmp").exists());
+}
+
+// Surfaces of models: scan A of the furnished room from the origin, scan B from
+// (0.8, 0.5, 0) turned by 30°, both with camera images; scan C with the LiDAR data of B,
+// without images.
+
+struct ModelScene {
+    a: PathBuf,
+    /// Model of A (reference) and B.
+    both: PathBuf,
+    /// Model of A (reference) and C: the points of `both`, the images of A only.
+    images_of_a: PathBuf,
+    /// Model of C (reference, no images) and A.
+    one_imageless: PathBuf,
+}
+
+/// SLAM and clean map of `scan` in `<scan>/driftless`.
+fn prepare_member(scan: &Path) {
+    let out = scan.join("driftless");
+    slam(scan, &out);
+    let mut input = map_input_for(scan, &out, &out, SlamSettings::default());
+    input.map.step = MapStep::Clean;
+    run_map(
+        &MapRequest {
+            input,
+            out_dir: out,
+        },
+        &Progress::new(),
+    )
+    .unwrap();
+}
+
+fn merge_member(scan: &Path) -> MergeMember {
+    let run = scan.join("driftless");
+    MergeMember {
+        scan: scan.to_path_buf(),
+        slam_dir: run.clone(),
+        map_dir: run,
+        slam: SlamSettings::default(),
+    }
+}
+
+fn merged(scans: &[&Path], out: &Path) -> PathBuf {
+    let req = MergeRequest {
+        members: scans.iter().map(|s| merge_member(s)).collect(),
+        out_dir: out.to_path_buf(),
+        align: AlignConfig::default(),
+        voxel: 0.01,
+        smooth: true,
+        include_unsure: false,
+        pairs: Vec::new(),
+    };
+    let report = run_merge(&req, &Progress::new()).unwrap();
+    assert!(
+        report.members.iter().all(|m| m.included),
+        "{}",
+        serde_json::to_string_pretty(&report.members).unwrap()
+    );
+    out.to_path_buf()
+}
+
+fn model_scene() -> &'static ModelScene {
+    static SCENE: OnceLock<ModelScene> = OnceLock::new();
+    SCENE.get_or_init(|| {
+        let root = tmp("steps-model-surface");
+        let (a, b, c) = (
+            root.join("raum-a"),
+            root.join("raum-b"),
+            root.join("raum-c"),
+        );
+        for d in [&a, &b, &c] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let yaw = 30f64.to_radians();
+        furnished_scan_with_images(&a, [0.0; 3], 0.0);
+        furnished_scan_with_images(&b, [0.8, 0.5, 0.0], yaw);
+        furnished_room_bag(&c, true, [0.8, 0.5, 0.0], yaw);
+        for d in [&a, &b, &c] {
+            prepare_member(d);
+        }
+        let both = merged(&[&a, &b], &root.join("modell-001"));
+        let images_of_a = merged(&[&a, &c], &root.join("modell-002"));
+        let one_imageless = merged(&[&c, &a], &root.join("modell-003"));
+        ModelScene {
+            a,
+            both,
+            images_of_a,
+            one_imageless,
+        }
+    })
+}
+
+fn model_request(model: &Path, out: &Path) -> ModelSurfaceRequest {
+    ModelSurfaceRequest {
+        model_dir: model.to_path_buf(),
+        out_dir: out.to_path_buf(),
+        config: small_config(),
+        texture: true,
+        gpu: driftless_gpu::GpuPref::default(),
+    }
+}
+
+/// Fresh output folder next to the models.
+fn model_out(name: &str) -> PathBuf {
+    let dir = model_scene().a.parent().unwrap().join("out").join(name);
+    let _ = fs::remove_dir_all(&dir);
+    dir
+}
+
+fn untextured(report: &Value) -> u64 {
+    report["stats"]["texture"]["faces_untextured"]
+        .as_u64()
+        .unwrap()
+}
+
+#[test]
+fn model_surface_textures_both_scans() {
+    let s = model_scene();
+    // The same points with the images of one scan.
+    let single = run_model_surface(
+        &model_request(&s.images_of_a, &model_out("bilder-von-a")),
+        &Progress::new(),
+    )
+    .unwrap();
+
+    let dest = s.both.join("oberflaeche");
+    let _ = fs::remove_dir_all(&dest);
+    let p = Progress::new();
+    let report = run_model_surface(&model_request(&s.both, &dest), &p).unwrap();
+    assert!(warnings(&p).is_empty(), "{:?}", warnings(&p));
+    for f in ["oberflaeche.glb", "oberflaeche.obj", SURFACE_REPORT] {
+        assert!(dest.join(f).is_file(), "{f} missing");
+    }
+    assert_eq!(
+        report["model"]["members"],
+        serde_json::json!(["raum-a", "raum-b"])
+    );
+    assert_eq!(report["model"]["dir"], s.both.display().to_string());
+    assert!(report["stats"]["accuracy_dense"].is_null(), "{report}");
+    assert!(
+        report["stats"]["accuracy"]["all"]["vertices"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        report["stats"]["faces_final"], single["stats"]["faces_final"],
+        "the same points give the same mesh"
+    );
+    assert!(
+        untextured(&report) < untextured(&single),
+        "both scans {} vs. images of one {}",
+        report["stats"]["texture"],
+        single["stats"]["texture"]
+    );
+    let on_disk: Value =
+        serde_json::from_str(&fs::read_to_string(dest.join(SURFACE_REPORT)).unwrap()).unwrap();
+    assert_eq!(on_disk, report);
+}
+
+#[test]
+fn model_surface_with_one_imageless_member() {
+    let s = model_scene();
+    let dest = model_out("ohne-bilder");
+    let p = Progress::new();
+    let report = run_model_surface(&model_request(&s.one_imageless, &dest), &p).unwrap();
+    let w = warnings(&p);
+    assert!(
+        w.iter()
+            .any(|w| w.contains("raum-c") && w.contains("keine Kamerabilder")),
+        "{w:?}"
+    );
+    assert_eq!(
+        report["model"]["members"],
+        serde_json::json!(["raum-c", "raum-a"])
+    );
+    let t = &report["stats"]["texture"];
+    assert!(t["faces_textured"].as_u64().unwrap() > 0, "{report}");
+    assert!(dest.join("oberflaeche.glb").is_file());
+}
+
+#[test]
+fn model_surface_fits_after_run() {
+    let s = model_scene();
+    let dest = model_out("passt");
+    let req = model_request(&s.both, &dest);
+    assert!(!model_surface_fits(&req));
+    run_model_surface(&req, &Progress::new()).unwrap();
+    assert!(model_surface_fits(&req));
+    let mut other = model_request(&s.both, &dest);
+    other.config.voxel = 0.2;
+    assert!(!model_surface_fits(&other), "other settings");
+    let mut gray = model_request(&s.both, &dest);
+    gray.texture = false;
+    assert!(!model_surface_fits(&gray), "without texture");
+}
+
+/// A copy of `modell.json` of the model of A and B in a new folder, changed by `edit`.
+fn edited_model(name: &str, edit: impl FnOnce(&mut Value)) -> PathBuf {
+    let dir = model_out(name);
+    fs::create_dir_all(&dir).unwrap();
+    let text = fs::read_to_string(model_scene().both.join(MODEL_REPORT)).unwrap();
+    let mut model: Value = serde_json::from_str(&text).unwrap();
+    edit(&mut model);
+    fs::write(dir.join(MODEL_REPORT), model.to_string()).unwrap();
+    dir
+}
+
+#[test]
+fn model_surface_takes_only_included_members() {
+    let model = edited_model("nur-a", |m| m["members"][1]["included"] = false.into());
+    let dest = model.join("oberflaeche");
+    let mut req = model_request(&model, &dest);
+    req.texture = false;
+    let report = run_model_surface(&req, &Progress::new()).unwrap();
+    assert_eq!(report["model"]["members"], serde_json::json!(["raum-a"]));
+}
+
+#[test]
+fn model_surface_refuses_a_changed_map_or_no_model() {
+    let model = edited_model("veraltet", |m| {
+        m["members"][1]["clean_id"] = "0000000000000000".into();
+    });
+    let dest = model.join("oberflaeche");
+    let req = model_request(&model, &dest);
+    let err = run_model_surface(&req, &Progress::new()).unwrap_err();
+    assert!(
+        err.to_string().contains("raum-b") && err.to_string().contains("neu zusammenführen"),
+        "{err}"
+    );
+    assert!(!dest.exists(), "nothing written");
+    assert!(!model_surface_fits(&req));
+
+    let empty = model_out("kein-modell");
+    let err =
+        run_model_surface(&model_request(&empty, &empty.join("o")), &Progress::new()).unwrap_err();
+    assert!(err.to_string().contains("modell.json"), "{err}");
+}
+
+#[test]
+fn model_surface_cancel_writes_nothing() {
+    let s = model_scene();
+    let dest = model_out("abbruch");
+    let p = Progress::new();
+    let handle = p.clone();
+    let p = p.with_observer(move |s: &ProgressSnapshot| {
+        if s.phase == "Oberfläche: Genauigkeit" {
+            handle.cancel();
+        }
+    });
+    let err = run_model_surface(&model_request(&s.both, &dest), &p).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    assert!(!dest.exists());
 }

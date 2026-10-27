@@ -131,6 +131,10 @@ pub struct ModelMember {
     pub color_gain: [f32; 3],
     /// Its points in the model (after thinning; 0 if not included).
     pub points: u64,
+    /// `hex` of the clean stage id of its map when merged: a map computed anew since then
+    /// does not fit [`Self::transform`] any more. `None` in a model written before the field.
+    #[serde(default)]
+    pub clean_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -749,7 +753,7 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
         .iter()
         .zip(&placed)
         .enumerate()
-        .map(|(k, (m, p))| model_member(m, p, gains[k], counts[k]))
+        .map(|(k, (m, p))| model_member(m, p, gains[k], counts[k], &clean_ids[k]))
         .collect();
     let peak = peak_rss_bytes();
     let report = ModelReport {
@@ -791,7 +795,13 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
     serde_json::from_str(&text).map_err(failed)
 }
 
-fn model_member(m: &MergeMember, p: &Placement, gain: [f32; 3], points: u64) -> ModelMember {
+fn model_member(
+    m: &MergeMember,
+    p: &Placement,
+    gain: [f32; 3],
+    points: u64,
+    clean_id: &str,
+) -> ModelMember {
     let (method, verdict, reason, q) = match &p.alignment {
         None => ("bezug", "sicher", None, None),
         Some(a) => {
@@ -824,6 +834,7 @@ fn model_member(m: &MergeMember, p: &Placement, gain: [f32; 3], points: u64) -> 
         included: p.included,
         color_gain: gain,
         points: if p.included { points } else { 0 },
+        clean_id: Some(hex(clean_id)),
     }
 }
 
@@ -866,6 +877,7 @@ mod tests {
             included: true,
             color_gain: [1.0; 3],
             points: 3,
+            clean_id: None,
         };
         // Row by row: the translation is the last column.
         assert_eq!(m.transform[3], 0.8);

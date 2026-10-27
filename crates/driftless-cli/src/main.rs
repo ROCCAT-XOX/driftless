@@ -51,8 +51,8 @@ enum Command {
     /// Karte eines SLAM-Laufs: dichte Wolke (dense.las), bereinigt (clean.las, removed.las),
     /// eingefärbt (color.las, color.ply) und map.json; jeder Schritt einzeln startbar
     Map(map::Args),
-    /// Fotoähnliche Oberfläche einer Karte: oberflaeche.glb, oberflaeche.obj (mit .mtl und
-    /// Texturseiten) und oberflaeche.json
+    /// Fotoähnliche Oberfläche einer Karte oder eines Modells (--model): oberflaeche.glb,
+    /// oberflaeche.obj (mit .mtl und Texturseiten) und oberflaeche.json
     Surface(surface::Args),
     /// Führt mehrere Scans eines Orts zu einem Modell zusammen: modell.las, modell.ply und
     /// modell.json (Lage und Güte je Scan)

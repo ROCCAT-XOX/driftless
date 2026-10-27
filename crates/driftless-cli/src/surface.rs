@@ -1,28 +1,40 @@
 //! `driftless surface <scan> --slam <ziel> [--map <karte>] [-o <ziel>]`: the photo-like
 //! surface of a map as glb and obj (`oberflaeche.glb`, `oberflaeche.obj` with `.mtl` and
 //! texture pages, `oberflaeche.json`). The run itself is
-//! [`driftless_steps::surface::run_surface`].
+//! [`driftless_steps::surface::run_surface`]; with `--model <modell>` instead of the scan
+//! the surface of a merged model ([`driftless_steps::surface::run_model_surface`]).
 
 use driftless_gpu::GpuPref;
 use driftless_map::surface::SurfaceConfig;
 use driftless_steps::map::map_input_for;
 use driftless_steps::scan::extrinsic_values;
 use driftless_steps::slam::SlamSettings;
-use driftless_steps::surface::{run_surface, SurfaceRequest};
-use std::path::PathBuf;
+use driftless_steps::surface::{
+    run_model_surface, run_surface, ModelSurfaceRequest, SurfaceRequest,
+};
+use std::path::{Path, PathBuf};
 
 #[derive(clap::Args)]
 pub struct Args {
     /// Scan-Ordner (mit LIDAR_*.bag; für die Textur auch IMAGE_*.bag und calibration/calib.json)
-    scan: PathBuf,
+    #[arg(required_unless_present = "model")]
+    scan: Option<PathBuf>,
     /// Zielordner von `driftless slam` (liest traj.tum)
-    #[arg(long, value_name = "ZIEL")]
-    slam: PathBuf,
+    #[arg(long, value_name = "ZIEL", required_unless_present = "model")]
+    slam: Option<PathBuf>,
+    /// Ordner eines Modells von `driftless merge` (mit modell.json) statt eines Scans: die
+    /// Oberfläche aus den Punkten und Bildern aller Scans im Modell
+    #[arg(
+        long,
+        value_name = "MODELL",
+        conflicts_with_all = ["scan", "slam", "map", "lidar_to_imu", "lidar_topic", "imu_topic"]
+    )]
+    model: Option<PathBuf>,
     /// Ordner der Karte (mit clean.bin und map.json von `driftless map`); Standard: der
     /// SLAM-Ordner
     #[arg(long, value_name = "KARTE")]
     map: Option<PathBuf>,
-    /// Zielordner der Oberfläche (Standard: <karte>/oberflaeche)
+    /// Zielordner der Oberfläche (Standard: <karte>/oberflaeche, mit --model <modell>/oberflaeche)
     #[arg(short, long, value_name = "ZIEL")]
     output: Option<PathBuf>,
     /// Voxelgröße der Oberfläche in m (kleiner = feiner, mehr Speicher und Zeit)
@@ -54,7 +66,10 @@ fn config(args: &Args) -> SurfaceConfig {
 }
 
 fn request(args: &Args) -> Result<SurfaceRequest, Box<dyn std::error::Error>> {
-    let map_dir = args.map.clone().unwrap_or_else(|| args.slam.clone());
+    let (Some(scan), Some(slam_dir)) = (&args.scan, &args.slam) else {
+        return Err("Scan-Ordner und --slam angeben, oder --model".into());
+    };
+    let map_dir = args.map.clone().unwrap_or_else(|| slam_dir.clone());
     let out_dir = args
         .output
         .clone()
@@ -65,7 +80,7 @@ fn request(args: &Args) -> Result<SurfaceRequest, Box<dyn std::error::Error>> {
         imu_topic: args.imu_topic.clone(),
     };
     Ok(SurfaceRequest {
-        map: map_input_for(&args.scan, &args.slam, &map_dir, slam),
+        map: map_input_for(scan, slam_dir, &map_dir, slam),
         map_dir,
         out_dir,
         config: config(args),
@@ -74,7 +89,26 @@ fn request(args: &Args) -> Result<SurfaceRequest, Box<dyn std::error::Error>> {
     })
 }
 
+fn model_request(args: &Args, model: &Path) -> ModelSurfaceRequest {
+    ModelSurfaceRequest {
+        model_dir: model.to_path_buf(),
+        out_dir: args
+            .output
+            .clone()
+            .unwrap_or_else(|| model.join("oberflaeche")),
+        config: config(args),
+        texture: !args.no_texture,
+        gpu: args.gpu,
+    }
+}
+
 pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(model) = &args.model {
+        let req = model_request(args, model);
+        req.config.check()?;
+        run_model_surface(&req, &crate::console())?;
+        return Ok(());
+    }
     let req = request(args)?;
     req.config.check()?;
     run_surface(&req, &crate::console())?;
@@ -111,6 +145,32 @@ mod tests {
         assert!(!r.texture);
         assert_eq!(r.map_dir, PathBuf::from("k"));
         assert_eq!(r.out_dir, PathBuf::from("x"));
+    }
+
+    #[test]
+    fn model_needs_no_scan() {
+        let argv = ["surface", "--model", "m", "--voxel", "0.05", "--no-texture"];
+        let args = Cli::try_parse_from(argv).unwrap().args;
+        let model = args.model.clone().unwrap();
+        let r = model_request(&args, &model);
+        assert_eq!(r.model_dir, PathBuf::from("m"));
+        assert_eq!(r.out_dir, PathBuf::from("m/oberflaeche"));
+        assert_eq!(r.config.voxel, 0.05);
+        assert!(!r.texture);
+        let argv = ["surface", "--model", "m", "-o", "x", "--gpu", "aus"];
+        let args = Cli::try_parse_from(argv).unwrap().args;
+        let r = model_request(&args, Path::new("m"));
+        assert_eq!(r.out_dir, PathBuf::from("x"));
+        assert_eq!(r.gpu, GpuPref::Off);
+        for argv in [
+            &["surface"][..],
+            &["surface", "scan"],
+            &["surface", "--slam", "ziel"],
+            &["surface", "scan", "--slam", "ziel", "--model", "m"],
+            &["surface", "--model", "m", "--map", "k"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
     }
 
     #[test]

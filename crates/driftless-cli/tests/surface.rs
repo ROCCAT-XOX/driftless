@@ -1,9 +1,10 @@
-//! `driftless surface` on the synthetic room scan with camera images.
+//! `driftless surface` on the synthetic room scan with camera images, and on a model of two
+//! scans of the furnished room.
 
 mod common;
 
 use assert_cmd::Command;
-use common::{scan_with_images, tmp};
+use common::{furnished_room_bag, furnished_scan_with_images, scan_with_images, tmp};
 use predicates::prelude::*;
 use std::fs;
 use std::path::Path;
@@ -248,4 +249,68 @@ fn surface_report_says_why_auto_took_the_cpu() {
     )
     .success();
     assert!(report(&none)["gpu"]["fallback"].is_null());
+}
+
+fn driftless(args: &[&std::ffi::OsStr]) -> assert_cmd::assert::Assert {
+    Command::cargo_bin("driftless").unwrap().args(args).assert()
+}
+
+#[test]
+fn surface_of_a_model() {
+    let dir = tmp("surface-cli-model");
+    let (a, b) = (dir.join("raum-a"), dir.join("raum-b"));
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    furnished_scan_with_images(&a, [0.0; 3], 0.0);
+    furnished_room_bag(&b, true, [0.8, 0.5, 0.0], 30f64.to_radians());
+    for scan in [&a, &b] {
+        let out = scan.join("driftless");
+        run("slam", scan, &out, &[]).success();
+        run("map", scan, &out, &["--step", "clean"]).success();
+    }
+    let m = dir.join("m");
+    driftless(&[
+        "merge".as_ref(),
+        a.as_os_str(),
+        b.as_os_str(),
+        "-o".as_ref(),
+        m.as_os_str(),
+    ])
+    .success();
+
+    driftless(&[
+        "surface".as_ref(),
+        "--model".as_ref(),
+        m.as_os_str(),
+        "--voxel".as_ref(),
+        "0.05".as_ref(),
+    ])
+    .success()
+    .stdout(predicate::str::contains("Oberfläche:"))
+    .stderr(predicate::str::contains("raum-b"));
+    let json = report(&m.join("oberflaeche"));
+    assert_eq!(json["settings"]["voxel"], 0.05);
+    assert_eq!(
+        json["model"]["members"],
+        serde_json::json!(["raum-a", "raum-b"])
+    );
+    assert!(m.join("oberflaeche/oberflaeche.glb").is_file());
+
+    // `--model` with a scan, or neither: a usage error.
+    driftless(&[
+        "surface".as_ref(),
+        a.as_os_str(),
+        "--model".as_ref(),
+        m.as_os_str(),
+    ])
+    .failure()
+    .code(2);
+}
+
+#[test]
+fn surface_needs_a_scan_or_a_model() {
+    driftless(&["surface".as_ref()])
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("<SCAN>").or(predicate::str::contains("--slam")));
 }

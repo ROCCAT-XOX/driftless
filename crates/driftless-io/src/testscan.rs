@@ -266,34 +266,46 @@ fn write_calib(dir: &Path) {
     fs::write(dir.join("calibration/calib.json"), json.to_string()).unwrap();
 }
 
-/// Stored image of the static device (at the origin) through the calibration of `dir` as
-/// Driftless reads it.
-fn render_from(dir: &Path) -> Vec<u8> {
+/// Colour of a box of [`FURNITURE`] in the images of [`furnished_scan_with_images`].
+pub const BLOCK_COLOR: [u8; 3] = [220, 120, 40];
+
+/// Colour where the ray from `o` along `d` first meets the room with `blocks`: [`cast`] on
+/// a wall, [`BLOCK_COLOR`] on a box.
+fn cast_in(o: &Vector3<f64>, d: &Vector3<f64>, blocks: &[Block]) -> [u8; 3] {
+    if !blocks.is_empty() && first_hit(o, d, blocks) < first_hit(o, d, &[]) - 1e-9 {
+        return BLOCK_COLOR;
+    }
+    cast(o, d)
+}
+
+/// Stored image of the static device at `device` (device → room) in the room with
+/// `blocks`, through the calibration of `dir` as Driftless reads it.
+fn render_from(dir: &Path, device: &Isometry3<f64>, blocks: &[Block]) -> Vec<u8> {
     let calib = load_calibration(&dir.join("calibration/calib.json")).unwrap();
     let c = &calib.cameras["left"];
     let cam = Camera::from_calib("left", c).unwrap();
-    let world_cam = c.lidar_to_cam.unwrap().inverse();
+    let world_cam = device * c.lidar_to_cam.unwrap().inverse();
     let o = world_cam.translation.vector;
     let mut rgb = Vec::new();
     for y in 0..cam.height {
         for x in 0..cam.width {
             let px = cam
                 .unproject([f64::from(x), f64::from(y)])
-                .map_or([0; 3], |d| cast(&o, &(world_cam.rotation * d)));
+                .map_or([0; 3], |d| cast_in(&o, &(world_cam.rotation * d), blocks));
             rgb.extend(px);
         }
     }
     rgb
 }
 
-/// Scan folder: static room (LiDAR + IMU), `IMAGES` camera images, calibration.
-pub fn scan_with_images(dir: &Path) {
-    room_bag(dir, true);
+/// Writes the calibration and `IMAGES` camera images of the static device at `device` in
+/// the room with `blocks` into the scan folder `dir`.
+fn write_images(dir: &Path, device: &Isometry3<f64>, blocks: &[Block]) {
     write_calib(dir);
     let mut jpeg = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
         .encode(
-            &render_from(dir),
+            &render_from(dir, device, blocks),
             u32::from(IMAGE_W),
             u32::from(IMAGE_H),
             image::ExtendedColorType::Rgb8,
@@ -311,4 +323,22 @@ pub fn scan_with_images(dir: &Path) {
         w.write_message(ic, time(s), &encode_compressed_image(&img));
     }
     fs::write(dir.join("IMAGE_0.bag"), w.finish()).unwrap();
+}
+
+/// Scan folder: static room (LiDAR + IMU), `IMAGES` camera images, calibration.
+pub fn scan_with_images(dir: &Path) {
+    room_bag(dir, true);
+    write_images(dir, &Isometry3::identity(), &[]);
+}
+
+/// [`furnished_room_bag`] with the calibration and `IMAGES` camera images of the device at
+/// `offset`, turned by `yaw` (rad): the camera looks along the device's +x, the boxes are
+/// [`BLOCK_COLOR`].
+pub fn furnished_scan_with_images(dir: &Path, offset: [f64; 3], yaw: f64) {
+    furnished_room_bag(dir, true, offset, yaw);
+    let device = Isometry3::from_parts(
+        Translation3::from(Vector3::from(offset)),
+        UnitQuaternion::from_axis_angle(&Vector3::z_axis(), yaw),
+    );
+    write_images(dir, &device, &FURNITURE);
 }
