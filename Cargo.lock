@@ -1635,6 +1635,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "chrono",
+ "driftless-export",
  "driftless-gpu",
  "driftless-io",
  "driftless-map",
@@ -1645,17 +1646,18 @@ dependencies = [
  "egui-phosphor",
  "egui-wgpu",
  "egui_kittest",
- "gltf",
  "image",
  "las",
  "mimalloc",
  "nalgebra",
+ "png",
  "pollster 0.4.0",
  "rayon",
  "rfd",
  "serde",
  "serde_json",
  "toml",
+ "winresource",
 ]
 
 [[package]]
@@ -1664,6 +1666,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "driftless-export",
  "driftless-gpu",
  "driftless-io",
  "driftless-map",
@@ -1680,6 +1683,25 @@ dependencies = [
  "rerun",
  "serde",
  "serde_json",
+ "winresource",
+]
+
+[[package]]
+name = "driftless-export"
+version = "0.1.0"
+dependencies = [
+ "driftless-export",
+ "driftless-io",
+ "driftless-traj",
+ "e57",
+ "gltf",
+ "gltf-json",
+ "image",
+ "las",
+ "laz",
+ "nalgebra",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1722,13 +1744,13 @@ dependencies = [
 name = "driftless-map"
 version = "0.1.0"
 dependencies = [
+ "driftless-export",
  "driftless-gpu",
  "driftless-io",
  "driftless-odom",
  "driftless-slam",
  "driftless-traj",
  "gltf",
- "gltf-json",
  "image",
  "jpeg-encoder",
  "kiddo",
@@ -1771,12 +1793,14 @@ dependencies = [
 name = "driftless-steps"
 version = "0.1.0"
 dependencies = [
+ "driftless-export",
  "driftless-gpu",
  "driftless-io",
  "driftless-map",
  "driftless-odom",
  "driftless-slam",
  "driftless-traj",
+ "image",
  "las",
  "libc",
  "png",
@@ -1792,6 +1816,15 @@ version = "0.1.0"
 dependencies = [
  "nalgebra",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "e57"
+version = "0.11.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcfee41a50fbd70278c70cc477b8671ffe03951cba028cc2c057777a9ee6a3cc"
+dependencies = [
+ "roxmltree",
 ]
 
 [[package]]
@@ -3247,10 +3280,21 @@ checksum = "987ee68552c50b61259b693e8b4f57b948990754d9ac401ea33cf392b551a018"
 dependencies = [
  "byteorder",
  "chrono",
+ "laz",
  "log",
  "num-traits",
  "thiserror 2.0.21",
  "uuid",
+]
+
+[[package]]
+name = "laz"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a1bd8242fad6a61a7520b73d072ddf63dff1f3680e3f5c157b1dc6e8e5ab2ec"
+dependencies = [
+ "byteorder",
+ "num-traits",
 ]
 
 [[package]]
@@ -6047,6 +6091,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxmltree"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9da7f59328b09405b181fee1018925fad50f157afb43c0c0f5c522c256dd5907"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8042,6 +8095,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2bc6d36480b829272a5bdabf08e6dca8004761c1da7e35efef800540c66221b"
+dependencies = [
+ "version_check",
 ]
 
 [[package]]

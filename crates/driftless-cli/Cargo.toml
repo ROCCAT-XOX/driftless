@@ -14,8 +14,14 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+# The program symbol and version information as a resource of the .exe (packaging/build_windows.rs);
+# without the default `toml` feature, so the only dependency is `version_check`.
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1.34", default-features = false }
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+driftless-export = { path = "../driftless-export" }
 driftless-gpu = { path = "../driftless-gpu" }
 driftless-io = { path = "../driftless-io" }
 driftless-map = { path = "../driftless-map" }
@@ -33,6 +39,7 @@ rerun = { version = "0.38.1", default-features = false, features = ["sdk", "rrd"
 
 [dev-dependencies]
 assert_cmd = "2"
+driftless-export = { path = "../driftless-export", features = ["test-util"] }
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
 jpeg-encoder = "0.7.1"
 predicates = "3"

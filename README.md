@@ -9,7 +9,11 @@ correctable by hand. Runs natively on **macOS (Apple Silicon)** and **Windows**.
 > before/after comparison and a history of states. Earlier: map in about 7 minutes with under 4 GB for a
 > 9.7-minute scan, thinner walls, window views removed (milestone 4), dense, cleaned and coloured map
 > (milestone 3), LiDAR-IMU odometry and SLAM with loop closure and manual corrections (milestone 2).
-> Results on real scans (German): [merging scans](docs/ergebnisse/2026-10-27-baustein-1.md),
+> Export to open formats (LAS/LAZ, E57, PLY, PCD, glb, OBJ, TUM, CSV), opening them in the desktop
+> program, and installers for macOS and Windows are built (see [Export](#export) and
+> [Installers](#installers)).
+> Results on real scans (German): [export and installers](docs/ergebnisse/2026-10-27-baustein-3.md),
+> [merging scans](docs/ergebnisse/2026-10-27-baustein-1.md),
 > [new interface](docs/ergebnisse/2026-10-24-baustein-4.md),
 > [photo-like surface](docs/ergebnisse/2026-10-22-baustein-2.md),
 > [milestone 5](docs/ergebnisse/2026-10-22-meilenstein-5.md),
@@ -55,6 +59,7 @@ Build with `cargo build --release`; the binaries are `driftless` (command line) 
 | `driftless surface <folder> --slam <slam-out> [--map <map-folder>] [-o <dir>] [--voxel M] [--no-texture] [--gpu auto\|an\|aus]` | Photo-like surface of a map (default `<map-folder>` = `<slam-out>`): a TSDF of the cleaned points (`clean.bin`) becomes a closed, simplified mesh, textured from the camera images (one image per face, texture pages with seam levelling); writes `oberflaeche.glb` (glTF, unlit, Y up), `oberflaeche.obj` with `.mtl` and the page JPEGs (Z up) and `oberflaeche.json` (settings, face counts, mean and 95 % deviation to the points, seconds per phase, peak memory) into `-o` (default `<map-folder>/oberflaeche`), the JSON last. Needs a `clean.bin` that fits the trajectory and switches (run `driftless map` first), otherwise it stops with „Karte fehlt oder ist veraltet“. Without `IMAGE_*.bag` or `calibration/calib.json`, or with `--no-texture`, every face is gray (with a warning in the first case). `--voxel` (default 0.02 m) sets the fineness: smaller is finer, needs more memory and time, and at 0.01 m leaves dark walls full of holes. Holes in walls and floors with a rim up to 2 m are closed flat; rims of open pieces, pipe ends and windows stay open. `--gpu` as for `map`: the views per face are found on the graphics card within 4 GB of graphics memory; a mesh too large for that runs in several passes (each decodes the images again, the result is the same as in one pass), and only if not even a pass of one face fits (all faces, images and depth buffers alone over the budget) does `auto` fall back to the CPU; `oberflaeche.json` reports it under `gpu`, the passes as `gpu_batches` |
 | `driftless merge <scan>... -o <dir> [--slam <slam-out>]... [--map <map-folder>]... [--auch-unsichere] [--ohne-glaetten] [--voxel M] [--punktpaare <file>]` | Merges several scans of one place into one model: each scan needs a SLAM run and a map with `clean.bin` (default `<scan>/driftless`; `--slam` and `--map` once per scan, in the same order). The first scan is the reference, its frame is the model frame. Every other scan is aligned automatically (features at corners and edges, RANSAC about the vertical, then ICP; a search over the turn if the features find nothing sure) to whichever placed scan fits best, so a chain room → corridor → room works. Each pair gets overlap, residual, wall residual and a word: „sicher“, „unsicher“ (e.g. too little overlap, edges that do not agree, residual over 5 mm, walls of one direction over 3 mm apart, a second pose almost as good) or „gescheitert“ (no pose, or one with almost no overlap or edges that almost all disagree); a scan placed surely against an unsure one is „unsicher“ too. Unsure and failed scans stay out unless `--auch-unsichere` (failed ones always). The colours of the scans are matched, the points thinned to `--voxel` (default 0.01 m, a coloured point wins) and the surfaces smoothed together (`--ohne-glaetten` keeps them as merged). Writes `modell.las` (scan number in `point_source_id`), `modell.ply` (property `scan`) and `modell.json` (per scan: pose, method, verdict, overlap, residual, wall residual, fit of the point pairs, colour gain; runtime, peak memory) into `-o`, the JSON last; a folder that already holds a model is refused. `--punktpaare` takes three or more points marked by hand in two scans (a `punktpaare.toml` as the desktop program writes it, map folders relative to the file); they replace the automatic alignment of those two scans and are refined by ICP; such a scan is „sicher“ when the pairs lie within 3 cm (RMS) of the refined pose and the residuals are within their limits, however little the scans overlap (a door, a short corridor). An entry the program cannot use (a hand edit) is skipped with a warning |
 | `driftless surface --model <model-dir> [-o <dir>] [--voxel M] [--no-texture] [--gpu auto\|an\|aus]` | The surface of a merged model: as `surface` above, but the mesh comes from the points of all scans in the model and the texture from the images of all of them, with one exposure levelling over all scans, so places one scan missed are filled. Default `-o` is `<model-dir>/oberflaeche`. Needs the maps the model was merged from unchanged, otherwise it stops with a message to merge again |
+| `driftless export <source> -o <file> [--format NAME] [--ueberschreiben]` | Writes a map, model, surface or run, or a single cloud or mesh file, in an open format chosen by the extension of `-o` (or `--format`): LAS, LAZ, E57, PLY, PCD for points; glb, OBJ, PLY mesh (`--format ply-netz`) for a surface; TUM or CSV for a trajectory. An existing target is only replaced with `--ueberschreiben`, the source itself never. See [Export](#export) |
 | `driftless view <folder> --cloud <file.las>` | Shows a point cloud (e.g. `color.las`) in the viewer, with its colours or gray by intensity, evenly thinned to at most 5 million points |
 | `driftless export-glim <folder> -o <dir>` | Writes `imu.bin` and `lidar.bin` for the GLIM spike (`spikes/glim/`) |
 | `driftless compare <a.tum> <b.tum> [--json]` | Trajectory yardstick: ATE after alignment, path length, start-to-end gap |
@@ -83,20 +88,118 @@ driftless view <scan> --cloud out/color.las
 Read the times for `correct loop` in the viewer on the timeline `ab_scan_beginn`, not on `stamp`:
 `stamp` is the raw bag clock, `ab_scan_beginn` is `stamp` minus `scan_start` from `slam.json`.
 
+## Export
+
+`driftless export <source> -o <file>` writes one file (an OBJ also its `.mtl` and page images). The
+source is a folder or a file:
+
+| Source | What is exported | Formats |
+|---|---|---|
+| map folder (`map.json`) | `color.las`, else `clean.las` | LAS, LAZ, E57, PLY, PCD |
+| model folder (`modell.json`) | `modell.las`, one scan per member | LAS, LAZ, E57, PLY, PCD |
+| surface folder (`oberflaeche.glb`) | the textured mesh | glb, OBJ, PLY mesh |
+| run folder (`traj.tum`) | the corrected trajectory | TUM, CSV |
+| a `.las .laz .e57 .ply .pcd .glb .obj` file | its points or mesh | as above for its kind |
+
+```sh
+driftless export out/karte -o buero.laz                    # map → LAZ
+driftless export modelle/modell-001 -o modell.e57           # model → E57, one entry per scan
+driftless export out/karte/oberflaeche -o raum.obj          # surface → raum.obj, raum.mtl, raum_seite_NN.jpg
+driftless export out/karte/oberflaeche -o raum.ply --format ply-netz
+driftless export out -o laufbahn.csv --format csv           # a run folder that is also a map
+driftless export buero.laz -o buero.e57 --ueberschreiben    # convert a file, replace an older result
+```
+
+- **Frame and units:** metres in the frame of the map or model, Z up. Only glb is Y up, as glTF
+  requires: `(x, y, z)` is stored as `(x, z, −y)`.
+- **LAS/LAZ:** LAS 1.4, point format 7 (time + colour), 6, 2 or 0 after the columns; coordinates at
+  0.1 mm around the rounded middle of the cloud, colour 16 bit, the scan of a model in
+  `point_source_id`, „no measured colour“ and removal reasons in `user_data`.
+- **E57:** one `data3D` entry per scan of a model, with the scan's name and pose, xyz as `double`;
+  colour 8 bit (what libE57-based tools expect), intensity 16 bit.
+- **PLY/PCD:** binary; xyz as `float`, as `double` once a coordinate reaches 8192 m (UTM); colour
+  8 bit, intensity 0–255, the scan in the property/field `scan`.
+- **Meshes:** glb (one texture page per material, JPEG), OBJ with `.mtl` and the pages as
+  `<name>_seite_NN.jpg`, or a PLY mesh with one colour per corner (no texture).
+- **Trajectory:** TUM as `driftless slam` writes it, or CSV with the header `zeit;x;y;z;qx;qy;qz;qw`
+  and `;` as the separator (German spreadsheets).
+- Every file is written to `<name>.tmp` and renamed at the end: an error or a cancel leaves no half
+  file and the old one unchanged. The same input gives the same bytes (no date in any header).
+  Stopping `driftless export` with Ctrl-C also leaves the old file unchanged, but its `<name>.tmp`
+  stays behind; delete it by hand.
+
+In the desktop program: right click on a run, map, model or surface in the tree → „Exportieren …“, or
+☰ → „Exportieren …“ for what the 3D view shows. The window „Exportieren“ offers the formats of the
+source („Format“), „Ziel wählen …“ opens the save dialog, existing files are only replaced after
+„Ersetzen“.
+
+## Opening files
+
+The desktop program opens point clouds (LAS, LAZ, E57, PLY, PCD) and surfaces (glb, OBJ) of other
+programs too, also without a project: ☰ → „Datei öffnen …“ or drop the file on the window.
+
+- An E57 with several scans keeps them apart: the colour mode „je Scan“ colours by scan.
+- Colours and intensities of 8-bit files (some foreign LAS, PLY with `uchar`, PCD) are read as such.
+- A PCD in an organised grid skips its empty (NaN) rows; an OBJ with quads, negative indices or a
+  missing texture opens (a missing texture is gray, with „Textur fehlt“ in the log; a texture or
+  `.mtl` outside the OBJ's folder, e.g. `../textures/x.png`, is not read: „… außerhalb des Ordners
+  wird nicht gelesen“ – copy it next to the OBJ); a glb with node
+  transforms or PNG textures opens.
+- What cannot be read gives a German message in the status bar instead of a crash: a PCD saved
+  „binary_compressed“ (save it as „binary“ in CloudCompare or PCL), a glb compressed with Draco, a
+  broken file.
+
+## Installers
+
+Each pull request builds both installers as CI artifacts (`driftless-macos`, `driftless-windows`,
+kept 14 days; `.github/workflows/package.yml`). A tag `v<version>` makes a **draft** release with
+both files (`.github/workflows/release.yml`); once it is published they are under the repository's
+Releases.
+
+- **macOS (Apple Silicon):** `Driftless-<version>-macos-arm64.dmg`. Open it and drag `Driftless.app`
+  onto the `Applications` link. The app is signed ad hoc, not notarised, so macOS blocks the first
+  start. After that first try, open System Settings → „Datenschutz & Sicherheit“, scroll down and
+  click „Dennoch öffnen“ next to the note about Driftless (once). Or, in Terminal:
+  `xattr -dr com.apple.quarantine /Applications/Driftless.app`. The command line is inside the app:
+  `/Applications/Driftless.app/Contents/MacOS/driftless`.
+- **Windows (x64):** `Driftless-<version>-setup.exe`. It installs for the current user without admin
+  rights (to `%LOCALAPPDATA%\Programs\Driftless` unless chosen otherwise) with a start menu entry.
+  It is not signed: SmartScreen shows „Der Computer wurde durch Windows geschützt“, click „Weitere
+  Informationen“ → „Trotzdem ausführen“. The command line `driftless.exe` is in the installation
+  folder next to `driftless-app.exe`; uninstall through „Apps“ in the Windows settings.
+- „Über Driftless …“ in ☰ shows the version, the commit and the path of the command line;
+  `driftless --version` and `driftless-app --version` print the same. On Windows the desktop
+  program has no console of its own: `driftless-app --version` shows its line only with the output
+  redirected, e.g. `driftless-app --version | more`.
+
+Build them yourself (version from `Cargo.toml`, result in `target/package/`):
+
+```sh
+packaging/macos/build-dmg.sh && packaging/macos/check-dmg.sh target/package/Driftless-*-macos-arm64.dmg
+```
+
+```powershell
+# Windows, needs Inno Setup 6.3 or newer
+pwsh packaging/windows/build-setup.ps1
+pwsh packaging/windows/check-setup.ps1 target/package/Driftless-<version>-setup.exe   # installs silently into a temp folder and removes it again
+```
+
 ## Desktop program
 
 `cargo build --release -p driftless-app`, then `target/release/driftless-app` (Windows:
-`driftless-app.exe`; every pull request also builds it as the CI artifact `driftless-app-windows`). The
-interface is German. It runs the same steps as the command line (`inspect`, `slam`, `slam --reuse`,
-`correct`, `map`, `surface`, `compare`) through the shared crate `driftless-steps`, and writes the same
-files.
+`driftless-app.exe`; every pull request also builds the installers as the CI artifacts `driftless-windows`
+and `driftless-macos`, see `.github/workflows/package.yml`). The interface is German. It runs the same
+steps as the command line (`inspect`, `slam`, `slam --reuse`, `correct`, `map`, `surface`, `compare`)
+through the shared crate `driftless-steps`, and writes the same files.
 
 The window has a rail at the left edge, the field of the chosen step next to it, the 3D view and a
 slim status bar:
 
 - **Rail:** ☰ opens the project menu („Neues Projekt …“ in an empty folder, „Projekt öffnen …“,
   „Scan hinzufügen …“ for a scan folder as above, „Lauf hinzufügen …“ for a run made with the command
-  line, „Oberfläche öffnen …“ for any `oberflaeche.glb`). Below it the three steps, and ⚙ at the bottom.
+  line, „Datei öffnen …“ for any point cloud or surface file, „Exportieren …“ for what the view shows,
+  „Über Driftless …“; see [Export](#export) and [Opening files](#opening-files)). Below it the three steps, and
+  ⚙ at the bottom.
 - **1 Daten:** a card per scan with its state (neu, wartet, rechnet, fertig ✓, veraltet) and „+ Scan
   hinzufügen“; the precision Schnell · Genau · Maximal sets only the voxel size of the map (0.02 /
   0.01 / 0.005 m; Maximal needs over 4 GB of memory on large scans, another voxel shows „Eigene“). „Alle
@@ -115,8 +218,10 @@ slim status bar:
   the model and in the scan beside it, „Übernehmen und neu zusammenführen“ saves them in
   `modelle/punktpaare.toml` and merges again into a new model. Point pairs can be switched off and on,
   never deleted; one the merge cannot use is marked „nicht nutzbar“. A model's surface is computed in „2 Bilder“ like that of a map, from the images of all
-  its scans; the colour mode „je Scan“ colours a model by scan. „Punktwolke öffnen …“ and dropping a
-  file show any LAS or PLY, also without a project.
+  its scans; the colour mode „je Scan“ colours a model by scan. „Datei öffnen …“ and dropping a
+  file show a point cloud (LAS, LAZ, E57, PLY, PCD; an E57 with several scans can be coloured „je
+  Scan“) or a surface (glb, OBJ), also without a project. A variant that cannot be read (a PCD saved
+  „binary_compressed“, a glb with Draco) gives a German message in the status bar.
 - **2 Bilder:** a card per map with its surfaces below it (one that no longer fits its map is marked
   „veraltet – Karte oder Lauf neu gerechnet“); a click shows it. The fineness 1 · 1,5 · 2 cm applies to
   the next surface; „Alle Oberflächen rechnen“ queues every map without a current surface, „Oberfläche
@@ -160,8 +265,8 @@ Project folder:
 <project>/modelle/punktpaare.toml                point pairs marked by hand (only appended or switched off)
 ```
 
-Not yet: export (milestone 6), a cache for the levels of detail (they are rebuilt on every load), more
-than one step at a time.
+Not yet: a cache for the levels of detail (they are rebuilt on every load), more than one step at a
+time.
 
 ## Legal
 

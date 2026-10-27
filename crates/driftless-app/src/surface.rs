@@ -1,32 +1,39 @@
-//! A surface (`oberflaeche.glb` of `driftless surface`) loaded for the 3D view.
+//! A surface loaded for the 3D view: the `oberflaeche.glb` of `driftless surface`, or any
+//! `.glb` or `.obj` ([`driftless_export::mesh::read_mesh`]).
 //!
-//! The glb is glTF: Y up, a Driftless point `(x, y, z)` stored as `(x, z, −y)`. Reading
-//! turns it back to Z up. Positions are made relative to an origin in whole metres, chosen
-//! like the cloud's (centre of the bounds, rounded), so that `f32` keeps millimetres; the
-//! view moves the surface into the frame of a cloud shown with it
+//! The reader gives Z-up positions in metres (glb is turned back from Y up, node transforms
+//! applied). They are made relative to an origin in whole metres, chosen like the cloud's
+//! (centre of the bounds, rounded), so that `f32` keeps millimetres; the view moves the
+//! surface into the frame of a cloud shown with it
 //! ([`crate::render::mesh::MeshRenderer::set_view_origin`]), so both line up exactly.
 //!
-//! Every primitive becomes a page: its corners, its triangle indices and its base colour
-//! texture (JPEG, decoded to RGBA). A primitive without a texture gets a 1 × 1 gray page.
+//! Every page of the mesh stays a page: its corners, its triangle indices and its image
+//! (JPEG or PNG, decoded to RGBA). A page without an image gets a 1 × 1 texture in its colour.
 //! The mipmaps of every page are made here too, in the loader's thread, so that the UI thread
-//! only copies them to the GPU. Node transforms are not applied (the writer stores none), and
-//! only data inside the glb is read (no separate `.bin` or image files).
+//! only copies them to the GPU.
 
 use crate::render::mesh::mip_levels;
 pub use crate::render::mesh::MeshVertex;
 use crate::ui::text;
+use driftless_export::mesh::{read_mesh, ImageKind, MeshPage};
+use driftless_export::ExportError;
 use driftless_io::progress::Progress;
 use driftless_steps::StepError;
 use image::RgbaImage;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 
-/// Phase name while a surface is read.
+/// Phase name while the pages of a surface are decoded.
 pub const PHASE_LOAD_SURFACE: &str = "Oberfläche laden";
 /// The glb in a surface folder.
 pub const SURFACE_GLB: &str = "oberflaeche.glb";
-/// Colour of a page without texture.
-const GRAY: [u8; 4] = [128, 128, 128, 255];
+/// Texture coordinate of the corners of a page without any (a plain colour).
+const NO_UV: [f32; 2] = [0.5, 0.5];
+/// Most pixels the page images of one surface decode to together: 64 per byte of image data
+/// in the file (photos as JPEG hold far fewer), at least [`PIXELS_FLOOR`] (2^29, 32 pages of
+/// 4096²). Decoded they take 4 bytes each, a third more with the mipmaps.
+const PIXELS_PER_IMAGE_BYTE: u64 = 64;
+const PIXELS_FLOOR: u64 = 1 << 29;
 
 /// A surface ready for the GPU.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -59,7 +66,7 @@ impl LoadedSurface {
     }
 }
 
-/// The glb to load for `path`: a folder means its [`SURFACE_GLB`].
+/// The file to load for `path`: a folder means its [`SURFACE_GLB`].
 pub fn surface_glb(path: &Path) -> PathBuf {
     if path.is_dir() {
         path.join(SURFACE_GLB)
@@ -68,149 +75,105 @@ pub fn surface_glb(path: &Path) -> PathBuf {
     }
 }
 
-/// glTF `(x, y, z)` (Y up) → Driftless `(x, −z, y)` (Z up), the inverse of the writer's.
-fn from_gltf(v: [f32; 3]) -> [f64; 3] {
-    [f64::from(v[0]), -f64::from(v[2]), f64::from(v[1])]
-}
-
-/// Reads the glb at `path` (phase [`PHASE_LOAD_SURFACE`], one step per primitive, a cancel
-/// check each). See the module docs.
-pub fn load_glb(path: &Path, progress: &Progress) -> Result<LoadedSurface, StepError> {
-    let fail = |e: String| StepError::Failed(format!("{}: {e}", path.display()));
-    let bytes = std::fs::read(path).map_err(|e| {
-        fail(if e.kind() == std::io::ErrorKind::NotFound {
-            text::SURFACE_FILE_MISSING.to_string()
-        } else {
-            e.to_string()
-        })
+/// Reads the surface at `path`: a `.glb` or `.obj`, or the [`SURFACE_GLB`] of a surface
+/// folder. Reading reports phase [`driftless_export::PHASE_READ`]; then the pages are decoded
+/// in parallel (phase [`PHASE_LOAD_SURFACE`], one step per page, a cancel check each). Problems
+/// that leave the surface usable (a missing OBJ texture) are warnings on `progress`; errors
+/// carry the reader's German message and name the file.
+pub fn load_mesh(path: &Path, progress: &Progress) -> Result<LoadedSurface, StepError> {
+    let path = surface_glb(path);
+    let mesh = read_mesh(&path, progress).map_err(|e| match e {
+        ExportError::Io { path, source } if source.kind() == std::io::ErrorKind::NotFound => {
+            StepError::Failed(format!("{path}: {}", text::SURFACE_FILE_MISSING))
+        }
+        e => e.into(),
     })?;
-    let gltf = gltf::Gltf::from_slice(&bytes).map_err(|e| fail(text::bad_glb(&e.to_string())))?;
-    // a buffer in a file of its own would otherwise be taken as a primitive without data
-    if let Some(uri) = gltf.buffers().find_map(|b| match b.source() {
-        gltf::buffer::Source::Uri(uri) => Some(uri.to_string()),
-        gltf::buffer::Source::Bin => None,
-    }) {
-        return Err(fail(text::external_buffer(&uri)));
-    }
-    let blob = gltf.blob.as_deref();
-    let buffer = |b: gltf::Buffer<'_>| match b.source() {
-        gltf::buffer::Source::Bin => blob,
-        gltf::buffer::Source::Uri(_) => None,
-    };
-    let primitives: Vec<gltf::Primitive<'_>> = gltf.meshes().flat_map(|m| m.primitives()).collect();
-    progress.phase(PHASE_LOAD_SURFACE, Some(primitives.len() as u64 + 1));
-
-    // Geometry first (absolute, f64), then the origin from all of it.
-    struct Raw<'a> {
-        positions: Vec<[f64; 3]>,
-        uvs: Vec<[f32; 2]>,
-        indices: Vec<u32>,
-        image: Option<(&'a [u8], String)>,
-    }
-    let mut raws = Vec::with_capacity(primitives.len());
-    for prim in &primitives {
-        if progress.is_cancelled() {
-            return Err(StepError::Cancelled);
-        }
-        if prim.mode() != gltf::mesh::Mode::Triangles {
-            return Err(fail(format!(
-                "Grundform {:?} statt Dreiecken wird nicht unterstützt",
-                prim.mode()
-            )));
-        }
-        let reader = prim.reader(buffer);
-        let positions: Vec<[f64; 3]> = reader
-            .read_positions()
-            .ok_or_else(|| fail("Fläche ohne Positionen".into()))?
-            .map(from_gltf)
-            .collect();
-        let uvs: Vec<[f32; 2]> = match reader.read_tex_coords(0) {
-            Some(t) => t.into_f32().collect(),
-            None => vec![[0.5; 2]; positions.len()],
-        };
-        let indices: Vec<u32> = match reader.read_indices() {
-            Some(i) => i.into_u32().collect(),
-            None => (0..positions.len() as u32).collect(),
-        };
-        if uvs.len() != positions.len()
-            || !indices.len().is_multiple_of(3)
-            || indices.iter().any(|&i| i as usize >= positions.len())
-        {
-            return Err(fail("Fläche mit unstimmigen Ecken oder Dreiecken".into()));
-        }
-        let texture = prim
-            .material()
-            .pbr_metallic_roughness()
-            .base_color_texture()
-            .map(|info| info.texture().source().source());
-        let image = match texture {
-            None => None,
-            Some(gltf::image::Source::View { view, mime_type }) => {
-                let data = buffer(view.buffer())
-                    .ok_or_else(|| fail("Textur liegt nicht in der Datei".into()))?;
-                let range = view.offset()..view.offset() + view.length();
-                let bytes = data
-                    .get(range)
-                    .ok_or_else(|| fail("Textur außerhalb der Daten".into()))?;
-                Some((bytes, mime_type.to_string()))
-            }
-            Some(gltf::image::Source::Uri { .. }) => {
-                return Err(fail(
-                    "Textur als eigene Datei wird nicht unterstützt".into(),
-                ));
-            }
-        };
-        raws.push(Raw {
-            positions,
-            uvs,
-            indices,
-            image,
-        });
-        progress.advance(1);
-    }
-    let origin = origin_of(raws.iter().flat_map(|r| &r.positions));
-
-    // The pages are decoded in parallel (each JPEG on its own).
-    let pages = raws
+    let origin = origin_of(mesh.pages.iter().flat_map(|p| &p.positions));
+    progress.phase(PHASE_LOAD_SURFACE, Some(mesh.pages.len() as u64));
+    let fail = |e: String| StepError::Failed(format!("{}: {e}", path.display()));
+    check_pixels(&mesh.pages).map_err(fail)?;
+    let pages = mesh
+        .pages
         .into_par_iter()
-        .map(|raw| {
+        .enumerate()
+        .map(|(p, page)| {
             if progress.is_cancelled() {
                 return Err(StepError::Cancelled);
             }
-            let image = match raw.image {
-                None => RgbaImage::from_pixel(1, 1, image::Rgba(GRAY)),
-                Some((bytes, mime)) => {
-                    let format = match mime.as_str() {
-                        "image/jpeg" => image::ImageFormat::Jpeg,
-                        other => {
-                            return Err(fail(format!("Texturformat {other} nicht unterstützt")))
-                        }
-                    };
-                    image::load_from_memory_with_format(bytes, format)
-                        .map_err(|e| fail(format!("Textur: {e}")))?
-                        .to_rgba8()
-                }
-            };
-            let mips = mip_levels(&image);
-            let vertices = raw
-                .positions
-                .iter()
-                .zip(&raw.uvs)
-                .map(|(p, &uv)| MeshVertex {
-                    pos: [0, 1, 2].map(|k| (p[k] - origin[k]) as f32),
-                    uv,
-                })
-                .collect();
-            Ok(((vertices, raw.indices, image), mips))
+            let page = loaded_page(page, origin).map_err(|e| fail(text::bad_texture(p, &e)))?;
+            progress.advance(1);
+            Ok(page)
         })
         .collect::<Result<Vec<_>, StepError>>()?;
-    progress.advance(1);
     let (pages, mips) = pages.into_iter().unzip();
     Ok(LoadedSurface {
         origin,
         pages,
         mips,
     })
+}
+
+/// Refuses pages whose images claim more pixels together than the images' bytes can
+/// plausibly hold (see [`PIXELS_PER_IMAGE_BYTE`]), read from their headers before anything is
+/// decoded: a small file must not decode to gigabytes, several pages at once. A header that
+/// cannot be read is left to the decoder and its message.
+fn check_pixels(pages: &[MeshPage]) -> Result<(), String> {
+    let (mut pixels, mut bytes) = (0u64, 0u64);
+    for img in pages.iter().filter_map(|p| p.image.as_ref()) {
+        bytes += img.bytes.len() as u64;
+        let format = match img.kind {
+            ImageKind::Jpeg => image::ImageFormat::Jpeg,
+            ImageKind::Png => image::ImageFormat::Png,
+        };
+        let reader = image::ImageReader::with_format(std::io::Cursor::new(&img.bytes[..]), format);
+        if let Ok((w, h)) = reader.into_dimensions() {
+            pixels = pixels.saturating_add(u64::from(w) * u64::from(h));
+        }
+    }
+    let max = bytes
+        .saturating_mul(PIXELS_PER_IMAGE_BYTE)
+        .max(PIXELS_FLOOR);
+    if pixels > max {
+        return Err(text::textures_too_large(pixels, max));
+    }
+    Ok(())
+}
+
+/// One page for the GPU, with its mipmaps: corners relative to `origin`, the image decoded
+/// (or 1 × 1 in the page's colour).
+#[allow(clippy::type_complexity)]
+fn loaded_page(
+    page: MeshPage,
+    origin: [f64; 3],
+) -> Result<((Vec<MeshVertex>, Vec<u32>, RgbaImage), Vec<RgbaImage>), String> {
+    let image = match &page.image {
+        None => {
+            let [r, g, b] = page.color;
+            RgbaImage::from_pixel(1, 1, image::Rgba([r, g, b, 255]))
+        }
+        Some(img) => {
+            let format = match img.kind {
+                ImageKind::Jpeg => image::ImageFormat::Jpeg,
+                ImageKind::Png => image::ImageFormat::Png,
+            };
+            image::load_from_memory_with_format(&img.bytes, format)
+                .map_err(|e| e.to_string())?
+                .to_rgba8()
+        }
+    };
+    let mips = mip_levels(&image);
+    let uv = |i: usize| page.uvs.get(i).copied().unwrap_or(NO_UV);
+    let vertices = page
+        .positions
+        .iter()
+        .enumerate()
+        .map(|(i, p)| MeshVertex {
+            pos: [0, 1, 2].map(|k| (p[k] - origin[k]) as f32),
+            uv: uv(i),
+        })
+        .collect();
+    let indices = page.indices.iter().flatten().copied().collect();
+    Ok(((vertices, indices, image), mips))
 }
 
 /// Centre of the bounds of `points` in whole metres; 0 without points.
@@ -239,11 +202,5 @@ mod tests {
         let pts = [[10.2, -3.0, 0.4], [12.0, -1.0, 2.6]];
         assert_eq!(origin_of(pts.iter()), [11.0, -2.0, 2.0]);
         assert_eq!(origin_of([].iter()), [0.0; 3]);
-    }
-
-    #[test]
-    fn axes_back_to_z_up() {
-        // the writer stores (x, y, z) as (x, z, −y)
-        assert_eq!(from_gltf([1.0, 3.0, -2.0]), [1.0, 2.0, 3.0]);
     }
 }

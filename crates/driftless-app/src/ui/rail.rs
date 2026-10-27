@@ -48,9 +48,10 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     action
 }
 
-/// The entries of ☰: what the old menu bar „Projekt“ had, and „Lauf hinzufügen“ for the scan
-/// of the selection.
-fn project_menu(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
+/// The entries of ☰: what the old menu bar „Projekt“ had, „Lauf hinzufügen“ for the scan of
+/// the selection, „Exportieren …“ for what the view shows, and „Über Driftless …“ (opens its
+/// window itself).
+fn project_menu(ui: &mut Ui, state: &mut AppState, action: &mut Option<Action>) {
     let has_project = state.project.is_some();
     if ui.button(text::NEW_PROJECT).clicked() {
         *action = Some(Action::PickNewProject);
@@ -71,11 +72,18 @@ fn project_menu(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
         }
     }
     r.on_disabled_hover_text(text::ADD_RUN_NEEDS_SCAN);
-    if ui.button(text::OPEN_CLOUD).clicked() {
-        *action = Some(Action::PickOpenCloud);
+    if ui.button(text::OPEN_FILE).clicked() {
+        *action = Some(Action::PickOpenFile);
     }
-    if ui.button(text::OPEN_SURFACE).clicked() {
-        *action = Some(Action::PickOpenSurface);
+    let shown = !super::export::shown_sources(state).is_empty();
+    let r = ui.add_enabled(shown, egui::Button::new(text::EXPORT));
+    if r.clicked() {
+        *action = Some(Action::OpenExportShown);
+    }
+    r.on_disabled_hover_text(text::EXPORT_NEEDS_VIEW);
+    ui.separator();
+    if ui.button(text::ABOUT).clicked() {
+        state.about_open = true;
     }
 }
 

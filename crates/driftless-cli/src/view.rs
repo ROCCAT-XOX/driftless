@@ -72,7 +72,7 @@ struct CloudView {
 
 fn load_cloud(path: &std::path::Path) -> Result<CloudView, BoxError> {
     let err = |e: las::Error| format!("{}: {e}", path.display());
-    let mut reader = las::Reader::from_path(path).map_err(err)?;
+    let (mut reader, limits) = driftless_export::las::open_las(path)?;
     let total = reader.header().number_of_points();
     let rgb = reader.header().point_format().has_color;
     let stride = cloud_stride(total);
@@ -83,7 +83,7 @@ fn load_cloud(path: &std::path::Path) -> Result<CloudView, BoxError> {
         .for_header(reader.header())
         .build();
     let mut i = 0u64;
-    while reader.fill_points(1 << 20, &mut batch).map_err(err)? > 0 {
+    while reader.fill_points(limits.batch, &mut batch).map_err(err)? > 0 {
         for p in batch.points() {
             let p = p.map_err(err)?;
             let take = i.is_multiple_of(stride);

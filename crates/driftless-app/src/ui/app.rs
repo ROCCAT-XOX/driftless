@@ -3,6 +3,7 @@
 
 use super::compare::{compare_maps, compare_refs, default_refs, TrajRef};
 use super::correct::{Corrected, RunLoaded};
+use super::export::{self, ExportDialog};
 use super::tools::{self, PairSession, ScreenLayout, Tool};
 use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
@@ -14,10 +15,11 @@ use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
 use crate::overlay::RunOverlay;
 use crate::project::{canonical, set_point_pair_enabled, Project};
 use crate::render::ShowMode;
-use crate::surface::{load_glb, surface_glb};
+use crate::surface::{load_mesh, surface_glb};
 use crate::synthetic::synthetic_cloud;
 use driftless_gpu::GpuPref;
 use driftless_io::progress::Progress;
+use driftless_steps::export::{file_kind, ExportKind, MESH_EXTENSIONS, POINT_EXTENSIONS};
 use driftless_steps::merge::MODEL_LAS;
 use driftless_steps::{correct, StepError};
 use eframe::egui;
@@ -48,20 +50,26 @@ const HINT_TOP: f32 = 64.0;
 /// Seed of the synthetic cloud of `--synthetic`.
 const SYNTHETIC_SEED: u64 = 1;
 
-/// The arguments of `driftless-app [--synthetic N] [projekt-ordner]`.
+/// The arguments of `driftless-app [--version] [--synthetic N] [projekt-ordner]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Args {
     pub project: Option<PathBuf>,
     /// Show a synthetic cloud of this many points (to try the view without a scan).
     pub synthetic: Option<usize>,
+    /// `--version`: print version and commit, open no window.
+    pub version: bool,
 }
 
 /// Reads the arguments: at most one project folder, `--synthetic N` with 1 ≤ N < 2³²
-/// written as digits, optionally grouped with '_' (`50_000_000`).
+/// written as digits, optionally grouped with '_' (`50_000_000`), and `--version`.
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut out = Args::default();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
+        if arg == "--version" {
+            out.version = true;
+            continue;
+        }
         if arg == "--synthetic" {
             let value = args.next();
             // digits, optionally grouped with '_' (no signs, no decimal points)
@@ -265,7 +273,7 @@ pub struct DriftlessApp {
     next_load: Option<CloudSource>,
     /// Loads surfaces, beside the cloud loader.
     surface_loader: JobRunner,
-    /// The glb it is loading (with its file stamp when the load began), and the one to load
+    /// The file it is loading (with its file stamp when the load began), and the one to load
     /// once a cancelled load has stopped.
     surface_loading: Option<(PathBuf, FileStamp)>,
     next_surface: Option<PathBuf>,
@@ -833,8 +841,9 @@ impl DriftlessApp {
         self.surface_loader.is_busy() || self.next_surface.is_some()
     }
 
-    /// Loads the surface at `path` (a `.glb` or a surface folder) in the background; it
-    /// replaces the surface shown once ready. A surface load that runs is cancelled.
+    /// Loads the surface at `path` (a `.glb`, an `.obj` or a surface folder) in the
+    /// background; it replaces the surface shown once ready. A surface load that runs is
+    /// cancelled.
     fn load_surface(&mut self, path: &Path) {
         self.load_surface_with(path, false);
     }
@@ -863,7 +872,7 @@ impl DriftlessApp {
         }
         let job = glb.clone();
         let started = self.surface_loader.start(text::LOAD_SURFACE, move |p| {
-            Ok(JobOutput::Surface(Box::new(load_glb(&job, p)?)))
+            Ok(JobOutput::Surface(Box::new(load_mesh(&job, p)?)))
         });
         match started {
             Ok(()) => self.surface_loading = Some((glb, stamp)),
@@ -1254,11 +1263,14 @@ impl DriftlessApp {
             self.finished(finished);
         }
         self.state.log.extend(self.jobs.take_log());
-        let over = self.state.log.len().saturating_sub(LOG_LIMIT);
-        self.state.log.drain(..over);
         self.state.job = self.jobs.status();
         self.tick_loader();
         self.tick_surface_loader();
+        // what the readers say about a file they read anyway (a missing OBJ texture, …)
+        self.state.log.extend(self.loader.take_log());
+        self.state.log.extend(self.surface_loader.take_log());
+        let over = self.state.log.len().saturating_sub(LOG_LIMIT);
+        self.state.log.drain(..over);
         self.sync_run();
         self.sync_compare();
         self.tick_helper();
@@ -1279,7 +1291,12 @@ impl DriftlessApp {
             .is_some_and(|a| self.state.computes_queue_head(a));
         let output = match f.result {
             Ok(output) => {
-                self.info(text::job_done(&f.label, &text::duration(f.seconds)));
+                match (&output, &step) {
+                    (JobOutput::Exported(report), Some(Action::RunExport(req))) => {
+                        self.info(text::exported(report, req.format.kind()))
+                    }
+                    _ => self.info(text::job_done(&f.label, &text::duration(f.seconds))),
+                }
                 Some(output)
             }
             Err(StepError::Cancelled) => {
@@ -1303,7 +1320,8 @@ impl DriftlessApp {
         // job, nor take the view from the user.
         let show = !queued
             || (self.state.queue.is_empty() && hand_loads.is_none_or(|n| n == self.hand_loads));
-        if show {
+        // an export shows nothing: a surface picked meanwhile stays one picked by hand
+        if show && !matches!(step, Some(Action::RunExport(_))) {
             self.surface_by_hand = false;
         }
         // a reuse started with the count of written changes (taken also if it failed)
@@ -1582,24 +1600,24 @@ impl DriftlessApp {
                 self.hand_loads += 1;
                 self.load(CloudSource::File { path, run })
             }
-            Action::PickOpenCloud => {
+            Action::PickOpenFile => {
+                let all: Vec<&str> = POINT_EXTENSIONS
+                    .iter()
+                    .chain(&MESH_EXTENSIONS)
+                    .copied()
+                    .collect();
                 if let Some(path) = rfd::FileDialog::new()
-                    .set_title(text::DIALOG_OPEN_CLOUD)
-                    .add_filter(text::FILTER_CLOUD, &["las", "ply"])
+                    .set_title(text::DIALOG_OPEN_FILE)
+                    .add_filter(text::FILTER_ALL, &all)
+                    .add_filter(text::FILTER_CLOUD, &POINT_EXTENSIONS)
+                    .add_filter(text::FILTER_MESH, &MESH_EXTENSIONS)
                     .pick_file()
                 {
-                    self.apply(Action::LoadCloud { path, run: None });
-                }
-            }
-            Action::PickOpenSurface => {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title(text::DIALOG_OPEN_SURFACE)
-                    .add_filter("glTF", &["glb"])
-                    .pick_file()
-                {
-                    self.hand_loads += 1;
-                    self.surface_by_hand = true;
-                    self.load_surface_with(&path, true);
+                    // picked again: a surface shown is read again
+                    match open_file(&path, true) {
+                        Ok(action) => self.apply(action),
+                        Err(hint) => self.info(hint),
+                    }
                 }
             }
             Action::LoadSurface(path) => {
@@ -1646,6 +1664,30 @@ impl DriftlessApp {
                     Err(e) => self.error(e),
                 }
             }
+            // the window closes once the export runs; refused, it stays for another try
+            step @ Action::RunExport(_) => {
+                match actions::start_step(&mut self.state, &mut self.jobs, &step) {
+                    Ok(()) => self.state.export = None,
+                    Err(e) => self.error(e),
+                }
+            }
+            Action::OpenExport(source) => {
+                let name = export::source_name(&self.state, &source);
+                self.state.export = ExportDialog::new(vec![(source, name)]);
+            }
+            Action::OpenExportShown => {
+                match ExportDialog::new(export::shown_sources(&self.state)) {
+                    Some(dialog) => self.state.export = Some(dialog),
+                    None => self.info(text::EXPORT_NEEDS_VIEW.into()),
+                }
+            }
+            Action::PickExportTarget => self.pick_export_target(),
+            Action::ConfirmExport(request) => {
+                if let Some(dialog) = &mut self.state.export {
+                    dialog.replace = None;
+                }
+                self.apply(Action::RunExport(request));
+            }
             Action::OpenMerge => self.state.open_merge(),
             Action::StartPairs { model, member } => self.start_pairs(&model, member),
             Action::SetPairEnabled { index, enabled } => self.switch_pair(index, enabled),
@@ -1669,6 +1711,30 @@ impl DriftlessApp {
                     None => self.error(text::unknown_scan(&id)),
                 }
             }
+        }
+    }
+
+    /// „Ziel wählen …“ of the window „Exportieren“: the save dialog of the system, with the
+    /// name the source suggests and the format's extension; then [`export::target_picked`].
+    fn pick_export_target(&mut self) {
+        let Some(dialog) = &self.state.export else {
+            return;
+        };
+        let format = dialog.format;
+        let name = format!("{}.{}", dialog.source().default_name(), format.extension());
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(text::EXPORT_TITLE)
+            .set_file_name(name)
+            .add_filter(format.label(), &[format.extension()])
+            .save_file()
+        else {
+            return;
+        };
+        match export::target_picked(&mut self.state, path) {
+            Ok(Some(action)) => self.apply(action),
+            // asked in the window
+            Ok(None) => {}
+            Err(e) => self.error(e),
         }
     }
 
@@ -1853,6 +1919,8 @@ impl DriftlessApp {
             .response
             .rect;
         settings::show(&ctx, &mut self.state);
+        super::about::show(&ctx, &mut self.state.about_open);
+        actions.extend(export::show(&ctx, &mut self.state));
         self.view.set_tool(self.state.tool);
         self.view
             .set_picked(self.state.picked.as_ref().map(|p| p.index));
@@ -1943,32 +2011,33 @@ impl DriftlessApp {
     }
 }
 
-/// What files dropped onto the window ask for: the first LAS or PLY is shown as a cloud
-/// (without a run, with or without a project), the first GLB as a surface; of other files
-/// only a hint (`Err`). Nothing without files.
+/// What opening the file `path` asks for, by its extension ([`file_kind`]): a point cloud is
+/// shown as a cloud (without a run, with or without a project), a mesh as a surface (with
+/// `reload`, also when it is shown and unchanged); of another file only a hint (`Err`).
+fn open_file(path: &Path, reload: bool) -> Result<Action, String> {
+    let path = path.to_path_buf();
+    match file_kind(&path) {
+        Some(ExportKind::Points) => Ok(Action::LoadCloud { path, run: None }),
+        Some(ExportKind::Mesh) if reload => Ok(Action::ReloadSurface(path)),
+        Some(ExportKind::Mesh) => Ok(Action::LoadSurface(path)),
+        _ => {
+            let name = path.file_name().unwrap_or_default();
+            Err(text::drop_unsupported(&name.to_string_lossy()))
+        }
+    }
+}
+
+/// What files dropped onto the window ask for: the first one Driftless can open
+/// ([`open_file`]); if there is none, the hint for the first file (`Err`). Nothing without
+/// files.
 fn dropped(files: &[egui::DroppedFileHandle]) -> Option<Result<Action, String>> {
     let first = files.first()?;
-    let has = |p: &Path, ext: &[&str]| {
-        p.extension()
-            .is_some_and(|e| ext.iter().any(|x| e.eq_ignore_ascii_case(x)))
-    };
-    let action = files.iter().find_map(|f| {
-        let path = f.path();
-        if has(path, &["las", "ply"]) {
-            Some(Action::LoadCloud {
-                path: path.to_path_buf(),
-                run: None,
-            })
-        } else if has(path, &["glb"]) {
-            Some(Action::LoadSurface(path.to_path_buf()))
-        } else {
-            None
-        }
-    });
-    Some(action.ok_or_else(|| {
-        let name = first.path().file_name().unwrap_or_default();
-        text::drop_unsupported(&name.to_string_lossy())
-    }))
+    Some(
+        files
+            .iter()
+            .find_map(|f| open_file(f.path(), false).ok())
+            .ok_or_else(|| open_file(first.path(), false).unwrap_err()),
+    )
 }
 
 /// When a file was last written, and its size; `None` if it cannot be read.

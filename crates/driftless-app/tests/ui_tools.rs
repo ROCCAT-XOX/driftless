@@ -119,8 +119,9 @@ fn measurement_distance() {
     assert_eq!(text::meters(12.345), "12,35 m");
 }
 
-/// A floor plate of 4 × 2 m with a point every 25 cm, as `color.las` in its own folder: a
-/// click hits exactly one point. Returns the LAS path.
+/// A floor plate of 4 × 2 m with a point every 25 cm, as `color.las` in a folder of the
+/// running test (tests run in parallel, and each LAS goes through its own `.tmp`): a click
+/// hits exactly one point. Returns the LAS path.
 fn plate() -> PathBuf {
     let mut xyz = Vec::new();
     for i in 0..=16 {
@@ -137,7 +138,11 @@ fn plate() -> PathBuf {
         rgb: Some(vec![[200, 200, 200]; n]),
         colored: Some(vec![true; n]),
     };
-    let path = tmp("ui-tools-platte").join("color.las");
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("?")
+        .replace(':', "_");
+    let path = tmp(&format!("ui-tools-platte-{test}")).join("color.las");
     write_las(&path, &cloud).unwrap();
     path
 }

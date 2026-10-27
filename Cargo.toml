@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/driftless-io",
     "crates/driftless-traj",
+    "crates/driftless-export",
     "crates/driftless-odom",
     "crates/driftless-slam",
     "crates/driftless-map",
@@ -50,6 +51,15 @@ opt-level = 2
 opt-level = 2
 # The GPU tests compare against the CPU camera model over many points.
 [profile.dev.package.driftless-gpu]
+opt-level = 2
+# The export tests write and read clouds of a million points and more, also as LAZ.
+[profile.dev.package.driftless-export]
+opt-level = 2
+[profile.dev.package.las]
+opt-level = 2
+[profile.dev.package.laz]
+opt-level = 2
+[profile.dev.package.e57]
 opt-level = 2
 # The step tests run whole synthetic scans (odometry, map) through the library.
 [profile.dev.package.driftless-steps]

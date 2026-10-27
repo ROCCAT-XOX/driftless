@@ -3,6 +3,7 @@
 mod calib_check;
 mod compare;
 mod correct;
+mod export;
 mod export_glim;
 mod inspect;
 mod map;
@@ -21,8 +22,21 @@ use std::process::ExitCode;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// `driftless --version`: the version and the commit it was built from (`build.rs`).
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("DRIFTLESS_COMMIT"),
+    ")"
+);
+
 #[derive(Parser)]
-#[command(name = "driftless", version, about = "Driftless: Handheld-LiDAR-Scans")]
+#[command(
+    name = "driftless",
+    version,
+    long_version = LONG_VERSION,
+    about = "Driftless: Handheld-LiDAR-Scans"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -57,6 +71,9 @@ enum Command {
     /// Führt mehrere Scans eines Orts zu einem Modell zusammen: modell.las, modell.ply und
     /// modell.json (Lage und Güte je Scan)
     Merge(merge::Args),
+    /// Exportiert Karte, Modell, Oberfläche, Laufbahn oder eine Punktwolken-Datei (LAS, LAZ,
+    /// E57, PLY, PCD, glb, OBJ, TUM, CSV)
+    Export(export::Args),
 }
 
 /// Progress of a step on the console: messages to stdout, warnings as „Warnung: …“ to stderr.
@@ -81,6 +98,7 @@ fn main() -> ExitCode {
         Command::Map(args) => map::run(&args),
         Command::Surface(args) => surface::run(&args),
         Command::Merge(args) => merge::run(&args),
+        Command::Export(args) => export::run(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

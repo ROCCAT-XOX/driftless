@@ -20,13 +20,14 @@ use crate::map::{
     peak_rss_bytes, read_traj, ColorInput, MapInput, CLEAN_BIN, DENSE_BIN,
 };
 use crate::merge::{member_transform, read_model, ModelMember};
+use driftless_export::mesh;
 use driftless_gpu::{GpuChoice, GpuContext, GpuPref};
 use driftless_io::atomic_write;
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_map::surface::{
-    build_mesh, encode_pages, sensors_for_frames, texture_mesh, write_glb, write_obj, Accuracy,
-    AccuracySplit, SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
+    build_mesh, encode_pages, sensors_for_frames, texture_mesh, Accuracy, AccuracySplit,
+    SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
 };
 use driftless_map::{load_stage, stage_fits};
 use driftless_traj::nalgebra::{Isometry3, Point3};
@@ -347,22 +348,30 @@ fn make_surface(
         "waiting_for_images": v.waiting_for_images,
     });
 
-    // Last chance to stop: from here on files are written.
+    check_cancel(progress)?;
+    let quality = target.config.jpeg_quality;
+    let jpegs = encode_pages(&tex, quality)?;
+    // One conversion for both writers; the textured mesh and the pages go before writing.
+    let pages = tex.pages.len();
+    let surface = tex.to_mesh(&jpegs)?;
+    drop((tex, jpegs));
+    // Last chance to stop: from here on files are written. The writers get a progress of
+    // their own that cannot be cancelled: a cancel between or in them would leave a new glb
+    // next to the old OBJ and report.
     check_cancel(progress)?;
     let out = target.out_dir;
     fs::create_dir_all(out).map_err(|e| format!("{} nicht anlegbar: {e}", out.display()))?;
     let report_path = out.join(SURFACE_REPORT);
-    let quality = target.config.jpeg_quality;
-    let jpegs = encode_pages(&tex, quality)?;
-    write_glb(&out.join(format!("{STEM}.glb")), &tex, &jpegs)?;
-    write_obj(out, STEM, &tex, &jpegs)?;
-    drop(jpegs);
+    let writing = Progress::new();
+    mesh::write_glb(&out.join(format!("{STEM}.glb")), &surface, &writing)?;
+    mesh::write_obj(&out.join(format!("{STEM}.obj")), &surface, &writing)?;
+    drop(surface);
     let mut files = vec![
         format!("{STEM}.glb"),
         format!("{STEM}.obj"),
         format!("{STEM}.mtl"),
     ];
-    files.extend((0..tex.pages.len()).map(|p| format!("{STEM}_seite_{p:02}.jpg")));
+    files.extend((0..pages).map(|p| format!("{STEM}_seite_{p:02}.jpg")));
     files.push(SURFACE_REPORT.to_string());
     let stale = stale_pages(out, &files);
     if !stale.is_empty() {

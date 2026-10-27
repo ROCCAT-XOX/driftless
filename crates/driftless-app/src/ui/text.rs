@@ -32,12 +32,12 @@ pub const GO_TO_DATA: &str = "Zu „Daten“";
 pub const NO_SURFACE_YET: &str = "Noch keine Oberfläche – im Feld „Bilder“ rechnen";
 /// Over the window while a file is dragged over it.
 pub const DROP_HERE: &str = "Loslassen zum Öffnen";
-/// A file dropped onto the window that is no LAS, PLY or GLB.
+/// A file dropped onto the window (or picked) that Driftless cannot open.
 pub const DROP_UNSUPPORTED: &str = "Dateiformat nicht unterstützt";
 
 /// [`DROP_UNSUPPORTED`] with the name of the (first) file dropped.
 pub fn drop_unsupported(name: &str) -> String {
-    format!("{DROP_UNSUPPORTED}: {name} (LAS, PLY oder GLB)")
+    format!("{DROP_UNSUPPORTED}: {name} (LAS, LAZ, E57, PLY, PCD, GLB oder OBJ)")
 }
 
 pub const PLAN_COMING: &str = "Hier entstehen Grundriss, Maße und der DWG-Export. Das folgt in \
@@ -407,12 +407,91 @@ pub const VIEW_HELP_FLY: &str =
     "W/A/S/D, Q/E: fliegen (Shift schneller) · linke Taste: wie das Werkzeug unten · rechte Taste: umsehen · Rad: vor/zurück · F: alles zeigen · O: Fläche/Punkte/beides · Esc: Messen abbrechen";
 pub const LOAD_CLOUD: &str = "Wolke laden";
 pub const LOAD_SURFACE: &str = "Oberfläche laden";
-pub const OPEN_CLOUD: &str = "Punktwolke öffnen …";
-pub const DIALOG_OPEN_CLOUD: &str = "Punktwolke öffnen (LAS oder PLY)";
-/// Filter of the dialog „Punktwolke öffnen …“.
+/// ☰: open a point cloud or a mesh (surface) file.
+pub const OPEN_FILE: &str = "Datei öffnen …";
+pub const DIALOG_OPEN_FILE: &str = "Datei öffnen (LAS, LAZ, E57, PLY, PCD, GLB, OBJ)";
+/// Filters of the dialog „Datei öffnen …“: everything, point clouds, meshes.
+pub const FILTER_ALL: &str = "Punktwolken und Netze";
 pub const FILTER_CLOUD: &str = "Punktwolke";
-pub const OPEN_SURFACE: &str = "Oberfläche öffnen …";
-pub const DIALOG_OPEN_SURFACE: &str = "Oberfläche öffnen (oberflaeche.glb)";
+pub const FILTER_MESH: &str = "Netz";
+// Export (☰, the context menu of the tree, the window „Exportieren“)
+pub const EXPORT: &str = "Exportieren …";
+/// The window, and the label of the export in the status bar.
+pub const EXPORT_TITLE: &str = "Exportieren";
+pub const EXPORT_WHAT: &str = "Was";
+pub const EXPORT_FORMAT: &str = "Format";
+pub const EXPORT_PICK: &str = "Ziel wählen …";
+pub const EXPORT_REPLACE: &str = "Ersetzen";
+/// Why „Exportieren …“ in ☰ is locked.
+pub const EXPORT_NEEDS_VIEW: &str = "Zuerst eine Punktwolke oder Oberfläche anzeigen";
+
+// The window „Über Driftless“ (☰)
+pub const ABOUT: &str = "Über Driftless …";
+pub const ABOUT_TITLE: &str = "Über Driftless";
+pub const ABOUT_LICENSE: &str = "Lizenz: Apache-2.0 OR MIT";
+pub const ABOUT_CLI_MISSING: &str = "Kommandozeile: nicht im Paket (cargo run -p driftless-cli)";
+
+/// „Driftless 0.1.0“.
+pub fn about_version(version: &str) -> String {
+    format!("{APP_TITLE} {version}")
+}
+
+/// „Commit abc123def“.
+pub fn about_commit(commit: &str) -> String {
+    format!("Commit {commit}")
+}
+
+/// „Kommandozeile: /Applications/Driftless.app/Contents/MacOS/driftless“.
+pub fn about_cli(path: &str) -> String {
+    format!("Kommandozeile: {path}")
+}
+
+/// A source in the window: „Karte 001 – color.las“ (its name and the file that is read).
+pub fn export_choice(name: &str, file: &str) -> String {
+    format!("{name} – {file}")
+}
+
+/// „Diese Dateien gibt es schon:\nx.mtl\nErsetzen?“ – the files by name (they are next to the
+/// target just chosen).
+pub fn export_replace_question(files: &[std::path::PathBuf]) -> String {
+    let names: Vec<String> = files.iter().map(|f| file_name(f)).collect();
+    format!(
+        "Diese Dateien gibt es schon:\n{}\n{EXPORT_REPLACE}?",
+        names.join("\n")
+    )
+}
+
+/// „Exportiert: modell.laz (1.234.567 Punkte, 12,3 MB)“ – the main file by name.
+pub fn exported(
+    report: &driftless_steps::export::ExportReport,
+    kind: driftless_steps::export::ExportKind,
+) -> String {
+    use driftless_steps::export::ExportKind;
+    let what = match kind {
+        ExportKind::Points => "Punkte",
+        ExportKind::Mesh => "Dreiecke",
+        ExportKind::Trajectory => "Lagen",
+    };
+    let file = report
+        .files
+        .first()
+        .map(|f| file_name(f))
+        .unwrap_or_default();
+    format!(
+        "Exportiert: {file} ({} {what}, {} MB)",
+        super::status::count(report.count),
+        decimal(report.bytes as f64 / 1e6, 1)
+    )
+}
+
+/// The name of `path`, or all of it if it has none.
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
 /// The switch at the top right of the view.
 pub const SHOW_MODE: &str = "Ansicht";
 pub const SHOW_SURFACE: &str = "Fläche";
@@ -914,17 +993,18 @@ pub fn surface_fits(dir: &std::path::Path) -> String {
     format!("{name} passt schon zu Karte und Einstellungen; nichts zu rechnen")
 }
 
-/// A file that is no glb (or is cut off).
-pub fn bad_glb(error: &str) -> String {
-    format!("keine gültige glb-Datei ({error})")
+/// The page images of a surface claim more pixels than are loaded (both in pixels).
+pub fn textures_too_large(pixels: u64, max: u64) -> String {
+    format!(
+        "Texturen zu groß: {} Mio. Pixel, höchstens {} Mio. werden geladen",
+        pixels / 1_000_000,
+        max / 1_000_000
+    )
 }
 
-/// A glTF whose data lie in a file of their own.
-pub fn external_buffer(uri: &str) -> String {
-    format!(
-        "Daten liegen in einer eigenen Datei ({uri}); nur eine glb mit allen Daten in der Datei \
-         wird gelesen (wie `driftless surface` sie schreibt)"
-    )
+/// A page whose image could not be decoded (`page` counts from 0).
+pub fn bad_texture(page: usize, error: &str) -> String {
+    format!("Seite {page}: Textur nicht lesbar ({error})")
 }
 
 /// „Oberfläche geladen: oberflaeche-001/oberflaeche.glb (712.218 Dreiecke, 12 Seite(n),

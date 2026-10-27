@@ -1,8 +1,9 @@
-//! A point cloud loaded from LAS or PLY ([`crate::ply`]) for the 3D view: columns relative
-//! to an origin in whole metres, so that `f32` keeps millimetres even for coordinates of
-//! ~10⁶ m.
+//! A point cloud loaded from LAS, LAZ, E57, PLY or PCD ([`driftless_export::read_points`]) for
+//! the 3D view: columns relative to an origin in whole metres, so that `f32` keeps millimetres
+//! even for coordinates of ~10⁶ m.
 
 use crate::lod::{build_octree, Octree};
+use driftless_export::{Layout, PointFormat, PointSink, Points, ReadEnd, ReadStart};
 use driftless_io::progress::Progress;
 use driftless_slam::report::SlamReport;
 use driftless_steps::overlay::submap_at;
@@ -10,16 +11,8 @@ use driftless_steps::StepError;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-pub use crate::ply::load_ply;
-
-/// Points read per batch (one cancel check and one progress step each).
-const BATCH: usize = 1 << 20;
-
 /// Intensity shown when a file carries none (all zero, as `map.las` of a SLAM run).
 pub const MID_GRAY: u8 = 128;
-
-/// Phase name while a cloud is read.
-pub const PHASE_LOAD: &str = "Wolke laden";
 
 /// The points of a cloud, one entry per point in every column.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -39,8 +32,9 @@ pub struct PointSet {
     pub quality_known: bool,
     /// LAS `user_data`: 1 = without measured colour, or the removal reason.
     pub flags: Vec<u8>,
-    /// The scan of each point in a model merged from several (LAS `point_source_id`, PLY
-    /// `scan`); empty if unknown or if all points have the same.
+    /// The scan of each point in a model merged from several (LAS `point_source_id`, PLY and
+    /// PCD `scan`, the `data3D` entry of an E57); empty if unknown or if all points have the
+    /// same.
     pub source: Vec<u16>,
 }
 
@@ -86,155 +80,316 @@ impl PointSet {
     }
 }
 
-/// Points checked against the header bounds before trusting them for the origin.
-const ORIGIN_SAMPLE: usize = 16;
+/// The quality × 255 of the submap of the time `t` (seconds since the scan start); 255
+/// without submaps.
+fn quality_at(submaps: &[driftless_slam::report::SubmapReport], t: f64) -> u8 {
+    submaps
+        .get(submap_at(submaps, t))
+        .map_or(255, |m| (m.quality.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
 
-/// Centre of the header bounds in whole metres, or the first point in whole metres if the
-/// bounds are not finite, all zero, or miss one of the `first` points (stale header of a
-/// foreign writer); 0 without points.
-fn origin_of(bounds: &las::Bounds, first: &[[f64; 3]]) -> [f64; 3] {
-    let Some(p0) = first.first() else {
-        return [0.0; 3];
+/// The [`PointSet`] of `points` read by [`driftless_export`], for every format alike:
+/// - origin = per axis `round((min + max) / 2)` of the points' bounds (0 without points);
+/// - colour and intensity `>> 8`; without intensity, or all 0, [`MID_GRAY`];
+/// - with times: `t` since the scan start of `slam` (else since the first point), and with
+///   `slam` the quality of each point's submap ([`submap_at`]); without times `t` = 0 and the
+///   quality unknown (255);
+/// - flags as they are (0 without), the scan number if it differs between points.
+///
+/// The columns are converted one after the other and each is freed right after.
+pub fn point_set(points: Points, slam: Option<&SlamReport>) -> PointSet {
+    let n = points.len();
+    let origin = points
+        .bounds()
+        .map(|(min, max)| std::array::from_fn(|k| ((min[k] + max[k]) / 2.0).round()))
+        .filter(|o: &[f64; 3]| o.iter().all(|v| v.is_finite()))
+        .unwrap_or([0.0; 3]);
+    let Points {
+        xyz,
+        rgb,
+        intensity,
+        source,
+        time,
+        flags,
+        scans: _,
+    } = points;
+    // `iter` and `drop`, not `into_iter`: a collect in place could keep the larger buffer.
+    let rel: Vec<[f32; 3]> = xyz
+        .iter()
+        .map(|p| std::array::from_fn(|k| (p[k] - origin[k]) as f32))
+        .collect();
+    drop(xyz);
+    let rgb = rgb.map(|c| {
+        let eight: Vec<[u8; 3]> = c.iter().map(|v| v.map(|c| (c >> 8) as u8)).collect();
+        drop(c);
+        eight
+    });
+    let intensity = match intensity {
+        Some(i) if i.iter().any(|&v| v != 0) => {
+            let eight: Vec<u8> = i.iter().map(|&v| (v >> 8) as u8).collect();
+            drop(i);
+            eight
+        }
+        _ => vec![MID_GRAY; n],
     };
-    let min = [bounds.min.x, bounds.min.y, bounds.min.z];
-    let max = [bounds.max.x, bounds.max.y, bounds.max.z];
-    // Slack for the LAS coordinate rounding.
-    const SLACK: f64 = 0.01;
-    let usable = min.iter().chain(&max).all(|v| v.is_finite())
-        && min.iter().chain(&max).any(|&v| v != 0.0)
-        && first
-            .iter()
-            .all(|p| (0..3).all(|k| p[k] >= min[k] - SLACK && p[k] <= max[k] + SLACK));
-    if usable {
-        [0, 1, 2].map(|k| ((min[k] + max[k]) / 2.0).round())
-    } else {
-        p0.map(f64::round)
+    let (t, quality, quality_known) = match time {
+        Some(time) => {
+            let t0 = slam
+                .map(|s| s.scan_start)
+                .or_else(|| time.first().copied())
+                .unwrap_or(0.0);
+            let submaps = slam.map_or(&[][..], |s| &s.submaps[..]);
+            let quality = time
+                .iter()
+                .map(|&g| {
+                    if slam.is_some() {
+                        quality_at(submaps, g - t0)
+                    } else {
+                        255
+                    }
+                })
+                .collect();
+            let t = time.iter().map(|&g| (g - t0) as f32).collect();
+            drop(time);
+            (t, quality, slam.is_some())
+        }
+        None => (vec![0.0; n], vec![255; n], false),
+    };
+    let flags = flags.unwrap_or_else(|| vec![0; n]);
+    let source = source
+        .filter(|s| s.windows(2).any(|w| w[0] != w[1]))
+        .unwrap_or_default();
+    PointSet {
+        origin,
+        xyz: rel,
+        rgb,
+        intensity,
+        t,
+        quality,
+        quality_known,
+        flags,
+        source,
     }
 }
 
-/// Reads a LAS file in batches of 2²⁰ points (phase [`PHASE_LOAD`], total from the header,
-/// a cancel check per batch). With `slam`, each point's time `gps_time − scan_start` picks
-/// its submap ([`submap_at`]) and so its quality. LAS intensity 0–65535 becomes `>> 8`; a
-/// file whose intensities are all 0 (none recorded) is shown [`MID_GRAY`]. Files whose
-/// colours (or intensities) never exceed 255 store 8-bit values; those are taken as they are.
-/// The origin comes from the header bounds unless they do not fit the first points. The
-/// `point_source_id` becomes [`PointSet::source`] if it differs between points.
-pub fn load_las(
+/// Reads the cloud at `path` in any format [`driftless_export::read_points`] knows, by its
+/// extension (LAS, LAZ, E57, PLY, PCD; phase [`driftless_export::PHASE_READ`], a cancel check
+/// per block), as a [`PointSet`] ([`point_set`]). With `slam`, points with times get the
+/// quality of their submap. Errors carry the reader's German message and name the file.
+///
+/// LAS, LAZ and E57 go block by block straight into the [`PointSet`] ([`Streamed`]): at the
+/// peak about 28 B per point instead of the 43 B of [`Points`] plus the columns being
+/// converted. PLY and PCD scale their intensities by the maximum of the whole file and go
+/// through [`Points`].
+pub fn load_points(
     path: &Path,
     slam: Option<&SlamReport>,
     progress: &Progress,
 ) -> Result<PointSet, StepError> {
-    let err = |e: las::Error| StepError::Failed(format!("{}: {e}", path.display()));
-    let mut reader = las::Reader::from_path(path).map_err(err)?;
-    let header = reader.header();
-    let total = header.number_of_points();
-    let has_color = header.point_format().has_color;
-    let bounds = header.bounds();
-    let capacity = usize::try_from(total).unwrap_or(0);
-    let mut out = PointSet {
-        origin: [0.0; 3],
-        xyz: Vec::with_capacity(capacity),
-        rgb: has_color.then(|| Vec::with_capacity(capacity)),
-        intensity: Vec::with_capacity(capacity),
-        t: Vec::with_capacity(capacity),
-        quality: Vec::with_capacity(capacity),
-        quality_known: slam.is_some(),
-        flags: Vec::with_capacity(capacity),
-        source: Vec::with_capacity(capacity),
+    let mut sink = Streamed::new(slam);
+    let end = match PointFormat::from_path(path) {
+        Some(PointFormat::Las | PointFormat::Laz) => {
+            driftless_export::las::read_las_into(path, &mut sink, progress)?
+        }
+        Some(PointFormat::E57) => driftless_export::e57::read_e57_into(path, &mut sink, progress)?,
+        _ => {
+            let points = driftless_export::read_points(path, progress)?;
+            return Ok(point_set(points, slam));
+        }
     };
-    // Time zero: the scan start of the report, else the first point's time.
-    let mut t0 = slam.map(|s| s.scan_start);
-    let submaps = slam.map_or(&[][..], |s| &s.submaps[..]);
-    let quality_of = |t: f64| {
-        submaps
-            .get(submap_at(submaps, t))
-            .map_or(255, |m| (m.quality.clamp(0.0, 1.0) * 255.0).round() as u8)
-    };
+    Ok(sink.finish(&end))
+}
 
-    // The point format of a file has times for all points or for none.
-    let mut timed = false;
-    progress.phase(PHASE_LOAD, Some(total));
-    let mut batch = las::PointDataBuilder::new()
-        .for_header(reader.header())
-        .build();
-    // Low bytes of colour and intensity, kept until the whole file shows whether it stores
-    // 16-bit values (as the LAS spec says) or 8-bit ones (as some foreign writers do).
-    let mut low: Vec<[u8; 4]> = Vec::with_capacity(capacity);
-    let (mut max_rgb, mut max_intensity) = (0u16, 0u16);
-    let mut first_batch = true;
-    loop {
-        if progress.is_cancelled() {
-            return Err(StepError::Cancelled);
+/// Points of the first block checked against the bounds a file states.
+const ORIGIN_SAMPLE: usize = 16;
+
+/// Builds a [`PointSet`] from the blocks of a streaming reader, with the same result as
+/// [`point_set`] of the whole [`Points`]:
+/// - positions relative to the centre of the stated bounds (if the first points lie inside
+///   them) or to the first point, in whole metres; at the end shifted to the rounded centre
+///   of the real bounds if that differs (an exact whole-metre step);
+/// - colour and intensity as their high byte, and their low byte as long as no value above
+///   255 has come, for a file that turns out to hold 8-bit values ([`ReadEnd`]).
+struct Streamed<'a> {
+    slam: Option<&'a SlamReport>,
+    set: PointSet,
+    layout: Layout,
+    stated: Option<([f64; 3], [f64; 3])>,
+    /// Origin of `set.xyz` while reading; `None` before the first point.
+    origin: Option<[f64; 3]>,
+    min: [f64; 3],
+    max: [f64; 3],
+    t0: Option<f64>,
+    low_rgb: Option<Vec<[u8; 3]>>,
+    low_intensity: Option<Vec<u8>>,
+    any_intensity: bool,
+}
+
+impl<'a> Streamed<'a> {
+    fn new(slam: Option<&'a SlamReport>) -> Self {
+        Streamed {
+            slam,
+            set: PointSet::default(),
+            layout: Layout::default(),
+            stated: None,
+            origin: None,
+            min: [f64::INFINITY; 3],
+            max: [f64::NEG_INFINITY; 3],
+            t0: slam.map(|s| s.scan_start),
+            low_rgb: None,
+            low_intensity: None,
+            any_intensity: false,
         }
-        let read = reader.fill_points(BATCH as u64, &mut batch).map_err(err)?;
-        if read == 0 {
-            break;
-        }
-        if first_batch {
-            first_batch = false;
-            let mut first = Vec::with_capacity(ORIGIN_SAMPLE);
-            for p in batch.points().take(ORIGIN_SAMPLE) {
-                let p = p.map_err(err)?;
-                first.push([p.x, p.y, p.z]);
+    }
+
+    /// The origin for the first block: the centre of the stated bounds if they are finite,
+    /// not all zero and hold the first points (slack for the LAS rounding), else the first
+    /// point, in whole metres.
+    fn first_origin(&self, first: &[[f64; 3]]) -> [f64; 3] {
+        const SLACK: f64 = 0.01;
+        let p0 = first[0];
+        match self.stated {
+            Some((min, max))
+                if min.iter().chain(&max).all(|v| v.is_finite())
+                    && min.iter().chain(&max).any(|&v| v != 0.0)
+                    && first.iter().take(ORIGIN_SAMPLE).all(|p| {
+                        (0..3).all(|k| p[k] >= min[k] - SLACK && p[k] <= max[k] + SLACK)
+                    }) =>
+            {
+                std::array::from_fn(|k| ((min[k] + max[k]) / 2.0).round())
             }
-            out.origin = origin_of(&bounds, &first);
+            _ => p0.map(|v| if v.is_finite() { v.round() } else { 0.0 }),
         }
-        let origin = out.origin;
-        for p in batch.points() {
-            let p = p.map_err(err)?;
-            out.xyz.push([
-                (p.x - origin[0]) as f32,
-                (p.y - origin[1]) as f32,
-                (p.z - origin[2]) as f32,
-            ]);
-            let c = p.color.unwrap_or_default();
-            if let Some(rgb) = &mut out.rgb {
-                rgb.push([c.red, c.green, c.blue].map(|v| (v >> 8) as u8));
-                max_rgb = max_rgb.max(c.red).max(c.green).max(c.blue);
-            }
-            out.intensity.push((p.intensity >> 8) as u8);
-            max_intensity = max_intensity.max(p.intensity);
-            low.push([c.red, c.green, c.blue, p.intensity].map(|v| v as u8));
-            out.flags.push(p.user_data);
-            out.source.push(p.point_source_id);
-            match p.gps_time {
-                Some(g) => {
-                    timed = true;
-                    let start = *t0.get_or_insert(g);
-                    let t = g - start;
-                    out.t.push(t as f32);
-                    out.quality
-                        .push(if slam.is_some() { quality_of(t) } else { 255 });
+    }
+
+    fn finish(mut self, end: &ReadEnd) -> PointSet {
+        let set = &mut self.set;
+        let n = set.xyz.len();
+        // the origin of `point_set`: the rounded centre of the real bounds
+        let origin: [f64; 3] = std::array::from_fn(|k| ((self.min[k] + self.max[k]) / 2.0).round());
+        let origin = if n > 0 && origin.iter().all(|v| v.is_finite()) {
+            origin
+        } else {
+            [0.0; 3]
+        };
+        let read = self.origin.unwrap_or(origin);
+        if read != origin {
+            let shift: [f32; 3] = std::array::from_fn(|k| (read[k] - origin[k]) as f32);
+            for p in &mut set.xyz {
+                for k in 0..3 {
+                    p[k] += shift[k];
                 }
-                None => {
-                    out.t.push(0.0);
-                    out.quality.push(255);
-                }
             }
         }
-        progress.advance(read);
+        set.origin = origin;
+        if end.rgb_eight_bit {
+            if let (Some(rgb), Some(low)) = (&mut set.rgb, self.low_rgb.take()) {
+                *rgb = low;
+            }
+        }
+        if end.intensity_eight_bit {
+            if let Some(low) = self.low_intensity.take() {
+                set.intensity = low;
+            }
+        }
+        if !self.layout.intensity || !self.any_intensity {
+            set.intensity.clear();
+            set.intensity.resize(n, MID_GRAY);
+        }
+        set.quality_known = self.layout.time && self.slam.is_some();
+        if set.source.windows(2).all(|w| w[0] == w[1]) {
+            set.source = Vec::new();
+        }
+        self.set
     }
-    // 8-bit values: scaled ×257 to 16 bits and back, i.e. taken as they are.
-    if let Some(rgb) = out.rgb.as_mut().filter(|_| max_rgb <= 255) {
-        for (c, l) in rgb.iter_mut().zip(&low) {
-            *c = [l[0], l[1], l[2]];
+}
+
+impl PointSink for Streamed<'_> {
+    fn start(&mut self, start: &ReadStart) {
+        let n = start.capacity;
+        let layout = start.layout;
+        self.layout = layout;
+        self.stated = start.bounds;
+        self.set = PointSet {
+            origin: [0.0; 3],
+            xyz: Vec::with_capacity(n),
+            rgb: layout.rgb.then(|| Vec::with_capacity(n)),
+            intensity: Vec::with_capacity(n),
+            t: Vec::with_capacity(n),
+            quality: Vec::with_capacity(n),
+            quality_known: false,
+            flags: Vec::with_capacity(n),
+            source: Vec::with_capacity(if layout.source { n } else { 0 }),
+        };
+        self.low_rgb = layout.rgb.then(|| Vec::with_capacity(n));
+        self.low_intensity = layout.intensity.then(|| Vec::with_capacity(n));
+    }
+
+    fn block(&mut self, block: &Points) {
+        if block.xyz.is_empty() {
+            return;
+        }
+        let origin = match self.origin {
+            Some(o) => o,
+            None => *self.origin.insert(self.first_origin(&block.xyz)),
+        };
+        let set = &mut self.set;
+        for p in &block.xyz {
+            for (k, &v) in p.iter().enumerate() {
+                self.min[k] = self.min[k].min(v);
+                self.max[k] = self.max[k].max(v);
+            }
+            set.xyz
+                .push(std::array::from_fn(|k| (p[k] - origin[k]) as f32));
+        }
+        if let (Some(rgb), Some(c)) = (&mut set.rgb, &block.rgb) {
+            rgb.extend(c.iter().map(|v| v.map(|c| (c >> 8) as u8)));
+            if c.iter().any(|v| v.iter().any(|&c| c > 255)) {
+                self.low_rgb = None;
+            }
+            if let Some(low) = &mut self.low_rgb {
+                low.extend(c.iter().map(|v| v.map(|c| c as u8)));
+            }
+        }
+        match &block.intensity {
+            Some(i) => {
+                set.intensity.extend(i.iter().map(|&v| (v >> 8) as u8));
+                self.any_intensity |= i.iter().any(|&v| v != 0);
+                if i.iter().any(|&v| v > 255) {
+                    self.low_intensity = None;
+                }
+                if let Some(low) = &mut self.low_intensity {
+                    low.extend(i.iter().map(|&v| v as u8));
+                }
+            }
+            None => set.intensity.resize(set.xyz.len(), MID_GRAY),
+        }
+        match &block.time {
+            Some(time) => {
+                let t0 = *self.t0.get_or_insert(time[0]);
+                let submaps = self.slam.map_or(&[][..], |s| &s.submaps[..]);
+                for &g in time {
+                    set.t.push((g - t0) as f32);
+                    set.quality.push(if self.slam.is_some() {
+                        quality_at(submaps, g - t0)
+                    } else {
+                        255
+                    });
+                }
+            }
+            None => {
+                set.t.resize(set.xyz.len(), 0.0);
+                set.quality.resize(set.xyz.len(), 255);
+            }
+        }
+        match &block.flags {
+            Some(f) => set.flags.extend_from_slice(f),
+            None => set.flags.resize(set.xyz.len(), 0),
+        }
+        if let Some(s) = &block.source {
+            set.source.extend_from_slice(s);
         }
     }
-    if max_intensity <= 255 {
-        for (i, l) in out.intensity.iter_mut().zip(&low) {
-            *i = l[3];
-        }
-    }
-    drop(low);
-    // without times the report cannot pick a submap
-    out.quality_known &= timed;
-    if out.intensity.iter().all(|&i| i == 0) {
-        out.intensity.fill(MID_GRAY);
-    }
-    if out.source.windows(2).all(|w| w[0] == w[1]) {
-        out.source = Vec::new();
-    }
-    Ok(out)
 }
 
 /// A cloud ready for the 3D view: its points and their levels of detail.
@@ -312,11 +467,10 @@ impl LoadedCloud {
     }
 }
 
-/// Reads `path` and builds its levels of detail: phase [`PHASE_LOAD`], then
-/// [`crate::lod::PHASE_BUILD`]. A file ending in `.ply` (any case) is read by [`load_ply`],
-/// any other as LAS. With `run`, the `slam.json` of that run folder gives each point of a
-/// LAS the quality of its submap; without it (or unreadable, or for a PLY, which has no
-/// point times) the quality is 255.
+/// Reads `path` ([`load_points`]) and builds its levels of detail: phase
+/// [`driftless_export::PHASE_READ`], then [`crate::lod::PHASE_BUILD`]. With `run`, the
+/// `slam.json` of that run folder gives each point with a time the quality of its submap;
+/// without it (or unreadable, or for a file without point times) the quality is 255.
 pub fn load_cloud(
     path: &Path,
     run: Option<&Path>,
@@ -326,23 +480,13 @@ pub fn load_cloud(
         .and_then(|dir| std::fs::read_to_string(dir.join("slam.json")).ok())
         .and_then(|t| serde_json::from_str(&t).ok());
     let t = Instant::now();
-    let points = if is_ply(path) {
-        load_ply(path, progress)?
-    } else {
-        load_las(path, report.as_ref(), progress)?
-    };
+    let points = load_points(path, report.as_ref(), progress)?;
     LoadedCloud::build(
         path.to_path_buf(),
         points,
         t.elapsed().as_secs_f64(),
         progress,
     )
-}
-
-/// Whether `path` ends in `.ply`, in any case.
-pub fn is_ply(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("ply"))
 }
 
 /// Points looked at by [`view_bounds`] at most.
@@ -530,11 +674,12 @@ pub fn combine_pair_points(
     (out, shift)
 }
 
-/// Reads the `modell.las` of a model and the cloud `scan_cloud` of its scan `member` (LAS or
-/// PLY, in the frame of that scan), sets them side by side ([`combine_pair_points`]; `lone`
-/// is the scan of a model with points of only one) and builds the levels of detail; `name`
-/// names the cloud. In a job: phases [`PHASE_LOAD`] (twice) and
-/// [`crate::lod::PHASE_BUILD`], each with cancel checks.
+/// Reads the `modell.las` of a model and the cloud `scan_cloud` of its scan `member` (any
+/// format of [`load_points`], in the frame of that scan), sets them side by side
+/// ([`combine_pair_points`]; `lone` is the scan of a model with points of only one) and builds
+/// the levels of detail; `name` names the cloud. In a job: phases
+/// [`driftless_export::PHASE_READ`] (twice) and [`crate::lod::PHASE_BUILD`], each with cancel
+/// checks.
 pub fn load_pair_cloud(
     name: PathBuf,
     model_las: &Path,
@@ -544,12 +689,8 @@ pub fn load_pair_cloud(
     progress: &Progress,
 ) -> Result<PairCloud, StepError> {
     let t = Instant::now();
-    let model = load_las(model_las, None, progress)?;
-    let scan = if is_ply(scan_cloud) {
-        load_ply(scan_cloud, progress)?
-    } else {
-        load_las(scan_cloud, None, progress)?
-    };
+    let model = load_points(model_las, None, progress)?;
+    let scan = load_points(scan_cloud, None, progress)?;
     let (points, shift) = combine_pair_points(model, lone, scan, member);
     let cloud = LoadedCloud::build(name, points, t.elapsed().as_secs_f64(), progress)?;
     Ok(PairCloud { cloud, shift })

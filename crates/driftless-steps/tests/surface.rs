@@ -266,6 +266,27 @@ fn cancel_writes_nothing() {
     assert_eq!(names(&out), before);
 }
 
+/// A cancel once the files are being written comes too late: the step writes the whole
+/// surface (glb, OBJ with its pages, report) rather than a new glb next to an old OBJ.
+#[test]
+fn cancel_while_writing_completes_surface() {
+    let (dir, out) = prepared("steps-surface-cancel-writing", false);
+    let dest = out.join("oberflaeche");
+    let p = Progress::new();
+    let handle = p.clone();
+    let p = p.with_observer(move |s: &ProgressSnapshot| {
+        if s.phase == driftless_export::PHASE_WRITE {
+            handle.cancel();
+        }
+    });
+    let report = run_surface(&request(&dir, &out, &dest), &p).unwrap();
+    for name in report["files"].as_array().unwrap() {
+        let name = name.as_str().unwrap();
+        assert!(dest.join(name).is_file(), "{name}");
+    }
+    assert!(!names(&dest).iter().any(|n| n.ends_with(".tmp")));
+}
+
 #[test]
 fn surface_fits_after_run() {
     let (dir, out) = prepared("steps-surface-fits", false);

@@ -6,6 +6,7 @@
 pub mod compare;
 pub mod correct;
 mod error;
+pub mod export;
 pub mod history;
 pub mod inspect;
 pub mod map;

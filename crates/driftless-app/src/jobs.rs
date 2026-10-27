@@ -35,6 +35,7 @@ use crate::surface::LoadedSurface;
 use crate::ui::compare::{Comparison, MapComparison};
 use crate::ui::correct::{Corrected, RunLoaded};
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
+use driftless_steps::export::ExportReport;
 use driftless_steps::inspect;
 use driftless_steps::StepError;
 
@@ -68,6 +69,8 @@ pub enum JobOutput {
     Compare(Box<Comparison>),
     /// Two `map.json` side by side (helper runner).
     MapCompare(Box<MapComparison>),
+    /// The step „Exportieren“: what it wrote.
+    Exported(Box<ExportReport>),
     /// Nothing to hand back; the job's effect is on disk.
     Done,
 }

@@ -326,3 +326,82 @@ fn scan_without_images_cannot_be_coloured() {
     assert!(app.state().job.is_none());
     assert!(!run.join("karte-001").exists());
 }
+
+/// `dir/lauf/traj.tum` with two poses, and the request to export it as CSV to `dir/<name>`.
+fn traj_export(dir: &Path, name: &str) -> driftless_steps::export::ExportRequest {
+    use driftless_steps::export::{ExportFormat, ExportRequest, ExportSource};
+    let run = dir.join("lauf");
+    fs::create_dir_all(&run).unwrap();
+    fs::write(
+        run.join("traj.tum"),
+        "0.0 0 0 0 0 0 0 1\n1.0 1 2 3 0 0 0 1\n",
+    )
+    .unwrap();
+    ExportRequest {
+        source: ExportSource::Run(run),
+        out: dir.join(name),
+        format: ExportFormat::Csv,
+        overwrite: false,
+    }
+}
+
+#[test]
+fn run_export_without_project_starts() {
+    let dir = tmp("aktion-export-ohne-projekt");
+    let req = traj_export(&dir, "Büro Lauf.csv");
+    let mut state = AppState::default();
+    let mut runner = JobRunner::new(Arc::new(|| {}));
+    let action = Action::RunExport(req.clone());
+    start_step(&mut state, &mut runner, &action).unwrap();
+    assert_eq!(state.running, Some(action.clone()));
+    assert_eq!(state.job.as_ref().unwrap().label, text::EXPORT_TITLE);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let finished = loop {
+        if let Some(f) = runner.poll() {
+            break f;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(matches!(finished.result, Ok(JobOutput::Exported(_))));
+
+    // the program: the message names the file, nothing else changes
+    let mut app = app();
+    let req = traj_export(&dir, "zweite.csv");
+    run_step(&mut app, Action::RunExport(req.clone()));
+    assert!(req.out.is_file());
+    assert!(app.state().project.is_none());
+    let last = app.state().messages.last().cloned();
+    assert!(
+        matches!(&last, Some(UiMessage::Info(m)) if m.starts_with("Exportiert: zweite.csv (2 Lagen, ")),
+        "{last:?}"
+    );
+    // a second time without „Ersetzen“: refused by the step, the file stays
+    let before = fs::read(&req.out).unwrap();
+    app.apply(Action::RunExport(req.clone()));
+    settle(&mut app);
+    let e = errors(&app);
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(e[0].contains("gibt es schon"), "{e:?}");
+    assert_eq!(fs::read(&req.out).unwrap(), before);
+}
+
+#[test]
+fn run_export_while_busy_refused() {
+    let dir = tmp("aktion-export-belegt");
+    let req = traj_export(&dir, "x.csv");
+    let mut app = app();
+    let (tx, rx) = channel::<()>();
+    app.start_job("warten", move |_| {
+        let _ = rx.recv();
+        Ok(JobOutput::Done)
+    })
+    .unwrap();
+    app.apply(Action::OpenExport(req.source.clone()));
+    app.apply(Action::RunExport(req.clone()));
+    assert_eq!(errors(&app), [text::busy("warten")]);
+    assert!(!req.out.exists());
+    // the window stays, to try again later
+    assert!(app.state().export.is_some());
+    tx.send(()).unwrap();
+}

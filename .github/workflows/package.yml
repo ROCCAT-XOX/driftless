@@ -1,0 +1,63 @@
+name: Package
+
+# The installers of both platforms, checked and kept as artifacts of every pull request
+# (14 days); release.yml calls this workflow for a tag `v*`.
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The commit shown by `--version` and „Über Driftless“ (packaging/build_commit.rs, cut to
+  # 9 characters there): for a pull request its head commit, not GitHub's merge commit.
+  DRIFTLESS_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  macos:
+    name: macos
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: packaging/macos/build-dmg.sh
+      - run: packaging/macos/check-dmg.sh target/package/Driftless-*-macos-arm64.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: driftless-macos
+          path: target/package/Driftless-*-macos-arm64.dmg
+          if-no-files-found: error
+          retention-days: 14
+          # The disk image is compressed already.
+          compression-level: 0
+
+  windows:
+    name: windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Inno Setup 6 comes with the runner image; install it only if an image lacks it.
+      - name: Inno Setup
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue) -and -not (Test-Path -LiteralPath $iscc)) {
+            choco install innosetup --yes --no-progress
+          }
+      - run: ./packaging/windows/build-setup.ps1
+      - run: ./packaging/windows/check-setup.ps1 (Get-Item target/package/Driftless-*-setup.exe).FullName
+      - uses: actions/upload-artifact@v4
+        with:
+          name: driftless-windows
+          path: target/package/Driftless-*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+          # The setup is LZMA2-compressed already.
+          compression-level: 0

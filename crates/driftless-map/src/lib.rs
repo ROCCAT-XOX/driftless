@@ -77,12 +77,22 @@ pub enum MapError {
         path: String,
         source: std::io::Error,
     },
-    #[error("{path}: {source}")]
-    Las { path: String, source: las::Error },
+    /// Writing a file through `driftless_export` failed (German).
+    #[error("{0}")]
+    Export(String),
     /// The GPU failed (German, from `driftless_gpu::GpuRunError`).
     #[error("{0}")]
     Gpu(String),
     /// The step was cancelled through its [`driftless_io::progress::Progress`].
     #[error("abgebrochen")]
     Cancelled,
+}
+
+impl From<driftless_export::ExportError> for MapError {
+    fn from(e: driftless_export::ExportError) -> Self {
+        match e {
+            driftless_export::ExportError::Cancelled => MapError::Cancelled,
+            e => MapError::Export(e.to_string()),
+        }
+    }
 }

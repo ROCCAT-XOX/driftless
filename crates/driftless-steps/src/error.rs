@@ -1,5 +1,6 @@
 //! The error of a step: cancelled, or failed with a German message for the user.
 
+use driftless_export::ExportError;
 use driftless_map::MapError;
 use std::fmt;
 
@@ -47,6 +48,15 @@ impl From<MapError> for StepError {
     }
 }
 
+impl From<ExportError> for StepError {
+    fn from(e: ExportError) -> Self {
+        match e {
+            ExportError::Cancelled => StepError::Cancelled,
+            e => StepError::Failed(e.to_string()),
+        }
+    }
+}
+
 /// Keeps a cancel that travelled through a boxed error.
 impl From<Box<dyn std::error::Error>> for StepError {
     fn from(e: Box<dyn std::error::Error>) -> Self {
@@ -54,6 +64,9 @@ impl From<Box<dyn std::error::Error>> for StepError {
             return s.clone();
         }
         if let Some(MapError::Cancelled) = e.downcast_ref::<MapError>() {
+            return StepError::Cancelled;
+        }
+        if let Some(ExportError::Cancelled) = e.downcast_ref::<ExportError>() {
             return StepError::Cancelled;
         }
         StepError::Failed(e.to_string())
@@ -85,6 +98,20 @@ mod tests {
         assert_eq!(StepError::from(MapError::Cancelled), StepError::Cancelled);
         let boxed: Box<dyn std::error::Error> = Box::new(MapError::Cancelled);
         assert_eq!(StepError::from(boxed), StepError::Cancelled);
+        assert_eq!(
+            StepError::from(ExportError::Cancelled),
+            StepError::Cancelled
+        );
+        let boxed: Box<dyn std::error::Error> = Box::new(ExportError::Cancelled);
+        assert_eq!(StepError::from(boxed), StepError::Cancelled);
+        let e = ExportError::Format {
+            path: "a.las".into(),
+            msg: "kaputt".into(),
+        };
+        assert_eq!(
+            StepError::from(e),
+            StepError::Failed("a.las: kaputt".into())
+        );
         let boxed: Box<dyn std::error::Error> = Box::new(StepError::Cancelled);
         assert_eq!(StepError::from(boxed), StepError::Cancelled);
         let boxed: Box<dyn std::error::Error> = "nicht lesbar".into();
