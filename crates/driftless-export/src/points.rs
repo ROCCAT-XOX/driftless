@@ -266,8 +266,8 @@ impl PointSource for Points {
     }
 }
 
-/// Per-axis minimum and maximum of the points; `None` without points. Coordinates that are
-/// not finite are skipped.
+/// Per-axis minimum and maximum of the points; `None` without points. A NaN coordinate is
+/// skipped (`f64::min`/`max` ignore it); ±∞ counts, so that [`needs_double`] is true for it.
 pub fn bounds_of(src: &dyn PointSource) -> Option<([f64; 3], [f64; 3])> {
     let mut min = [f64::INFINITY; 3];
     let mut max = [f64::NEG_INFINITY; 3];

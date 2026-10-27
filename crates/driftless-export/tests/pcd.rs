@@ -207,8 +207,8 @@ fn pcd_ascii_reads() {
         p.rgb,
         Some(vec![wide([255, 0, 0]), wide([0, 128, 0]), wide([1, 2, 3])])
     );
-    // floats in 0–1: ×255
-    assert_eq!(p.intensity, Some(wide([128, 255, 0]).to_vec()));
+    // floats in 0–1: ×65535
+    assert_eq!(p.intensity, Some(vec![32768, 65535, 0]));
     assert_eq!(p.source, None);
 
     // rgba as U 4, scan as U 2, intensity above 255 scaled to the brightest
@@ -220,7 +220,7 @@ fn pcd_ascii_reads() {
     let p = read_pcd(&path, &Progress::new()).unwrap();
     assert_eq!(p.xyz, vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
     assert_eq!(p.rgb, Some(vec![wide([0, 255, 0]), wide([255, 255, 255])]));
-    assert_eq!(p.intensity, Some(wide([89, 255]).to_vec()));
+    assert_eq!(p.intensity, Some(vec![22937, 65535]));
     assert_eq!(p.source, Some(vec![4, 2]));
     std::fs::remove_dir_all(dir).unwrap();
 }

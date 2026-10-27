@@ -584,7 +584,8 @@ fn channel(v: f64, s: Scalar, float_scale: f64) -> u16 {
 }
 
 /// The intensities as 16 bit: float ones up to 1 ×255, up to 255 as they are, larger ones
-/// scaled so that the brightest is 255, then ×257; all 0 (or none finite above 0) stays 0.
+/// scaled so that the brightest is 255, then ×257 and rounded (so Driftless' own float
+/// 0–255, `v / 257`, comes back exactly); all 0 (or none finite above 0) stays 0.
 pub(crate) fn intensities(raw: &[f32], float: bool) -> Vec<u16> {
     let max = raw
         .iter()
@@ -603,7 +604,9 @@ pub(crate) fn intensities(raw: &[f32], float: bool) -> Vec<u16> {
     raw.iter()
         .map(|&v| {
             if v.is_finite() {
-                ((v * scale).round().clamp(0.0, 255.0) as u16) * 257
+                (f64::from(v) * f64::from(scale) * 257.0)
+                    .round()
+                    .clamp(0.0, 65535.0) as u16
             } else {
                 0
             }

@@ -147,14 +147,8 @@ fn ply_round_trip_synthetic() {
         .map(|c| c.map(eight))
         .collect();
     assert_eq!(p.rgb.as_ref(), Some(&want_rgb));
-    let want_i: Vec<u16> = pts
-        .intensity
-        .as_ref()
-        .unwrap()
-        .iter()
-        .map(|&v| eight(v))
-        .collect();
-    assert_eq!(p.intensity.as_ref(), Some(&want_i));
+    // Intensity is written as float 0–255 (v / 257) and comes back exactly, not as 8 bit.
+    assert_eq!(p.intensity, pts.intensity);
     assert_eq!(p.source, pts.source);
     let want_flags: Vec<u8> = pts
         .flags
@@ -250,7 +244,8 @@ fn ply_ascii_with_float_color() {
             wide([0, 0, 255])
         ])
     );
-    assert_eq!(p.intensity, Some(wide([10, 21, 255]).to_vec()));
+    // 0–255 as float: × 257, without rounding to whole 8-bit steps first
+    assert_eq!(p.intensity, Some(vec![2570, 5269, 65535]));
     assert_eq!(p.flags, None);
     std::fs::remove_dir_all(dir).unwrap();
 }
