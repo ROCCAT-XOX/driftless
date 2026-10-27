@@ -1696,6 +1696,7 @@ dependencies = [
  "image",
  "las",
  "nalgebra",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 

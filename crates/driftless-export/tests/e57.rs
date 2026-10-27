@@ -617,3 +617,149 @@ fn e57_foreign_garbage_and_dispatch() {
     assert_eq!(back.rgb, pts.rgb);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// CRC-32C (Castagnoli), as on every E57 page.
+fn crc32c(data: &[u8]) -> u32 {
+    !data.iter().fold(!0u32, |crc, &b| {
+        (0..8).fold(crc ^ u32::from(b), |c, _| {
+            if c & 1 == 1 {
+                (c >> 1) ^ 0x82F6_3B78
+            } else {
+                c >> 1
+            }
+        })
+    })
+}
+
+/// Rewrites the XML section of the E57 file at `path` through `edit` and lays the file out
+/// in checked 1024-byte pages again (the XML is the last section).
+fn edit_xml(path: &Path, edit: impl FnOnce(&str) -> String) {
+    const PAGE: usize = 1024;
+    const DATA: usize = PAGE - 4;
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(bytes.len() % PAGE, 0);
+    let mut logical: Vec<u8> = bytes
+        .chunks(PAGE)
+        .flat_map(|p| &p[..DATA])
+        .copied()
+        .collect();
+    let u64_at = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+    let phys = u64_at(&logical, 24) as usize;
+    let xml_len = u64_at(&logical, 32) as usize;
+    let start = phys / PAGE * DATA + phys % PAGE;
+    let xml = std::str::from_utf8(&logical[start..start + xml_len])
+        .unwrap()
+        .to_string();
+    let new_xml = edit(&xml);
+    assert_ne!(new_xml, xml, "the edit changed nothing");
+    logical.truncate(start);
+    logical.extend_from_slice(new_xml.as_bytes());
+    logical.resize(logical.len().div_ceil(DATA) * DATA, 0);
+    let pages = logical.len() / DATA;
+    logical[16..24].copy_from_slice(&((pages * PAGE) as u64).to_le_bytes());
+    logical[32..40].copy_from_slice(&(new_xml.len() as u64).to_le_bytes());
+    let mut out = Vec::with_capacity(pages * PAGE);
+    for page in logical.chunks(DATA) {
+        out.extend_from_slice(page);
+        out.extend_from_slice(&crc32c(page).to_be_bytes());
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+fn integer(name: RecordName, min: i64, max: i64) -> Record {
+    Record {
+        name,
+        data_type: RecordDataType::Integer { min, max },
+    }
+}
+
+/// A foreign header may claim any number of points: more than the file can hold is refused
+/// at once, without reserving memory for them.
+#[test]
+fn e57_claimed_points_beyond_the_file_are_refused() {
+    let dir = temp_dir("claimed");
+    let path = dir.join("gross.e57");
+    let prototype = vec![
+        double(RecordName::CartesianX),
+        double(RecordName::CartesianY),
+        double(RecordName::CartesianZ),
+    ];
+    let rows = [
+        vec![
+            RecordValue::Double(1.0),
+            RecordValue::Double(2.0),
+            RecordValue::Double(3.0),
+        ],
+        vec![
+            RecordValue::Double(4.0),
+            RecordValue::Double(5.0),
+            RecordValue::Double(6.0),
+        ],
+    ];
+    foreign(&path, Some("Riese"), prototype, &rows, None, false);
+    assert_eq!(read_e57(&path, &Progress::new()).unwrap().len(), 2);
+    edit_xml(&path, |xml| {
+        xml.replace("recordCount=\"2\"", "recordCount=\"1000000000000\"")
+    });
+    let start = std::time::Instant::now();
+    let err = read_e57(&path, &Progress::new()).unwrap_err();
+    assert!(start.elapsed().as_secs_f64() < 2.0, "{:?}", start.elapsed());
+    let ExportError::Format { msg, .. } = err else {
+        panic!("{err:?}");
+    };
+    assert!(
+        msg.starts_with("E57: Scan „Riese“ gibt 1000000000000 Punkte an, die Datei kann höchstens"),
+        "{msg}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A coordinate with min = max takes no bits; the library would then make up points without
+/// end from an empty packet. Such files are refused before anything is decoded.
+#[test]
+fn e57_zero_bit_coordinates_are_refused() {
+    let dir = temp_dir("zero-bits");
+    // x and y take 1 bit (0..=1), z 10 bits; the XML is then edited so that x and y (and z,
+    // if `all`) have min = max = 0.
+    let zero = |path: &Path, all: bool| {
+        let prototype = vec![
+            integer(RecordName::CartesianX, 0, 1),
+            integer(RecordName::CartesianY, 0, 1),
+            integer(RecordName::CartesianZ, 0, if all { 1 } else { 1000 }),
+        ];
+        let rows = [vec![
+            RecordValue::Integer(0),
+            RecordValue::Integer(0),
+            RecordValue::Integer(0),
+        ]];
+        foreign(path, Some("Leer"), prototype, &rows, None, false);
+        edit_xml(path, |xml| {
+            let xml = xml.replace("maximum=\"1\"", "maximum=\"0\"");
+            if all {
+                xml.replace("recordCount=\"1\"", "recordCount=\"1000000000000\"")
+            } else {
+                xml
+            }
+        });
+    };
+    // Every field 0 bit, and a claimed count far beyond the file.
+    let path = dir.join("null.e57");
+    zero(&path, true);
+    let start = std::time::Instant::now();
+    let err = read_e57(&path, &Progress::new()).unwrap_err();
+    assert!(start.elapsed().as_secs_f64() < 2.0, "{:?}", start.elapsed());
+    let ExportError::Format { msg, .. } = err else {
+        panic!("{err:?}");
+    };
+    assert_eq!(
+        msg,
+        "E57: Scan „Leer“ speichert cartesianX mit 0 Bit je Punkt – solche Dateien werden \
+         nicht gelesen"
+    );
+    // Only x and y without bits, the true count: refused the same way.
+    let path = dir.join("halb.e57");
+    zero(&path, false);
+    let err = read_e57(&path, &Progress::new()).unwrap_err().to_string();
+    assert!(err.contains("speichert cartesianX mit 0 Bit"), "{err}");
+    std::fs::remove_dir_all(dir).unwrap();
+}

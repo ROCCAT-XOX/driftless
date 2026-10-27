@@ -21,7 +21,7 @@ use driftless_io::TempPath;
 use gltf_json as json;
 use json::validation::{Checked, USize64};
 use nalgebra::{Matrix4, Vector4};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -31,6 +31,15 @@ use std::path::Path;
 const MAX_INSTANCES: usize = 1 << 16;
 /// At most this many node visits, for the same reason.
 const MAX_VISITS: usize = 1 << 20;
+/// Bytes of corners and triangles all primitives of a glb may decode to: this many per byte
+/// of the file (instancing a mesh many times costs nothing in the file), at least
+/// [`DECODED_FLOOR`] and at most [`DECODED_MAX`].
+const DECODED_PER_FILE_BYTE: u64 = 16;
+const DECODED_FLOOR: u64 = 256 << 20;
+const DECODED_MAX: u64 = 8 << 30;
+/// Decoded bytes per corner (f64 position, f32 uv) and per index (u32, then in a triangle).
+const BYTES_PER_CORNER: u64 = 24 + 8;
+const BYTES_PER_INDEX: u64 = 4 + 4;
 
 /// Writes `mesh` as one binary glTF through `<name>.tmp` next to `path` (see the module
 /// docs). Pages without triangles are left out.
@@ -427,13 +436,28 @@ pub(crate) fn read_glb(path: &Path, progress: &Progress) -> Result<Mesh, ExportE
 
     progress.phase(PHASE_READ, Some(instances.len() as u64));
     let blob = blob.as_deref();
+    let limit = (bytes.len() as u64)
+        .saturating_mul(DECODED_PER_FILE_BYTE)
+        .clamp(DECODED_FLOOR, DECODED_MAX);
+    let mut decoded = 0u64;
+    // The image of each glTF image index, read once and shared by its pages.
+    let mut images: HashMap<usize, PageImage> = HashMap::new();
     let mut pages = Vec::with_capacity(instances.len());
     for (prim, world) in &instances {
         check_cancel(progress)?;
+        // Before anything of it is allocated.
+        decoded = decoded.saturating_add(decoded_bytes(prim));
+        if decoded > limit {
+            return Err(fail(format!(
+                "glTF ergibt mehr als {} MB Flächendaten (eine Fläche wird zu oft verwendet) – \
+                 wird nicht gelesen",
+                limit >> 20
+            )));
+        }
         // The gltf reader asserts on inconsistent accessors in places; that must never take
         // the program down.
         let page = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            read_primitive(prim, world, blob)
+            read_primitive(prim, world, blob, &mut images)
         }))
         .unwrap_or_else(|_| Err("keine gültige glb-Datei (unerwarteter Inhalt)".into()))
         .map_err(fail)?;
@@ -458,11 +482,25 @@ fn add<'a>(
     Ok(())
 }
 
+/// What reading `prim` allocates for its corners and triangles, from the counts its
+/// accessors claim.
+fn decoded_bytes(prim: &gltf::Primitive<'_>) -> u64 {
+    let corners = prim
+        .get(&gltf::Semantic::Positions)
+        .map_or(0, |a| a.count() as u64);
+    let indices = prim.indices().map_or(corners, |a| a.count() as u64);
+    corners
+        .saturating_mul(BYTES_PER_CORNER)
+        .saturating_add(indices.saturating_mul(BYTES_PER_INDEX))
+}
+
 /// One primitive as a page, its positions through `world` (glTF frame) and then to Z up.
+/// Its image comes from `images` if another page has read it already.
 fn read_primitive(
     prim: &gltf::Primitive<'_>,
     world: &Matrix4<f64>,
     blob: Option<&[u8]>,
+    images: &mut HashMap<usize, PageImage>,
 ) -> Result<MeshPage, String> {
     use gltf::accessor::{DataType, Dimensions};
     if prim.mode() != gltf::mesh::Mode::Triangles {
@@ -516,6 +554,10 @@ fn read_primitive(
     let (image, set) = match pbr.base_color_texture() {
         None => (None, 0),
         Some(info) => match info.texture().source().source() {
+            _ if images.contains_key(&info.texture().source().index()) => {
+                let image = images[&info.texture().source().index()].clone();
+                (Some(image), info.tex_coord())
+            }
             gltf::image::Source::View { view, mime_type } => {
                 let kind = match mime_type {
                     "image/jpeg" => ImageKind::Jpeg,
@@ -528,8 +570,9 @@ fn read_primitive(
                     .ok_or("Textur außerhalb der Daten")?;
                 let image = PageImage {
                     kind,
-                    bytes: bytes.to_vec(),
+                    bytes: bytes.into(),
                 };
+                images.insert(info.texture().source().index(), image.clone());
                 (Some(image), info.tex_coord())
             }
             gltf::image::Source::Uri { .. } => {

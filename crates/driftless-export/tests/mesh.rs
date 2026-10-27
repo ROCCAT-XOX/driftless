@@ -46,7 +46,7 @@ fn png(w: u32, h: u32, rgb: &[u8]) -> PageImage {
         .unwrap();
     PageImage {
         kind: ImageKind::Png,
-        bytes,
+        bytes: bytes.into(),
     }
 }
 
@@ -57,7 +57,7 @@ fn jpeg(w: u32, h: u32, rgb: &[u8]) -> PageImage {
         .unwrap();
     PageImage {
         kind: ImageKind::Jpeg,
-        bytes,
+        bytes: bytes.into(),
     }
 }
 
@@ -291,6 +291,81 @@ fn glb_node_transform_applied() {
     let mesh = read_mesh(&path, &Progress::new()).unwrap();
     assert_eq!(mesh.pages.len(), 1);
     assert_eq!(mesh.pages[0].positions[2], [0.0, 0.0, 1.0]);
+}
+
+/// The JSON (parsed) and the binary chunk of a glb.
+fn glb_parts(bytes: &[u8]) -> (serde_json::Value, Vec<u8>) {
+    let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let json_len = u32_at(12);
+    let json = serde_json::from_slice(&bytes[20..20 + json_len]).unwrap();
+    let bin_len = u32_at(20 + json_len);
+    let bin = bytes[28 + json_len..28 + json_len + bin_len].to_vec();
+    (json, bin)
+}
+
+/// A mesh used by many nodes: the image is held once for all its pages, and the corners and
+/// triangles all instances would give are bounded by the size of the file.
+#[test]
+fn glb_instances_share_images_and_are_bounded() {
+    let dir = temp_dir("glb-instances");
+    // A 100 × 100 grid with a PNG.
+    let side = 100usize;
+    let mut page = MeshPage {
+        image: Some(png(2, 2, &[50; 12])),
+        color: [255; 3],
+        ..Default::default()
+    };
+    for y in 0..side {
+        for x in 0..side {
+            page.positions.push([x as f64 * 0.01, y as f64 * 0.01, 0.0]);
+            page.uvs
+                .push([x as f32 / side as f32, y as f32 / side as f32]);
+        }
+    }
+    for y in 0..side as u32 - 1 {
+        for x in 0..side as u32 - 1 {
+            let i = y * side as u32 + x;
+            let s = side as u32;
+            page.indices.push([i, i + 1, i + s]);
+            page.indices.push([i + 1, i + s + 1, i + s]);
+        }
+    }
+    let path = dir.join("viele.glb");
+    write_glb(&path, &Mesh { pages: vec![page] }).unwrap();
+    let (json, bin) = glb_parts(&std::fs::read(&path).unwrap());
+    let instanced = |k: usize| {
+        let mut json = json.clone();
+        json["nodes"] = (0..k)
+            .map(|i| serde_json::json!({"mesh": 0, "translation": [i as f64, 0.0, 0.0]}))
+            .collect();
+        json["scenes"] = serde_json::json!([{"nodes": (0..k).collect::<Vec<_>>()}]);
+        json["scene"] = 0.into();
+        glb_bytes(&json.to_string(), &bin)
+    };
+
+    std::fs::write(&path, instanced(3)).unwrap();
+    let mesh = read_mesh(&path, &Progress::new()).unwrap();
+    assert_eq!(mesh.pages.len(), 3);
+    let bytes = |p: usize| mesh.pages[p].image.as_ref().unwrap().bytes.clone();
+    assert!(
+        std::sync::Arc::ptr_eq(&bytes(0), &bytes(2)),
+        "one copy of the image"
+    );
+    let moved = mesh.pages[2].positions[1];
+    assert!(
+        (moved[0] - 2.01).abs() < 1e-6 && moved[1] == 0.0,
+        "{moved:?}"
+    );
+
+    // 400 instances would decode to about 300 MB from a file of about 400 KB.
+    let many = instanced(400);
+    assert!(many.len() < 1 << 20);
+    std::fs::write(&path, many).unwrap();
+    let msg = format_msg(read_mesh(&path, &Progress::new()).unwrap_err());
+    assert!(
+        msg.starts_with("glTF ergibt mehr als 256 MB Flächendaten"),
+        "{msg}"
+    );
 }
 
 #[test]
@@ -613,6 +688,77 @@ fn obj_foreign_quads_negative_indices_missing_texture() {
     .unwrap();
     let mesh = read_mesh(&dir.join("mit bild.obj"), &Progress::new()).unwrap();
     assert_eq!(mesh.pages[0].image, Some(image));
+}
+
+/// Names in `mtllib` and `map_Kd` of a foreign OBJ never reach outside the OBJ's folder:
+/// absolute names, `..`, Windows drive and share names (a share would be contacted) and links
+/// that point outside are taken as missing.
+#[test]
+fn obj_names_stay_inside_the_folder() {
+    let dir = temp_dir("obj-escape");
+    let inner = dir.join("innen");
+    std::fs::create_dir_all(inner.join("bilder")).unwrap();
+    // Outside the OBJ's folder: a green material and its image.
+    let secret = png(2, 2, &[7; 12]);
+    std::fs::write(dir.join("geheim.png"), &secret.bytes).unwrap();
+    std::fs::write(dir.join("geheim.mtl"), "newmtl a\nKd 0 1 0\n").unwrap();
+    let face = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nusemtl a\nf 1/1 2/2 3/3\n";
+    let outside_mtl = dir.join("geheim.mtl").display().to_string();
+    for lib in [
+        "../geheim.mtl",
+        "..\\geheim.mtl",
+        outside_mtl.as_str(),
+        "/etc/passwd",
+    ] {
+        std::fs::write(inner.join("x.obj"), format!("mtllib {lib}\n{face}")).unwrap();
+        let progress = Progress::new();
+        let mesh = read_mesh(&inner.join("x.obj"), &progress).unwrap();
+        assert_eq!(
+            warnings(&progress),
+            [format!("Textur fehlt: {lib}")],
+            "{lib}"
+        );
+        assert_eq!(mesh.pages[0].color, [128; 3], "{lib}");
+    }
+
+    // A material inside, its image named outside.
+    let outside_png = dir.join("geheim.png").display().to_string();
+    let mut names = vec![
+        "../geheim.png".to_string(),
+        "bilder/../../geheim.png".to_string(),
+        "\\\\server\\share\\x.png".to_string(),
+        "//server/share/x.png".to_string(),
+        "C:\\geheim.png".to_string(),
+        "C:geheim.png".to_string(),
+        outside_png,
+    ];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.join("geheim.png"), inner.join("bilder/link.png")).unwrap();
+        names.push("bilder/link.png".to_string());
+    }
+    for name in &names {
+        std::fs::write(inner.join("x.mtl"), format!("newmtl a\nmap_Kd {name}\n")).unwrap();
+        std::fs::write(inner.join("x.obj"), format!("mtllib x.mtl\n{face}")).unwrap();
+        let progress = Progress::new();
+        let mesh = read_mesh(&inner.join("x.obj"), &progress).unwrap();
+        assert_eq!(
+            warnings(&progress),
+            [format!("Textur fehlt: {name}")],
+            "{name}"
+        );
+        assert!(mesh.pages[0].image.is_none(), "{name}");
+    }
+
+    // Inside the folder (also below it, also with `\\`) it is read.
+    std::fs::write(inner.join("bilder/gut.png"), &secret.bytes).unwrap();
+    for name in ["bilder/gut.png", "bilder\\gut.png", "./bilder/gut.png"] {
+        std::fs::write(inner.join("x.mtl"), format!("newmtl a\nmap_Kd {name}\n")).unwrap();
+        let progress = Progress::new();
+        let mesh = read_mesh(&inner.join("x.obj"), &progress).unwrap();
+        assert!(warnings(&progress).is_empty(), "{name}");
+        assert_eq!(mesh.pages[0].image.as_ref(), Some(&secret), "{name}");
+    }
 }
 
 #[test]

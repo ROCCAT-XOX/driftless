@@ -12,6 +12,11 @@
 //! `mtllib` with `Kd` and `map_Kd` (relative to the `.mtl`, JPEG or PNG). One page per
 //! material, in the order of first use. A missing `.mtl` or image gives a gray page and a
 //! warning. Read as Z up, as Driftless and Blender ("Z up") write it.
+//!
+//! A foreign OBJ is untrusted: the names in `mtllib` and `map_Kd` are only looked up inside
+//! the OBJ's folder (and below it). An absolute name, a Windows drive or share name, a `..`
+//! and a link that leads outside count as missing, so the file never makes the program read
+//! elsewhere or contact a share.
 
 use super::glb::write_temp;
 use super::{check_mesh, page_name, ImageKind, Mesh, MeshPage, PageImage, MISSING_GRAY};
@@ -255,7 +260,14 @@ pub(crate) fn read_obj(path: &Path, progress: &Progress) -> Result<Mesh, ExportE
     }
     progress.advance(since as u64);
 
-    let dir = path.parent().unwrap_or(Path::new(""));
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    // Every name must stay inside this folder; without it nothing is found.
+    let root = std::fs::canonicalize(dir).ok();
+    let root = root.as_deref();
+    let mut images: HashMap<PathBuf, PageImage> = HashMap::new();
     let mut warned: Vec<String> = Vec::new();
     let mut warn = |text: String| {
         if !warned.contains(&text) {
@@ -265,7 +277,7 @@ pub(crate) fn read_obj(path: &Path, progress: &Progress) -> Result<Mesh, ExportE
     };
     let mut materials: HashMap<String, Material> = HashMap::new();
     for lib in &libs {
-        match read_mtl(dir, lib) {
+        match root.and_then(|root| read_mtl(root, lib)) {
             Some(found) => {
                 for (name, m) in found {
                     materials.entry(name).or_insert(m);
@@ -285,7 +297,7 @@ pub(crate) fn read_obj(path: &Path, progress: &Progress) -> Result<Mesh, ExportE
                     m.kd.map(|kd| kd.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8));
                 match &m.map {
                     None => (None, kd.unwrap_or(MISSING_GRAY)),
-                    Some((name, base)) => match load_image(base, name) {
+                    Some((name, base)) => match load_image(root, base, name, &mut images) {
                         Ok(image) => (Some(image), kd.unwrap_or([255; 3])),
                         Err(text) => {
                             warn(text);
@@ -335,9 +347,10 @@ fn corner(token: &str, nv: usize, nt: usize) -> Result<(usize, Option<usize>), S
     Ok((vi, ti))
 }
 
-/// The materials of the `.mtl` `name` (relative to `dir`); `None` if it cannot be read.
-fn read_mtl(dir: &Path, name: &str) -> Option<Vec<(String, Material)>> {
-    let path = find(dir, name)?;
+/// The materials of the `.mtl` `name` (relative to the OBJ's canonical folder `root`);
+/// `None` if it cannot be read or lies outside.
+fn read_mtl(root: &Path, name: &str) -> Option<Vec<(String, Material)>> {
+    let path = find(root, root, name)?;
     let bytes = std::fs::read(&path).ok()?;
     let base = path.parent().unwrap_or(Path::new("")).to_path_buf();
     let mut out: Vec<(String, Material)> = Vec::new();
@@ -402,24 +415,50 @@ fn strip_map_options(mut rest: &str) -> &str {
     rest.trim()
 }
 
-/// `name` relative to `dir` (absolute names as they are); a Windows path with `\` is tried
-/// with `/` as well.
-fn find(dir: &Path, name: &str) -> Option<PathBuf> {
-    let direct = dir.join(name);
-    if direct.is_file() {
-        return Some(direct);
+/// The file `name` relative to `base`, if it exists inside `root` (the OBJ's canonical
+/// folder; `base` lies in it); a Windows path with `\` is tried with `/` as well. `None` for
+/// a name that is absolute, has a drive or share prefix or a `..`, and for one whose real
+/// place (links followed) is outside `root`.
+fn find(root: &Path, base: &Path, name: &str) -> Option<PathBuf> {
+    let escapes = name.starts_with(['/', '\\'])
+        || name.contains(':')
+        || Path::new(name).has_root()
+        || Path::new(name).is_absolute()
+        || name.split(['/', '\\']).any(|part| part == "..");
+    if escapes {
+        return None;
     }
-    let slashed = dir.join(name.replace('\\', "/"));
-    slashed.is_file().then_some(slashed)
+    [base.join(name), base.join(name.replace('\\', "/"))]
+        .into_iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .find(|p| p.starts_with(root) && p.is_file())
 }
 
-/// The page image `name` relative to `dir` if it exists and is a JPEG or PNG, else the
-/// warning.
-fn load_image(dir: &Path, name: &str) -> Result<PageImage, String> {
+/// The page image `name` relative to `base` (see [`find`]) if it exists and is a JPEG or PNG,
+/// else the warning. An image read once is shared by every page that names it.
+fn load_image(
+    root: Option<&Path>,
+    base: &Path,
+    name: &str,
+    images: &mut HashMap<PathBuf, PageImage>,
+) -> Result<PageImage, String> {
     let missing = || format!("Textur fehlt: {name}");
-    let bytes = std::fs::read(find(dir, name).ok_or_else(missing)?).map_err(|_| missing())?;
+    let file = root
+        .and_then(|root| find(root, base, name))
+        .ok_or_else(missing)?;
+    if let Some(image) = images.get(&file) {
+        return Ok(image.clone());
+    }
+    let bytes = std::fs::read(&file).map_err(|_| missing())?;
     match ImageKind::sniff(&bytes) {
-        Some(kind) => Ok(PageImage { kind, bytes }),
+        Some(kind) => {
+            let image = PageImage {
+                kind,
+                bytes: bytes.into(),
+            };
+            images.insert(file, image.clone());
+            Ok(image)
+        }
         None => Err(format!(
             "Texturformat nicht unterstützt (nur JPEG und PNG): {name}"
         )),

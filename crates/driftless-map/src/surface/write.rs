@@ -71,7 +71,7 @@ impl TexturedMesh {
                 indices: page.indices.clone(),
                 image: Some(PageImage {
                     kind: ImageKind::Jpeg,
-                    bytes: jpegs.page(p).to_vec(),
+                    bytes: jpegs.page(p).into(),
                 }),
                 color: [255; 3],
             })

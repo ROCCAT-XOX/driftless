@@ -22,6 +22,7 @@ pub use ply::write_ply_mesh;
 use crate::ExportError;
 use driftless_io::progress::Progress;
 use std::path::Path;
+use std::sync::Arc;
 
 /// `asset.generator` of every glb.
 pub const GENERATOR: &str = "Driftless";
@@ -69,11 +70,13 @@ impl ImageKind {
     }
 }
 
-/// An encoded page image, kept as it is in the file.
+/// An encoded page image, kept as it is in the file. The bytes are shared: pages that show
+/// the same image (a glTF mesh used by several nodes, an OBJ image named by several
+/// materials) hold one copy.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageImage {
     pub kind: ImageKind,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
 }
 
 /// One page of a [`Mesh`]: its corners, triangles and image or colour.

@@ -26,6 +26,8 @@ use std::path::Path;
 
 /// Buffer of the file reader (bytes).
 const READ_BUFFER: usize = 1 << 16;
+/// Fewest bits a point is taken to occupy in the file, for the cap on claimed points.
+const MIN_POINT_BITS: u64 = 3;
 /// Scan number of the file itself in [`guid`].
 const FILE_GUID: u32 = u32::MAX;
 
@@ -401,10 +403,36 @@ fn read(path: &Path, file: File, len: u64, progress: &Progress) -> Result<Points
         )),
     }
 
+    // A header can claim any count. Every point takes the bits of its prototype in the file,
+    // so no entry can hold more than `len × 8 / bits` points: more is refused before anything
+    // is decoded, and the decoding stops there as well.
+    let mut caps = Vec::with_capacity(clouds.len());
+    for (k, pc) in clouds.iter().enumerate() {
+        let name = entry_name(pc, k);
+        if let Some(field) = pc
+            .prototype
+            .iter()
+            .find_map(|r| coordinate_tag(&r.name).filter(|_| record_bits(&r.data_type) == 0))
+        {
+            return Err(ExportError::format(
+                path,
+                format!(
+                    "E57: Scan „{name}“ speichert {} mit 0 Bit je Punkt – solche Dateien werden \
+                     nicht gelesen",
+                    field
+                ),
+            ));
+        }
+        let bits: u64 = pc.prototype.iter().map(|r| record_bits(&r.data_type)).sum();
+        let cap = len.saturating_mul(8) / bits.max(MIN_POINT_BITS);
+        if pc.records > cap {
+            return Err(too_many(path, &name, pc.records, cap));
+        }
+        caps.push(cap);
+    }
     let total = clouds
         .iter()
         .fold(0u64, |sum, pc| sum.saturating_add(pc.records));
-    // A header can claim any count: reserve no more than the file could hold.
     let reserve = total.min(len / 4) as usize;
     let mut xyz = Vec::with_capacity(reserve);
     let mut rgb = clouds
@@ -422,11 +450,7 @@ fn read(path: &Path, file: File, len: u64, progress: &Progress) -> Result<Points
 
     for (k, pc) in clouds.iter().enumerate() {
         check_cancel(progress)?;
-        let name = pc
-            .name
-            .clone()
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| format!("Scan {}", k + 1));
+        let name = entry_name(pc, k);
         let pose = match &pc.transform {
             None => Isometry3::identity(),
             Some(t) => pose_of(t).ok_or_else(|| {
@@ -440,8 +464,13 @@ fn read(path: &Path, file: File, len: u64, progress: &Progress) -> Result<Points
             points.intensity_to_color(false);
             let mut valid = 0u64;
             let mut pending = 0u64;
+            let mut decoded = 0u64;
             for p in points {
                 let p = p.map_err(broken)?;
+                decoded += 1;
+                if decoded > caps[k] {
+                    return Err(too_many(path, &name, pc.records, caps[k]));
+                }
                 pending += 1;
                 if pending == BLOCK as u64 {
                     progress.advance(pending);
@@ -492,6 +521,54 @@ fn read(path: &Path, file: File, len: u64, progress: &Progress) -> Result<Points
         flags: None,
         scans,
     })
+}
+
+/// The name of entry `k` for messages and [`ScanInfo::name`]: its own, else `Scan <k+1>`.
+fn entry_name(pc: &e57::PointCloud, k: usize) -> String {
+    pc.name
+        .clone()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| format!("Scan {}", k + 1))
+}
+
+fn too_many(path: &Path, name: &str, records: u64, cap: u64) -> ExportError {
+    ExportError::format(
+        path,
+        format!(
+            "E57: Scan „{name}“ gibt {records} Punkte an, die Datei kann höchstens {cap} \
+             enthalten"
+        ),
+    )
+}
+
+/// The E57 name of a coordinate field (cartesian or spherical); `None` for other fields.
+fn coordinate_tag(name: &RecordName) -> Option<&'static str> {
+    Some(match name {
+        RecordName::CartesianX => "cartesianX",
+        RecordName::CartesianY => "cartesianY",
+        RecordName::CartesianZ => "cartesianZ",
+        RecordName::SphericalRange => "sphericalRange",
+        RecordName::SphericalAzimuth => "sphericalAzimuth",
+        RecordName::SphericalElevation => "sphericalElevation",
+        _ => return None,
+    })
+}
+
+/// Bits a value of this type takes in the file (as the library packs it): an integer with
+/// `min = max` takes none.
+fn record_bits(t: &RecordDataType) -> u64 {
+    match *t {
+        RecordDataType::Single { .. } => 32,
+        RecordDataType::Double { .. } => 64,
+        RecordDataType::Integer { min, max } | RecordDataType::ScaledInteger { min, max, .. } => {
+            let range = i128::from(max) - i128::from(min);
+            if range > 0 {
+                u64::from(range.ilog2()) + 1
+            } else {
+                0
+            }
+        }
+    }
 }
 
 /// A value normalised to 0–1 as 16 bit.
