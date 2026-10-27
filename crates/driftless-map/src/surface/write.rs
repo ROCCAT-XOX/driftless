@@ -1,33 +1,16 @@
-//! Writing a [`TexturedMesh`] as `.glb` and as `.obj` with `.mtl` and JPEG pages.
+//! Writing a [`TexturedMesh`] as `.glb` and as `.obj` with `.mtl` and JPEG pages: thin
+//! wrappers that turn it into a [`driftless_export::mesh::Mesh`] ([`TexturedMesh::to_mesh`])
+//! and hand it to the writers of `driftless-export`, which describe the formats.
 //!
-//! **glb** (glTF 2.0, binary): metres, Y up — a Driftless point `(x, y, z)` (Z up) becomes
-//! `(x, z, −y)`, a rotation, so the winding and the front sides stay. One mesh with one
-//! primitive per non-empty page (positions, `TEXCOORD_0`, `u32` indices), one material per
-//! page: `baseColorTexture` with the page as embedded JPEG and `KHR_materials_unlit` (the
-//! photos are already lit). glTF texture coordinates start at the top left with `v` down,
-//! as ours, so they are written unchanged.
-//!
-//! **obj**: stays Z up (Blender: import with "Z up"); texture coordinates with `v` up, so
-//! `1 − v` is written. One material `seite_NN` per page with its JPEG `stem_seite_NN.jpg`.
-//!
-//! Both are deterministic: fixed generator string, no time, fixed key and file order, floats
-//! in their shortest round-trip form. Every file goes to `<name>.tmp` first and is renamed
-//! when complete, so an interrupted write leaves no half file under the real name. The pages
-//! are encoded once ([`encode_pages`]) for both files; only the compressed JPEGs are held.
+//! The pages are encoded once ([`encode_pages`]) for both files; only the compressed JPEGs
+//! are held.
 
 use super::TexturedMesh;
 use crate::MapError;
-use gltf_json as json;
+use driftless_export::mesh::{self, ImageKind, Mesh, MeshPage, PageImage};
 use image::codecs::jpeg::JpegEncoder;
 use image::ExtendedColorType;
-use json::validation::{Checked, USize64};
-use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
-
-/// `asset.generator` of every glb.
-pub const GENERATOR: &str = "Driftless";
+use std::path::Path;
 
 /// The texture pages of a [`TexturedMesh`] as JPEG, encoded once for the glb and the obj.
 #[derive(Debug, Clone, PartialEq)]
@@ -73,309 +56,47 @@ pub fn encode_pages(tex: &TexturedMesh, jpeg_quality: u8) -> Result<PageJpegs, M
     Ok(PageJpegs { jpegs })
 }
 
-/// Writes `tex` with its encoded pages `jpegs` as one binary glTF (see the module docs).
-pub fn write_glb(path: &Path, tex: &TexturedMesh, jpegs: &PageJpegs) -> Result<(), MapError> {
-    jpegs.check(tex)?;
-    let pages: Vec<usize> = (0..tex.pages.len())
-        .filter(|&p| !tex.pages[p].indices.is_empty())
-        .collect();
-    let jpegs: Vec<&[u8]> = pages.iter().map(|&p| jpegs.page(p)).collect();
-
-    // Layout of the binary chunk: per page positions, uvs, indices, then the images; every
-    // part starts at a multiple of 4.
-    let mut root = json::Root {
-        asset: json::Asset {
-            generator: Some(GENERATOR.into()),
-            ..Default::default()
-        },
-        extensions_used: vec!["KHR_materials_unlit".into()],
-        ..Default::default()
-    };
-    let mut offset = 0u64;
-    let mut view = |root: &mut json::Root, len: u64, target: Option<json::buffer::Target>| {
-        let v = root.push(json::buffer::View {
-            buffer: json::Index::new(0),
-            byte_length: USize64(len),
-            byte_offset: Some(USize64(offset)),
-            byte_stride: None,
-            target: target.map(Checked::Valid),
-            extensions: None,
-            extras: Default::default(),
-        });
-        offset += padded(len);
-        v
-    };
-    let sampler = root.push(json::texture::Sampler {
-        mag_filter: Some(Checked::Valid(json::texture::MagFilter::Linear)),
-        min_filter: Some(Checked::Valid(json::texture::MinFilter::LinearMipmapLinear)),
-        wrap_s: Checked::Valid(json::texture::WrappingMode::ClampToEdge),
-        wrap_t: Checked::Valid(json::texture::WrappingMode::ClampToEdge),
-        ..Default::default()
-    });
-    let mut primitives = Vec::new();
-    for &p in &pages {
-        let page = &tex.pages[p];
-        let n = page.positions.len() as u64;
-        let (lo, hi) = bounds(page.positions.iter().map(|&v| to_gltf(v)));
-        let pos_view = view(&mut root, n * 12, Some(json::buffer::Target::ArrayBuffer));
-        let uv_view = view(&mut root, n * 8, Some(json::buffer::Target::ArrayBuffer));
-        let idx_view = view(
-            &mut root,
-            page.indices.len() as u64 * 12,
-            Some(json::buffer::Target::ElementArrayBuffer),
-        );
-        let accessor = |root: &mut json::Root,
-                        view,
-                        count: u64,
-                        ty,
-                        component,
-                        minmax: Option<(json::Value, json::Value)>| {
-            let (min, max) = minmax.unzip();
-            root.push(json::Accessor {
-                buffer_view: Some(view),
-                byte_offset: None,
-                count: USize64(count),
-                component_type: Checked::Valid(json::accessor::GenericComponentType(component)),
-                extensions: None,
-                extras: Default::default(),
-                type_: Checked::Valid(ty),
-                min,
-                max,
-                normalized: false,
-                sparse: None,
-            })
-        };
-        let pos = accessor(
-            &mut root,
-            pos_view,
-            n,
-            json::accessor::Type::Vec3,
-            json::accessor::ComponentType::F32,
-            Some((
-                json::Value::from(lo.to_vec()),
-                json::Value::from(hi.to_vec()),
-            )),
-        );
-        let uv = accessor(
-            &mut root,
-            uv_view,
-            n,
-            json::accessor::Type::Vec2,
-            json::accessor::ComponentType::F32,
-            None,
-        );
-        let idx = accessor(
-            &mut root,
-            idx_view,
-            page.indices.len() as u64 * 3,
-            json::accessor::Type::Scalar,
-            json::accessor::ComponentType::U32,
-            None,
-        );
-        primitives.push((pos, uv, idx));
-    }
-    let mut mesh = json::Mesh {
-        extensions: None,
-        extras: Default::default(),
-        primitives: Vec::new(),
-        weights: None,
-    };
-    for ((pos, uv, idx), jpeg) in primitives.into_iter().zip(jpegs.iter().copied()) {
-        let image_view = view(&mut root, jpeg.len() as u64, None);
-        let image = root.push(json::Image {
-            buffer_view: Some(image_view),
-            mime_type: Some(json::image::MimeType("image/jpeg".into())),
-            uri: None,
-            extensions: None,
-            extras: Default::default(),
-        });
-        let texture = root.push(json::Texture {
-            sampler: Some(sampler),
-            source: image,
-            extensions: None,
-            extras: Default::default(),
-        });
-        let material = root.push(json::Material {
-            pbr_metallic_roughness: json::material::PbrMetallicRoughness {
-                base_color_texture: Some(json::texture::Info {
-                    index: texture,
-                    tex_coord: 0,
-                    extensions: None,
-                    extras: Default::default(),
+impl TexturedMesh {
+    /// The mesh with its encoded pages `jpegs`, for the writers of `driftless-export`:
+    /// positions as `f64`, every page with its JPEG.
+    pub fn to_mesh(&self, jpegs: &PageJpegs) -> Result<Mesh, MapError> {
+        jpegs.check(self)?;
+        let pages = self
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(p, page)| MeshPage {
+                positions: page.positions.iter().map(|v| v.map(f64::from)).collect(),
+                uvs: page.uvs.clone(),
+                indices: page.indices.clone(),
+                image: Some(PageImage {
+                    kind: ImageKind::Jpeg,
+                    bytes: jpegs.page(p).to_vec(),
                 }),
-                metallic_factor: json::material::StrengthFactor(0.0),
-                roughness_factor: json::material::StrengthFactor(1.0),
-                ..Default::default()
-            },
-            extensions: Some(json::extensions::material::Material {
-                unlit: Some(json::extensions::material::Unlit {}),
-            }),
-            ..Default::default()
-        });
-        mesh.primitives.push(json::mesh::Primitive {
-            attributes: BTreeMap::from([
-                (Checked::Valid(json::mesh::Semantic::Positions), pos),
-                (Checked::Valid(json::mesh::Semantic::TexCoords(0)), uv),
-            ]),
-            extensions: None,
-            extras: Default::default(),
-            indices: Some(idx),
-            material: Some(material),
-            mode: Checked::Valid(json::mesh::Mode::Triangles),
-            targets: None,
-        });
+                color: [255; 3],
+            })
+            .collect();
+        Ok(Mesh { pages })
     }
-    let bin_len = offset;
-    if !mesh.primitives.is_empty() {
-        let mesh = root.push(mesh);
-        let node = root.push(json::Node {
-            mesh: Some(mesh),
-            ..Default::default()
-        });
-        let scene = root.push(json::Scene {
-            extensions: None,
-            extras: Default::default(),
-            nodes: vec![node],
-        });
-        root.scene = Some(scene);
-    }
-    if bin_len > 0 {
-        root.push(json::Buffer {
-            byte_length: USize64(bin_len),
-            uri: None,
-            extensions: None,
-            extras: Default::default(),
-        });
-    }
-    let mut text = root
-        .to_vec()
-        .map_err(|e| MapError::Config(format!("glTF-Beschreibung: {e}")))?;
-    while text.len() % 4 != 0 {
-        text.push(b' ');
-    }
+}
 
-    let total = 12 + 8 + text.len() as u64 + if bin_len > 0 { 8 + bin_len } else { 0 };
-    let total = u32::try_from(total).map_err(|_| {
-        MapError::Config("Oberfläche ist für eine glb-Datei zu groß (> 4 GB)".into())
-    })?;
-    write_atomic(path, |w| {
-        w.write_all(b"glTF")?;
-        w.write_all(&2u32.to_le_bytes())?;
-        w.write_all(&total.to_le_bytes())?;
-        w.write_all(&(text.len() as u32).to_le_bytes())?;
-        w.write_all(b"JSON")?;
-        w.write_all(&text)?;
-        if bin_len == 0 {
-            return Ok(());
-        }
-        w.write_all(&(bin_len as u32).to_le_bytes())?;
-        w.write_all(b"BIN\0")?;
-        let mut written = 0u64;
-        let mut part = |w: &mut dyn Write, bytes: &mut dyn Iterator<Item = [u8; 4]>| {
-            let mut n = 0u64;
-            for b in bytes {
-                w.write_all(&b)?;
-                n += 4;
-            }
-            written += n;
-            Ok::<u64, io::Error>(n)
-        };
-        for &p in &pages {
-            let page = &tex.pages[p];
-            let pos = page.positions.iter().flat_map(|&v| to_gltf(v));
-            part(w, &mut pos.map(f32::to_le_bytes))?;
-            let uv = page.uvs.iter().flatten();
-            part(w, &mut uv.map(|x| x.to_le_bytes()))?;
-            let idx = page.indices.iter().flatten();
-            part(w, &mut idx.map(|x| x.to_le_bytes()))?;
-        }
-        for &jpeg in &jpegs {
-            w.write_all(jpeg)?;
-            let pad = padded(jpeg.len() as u64) - jpeg.len() as u64;
-            w.write_all(&[0u8; 3][..pad as usize])?;
-            written += padded(jpeg.len() as u64);
-        }
-        debug_assert_eq!(written, bin_len);
-        Ok(())
-    })
+/// Writes `tex` with its encoded pages `jpegs` as one binary glTF (Y up, see
+/// [`driftless_export::mesh::write_glb`]).
+pub fn write_glb(path: &Path, tex: &TexturedMesh, jpegs: &PageJpegs) -> Result<(), MapError> {
+    Ok(mesh::write_glb(path, &tex.to_mesh(jpegs)?)?)
 }
 
 /// Writes `tex` as `stem.obj`, `stem.mtl` and its encoded pages `jpegs` as one
-/// `stem_seite_NN.jpg` per page into `dir` (see the module docs). The `.obj` comes last:
-/// once it is there, the rest is too.
+/// `stem_seite_NN.jpg` per page into `dir` (see [`driftless_export::mesh::write_obj`]). The
+/// `.obj` comes last: once it is there, the rest is too.
 pub fn write_obj(
     dir: &Path,
     stem: &str,
     tex: &TexturedMesh,
     jpegs: &PageJpegs,
 ) -> Result<(), MapError> {
-    jpegs.check(tex)?;
-    let jpg = |p: usize| format!("{stem}_{}.jpg", page_name(p));
-    for p in 0..tex.pages.len() {
-        write_atomic(&dir.join(jpg(p)), |w| w.write_all(jpegs.page(p)))?;
-    }
-    write_atomic(&dir.join(format!("{stem}.mtl")), |w| {
-        writeln!(
-            w,
-            "# Driftless surface: one material per texture page, unlit photos"
-        )?;
-        for p in 0..tex.pages.len() {
-            writeln!(w, "\nnewmtl {}", page_name(p))?;
-            writeln!(w, "Ka 1 1 1\nKd 1 1 1\nKs 0 0 0\nillum 0")?;
-            writeln!(w, "map_Kd {}", jpg(p))?;
-        }
-        Ok(())
-    })?;
-    write_atomic(&dir.join(format!("{stem}.obj")), |w| {
-        // OBJ keeps Driftless' axes: Z up, metres (import into Blender with "Z up").
-        writeln!(w, "# Driftless surface: metres, Z up")?;
-        writeln!(w, "mtllib {stem}.mtl")?;
-        writeln!(w, "o oberflaeche")?;
-        let mut base = 1usize;
-        for (p, page) in tex.pages.iter().enumerate() {
-            for v in &page.positions {
-                writeln!(w, "v {} {} {}", v[0], v[1], v[2])?;
-            }
-            for t in &page.uvs {
-                // OBJ texture coordinates have v up.
-                writeln!(w, "vt {} {}", t[0], 1.0 - t[1])?;
-            }
-            writeln!(w, "usemtl {}", page_name(p))?;
-            for tri in &page.indices {
-                let [a, b, c] = tri.map(|i| i as usize + base);
-                writeln!(w, "f {a}/{a} {b}/{b} {c}/{c}")?;
-            }
-            base += page.positions.len();
-        }
-        Ok(())
-    })
-}
-
-/// `seite_NN`: the name of page `p` (material, image).
-fn page_name(p: usize) -> String {
-    format!("seite_{p:02}")
-}
-
-/// Driftless `(x, y, z)` (Z up) → glTF `(x, z, −y)` (Y up).
-fn to_gltf(v: [f32; 3]) -> [f32; 3] {
-    [v[0], v[2], -v[1]]
-}
-
-fn bounds(points: impl Iterator<Item = [f32; 3]>) -> ([f32; 3], [f32; 3]) {
-    points.fold(
-        ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]),
-        |(lo, hi), p| {
-            (
-                [0, 1, 2].map(|k| lo[k].min(p[k])),
-                [0, 1, 2].map(|k| hi[k].max(p[k])),
-            )
-        },
-    )
-}
-
-/// `len` rounded up to a multiple of 4.
-fn padded(len: u64) -> u64 {
-    len.div_ceil(4) * 4
+    let path = dir.join(format!("{stem}.obj"));
+    Ok(mesh::write_obj(&path, &tex.to_mesh(jpegs)?)?)
 }
 
 /// Baseline JPEG of `image` (`image` crate encoder: pure Rust, MIT/Apache, deterministic,
@@ -394,30 +115,6 @@ fn encode_jpeg(image: &driftless_io::images::RgbImage, quality: u8) -> Result<Ve
         .encode(&image.data, w, h, ExtendedColorType::Rgb8)
         .map_err(|e| MapError::Config(format!("Textur als JPEG: {e}")))?;
     Ok(out)
-}
-
-/// Writes through `write` to `<path>.tmp` and renames it to `path` when complete; on an
-/// error the `.tmp` is removed.
-fn write_atomic(
-    path: &Path,
-    write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
-) -> Result<(), MapError> {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    let tmp: PathBuf = path.with_file_name(name);
-    let result = (|| {
-        let mut w = BufWriter::new(File::create(&tmp)?);
-        write(&mut w)?;
-        w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-        fs::rename(&tmp, path)
-    })();
-    result.map_err(|source| {
-        let _ = fs::remove_file(&tmp);
-        MapError::Io {
-            path: path.display().to_string(),
-            source,
-        }
-    })
 }
 
 #[cfg(test)]
@@ -628,6 +325,24 @@ mod tests {
             assert!(!x.is_empty(), "{name}");
             assert!(x == y, "{name} differs");
         }
+    }
+
+    /// The bytes of today's glb, obj and mtl, pinned before the writers moved to
+    /// `driftless-export`: the move must not change a single byte.
+    #[test]
+    fn files_unchanged_by_move() {
+        let tex = floor_and_ceiling();
+        let dir = temp_dir("unchanged");
+        let pages = encode_pages(&tex, 90).unwrap();
+        write_glb(&dir.join("x.glb"), &tex, &pages).unwrap();
+        write_obj(&dir, "x", &tex, &pages).unwrap();
+        let hash = |name: &str| crate::content_hash(&fs::read(dir.join(name)).unwrap());
+        let got = [hash("x.glb"), hash("x.obj"), hash("x.mtl")];
+        assert_eq!(
+            got,
+            [0xacdf49bc5448d4b8, 0x5aab2ed88a5d7333, 0xe8f7b8df59fdd85e],
+            "{got:#018x?}"
+        );
     }
 
     #[test]

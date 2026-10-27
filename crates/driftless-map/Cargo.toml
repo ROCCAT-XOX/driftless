@@ -16,7 +16,6 @@ driftless-gpu = { path = "../driftless-gpu" }
 driftless-io = { path = "../driftless-io" }
 driftless-odom = { path = "../driftless-odom" }
 driftless-traj = { path = "../driftless-traj" }
-gltf-json = { version = "1.4.1", features = ["KHR_materials_unlit"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 kiddo = { version = "6", default-features = false }
 meshopt = "0.7"

@@ -18,6 +18,9 @@ test-util = []
 driftless-io = { path = "../driftless-io" }
 driftless-traj = { path = "../driftless-traj" }
 e57 = "0.11"
+gltf = { version = "1.4.1", default-features = false, features = ["KHR_materials_unlit", "utils"] }
+gltf-json = { version = "1.4.1", features = ["KHR_materials_unlit"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 las = { version = "0.11", features = ["laz"] }
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }
 thiserror = "2"

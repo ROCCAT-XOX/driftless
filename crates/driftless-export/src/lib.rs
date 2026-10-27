@@ -7,6 +7,7 @@
 
 pub mod e57;
 pub mod las;
+pub mod mesh;
 pub mod pcd;
 pub mod ply;
 mod points;
