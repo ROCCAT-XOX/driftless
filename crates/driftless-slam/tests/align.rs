@@ -6,7 +6,7 @@
 
 use driftless_io::progress::Progress;
 use driftless_slam::align::{
-    align_pair, align_with_pairs, pair_quality, pose_from_pairs, AlignConfig, AlignMethod,
+    align_pair, align_with_pairs, pair_quality, pose_from_pairs, verdict, AlignConfig, AlignMethod,
     Alignment, Verdict,
 };
 use nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, Vector3};
@@ -145,14 +145,17 @@ fn pose_error(est: &Isometry3<f64>, truth: &Isometry3<f64>, source: &[Vector3<f6
 
 fn describe(a: &Alignment) -> String {
     format!(
-        "{:?} {:?} overlap {:.3} agreement {:.3} residual {:.2} mm tilt {:.2}° runner-up {:?}",
+        "{:?} {:?} overlap {:.3} agreement {:.3} residual {:.2} mm walls {:.2} mm tilt {:.2}° \
+         runner-up {:?} pairs {:?} mm",
         a.verdict,
         a.method,
         a.quality.overlap,
         a.quality.agreement,
         a.quality.residual_median_mm,
+        a.quality.wall_residual_mm,
         a.quality.tilt_deg,
-        a.runner_up.as_ref().map(|r| r.1)
+        a.runner_up.as_ref().map(|r| r.1),
+        a.pair_rms_mm
     )
 }
 
@@ -349,11 +352,12 @@ fn pose_from_pairs_rejects_collinear() {
 fn align_with_pairs_refines() {
     let pose = truth(0.0);
     let (source, target) = room_pair(&pose);
-    // Box corners and the column seen in both parts, each source mark 5 cm off.
+    // Box corners and the column seen in both parts, each source mark 2 cm off (a click
+    // two or three drawn points beside the corner).
     let marks = [
-        (v3(2.5, 0.6, 0.8), v3(0.05, 0.0, 0.0)),
-        (v3(5.6, 3.6, 0.5), v3(0.0, -0.05, 0.0)),
-        (v3(3.8, 2.2, 2.8), v3(0.0, 0.0, 0.05)),
+        (v3(2.5, 0.6, 0.8), v3(0.02, 0.0, 0.0)),
+        (v3(5.6, 3.6, 0.5), v3(0.0, -0.02, 0.0)),
+        (v3(3.8, 2.2, 2.8), v3(0.0, 0.0, 0.02)),
     ];
     let inv = pose.inverse();
     let pairs: Vec<_> = marks
@@ -371,6 +375,119 @@ fn align_with_pairs_refines() {
     assert!(dt < 0.01 && dr < 0.3, "error {dt:.4} m {dr:.3}°");
     assert_eq!(a.method, AlignMethod::PointPairs);
     assert!(a.runner_up.is_none());
+    assert_eq!(a.verdict, Verdict::Sure, "{}", describe(&a));
+    // The marks are 2 cm off the right pose the ICP found.
+    let rms = a.pair_rms_mm.expect("pair fit");
+    assert!(rms > 15.0 && rms < 25.0, "{}", describe(&a));
+}
+
+/// Room A and the first 0.5 m of the corridor as the target, the corridor and room B as the
+/// source: they share only that strip of the corridor (a few % of the source points).
+fn narrow_corridor() -> (Vec<Vector3<f64>>, Vec<Vector3<f64>>, Isometry3<f64>) {
+    let (a, corridor, b) = suite();
+    let target_rects: Vec<Rect> = a.iter().chain(&corridor).copied().collect();
+    let source_rects: Vec<Rect> = corridor.iter().chain(&b).copied().collect();
+    let target = sample(&target_rects, |p| p.x <= 8.5, 13);
+    let world = sample(&source_rects, |p| p.x >= 8.0, 14);
+    let pose = truth(0.0);
+    (transform(&pose.inverse(), &world), target, pose)
+}
+
+/// Pairs on four corners of the shared strip of [`narrow_corridor`], (place in the world,
+/// click error in the source, click error in the target): a few mm to 1.4 cm off, as a
+/// careful click is.
+fn corridor_marks() -> Vec<(Vector3<f64>, Vector3<f64>, Vector3<f64>)> {
+    vec![
+        (v3(8.0, 1.75, 0.0), v3(0.01, 0.0, 0.0), v3(0.0, 0.005, 0.0)),
+        (v3(8.0, 3.25, 2.1), v3(0.0, -0.01, 0.0), v3(0.0, 0.0, 0.01)),
+        (v3(8.4, 3.25, 2.8), v3(0.0, 0.0, -0.01), v3(-0.01, 0.0, 0.0)),
+        (v3(8.3, 1.75, 1.2), v3(0.0, 0.01, 0.01), v3(0.005, 0.0, 0.0)),
+    ]
+}
+
+fn marks_to_pairs(
+    marks: &[(Vector3<f64>, Vector3<f64>, Vector3<f64>)],
+    pose: &Isometry3<f64>,
+) -> Vec<(Vector3<f64>, Vector3<f64>)> {
+    let inv = pose.inverse();
+    marks
+        .iter()
+        .map(|(w, es, et)| ((inv * Point3::from(w + es)).coords, w + et))
+        .collect()
+}
+
+/// Two rooms joined by a corridor of which both scans saw only half a metre: even the right
+/// pose overlaps too little for an automatic sure result, but point pairs on the corners of
+/// that strip place the scan surely.
+#[test]
+fn pairs_place_a_narrow_corridor() {
+    let (source, target, pose) = narrow_corridor();
+    let cfg = AlignConfig::default();
+    let right = pair_quality(&source, &target, &pose, &cfg);
+    eprintln!(
+        "right pose: overlap {:.3} agreement {:.3} residual {:.2} mm walls {:.2} mm",
+        right.overlap, right.agreement, right.residual_median_mm, right.wall_residual_mm
+    );
+    assert!(right.overlap < cfg.min_overlap, "{right:?}");
+    assert!(
+        matches!(verdict(&right, &cfg), Verdict::Unsure(_)),
+        "{right:?}"
+    );
+    let pairs = marks_to_pairs(&corridor_marks(), &pose);
+    let a = align_with_pairs(&source, &target, &pairs, &cfg, &Progress::new());
+    eprintln!("pairs: {}", describe(&a));
+    let (dt, dr) = pose_error(&a.pose, &pose, &source);
+    assert!(dt < 0.02 && dr < 0.3, "error {dt:.4} m {dr:.3}°");
+    assert_eq!(a.method, AlignMethod::PointPairs);
+    assert_eq!(a.verdict, Verdict::Sure, "{}", describe(&a));
+}
+
+/// One pair of four on the wrong door jamb (1.5 m off): the pairs do not fit any rigid pose,
+/// the result says so.
+#[test]
+fn wrong_pairs_are_refused() {
+    let (source, target, pose) = narrow_corridor();
+    let mut pairs = marks_to_pairs(&corridor_marks(), &pose);
+    pairs[1].1 = v3(8.0, 1.75, 2.1);
+    let a = align_with_pairs(
+        &source,
+        &target,
+        &pairs,
+        &AlignConfig::default(),
+        &Progress::new(),
+    );
+    eprintln!("wrong pairs: {}", describe(&a));
+    let Verdict::Unsure(why) = &a.verdict else {
+        panic!("not unsure: {}", describe(&a));
+    };
+    assert!(why.contains("Punktpaare liegen im Mittel"), "{why}");
+}
+
+/// A closed room seen whole twice. The right pose is sure; slid by 1 or 3 cm along one wall
+/// it moves the two walls across, which the median over all points (mostly floor and
+/// ceiling) hardly shows, but the residual of those walls does.
+#[test]
+fn slid_along_a_wall_is_unsure() {
+    let scene = main_room();
+    let target = sample(&scene, |_| true, 15);
+    let pose = truth(0.0);
+    let source = transform(&pose.inverse(), &sample(&scene, |_| true, 16));
+    let cfg = AlignConfig::default();
+    let right = pair_quality(&source, &target, &pose, &cfg);
+    eprintln!("right: {right:?}");
+    assert_eq!(verdict(&right, &cfg), Verdict::Sure, "{right:?}");
+    for d in [0.01, 0.03] {
+        // Along the walls y = 0 and y = 5, across the walls x = 0 and x = 8.
+        let slid = Isometry3::from(Translation3::new(d, 0.0, 0.0)) * pose;
+        let q = pair_quality(&source, &target, &slid, &cfg);
+        eprintln!("slid {d} m: {q:?}");
+        assert!(q.residual_median_mm <= cfg.max_residual_mm, "{q:?}");
+        assert!(q.overlap >= cfg.min_overlap && q.agreement >= 0.85, "{q:?}");
+        assert!(
+            matches!(verdict(&q, &cfg), Verdict::Unsure(w) if w.contains("Wände")),
+            "{q:?}"
+        );
+    }
 }
 
 #[test]

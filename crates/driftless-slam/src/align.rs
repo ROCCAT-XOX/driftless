@@ -22,8 +22,17 @@
 //!    the vertical through the centre of the source ([`SYMMETRY_TURNS`]; once rated as it
 //!    is, once refined), and those join the candidates: a room that looks the same turned
 //!    is caught even if no feature match proposed the turned pose. Too little overlap or
-//!    agreement, a large residual or tilt, or a different candidate almost as good make the
-//!    result "unsicher".
+//!    agreement, a large residual (over all overlapping points, or on the walls of one
+//!    orientation, [`PairQuality::wall_residual_mm`]) or tilt, or a different candidate
+//!    almost as good make the result "unsicher". Almost no overlap ([`FAILED_OVERLAP`]) or
+//!    edges that almost all disagree ([`FAILED_AGREEMENT`]) make it "gescheitert": such a
+//!    pose is no place of the scan at all.
+//!
+//! [`align_with_pairs`] starts from point pairs marked by hand instead. The user chose the
+//! place, so overlap, agreement and ambiguity do not count there: the result is sure if the
+//! pairs fit the refined pose ([`AlignConfig::max_pair_rms_mm`]) and the residuals and the
+//! tilt are within their limits. Two rooms that share only a door or a short corridor
+//! overlap too little for an automatic sure result even at the right pose.
 //!
 //! Why the agreement: walls, floor and ceiling hold most points, and the shell of a
 //! rectangular room fits itself turned by 180°. Two scans that each cover part of a room, or
@@ -76,6 +85,12 @@ pub struct AlignConfig {
     pub min_overlap: f64,
     /// Largest median residual of a sure alignment (mm).
     pub max_residual_mm: f64,
+    /// Largest [`PairQuality::wall_residual_mm`] of a sure alignment (mm): spec 2a, "≤ 3 mm
+    /// at the walls, otherwise the pair is unsure".
+    pub max_wall_residual_mm: f64,
+    /// Largest RMS distance of the point pairs marked by hand at the refined pose of a sure
+    /// [`align_with_pairs`] (mm).
+    pub max_pair_rms_mm: f64,
     /// Largest tilt of the found pose against the vertical (°).
     pub max_tilt_deg: f64,
     /// A different candidate with at least this share of the best overlap makes the
@@ -97,6 +112,8 @@ impl Default for AlignConfig {
             overlap_dist: 0.05,
             min_overlap: 0.15,
             max_residual_mm: 5.0,
+            max_wall_residual_mm: 3.0,
+            max_pair_rms_mm: 30.0,
             max_tilt_deg: 3.0,
             ambiguity: 0.9,
         }
@@ -157,6 +174,15 @@ pub struct PairQuality {
     /// at the bottom of its column, the other at the top) does not agree. 1 if no edge point
     /// could have been seen (no evidence against the pose), 0 for a failed alignment.
     pub agreement: f64,
+    /// Residual on the walls (mm): the overlapping source points whose local target surface
+    /// is a wall (a flat plane whose normal is within [`WALL_MAX_NZ`] of horizontal) are
+    /// grouped by the direction of that normal about the vertical (bins of
+    /// [`WALL_BIN_DEG`], a wall seen from either side in the same bin); the largest median
+    /// residual of a group of at least [`MIN_WALL_POINTS`] points and [`MIN_WALL_SHARE`] of
+    /// all wall points. A pose slid along one wall moves the walls across it, which the
+    /// median over all points (mostly floor and ceiling) hardly shows. 0 if no group is
+    /// that large.
+    pub wall_residual_mm: f64,
 }
 
 impl PairQuality {
@@ -166,13 +192,15 @@ impl PairQuality {
         residual_rms_mm: 0.0,
         tilt_deg: 0.0,
         agreement: 0.0,
+        wall_residual_mm: 0.0,
     };
 }
 
 /// Result of [`align_pair`] or [`align_with_pairs`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Alignment {
-    /// Maps source world coordinates to target world coordinates (identity if failed).
+    /// Maps source world coordinates to target world coordinates (identity if no pose was
+    /// found).
     pub pose: Isometry3<f64>,
     pub method: AlignMethod,
     pub quality: PairQuality,
@@ -180,6 +208,9 @@ pub struct Alignment {
     /// Pose and overlap of the best other candidate after ICP (more than
     /// [`DISTINCT_TRANS`] or [`DISTINCT_ROT_DEG`] away from `pose`), ranked like the best.
     pub runner_up: Option<(Isometry3<f64>, f64)>,
+    /// RMS distance of the point pairs marked by hand at `pose` (mm), for
+    /// [`align_with_pairs`] once it got as far as a pose.
+    pub pair_rms_mm: Option<f64>,
 }
 
 /// Two candidates are different if they put the source centroid this far apart (m) …
@@ -200,14 +231,42 @@ pub const COLUMN_CELL: f64 = 0.25;
 /// this far from both; a point at most this far from the lowest (highest) is at the
 /// bottom (top) of the column (m).
 pub const COLUMN_MARGIN: f64 = 0.1;
+/// A local target plane is a wall ([`PairQuality::wall_residual_mm`]) if the vertical part
+/// of its normal is at most this (sin 11.5°; the maps are levelled within 1°) …
+pub const WALL_MAX_NZ: f64 = 0.2;
+/// … and it is flat: the spread across it (variance) at most this share of the spread along
+/// its second axis (a plane of 8 points on 2 cm with 1–3 mm noise has 0.005–0.03; an edge or
+/// a corner more).
+pub const WALL_FLATNESS: f64 = 0.05;
+/// Walls are grouped by the direction of their normal about the vertical, modulo 180°, in
+/// bins of this size (°).
+pub const WALL_BIN_DEG: f64 = 10.0;
+const WALL_BINS: usize = 18;
+/// Smallest group of wall points with a residual of its own (a stable median), …
+pub const MIN_WALL_POINTS: usize = 200;
+/// … and its smallest share of all wall points (the side of a cupboard at an odd angle does
+/// not count, a wall does).
+pub const MIN_WALL_SHARE: f64 = 0.05;
+/// An automatic result with less overlap than this, or with less edge agreement, is
+/// "gescheitert", not "unsicher": two disjoint rooms put side by side (0 % overlap, edges
+/// that cannot disagree) or a turned shell (edges 0.09–0.31 on the real scans) is no place
+/// of the scan, and „Auch unsichere übernehmen“ must not take it into the model. The right
+/// pose of the narrowest corridor strip measured (2 %, 0.11 m) has 0.043 and 0.66.
+pub const FAILED_OVERLAP: f64 = 0.02;
+pub const FAILED_AGREEMENT: f64 = 0.3;
 /// The best candidate is also tried turned by every `360° / SYMMETRY_TURNS` about the
 /// vertical through the centre of the source (step 4 of the module documentation).
 pub const SYMMETRY_TURNS: usize = 4;
 /// Correspondence distances of the coarse ICP stages on the thinned points (m).
 const STAGES: [f64; 3] = [1.0, 0.5, 0.25];
 /// Neighbours and iterations of the fine ICP stage (it starts within a few centimetres; a
-/// candidate that still slides after 10 iterations is a wrong one).
-const FINE_KNN: usize = 20;
+/// candidate that still slides after 10 iterations is a wrong one). On 2 cm points 5
+/// neighbours span too little for the plane tests of the coarse stages. 20 (until the wall
+/// residual showed it) reach over the foot of a box or a corner: such planes pulled the right
+/// pose of the synthetic room of the surface tests 6–30 mm along one wall, and a start on the
+/// right pose did not stay there. With 12 it stays within 0.3 mm, and a start 6 cm off comes
+/// back.
+const FINE_KNN: usize = 12;
 const FINE_ICP_ITERS: u32 = 10;
 /// Neighbours of the local target surface in [`pair_quality`].
 const QUALITY_KNN: usize = 8;
@@ -513,6 +572,96 @@ fn tilt_deg(pose: &Isometry3<f64>) -> f64 {
     up.z.clamp(-1.0, 1.0).acos().to_degrees()
 }
 
+/// Median of `v` (sorted in place, not empty).
+fn median(v: &mut [f64]) -> f64 {
+    v.sort_by(f64::total_cmp);
+    let mid = v.len() / 2;
+    if v.len().is_multiple_of(2) {
+        0.5 * (v[mid - 1] + v[mid])
+    } else {
+        v[mid]
+    }
+}
+
+/// The wall bin ([`PairQuality::wall_residual_mm`]) of a local plane with `normal`, spread
+/// `across` it and `along` its second axis; `None` if it is no wall.
+fn wall_bin(normal: &Vector3<f64>, across: f64, along: f64) -> Option<usize> {
+    if normal.z.abs() > WALL_MAX_NZ || across > WALL_FLATNESS * along {
+        return None;
+    }
+    let deg = normal
+        .y
+        .atan2(normal.x)
+        .rem_euclid(std::f64::consts::PI)
+        .to_degrees();
+    Some(((deg / WALL_BIN_DEG) as usize).min(WALL_BINS - 1))
+}
+
+/// Per overlapping source point (in the order of [`Pair::src_quality`]) its residual (m) and
+/// wall bin.
+fn residuals(p: &Pair, pose: &Isometry3<f64>, cfg: &AlignConfig) -> Vec<(f64, Option<usize>)> {
+    let max_d2 = cfg.overlap_dist * cfg.overlap_dist;
+    // Neighbours spread less than this along the second axis lie on a line: no surface.
+    let min_spread = (0.25 * cfg.fine_voxel).powi(2);
+    let pts = p.tgt.fine.points();
+    let found: Vec<Option<(f64, Option<usize>)>> = p
+        .src_quality
+        .par_iter()
+        .map(|s| {
+            let q = (pose * Point3::from(*s)).coords;
+            let nn = p.tgt.fine.nearest(&q, QUALITY_KNN);
+            let &(i, d2) = nn.first()?;
+            if d2 >= max_d2 || p.src.side(s) * p.tgt.side(&pts[i]) < 0 {
+                return None;
+            }
+            let near: Vec<Vector3<f64>> = nn.iter().map(|&(i, _)| pts[i]).collect();
+            if near.len() < 3 {
+                return Some((d2.sqrt(), None));
+            }
+            let (c, cov) = mean_cov(&near);
+            let axes = spread_axes(&cov);
+            if axes[1].0 < min_spread {
+                return Some((d2.sqrt(), None));
+            }
+            let normal = axes[0].1.normalize();
+            let r = normal.dot(&(q - c)).abs().min(d2.sqrt());
+            Some((r, wall_bin(&normal, axes[0].0, axes[1].0)))
+        })
+        .collect();
+    found.into_iter().flatten().collect()
+}
+
+/// Residual of one wall orientation ([`wall_residuals`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WallResidual {
+    /// Direction of the wall normal about the vertical, centre of its bin (0–180°, in the
+    /// target frame).
+    pub direction_deg: f64,
+    pub points: usize,
+    pub median_mm: f64,
+}
+
+/// The wall groups of `hits` ([`PairQuality::wall_residual_mm`]), by direction.
+fn wall_groups(hits: &[(f64, Option<usize>)]) -> Vec<WallResidual> {
+    let mut bins: Vec<Vec<f64>> = vec![Vec::new(); WALL_BINS];
+    for &(r, bin) in hits {
+        if let Some(b) = bin {
+            bins[b].push(r);
+        }
+    }
+    let total: usize = bins.iter().map(Vec::len).sum();
+    let least = MIN_WALL_POINTS.max((MIN_WALL_SHARE * total as f64).ceil() as usize);
+    bins.into_iter()
+        .enumerate()
+        .filter(|(_, v)| v.len() >= least)
+        .map(|(b, mut v)| WallResidual {
+            direction_deg: (b as f64 + 0.5) * WALL_BIN_DEG,
+            points: v.len(),
+            median_mm: median(&mut v) * 1e3,
+        })
+        .collect()
+}
+
 /// Fit of the pair at `pose` (see [`PairQuality`]).
 fn quality(p: &Pair, pose: &Isometry3<f64>, cfg: &AlignConfig) -> PairQuality {
     let agreement = agreement(
@@ -525,55 +674,28 @@ fn quality(p: &Pair, pose: &Isometry3<f64>, cfg: &AlignConfig) -> PairQuality {
             cfg.overlap_dist,
         ),
     );
-    let max_d2 = cfg.overlap_dist * cfg.overlap_dist;
-    // Neighbours spread less than this along the second axis lie on a line: no surface.
-    let min_spread = (0.25 * cfg.fine_voxel).powi(2);
-    let pts = p.tgt.fine.points();
-    let residuals: Vec<Option<f64>> = p
-        .src_quality
-        .par_iter()
-        .map(|s| {
-            let q = (pose * Point3::from(*s)).coords;
-            let nn = p.tgt.fine.nearest(&q, QUALITY_KNN);
-            let &(i, d2) = nn.first()?;
-            if d2 >= max_d2 || p.src.side(s) * p.tgt.side(&pts[i]) < 0 {
-                return None;
-            }
-            let near: Vec<Vector3<f64>> = nn.iter().map(|&(i, _)| pts[i]).collect();
-            if near.len() < 3 {
-                return Some(d2.sqrt());
-            }
-            let (c, cov) = mean_cov(&near);
-            let axes = spread_axes(&cov);
-            if axes[1].0 < min_spread {
-                return Some(d2.sqrt());
-            }
-            Some(axes[0].1.normalize().dot(&(q - c)).abs().min(d2.sqrt()))
-        })
-        .collect();
-    let mut r: Vec<f64> = residuals.into_iter().flatten().collect();
-    if r.is_empty() {
+    let hits = residuals(p, pose, cfg);
+    if hits.is_empty() {
         return PairQuality {
             tilt_deg: tilt_deg(pose),
             agreement,
             ..PairQuality::NONE
         };
     }
-    let overlap = r.len() as f64 / p.src_quality.len() as f64;
-    r.sort_by(f64::total_cmp);
-    let mid = r.len() / 2;
-    let median = if r.len().is_multiple_of(2) {
-        0.5 * (r[mid - 1] + r[mid])
-    } else {
-        r[mid]
-    };
+    let wall_residual_mm = wall_groups(&hits)
+        .iter()
+        .map(|w| w.median_mm)
+        .fold(0.0, f64::max);
+    let overlap = hits.len() as f64 / p.src_quality.len() as f64;
+    let mut r: Vec<f64> = hits.into_iter().map(|h| h.0).collect();
     let rms = (r.iter().map(|x| x * x).sum::<f64>() / r.len() as f64).sqrt();
     PairQuality {
         overlap,
-        residual_median_mm: median * 1e3,
+        residual_median_mm: median(&mut r) * 1e3,
         residual_rms_mm: rms * 1e3,
         tilt_deg: tilt_deg(pose),
         agreement,
+        wall_residual_mm,
     }
 }
 
@@ -594,6 +716,21 @@ pub fn pair_quality(
             tilt_deg: tilt_deg(pose),
             ..PairQuality::NONE
         },
+    }
+}
+
+/// Every wall group of `source` against `target` at `pose` that counts for
+/// [`PairQuality::wall_residual_mm`], by direction (for measuring the thresholds). Empty if
+/// either cloud has fewer than 3 points.
+pub fn wall_residuals(
+    source: &[Vector3<f64>],
+    target: &[Vector3<f64>],
+    pose: &Isometry3<f64>,
+    cfg: &AlignConfig,
+) -> Vec<WallResidual> {
+    match Pair::new(source, target, cfg) {
+        Ok(p) => wall_groups(&residuals(&p, pose, cfg)),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -653,9 +790,9 @@ impl Icp {
     }
 }
 
-/// ICP parameters of the fine stage: correspondences within `overlap_dist`, planes from 20
-/// neighbours (on 2 cm points 5 neighbours span too little for the plane tests of the
-/// coarse stages), flatter planes accepted (6.5 mm noise on a 5 cm patch), weak prior.
+/// ICP parameters of the fine stage: correspondences within `overlap_dist`, planes from
+/// [`FINE_KNN`] neighbours, flatter planes accepted (6.5 mm noise on a 5 cm patch), weak
+/// prior.
 fn fine_params(cfg: &AlignConfig) -> IcpParams {
     IcpParams {
         knn: FINE_KNN,
@@ -870,6 +1007,7 @@ fn failed(method: AlignMethod, reason: impl Into<String>) -> Alignment {
         quality: PairQuality::NONE,
         verdict: Verdict::Failed(reason.into()),
         runner_up: None,
+        pair_rms_mm: None,
     }
 }
 
@@ -888,10 +1026,42 @@ fn plausible(q: &PairQuality, cfg: &AlignConfig) -> bool {
     agrees(q) && q.overlap >= cfg.min_overlap
 }
 
-/// Verdict of the best candidate: unsure for every threshold it misses (reasons joined by
-/// "; "), and for a runner-up (`runner_up`: its quality) that is as plausible and has at
-/// least `ambiguity` of its overlap.
+/// The reasons (German) why a pose with quality `q` does not fit closely enough: residual over
+/// all points and on the walls, tilt.
+fn fit_reasons(q: &PairQuality, cfg: &AlignConfig) -> Vec<String> {
+    let mut why = Vec::new();
+    if q.residual_median_mm > cfg.max_residual_mm {
+        why.push(format!("Restfehler {:.1} mm", q.residual_median_mm));
+    }
+    if q.wall_residual_mm > cfg.max_wall_residual_mm {
+        why.push(format!("Wände {:.1} mm versetzt", q.wall_residual_mm));
+    }
+    if q.tilt_deg > cfg.max_tilt_deg {
+        why.push(format!("Neigung {:.1}°", q.tilt_deg));
+    }
+    why
+}
+
+fn unsure_if(why: Vec<String>) -> Verdict {
+    if why.is_empty() {
+        Verdict::Sure
+    } else {
+        Verdict::Unsure(why.join("; "))
+    }
+}
+
+/// Verdict of the best candidate: failed below [`FAILED_OVERLAP`] or [`FAILED_AGREEMENT`];
+/// else unsure for every threshold it misses (reasons joined by "; "), and for a runner-up
+/// (`runner_up`: its quality) that is as plausible and has at least `ambiguity` of its
+/// overlap.
 fn judge(q: &PairQuality, runner_up: Option<&PairQuality>, cfg: &AlignConfig) -> Verdict {
+    if q.overlap < FAILED_OVERLAP || q.agreement < FAILED_AGREEMENT {
+        return Verdict::Failed(format!(
+            "keine passende Lage (Überlappung {:.0} %, Kanten passen zu {:.0} %)",
+            100.0 * q.overlap,
+            100.0 * q.agreement
+        ));
+    }
     let mut why = Vec::new();
     if q.overlap < cfg.min_overlap {
         why.push(format!("Überlappung nur {:.0} %", 100.0 * q.overlap));
@@ -899,12 +1069,7 @@ fn judge(q: &PairQuality, runner_up: Option<&PairQuality>, cfg: &AlignConfig) ->
     if !agrees(q) {
         why.push(format!("Kanten passen nur zu {:.0} %", 100.0 * q.agreement));
     }
-    if q.residual_median_mm > cfg.max_residual_mm {
-        why.push(format!("Restfehler {:.1} mm", q.residual_median_mm));
-    }
-    if q.tilt_deg > cfg.max_tilt_deg {
-        why.push(format!("Neigung {:.1}°", q.tilt_deg));
-    }
+    why.extend(fit_reasons(q, cfg));
     if let Some(r) = runner_up {
         if plausible(r, cfg) == plausible(q, cfg) && r.overlap >= cfg.ambiguity * q.overlap {
             why.push(format!(
@@ -914,11 +1079,39 @@ fn judge(q: &PairQuality, runner_up: Option<&PairQuality>, cfg: &AlignConfig) ->
             ));
         }
     }
-    if why.is_empty() {
-        Verdict::Sure
-    } else {
-        Verdict::Unsure(why.join("; "))
+    unsure_if(why)
+}
+
+/// The verdict [`align_pair`] gives a best candidate of quality `q` that has no runner-up
+/// (for measuring the thresholds at a given pose with [`pair_quality`]).
+pub fn verdict(q: &PairQuality, cfg: &AlignConfig) -> Verdict {
+    judge(q, None, cfg)
+}
+
+/// Verdict of [`align_with_pairs`]: unsure if the pairs lie more than
+/// [`AlignConfig::max_pair_rms_mm`] (RMS, `pair_rms_mm`) from the refined pose, or for a
+/// residual or tilt over its limit ([`fit_reasons`]). Overlap, agreement and ambiguity do not
+/// count: the user chose the place, and at a door or a short corridor the right pose
+/// overlaps too little for them.
+fn judge_pairs(q: &PairQuality, pair_rms_mm: f64, cfg: &AlignConfig) -> Verdict {
+    let mut why = Vec::new();
+    if pair_rms_mm.is_nan() || pair_rms_mm > cfg.max_pair_rms_mm {
+        why.push(format!(
+            "Punktpaare liegen im Mittel {:.1} cm neben der Lage",
+            pair_rms_mm / 10.0
+        ));
     }
+    why.extend(fit_reasons(q, cfg));
+    unsure_if(why)
+}
+
+/// RMS distance (mm) of the pairs (source point, target point) at `pose`; `pairs` not empty.
+fn pair_rms_mm(pairs: &[(Vector3<f64>, Vector3<f64>)], pose: &Isometry3<f64>) -> f64 {
+    let sum: f64 = pairs
+        .iter()
+        .map(|(s, t)| ((pose * Point3::from(*s)).coords - t).norm_squared())
+        .sum();
+    (sum / pairs.len() as f64).sqrt() * 1e3
 }
 
 /// Order of the candidates, best first: plausible first, then the largest overlap; ties keep
@@ -1010,13 +1203,14 @@ pub fn align_pair(
             let turn =
                 Translation3::from(c) * yaw_pose(yaw, Vector3::zeros()) * Translation3::from(-c);
             // A source that looks the same turned is already in place there; it is rated
-            // as it is, since the ICP can drag it away (towards furniture only the target
+            // as it is too, since the ICP can drag it away (towards furniture only the target
             // has, 7–10 cm in the synthetic room of the merge tests). The refined one
-            // covers a source that looks almost the same.
+            // covers a source that looks almost the same, and goes first: of two equally good
+            // ones the refined pose is kept.
             let init = start * turn;
-            refined.push((init, quality(&p, &init, cfg), method));
             let (pose, q) = refine(&p, &icp, &init, cfg);
             refined.push((pose, q, method));
+            refined.push((init, quality(&p, &init, cfg), method));
         }
     }
     let order = rank(&refined, cfg);
@@ -1033,12 +1227,15 @@ pub fn align_pair(
         quality,
         verdict: judge(&quality, runner.map(|r| &r.1), cfg),
         runner_up: runner.map(|r| (r.0, r.1.overlap)),
+        pair_rms_mm: None,
     }
 }
 
 /// Aligns `source` to `target` from point pairs marked by hand (source point, target point):
-/// [`pose_from_pairs`] as start, then ICP and rating as in [`align_pair`] with this one
-/// candidate and without the ambiguity test (the user chose the place).
+/// [`pose_from_pairs`] as start, then ICP as in [`align_pair`], rated by how well the pairs
+/// fit the refined pose ([`Alignment::pair_rms_mm`]) and by the residuals and the tilt;
+/// overlap, agreement and ambiguity do not count (the user chose the place; see the module
+/// documentation).
 pub fn align_with_pairs(
     source: &[Vector3<f64>],
     target: &[Vector3<f64>],
@@ -1067,12 +1264,14 @@ pub fn align_with_pairs(
         return cancelled(method);
     }
     let (pose, quality) = refine(&p, &icp, &init, cfg);
+    let rms = pair_rms_mm(pairs, &pose);
     Alignment {
         pose,
         method,
         quality,
-        verdict: judge(&quality, None, cfg),
+        verdict: judge_pairs(&quality, rms, cfg),
         runner_up: None,
+        pair_rms_mm: Some(rms),
     }
 }
 
@@ -1184,6 +1383,7 @@ mod tests {
             residual_rms_mm: 3.0,
             tilt_deg: 0.2,
             agreement: 0.98,
+            wall_residual_mm: 2.0,
         }
     }
 
@@ -1196,14 +1396,90 @@ mod tests {
             residual_median_mm: 7.0,
             tilt_deg: 4.0,
             agreement: 0.5,
+            wall_residual_mm: 3.5,
             ..good()
         };
         let Verdict::Unsure(why) = judge(&bad, None, &cfg) else {
             panic!("not unsure");
         };
-        for word in ["Überlappung", "Kanten", "Restfehler", "Neigung"] {
+        for word in [
+            "Überlappung",
+            "Kanten",
+            "Restfehler",
+            "Wände 3.5 mm",
+            "Neigung",
+        ] {
             assert!(why.contains(word), "{why}");
         }
+        // Next to nothing in common, or edges that almost all disagree: no place at all.
+        for garbage in [
+            PairQuality {
+                overlap: 0.0,
+                agreement: 1.0,
+                ..PairQuality::NONE
+            },
+            PairQuality {
+                agreement: 0.2,
+                ..good()
+            },
+        ] {
+            assert!(
+                matches!(judge(&garbage, None, &cfg), Verdict::Failed(w) if w.contains("keine passende Lage")),
+                "{garbage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn judge_pairs_ignores_overlap_and_edges() {
+        let cfg = AlignConfig::default();
+        let narrow = PairQuality {
+            overlap: 0.04,
+            agreement: 0.6,
+            ..good()
+        };
+        assert!(matches!(judge(&narrow, None, &cfg), Verdict::Unsure(_)));
+        assert_eq!(judge_pairs(&narrow, 12.0, &cfg), Verdict::Sure);
+        let Verdict::Unsure(why) = judge_pairs(&narrow, 80.0, &cfg) else {
+            panic!("not unsure");
+        };
+        assert!(why.contains("Punktpaare liegen im Mittel 8.0 cm"), "{why}");
+        assert!(matches!(
+            judge_pairs(&narrow, f64::NAN, &cfg),
+            Verdict::Unsure(_)
+        ));
+        let walls = PairQuality {
+            wall_residual_mm: 9.0,
+            ..narrow
+        };
+        assert!(
+            matches!(judge_pairs(&walls, 5.0, &cfg), Verdict::Unsure(w) if w.contains("Wände"))
+        );
+    }
+
+    #[test]
+    fn wall_groups_take_large_groups_by_direction() {
+        let mut hits = Vec::new();
+        // Wall at 0° (bin 0) 1 mm, wall at 90° (bin 9) 4 mm, a small group at 45° 50 mm,
+        // floor points without a bin 20 mm.
+        hits.extend(std::iter::repeat_n((0.001, Some(0)), 1000));
+        hits.extend(std::iter::repeat_n((0.004, Some(9)), 800));
+        hits.extend(std::iter::repeat_n((0.05, Some(4)), 60));
+        hits.extend(std::iter::repeat_n((0.02, None), 5000));
+        let groups = wall_groups(&hits);
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        assert_eq!(groups[0].direction_deg, 5.0);
+        assert_eq!(groups[0].points, 1000);
+        assert!((groups[0].median_mm - 1.0).abs() < 1e-9);
+        assert!((groups[1].median_mm - 4.0).abs() < 1e-9);
+        let v = |x: f64, y: f64, z: f64| Vector3::new(x, y, z).normalize();
+        assert_eq!(wall_bin(&v(1.0, 0.001, 0.0), 1e-6, 1e-4), Some(0));
+        // Seen from the other side: the same bin.
+        assert_eq!(wall_bin(&v(-1.0, -0.001, 0.0), 1e-6, 1e-4), Some(0));
+        assert_eq!(wall_bin(&v(0.0, 1.0, 0.05), 1e-6, 1e-4), Some(9));
+        // A floor, an edge.
+        assert_eq!(wall_bin(&v(0.0, 0.0, 1.0), 1e-6, 1e-4), None);
+        assert_eq!(wall_bin(&v(1.0, 0.0, 0.0), 1e-5, 1e-4), None);
     }
 
     #[test]
