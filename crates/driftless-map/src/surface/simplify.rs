@@ -1,6 +1,7 @@
 //! Triangle reduction: flat walls become a few big triangles, the shape stays within a tight error.
-//! Then edges longer than [`SurfaceConfig::max_edge`] are split, so that every face fits into
-//! a camera image for the texture, and slivers on flat parts are turned into rounder faces by
+//! Then edges longer than [`SurfaceConfig::max_edge`] or [`TEXTURE_EDGE_VOXELS`] voxels are
+//! split, so that every face fits into a camera image and is small enough for the texture's
+//! seam levelling, and slivers on flat parts are turned into rounder faces by
 //! edge flips ([`improve_triangles`]). Finally every vertex of the input is checked against the
 //! result ([`far_vertices`]); those too far away are locked and the reduction runs again.
 
@@ -17,13 +18,22 @@ const MAX_SPLIT_ROUNDS: usize = 40;
 /// left further than [`SurfaceConfig::simplify_error`] from the result.
 const MAX_LOCK_ROUNDS: usize = 4;
 
+/// Edges of the textured mesh are at most this many voxels long (and at most
+/// [`SurfaceConfig::max_edge`], the bound for coarse voxels): the seam levelling has one gain
+/// per vertex and the labels are per face, so large flat triangles (a merged model's floor,
+/// fused from several scans and simplified further than a single scan's) cannot follow the
+/// brightness that changes from image to image and show polygonal blotches. Black room model
+/// at 1 cm: `seam_step` 23.31 → 19.24 with 4 voxels (together with 16 views per face and the
+/// gray fill), faces 1.97 → 2.92 M.
+pub const TEXTURE_EDGE_VOXELS: f64 = 4.0;
+
 /// Reduces the triangles of `mesh` with meshoptimizer.
 ///
 /// The vertices of `mesh` stay within `cfg.simplify_error` (m) of the result (see below), and the
 /// vertices on the border of the mesh stay where they are, so open edges keep their length.
 /// Vertices no face uses after the reduction are dropped; the order of the rest is kept. Every
-/// edge longer than `cfg.max_edge` is split at its midpoint (see [`split_long_edges`]), slivers
-/// are flipped (see [`improve_triangles`]).
+/// edge longer than `cfg.max_edge` or [`TEXTURE_EDGE_VOXELS`] · `cfg.voxel` is split at its
+/// midpoint (see [`split_long_edges`]), slivers are flipped (see [`improve_triangles`]).
 ///
 /// meshoptimizer's error limit alone does not give that bound: its error is a weighted mean of
 /// the squared distances to the planes merged into a vertex, so where a thin part (a rod, a
@@ -44,6 +54,7 @@ pub fn simplify(mesh: &Mesh, cfg: &SurfaceConfig) -> Mesh {
     let adapter = VertexDataAdapter::new(bytes, 12, 0).expect("Eckpunkte sind drei f32 je Punkt");
     let mut lock = vec![false; mesh.positions.len()];
     let mut round = 0;
+    let max_edge = cfg.max_edge.min(TEXTURE_EDGE_VOXELS * cfg.voxel);
     loop {
         // Target count 0: reduce as far as the error allows. The error is absolute (m), which
         // is the same as the relative error of the brief scaled by the extent of the mesh.
@@ -61,12 +72,8 @@ pub fn simplify(mesh: &Mesh, cfg: &SurfaceConfig) -> Mesh {
             indices: reduced.as_chunks::<3>().0.to_vec(),
         };
         drop_unused(&mut out);
-        split_long_edges(&mut out, cfg.max_edge);
-        improve_triangles(
-            &mut out,
-            MAX_FLIP_DEVIATION * cfg.simplify_error,
-            cfg.max_edge,
-        );
+        split_long_edges(&mut out, max_edge);
+        improve_triangles(&mut out, MAX_FLIP_DEVIATION * cfg.simplify_error, max_edge);
         if round == MAX_LOCK_ROUNDS {
             return out;
         }
@@ -84,39 +91,81 @@ pub fn simplify(mesh: &Mesh, cfg: &SurfaceConfig) -> Mesh {
 /// The vertices of `from` (those a face uses) further than `max` (m) from every face of `to`,
 /// in ascending order. A grid of cells finds the faces near a vertex: each face is listed in
 /// every cell its bounding box, grown by `max`, touches.
+///
+/// The cells are as large as the mean edge of `to` (at least `2 · max`), and the grid is one
+/// sorted list of (cell, face), 16 bytes per entry and a few entries per face. Cells of an
+/// eighth of the longest edge in a hash map of lists were tiny once the edges were split to
+/// 4 cm (5-mm cells, dozens per face, each list its own allocation): on the merged black room
+/// at 1 cm (2.9 M faces) the process grew to 6.7 GB in this function, now to 1.9 GB.
 pub(crate) fn far_vertices(from: &Mesh, to: &Mesh, max: f64) -> Vec<u32> {
     let up = |p: [f32; 3]| p.map(f64::from);
-    let tris: Vec<[[f64; 3]; 3]> = to
-        .indices
-        .iter()
-        .map(|f| f.map(|i| up(to.positions[i as usize])))
-        .collect();
-    let longest = tris
-        .iter()
-        .flat_map(|t| {
-            (0..3).map(move |k| dot(sub(t[k], t[(k + 1) % 3]), sub(t[k], t[(k + 1) % 3])).sqrt())
-        })
-        .fold(0.0, f64::max);
-    // About 8 cells along the longest edge (at most 0.3 m after the split: 3.75 cm), never
-    // smaller than the reach itself.
-    let cell = (longest / 8.0).max(2.0 * max).max(1e-3);
-    let cell_of = |x: f64| (x / cell).floor() as i64;
-    let mut grid: HashMap<[i64; 3], Vec<u32>> = HashMap::new();
-    for (f, t) in tris.iter().enumerate() {
-        let lo = [0, 1, 2].map(|k| cell_of(t[0][k].min(t[1][k]).min(t[2][k]) - max));
-        let hi = [0, 1, 2].map(|k| cell_of(t[0][k].max(t[1][k]).max(t[2][k]) + max));
-        for x in lo[0]..=hi[0] {
-            for y in lo[1]..=hi[1] {
-                for z in lo[2]..=hi[2] {
-                    grid.entry([x, y, z]).or_default().push(f as u32);
-                }
-            }
+    let tri = |f: usize| to.indices[f].map(|i| up(to.positions[i as usize]));
+    let used = || {
+        let mut used = vec![false; from.positions.len()];
+        for &v in from.indices.iter().flatten() {
+            used[v as usize] = true;
         }
+        used
+    };
+    if to.indices.is_empty() {
+        let used = used();
+        return (0..from.positions.len() as u32)
+            .filter(|&v| used[v as usize])
+            .collect();
     }
-    let mut used = vec![false; from.positions.len()];
-    for &v in from.indices.iter().flatten() {
-        used[v as usize] = true;
-    }
+    let length: f64 = (0..to.indices.len())
+        .into_par_iter()
+        .map(|f| {
+            let t = tri(f);
+            (0..3)
+                .map(|k| dot(sub(t[k], t[(k + 1) % 3]), sub(t[k], t[(k + 1) % 3])).sqrt())
+                .sum::<f64>()
+        })
+        .sum();
+    let mean_edge = length / (3 * to.indices.len()) as f64;
+    let (lo_all, hi_all) = to.positions.iter().fold(
+        ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]),
+        |(lo, hi), p| {
+            (
+                [0, 1, 2].map(|k| lo[k].min(f64::from(p[k]))),
+                [0, 1, 2].map(|k| hi[k].max(f64::from(p[k]))),
+            )
+        },
+    );
+    // Cell coordinates of 21 bits per axis, packed into one key; coarser cells if the mesh is
+    // too large for that.
+    const BITS: u32 = 21;
+    let span = (0..3)
+        .map(|k| hi_all[k] - lo_all[k] + 4.0 * max)
+        .fold(0.0, f64::max);
+    let cell = mean_edge
+        .max(2.0 * max)
+        .max(1e-3)
+        .max(span / f64::from((1u32 << BITS) - 4));
+    let origin = lo_all.map(|x| x - max - cell);
+    let coord = |x: f64, k: usize| ((x - origin[k]) / cell).floor() as i64;
+    let key = |c: [i64; 3]| -> Option<u64> {
+        let limit = 1i64 << BITS;
+        c.iter()
+            .all(|&x| (0..limit).contains(&x))
+            .then(|| (c[0] as u64) << (2 * BITS) | (c[1] as u64) << BITS | c[2] as u64)
+    };
+    let mut grid: Vec<(u64, u32)> = (0..to.indices.len())
+        .into_par_iter()
+        .flat_map_iter(|f| {
+            let t = tri(f);
+            let lo = [0, 1, 2].map(|k| coord(t[0][k].min(t[1][k]).min(t[2][k]) - max, k));
+            let hi = [0, 1, 2].map(|k| coord(t[0][k].max(t[1][k]).max(t[2][k]) + max, k));
+            (lo[0]..=hi[0]).flat_map(move |x| {
+                (lo[1]..=hi[1]).flat_map(move |y| {
+                    (lo[2]..=hi[2])
+                        .map(move |z| (key([x, y, z]).expect("cell within the grid"), f as u32))
+                })
+            })
+        })
+        .collect();
+    grid.par_sort_unstable();
+    let used = used();
     let max_sq = max * max;
     (0..from.positions.len() as u32)
         .into_par_iter()
@@ -125,11 +174,14 @@ pub(crate) fn far_vertices(from: &Mesh, to: &Mesh, max: f64) -> Vec<u32> {
                 return false;
             }
             let p = up(from.positions[v as usize]);
-            let near = grid.get(&p.map(cell_of)).is_some_and(|faces| {
-                faces
-                    .iter()
-                    .any(|&f| point_triangle_sq(p, tris[f as usize]) <= max_sq)
-            });
+            let Some(k) = key([0, 1, 2].map(|i| coord(p[i], i))) else {
+                return true;
+            };
+            let first = grid.partition_point(|e| e.0 < k);
+            let near = grid[first..]
+                .iter()
+                .take_while(|e| e.0 == k)
+                .any(|&(_, f)| point_triangle_sq(p, tri(f as usize)) <= max_sq);
             !near
         })
         .collect()
@@ -440,6 +492,15 @@ mod tests {
         SurfaceConfig::default()
     }
 
+    /// [`cfg`] with a voxel so coarse that `max_edge` alone limits the edges.
+    fn coarse(max_edge: f64) -> SurfaceConfig {
+        SurfaceConfig {
+            voxel: max_edge / TEXTURE_EDGE_VOXELS * 2.0,
+            max_edge,
+            ..cfg()
+        }
+    }
+
     /// A flat wall `x = 0.5` of `nx × ny` squares of `step` (m), normals `+x`.
     fn grid_wall(nx: usize, ny: usize, step: f32) -> Mesh {
         let mut mesh = Mesh::default();
@@ -486,13 +547,7 @@ mod tests {
     fn flat_wall_gets_few_triangles() {
         let mesh = grid_wall(300, 250, 0.01); // 3 × 2.5 m
                                               // The reduction alone; the split of long edges is checked in `long_edges_are_split`.
-        let out = simplify(
-            &mesh,
-            &SurfaceConfig {
-                max_edge: 100.0,
-                ..cfg()
-            },
-        );
+        let out = simplify(&mesh, &coarse(100.0));
         assert!(
             out.indices.len() * 100 < mesh.indices.len(),
             "{} von {} Dreiecken übrig",
@@ -575,16 +630,10 @@ mod tests {
     #[test]
     fn long_edges_are_split() {
         let mesh = grid_wall(300, 250, 0.01); // 3 × 2.5 m
-        let unsplit = simplify(
-            &mesh,
-            &SurfaceConfig {
-                max_edge: 100.0,
-                ..cfg()
-            },
-        );
+        let unsplit = simplify(&mesh, &coarse(100.0));
         assert!(longest_edge(&unsplit) > 1.0, "{}", longest_edge(&unsplit));
-        let out = simplify(&mesh, &cfg());
         let max_edge = cfg().max_edge;
+        let out = simplify(&mesh, &coarse(max_edge));
         assert!(longest_edge(&out) <= max_edge, "{}", longest_edge(&out));
         assert!(out.indices.len() > unsplit.indices.len());
         // The fans from the locked 1-cm border to the inside are split too, which costs most
@@ -611,7 +660,62 @@ mod tests {
         assert_eq!(before, (0, 0));
         assert!(longest_edge(&slab) <= 0.3);
         // Deterministic.
-        assert_eq!(simplify(&mesh, &cfg()), out);
+        assert_eq!(simplify(&mesh, &coarse(max_edge)), out);
+    }
+
+    #[test]
+    fn max_edge_is_capped_by_the_voxel() {
+        let mesh = grid_wall(300, 250, 0.01); // 3 × 2.5 m
+        for voxel in [0.01, 0.02] {
+            let cfg = SurfaceConfig { voxel, ..cfg() };
+            assert!(TEXTURE_EDGE_VOXELS * voxel < cfg.max_edge);
+            let out = simplify(&mesh, &cfg);
+            let longest = longest_edge(&out);
+            assert!(longest <= TEXTURE_EDGE_VOXELS * voxel, "{voxel}: {longest}");
+            assert!(
+                longest > 0.5 * TEXTURE_EDGE_VOXELS * voxel,
+                "{voxel}: {longest}"
+            );
+            assert!(out.positions.iter().all(|p| (p[0] - 0.5).abs() <= 0.001));
+        }
+        // A coarse voxel: `max_edge` is the bound.
+        let out = simplify(&mesh, &coarse(0.3));
+        assert!(longest_edge(&out) <= 0.3);
+        assert!(longest_edge(&out) > TEXTURE_EDGE_VOXELS * cfg().voxel);
+    }
+
+    /// [`far_vertices`] against a search over all faces.
+    #[test]
+    fn far_vertices_match_brute_force() {
+        let (from, _) = rod_on_wall(30, 0.01, 20);
+        let to = simplify(&from, &cfg());
+        let up = |p: [f32; 3]| p.map(f64::from);
+        // Shifted a little, so that some vertices are near and some far.
+        let mut moved = to.clone();
+        for (i, p) in moved.positions.iter_mut().enumerate() {
+            p[0] += 0.0005 * (i % 7) as f32;
+        }
+        // Only vertices a face uses: the fixture leaves orphans behind.
+        let used: std::collections::BTreeSet<u32> =
+            from.indices.iter().flatten().copied().collect();
+        for max in [0.0005, 0.001, 0.002, 0.005] {
+            let want: Vec<u32> = (0..from.positions.len() as u32)
+                .filter(|v| used.contains(v))
+                .filter(|&v| {
+                    let p = up(from.positions[v as usize]);
+                    moved.indices.iter().all(|f| {
+                        point_triangle_sq(p, f.map(|i| up(moved.positions[i as usize]))) > max * max
+                    })
+                })
+                .collect();
+            assert_eq!(far_vertices(&from, &moved, max), want, "{max}");
+        }
+        assert!(!far_vertices(&from, &moved, 0.0005).is_empty());
+        // Nothing to be near to: all used vertices are far.
+        assert_eq!(
+            far_vertices(&from, &Mesh::default(), 0.002).len(),
+            used.len()
+        );
     }
 
     /// Smallest angle of any face of `mesh` (rad).
