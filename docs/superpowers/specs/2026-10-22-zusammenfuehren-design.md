@@ -48,10 +48,30 @@ Erfolg heißt:
    z. B. das Ergebnis von heute). Ohne Projekt nur ansehen.
 7. Wie bisher: nichts wird überschrieben, jedes Zusammenführen ist ein eigener Stand, Abbrechen
    hinterlässt keine halben Dateien.
+8. **Oberfläche aus dem Modell** (Nachtrag 27.10.): Der Oberflächen-Schritt läuft auf einem Modell wie
+   auf einem einzelnen Lauf und nimmt die Bilder **aller** Scans. Nur so werden Stellen, die ein
+   Durchgang übersehen hat, auch farbig gefüllt. Die Belichtung wird über alle Scans gemeinsam
+   angeglichen.
+
+## 2a. Qualitätsziele (Nachtrag 27.10.)
+
+Yannick scannt denselben Raum mehrmals, um übersehene Stellen zu erwischen. Das Modell soll die Lücken
+füllen, **ohne neue Artefakte**. Gemessen mit den Werkzeugen der Qualitätsrunde
+(`tools/qualitaet/`), Vergleich gegen den besten einzelnen Scan (S1 = 133554, 1 cm):
+
+| Artefakt | Messgröße | Ziel |
+|---|---|---|
+| Doppelte Wände | Restversatz zwischen den Scans an Wänden (Median) | ≤ 3 mm, sonst Paar „unsicher“ |
+| Dicke Flächen | Wanddicke im Modell nach dem Glätten | nicht dicker als im einzelnen Scan (+0,5 mm Toleranz) |
+| Fleckige Farben | Belichtung gemeinsam, `seam_step` Mittel | nicht schlechter als im einzelnen Scan |
+| Lücken | Flächen ohne Bild %, Löcher | weniger als im besten einzelnen Scan |
+| Genauigkeit | Wände Median mm | nicht schlechter als im einzelnen Scan (+0,2 mm) |
+
+Die Werte kommen in `docs/ergebnisse/` wie bei der Qualitätsrunde.
 
 ## 3. Nicht-Ziele (später)
 
-- Fotoähnliche Oberfläche (Baustein 2), Export E57/LAZ/Mesh und Installer (Baustein 3).
+- Export E57/LAZ/Mesh und Installer (Baustein 3).
 - Gemeinsame Optimierung aller Laufbahnen über Scan-Grenzen (ein Pose-Graph über alle Scans). Jeder
   Scan bleibt in sich, wie SLAM ihn gerechnet hat; nur die Lage als Ganzes wird bestimmt.
 - Stockwerke ohne gemeinsamen Bereich (Treppe nicht mitgescannt): bleibt Handarbeit über Punktpaare.
