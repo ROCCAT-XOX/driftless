@@ -84,6 +84,120 @@ impl Points {
     }
 }
 
+/// Points per block that a streaming reader hands to its [`PointSink`].
+pub const SINK_BLOCK: usize = 1 << 16;
+
+impl Points {
+    /// An empty cloud with the columns of `layout`, each with room for `capacity` points.
+    pub(crate) fn with_layout(layout: Layout, capacity: usize) -> Points {
+        fn col<T>(on: bool, capacity: usize) -> Option<Vec<T>> {
+            on.then(|| Vec::with_capacity(capacity))
+        }
+        Points {
+            xyz: Vec::with_capacity(capacity),
+            rgb: col(layout.rgb, capacity),
+            intensity: col(layout.intensity, capacity),
+            source: col(layout.source, capacity),
+            time: col(layout.time, capacity),
+            flags: col(layout.flags, capacity),
+            scans: Vec::new(),
+        }
+    }
+
+    /// Removes the points, keeps the columns and their room.
+    pub(crate) fn clear(&mut self) {
+        fn clear<T>(col: &mut Option<Vec<T>>) {
+            if let Some(c) = col {
+                c.clear();
+            }
+        }
+        self.xyz.clear();
+        clear(&mut self.rgb);
+        clear(&mut self.intensity);
+        clear(&mut self.source);
+        clear(&mut self.time);
+        clear(&mut self.flags);
+    }
+}
+
+/// What a streaming reader ([`crate::las::read_las_into`], [`crate::e57::read_e57_into`])
+/// knows before the first block.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReadStart {
+    /// The columns of every block.
+    pub layout: Layout,
+    /// The points the file claims, bounded by its size: room to reserve, not a promise.
+    pub capacity: usize,
+    /// The bounds the file states (the LAS header), unchecked; `None` if it states none.
+    pub bounds: Option<([f64; 3], [f64; 3])>,
+}
+
+/// What a streaming reader knows after the last block.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReadEnd {
+    /// As [`Points::scans`].
+    pub scans: Vec<ScanInfo>,
+    /// The colours of the whole file are 8-bit values (maximum ≤ 255, some foreign LAS):
+    /// the blocks hold them as stored, [`read_points`] widens them ×257.
+    pub rgb_eight_bit: bool,
+    /// The same for the intensities.
+    pub intensity_eight_bit: bool,
+}
+
+/// Receives the points of a streaming reader block by block, so that a caller can keep them
+/// in its own form without holding the whole [`Points`] (43 B per point) as well.
+pub trait PointSink {
+    /// Called once, before the first block.
+    fn start(&mut self, start: &ReadStart);
+    /// Up to [`SINK_BLOCK`] points with the columns of [`ReadStart::layout`]; its `scans` is
+    /// empty (see [`ReadEnd::scans`]).
+    fn block(&mut self, block: &Points);
+}
+
+/// The sink of the plain readers: all blocks into one [`Points`].
+#[derive(Default)]
+pub(crate) struct Collect(Points);
+
+impl PointSink for Collect {
+    fn start(&mut self, start: &ReadStart) {
+        self.0 = Points::with_layout(start.layout, start.capacity);
+    }
+
+    fn block(&mut self, block: &Points) {
+        fn extend<T: Copy>(to: &mut Option<Vec<T>>, from: &Option<Vec<T>>) {
+            if let (Some(to), Some(from)) = (to, from) {
+                to.extend_from_slice(from);
+            }
+        }
+        let out = &mut self.0;
+        out.xyz.extend_from_slice(&block.xyz);
+        extend(&mut out.rgb, &block.rgb);
+        extend(&mut out.intensity, &block.intensity);
+        extend(&mut out.source, &block.source);
+        extend(&mut out.time, &block.time);
+        extend(&mut out.flags, &block.flags);
+    }
+}
+
+impl Collect {
+    /// The collected points with the scans of `end`, 8-bit columns widened ×257.
+    pub(crate) fn finish(self, end: ReadEnd) -> Points {
+        let mut out = self.0;
+        if let Some(rgb) = out.rgb.as_mut().filter(|_| end.rgb_eight_bit) {
+            for c in rgb.iter_mut() {
+                *c = c.map(|v| v * 257);
+            }
+        }
+        if let Some(intensity) = out.intensity.as_mut().filter(|_| end.intensity_eight_bit) {
+            for v in intensity.iter_mut() {
+                *v *= 257;
+            }
+        }
+        out.scans = end.scans;
+        out
+    }
+}
+
 /// Read access to a cloud, point by point, for the writers. A column the [`Layout`] does not
 /// have reads as zero.
 pub trait PointSource {

@@ -3,7 +3,7 @@
 //! even for coordinates of ~10⁶ m.
 
 use crate::lod::{build_octree, Octree};
-use driftless_export::Points;
+use driftless_export::{Layout, PointFormat, PointSink, Points, ReadEnd, ReadStart};
 use driftless_io::progress::Progress;
 use driftless_slam::report::SlamReport;
 use driftless_steps::overlay::submap_at;
@@ -176,13 +176,220 @@ pub fn point_set(points: Points, slam: Option<&SlamReport>) -> PointSet {
 /// extension (LAS, LAZ, E57, PLY, PCD; phase [`driftless_export::PHASE_READ`], a cancel check
 /// per block), as a [`PointSet`] ([`point_set`]). With `slam`, points with times get the
 /// quality of their submap. Errors carry the reader's German message and name the file.
+///
+/// LAS, LAZ and E57 go block by block straight into the [`PointSet`] ([`Streamed`]): at the
+/// peak about 28 B per point instead of the 43 B of [`Points`] plus the columns being
+/// converted. PLY and PCD scale their intensities by the maximum of the whole file and go
+/// through [`Points`].
 pub fn load_points(
     path: &Path,
     slam: Option<&SlamReport>,
     progress: &Progress,
 ) -> Result<PointSet, StepError> {
-    let points = driftless_export::read_points(path, progress)?;
-    Ok(point_set(points, slam))
+    let mut sink = Streamed::new(slam);
+    let end = match PointFormat::from_path(path) {
+        Some(PointFormat::Las | PointFormat::Laz) => {
+            driftless_export::las::read_las_into(path, &mut sink, progress)?
+        }
+        Some(PointFormat::E57) => driftless_export::e57::read_e57_into(path, &mut sink, progress)?,
+        _ => {
+            let points = driftless_export::read_points(path, progress)?;
+            return Ok(point_set(points, slam));
+        }
+    };
+    Ok(sink.finish(&end))
+}
+
+/// Points of the first block checked against the bounds a file states.
+const ORIGIN_SAMPLE: usize = 16;
+
+/// Builds a [`PointSet`] from the blocks of a streaming reader, with the same result as
+/// [`point_set`] of the whole [`Points`]:
+/// - positions relative to the centre of the stated bounds (if the first points lie inside
+///   them) or to the first point, in whole metres; at the end shifted to the rounded centre
+///   of the real bounds if that differs (an exact whole-metre step);
+/// - colour and intensity as their high byte, and their low byte as long as no value above
+///   255 has come, for a file that turns out to hold 8-bit values ([`ReadEnd`]).
+struct Streamed<'a> {
+    slam: Option<&'a SlamReport>,
+    set: PointSet,
+    layout: Layout,
+    stated: Option<([f64; 3], [f64; 3])>,
+    /// Origin of `set.xyz` while reading; `None` before the first point.
+    origin: Option<[f64; 3]>,
+    min: [f64; 3],
+    max: [f64; 3],
+    t0: Option<f64>,
+    low_rgb: Option<Vec<[u8; 3]>>,
+    low_intensity: Option<Vec<u8>>,
+    any_intensity: bool,
+}
+
+impl<'a> Streamed<'a> {
+    fn new(slam: Option<&'a SlamReport>) -> Self {
+        Streamed {
+            slam,
+            set: PointSet::default(),
+            layout: Layout::default(),
+            stated: None,
+            origin: None,
+            min: [f64::INFINITY; 3],
+            max: [f64::NEG_INFINITY; 3],
+            t0: slam.map(|s| s.scan_start),
+            low_rgb: None,
+            low_intensity: None,
+            any_intensity: false,
+        }
+    }
+
+    /// The origin for the first block: the centre of the stated bounds if they are finite,
+    /// not all zero and hold the first points (slack for the LAS rounding), else the first
+    /// point, in whole metres.
+    fn first_origin(&self, first: &[[f64; 3]]) -> [f64; 3] {
+        const SLACK: f64 = 0.01;
+        let p0 = first[0];
+        match self.stated {
+            Some((min, max))
+                if min.iter().chain(&max).all(|v| v.is_finite())
+                    && min.iter().chain(&max).any(|&v| v != 0.0)
+                    && first.iter().take(ORIGIN_SAMPLE).all(|p| {
+                        (0..3).all(|k| p[k] >= min[k] - SLACK && p[k] <= max[k] + SLACK)
+                    }) =>
+            {
+                std::array::from_fn(|k| ((min[k] + max[k]) / 2.0).round())
+            }
+            _ => p0.map(|v| if v.is_finite() { v.round() } else { 0.0 }),
+        }
+    }
+
+    fn finish(mut self, end: &ReadEnd) -> PointSet {
+        let set = &mut self.set;
+        let n = set.xyz.len();
+        // the origin of `point_set`: the rounded centre of the real bounds
+        let origin: [f64; 3] = std::array::from_fn(|k| ((self.min[k] + self.max[k]) / 2.0).round());
+        let origin = if n > 0 && origin.iter().all(|v| v.is_finite()) {
+            origin
+        } else {
+            [0.0; 3]
+        };
+        let read = self.origin.unwrap_or(origin);
+        if read != origin {
+            let shift: [f32; 3] = std::array::from_fn(|k| (read[k] - origin[k]) as f32);
+            for p in &mut set.xyz {
+                for k in 0..3 {
+                    p[k] += shift[k];
+                }
+            }
+        }
+        set.origin = origin;
+        if end.rgb_eight_bit {
+            if let (Some(rgb), Some(low)) = (&mut set.rgb, self.low_rgb.take()) {
+                *rgb = low;
+            }
+        }
+        if end.intensity_eight_bit {
+            if let Some(low) = self.low_intensity.take() {
+                set.intensity = low;
+            }
+        }
+        if !self.layout.intensity || !self.any_intensity {
+            set.intensity.clear();
+            set.intensity.resize(n, MID_GRAY);
+        }
+        set.quality_known = self.layout.time && self.slam.is_some();
+        if set.source.windows(2).all(|w| w[0] == w[1]) {
+            set.source = Vec::new();
+        }
+        self.set
+    }
+}
+
+impl PointSink for Streamed<'_> {
+    fn start(&mut self, start: &ReadStart) {
+        let n = start.capacity;
+        let layout = start.layout;
+        self.layout = layout;
+        self.stated = start.bounds;
+        self.set = PointSet {
+            origin: [0.0; 3],
+            xyz: Vec::with_capacity(n),
+            rgb: layout.rgb.then(|| Vec::with_capacity(n)),
+            intensity: Vec::with_capacity(n),
+            t: Vec::with_capacity(n),
+            quality: Vec::with_capacity(n),
+            quality_known: false,
+            flags: Vec::with_capacity(n),
+            source: Vec::with_capacity(if layout.source { n } else { 0 }),
+        };
+        self.low_rgb = layout.rgb.then(|| Vec::with_capacity(n));
+        self.low_intensity = layout.intensity.then(|| Vec::with_capacity(n));
+    }
+
+    fn block(&mut self, block: &Points) {
+        if block.xyz.is_empty() {
+            return;
+        }
+        let origin = match self.origin {
+            Some(o) => o,
+            None => *self.origin.insert(self.first_origin(&block.xyz)),
+        };
+        let set = &mut self.set;
+        for p in &block.xyz {
+            for (k, &v) in p.iter().enumerate() {
+                self.min[k] = self.min[k].min(v);
+                self.max[k] = self.max[k].max(v);
+            }
+            set.xyz
+                .push(std::array::from_fn(|k| (p[k] - origin[k]) as f32));
+        }
+        if let (Some(rgb), Some(c)) = (&mut set.rgb, &block.rgb) {
+            rgb.extend(c.iter().map(|v| v.map(|c| (c >> 8) as u8)));
+            if c.iter().any(|v| v.iter().any(|&c| c > 255)) {
+                self.low_rgb = None;
+            }
+            if let Some(low) = &mut self.low_rgb {
+                low.extend(c.iter().map(|v| v.map(|c| c as u8)));
+            }
+        }
+        match &block.intensity {
+            Some(i) => {
+                set.intensity.extend(i.iter().map(|&v| (v >> 8) as u8));
+                self.any_intensity |= i.iter().any(|&v| v != 0);
+                if i.iter().any(|&v| v > 255) {
+                    self.low_intensity = None;
+                }
+                if let Some(low) = &mut self.low_intensity {
+                    low.extend(i.iter().map(|&v| v as u8));
+                }
+            }
+            None => set.intensity.resize(set.xyz.len(), MID_GRAY),
+        }
+        match &block.time {
+            Some(time) => {
+                let t0 = *self.t0.get_or_insert(time[0]);
+                let submaps = self.slam.map_or(&[][..], |s| &s.submaps[..]);
+                for &g in time {
+                    set.t.push((g - t0) as f32);
+                    set.quality.push(if self.slam.is_some() {
+                        quality_at(submaps, g - t0)
+                    } else {
+                        255
+                    });
+                }
+            }
+            None => {
+                set.t.resize(set.xyz.len(), 0.0);
+                set.quality.resize(set.xyz.len(), 255);
+            }
+        }
+        match &block.flags {
+            Some(f) => set.flags.extend_from_slice(f),
+            None => set.flags.resize(set.xyz.len(), 0),
+        }
+        if let Some(s) = &block.source {
+            set.source.extend_from_slice(s);
+        }
+    }
 }
 
 /// A cloud ready for the 3D view: its points and their levels of detail.

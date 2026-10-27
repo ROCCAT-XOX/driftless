@@ -12,8 +12,10 @@
 //! points without a position (invalid, or only a direction). Images are not read.
 
 use crate::ply::to_8bit;
+use crate::points::Collect;
 use crate::{
-    check_cancel, ExportError, PointSource, Points, ScanInfo, BLOCK, PHASE_READ, PHASE_WRITE,
+    check_cancel, ExportError, Layout, PointSink, PointSource, Points, ReadEnd, ReadStart,
+    ScanInfo, BLOCK, PHASE_READ, PHASE_WRITE, SINK_BLOCK,
 };
 use driftless_io::progress::Progress;
 use driftless_io::TempPath;
@@ -360,12 +362,24 @@ fn failed(path: &Path, e: e57::Error) -> ExportError {
 /// Errors: [`ExportError::Io`] for a file that cannot be opened, [`ExportError::Format`] for
 /// anything that is not a readable E57 file – never a panic.
 pub fn read_e57(path: &Path, progress: &Progress) -> Result<Points, ExportError> {
+    let mut points = Collect::default();
+    let end = read_e57_into(path, &mut points, progress)?;
+    Ok(points.finish(end))
+}
+
+/// [`read_e57`] block by block into `sink`, without holding the whole cloud.
+/// [`ReadStart::bounds`] is `None`.
+pub fn read_e57_into(
+    path: &Path,
+    sink: &mut dyn PointSink,
+    progress: &Progress,
+) -> Result<ReadEnd, ExportError> {
     check_cancel(progress)?;
     let file = File::open(path).map_err(|e| ExportError::io(path, e))?;
     let len = file.metadata().map_err(|e| ExportError::io(path, e))?.len();
     // The library checks what it reads; this only turns a missed case into a message.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        read(path, file, len, progress)
+        read(path, file, len, sink, progress)
     }))
     .unwrap_or_else(|_| {
         Err(ExportError::format(
@@ -375,7 +389,13 @@ pub fn read_e57(path: &Path, progress: &Progress) -> Result<Points, ExportError>
     })
 }
 
-fn read(path: &Path, file: File, len: u64, progress: &Progress) -> Result<Points, ExportError> {
+fn read(
+    path: &Path,
+    file: File,
+    len: u64,
+    sink: &mut dyn PointSink,
+    progress: &Progress,
+) -> Result<ReadEnd, ExportError> {
     let mut reader = E57Reader::new(BufReader::with_capacity(READ_BUFFER, file))
         .map_err(|e| ExportError::format(path, format!("keine lesbare E57-Datei ({e})")))?;
     let broken =
@@ -439,18 +459,20 @@ fn read(path: &Path, file: File, len: u64, progress: &Progress) -> Result<Points
     let total = clouds
         .iter()
         .fold(0u64, |sum, pc| sum.saturating_add(pc.records));
-    let reserve = total.min(len / 4) as usize;
-    let mut xyz = Vec::with_capacity(reserve);
-    let mut rgb = clouds
-        .iter()
-        .any(|pc| pc.has_color())
-        .then(|| Vec::with_capacity(reserve));
-    let mut intensity = clouds
-        .iter()
-        .any(|pc| pc.has_intensity())
-        .then(|| Vec::with_capacity(reserve));
-    let several = clouds.len() > 1;
-    let mut source = several.then(|| Vec::with_capacity(reserve));
+    let layout = Layout {
+        rgb: clouds.iter().any(|pc| pc.has_color()),
+        intensity: clouds.iter().any(|pc| pc.has_intensity()),
+        source: clouds.len() > 1,
+        time: false,
+        flags: false,
+    };
+    let capacity = total.min(len / 4) as usize;
+    sink.start(&ReadStart {
+        layout,
+        capacity,
+        bounds: None,
+    });
+    let mut block = Points::with_layout(layout, SINK_BLOCK.min(capacity));
     let mut scans = Vec::with_capacity(clouds.len());
     progress.phase(PHASE_READ, Some(total));
 
@@ -489,18 +511,22 @@ fn read(path: &Path, file: File, len: u64, progress: &Progress) -> Result<Points
                     continue;
                 }
                 valid += 1;
-                xyz.push([x, y, z]);
-                if let Some(rgb) = &mut rgb {
+                block.xyz.push([x, y, z]);
+                if let Some(rgb) = &mut block.rgb {
                     rgb.push(
                         p.color
                             .map_or([0; 3], |c| [c.red, c.green, c.blue].map(sixteen_bit)),
                     );
                 }
-                if let Some(intensity) = &mut intensity {
+                if let Some(intensity) = &mut block.intensity {
                     intensity.push(p.intensity.map_or(0, sixteen_bit));
                 }
-                if let Some(source) = &mut source {
+                if let Some(source) = &mut block.source {
                     source.push(k as u16);
+                }
+                if block.xyz.len() == SINK_BLOCK {
+                    sink.block(&block);
+                    block.clear();
                 }
             }
             progress.advance(pending);
@@ -517,14 +543,12 @@ fn read(path: &Path, file: File, len: u64, progress: &Progress) -> Result<Points
             pose,
         });
     }
-    Ok(Points {
-        xyz,
-        rgb,
-        intensity,
-        source,
-        time: None,
-        flags: None,
+    if !block.is_empty() {
+        sink.block(&block);
+    }
+    Ok(ReadEnd {
         scans,
+        ..ReadEnd::default()
     })
 }
 

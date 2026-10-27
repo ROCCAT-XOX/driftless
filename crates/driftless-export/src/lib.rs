@@ -16,8 +16,8 @@ pub mod testutil;
 pub mod traj;
 
 pub use points::{
-    bounds_of, needs_double, read_points, write_points, Layout, PointFormat, PointSource, Points,
-    ScanInfo,
+    bounds_of, needs_double, read_points, write_points, Layout, PointFormat, PointSink,
+    PointSource, Points, ReadEnd, ReadStart, ScanInfo, SINK_BLOCK,
 };
 
 /// Points per block when reading and writing: progress and the cancel check once per block.

@@ -759,3 +759,94 @@ fn pcd_compressed_shows_message() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// `n` points with every column around `base`: 16-bit colours, intensities, two scans, times
+/// from 1.7e9 s and flags, in a fixed pseudo-random order.
+fn every_column(base: [f64; 3], n: usize) -> Points {
+    let mut s = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut xyz = Vec::with_capacity(n);
+    let mut rgb = Vec::with_capacity(n);
+    let mut intensity = Vec::with_capacity(n);
+    for _ in 0..n {
+        let r = next();
+        xyz.push([
+            base[0] + (r % 40_000) as f64 * 0.000_5 - 10.0,
+            base[1] + (r >> 16) as f64 % 20_000.0 * 0.000_5 - 5.0,
+            base[2] + (r >> 32) as f64 % 6_000.0 * 0.000_5,
+        ]);
+        let c = next();
+        rgb.push([c as u16, (c >> 16) as u16, (c >> 32) as u16]);
+        intensity.push((c >> 48) as u16);
+    }
+    let pose = |x: f64| nalgebra::Isometry3::translation(x, 0.0, 0.0);
+    Points {
+        xyz,
+        rgb: Some(rgb),
+        intensity: Some(intensity),
+        source: Some((0..n).map(|i| u16::from(i % 7 == 0)).collect()),
+        time: Some((0..n).map(|i| 1.7e9 + i as f64 * 1e-4).collect()),
+        flags: Some((0..n).map(|i| (i % 3) as u8).collect()),
+        scans: vec![
+            ScanInfo {
+                source: 0,
+                name: "A".into(),
+                pose: pose(0.0),
+            },
+            ScanInfo {
+                source: 1,
+                name: "B".into(),
+                pose: pose(1.0),
+            },
+        ],
+    }
+}
+
+/// LAS, LAZ and E57 go block by block straight into the [`PointSet`]; over several blocks,
+/// with times, a SLAM report and far coordinates the result is the same as [`point_set`] of
+/// the whole cloud. The E57 states no bounds, so its origin starts at the first point and is
+/// shifted at the end.
+#[test]
+fn streamed_load_matches_point_set() {
+    let dir = tmp("app-cloud-streamed");
+    let n = 2 * driftless_export::SINK_BLOCK + 17;
+    let slam = report(1.7e9 + 1.0, &[0.0, 5.0, 10.0], &[0.2, 0.6, 1.0]);
+    for (base, name) in [
+        ([500_000.3, 5_400_000.7, 300.2], "utm"),
+        ([12.0, -3.4, 0.5], "nah"),
+    ] {
+        let pts = every_column(base, n);
+        for format in [PointFormat::Las, PointFormat::Laz, PointFormat::E57] {
+            let path = dir.join(format!("{name}.{}", format.extension()));
+            write_points(&path, format, &pts, &Progress::new()).unwrap();
+            for slam in [None, Some(&slam)] {
+                let want = point_set(
+                    driftless_export::read_points(&path, &Progress::new()).unwrap(),
+                    slam,
+                );
+                let got = load_points(&path, slam, &Progress::new()).unwrap();
+                let what = format!("{name}.{}", format.extension());
+                assert_eq!(got.origin, want.origin, "{what}");
+                assert_eq!(got.len(), want.len(), "{what}");
+                for (a, b) in got.xyz.iter().zip(&want.xyz) {
+                    for k in 0..3 {
+                        assert!((a[k] - b[k]).abs() <= 2e-5, "{what}: {a:?} vs {b:?}");
+                    }
+                }
+                assert_eq!(got.rgb, want.rgb, "{what}");
+                assert_eq!(got.intensity, want.intensity, "{what}");
+                assert_eq!(got.t, want.t, "{what}");
+                assert_eq!(got.quality, want.quality, "{what}");
+                assert_eq!(got.quality_known, want.quality_known, "{what}");
+                assert_eq!(got.flags, want.flags, "{what}");
+                assert_eq!(got.source, want.source, "{what}");
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -6,8 +6,10 @@
 //! stored at 0.1 mm around the rounded middle of the cloud. The header has no date, so the
 //! same cloud gives the same bytes.
 
+use crate::points::Collect;
 use crate::{
-    check_cancel, ExportError, Layout, PointSource, Points, BLOCK, PHASE_READ, PHASE_WRITE,
+    check_cancel, ExportError, Layout, PointSink, PointSource, Points, ReadEnd, ReadStart, BLOCK,
+    PHASE_READ, PHASE_WRITE, SINK_BLOCK,
 };
 use driftless_io::progress::Progress;
 use driftless_io::TempPath;
@@ -252,67 +254,84 @@ fn write_body(
 /// point format `time` is `None`; intensity, scan number and flags are always there (see
 /// [`crate::read_points`], which drops them when they say nothing). `scans` stays empty.
 pub fn read_las(path: &Path, progress: &Progress) -> Result<Points, ExportError> {
+    let mut points = Collect::default();
+    let end = read_las_into(path, &mut points, progress)?;
+    Ok(points.finish(end))
+}
+
+/// [`read_las`] block by block into `sink`, without holding the whole cloud. The blocks
+/// hold colour and intensity as stored; [`ReadEnd`] says whether they are 8 bit.
+/// [`ReadStart::bounds`] are the header's bounds, unchecked.
+pub fn read_las_into(
+    path: &Path,
+    sink: &mut dyn PointSink,
+    progress: &Progress,
+) -> Result<ReadEnd, ExportError> {
     check_cancel(progress)?;
     let err = |e| las_error(path, "keine lesbare LAS-Datei", e);
     let mut reader = ::las::Reader::from_path(path).map_err(err)?;
     let header = reader.header();
     let total = header.number_of_points();
     let format = *header.point_format();
+    let b = header.bounds();
     // A broken header must not reserve memory for points the file cannot hold.
     let file_len = std::fs::metadata(path).map_or(0, |m| m.len());
     let capacity = usize::try_from(total.min(file_len.saturating_mul(8))).unwrap_or(0);
-    let mut out = Points {
-        xyz: Vec::with_capacity(capacity),
-        rgb: format.has_color.then(|| Vec::with_capacity(capacity)),
-        intensity: Some(Vec::with_capacity(capacity)),
-        source: Some(Vec::with_capacity(capacity)),
-        time: format.has_gps_time.then(|| Vec::with_capacity(capacity)),
-        flags: Some(Vec::with_capacity(capacity)),
-        scans: Vec::new(),
+    let layout = Layout {
+        rgb: format.has_color,
+        intensity: true,
+        source: true,
+        time: format.has_gps_time,
+        flags: true,
     };
+    sink.start(&ReadStart {
+        layout,
+        capacity,
+        bounds: Some(([b.min.x, b.min.y, b.min.z], [b.max.x, b.max.y, b.max.z])),
+    });
+    let mut block = Points::with_layout(layout, SINK_BLOCK.min(capacity));
     let (mut max_rgb, mut max_intensity) = (0u16, 0u16);
-    {
-        let intensity = out.intensity.as_mut().expect("set above");
-        let source = out.source.as_mut().expect("set above");
-        let flags = out.flags.as_mut().expect("set above");
-        progress.phase(PHASE_READ, Some(total));
-        let mut batch = ::las::PointDataBuilder::new()
-            .for_header(reader.header())
-            .build();
-        loop {
-            check_cancel(progress)?;
-            let read = reader.fill_points(BLOCK as u64, &mut batch).map_err(err)?;
-            if read == 0 {
-                break;
+    progress.phase(PHASE_READ, Some(total));
+    let mut batch = ::las::PointDataBuilder::new()
+        .for_header(reader.header())
+        .build();
+    loop {
+        check_cancel(progress)?;
+        let read = reader.fill_points(BLOCK as u64, &mut batch).map_err(err)?;
+        if read == 0 {
+            break;
+        }
+        for p in batch.points() {
+            let p = p.map_err(err)?;
+            block.xyz.push([p.x, p.y, p.z]);
+            if let Some(rgb) = &mut block.rgb {
+                let c = p.color.unwrap_or_default();
+                max_rgb = max_rgb.max(c.red).max(c.green).max(c.blue);
+                rgb.push([c.red, c.green, c.blue]);
             }
-            for p in batch.points() {
-                let p = p.map_err(err)?;
-                out.xyz.push([p.x, p.y, p.z]);
-                if let Some(rgb) = &mut out.rgb {
-                    let c = p.color.unwrap_or_default();
-                    max_rgb = max_rgb.max(c.red).max(c.green).max(c.blue);
-                    rgb.push([c.red, c.green, c.blue]);
-                }
-                if let Some(time) = &mut out.time {
-                    time.push(p.gps_time.unwrap_or_default());
-                }
-                max_intensity = max_intensity.max(p.intensity);
+            if let Some(time) = &mut block.time {
+                time.push(p.gps_time.unwrap_or_default());
+            }
+            max_intensity = max_intensity.max(p.intensity);
+            let columns = (&mut block.intensity, &mut block.source, &mut block.flags);
+            if let (Some(intensity), Some(source), Some(flags)) = columns {
                 intensity.push(p.intensity);
                 source.push(p.point_source_id);
                 flags.push(p.user_data);
             }
-            progress.advance(read);
+            if block.xyz.len() == SINK_BLOCK {
+                sink.block(&block);
+                block.clear();
+            }
         }
+        progress.advance(read);
     }
-    if let Some(rgb) = out.rgb.as_mut().filter(|_| max_rgb <= 255) {
-        for c in rgb.iter_mut() {
-            *c = c.map(|v| v * 257);
-        }
+    if !block.is_empty() {
+        sink.block(&block);
     }
-    if let Some(intensity) = out.intensity.as_mut().filter(|_| max_intensity <= 255) {
-        for v in intensity.iter_mut() {
-            *v *= 257;
-        }
-    }
-    Ok(out)
+    Ok(ReadEnd {
+        scans: Vec::new(),
+        rgb_eight_bit: format.has_color && max_rgb <= 255,
+        intensity_eight_bit: max_intensity <= 255,
+    })
 }
