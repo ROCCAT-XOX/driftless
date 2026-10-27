@@ -10,7 +10,7 @@
 
 use driftless_io::progress::{LogLine, Progress};
 use driftless_map::load_stage;
-use driftless_slam::align::{align_pair, AlignConfig, Verdict};
+use driftless_slam::align::{align_pair, align_with_pairs, AlignConfig, AlignMethod, Verdict};
 use driftless_steps::map::{clean_stage_id, map_input_for, CLEAN_BIN};
 use driftless_steps::merge::{run_merge, MergeMember, MergeRequest};
 use driftless_steps::slam::SlamSettings;
@@ -83,6 +83,10 @@ fn black_room_three_scans() {
     );
     for m in &report.members[1..] {
         let name = m.scan.display();
+        println!(
+            "{name}: Wände {:.2} mm, Restfehler {:.2} mm",
+            m.wall_residual_mm, m.residual_median_mm
+        );
         assert_eq!(m.verdict, "sicher", "{name}: {:?}", m.reason);
         assert!(m.overlap > 0.8, "{name}: overlap {:.3}", m.overlap);
         assert!(
@@ -150,7 +154,7 @@ fn corridor_cut_from_office() {
         .to_degrees();
     println!(
         "{} + {} Punkte, {:.1} s: {:?} {:?}, Überlappung {:.3}, Kanten {:.3}, Restfehler {:.2} mm, \
-         Fehler {err:.4} m {rot:.3}°",
+         Wände {:.2} mm, Fehler {err:.4} m {rot:.3}°",
         source.len(),
         target.len(),
         start.elapsed().as_secs_f64(),
@@ -158,9 +162,118 @@ fn corridor_cut_from_office() {
         a.method,
         a.quality.overlap,
         a.quality.agreement,
-        a.quality.residual_median_mm
+        a.quality.residual_median_mm,
+        a.quality.wall_residual_mm
     );
     if a.verdict == Verdict::Sure {
         assert!(err < 0.03, "sure with error {err:.4} m {rot:.3}°");
+    }
+}
+
+/// Source, target, the pose of the source in the target and the shared strip `(lo, hi)` in x.
+type Strip = (
+    Vec<Vector3<f64>>,
+    Vec<Vector3<f64>>,
+    Isometry3<f64>,
+    (f64, f64),
+);
+
+/// The office cut as in [`corridor_cut_from_office`], sharing a strip of `share` of the
+/// points.
+fn office_strip(points: &[Vector3<f64>], share: f64) -> Strip {
+    let (lo, hi) = (
+        x_quantile(points, 0.5 - share / 2.0),
+        x_quantile(points, 0.5 + share / 2.0),
+    );
+    let target: Vec<Vector3<f64>> = points.iter().filter(|p| p.x <= hi).copied().collect();
+    let moved = Isometry3::from_parts(
+        Translation3::new(3.0, -2.0, 0.0),
+        UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 70f64.to_radians()),
+    );
+    let source: Vec<Vector3<f64>> = points
+        .iter()
+        .filter(|p| p.x >= lo)
+        .map(|p| (moved * Point3::from(*p)).coords)
+        .collect();
+    (source, target, moved.inverse(), (lo, hi))
+}
+
+/// Four places of the shared strip `x ∈ [lo, hi]`, far apart: the points at 2 % and 98 % of
+/// y near the floor, and the lowest and highest point around the middle of y.
+fn strip_marks(points: &[Vector3<f64>], (lo, hi): (f64, f64)) -> Vec<Vector3<f64>> {
+    let mut strip: Vec<Vector3<f64>> = points
+        .iter()
+        .filter(|p| p.x >= lo && p.x <= hi)
+        .copied()
+        .collect();
+    strip.sort_by(|a, b| a.y.total_cmp(&b.y));
+    let at = |q: f64| strip[((strip.len() - 1) as f64 * q).round() as usize];
+    let mid = at(0.5).y;
+    let middle: Vec<&Vector3<f64>> = strip.iter().filter(|p| (p.y - mid).abs() < 0.3).collect();
+    let low = **middle.iter().min_by(|a, b| a.z.total_cmp(&b.z)).unwrap();
+    let high = **middle.iter().max_by(|a, b| a.z.total_cmp(&b.z)).unwrap();
+    vec![at(0.02), at(0.98), low, high]
+}
+
+/// Point pairs by hand where the office parts share only a narrow strip: the right pose there
+/// overlaps too little for an automatic sure result (5 %: overlap 0.10, edges 0.82), the
+/// pairs place it surely. A wrong pair set (one place on another point of the strip) is
+/// refused.
+#[test]
+#[ignore = "needs DRIFTLESS_TESTDATA"]
+fn corridor_pairs_narrow_strip() {
+    let points = office_points();
+    let cfg = AlignConfig::default();
+    for share in [0.05, 0.02] {
+        let (source, target, truth, strip) = office_strip(&points, share);
+        let marks = strip_marks(&points, strip);
+        // A careful click: 1 cm off in the target, 1 cm the other way in the source.
+        let errors = [
+            Vector3::new(0.01, 0.0, 0.0),
+            Vector3::new(0.0, 0.01, 0.0),
+            Vector3::new(0.0, 0.0, 0.01),
+            Vector3::new(-0.007, 0.007, 0.0),
+        ];
+        let inv = truth.inverse();
+        let pairs: Vec<(Vector3<f64>, Vector3<f64>)> = marks
+            .iter()
+            .zip(&errors)
+            .map(|(m, e)| ((inv * Point3::from(m - e)).coords, m + e))
+            .collect();
+        let c = Point3::from(source.iter().sum::<Vector3<f64>>() / source.len() as f64);
+        let start = Instant::now();
+        let a = align_with_pairs(&source, &target, &pairs, &cfg, &Progress::new());
+        let err = (a.pose * c - truth * c).norm();
+        println!(
+            "Streifen {:.0} %, Punktpaare: {:?}, Überlappung {:.3}, Kanten {:.3}, Restfehler {:.2} \
+             mm, Wände {:.2} mm, Paare {:.1} mm, Fehler {err:.4} m, {:.1} s",
+            100.0 * share,
+            a.verdict,
+            a.quality.overlap,
+            a.quality.agreement,
+            a.quality.residual_median_mm,
+            a.quality.wall_residual_mm,
+            a.pair_rms_mm.unwrap_or(f64::NAN),
+            start.elapsed().as_secs_f64()
+        );
+        assert_eq!(a.method, AlignMethod::PointPairs);
+        if share >= 0.05 {
+            assert_eq!(a.verdict, Verdict::Sure);
+            assert!(err < 0.03, "error {err:.4} m");
+        }
+        let mut wrong = pairs.clone();
+        wrong[2].1 = marks[0];
+        let w = align_with_pairs(&source, &target, &wrong, &cfg, &Progress::new());
+        println!(
+            "Streifen {:.0} %, falsches Paar: {:?}, Paare {:.1} mm",
+            100.0 * share,
+            w.verdict,
+            w.pair_rms_mm.unwrap_or(f64::NAN)
+        );
+        assert!(
+            matches!(&w.verdict, Verdict::Unsure(r) if r.contains("Punktpaare")),
+            "{:?}",
+            w.verdict
+        );
     }
 }

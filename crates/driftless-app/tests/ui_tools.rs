@@ -700,6 +700,8 @@ fn model_member(root: &Path, name: &str, pose: &Isometry3<f64>, verdict: &str) -
         residual_median_mm: 3.0,
         residual_rms_mm: 4.0,
         agreement: 0.9,
+        wall_residual_mm: 3.0,
+        pair_rms_mm: None,
         included: verdict != "unsicher",
         color_gain: [1.0; 3],
         points: 100,
@@ -980,6 +982,7 @@ fn pair_project(name: &str) -> (DriftlessApp, PathBuf) {
                 enabled,
                 note: "Ecken".into(),
                 added: "2026-10-27T10:00:00Z".into(),
+                unknown: Default::default(),
             })
             .unwrap();
     }

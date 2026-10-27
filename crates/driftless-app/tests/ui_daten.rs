@@ -847,6 +847,8 @@ fn member(scan: &str, verdict: &str, included: bool) -> ModelMember {
         residual_median_mm: 1.84,
         residual_rms_mm: 2.5,
         agreement: 0.95,
+        wall_residual_mm: 1.9,
+        pair_rms_mm: None,
         included,
         color_gain: [1.0; 3],
         points: if included { 1000 } else { 0 },

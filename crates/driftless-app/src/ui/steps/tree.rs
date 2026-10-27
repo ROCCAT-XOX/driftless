@@ -3,9 +3,11 @@
 //! per run its history („Verlauf“: each state with number, kind, time and start↔end gap). Below
 //! the scans the models („Modell 001“): per scan of a model its number, name and how surely it
 //! was placed (✓ sicher, ⚠ unsicher, ✗ gescheitert, the reason on hover) with overlap and
-//! residual, under an unsure or failed one „Von Hand ausrichten“ ([`Action::StartPairs`]);
-//! then the point pairs of the model („Punktpaare“, each with its switch, as the loops of a
-//! run), `modell.las` and the surfaces of the model. Names too long for the field end in „…“;
+//! residual („Punktpaare“ before them if placed by hand, the fit of the pairs and the wall
+//! residual on hover), under an unsure or failed one „Von Hand ausrichten“
+//! ([`Action::StartPairs`]); then the point pairs of the model („Punktpaare“, each with its
+//! switch, as the loops of a run; one the merge cannot use marked „nicht nutzbar“, why on
+//! hover), `modell.las` and the surfaces of the model. Names too long for the field end in „…“;
 //! the full name and the folder show on hover.
 
 use super::badge;
@@ -172,8 +174,15 @@ fn member_rows(ui: &mut Ui, state: &AppState, k: usize, m: &ModelMember) {
             hover += &format!(" – {}", text::NOT_IN_MODEL_UNSURE);
         }
     }
+    if let Some(rms) = m.pair_rms_mm {
+        hover += &format!("\n{}", text::member_pairs_fit(rms));
+    }
     if !reference {
-        hover += &format!("\n{}", text::VERDICT_HINT);
+        hover += &format!(
+            "\n{}\n{}",
+            text::member_walls(m.wall_residual_mm),
+            text::VERDICT_HINT
+        );
     }
     let [r, g, b] = SCAN_COLORS[k % SCAN_COLORS.len()];
     let row = ui
@@ -200,11 +209,12 @@ fn member_rows(ui: &mut Ui, state: &AppState, k: usize, m: &ModelMember) {
         rect = rect.union(r.response.rect);
     };
     if !reference {
-        line(
-            ui,
-            text::member_numbers(m.overlap, m.residual_median_mm),
-            DARK.text_dim,
-        );
+        let numbers = if m.method == "punktpaare" {
+            text::member_numbers_pairs(m.overlap, m.residual_median_mm)
+        } else {
+            text::member_numbers(m.overlap, m.residual_median_mm)
+        };
+        line(ui, numbers, DARK.text_dim);
     }
     if !m.included {
         line(ui, text::NOT_IN_MODEL.to_string(), DARK.warn);
@@ -243,13 +253,25 @@ fn pair_list(ui: &mut Ui, state: &AppState, model: &ModelInfo, action: &mut Opti
                         *action = Some(Action::SetPairEnabled { index, enabled: on });
                     }
                     switch.on_hover_text(text::PAIR_SWITCH_HINT);
-                    let row = text::pair_row(nr, a + 1, b + 1, e.points_a.len());
-                    let color = if e.enabled { DARK.text } else { DARK.text_dim };
-                    let hover = [e.note.as_str(), e.added.as_str()]
-                        .into_iter()
-                        .filter(|t| !t.is_empty())
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let mut row = text::pair_row(nr, a + 1, b + 1, e.points_a.len());
+                    let unusable = e.check().err();
+                    let color = match (&unusable, e.enabled) {
+                        (Some(_), _) => DARK.warn,
+                        (None, true) => DARK.text,
+                        (None, false) => DARK.text_dim,
+                    };
+                    if unusable.is_some() {
+                        row += &format!(" · {}", text::PAIR_UNUSABLE);
+                    }
+                    let hover = [
+                        unusable.as_deref().unwrap_or(""),
+                        e.note.as_str(),
+                        e.added.as_str(),
+                    ]
+                    .into_iter()
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                     let label = ui.add(
                         egui::Label::new(RichText::new(row).color(color))
                             .truncate()

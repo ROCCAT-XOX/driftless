@@ -1020,6 +1020,7 @@ fn pairs_rerun_creates_next_model() {
         enabled: true,
         note: "Ecken".into(),
         added: String::new(),
+        unknown: Default::default(),
     };
     let second = run_pairs_merge_job(&p, &model, entry.clone(), &Progress::new()).unwrap();
     assert_eq!(second, models_dir(&p).join("modell-002"));
@@ -1095,5 +1096,6 @@ fn entry_again(model: &driftless_app::project::ModelInfo) -> PointPairEntry {
         enabled: true,
         note: "Ecken".into(),
         added: String::new(),
+        unknown: Default::default(),
     }
 }

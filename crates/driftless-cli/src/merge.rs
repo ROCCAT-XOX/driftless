@@ -140,7 +140,8 @@ fn folder_name(p: &Path) -> String {
     )
 }
 
-/// One line per scan: name, verdict, overlap, residual and why it is unsure.
+/// One line per scan: name, verdict (with the fit of the point pairs that placed it), overlap,
+/// residual over all points and on the walls, and why it is unsure.
 fn lines(report: &ModelReport) -> Vec<String> {
     report
         .members
@@ -150,16 +151,19 @@ fn lines(report: &ModelReport) -> Vec<String> {
             if m.placed_against.is_none() {
                 return format!("{name}: Bezug");
             }
-            let by_hand = if m.method == "punktpaare" {
-                " (Punktpaare)"
-            } else {
-                ""
+            let by_hand = match m.pair_rms_mm {
+                Some(rms) if m.method == "punktpaare" => {
+                    format!(" (Punktpaare, im Mittel {:.1} cm daneben)", rms / 10.0)
+                }
+                _ if m.method == "punktpaare" => " (Punktpaare)".to_string(),
+                _ => String::new(),
             };
             let mut line = format!(
-                "{name}: {}{by_hand}, Überlappung {:.0} %, Restfehler {:.1} mm",
+                "{name}: {}{by_hand}, Überlappung {:.0} %, Restfehler {:.1} mm, Wände {:.1} mm",
                 m.verdict,
                 100.0 * m.overlap,
-                m.residual_median_mm
+                m.residual_median_mm,
+                m.wall_residual_mm
             );
             if let Some(why) = &m.reason {
                 line += &format!(" – {why}");

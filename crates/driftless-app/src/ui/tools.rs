@@ -367,6 +367,7 @@ impl PairSession {
             enabled: true,
             note: text::pairs_subject(&self.member_name, &self.model_label),
             added: String::new(),
+            unknown: Default::default(),
         })
     }
 }

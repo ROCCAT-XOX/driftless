@@ -410,6 +410,7 @@ fn pair_entry(
         enabled: true,
         note: String::new(),
         added: "2026-10-27T12:00:00Z".into(),
+        unknown: Default::default(),
     }
 }
 
@@ -545,12 +546,33 @@ fn pairs_round_trip_and_reject_two_points() {
         "zwei verschiedene",
     );
 
-    // A broken file is an error, not an empty list.
+    // A file that is no TOML, or a value of the wrong type, is an error, not an empty list.
     fs::write(&path, "[[paar]]\na = 1\n").unwrap();
     assert!(PointPairs::load(&path).is_err());
-    fs::write(&path, "[[paar]]\na = \"x\"\nb = \"y\"\npoints_a = [[0.0, 0.0, 0.0]]\npoints_b = []\nenabled = true\n").unwrap();
-    let e = PointPairs::load(&path).unwrap_err();
-    assert!(e.to_string().contains("Eintrag 1"), "{e}");
+    fs::write(&path, "[[paar\n").unwrap();
+    assert!(PointPairs::load(&path).is_err());
+    // An entry that cannot be used (a hand edit) is read beside the good one and written back
+    // as it was, unknown keys included; only switching it changes it.
+    pairs.save(&path).unwrap();
+    let mut text = fs::read_to_string(&path).unwrap();
+    text += "\n[[paar]]\na = \"x\"\nb = \"y\"\npoints_a = [[0, 0, 0]]\npoints_b = []\n\
+             enabeld = true\n";
+    fs::write(&path, &text).unwrap();
+    let mut loaded = PointPairs::load(&path).unwrap();
+    assert_eq!(loaded.entries.len(), 3);
+    assert_eq!(&loaded.entries[..2], &pairs.entries[..]);
+    let odd = loaded.entries[2].clone();
+    assert!(!odd.enabled, "a missing switch reads as off");
+    assert!(odd.check().unwrap_err().contains("enabeld"));
+    let mut no_typo = odd.clone();
+    no_typo.unknown.clear();
+    assert!(no_typo.check().unwrap_err().contains("gleich viele"));
+    loaded.set_enabled(2, true).unwrap();
+    loaded.save(&path).unwrap();
+    let again = PointPairs::load(&path).unwrap();
+    assert_eq!(again.entries[2].unknown, odd.unknown);
+    assert!(again.entries[2].enabled);
+    assert_eq!(again.entries[2].points_a, vec![[0.0; 3]]);
 }
 
 /// What the app writes into `<projekt>/modelle/punktpaare.toml`: a map folder of the project

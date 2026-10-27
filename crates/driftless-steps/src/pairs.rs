@@ -18,6 +18,12 @@
 //! absolute if outside the project; [`PointPairs::resolved`] with the folder of the file
 //! makes them paths of the file system for [`crate::merge::MergeRequest::pairs`]. A
 //! switched-on entry replaces the automatic alignment of its two scans in the merge.
+//!
+//! An entry that cannot be used (a hand edit: missing or unknown keys, too few or unequal
+//! points, see [`PointPairEntry::check`]) is still read and written back as it is, with its
+//! unknown keys; the merge leaves it out with a warning, so it can be switched off in the
+//! program instead of blocking every merge. Only a file that is no TOML, or a value of the
+//! wrong type, cannot be read at all.
 
 use crate::StepError;
 use driftless_slam::align::pose_from_pairs;
@@ -38,24 +44,34 @@ const HEADER: &str = "# Driftless-Punktpaare: gleiche Stellen in zwei Scans, Pun
 Rahmen des jeweiligen Scans.\n# Pfade relativ zu diesem Ordner; Einträge werden nur angehängt oder \
 abgeschaltet.\n\n";
 
-/// Points marked by hand on two scans that show the same places.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
+/// Points marked by hand on two scans that show the same places. A missing key reads as
+/// empty (a missing `enabled` as switched off) and makes the entry unusable
+/// ([`Self::check`]), as does an unknown one.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct PointPairEntry {
     /// Map folders of the two scans.
+    #[serde(default)]
     pub a: PathBuf,
+    #[serde(default)]
     pub b: PathBuf,
     /// The points, pair by pair (at least [`MIN_POINT_PAIRS`]), each in the world frame of
     /// its own scan.
+    #[serde(default)]
     pub points_a: Vec<[f64; 3]>,
+    #[serde(default)]
     pub points_b: Vec<[f64; 3]>,
     /// Switched off entries are kept but not used.
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub note: String,
     /// When the entry was added (RFC 3339, UTC).
     #[serde(default)]
     pub added: String,
+    /// Keys the program does not know (a mistyped hand edit), kept so that saving the file
+    /// does not drop them.
+    #[serde(flatten)]
+    pub unknown: toml::Table,
 }
 
 impl PointPairEntry {
@@ -68,9 +84,16 @@ impl PointPairEntry {
             .collect()
     }
 
-    /// Whether the entry can be used at all: at least [`MIN_POINT_PAIRS`] pairs, as many
-    /// points in `a` as in `b`, all finite. The message is German.
+    /// Whether the entry can be used at all: both folders given, no unknown key, at least
+    /// [`MIN_POINT_PAIRS`] pairs, as many points in `a` as in `b`, all finite. The message is
+    /// German.
     pub fn check(&self) -> Result<(), String> {
+        if let Some(key) = self.unknown.keys().next() {
+            return Err(format!("Punktpaare: unbekannter Eintrag „{key}“"));
+        }
+        if self.a.as_os_str().is_empty() || self.b.as_os_str().is_empty() {
+            return Err("Punktpaare: Kartenordner a und b nötig".into());
+        }
         let (na, nb) = (self.points_a.len(), self.points_b.len());
         if na != nb {
             return Err(format!(
@@ -95,8 +118,8 @@ impl PointPairEntry {
     }
 }
 
-/// The entries of `punktpaare.toml`, in file order. Unknown keys (e.g. a mistyped hand edit)
-/// are an error instead of being dropped silently.
+/// The entries of `punktpaare.toml`, in file order. An unknown key beside `paar` is an error
+/// instead of being dropped silently.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PointPairs {
@@ -105,21 +128,15 @@ pub struct PointPairs {
 }
 
 impl PointPairs {
-    /// Reads `path`; a missing file means no pairs yet. An entry that cannot be used
-    /// ([`PointPairEntry::check`]) is an error naming its number (1-based).
+    /// Reads `path`; a missing file means no pairs yet. Entries that cannot be used are read
+    /// too ([`PointPairEntry::check`], see the module documentation).
     pub fn load(path: &Path) -> Result<Self, StepError> {
         let text = match fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(format!("{}: {e}", path.display()).into()),
         };
-        let pairs: Self =
-            toml::from_str(&text).map_err(|e| format!("{} nicht lesbar: {e}", path.display()))?;
-        for (k, e) in pairs.entries.iter().enumerate() {
-            e.check()
-                .map_err(|m| format!("{}, Eintrag {}: {m}", path.display(), k + 1))?;
-        }
-        Ok(pairs)
+        toml::from_str(&text).map_err(|e| format!("{} nicht lesbar: {e}", path.display()).into())
     }
 
     /// Writes `path` through a file next to it, so an interrupted write never leaves half a

@@ -12,12 +12,16 @@
 //!    a better verdict first, then agreeing edges ([`MIN_AGREEMENT`]), then the larger
 //!    overlap, then the smaller numbers. `T_i = T_j · pose`. An unsure or failed member is
 //!    entered with its best result; it is in the model (and an anchor for the others) only
-//!    with [`MergeRequest::include_unsure`] and if not failed.
+//!    with [`MergeRequest::include_unsure`] and if not failed. A member placed surely against
+//!    such an anchor, or against one placed so, is reported "unsicher" as well: its place in
+//!    the model is only as sure as the anchor's.
 //!
 //!    Two members with switched-on point pairs ([`MergeRequest::pairs`], in either
 //!    direction) are aligned through them ([`align_with_pairs`]) instead of [`align_pair`];
-//!    the pairs of all such entries of the two count together. A sure result of point pairs
-//!    goes before every sure automatic one.
+//!    the pairs of all such entries of the two count together, an entry that cannot be used
+//!    ([`PointPairEntry::check`]) is left out with a warning. A sure result of point pairs
+//!    goes before every sure automatic one. It is sure on the fit of the pairs and the
+//!    residuals alone, not on the overlap: the user chose the place.
 //! 2. **Colour**: per member in the model after the reference, the median ratio per channel
 //!    between the colour of the earlier members and its own, over the 1 cm voxels both
 //!    coloured ([`COLOR_VOXEL`]), clamped to [[`MIN_GAIN`], [`MAX_GAIN`]]; 1 with fewer than
@@ -59,7 +63,7 @@ use std::time::Instant;
 
 /// Part of the input id: raised whenever the merge gives another result for the same
 /// request, so an older model counts as stale.
-pub const MERGE_VERSION: u32 = 1;
+pub const MERGE_VERSION: u32 = 2;
 pub const MODEL_REPORT: &str = "modell.json";
 pub const MODEL_LAS: &str = "modell.las";
 pub const MODEL_PLY: &str = "modell.ply";
@@ -132,6 +136,15 @@ pub struct ModelMember {
     pub residual_rms_mm: f64,
     /// Edge agreement ([`driftless_slam::align::PairQuality::agreement`]).
     pub agreement: f64,
+    /// Residual on the walls of the worst orientation
+    /// ([`driftless_slam::align::PairQuality::wall_residual_mm`]); 0 in a model written
+    /// before the field.
+    #[serde(default)]
+    pub wall_residual_mm: f64,
+    /// For a member placed by point pairs: their RMS distance at its pose
+    /// ([`driftless_slam::align::Alignment::pair_rms_mm`]).
+    #[serde(default)]
+    pub pair_rms_mm: Option<f64>,
     /// Whether its points are in the model.
     pub included: bool,
     /// Colour gain per channel applied to its coloured points.
@@ -216,21 +229,24 @@ pub fn pair_members(req: &MergeRequest, e: &PointPairEntry) -> Option<(usize, us
 type HandPairs = Vec<(Vector3<f64>, Vector3<f64>)>;
 
 /// The point pairs that count ([`MergeRequest::pairs`]) by members (smaller, larger number),
-/// those of several entries one after another in their order. Fails if one of them cannot be
-/// used ([`PointPairEntry::check`]).
-fn hand_pairs(req: &MergeRequest) -> Result<BTreeMap<(usize, usize), HandPairs>, StepError> {
+/// those of several entries one after another in their order, and a warning (German) for
+/// every switched-on entry of two members that cannot be used ([`PointPairEntry::check`]):
+/// it is left out, as if switched off.
+fn hand_pairs(req: &MergeRequest) -> (BTreeMap<(usize, usize), HandPairs>, Vec<String>) {
     let mut out: BTreeMap<(usize, usize), HandPairs> = BTreeMap::new();
+    let mut warnings = Vec::new();
     for e in req.pairs.iter().filter(|e| e.enabled) {
         let Some((i, j)) = pair_members(req, e) else {
             continue;
         };
-        e.check().map_err(|m| {
-            format!(
-                "{m} ({} – {})",
+        if let Err(m) = e.check() {
+            warnings.push(format!(
+                "{m} ({} – {}), nicht genutzt",
                 req.members[i].map_dir.display(),
                 req.members[j].map_dir.display()
-            )
-        })?;
+            ));
+            continue;
+        }
         let pairs = e.pairs();
         let slot = out.entry((i.min(j), i.max(j))).or_default();
         if i < j {
@@ -239,7 +255,7 @@ fn hand_pairs(req: &MergeRequest) -> Result<BTreeMap<(usize, usize), HandPairs>,
             slot.extend(pairs.into_iter().map(|(p, q)| (q, p)));
         }
     }
-    Ok(out)
+    (out, warnings)
 }
 
 /// The point pairs of members `i` and `j` ([`hand_pairs`]) as (point in `i`, point in `j`).
@@ -273,7 +289,7 @@ fn input_text(req: &MergeRequest) -> Result<(String, Vec<String>), StepError> {
         "{:?}\nvoxel {:?}\nsmooth {}\ninclude_unsure {}\n",
         req.align, req.voxel, req.smooth, req.include_unsure
     );
-    for ((i, j), pairs) in hand_pairs(req)? {
+    for ((i, j), pairs) in hand_pairs(req).0 {
         let pairs: Vec<_> = pairs
             .iter()
             .map(|(p, q)| (p.as_slice(), q.as_slice()))
@@ -417,6 +433,9 @@ struct Placement {
     /// `None` for the reference.
     alignment: Option<Alignment>,
     included: bool,
+    /// The nearest member on the way to the reference that is placed unsurely (only with
+    /// [`MergeRequest::include_unsure`] an anchor), if any.
+    unsure_anchor: Option<usize>,
 }
 
 /// Rank of an alignment in the chain; larger is better.
@@ -455,10 +474,18 @@ fn chain(
         against: None,
         alignment: None,
         included: true,
+        unsure_anchor: None,
     });
     let mut cache: BTreeMap<(usize, usize), Alignment> = BTreeMap::new();
-    let by_hand = hand_pairs(req)?;
-    progress.phase(PHASE_ALIGN, Some(n as u64 - 1));
+    let (by_hand, warnings) = hand_pairs(req);
+    for w in warnings {
+        progress.warn(w);
+    }
+    // Every pair is aligned at most once, each open member against each anchor: n (n − 1) / 2
+    // when every member is in the model, fewer otherwise (the rest is counted at the end).
+    let total = (n * (n - 1) / 2) as u64;
+    progress.phase(PHASE_ALIGN, Some(total));
+    let mut done = 0u64;
     loop {
         let open: Vec<usize> = (0..n).filter(|&i| placed[i].is_none()).collect();
         if open.is_empty() {
@@ -493,6 +520,8 @@ fn chain(
                         start.elapsed().as_secs_f64()
                     ));
                     slot.insert(a);
+                    progress.advance(1);
+                    done += 1;
                 }
                 let a = &cache[&(i, j)];
                 if best.is_none_or(|b| better(a, &cache[&b])) {
@@ -507,15 +536,26 @@ fn chain(
             Verdict::Unsure(_) => req.include_unsure,
             Verdict::Failed(_) => false,
         };
-        let pose = placed[j].as_ref().expect("anchor is placed").pose * a.pose;
+        let anchor = placed[j].as_ref().expect("anchor is placed");
+        let pose = anchor.pose * a.pose;
+        let anchor_unsure = anchor
+            .alignment
+            .as_ref()
+            .is_some_and(|b| b.verdict != Verdict::Sure);
+        let unsure_anchor = if anchor_unsure {
+            Some(j)
+        } else {
+            anchor.unsure_anchor
+        };
         placed[i] = Some(Placement {
             pose,
             against: Some(j),
             alignment: Some(a),
             included,
+            unsure_anchor,
         });
-        progress.advance(1);
     }
+    progress.advance(total.saturating_sub(done));
     Ok(placed.into_iter().map(|p| p.expect("all placed")).collect())
 }
 
@@ -829,7 +869,10 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
         .iter()
         .zip(&placed)
         .enumerate()
-        .map(|(k, (m, p))| model_member(m, p, gains[k], counts[k], &clean_ids[k]))
+        .map(|(k, (m, p))| {
+            let anchor = p.unsure_anchor.map(|j| name(&req.members[j]));
+            model_member(m, p, anchor, gains[k], counts[k], &clean_ids[k])
+        })
         .collect();
     let peak = peak_rss_bytes();
     let report = ModelReport {
@@ -872,9 +915,12 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
     serde_json::from_str(&text).map_err(failed)
 }
 
+/// The report of member `m` placed at `p`; `unsure_anchor` names the unsurely placed member
+/// its place depends on ([`Placement::unsure_anchor`]).
 fn model_member(
     m: &MergeMember,
     p: &Placement,
+    unsure_anchor: Option<String>,
     gain: [f32; 3],
     points: u64,
     clean_id: &str,
@@ -882,16 +928,17 @@ fn model_member(
     let (method, verdict, reason, q) = match &p.alignment {
         None => ("bezug", "sicher", None, None),
         Some(a) => {
-            let reason = match &a.verdict {
-                Verdict::Sure => None,
-                Verdict::Unsure(r) | Verdict::Failed(r) => Some(r.clone()),
+            let (word, reason) = match (&a.verdict, unsure_anchor) {
+                (Verdict::Sure, None) => (a.verdict.word(), None),
+                (Verdict::Sure, Some(anchor)) => (
+                    Verdict::Unsure(String::new()).word(),
+                    Some(format!(
+                        "sicher an {anchor} ausgerichtet, dessen Lage aber unsicher ist"
+                    )),
+                ),
+                (Verdict::Unsure(r) | Verdict::Failed(r), _) => (a.verdict.word(), Some(r.clone())),
             };
-            (
-                method_word(a.method),
-                a.verdict.word(),
-                reason,
-                Some(a.quality),
-            )
+            (method_word(a.method), word, reason, Some(a))
         }
     };
     ModelMember {
@@ -904,10 +951,12 @@ fn model_member(
         method: method.into(),
         verdict: verdict.into(),
         reason,
-        overlap: q.map_or(1.0, |q| q.overlap),
-        residual_median_mm: q.map_or(0.0, |q| q.residual_median_mm),
-        residual_rms_mm: q.map_or(0.0, |q| q.residual_rms_mm),
-        agreement: q.map_or(1.0, |q| q.agreement),
+        overlap: q.map_or(1.0, |a| a.quality.overlap),
+        residual_median_mm: q.map_or(0.0, |a| a.quality.residual_median_mm),
+        residual_rms_mm: q.map_or(0.0, |a| a.quality.residual_rms_mm),
+        agreement: q.map_or(1.0, |a| a.quality.agreement),
+        wall_residual_mm: q.map_or(0.0, |a| a.quality.wall_residual_mm),
+        pair_rms_mm: q.and_then(|a| a.pair_rms_mm),
         included: p.included,
         color_gain: gain,
         points: if p.included { points } else { 0 },
@@ -947,6 +996,7 @@ mod tests {
             enabled: true,
             note: String::new(),
             added: String::new(),
+            unknown: Default::default(),
         };
         let mut off = entry("s1", "s0", 50.0, 3);
         off.enabled = false;
@@ -967,7 +1017,8 @@ mod tests {
                 entry("s9", "s0", 40.0, 2),
             ],
         };
-        let by_hand = hand_pairs(&req).unwrap();
+        let (by_hand, warnings) = hand_pairs(&req);
+        assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(by_hand.keys().copied().collect::<Vec<_>>(), vec![(0, 2)]);
         let x = |v: f64| Vector3::new(v, 0.0, 0.0);
         let y = |v: f64| Vector3::new(0.0, v, 0.0);
@@ -981,13 +1032,15 @@ mod tests {
         assert_eq!(from_0[6], (x(33.0), y(33.0)));
         assert!(pairs_between(&by_hand, 0, 1).is_none());
 
-        // A switched-on entry of two members that cannot be used is an error.
+        // A switched-on entry of two members that cannot be used is left out with a warning.
         let mut bad = req.clone();
         bad.pairs.push(entry("s1", "s2", 60.0, 2));
-        let e = hand_pairs(&bad).unwrap_err().to_string();
+        let (by_hand, warnings) = hand_pairs(&bad);
+        assert_eq!(by_hand.keys().copied().collect::<Vec<_>>(), vec![(0, 2)]);
+        assert_eq!(warnings.len(), 1);
         assert!(
-            e.contains("mindestens drei") && e.contains("s1/karte"),
-            "{e}"
+            warnings[0].contains("mindestens drei") && warnings[0].contains("s1/karte"),
+            "{warnings:?}"
         );
     }
 
@@ -1011,6 +1064,8 @@ mod tests {
             residual_median_mm: 1.0,
             residual_rms_mm: 2.0,
             agreement: 0.9,
+            wall_residual_mm: 1.0,
+            pair_rms_mm: None,
             included: true,
             color_gain: [1.0; 3],
             points: 3,
@@ -1023,6 +1078,54 @@ mod tests {
         let back = member_transform(&m);
         assert!((back.translation.vector - pose.translation.vector).norm() < 1e-12);
         assert!(back.rotation.angle_to(&pose.rotation) < 1e-12);
+    }
+
+    #[test]
+    fn sure_against_an_unsure_anchor_is_unsure() {
+        let m = MergeMember {
+            scan: "s2".into(),
+            slam_dir: "s2/d".into(),
+            map_dir: "s2/d".into(),
+            slam: SlamSettings::default(),
+        };
+        let quality = driftless_slam::align::PairQuality {
+            overlap: 0.9,
+            residual_median_mm: 2.0,
+            residual_rms_mm: 3.0,
+            tilt_deg: 0.1,
+            agreement: 0.98,
+            wall_residual_mm: 2.1,
+        };
+        let mut p = Placement {
+            pose: Isometry3::identity(),
+            against: Some(1),
+            alignment: Some(Alignment {
+                pose: Isometry3::identity(),
+                method: AlignMethod::Features,
+                quality,
+                verdict: Verdict::Sure,
+                runner_up: None,
+                pair_rms_mm: None,
+            }),
+            included: true,
+            unsure_anchor: None,
+        };
+        let alone = model_member(&m, &p, None, [1.0; 3], 5, "id");
+        assert_eq!(alone.verdict, "sicher");
+        assert!(alone.reason.is_none());
+        assert_eq!(alone.wall_residual_mm, 2.1);
+        p.unsure_anchor = Some(1);
+        let inherited = model_member(&m, &p, Some("s1".into()), [1.0; 3], 5, "id");
+        assert_eq!(inherited.verdict, "unsicher");
+        assert!(
+            inherited
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("an s1")),
+            "{:?}",
+            inherited.reason
+        );
+        assert!(inherited.included);
     }
 
     #[test]

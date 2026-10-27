@@ -98,7 +98,9 @@ fn merges_two_scans_and_checks_the_folders() {
         file.as_os_str(),
     ])
     .success()
-    .stdout(predicate::str::contains("raum-b: sicher (Punktpaare)"))
+    .stdout(predicate::str::contains(
+        "raum-b: sicher (Punktpaare, im Mittel ",
+    ))
     .stderr(predicate::str::contains("Warnung: Punktpaare Eintrag 2"));
     let report: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(by_hand.join("modell.json")).unwrap())

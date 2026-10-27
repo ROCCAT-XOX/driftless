@@ -104,7 +104,8 @@ pub const VERDICT_FAILED: &str = "gescheitert";
 pub const NOT_IN_MODEL: &str = "nicht im Modell";
 pub const NOT_IN_MODEL_UNSURE: &str = "„Auch unsichere übernehmen“ nimmt ihn auf";
 pub const VERDICT_HINT: &str = "Überlappung: welcher Teil des Scans im Modell wiederkehrt. \
-     Restversatz: wie weit seine Punkte im Mittel neben denen der anderen liegen.";
+     Restversatz: wie weit seine Punkte im Mittel neben denen der anderen liegen. Wände: \
+     derselbe Versatz an der schlechtesten Wandrichtung.";
 /// A model whose maps were computed anew since the merge.
 pub const MODEL_STALE: &str = "veraltet – Karte eines Scans neu gerechnet";
 pub const STATUS_MODEL_STALE: &str = "Modell veraltet";
@@ -144,6 +145,26 @@ pub fn member_numbers(overlap: f64, residual_mm: f64) -> String {
         (overlap * 100.0).round() as i64,
         decimal(residual_mm, 1)
     )
+}
+
+/// Under a scan of a model placed by point pairs: „Punktpaare · Überlappung 10 % · Restversatz
+/// 0,5 mm“.
+pub fn member_numbers_pairs(overlap: f64, residual_mm: f64) -> String {
+    format!("{PAIRS_LIST} · {}", member_numbers(overlap, residual_mm))
+}
+
+/// On hover over a scan placed by point pairs: „Von Hand über Punktpaare ausgerichtet, sie
+/// liegen im Mittel 1,2 cm neben der Lage“.
+pub fn member_pairs_fit(rms_mm: f64) -> String {
+    format!(
+        "Von Hand über Punktpaare ausgerichtet, sie liegen im Mittel {} cm neben der Lage",
+        decimal(rms_mm / 10.0, 1)
+    )
+}
+
+/// On hover over a scan of a model: „Wände 1,9 mm“ (the worst wall orientation).
+pub fn member_walls(wall_mm: f64) -> String {
+    format!("Wände {} mm", decimal(wall_mm, 1))
 }
 
 pub fn unknown_model(dir: &std::path::Path) -> String {
@@ -221,6 +242,9 @@ pub fn pair_cloud_name(member: &str) -> String {
 pub fn pair_row(nr: usize, a: usize, b: usize, points: usize) -> String {
     format!("Paar {nr} · {a} ↔ {b} · {points} Punkte")
 }
+
+/// Beside a point pair the merge cannot use (a hand edit of the file); the reason on hover.
+pub const PAIR_UNUSABLE: &str = "nicht nutzbar";
 
 /// The name of the switch of point pair `nr` (from 1), for screen readers and tests.
 pub fn pair_switch(nr: usize) -> String {
