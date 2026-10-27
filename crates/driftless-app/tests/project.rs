@@ -1058,4 +1058,42 @@ fn pairs_rerun_creates_next_model() {
     assert!(err.to_string().contains("Linie"), "{err}");
     assert_eq!(PointPairs::load(&file).unwrap().entries.len(), 1);
     assert_eq!(p.models().len(), 3);
+    assert!(!report.include_unsure, "merged without unsure ones");
+
+    // „Auch unsichere übernehmen“ is stored in the model, and the rerun with point pairs keeps
+    // it although no member is unsure
+    let fourth = run_merge_job(&p, &picks(&p), true, &Progress::new()).unwrap();
+    let unsure = read_model(&fourth).unwrap();
+    assert!(unsure.include_unsure);
+    assert!(unsure.members.iter().all(|m| m.verdict != "unsicher"));
+    let model = p
+        .models()
+        .into_iter()
+        .find(|m| m.dir == fourth)
+        .expect("the fourth model");
+    let fifth = run_pairs_merge_job(&p, &model, entry_again(&model), &Progress::new()).unwrap();
+    assert!(read_model(&fifth).unwrap().include_unsure);
+}
+
+/// A point pair entry between the first two members of `model` (the same room corners as
+/// above, by its transforms).
+fn entry_again(model: &driftless_app::project::ModelInfo) -> PointPairEntry {
+    use driftless_traj::nalgebra::Point3;
+    let members = &model.report.members;
+    let in_model = [[0.5, 0.5, 0.3], [2.5, 0.8, 1.2], [1.0, 2.5, 2.0]];
+    let t_b = member_transform(&members[1]);
+    PointPairEntry {
+        a: members[0].map_dir.clone(),
+        b: members[1].map_dir.clone(),
+        points_a: in_model.to_vec(),
+        points_b: in_model
+            .map(|q| {
+                let r = t_b.inverse() * Point3::from(q);
+                [r.x, r.y, r.z]
+            })
+            .to_vec(),
+        enabled: true,
+        note: "Ecken".into(),
+        added: String::new(),
+    }
 }

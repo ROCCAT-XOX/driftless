@@ -725,6 +725,7 @@ fn pair_model(dir: &Path, root: &Path) -> ModelInfo {
             members,
             seconds_total: 3.0,
             peak_rss_bytes: 0,
+            include_unsure: false,
         },
         surfaces: Vec::new(),
     }

@@ -156,6 +156,10 @@ pub struct ModelReport {
     pub seconds_total: f64,
     /// 0 if the platform does not report it.
     pub peak_rss_bytes: u64,
+    /// [`MergeRequest::include_unsure`] of the merge. `false` in a model written before the
+    /// field.
+    #[serde(default)]
+    pub include_unsure: bool,
 }
 
 /// `T_i` of a member: world of its scan → model.
@@ -835,6 +839,7 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
         points,
         seconds_total: (start.elapsed().as_secs_f64() * 1000.0).round() / 1000.0,
         peak_rss_bytes: peak.unwrap_or(0),
+        include_unsure: req.include_unsure,
     };
     let text = serde_json::to_string_pretty(&report).map_err(failed)? + "\n";
     atomic_write(&report_path, text.as_bytes())

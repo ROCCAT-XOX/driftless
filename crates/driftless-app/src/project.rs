@@ -1447,7 +1447,7 @@ pub fn model_picks(project: &Project, report: &ModelReport) -> Result<Vec<MergeP
 /// „Übernehmen und neu zusammenführen“: adds `entry` (map folders absolute, points in the
 /// frame of each scan) to `modelle/punktpaare.toml`, its folders relative to that file and
 /// with the time it was added, then merges the scans of `model` again as they were merged
-/// ([`model_picks`], unsure ones taken in if the model took one in) into a new `modell-NNN`
+/// ([`model_picks`], unsure ones taken in if the model was merged so) into a new `modell-NNN`
 /// ([`run_merge_job`]). An entry that cannot be used ([`PointPairs::add`]) adds nothing and
 /// makes no model; the entry stays saved if the merge then fails or is cancelled (it can be
 /// switched off).
@@ -1459,11 +1459,7 @@ pub fn run_pairs_merge_job(
 ) -> Result<PathBuf, StepError> {
     let picks = model_picks(project, &model.report)?;
     merge_members(project, &picks)?;
-    let include_unsure = model
-        .report
-        .members
-        .iter()
-        .any(|m| m.included && m.verdict == "unsicher");
+    let include_unsure = model.report.include_unsure;
     let file = point_pairs_file(project);
     let models = project.dir.join(MODELS_DIR);
     let mut pairs = PointPairs::load(&file)?;
