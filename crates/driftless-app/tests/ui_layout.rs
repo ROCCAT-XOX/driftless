@@ -177,6 +177,7 @@ fn menu_has_all_project_actions() {
             (text::ADD_SCAN, ()),
             (text::ADD_RUN, ()),
             (text::OPEN_FILE, ()),
+            (text::EXPORT, ()),
         ] {
             h.get_by_label(l);
         }
@@ -206,6 +207,8 @@ fn menu_without_project_or_scan_explains_locked_entries() {
     assert!(disabled(&h, text::ADD_SCAN));
     assert!(disabled(&h, text::ADD_RUN));
     assert!(!disabled(&h, text::OPEN_FILE));
+    // nothing shown: nothing to export
+    assert!(disabled(&h, text::EXPORT));
 }
 
 #[test]

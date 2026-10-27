@@ -5,12 +5,14 @@
 //! Layout: the rail at the left edge ([`rail`]: ☰, the three [`Step`]s, ⚙), next to it the
 //! field of the active step ([`steps`]), the 3D view ([`view3d`]) in the rest with its floating
 //! bars ([`tools`]: info, the switch Punkte · Fläche · beides, the tools and the cut), the
-//! status bar ([`status`]) at the bottom and the settings window ⚙ ([`settings`]).
+//! status bar ([`status`]) at the bottom, the settings window ⚙ ([`settings`]) and the window
+//! „Exportieren“ ([`export`]).
 
 pub mod actions;
 mod app;
 pub mod compare;
 pub mod correct;
+pub mod export;
 pub mod rail;
 pub mod settings;
 pub mod status;
@@ -31,6 +33,7 @@ use crate::project::{
 use crate::render::{ColorMode, PointSize, ShowMode};
 use driftless_gpu::GpuPref;
 use driftless_io::progress::LogLine;
+use driftless_steps::export::{ExportRequest, ExportSource};
 use driftless_steps::inspect;
 use driftless_steps::map::MapSettings;
 use driftless_steps::pairs::PointPairEntry;
@@ -190,6 +193,17 @@ pub enum Action {
         a: PathBuf,
         b: PathBuf,
     },
+    /// Open the window „Exportieren“ for this source (the context menu of the tree).
+    OpenExport(ExportSource),
+    /// Open the window „Exportieren“ for what the view shows ([`export::shown_sources`]: the
+    /// cloud, the surface, or both to choose from).
+    OpenExportShown,
+    /// „Ziel wählen …“: the save dialog of the system, then [`export::target_picked`].
+    PickExportTarget,
+    /// „Ersetzen“ was answered: closes the question and exports.
+    ConfirmExport(ExportRequest),
+    /// Export as asked, as a step (also without a project).
+    RunExport(ExportRequest),
 }
 
 /// What the queue of [`AppState::queue`] computes one after the other.
@@ -371,6 +385,8 @@ pub struct AppState {
     pub map_status_pending: bool,
     /// The settings window ⚙.
     pub settings_window: SettingsWindow,
+    /// The window „Exportieren“, while it is open.
+    pub export: Option<export::ExportDialog>,
     /// The last check of a scan, shown under „Eigenschaften“ while that scan is selected.
     pub inspect: Option<InspectResult>,
     /// The map and surface folders of the tree whose status is known. Filled in the

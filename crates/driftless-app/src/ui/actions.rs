@@ -1,7 +1,8 @@
 //! The steps of the right panel as jobs: [`start_step`] checks what the step needs, then hands
 //! it to the job runner. All work on disk – also creating the run or map folder and taking
 //! over earlier stages – happens in the job ([`run_slam_job`], [`run_map_job`]), so the
-//! window never waits, and a cancelled or failed step leaves no new folder behind.
+//! window never waits, and a cancelled or failed step leaves no new folder behind. The export
+//! ([`Action::RunExport`]) runs the same way, but also without a project.
 
 use super::{text, Action, AppState};
 use crate::jobs::{JobOutput, JobRunner};
@@ -9,13 +10,15 @@ use crate::project::{
     restore_job, run_map_job, run_merge_job, run_model_surface_job, run_pairs_merge_job,
     run_slam_job, run_surface_job, ScanState, SlamJob,
 };
+use driftless_steps::export::run_export;
 use driftless_steps::inspect;
 use driftless_steps::map::MapStep;
 
 /// Starts the job of a step action (`Inspect`, `RunSlam`, `Reuse`, `RestoreHistory`,
-/// `RunMap`, `RunSurface`, `RunMerge`, `ApplyPairs`, `RunModelSurface`) and records it in
-/// [`AppState::running`]. Refused with a German message while a job runs, for a scan that
-/// cannot be read, a run without `submaps.bin` (reuse, restore), while a change of the
+/// `RunMap`, `RunSurface`, `RunMerge`, `ApplyPairs`, `RunModelSurface`, `RunExport`) and
+/// records it in [`AppState::running`]. Only the export runs without a project; its checks
+/// are the step's own ([`run_export`]). Refused with a German message while a job runs, for a
+/// scan that cannot be read, a run without `submaps.bin` (reuse, restore), while a change of the
 /// corrections is being written (reuse, restore), for invalid map or surface settings, a map
 /// without `map.json` (surface), fewer than two scans to merge, a model not in the project,
 /// or any other action.
@@ -26,6 +29,17 @@ pub fn start_step(
 ) -> Result<(), String> {
     if let Some(job) = runner.status() {
         return Err(text::busy(&job.label));
+    }
+    if let Action::RunExport(req) = action {
+        let req = req.clone();
+        runner
+            .start(text::EXPORT_TITLE, move |p| {
+                Ok(JobOutput::Exported(Box::new(run_export(&req, p)?)))
+            })
+            .map_err(|e| e.to_string())?;
+        state.running = Some(action.clone());
+        state.job = runner.status();
+        return Ok(());
     }
     let project = state.project.clone().ok_or(text::NO_PROJECT)?;
     let started = match action {

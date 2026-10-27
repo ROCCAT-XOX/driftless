@@ -3,6 +3,7 @@
 
 use super::compare::{compare_maps, compare_refs, default_refs, TrajRef};
 use super::correct::{Corrected, RunLoaded};
+use super::export::{self, ExportDialog};
 use super::tools::{self, PairSession, ScreenLayout, Tool};
 use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
@@ -1284,7 +1285,12 @@ impl DriftlessApp {
             .is_some_and(|a| self.state.computes_queue_head(a));
         let output = match f.result {
             Ok(output) => {
-                self.info(text::job_done(&f.label, &text::duration(f.seconds)));
+                match (&output, &step) {
+                    (JobOutput::Exported(report), Some(Action::RunExport(req))) => {
+                        self.info(text::exported(report, req.format.kind()))
+                    }
+                    _ => self.info(text::job_done(&f.label, &text::duration(f.seconds))),
+                }
                 Some(output)
             }
             Err(StepError::Cancelled) => {
@@ -1308,7 +1314,8 @@ impl DriftlessApp {
         // job, nor take the view from the user.
         let show = !queued
             || (self.state.queue.is_empty() && hand_loads.is_none_or(|n| n == self.hand_loads));
-        if show {
+        // an export shows nothing: a surface picked meanwhile stays one picked by hand
+        if show && !matches!(step, Some(Action::RunExport(_))) {
             self.surface_by_hand = false;
         }
         // a reuse started with the count of written changes (taken also if it failed)
@@ -1651,6 +1658,30 @@ impl DriftlessApp {
                     Err(e) => self.error(e),
                 }
             }
+            // the window closes once the export runs; refused, it stays for another try
+            step @ Action::RunExport(_) => {
+                match actions::start_step(&mut self.state, &mut self.jobs, &step) {
+                    Ok(()) => self.state.export = None,
+                    Err(e) => self.error(e),
+                }
+            }
+            Action::OpenExport(source) => {
+                let name = export::source_name(&self.state, &source);
+                self.state.export = ExportDialog::new(vec![(source, name)]);
+            }
+            Action::OpenExportShown => {
+                match ExportDialog::new(export::shown_sources(&self.state)) {
+                    Some(dialog) => self.state.export = Some(dialog),
+                    None => self.info(text::EXPORT_NEEDS_VIEW.into()),
+                }
+            }
+            Action::PickExportTarget => self.pick_export_target(),
+            Action::ConfirmExport(request) => {
+                if let Some(dialog) = &mut self.state.export {
+                    dialog.replace = None;
+                }
+                self.apply(Action::RunExport(request));
+            }
             Action::OpenMerge => self.state.open_merge(),
             Action::StartPairs { model, member } => self.start_pairs(&model, member),
             Action::SetPairEnabled { index, enabled } => self.switch_pair(index, enabled),
@@ -1674,6 +1705,30 @@ impl DriftlessApp {
                     None => self.error(text::unknown_scan(&id)),
                 }
             }
+        }
+    }
+
+    /// „Ziel wählen …“ of the window „Exportieren“: the save dialog of the system, with the
+    /// name the source suggests and the format's extension; then [`export::target_picked`].
+    fn pick_export_target(&mut self) {
+        let Some(dialog) = &self.state.export else {
+            return;
+        };
+        let format = dialog.format;
+        let name = format!("{}.{}", dialog.source().default_name(), format.extension());
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(text::EXPORT_TITLE)
+            .set_file_name(name)
+            .add_filter(format.label(), &[format.extension()])
+            .save_file()
+        else {
+            return;
+        };
+        match export::target_picked(&mut self.state, path) {
+            Ok(Some(action)) => self.apply(action),
+            // asked in the window
+            Ok(None) => {}
+            Err(e) => self.error(e),
         }
     }
 
@@ -1858,6 +1913,7 @@ impl DriftlessApp {
             .response
             .rect;
         settings::show(&ctx, &mut self.state);
+        actions.extend(export::show(&ctx, &mut self.state));
         self.view.set_tool(self.state.tool);
         self.view
             .set_picked(self.state.picked.as_ref().map(|p| p.index));

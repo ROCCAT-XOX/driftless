@@ -215,3 +215,37 @@ fn separate_runners_work_side_by_side() {
     tx.send(()).unwrap();
     wait_finished(&mut a);
 }
+
+#[test]
+fn export_job_reports_file() {
+    use driftless_app::ui::actions::start_step;
+    use driftless_app::ui::{Action, AppState};
+    use driftless_steps::export::{ExportFormat, ExportRequest, ExportSource};
+    let dir = driftless_io::testscan::tmp("job-export");
+    let run = dir.join("lauf");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(
+        run.join("traj.tum"),
+        "0.0 0 0 0 0 0 0 1\n0.5 1 2 3 0 0 0 1\n1.0 2 2 3 0 0 0 1\n",
+    )
+    .unwrap();
+    let out = dir.join("ziel").join("laufbahn.tum");
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+    let req = ExportRequest {
+        source: ExportSource::Run(run),
+        out: out.clone(),
+        format: ExportFormat::Tum,
+        overwrite: false,
+    };
+    let mut state = AppState::default();
+    let mut r = runner();
+    start_step(&mut state, &mut r, &Action::RunExport(req)).unwrap();
+    let f = wait_finished(&mut r);
+    let Ok(JobOutput::Exported(report)) = f.result else {
+        panic!("{:?}", f.result);
+    };
+    assert_eq!(report.files, std::slice::from_ref(&out));
+    assert_eq!(report.count, 3);
+    assert_eq!(report.bytes, std::fs::metadata(&out).unwrap().len());
+    assert!(!out.with_extension("tum.tmp").exists());
+}

@@ -48,8 +48,8 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     action
 }
 
-/// The entries of ☰: what the old menu bar „Projekt“ had, and „Lauf hinzufügen“ for the scan
-/// of the selection.
+/// The entries of ☰: what the old menu bar „Projekt“ had, „Lauf hinzufügen“ for the scan of
+/// the selection, and „Exportieren …“ for what the view shows.
 fn project_menu(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
     let has_project = state.project.is_some();
     if ui.button(text::NEW_PROJECT).clicked() {
@@ -74,6 +74,12 @@ fn project_menu(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
     if ui.button(text::OPEN_FILE).clicked() {
         *action = Some(Action::PickOpenFile);
     }
+    let shown = !super::export::shown_sources(state).is_empty();
+    let r = ui.add_enabled(shown, egui::Button::new(text::EXPORT));
+    if r.clicked() {
+        *action = Some(Action::OpenExportShown);
+    }
+    r.on_disabled_hover_text(text::EXPORT_NEEDS_VIEW);
 }
 
 /// The scan of the selection: the scan itself, or the scan of a selected run, map, cloud,

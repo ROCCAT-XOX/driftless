@@ -414,6 +414,63 @@ pub const DIALOG_OPEN_FILE: &str = "Datei öffnen (LAS, LAZ, E57, PLY, PCD, GLB,
 pub const FILTER_ALL: &str = "Punktwolken und Netze";
 pub const FILTER_CLOUD: &str = "Punktwolke";
 pub const FILTER_MESH: &str = "Netz";
+// Export (☰, the context menu of the tree, the window „Exportieren“)
+pub const EXPORT: &str = "Exportieren …";
+/// The window, and the label of the export in the status bar.
+pub const EXPORT_TITLE: &str = "Exportieren";
+pub const EXPORT_WHAT: &str = "Was";
+pub const EXPORT_FORMAT: &str = "Format";
+pub const EXPORT_PICK: &str = "Ziel wählen …";
+pub const EXPORT_REPLACE: &str = "Ersetzen";
+/// Why „Exportieren …“ in ☰ is locked.
+pub const EXPORT_NEEDS_VIEW: &str = "Zuerst eine Punktwolke oder Oberfläche anzeigen";
+
+/// A source in the window: „Karte 001 – color.las“ (its name and the file that is read).
+pub fn export_choice(name: &str, file: &str) -> String {
+    format!("{name} – {file}")
+}
+
+/// „Diese Dateien gibt es schon:\nx.mtl\nErsetzen?“ – the files by name (they are next to the
+/// target just chosen).
+pub fn export_replace_question(files: &[std::path::PathBuf]) -> String {
+    let names: Vec<String> = files.iter().map(|f| file_name(f)).collect();
+    format!(
+        "Diese Dateien gibt es schon:\n{}\n{EXPORT_REPLACE}?",
+        names.join("\n")
+    )
+}
+
+/// „Exportiert: modell.laz (1.234.567 Punkte, 12,3 MB)“ – the main file by name.
+pub fn exported(
+    report: &driftless_steps::export::ExportReport,
+    kind: driftless_steps::export::ExportKind,
+) -> String {
+    use driftless_steps::export::ExportKind;
+    let what = match kind {
+        ExportKind::Points => "Punkte",
+        ExportKind::Mesh => "Dreiecke",
+        ExportKind::Trajectory => "Lagen",
+    };
+    let file = report
+        .files
+        .first()
+        .map(|f| file_name(f))
+        .unwrap_or_default();
+    format!(
+        "Exportiert: {file} ({} {what}, {} MB)",
+        super::status::count(report.count),
+        decimal(report.bytes as f64 / 1e6, 1)
+    )
+}
+
+/// The name of `path`, or all of it if it has none.
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
 /// The switch at the top right of the view.
 pub const SHOW_MODE: &str = "Ansicht";
 pub const SHOW_SURFACE: &str = "Fläche";

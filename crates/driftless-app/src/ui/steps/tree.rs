@@ -8,13 +8,15 @@
 //! ([`Action::StartPairs`]); then the point pairs of the model („Punktpaare“, each with its
 //! switch, as the loops of a run; one the merge cannot use marked „nicht nutzbar“, why on
 //! hover), `modell.las` and the surfaces of the model. Names too long for the field end in „…“;
-//! the full name and the folder show on hover.
+//! the full name and the folder show on hover. A run, a map, a model and a surface have
+//! „Exportieren …“ in their context menu (right click, [`Action::OpenExport`]).
 
 use super::badge;
 use crate::project::{MapInfo, ModelInfo, RunInfo, SurfaceInfo};
 use crate::render::SCAN_COLORS;
 use crate::ui::theme::{icon, DARK};
 use crate::ui::{text, Action, AppState, Selection};
+use driftless_steps::export::ExportSource;
 use driftless_steps::merge::{ModelMember, MODEL_LAS};
 use eframe::egui::{
     self, collapsing_header::CollapsingState, Align, Color32, Id, Layout, Response, RichText,
@@ -49,6 +51,7 @@ pub(super) fn run_node(ui: &mut Ui, state: &AppState, run: &RunInfo, action: &mu
             }
         })
     };
+    export_menu(&header, || ExportSource::Run(run.dir.clone()), action);
     if header.clicked() {
         *action = Some(Action::Select(Selection::Run(run.dir.clone())));
     }
@@ -95,6 +98,7 @@ fn map_node(ui: &mut Ui, state: &AppState, map: &MapInfo, action: &mut Option<Ac
             }
         })
     };
+    export_menu(&header, || ExportSource::Map(map.dir.clone()), action);
     if header.clicked() {
         *action = Some(Action::Select(Selection::Map(map.dir.clone())));
     }
@@ -147,6 +151,7 @@ pub(super) fn model_node(
             surface_leaf(ui, state, surface, action);
         }
     });
+    export_menu(&header, || ExportSource::Model(model.dir.clone()), action);
     if header.clicked() {
         *action = Some(Action::Select(Selection::Model(model.dir.clone())));
     }
@@ -317,9 +322,23 @@ pub(super) fn surface_leaf(
             entry(ui, selected, surface.label.clone(), &hover)
         }
     });
+    export_menu(&r, || ExportSource::Surface(surface.dir.clone()), action);
     if r.clicked() {
         *action = Some(Action::Select(Selection::Surface(surface.dir.clone())));
     }
+}
+
+/// The context menu (right click) of `entry`: „Exportieren …“ opens the window for `source`.
+fn export_menu(
+    entry: &Response,
+    source: impl FnOnce() -> ExportSource,
+    action: &mut Option<Action>,
+) {
+    entry.context_menu(|ui| {
+        if ui.button(text::EXPORT).clicked() {
+            *action = Some(Action::OpenExport(source()));
+        }
+    });
 }
 
 /// A selectable name, cut with „…“ where the panel ends, the full text on hover.
