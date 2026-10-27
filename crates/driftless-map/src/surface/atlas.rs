@@ -427,8 +427,10 @@ fn pack(sizes: &[[u32; 2]], page: u32, keep_first: bool) -> (Vec<(u32, [u32; 2])
 /// colours. Remaining risk: a small separate object (fewer than [`ISLAND_FACES`] faces)
 /// bordering a surface may take that surface's image.
 ///
-/// The camera of `l` must see every face of the island geometrically: all corners project into
-/// the image within [`ColorConfig::rim_theta`] of the optical axis, the centroid is within
+/// `cams` are the cameras of all sources in turn ([`super::views::all_cameras`], numbered as
+/// [`super::views::UsedImage::exposure_camera`]). The camera of `l` must see every face of the
+/// island geometrically: all corners project into the image within
+/// [`ColorConfig::rim_theta`] of the optical axis, the centroid is within
 /// [`ColorConfig::max_dist`] of the camera, and the area-weighted summed normal of the island
 /// and of the faces around it (other charts) faces the camera. There is no depth test and no
 /// per-face facing test (the views are not read). With `smooth_weight == 0` nothing is changed
@@ -494,7 +496,7 @@ pub(crate) fn absorb_islands(
                 counted.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
                 let sees = |l: u32| {
                     let img = &views.images[l as usize];
-                    let Some(cam) = cams.get(img.camera) else {
+                    let Some(cam) = cams.get(img.exposure_camera) else {
                         return false;
                     };
                     let eye = img.world_from_cam.translation.vector;
@@ -644,9 +646,11 @@ impl Chart {
     }
 }
 
-/// Bakes the texture: charts, pages and their images (see the module docs). Progress: phase
-/// „Textur backen“, one step per image of the stream; a cancel is checked at every image and
-/// returns [`MapError::Cancelled`]. Same input, byte-identical pages.
+/// Bakes the texture: charts, pages and their images (see the module docs); `views` were found
+/// in the images of `sources`. Progress: phase „Textur backen“, one step per image of the
+/// streams of the sources that texture a chart (read one after the other); a cancel is
+/// checked at every image and returns [`MapError::Cancelled`]. Same input, byte-identical
+/// pages.
 ///
 /// Fails if `cfg` is invalid, `labels` does not fit the mesh or the images cannot be read
 /// or have changed since the views were found.
@@ -654,7 +658,7 @@ pub(crate) fn bake(
     mesh: &Mesh,
     labels: &[Option<u32>],
     views: &ViewTable,
-    src: &TextureSource,
+    sources: &[TextureSource],
     cfg: &SurfaceConfig,
     progress: &Progress,
 ) -> Result<(TexturedMesh, TextureStats), MapError> {
@@ -681,7 +685,8 @@ pub(crate) fn bake(
         .into_par_iter()
         .map(|f| {
             let r = labels[f]? as usize;
-            let cam = &src.cams.get(views.images.get(r)?.camera)?.camera;
+            let img = views.images.get(r)?;
+            let cam = &sources.get(img.source)?.cams.get(img.camera)?.camera;
             let mut p = Projected {
                 uv: [[0.0; 2]; 3],
                 theta: [0.0; 3],
@@ -858,14 +863,28 @@ pub(crate) fn bake(
         }
     }
 
-    // Charts of every image (by rank).
+    // Charts of every image (by rank), and per source the images that texture a chart.
     let mut by_rank: Vec<Vec<u32>> = vec![Vec::new(); views.images.len()];
     for (c, chart) in charts.iter().enumerate() {
         by_rank[chart.rank as usize].push(c as u32);
     }
-    let mut remaining = by_rank.iter().filter(|c| !c.is_empty()).count();
+    let mut needed = vec![0usize; sources.len()];
+    for (r, c) in by_rank.iter().enumerate() {
+        if let Some(n) = needed
+            .get_mut(views.images[r].source)
+            .filter(|_| !c.is_empty())
+        {
+            *n += 1;
+        }
+    }
+    let remaining: usize = needed.iter().sum();
     let total = if remaining > 0 {
-        image_count(&src.images)
+        sources
+            .iter()
+            .zip(&needed)
+            .filter(|&(_, &n)| n > 0)
+            .map(|(s, _)| image_count(&s.images))
+            .sum::<Option<u64>>()
     } else {
         Some(0)
     };
@@ -874,88 +893,97 @@ pub(crate) fn bake(
     if remaining > 0 {
         let d = cfg.color.downscale;
         let lin = linear_table();
-        let mut cancelled = false;
-        // Images that could not be decoded, and images of a known camera at the wrong size.
-        let (mut unreadable, mut wrong_size) = (0usize, 0usize);
-        let read = for_each_image(&src.images.bags, &src.images.topics, d, |frame| {
-            if progress.is_cancelled() {
-                cancelled = true;
-                return false;
+        for (s, src) in sources.iter().enumerate() {
+            let mut remaining = needed[s];
+            if remaining == 0 {
+                continue;
             }
-            progress.advance(1);
-            let Ok(frame) = frame else {
-                unreadable += 1;
-                return true;
-            };
-            let Some(camera) = frame_camera(&frame, &src.cams, d) else {
-                if src.cams.iter().any(|c| c.camera.name == frame.camera) {
-                    wrong_size += 1;
+            let mut cancelled = false;
+            // Images that could not be decoded, and images of a known camera at the wrong size.
+            let (mut unreadable, mut wrong_size) = (0usize, 0usize);
+            let read = for_each_image(&src.images.bags, &src.images.topics, d, |frame| {
+                if progress.is_cancelled() {
+                    cancelled = true;
+                    return false;
                 }
-                return true;
-            };
-            let Some(rank) = views.rank_of(camera, frame.stamp) else {
-                return true;
-            };
-            let todo = std::mem::take(&mut by_rank[rank as usize]);
-            if todo.is_empty() {
-                return true;
-            }
-            let shot = Shot {
-                rgb: &frame.rgb,
-                downscale: d,
-                gain: views.gains[rank as usize],
-                vignetting: &views.vignetting,
-                camera,
-                lin: &lin,
-            };
-            // In batches of at most FILL_BATCH_TEXELS, so that the large charts of one image
-            // are not all held at once.
-            let mut from = 0;
-            while from < todo.len() {
-                let mut to = from;
-                let mut texels = 0u64;
-                while to < todo.len() && (to == from || texels < FILL_BATCH_TEXELS) {
-                    let size = charts[todo[to] as usize].size;
-                    texels += u64::from(size[0]) * u64::from(size[1]);
-                    to += 1;
-                }
-                let batch = &todo[from..to];
-                let filled: Vec<(Vec<u8>, u64)> = batch
-                    .par_iter()
-                    .map(|&c| fill_chart(&charts[c as usize], faces_of(c as usize), &proj, &shot))
-                    .collect();
-                for (&c, (buf, inside)) in batch.iter().zip(&filled) {
-                    covered += inside;
-                    let chart = &charts[c as usize];
-                    let image = &mut pages[chart.page as usize].image.data;
-                    let row = chart.size[0] as usize * 3;
-                    for (y, src_row) in buf.chunks_exact(row).enumerate() {
-                        let start =
-                            ((chart.origin[1] as usize + y) * side + chart.origin[0] as usize) * 3;
-                        image[start..start + row].copy_from_slice(src_row);
+                progress.advance(1);
+                let Ok(frame) = frame else {
+                    unreadable += 1;
+                    return true;
+                };
+                let Some(camera) = frame_camera(&frame, &src.cams, d) else {
+                    if src.cams.iter().any(|c| c.camera.name == frame.camera) {
+                        wrong_size += 1;
                     }
+                    return true;
+                };
+                let Some(rank) = views.rank_of(s, camera, frame.stamp) else {
+                    return true;
+                };
+                let todo = std::mem::take(&mut by_rank[rank as usize]);
+                if todo.is_empty() {
+                    return true;
                 }
-                from = to;
+                let shot = Shot {
+                    rgb: &frame.rgb,
+                    downscale: d,
+                    gain: views.gains[rank as usize],
+                    vignetting: &views.vignetting,
+                    camera: views.images[rank as usize].exposure_camera,
+                    lin: &lin,
+                };
+                // In batches of at most FILL_BATCH_TEXELS, so that the large charts of one
+                // image are not all held at once.
+                let mut from = 0;
+                while from < todo.len() {
+                    let mut to = from;
+                    let mut texels = 0u64;
+                    while to < todo.len() && (to == from || texels < FILL_BATCH_TEXELS) {
+                        let size = charts[todo[to] as usize].size;
+                        texels += u64::from(size[0]) * u64::from(size[1]);
+                        to += 1;
+                    }
+                    let batch = &todo[from..to];
+                    let filled: Vec<(Vec<u8>, u64)> = batch
+                        .par_iter()
+                        .map(|&c| {
+                            fill_chart(&charts[c as usize], faces_of(c as usize), &proj, &shot)
+                        })
+                        .collect();
+                    for (&c, (buf, inside)) in batch.iter().zip(&filled) {
+                        covered += inside;
+                        let chart = &charts[c as usize];
+                        let image = &mut pages[chart.page as usize].image.data;
+                        let row = chart.size[0] as usize * 3;
+                        for (y, src_row) in buf.chunks_exact(row).enumerate() {
+                            let start = ((chart.origin[1] as usize + y) * side
+                                + chart.origin[0] as usize)
+                                * 3;
+                            image[start..start + row].copy_from_slice(src_row);
+                        }
+                    }
+                    from = to;
+                }
+                remaining -= 1;
+                remaining > 0
+            });
+            if cancelled {
+                return Err(MapError::Cancelled);
             }
-            remaining -= 1;
-            remaining > 0
-        });
-        if cancelled {
-            return Err(MapError::Cancelled);
+            read.map_err(|e| MapError::Images(e.to_string()))?;
+            if remaining > 0 && unreadable + wrong_size > 0 {
+                return Err(MapError::Images(format!(
+                    "{remaining} für die Textur nötige Bilder fehlen: {unreadable} Bilder \
+                     unlesbar, {wrong_size} in falscher Größe"
+                )));
+            }
+            if remaining > 0 {
+                return Err(MapError::Images(
+                    "Bilder haben sich zwischen zwei Durchläufen geändert".into(),
+                ));
+            }
         }
-        read.map_err(|e| MapError::Images(e.to_string()))?;
-        if remaining > 0 && unreadable + wrong_size > 0 {
-            return Err(MapError::Images(format!(
-                "{remaining} für die Textur nötige Bilder fehlen: {unreadable} Bilder \
-                 unlesbar, {wrong_size} in falscher Größe"
-            )));
-        }
-        if remaining > 0 {
-            return Err(MapError::Images(
-                "Bilder haben sich zwischen zwei Durchläufen geändert".into(),
-            ));
-        }
-        // The stream stops after the last needed image: the phase is complete.
+        // Each stream stops after its last needed image: the phase is complete.
         if let Some(total) = total {
             let done = progress.snapshot().done;
             progress.advance(total.saturating_sub(done));
@@ -1607,7 +1635,9 @@ mod tests {
             per_face[f * k..f * k + 2].copy_from_slice(&v);
         }
         let image = |stamp: f64| UsedImage {
+            source: 0,
             camera: 0,
+            exposure_camera: 0,
             stamp,
             world_from_cam: Isometry3::identity(),
         };
@@ -1641,10 +1671,18 @@ mod tests {
         let (mesh, src, front) = fixture("atlas-checker", &[0.0], false);
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
         assert!(labels.iter().all(Option::is_some));
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         println!("{stats:?}");
         let snap = progress.snapshot();
         assert_eq!(snap.phase, "Textur backen");
@@ -1668,14 +1706,30 @@ mod tests {
         assert_pages_sane(&tm, cfg.page_size, mesh.indices.len());
         assert_checker(&mesh, &tm, front);
         // Same input, byte-identical pages.
-        let (again, _) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (again, _) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         assert_eq!(again, tm);
         // Coarser than the image: the chart is scaled down to 15 mm texels and averaged.
         let coarse = SurfaceConfig {
             min_texel: 0.015,
             ..cfg.clone()
         };
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &coarse, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &coarse,
+            &progress,
+        )
+        .unwrap();
         assert!((stats.texel_median_mm - 15.0).abs() < 0.5, "{stats:?}");
         assert_checker(&mesh, &tm, front);
     }
@@ -1686,10 +1740,18 @@ mod tests {
         let back = mesh.indices.len() - front;
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
         assert!(labels[front..].iter().all(Option::is_none));
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         assert_eq!(stats.faces_untextured, back);
         assert_eq!(stats.faces_textured, front);
         assert_charts(&tm, cfg.page_size);
@@ -1770,7 +1832,7 @@ mod tests {
             ..SurfaceConfig::default()
         };
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         assert_eq!(views.images.len(), 2);
         let k = cfg.views_per_face;
         let labels: Vec<Option<u32>> = (0..front)
@@ -1781,7 +1843,15 @@ mod tests {
                 Some(want)
             })
             .collect();
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         println!("{stats:?}");
         assert!(stats.charts > 100, "{stats:?}");
         assert!(
@@ -1803,10 +1873,18 @@ mod tests {
         let faces = mesh.indices.len();
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
         assert!(labels.iter().all(|&l| l == Some(0)));
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         println!("{stats:?}");
         assert!(stats.charts > 1, "{stats:?}");
         assert!(stats.fill_ratio >= 0.5, "{stats:?}");
@@ -1815,7 +1893,15 @@ mod tests {
         assert_charts(&tm, cfg.page_size);
         assert!(check_fields(&mesh, &tm, faces) >= 10);
         // Deterministic.
-        let (again, _) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (again, _) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         assert_eq!(again, tm);
     }
 
@@ -1828,9 +1914,17 @@ mod tests {
         let faces = mesh.indices.len();
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         println!("{stats:?}");
         assert_eq!(stats.charts, 1);
         assert!(stats.fill_ratio < 0.95, "{stats:?}");
@@ -1855,9 +1949,17 @@ mod tests {
         keep_faces(&mut mesh, |c| c[0] < -0.7 || c[2] < -0.3);
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         println!("{stats:?}");
         assert_charts(&tm, cfg.page_size);
         assert!(stats.fill_ratio > 0.75, "{stats:?}");
@@ -1886,7 +1988,9 @@ mod tests {
             }
         }
         let image = |stamp: f64| UsedImage {
+            source: 0,
             camera: 0,
+            exposure_camera: 0,
             stamp,
             world_from_cam: Isometry3::identity(),
         };
@@ -1951,9 +2055,17 @@ mod tests {
             ..SurfaceConfig::default()
         };
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         println!("{} faces: {stats:?}", mesh.indices.len());
         assert_charts(&tm, cfg.page_size);
         assert_pages_sane(&tm, cfg.page_size, mesh.indices.len());
@@ -1990,10 +2102,18 @@ mod tests {
         };
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
-        let views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
         assert!(labels.iter().all(|&l| l == Some(0)));
-        let (tm, stats) = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let (tm, stats) = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         println!("{stats:?}");
         assert_eq!(stats.charts, 1, "{stats:?}");
         assert!(stats.fill_ratio > 0.75, "{stats:?}");
@@ -2007,11 +2127,27 @@ mod tests {
         let (mesh, src, _) = fixture("atlas-noviews", &[-0.15, 0.15], false);
         let cfg = SurfaceConfig::default();
         let progress = Progress::new();
-        let mut views = collect_views(&mesh, &src, &cfg, &progress).unwrap();
+        let mut views = collect_views(&mesh, std::slice::from_ref(&src), &cfg, &progress).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
-        let with = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let with = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         views.per_face = Vec::new();
-        let without = bake(&mesh, &labels, &views, &src, &cfg, &progress).unwrap();
+        let without = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &progress,
+        )
+        .unwrap();
         assert_eq!(with, without);
     }
 
@@ -2019,7 +2155,8 @@ mod tests {
     fn bake_cancellable_and_checked() {
         let (mesh, src, _) = fixture("atlas-cancel", &[0.0], false);
         let cfg = SurfaceConfig::default();
-        let views = collect_views(&mesh, &src, &cfg, &Progress::new()).unwrap();
+        let views =
+            collect_views(&mesh, std::slice::from_ref(&src), &cfg, &Progress::new()).unwrap();
         let labels = choose_labels(&mesh, &views, &cfg);
         let p = Progress::new();
         let q = p.clone();
@@ -2028,10 +2165,17 @@ mod tests {
                 q.cancel();
             }
         });
-        let r = bake(&mesh, &labels, &views, &src, &cfg, &p);
+        let r = bake(&mesh, &labels, &views, std::slice::from_ref(&src), &cfg, &p);
         assert!(matches!(r, Err(MapError::Cancelled)), "{r:?}");
         // Labels that do not fit the mesh are refused.
-        let r = bake(&mesh, &labels[1..], &views, &src, &cfg, &Progress::new());
+        let r = bake(
+            &mesh,
+            &labels[1..],
+            &views,
+            std::slice::from_ref(&src),
+            &cfg,
+            &Progress::new(),
+        );
         assert!(matches!(r, Err(MapError::Config(_))), "{r:?}");
         // A page too small for the gray block and a chart's border.
         let tiny = SurfaceConfig {
@@ -2042,7 +2186,14 @@ mod tests {
         // A needed image of the wrong size has its own message.
         let mut resized = src.clone();
         resized.cams[0].camera.width *= 2;
-        let r = bake(&mesh, &labels, &views, &resized, &cfg, &Progress::new());
+        let r = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&resized),
+            &cfg,
+            &Progress::new(),
+        );
         match r {
             Err(MapError::Images(m)) => assert!(m.contains("falscher Größe"), "{m}"),
             other => panic!("{other:?}"),
@@ -2050,7 +2201,14 @@ mod tests {
         // Images that went missing since the views were found.
         let mut gone = src.clone();
         gone.images.topics = vec!["/camera_nichts/image_raw".into()];
-        let r = bake(&mesh, &labels, &views, &gone, &cfg, &Progress::new());
+        let r = bake(
+            &mesh,
+            &labels,
+            &views,
+            std::slice::from_ref(&gone),
+            &cfg,
+            &Progress::new(),
+        );
         assert!(matches!(r, Err(MapError::Images(_))), "{r:?}");
     }
 
@@ -2088,7 +2246,9 @@ mod tests {
                 .zip(cameras)
                 .enumerate()
                 .map(|(i, (p, &camera))| UsedImage {
+                    source: 0,
                     camera,
+                    exposure_camera: camera,
                     stamp: i as f64,
                     world_from_cam: *p,
                 })

@@ -432,6 +432,52 @@ pub(crate) fn painted_mesh(painted: &Painted, step: f64) -> Mesh {
     mesh
 }
 
+/// The rendered walk ([`scene::walk_scene`] along [`scene::walk`]) as one image source of its
+/// own (a bag in the temporary directory `name`): the images of the cameras `which` (indices
+/// into [`scene::cameras`]; the source's cameras in this order) at the walk's steps `steps`
+/// (stamp `T0 + 0.5 · step`, 1 to 11 as in [`scene::walk_shots`]), every pixel's linear colour
+/// times `gain`. Poses: the walk at 10 Hz over 6 s, in the scene's frame.
+pub(crate) fn walk_source(
+    name: &str,
+    which: &[usize],
+    steps: std::ops::RangeInclusive<u32>,
+    gain: f64,
+) -> super::TextureSource {
+    let painted = scene::walk_scene();
+    let all = scene::cameras();
+    let cams: Vec<crate::ColorCamera> = which.iter().map(|&c| all[c].clone()).collect();
+    let traj = scene::walk();
+    let shots: Vec<scene::Shot> = steps
+        .flat_map(|i| {
+            (0..cams.len()).map(move |c| scene::Shot {
+                camera: c,
+                stamp: scene::T0 + 0.5 * f64::from(i),
+                edit: if gain == 1.0 {
+                    Box::new(|rgb| rgb)
+                } else {
+                    Box::new(move |rgb: Vec<u8>| brighter(rgb, gain))
+                },
+            })
+        })
+        .collect();
+    let images = scene::write_bag(name, &painted, &traj, &cams, &shots);
+    super::TextureSource {
+        images,
+        poses: scene::poses(&traj, 6.0),
+        cams,
+    }
+}
+
+/// `rgb` (sRGB) with every linear value times `gain`, clipped at white.
+pub(crate) fn brighter(rgb: Vec<u8>, gain: f64) -> Vec<u8> {
+    rgb.into_iter()
+        .map(|v| {
+            let l = (f64::from(v) / 255.0).powf(2.2) * gain;
+            (l.min(1.0).powf(1.0 / 2.2) * 255.0).round() as u8
+        })
+        .collect()
+}
+
 /// Index of the face whose centroid lies nearest to `p`.
 pub(crate) fn face_near(mesh: &Mesh, p: [f32; 3]) -> usize {
     let d2 = |f: usize| {

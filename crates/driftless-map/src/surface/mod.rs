@@ -227,34 +227,24 @@ pub struct ViewsSeconds {
     pub waiting_for_images: Option<f64>,
 }
 
-/// The textured surface of `input`: [`build_mesh`], then [`texture_mesh`] from `sources`.
-/// Without `sources` (a scan without images) every face is gray, on one page of
-/// [`MIN_PAGE_SIZE`]². Only one source is supported for now (one scan); several scans come
-/// later.
+/// The textured surface of `input`: [`build_mesh`], then [`texture_mesh`] from `sources`
+/// (one per scan, see [`TextureSource`]). Without `sources` (a scan without images) every face
+/// is gray, on one page of [`MIN_PAGE_SIZE`]².
 ///
 /// Progress: the phases of the parts; a cancel is checked between them and returns
 /// [`MapError::Cancelled`]. Same input, same mesh and pages (only `seconds` varies).
 ///
-/// Fails if `cfg` is invalid, more than one source is given or the images cannot be read.
+/// Fails if `cfg` is invalid, two cameras of one source share a name or the images cannot be
+/// read.
 pub fn build_surface(
     input: &SurfaceInput,
     sources: &[TextureSource],
     cfg: &SurfaceConfig,
     progress: &Progress,
 ) -> Result<(TexturedMesh, SurfaceStats), MapError> {
-    check_sources(sources)?;
     let (mesh, mut stats) = build_mesh(input, cfg, progress)?;
     let tex = texture_mesh(&mesh, sources, cfg, progress, &mut stats, None)?;
     Ok((tex, stats))
-}
-
-fn check_sources(sources: &[TextureSource]) -> Result<(), MapError> {
-    if sources.len() > 1 {
-        return Err(MapError::Config(
-            "mehrere Bildquellen für eine Oberfläche werden noch nicht unterstützt".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn check_cancel(progress: &Progress) -> Result<(), MapError> {
@@ -312,8 +302,10 @@ pub fn build_mesh(
     Ok((mesh, stats))
 }
 
-/// `mesh` (from [`build_mesh`]) textured from `sources`: views, labels, baking and seam
-/// levelling; gray without sources. Adds its figures and phases to `stats`. With `gpu` the
+/// `mesh` (from [`build_mesh`]) textured from `sources` (all in the mesh's frame, see
+/// [`TextureSource`]): views, labels, baking and seam levelling, the images of the sources
+/// one after the other in every pass; gray without sources. Adds its figures and phases to
+/// `stats`. With `gpu` the
 /// views per face are found on the GPU (the same views up to rounding; see
 /// [`ViewsSeconds`] and [`SurfaceStats::gpu_fallback`]).
 pub fn texture_mesh(
@@ -325,13 +317,12 @@ pub fn texture_mesh(
     gpu: Option<&GpuContext>,
 ) -> Result<TexturedMesh, MapError> {
     cfg.check()?;
-    check_sources(sources)?;
     let mut clock = Clock::new();
     check_cancel(progress)?;
-    let tex = match sources.first() {
-        Some(src) => {
+    let tex = match sources {
+        [_, ..] => {
             let (mut views, info) =
-                views::collect_views_on(mesh, src, cfg, progress, gpu.map(|g| (g, None)))?;
+                views::collect_views_on(mesh, sources, cfg, progress, gpu.map(|g| (g, None)))?;
             stats.views_seconds = ViewsSeconds {
                 quality: info.quality_seconds,
                 pass: info.views_seconds,
@@ -346,10 +337,11 @@ pub fn texture_mesh(
             // view, `views_per_face` per face): free them before the pages are allocated.
             // `absorb_islands` only reads `views.images`.
             views.per_face = Vec::new();
-            let islands_absorbed = atlas::absorb_islands(mesh, &views, &src.cams, cfg, &mut labels);
+            let cams = views::all_cameras(sources);
+            let islands_absorbed = atlas::absorb_islands(mesh, &views, &cams, cfg, &mut labels);
             clock.lap(stats, "labels");
             check_cancel(progress)?;
-            let (mut tex, texture) = atlas::bake(mesh, &labels, &views, src, cfg, progress)?;
+            let (mut tex, texture) = atlas::bake(mesh, &labels, &views, sources, cfg, progress)?;
             drop(views);
             stats.texture = texture;
             stats.texture.islands_absorbed = islands_absorbed;
@@ -360,7 +352,7 @@ pub fn texture_mesh(
             clock.lap(stats, "seams");
             tex
         }
-        None => {
+        [] => {
             let (tex, texture) = gray_only(mesh, cfg, progress)?;
             stats.texture = texture;
             clock.lap(stats, "bake");
@@ -388,16 +380,8 @@ fn gray_only(
         gains: Vec::new(),
         vignetting: crate::Vignetting::default(),
     };
-    let none = TextureSource {
-        images: crate::ImageSource {
-            bags: Vec::new(),
-            topics: Vec::new(),
-        },
-        poses: Vec::new(),
-        cams: Vec::new(),
-    };
     let labels = vec![None; mesh.indices.len()];
-    atlas::bake(mesh, &labels, &views, &none, &cfg, progress)
+    atlas::bake(mesh, &labels, &views, &[], &cfg, progress)
 }
 
 /// A vertex counts as wall (flat) if the normals of all its faces lie within this angle
@@ -722,10 +706,268 @@ mod tests {
             "{got:?}"
         );
 
-        // Two sources are refused.
+        // The same scan twice: no error, every face seen before is seen again.
         let two = [src.clone(), src];
-        let r = build_surface(&scan.input(), &two, &cfg, &Progress::new());
-        assert!(matches!(r, Err(MapError::Config(_))), "{r:?}");
+        let (_, twice) = build_surface(&scan.input(), &two, &cfg, &Progress::new()).unwrap();
+        assert!(
+            twice.texture.faces_textured >= stats.texture.faces_textured,
+            "{twice:?}"
+        );
+    }
+
+    /// FNV-1a over every page (geometry and texels) and the face references of `tex`.
+    fn pages_hash(tex: &TexturedMesh) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        for p in &tex.pages {
+            let floats = p.positions.iter().flatten().chain(p.uvs.iter().flatten());
+            for x in floats {
+                eat(&x.to_bits().to_le_bytes());
+            }
+            for t in &p.indices {
+                for i in t {
+                    eat(&i.to_le_bytes());
+                }
+            }
+            eat(&p.image.width.to_le_bytes());
+            eat(&p.image.data);
+        }
+        for (a, b) in &tex.face_ref {
+            eat(&a.to_le_bytes());
+            eat(&b.to_le_bytes());
+        }
+        h
+    }
+
+    /// The pages of the rendered walk from one source, as they were before several sources
+    /// were supported (recorded on Apple silicon; elsewhere the platform's `exp`/`atan2` may
+    /// differ in the last bit, so only determinism is checked there).
+    #[test]
+    fn one_source_pages_unchanged() {
+        let (painted, images, poses, cams) = scene::walk_data();
+        let mesh = painted_mesh(painted, 0.1);
+        let src = TextureSource {
+            images: images.clone(),
+            poses: poses.clone(),
+            cams: cams.clone(),
+        };
+        let cfg = SurfaceConfig {
+            min_texel: 0.01,
+            page_size: 1024,
+            ..SurfaceConfig::default()
+        };
+        let run = || {
+            let mut stats = SurfaceStats::default();
+            let tex = texture_mesh(
+                &mesh,
+                std::slice::from_ref(&src),
+                &cfg,
+                &Progress::new(),
+                &mut stats,
+                None,
+            )
+            .unwrap();
+            (tex, stats)
+        };
+        let (tex, stats) = run();
+        assert!(
+            stats.texture.faces_textured > mesh.indices.len() / 4,
+            "{stats:?}"
+        );
+        let h = pages_hash(&tex);
+        println!("pages hash {h:#018x}, {} pages", tex.pages.len());
+        assert_eq!(pages_hash(&run().0), h);
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(h, 0xd7bf_a35a_ab37_0f12, "pages changed");
+    }
+
+    /// [`texture_mesh`] of `mesh` from `sources` on the CPU, at 1 cm texels on 1024² pages.
+    fn textured(
+        mesh: &Mesh,
+        sources: &[TextureSource],
+    ) -> Result<(TexturedMesh, SurfaceStats), MapError> {
+        let cfg = SurfaceConfig {
+            min_texel: 0.01,
+            page_size: 1024,
+            ..SurfaceConfig::default()
+        };
+        let mut stats = SurfaceStats::default();
+        let tex = texture_mesh(mesh, sources, &cfg, &Progress::new(), &mut stats, None)?;
+        Ok((tex, stats))
+    }
+
+    /// The texel at the centre of face `f` in its page.
+    fn face_colour(tex: &TexturedMesh, f: usize) -> [u8; 3] {
+        let (page, tri) = tex.face_ref[f];
+        let page = &tex.pages[page as usize];
+        let uv = page.indices[tri as usize].map(|v| page.uvs[v as usize]);
+        let at = |k: usize| {
+            let c = (uv[0][k] + uv[1][k] + uv[2][k]) / 3.0 * page.image.width as f32;
+            (c.floor() as usize).min(page.image.width as usize - 1)
+        };
+        let i = (at(1) * page.image.width as usize + at(0)) * 3;
+        [
+            page.image.data[i],
+            page.image.data[i + 1],
+            page.image.data[i + 2],
+        ]
+    }
+
+    /// The colour at the centre of a 32 × 24 preview from `eye` towards `target` (40°).
+    fn preview_centre(tex: &TexturedMesh, eye: [f32; 3], target: [f32; 3]) -> [u8; 3] {
+        let img = render_preview(tex, eye, target, 40.0, [32, 24]);
+        let i = (12 * 32 + 16) * 3;
+        [img.data[i], img.data[i + 1], img.data[i + 2]]
+    }
+
+    #[test]
+    fn two_sources_cover_more() {
+        // Two scans of the walk: one saw only the left (+y) half of the room, the other only
+        // the right (−y) half; each source has just its one camera.
+        let mesh = painted_mesh(&scene::walk_scene(), 0.1);
+        let left = walk_source("two-left", &[0], 1..=11, 1.0);
+        let right = walk_source("two-right", &[1], 1..=11, 1.0);
+        let (_, a) = textured(&mesh, std::slice::from_ref(&left)).unwrap();
+        let (_, b) = textured(&mesh, std::slice::from_ref(&right)).unwrap();
+        let (tex, both) = textured(&mesh, &[left, right]).unwrap();
+        let untextured = |s: &SurfaceStats| s.texture.faces_untextured;
+        println!(
+            "untextured: left {}, right {}, both {}",
+            untextured(&a),
+            untextured(&b),
+            untextured(&both)
+        );
+        assert!(untextured(&both) < untextured(&a), "{both:?}");
+        assert!(untextured(&both) < untextured(&b), "{both:?}");
+        // Each half has the colour of its wall.
+        let plus_y = preview_centre(&tex, [0.5, 0.0, 0.0], [0.5, 5.0, 0.0]);
+        assert!(
+            scene::close(plus_y, scene::WALLS[3], 2 * scene::TOL),
+            "{plus_y:?}"
+        );
+        let minus_y = preview_centre(&tex, [0.5, 0.0, 0.0], [0.5, -4.0, 0.0]);
+        assert!(
+            scene::close(minus_y, scene::WALLS[2], 2 * scene::TOL),
+            "{minus_y:?}"
+        );
+    }
+
+    #[test]
+    fn two_sources_same_camera_name() {
+        // Both scans have a camera "left": no clash between sources.
+        let mesh = painted_mesh(&scene::walk_scene(), 0.1);
+        let early = walk_source("name-early", &[0], 1..=6, 1.0);
+        let late = walk_source("name-late", &[0], 7..=11, 1.0);
+        assert_eq!(early.cams[0].camera.name, late.cams[0].camera.name);
+        let (_, stats) = textured(&mesh, &[early.clone(), late]).unwrap();
+        assert!(stats.texture.faces_textured > 0, "{stats:?}");
+        // Twice the same name within one source is still an error.
+        let mut twice = early;
+        twice.cams.push(twice.cams[0].clone());
+        let r = textured(&mesh, &[twice]);
+        assert!(
+            matches!(r, Err(MapError::Config(_))),
+            "{:?}",
+            r.map(|r| r.1)
+        );
+    }
+
+    #[test]
+    fn second_source_in_other_frame() {
+        // The second scan was recorded in its own frame: its poses there are `T⁻¹ · pose`, its
+        // points `T⁻¹ · p` (f32). The caller moves both with `T` into the model frame; the
+        // texture is the one without `T`, up to rounding.
+        let mesh = painted_mesh(&scene::walk_scene(), 0.1);
+        let first = walk_source("frame-first", &[0, 1], 1..=6, 1.0);
+        let second = walk_source("frame-second", &[0, 1], 7..=11, 1.0);
+        let (plain, plain_stats) = textured(&mesh, &[first.clone(), second.clone()]).unwrap();
+
+        let t = Isometry3::from_parts(
+            nalgebra::Translation3::new(3.2, -1.7, 0.4),
+            nalgebra::UnitQuaternion::from_euler_angles(0.0, 0.0, 0.7),
+        );
+        let move_pose = |m: &Isometry3<f64>, p: &Pose| {
+            let iso = m * Isometry3::from_parts(p.p.into(), p.q);
+            Pose {
+                t: p.t,
+                p: iso.translation.vector,
+                q: iso.rotation,
+            }
+        };
+        let own: Vec<Pose> = second
+            .poses
+            .iter()
+            .map(|p| move_pose(&t.inverse(), p))
+            .collect();
+        let back = |p: [f32; 3], m: &Isometry3<f64>| {
+            let q = m * nalgebra::Point3::from(nalgebra::Vector3::from(p.map(f64::from)));
+            [q.x as f32, q.y as f32, q.z as f32]
+        };
+        let mut moved = mesh.clone();
+        for p in &mut moved.positions {
+            *p = back(back(*p, &t.inverse()), &t);
+        }
+        let mut brought = second.clone();
+        brought.poses = own.iter().map(|p| move_pose(&t, p)).collect();
+        let (tex, stats) = textured(&moved, &[first.clone(), brought]).unwrap();
+        assert_eq!(
+            stats.texture.faces_textured,
+            plain_stats.texture.faces_textured
+        );
+        let n = mesh.indices.len();
+        let off = (0..n)
+            .filter(|&f| {
+                let (a, b) = (face_colour(&tex, f), face_colour(&plain, f));
+                (0..3).any(|c| a[c].abs_diff(b[c]) > 2)
+            })
+            .count();
+        println!("{off} of {n} faces differ by more than 2 levels");
+        assert!(off * 200 <= n, "{off} of {n}");
+
+        // Without `T` the second scan's images land elsewhere: the texture is clearly worse.
+        let mut forgot = second;
+        forgot.poses = own;
+        let (wrong, _) = textured(&mesh, &[first, forgot]).unwrap();
+        let off = (0..n)
+            .filter(|&f| {
+                let (a, b) = (face_colour(&wrong, f), face_colour(&plain, f));
+                (0..3).any(|c| a[c].abs_diff(b[c]) > 2)
+            })
+            .count();
+        assert!(off * 20 > n, "{off} of {n}");
+    }
+
+    #[test]
+    fn source_without_images() {
+        // A scan without images next to one with: the same pages as the one alone, in either
+        // order the same faces textured.
+        let mesh = painted_mesh(&scene::walk_scene(), 0.1);
+        let (_, images, poses, cams) = scene::walk_data();
+        let src = TextureSource {
+            images: images.clone(),
+            poses: poses.clone(),
+            cams: cams.clone(),
+        };
+        let none = TextureSource {
+            images: crate::ImageSource {
+                bags: Vec::new(),
+                topics: Vec::new(),
+            },
+            poses: Vec::new(),
+            cams: cams.clone(),
+        };
+        let (alone, stats) = textured(&mesh, std::slice::from_ref(&src)).unwrap();
+        let (after, _) = textured(&mesh, &[src.clone(), none.clone()]).unwrap();
+        assert_eq!(after, alone);
+        let (_, before) = textured(&mesh, &[none.clone(), src]).unwrap();
+        assert_eq!(before.texture.faces_textured, stats.texture.faces_textured);
+        // Only sources without images: gray.
+        let (_, gray) = textured(&mesh, &[none]).unwrap();
+        assert_eq!(gray.texture.faces_textured, 0);
     }
 
     #[test]

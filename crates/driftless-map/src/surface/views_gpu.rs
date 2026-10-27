@@ -4,22 +4,24 @@
 //! face's samples, the visibility of centroid and corners, the score, the carrier tag, the
 //! mean colour and the angle, and the insertion into the face's slots (as `keep_best_view`)
 //! and the exposure samples (as `keep_sample`). One invocation per face, images in stream
-//! order: no atomics on the slots, the same order as the CPU on equal scores. The smoothed
-//! normals come from the CPU (`Faces`); after the last image the slots come back and the
-//! exposure fit, the occlusion mask and the photo consistency run on the CPU, unchanged.
+//! order (the sources' streams one after the other): no atomics on the slots, the same order
+//! as the CPU on equal scores. The smoothed normals come from the CPU (`Faces`); after the
+//! last image the slots come back and the exposure fit, the occlusion mask and the photo
+//! consistency run on the CPU, unchanged.
 //! The images are decoded in a thread of their own, up to [`LOOKAHEAD`] images ahead.
 
 use super::views::{
     FaceView, Pass, ANGLE_STEP, CARRIER_ALTERNATIVE, CARRIER_BELOW, CARRIER_NORMAL_Z,
     CARRIER_RADIUS, MAX_SUBDIVISIONS, SAMPLE_GAP_CELLS, SMOOTH_COS_MIN,
 };
-use crate::color::{frame_camera, linear_table, ImageRecord, Status, View, SHARPNESS_DOWNSCALE};
+use crate::color::{frame_camera, linear_table, View, SHARPNESS_DOWNSCALE};
 use crate::color_gpu::{vis_params, GpuStop, LOOKAHEAD};
 use crate::MapError;
 use driftless_gpu::{
     faces_batch, faces_bytes, guarded, CarrierRule, FaceData, FaceImage, FaceParams, FaceViews,
     GpuCamera, GpuContext, GpuRunError,
 };
+use driftless_io::bag::BagError;
 use driftless_io::camera::Camera;
 use driftless_io::images::{for_each_image, Frame, ImageError};
 use driftless_io::progress::Progress;
@@ -43,15 +45,15 @@ pub(crate) fn gpu_views(
     let Pass {
         mesh,
         faces,
-        src,
+        sources,
+        cams,
         cfg,
-        records,
+        streams,
         images,
-        last_used,
         stride,
         sample_faces,
     } = *pass;
-    let (cams, ccfg) = (&src.cams, &cfg.color);
+    let ccfg = &cfg.color;
     let k = cfg.views_per_face;
     let start = |e: GpuRunError| {
         if ctx.falls_back() {
@@ -121,52 +123,61 @@ pub(crate) fn gpu_views(
     let mut cancelled = false;
     let mut waited = Duration::ZERO;
     let read = std::thread::scope(|scope| {
-        // Decoding runs ahead of the GPU by up to `LOOKAHEAD` images; it stops after the last
-        // used image, at a cancel or when the GPU side stops listening.
-        let (tx, rx) = sync_channel::<Result<Frame, ImageError>>(LOOKAHEAD);
+        // Decoding runs ahead of the GPU by up to `LOOKAHEAD` images, source by source; a
+        // source's stream stops after its last used image, all of them at a cancel or when the
+        // GPU side stops listening. Every frame comes with its source.
+        let (tx, rx) = sync_channel::<(usize, Result<Frame, ImageError>)>(LOOKAHEAD);
         let reader = scope.spawn(move || {
-            let mut index = 0usize;
-            for_each_image(
-                &src.images.bags,
-                &src.images.topics,
-                SHARPNESS_DOWNSCALE,
-                |frame| {
-                    if progress.is_cancelled() {
-                        return false;
-                    }
-                    let more = index < last_used;
-                    index += 1;
-                    tx.send(frame).is_ok() && more
-                },
-            )
+            let mut stop = false;
+            for (s, (src, stream)) in sources.iter().zip(streams).enumerate() {
+                let Some(last_used) = stream.last_used else {
+                    continue;
+                };
+                let mut index = 0usize;
+                for_each_image(
+                    &src.images.bags,
+                    &src.images.topics,
+                    SHARPNESS_DOWNSCALE,
+                    |frame| {
+                        if progress.is_cancelled() || tx.send((s, frame)).is_err() {
+                            stop = true;
+                            return false;
+                        }
+                        let more = index < last_used;
+                        index += 1;
+                        more
+                    },
+                )?;
+                if stop {
+                    break;
+                }
+            }
+            Ok::<(), BagError>(())
         });
-        let mut i = 0usize;
+        // The source of the frames coming in and the stream index within it.
+        let (mut source, mut i) = (usize::MAX, 0usize);
         loop {
             let asked = Instant::now();
-            let Ok(frame) = rx.recv() else { break };
+            let Ok((s, frame)) = rx.recv() else { break };
             waited += asked.elapsed();
             if progress.is_cancelled() {
                 cancelled = true;
                 break;
             }
-            if let Some(&ImageRecord {
-                camera,
-                stamp,
-                status:
-                    Status::Used {
-                        rank,
-                        sharpness_norm,
-                    },
-            }) = records.get(i)
-            {
+            if s != source {
+                (source, i) = (s, 0);
+            }
+            let (src, stream) = (&sources[s], &streams[s]);
+            if let Some((camera, stamp, rank, sharpness_norm)) = stream.used(i) {
                 match frame {
                     Ok(f)
                         if f.stamp == stamp
-                            && frame_camera(&f, cams, SHARPNESS_DOWNSCALE) == Some(camera) =>
+                            && frame_camera(&f, &src.cams, SHARPNESS_DOWNSCALE) == Some(camera) =>
                     {
+                        let c = stream.cam_base + camera;
                         let added = views.add_image(&FaceImage {
-                            geometry: GpuCamera::from_camera(&geometry[camera]),
-                            full: GpuCamera::from_camera(&cams[camera].camera),
+                            geometry: GpuCamera::from_camera(&geometry[c]),
+                            full: GpuCamera::from_camera(&cams[c].camera),
                             world_from_cam: images[rank as usize].world_from_cam,
                             rgb: &f.rgb.data,
                             rgb_size: (f.rgb.width, f.rgb.height),
