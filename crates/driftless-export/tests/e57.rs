@@ -763,3 +763,41 @@ fn e57_zero_bit_coordinates_are_refused() {
     assert!(err.contains("speichert cartesianX mit 0 Bit"), "{err}");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// Entries may point at the same data: the claimed points of all of them together are bounded
+/// by the file, not each one on its own.
+#[test]
+fn e57_entries_sharing_one_section_are_refused() {
+    let dir = temp_dir("shared");
+    let path = dir.join("geteilt.e57");
+    let prototype = vec![
+        double(RecordName::CartesianX),
+        double(RecordName::CartesianY),
+        double(RecordName::CartesianZ),
+    ];
+    let rows: Vec<Vec<RecordValue>> = (0..50)
+        .map(|i| vec![RecordValue::Double(f64::from(i)); 3])
+        .collect();
+    foreign(&path, Some("Kopie"), prototype, &rows, None, false);
+    let len = std::fs::metadata(&path).unwrap().len();
+    // One entry fits the file easily.
+    assert!(50 * 192 < len * 8);
+    edit_xml(&path, |xml| {
+        let start = xml.find("<vectorChild type=\"Structure\">").unwrap();
+        let data3d = &xml[start..];
+        let end = start + data3d.find("</data3D>").unwrap();
+        let entry = &xml[start..end];
+        format!("{}{}{}", &xml[..start], entry.repeat(500), &xml[end..])
+    });
+    let start = std::time::Instant::now();
+    let err = read_e57(&path, &Progress::new()).unwrap_err();
+    assert!(start.elapsed().as_secs_f64() < 2.0, "{:?}", start.elapsed());
+    let ExportError::Format { msg, .. } = err else {
+        panic!("{err:?}");
+    };
+    assert!(
+        msg.starts_with("E57: Scan „Kopie“ gibt 50 Punkte an, die Datei kann höchstens"),
+        "{msg}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

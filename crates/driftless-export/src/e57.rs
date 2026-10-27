@@ -404,9 +404,14 @@ fn read(path: &Path, file: File, len: u64, progress: &Progress) -> Result<Points
     }
 
     // A header can claim any count. Every point takes the bits of its prototype in the file,
-    // so no entry can hold more than `len × 8 / bits` points: more is refused before anything
-    // is decoded, and the decoding stops there as well.
-    let mut caps = Vec::with_capacity(clouds.len());
+    // and all entries together cannot hold more bits than the file has: one budget of
+    // `len × 8` bits for the whole file (entries may point at the same data), checked against
+    // the claimed counts before anything is decoded and against the decoded points as they
+    // come.
+    let budget = len.saturating_mul(8);
+    let mut claimed = 0u64;
+    // Bits per point and the most points each entry could have left of the budget.
+    let mut plan = Vec::with_capacity(clouds.len());
     for (k, pc) in clouds.iter().enumerate() {
         let name = entry_name(pc, k);
         if let Some(field) = pc
@@ -417,19 +422,25 @@ fn read(path: &Path, file: File, len: u64, progress: &Progress) -> Result<Points
             return Err(ExportError::format(
                 path,
                 format!(
-                    "E57: Scan „{name}“ speichert {} mit 0 Bit je Punkt – solche Dateien werden \
-                     nicht gelesen",
-                    field
+                    "E57: Scan „{name}“ speichert {field} mit 0 Bit je Punkt – solche Dateien \
+                     werden nicht gelesen"
                 ),
             ));
         }
-        let bits: u64 = pc.prototype.iter().map(|r| record_bits(&r.data_type)).sum();
-        let cap = len.saturating_mul(8) / bits.max(MIN_POINT_BITS);
+        let bits = pc
+            .prototype
+            .iter()
+            .map(|r| record_bits(&r.data_type))
+            .sum::<u64>()
+            .max(MIN_POINT_BITS);
+        let cap = budget.saturating_sub(claimed) / bits;
         if pc.records > cap {
             return Err(too_many(path, &name, pc.records, cap));
         }
-        caps.push(cap);
+        claimed += pc.records * bits;
+        plan.push((bits, cap));
     }
+    let mut decoded_bits = 0u64;
     let total = clouds
         .iter()
         .fold(0u64, |sum, pc| sum.saturating_add(pc.records));
@@ -464,12 +475,11 @@ fn read(path: &Path, file: File, len: u64, progress: &Progress) -> Result<Points
             points.intensity_to_color(false);
             let mut valid = 0u64;
             let mut pending = 0u64;
-            let mut decoded = 0u64;
             for p in points {
                 let p = p.map_err(broken)?;
-                decoded += 1;
-                if decoded > caps[k] {
-                    return Err(too_many(path, &name, pc.records, caps[k]));
+                decoded_bits = decoded_bits.saturating_add(plan[k].0);
+                if decoded_bits > budget {
+                    return Err(too_many(path, &name, pc.records, plan[k].1));
                 }
                 pending += 1;
                 if pending == BLOCK as u64 {

@@ -33,6 +33,7 @@ rerun = { version = "0.38.1", default-features = false, features = ["sdk", "rrd"
 
 [dev-dependencies]
 assert_cmd = "2"
+driftless-export = { path = "../driftless-export", features = ["test-util"] }
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
 jpeg-encoder = "0.7.1"
 predicates = "3"

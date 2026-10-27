@@ -31,6 +31,9 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [dev-dependencies]
+driftless-export = { path = "../driftless-export", features = ["test-util"] }
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
+# Tiny JPEG pages of the export tests.
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 # Comparison images of the real-data surface test.
 png = "0.18"

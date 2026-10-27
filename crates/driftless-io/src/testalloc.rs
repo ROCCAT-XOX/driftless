@@ -1,12 +1,19 @@
-//! A counting global allocator for the memory tests: each test binary that includes this
-//! module counts the bytes alive and their peak. Such a binary must hold exactly one test, so
-//! that no second test running in parallel disturbs the peak.
+//! A counting allocator for the memory tests. A test binary installs it as its global
+//! allocator and then measures with [`peak_during`]:
+//!
+//! ```ignore
+//! #[global_allocator]
+//! static ALLOC: driftless_io::testalloc::Counting = driftless_io::testalloc::Counting;
+//! ```
+//!
+//! Such a binary must hold exactly one test, so that no second test running in parallel
+//! disturbs the peak.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 /// The system allocator, counting the bytes currently alive and their peak.
-struct Counting;
+pub struct Counting;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
@@ -49,10 +56,8 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
-#[global_allocator]
-static ALLOC: Counting = Counting;
-
 /// Peak of the bytes allocated in addition to those alive when `f` starts, and its result.
+/// Only meaningful in a binary whose global allocator is [`Counting`].
 pub fn peak_during<T>(f: impl FnOnce() -> T) -> (usize, T) {
     let base = LIVE.load(Relaxed);
     PEAK.store(base, Relaxed);

@@ -13,6 +13,7 @@ pub mod ply;
 mod points;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testutil;
+pub mod traj;
 
 pub use points::{
     bounds_of, needs_double, read_points, write_points, Layout, PointFormat, PointSource, Points,

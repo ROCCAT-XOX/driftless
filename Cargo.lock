@@ -1665,6 +1665,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "driftless-export",
  "driftless-gpu",
  "driftless-io",
  "driftless-map",
@@ -1796,6 +1797,7 @@ dependencies = [
  "driftless-odom",
  "driftless-slam",
  "driftless-traj",
+ "image",
  "las",
  "libc",
  "png",

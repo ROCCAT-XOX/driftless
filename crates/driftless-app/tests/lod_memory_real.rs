@@ -3,7 +3,8 @@
 //! allocator, exactly one test. Run with `cargo test -p driftless-app --release --test
 //! lod_memory_real -- --ignored --nocapture`.
 
-mod counting;
+#[global_allocator]
+static ALLOC: driftless_io::testalloc::Counting = driftless_io::testalloc::Counting;
 
 use driftless_app::cloud::load_las;
 use driftless_app::lod::build_octree;
@@ -27,7 +28,8 @@ fn buero_scan_octree_live_heap() {
     }
     let points = load_las(&path, None, &Progress::new()).unwrap();
     let n = points.len();
-    let (peak, tree) = counting::peak_during(|| build_octree(&points, &Progress::new()).unwrap());
+    let (peak, tree) =
+        driftless_io::testalloc::peak_during(|| build_octree(&points, &Progress::new()).unwrap());
     let limit = 64 * n + (32 << 20);
     eprintln!(
         "{n} points, {} nodes, peak {peak} B ({:.1} B/point), limit {limit} B",

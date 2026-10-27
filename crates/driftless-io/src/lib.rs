@@ -8,6 +8,8 @@ pub mod images;
 pub mod msg;
 pub mod progress;
 pub mod project;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testalloc;
 pub mod testdata;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testscan;
