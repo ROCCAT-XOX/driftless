@@ -55,7 +55,11 @@
 //! difference of both sides on the edge itself (at [`SEAM_SAMPLES`] from either end), over the
 //! edges between faces of different images, creases included (they are not levelled; in the
 //! black room 13 % of the seam spots): what levelling aims at; what remains is
-//! misregistration, noise and the creases.
+//! misregistration, noise and the creases. The step is also given per metre of seam
+//! ([`SeamStats::seam_step_per_m`], every sample weighted by the length of its edge): the plain
+//! mean takes the same samples from every edge, so a fine mesh puts more of them where its
+//! faces are small, and a merged model with larger faces looked better or worse than a
+//! single scan by its face size alone.
 //!
 //! Memory: per chart its vertices with their corrections (≈ 32 bytes per vertex and chart, and
 //! the solver's vectors for one chart at a time per thread), per mesh edge between textured
@@ -107,6 +111,10 @@ pub struct SeamStats {
     pub seam_step_after: f64,
     pub seam_step_median_before: f64,
     pub seam_step_median_after: f64,
+    /// The step after levelling as a mean per metre of seam: every sample weighted by the length
+    /// of its edge. The plain mean counts the same samples per edge whatever its length and so
+    /// favours fine meshes.
+    pub seam_step_per_m: f64,
     /// Border vertex corrections (vertex and chart) …
     pub corrections: usize,
     /// … of them clamped to [`MAX_GAIN`] in a channel …
@@ -141,7 +149,7 @@ pub(crate) fn level_seams(
     }
     let edges = edge_pairs(mesh, &chart_of);
     let seam_jump_before = seam_jump(mesh, tex, &chart_of, &edges, &lin);
-    let (seam_step_before, seam_step_median_before) = seam_step(mesh, tex, labels, &edges, &lin);
+    let (seam_step_before, seam_step_median_before, _) = seam_step(mesh, tex, labels, &edges, &lin);
 
     // 1. Every chart's vertices; the corrections of the border vertices from paired samples
     //    on the seams.
@@ -200,7 +208,8 @@ pub(crate) fn level_seams(
     });
 
     let seam_jump_after = seam_jump(mesh, tex, &chart_of, &edges, &lin);
-    let (seam_step_after, seam_step_median_after) = seam_step(mesh, tex, labels, &edges, &lin);
+    let (seam_step_after, seam_step_median_after, seam_step_per_m) =
+        seam_step(mesh, tex, labels, &edges, &lin);
     SeamStats {
         seam_jump_before,
         seam_jump_after,
@@ -208,6 +217,7 @@ pub(crate) fn level_seams(
         seam_step_after,
         seam_step_median_before,
         seam_step_median_after,
+        seam_step_per_m,
         corrections: border_count,
         clamped,
         content_pairs,
@@ -433,17 +443,22 @@ fn border_corrections(
     (out, content)
 }
 
-/// The step measure over `edges` (see the module docs): sRGB luminance levels.
+/// The step measure over `edges` (see the module docs): sRGB luminance levels. Returns the
+/// mean and the median over the samples, and the mean with every sample weighted by the length
+/// of its edge (m), i.e. per metre of seam.
 fn seam_step(
     mesh: &Mesh,
     tex: &TexturedMesh,
     labels: &[Option<u32>],
     edges: &[EdgePair],
     lin: &[f32; 256],
-) -> (f64, f64) {
+) -> (f64, f64, f64) {
+    let seam = |e: &&EdgePair| labels[e[0] as usize] != labels[e[1] as usize];
+    let per_edge = 2 * SEAM_SAMPLES.len();
+    // In edge order: `per_edge` samples of every seam edge.
     let mut steps: Vec<f64> = edges
         .par_iter()
-        .filter(|e| labels[e[0] as usize] != labels[e[1] as usize])
+        .filter(seam)
         .flat_map_iter(|&[f, g, a, b]| {
             [(a, b), (b, a)].into_iter().flat_map(move |(v, w)| {
                 SEAM_SAMPLES.iter().map(move |&t| {
@@ -456,11 +471,31 @@ fn seam_step(
         })
         .collect();
     if steps.is_empty() {
-        return (0.0, 0.0);
+        return (0.0, 0.0, 0.0);
     }
     let mean = steps.iter().sum::<f64>() / steps.len() as f64;
+    let (weighted, length) = edges
+        .iter()
+        .filter(seam)
+        .zip(steps.chunks_exact(per_edge))
+        .fold((0.0, 0.0), |(sum, total), (&[_, _, a, b], s)| {
+            let (p, q) = (mesh.positions[a as usize], mesh.positions[b as usize]);
+            let len = (0..3)
+                .map(|k| (f64::from(p[k]) - f64::from(q[k])).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            (
+                sum + len * s.iter().sum::<f64>(),
+                total + len * per_edge as f64,
+            )
+        });
+    let per_m = if length > 0.0 {
+        weighted / length
+    } else {
+        mean
+    };
     steps.par_sort_unstable_by(f64::total_cmp);
-    (mean, steps[steps.len() / 2])
+    (mean, steps[steps.len() / 2], per_m)
 }
 
 /// Linear colour of face `f`'s texture at the point `t` of the way from its corner `v` to its
@@ -1102,6 +1137,19 @@ mod tests {
         let stats = level_seams(&mesh, &labels, &mut tex);
         assert!(
             stats.seam_step_after < 0.2 * stats.seam_step_before,
+            "{stats:?}"
+        );
+    }
+
+    #[test]
+    fn step_per_metre_is_the_mean_on_equal_edges() {
+        let left = [60, 55, 50];
+        let (mesh, labels, mut tex) = SMALL.build(left, brighter(left, 1.5));
+        let stats = level_seams(&mesh, &labels, &mut tex);
+        assert!(stats.seam_step_before > 0.0, "{stats:?}");
+        // Every seam edge of the wall is equally long.
+        assert!(
+            (stats.seam_step_per_m - stats.seam_step_after).abs() < 1e-9,
             "{stats:?}"
         );
     }

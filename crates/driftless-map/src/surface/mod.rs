@@ -97,7 +97,9 @@ pub struct SurfaceConfig {
     pub min_texel: f64,
     /// Edge of a texture page (pixels, at least [`MIN_PAGE_SIZE`]).
     pub page_size: u32,
-    /// Camera views kept per face.
+    /// Camera views kept per face. The default is 16: with the images of several scans, 8
+    /// views per face left neighbouring faces too few images in common for the labels to
+    /// agree (merged black room at 2 cm: `seam_step` 21.7 → 20.6, the single scan 18.5 → 17.6).
     pub views_per_face: usize,
     /// Weight of the smoothing step of the texture blend (0 to 1).
     pub smooth_weight: f32,
@@ -121,7 +123,7 @@ impl Default for SurfaceConfig {
             max_edge: 0.3,
             min_texel: 0.002,
             page_size: 4096,
-            views_per_face: 8,
+            views_per_face: 16,
             smooth_weight: 0.5,
             jpeg_quality: 90,
             color: ColorConfig {
@@ -338,13 +340,14 @@ pub fn texture_mesh(
             // `absorb_islands` only reads `views.images`.
             views.per_face = Vec::new();
             let cams = views::all_cameras(sources);
-            let islands_absorbed = atlas::absorb_islands(mesh, &views, &cams, cfg, &mut labels);
+            let absorbed = atlas::absorb_islands(mesh, &views, &cams, cfg, &mut labels);
             clock.lap(stats, "labels");
             check_cancel(progress)?;
             let (mut tex, texture) = atlas::bake(mesh, &labels, &views, sources, cfg, progress)?;
             drop(views);
             stats.texture = texture;
-            stats.texture.islands_absorbed = islands_absorbed;
+            stats.texture.islands_absorbed = absorbed.islands;
+            stats.texture.gray_filled = absorbed.gray_filled;
             clock.lap(stats, "bake");
             check_cancel(progress)?;
             progress.phase("Oberfläche: Nähte", None);
@@ -743,9 +746,11 @@ mod tests {
         h
     }
 
-    /// The pages of the rendered walk from one source, as they were before several sources
-    /// were supported (recorded on Apple silicon; elsewhere the platform's `exp`/`atan2` may
-    /// differ in the last bit, so only determinism is checked there).
+    /// The pages of the rendered walk from one source (recorded on Apple silicon; elsewhere the
+    /// platform's `exp`/`atan2` may differ in the last bit, so only determinism is checked
+    /// there). Recorded before several sources were supported, and again for surface v13: the
+    /// small gray patches are filled and 16 views are kept per face, and each of the two alone
+    /// changes these pages.
     #[test]
     fn one_source_pages_unchanged() {
         let (painted, images, poses, cams) = scene::walk_data();
@@ -782,7 +787,7 @@ mod tests {
         println!("pages hash {h:#018x}, {} pages", tex.pages.len());
         assert_eq!(pages_hash(&run().0), h);
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        assert_eq!(h, 0xd7bf_a35a_ab37_0f12, "pages changed");
+        assert_eq!(h, 0x983d_b7f7_809e_1db6, "pages changed");
     }
 
     /// [`texture_mesh`] of `mesh` from `sources` on the CPU, at 1 cm texels on 1024² pages.

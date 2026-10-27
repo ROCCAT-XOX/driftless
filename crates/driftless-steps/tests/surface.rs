@@ -132,6 +132,18 @@ fn surface_end_to_end() {
         report["stats"]["texture"]["islands_absorbed"].is_u64(),
         "{report}"
     );
+    assert!(
+        report["stats"]["texture"]["gray_filled"].is_u64(),
+        "{report}"
+    );
+    let share = report["stats"]["texture"]["untextured_area_share"]
+        .as_f64()
+        .unwrap();
+    assert!((0.0..1.0).contains(&share), "{report}");
+    let per_m = report["stats"]["seams"]["seam_step_per_m"]
+        .as_f64()
+        .unwrap();
+    assert!(per_m >= 0.0, "{report}");
     assert_eq!(report["axes"], "glb: Y oben; obj: Z oben");
     assert_eq!(report["input_id"].as_str().unwrap().len(), 16);
     assert!(report["stats"]["seconds"]["tsdf"].is_number());
@@ -216,6 +228,8 @@ fn surface_without_images_is_gray_with_warning() {
     let t = &report["stats"]["texture"];
     assert_eq!(t["faces_textured"], 0);
     assert!(t["faces_untextured"].as_u64().unwrap() > 0, "{report}");
+    assert_eq!(t["untextured_area_share"], 1.0);
+    assert_eq!(t["gray_filled"], 0);
     assert!(dest.join("oberflaeche.glb").is_file());
 }
 
