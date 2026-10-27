@@ -216,8 +216,8 @@ fn strip_marks(points: &[Vector3<f64>], (lo, hi): (f64, f64)) -> Vec<Vector3<f64
 }
 
 /// Point pairs by hand where the office parts share only a narrow strip: the right pose there
-/// overlaps too little for an automatic sure result (5 %: overlap 0.10, edges 0.82), the
-/// pairs place it surely. A wrong pair set (one place on another point of the strip) is
+/// overlaps too little for an automatic sure result (5 %: overlap 0.10, edges 0.82; 2 %:
+/// 0.043, 0.66), the pairs place it surely. A wrong pair set (one place on another point of the strip) is
 /// refused.
 #[test]
 #[ignore = "needs DRIFTLESS_TESTDATA"]
@@ -257,10 +257,8 @@ fn corridor_pairs_narrow_strip() {
             start.elapsed().as_secs_f64()
         );
         assert_eq!(a.method, AlignMethod::PointPairs);
-        if share >= 0.05 {
-            assert_eq!(a.verdict, Verdict::Sure);
-            assert!(err < 0.03, "error {err:.4} m");
-        }
+        assert_eq!(a.verdict, Verdict::Sure);
+        assert!(err < 0.03, "error {err:.4} m");
         let mut wrong = pairs.clone();
         wrong[2].1 = marks[0];
         let w = align_with_pairs(&source, &target, &wrong, &cfg, &Progress::new());
