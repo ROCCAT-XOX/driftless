@@ -35,7 +35,7 @@ fn names() -> String {
 }
 
 fn request(args: &Args) -> Result<ExportRequest, Box<dyn std::error::Error>> {
-    let source = ExportSource::detect(&args.source)?;
+    let mut source = ExportSource::detect(&args.source)?;
     let format = match &args.format {
         Some(name) => ExportFormat::parse(name)
             .ok_or_else(|| format!("unbekanntes Format „{name}“ – möglich sind: {}", names()))?,
@@ -51,6 +51,10 @@ fn request(args: &Args) -> Result<ExportRequest, Box<dyn std::error::Error>> {
             )
         })?,
     };
+    // A folder that holds more than one thing: the one the format asks for.
+    if format.kind() != source.kind() {
+        source = ExportSource::detect_as(&args.source, format.kind())?;
+    }
     Ok(ExportRequest {
         source,
         out: args.out.clone(),

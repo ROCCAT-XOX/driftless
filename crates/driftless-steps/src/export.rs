@@ -205,7 +205,7 @@ impl ExportSource {
     ///   `oberflaeche.glb` a surface, with `traj.tum` a run (the first that fits);
     /// - `modell.las` next to a `modell.json` is that model;
     /// - a file with an extension of [`POINT_EXTENSIONS`] or [`MESH_EXTENSIONS`] is a point
-    ///   or mesh file.
+    ///   or mesh file; `traj.tum` is its run folder.
     pub fn detect(path: &Path) -> Result<Self, StepError> {
         if path.is_dir() {
             if path.join(MODEL_REPORT).is_file() {
@@ -226,6 +226,9 @@ impl ExportSource {
             {
                 return Ok(ExportSource::Model(dir.to_path_buf()));
             }
+            if path.file_name().is_some_and(|n| n == RUN_TRAJ) && path.is_file() {
+                return Ok(ExportSource::Run(dir.to_path_buf()));
+            }
             match file_kind(path) {
                 Some(ExportKind::Points) => return Ok(ExportSource::PointFile(path.to_path_buf())),
                 Some(ExportKind::Mesh) => return Ok(ExportSource::MeshFile(path.to_path_buf())),
@@ -237,6 +240,23 @@ impl ExportSource {
             path.display()
         )
         .into())
+    }
+
+    /// The source at `path` ([`Self::detect`]), but for `kind` if the folder holds that as
+    /// well: a run folder of `driftless slam` is often also the map folder, a map folder may
+    /// hold the surface. Falls back to [`Self::detect`].
+    pub fn detect_as(path: &Path, kind: ExportKind) -> Result<Self, StepError> {
+        let found = Self::detect(path)?;
+        if found.kind() == kind || !path.is_dir() {
+            return Ok(found);
+        }
+        let dir = path.to_path_buf();
+        Ok(match kind {
+            ExportKind::Trajectory if path.join(RUN_TRAJ).is_file() => ExportSource::Run(dir),
+            ExportKind::Mesh if path.join(SURFACE_GLB).is_file() => ExportSource::Surface(dir),
+            ExportKind::Points if path.join(MAP_REPORT).is_file() => ExportSource::Map(dir),
+            _ => found,
+        })
     }
 
     pub fn kind(&self) -> ExportKind {

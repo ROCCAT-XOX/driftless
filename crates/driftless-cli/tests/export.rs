@@ -141,3 +141,29 @@ fn export_format_overrides_extension() {
         "glb (Y oben) passt nicht zu Punktwolke: möglich sind LAS 1.4",
     ));
 }
+
+#[test]
+fn export_run_folder_that_is_also_the_map() {
+    let dir = tmp("export-run-map");
+    std::fs::write(dir.join("map.json"), "{}").unwrap();
+    std::fs::write(
+        dir.join("traj.tum"),
+        "# timestamp tx ty tz qx qy qz qw\n1.000000000 0.000000000 0.000000000 0.000000000 \
+         0.000000000 0.000000000 0.000000000 1.000000000\n",
+    )
+    .unwrap();
+    let out = dir.join("bahn.csv");
+    driftless(&[
+        "export".as_ref(),
+        dir.as_os_str(),
+        "-o".as_ref(),
+        out.as_os_str(),
+    ])
+    .success()
+    .stdout(predicate::str::starts_with("1 Lagen → "));
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "zeit;x;y;z;qx;qy;qz;qw\n1.000000000;0.000000000;0.000000000;0.000000000;0.000000000;\
+         0.000000000;0.000000000;1.000000000\n"
+    );
+}

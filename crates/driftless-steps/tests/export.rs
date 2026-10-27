@@ -336,11 +336,34 @@ fn detect_sources() {
         ExportSource::detect(&run).unwrap(),
         ExportSource::Run(run.clone())
     );
-    // A map folder is also the run folder of `driftless map`: the map wins.
+    // A map folder is also the run folder of `driftless map`: the map wins, unless a
+    // trajectory (or a surface) is asked for.
     fs::write(map.join("traj.tum"), "").unwrap();
     assert_eq!(
         ExportSource::detect(&map).unwrap(),
         ExportSource::Map(map.clone())
+    );
+    assert_eq!(
+        ExportSource::detect_as(&map, ExportKind::Trajectory).unwrap(),
+        ExportSource::Run(map.clone())
+    );
+    assert_eq!(
+        ExportSource::detect_as(&map, ExportKind::Mesh).unwrap(),
+        ExportSource::Map(map.clone()),
+        "no surface there"
+    );
+    fs::write(map.join("oberflaeche.glb"), "").unwrap();
+    assert_eq!(
+        ExportSource::detect_as(&map, ExportKind::Mesh).unwrap(),
+        ExportSource::Surface(map.clone())
+    );
+    assert_eq!(
+        ExportSource::detect_as(&map, ExportKind::Points).unwrap(),
+        ExportSource::Map(map.clone())
+    );
+    assert_eq!(
+        ExportSource::detect(&map.join("traj.tum")).unwrap(),
+        ExportSource::Run(map.clone())
     );
     for ext in POINT_EXTENSIONS {
         let f = base.join(format!("wolke.{}", ext.to_uppercase()));
