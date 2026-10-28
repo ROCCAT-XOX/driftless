@@ -430,6 +430,15 @@ pub const ABOUT: &str = "Über Driftless …";
 pub const ABOUT_TITLE: &str = "Über Driftless";
 pub const ABOUT_LICENSE: &str = "Lizenz: Apache-2.0 OR MIT";
 pub const ABOUT_CLI_MISSING: &str = "Kommandozeile: nicht im Paket (cargo run -p driftless-cli)";
+/// Opens the licence notices of the third-party parts (THIRD-PARTY-NOTICES.html).
+pub const ABOUT_NOTICES: &str = "Lizenzen Dritter …";
+pub const ABOUT_NOTICES_MISSING: &str = "Lizenzen Dritter: nicht im Paket (packaging/about.toml)";
+
+/// A file, folder or address the system could not open: „/Users/…/Logs/Driftless nicht geöffnet:
+/// …“.
+pub fn open_failed(what: &str, error: &str) -> String {
+    format!("{what} nicht geöffnet: {error}")
+}
 
 /// „Driftless 0.1.0“.
 pub fn about_version(version: &str) -> String {
