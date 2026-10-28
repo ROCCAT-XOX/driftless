@@ -5,7 +5,7 @@
 
 use driftless_io::progress::{Progress, ProgressSnapshot};
 use driftless_io::testscan::{empty_room_bag, furnished_room_bag, tmp};
-use driftless_map::{load_stage, write_las, Cloud};
+use driftless_map::{load_stage, write_las, Cloud, SMOOTH_CHUNK};
 use driftless_slam::align::AlignConfig;
 use driftless_steps::map::{clean_stage_id, map_input_for, run_map, MapRequest, CLEAN_BIN};
 use driftless_steps::merge::{
@@ -19,7 +19,7 @@ use driftless_traj::nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Pose of scan B in the frame of scan A.
 fn truth_b() -> Isometry3<f64> {
@@ -458,6 +458,29 @@ fn cancel_leaves_no_report() {
     for f in [MODEL_REPORT, MODEL_LAS, MODEL_PLY] {
         assert!(!out.join(f).exists(), "{f} written");
     }
+
+    // Cancelled while smoothing, after its first chunk of points: it stops at the next one
+    // (before, the smoothing ran to its end), and nothing is written.
+    let p = Progress::new();
+    let handle = p.clone();
+    let seen = Arc::new(Mutex::new(ProgressSnapshot::default()));
+    let last = seen.clone();
+    let p = p.with_observer(move |s: &ProgressSnapshot| {
+        if s.phase == "Glätten" {
+            *last.lock().unwrap() = s.clone();
+            if s.done > 0 {
+                handle.cancel();
+            }
+        }
+    });
+    assert_eq!(run_merge(&req, &p).unwrap_err(), StepError::Cancelled);
+    for f in [MODEL_REPORT, MODEL_LAS, MODEL_PLY] {
+        assert!(!out.join(f).exists(), "{f} written");
+    }
+    let seen = seen.lock().unwrap().clone();
+    let total = seen.total.expect("the points of the model");
+    assert!(total > 2 * SMOOTH_CHUNK as u64, "{seen:?}");
+    assert_eq!(seen.done, SMOOTH_CHUNK as u64, "{seen:?}");
 }
 
 #[test]

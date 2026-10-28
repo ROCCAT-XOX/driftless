@@ -30,9 +30,10 @@
 //! 3. **Thinning**: one point per [`MergeRequest::voxel`] cell of the model, a coloured one
 //!    before an uncoloured one, then the one of the smaller member number, then the earlier
 //!    one; then, with [`MergeRequest::smooth`], the surfaces of all scans are smoothed
-//!    together ([`smooth_surfaces`]).
+//!    together ([`driftless_map::smooth_surfaces`]).
 //!
-//! A cancel is honoured up to the writing. `modell.las` and `modell.ply` are written through
+//! A cancel is honoured up to the writing, in the smoothing at the next chunk of points
+//! ([`driftless_map::SMOOTH_CHUNK`]). `modell.las` and `modell.ply` are written through
 //! a temporary file each, `modell.json` last and atomically: a folder with a report holds a
 //! complete model. A folder that already holds a report is refused, nothing is overwritten;
 //! the `.tmp` files a killed merge left in it are removed at the start. Every step is
@@ -53,8 +54,8 @@ use crate::slam::SlamSettings;
 use driftless_io::progress::Progress;
 use driftless_io::{atomic_write, paths};
 use driftless_map::{
-    intensity_grays, load_stage, smooth_surfaces, stage_fits, write_las_sources, write_ply_sources,
-    Cloud, SmoothConfig,
+    intensity_grays, load_stage, smooth_surfaces_with, stage_fits, write_las_sources,
+    write_ply_sources, Cloud, SmoothConfig,
 };
 use driftless_odom::voxel_map::{voxel_key, FixedState, VoxelKey};
 use driftless_slam::align::{
@@ -114,7 +115,7 @@ pub struct MergeRequest {
     pub align: AlignConfig,
     /// One point per cell of this size (m) in the model.
     pub voxel: f64,
-    /// Smooth the surfaces of the merged points ([`smooth_surfaces`]).
+    /// Smooth the surfaces of the merged points ([`driftless_map::smooth_surfaces`]).
     pub smooth: bool,
     /// Take unsure members into the model as well.
     pub include_unsure: bool,
@@ -914,8 +915,9 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
     drop(keep);
     check_cancel(progress)?;
     if req.smooth {
-        progress.phase("Glätten", None);
-        let (xyz, stats) = smooth_surfaces(&model.xyz, &SmoothConfig::default());
+        // counted by points; a cancel stops it at the next chunk of them
+        progress.phase("Glätten", Some(model.len() as u64));
+        let (xyz, stats) = smooth_surfaces_with(&model.xyz, &SmoothConfig::default(), progress)?;
         model.xyz = xyz;
         progress.info(format!(
             "Geglättet: {} Punkte um im Mittel {:.1} mm verschoben, Wanddicke {:.1} → {:.1} mm",
