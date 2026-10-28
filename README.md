@@ -97,13 +97,13 @@ Test data and how to set it up: [docs/testdaten.md](docs/testdaten.md).
 | `driftless view <folder> [--traj t.tum] [--slam <slam-out>] [--lidar-topic T] [--imu-topic T] [--every N] [--dry-run <file.rrd>]` | Debug viewer (rerun), only in a build with `cargo build --release -p driftless-cli --features debug-viewer` and with `rerun-cli` 0.38.1 installed (the packages leave it out and say so; the desktop program shows the clouds): point clouds, IMU, every N-th camera image, optional trajectory; `--dry-run` writes the recording to a file instead of opening the viewer; `--slam` adds quality-coloured trajectory, odometry, loops and submap anchors, and the timeline `ab_scan_beginn` (seconds since scan start, the times `driftless correct` takes) next to the bag timeline `stamp` |
 | `driftless odom <folder> -o <dir> [--lidar-to-imu x y z qx qy qz qw]` | LiDAR-IMU odometry (Rust baseline); writes `traj.tum` and `map.las` |
 | `driftless slam <folder> -o <dir> [--ueberschreiben] [--lidar-to-imu x y z qx qy qz qw] [--lidar-topic T] [--imu-topic T]` | SLAM with automatic loop closure and the manual loops of `<dir>/corrections.toml`; writes `traj.tum` (corrected), `traj_odom.tum` (before), `map.las`, `slam.json` (absolute `scan_start`, submaps, loop checks, graph) and `submaps.bin` (cache for `--reuse`). A `<dir>` that already holds a run (also an unfinished one) is refused unless `--ueberschreiben`: its trajectory, and a map made from it, would be replaced; `--reuse` recomputes it instead. A `<dir>` that holds the run of another scan (recorded at another time) is always refused, so one `<dir>` per scan, e.g. `<folder>/driftless` |
-| `driftless slam <folder> -o <dir> --reuse` | Recomputes only the pose graph from `submaps.bin` with the current corrections (seconds instead of a full run) and rewrites all outputs; the previous `traj.tum` is kept as `traj.vorher.tum` (an older one is replaced) |
-| `driftless correct <dir> list` · `loop <a_s> <b_s> [--note TEXT]` · `disable <nr>` · `enable <nr>` | Manual corrections in `<dir>/corrections.toml`: list them (with the automatic loops switched off in the app, `[[reject]]`), add a loop (the places at two times, seconds since scan start as in `slam.json`, are the same), switch entries off and on; entries are never removed |
+| `driftless slam <folder> -o <dir> --reuse` | Recomputes only the pose graph from `submaps.bin` with the current corrections (seconds instead of a full run) and rewrites all outputs; the previous `traj.tum` is kept as `traj.vorher.tum` (an older one is replaced). The new files are written beside the old ones and put in place together once all are written: if the reuse fails (a full disk) or is stopped, the run stays as it was |
+| `driftless correct <dir> list` · `loop <a_s> <b_s> [--note TEXT]` · `disable <nr>` · `enable <nr>` | Manual corrections in `<dir>/corrections.toml`: list them, numbered (the automatic loops switched off in the app, `[[reject]]`, after the manual loops), add a loop (the places at two times, seconds since scan start as in `slam.json`, are the same), switch entries off and on; `enable` on a switched-off automatic loop removes its entry, so the loop counts again; manual loops are never removed. If an entry breaks a run, the message names the command that gets past it |
 | `driftless calib-check <scan> --slam <slam-out> -o <dir> [--images N] [--lidar-to-imu x y z qx qy qz qw] [--lidar-topic T]` | Checks the camera calibration (`calibration/calib.json`) by projecting the points of a SLAM run into the sharpest images, spread over the scan (`--images` per camera, default 12): the direction of the LiDAR↔camera matrix and the time offset of the images; writes `calib_check.json` and overlay images into `-o` |
 | `driftless map <folder> --slam <slam-out> [--step dense\|clean\|color\|all] [--no-ghosts] [--no-outliers] [--no-through] [--no-smooth] [--highlights] [--no-vignetting] [--voxel M] [--downscale 1\|2\|4] [--gpu auto\|an\|aus] [--alle-dateien] [--neu]` | Map of a SLAM run, written into `<slam-out>`: dense cloud from the corrected `traj.tum`, cleaned of ghosts, points measured through windows and outliers (the removed points with their reason in `removed.las`; walls are projected onto their local plane), coloured from the camera images (`color.las`; points no camera saw are marked `user_data` 1; `removed.las` carries the reason in `user_data`: 1 ghost, 2 outlier, 3 window), and `map.json` (settings, statistics, runtime per step, peak memory). Of the clouds to look at, a run writes the one of its last step: `color.las`, or `clean.las` when the scan cannot be coloured (`dense.las` for `--step dense` alone). `--alle-dateien` writes every step's cloud as well: `dense.las` (unsmoothed), `clean.las` and `color.ply` (with a `colored` property, 1 = measured colour); `driftless export` writes the cloud of a map as PLY, LAZ, E57 or PCD as well. The requested step always runs; the step before it is taken from `dense.bin` / `clean.bin` (full-precision intermediate results; LAS is export only) if they were written for the same input and settings, otherwise rebuilt. Only a whole map (`--step all`, the default) that is current already – the same input and switches, every file there – is not computed again: it says „Karte ist aktuell“ (about a second instead of minutes); `--neu` computes it anyway. Outputs of earlier runs that no longer fit are never deleted, but warned about and listed under `stale` in `map.json`. Each cleaning and colour refinement can be switched off (`--no-through`, `--no-smooth`, `--no-vignetting` for the edge falloff of the cameras); `--highlights` additionally down-weights highlights but is experimental and off by default, because on a real scan it lowered floor reflections yet made the seams between images more visible. Quality figures (floor highlights, seam jump, edge-falloff residual, removed and smoothed points, wall thickness) are in `map.json` and on the console. Without `IMAGE_*.bag` or `calibration/calib.json`, `--step color` fails and `all` skips colouring with a warning. `--gpu` (default `auto`) colours on the graphics card (Vulkan, Metal, DX12) when a usable one is there, else on the CPU with a notice; `an` requires one and fails without, `aus` always uses the CPU. The result is equivalent, not byte-identical; `map.json` names the device, driver and, under `auto`, why the CPU was used (`steps.color.gpu`) |
-| `driftless surface <folder> --slam <slam-out> [--map <map-folder>] [-o <dir>] [--voxel M] [--no-texture] [--gpu auto\|an\|aus] [--obj]` | Photo-like surface of a map (default `<map-folder>` = `<slam-out>`): a TSDF of the cleaned points (`clean.bin`) becomes a closed, simplified mesh, textured from the camera images (one image per face, texture pages with seam levelling); writes `oberflaeche.glb` (glTF, unlit, Y up, the texture pages inside) and `oberflaeche.json` (settings, face counts, mean and 95 % deviation to the points, seconds per phase, peak memory, the size of every file, and under `hinweise` short German hints for the user, e.g. why a large room stays open in places: from 15 % of the faces the coarse grid offered dropped for lack of a point within 1.5 cm, `max_fill_gap`) into `-o` (default `<map-folder>/oberflaeche`), the JSON last. `--obj` also writes `oberflaeche.obj` with `.mtl` and the page JPEGs (Z up); `driftless export` makes the OBJ from the glb as well. Needs a `clean.bin` that fits the trajectory and switches (run `driftless map` first), otherwise it stops with „Karte fehlt oder ist veraltet“. Without `IMAGE_*.bag` or `calibration/calib.json`, or with `--no-texture`, every face is gray (with a warning in the first case). `--voxel` (default 0.02 m) sets the fineness: smaller is finer and needs more memory and time (0.01 m: up to 9 GB and about 20 minutes on a large scan), and leaves more of a large or dark room open. Holes in walls and floors with a rim up to 2 m are closed flat; rims of open pieces, pipe ends and windows stay open. `--gpu` as for `map`: the views per face are found on the graphics card within 4 GB of graphics memory; a mesh too large for that runs in several passes (each decodes the images again, the result is the same as in one pass), and only if not even a pass of one face fits (all faces, images and depth buffers alone over the budget) does `auto` fall back to the CPU; `oberflaeche.json` reports it under `gpu`, the passes as `gpu_batches` |
-| `driftless merge <scan>... -o <dir> [--slam <slam-out>]... [--map <map-folder>]... [--auch-unsichere] [--ohne-glaetten] [--voxel M] [--punktpaare <file>] [--ply]` | Merges several scans of one place into one model: each scan needs a SLAM run and a map with `clean.bin` (default `<scan>/driftless`; `--slam` and `--map` once per scan, in the same order). The first scan is the reference, its frame is the model frame. Every other scan is aligned automatically (features at corners and edges, RANSAC about the vertical, then ICP; a search over the turn if the features find nothing sure) to whichever placed scan fits best, so a chain room → corridor → room works. Each pair gets overlap, residual, wall residual and a word: „sicher“, „unsicher“ (e.g. too little overlap, edges that do not agree, residual over 5 mm, walls of one direction over 3 mm apart, a second pose almost as good) or „gescheitert“ (no pose, or one with almost no overlap or edges that almost all disagree); a scan placed surely against an unsure one is „unsicher“ too. Unsure and failed scans stay out unless `--auch-unsichere` (failed ones always). The colours of the scans are matched, the points thinned to `--voxel` (default 0.01 m, a coloured point wins) and the surfaces smoothed together (`--ohne-glaetten` keeps them as merged). Writes `modell.las` (scan number in `point_source_id`) and `modell.json` (per scan: its folders, absolute and relative to the model folder, pose, method, verdict, overlap, residual, wall residual, fit of the point pairs, colour gain; the warnings; runtime, peak memory) into `-o`, the JSON last, with `--ply` also `modell.ply` (property `scan`); a folder that already holds a model is refused. `--punktpaare` takes three or more points marked by hand in two scans (a `punktpaare.toml` as the desktop program writes it, map folders relative to the file); they replace the automatic alignment of those two scans and are refined by ICP; such a scan is „sicher“ when the pairs lie within 3 cm (RMS) of the refined pose and the residuals are within their limits, however little the scans overlap (a door, a short corridor). An entry the program cannot use (a hand edit), or a switched-on one that names no two of the maps, is skipped with a warning |
-| `driftless surface --model <model-dir> [-o <dir>] [--voxel M] [--no-texture] [--gpu auto\|an\|aus] [--obj]` | The surface of a merged model: as `surface` above, but the mesh comes from the points of all scans in the model and the texture from the images of all of them, with one exposure levelling over all scans, so places one scan missed are filled. Default `-o` is `<model-dir>/oberflaeche`. Needs the maps the model was merged from unchanged, otherwise it stops with a message to merge again |
+| `driftless surface <folder> --slam <slam-out> [--map <map-folder>] [-o <dir>] [--voxel M] [--no-texture] [--gpu auto\|an\|aus] [--obj]` | Photo-like surface of a map (default `<map-folder>` = `<slam-out>`): a TSDF of the cleaned points (`clean.bin`) becomes a closed, simplified mesh, textured from the camera images (one image per face, texture pages with seam levelling); writes `oberflaeche.glb` (glTF, unlit, Y up, the texture pages inside) and `oberflaeche.json` (settings, face counts, mean and 95 % deviation to the points, seconds per phase, peak memory, the size of every file, and under `hinweise` short German hints for the user (the desktop program shows them below the surface), e.g. why a large room stays open in places: from 15 % of the faces the coarse grid offered dropped for lack of a point within 1.5 cm, `max_fill_gap`) into `-o` (default `<map-folder>/oberflaeche`), the JSON last. `--obj` also writes `oberflaeche.obj` with `.mtl` and the page JPEGs (Z up); `driftless export` makes the OBJ from the glb as well. Needs a `clean.bin` that fits the trajectory and switches (run `driftless map` first), otherwise it stops with „Karte fehlt oder ist veraltet“. Without `IMAGE_*.bag` or `calibration/calib.json`, or with `--no-texture`, every face is gray (with a warning in the first case). `--voxel` (default 0.02 m) sets the fineness: smaller is finer and needs more memory and time (0.01 m: up to 9 GB and about 20 minutes on a large scan), and leaves more of a large or dark room open. Holes in walls and floors with a rim up to 2 m are closed flat; rims of open pieces, pipe ends and windows stay open. `--gpu` as for `map`: the views per face are found on the graphics card within 4 GB of graphics memory; a mesh too large for that runs in several passes (each decodes the images again, the result is the same as in one pass), and only if not even a pass of one face fits (all faces, images and depth buffers alone over the budget) does `auto` fall back to the CPU; `oberflaeche.json` reports it under `gpu`, the passes as `gpu_batches` |
+| `driftless merge <scan>... -o <dir> [--slam <slam-out>]... [--map <map-folder>]... [--auch-unsichere] [--ohne-glaetten] [--voxel M] [--punktpaare <file>] [--ply]` | Merges several scans of one place into one model: each scan needs a SLAM run and a map with `clean.bin` (default `<scan>/driftless`; `--slam` and `--map` once per scan, in the same order). The first scan is the reference, its frame is the model frame. Every other scan is aligned automatically (features at corners and edges, RANSAC about the vertical, then ICP; a search over the turn if the features find nothing sure) to whichever placed scan fits best, so a chain room → corridor → room works. Each pair gets overlap, residual, wall residual and a word: „sicher“, „unsicher“ (e.g. too little overlap, edges that do not agree, residual over 5 mm, walls of one direction over 3 mm apart, a second pose almost as good, or – for an automatic placement – walls that cannot be measured: no group of wall points large enough, „Wände nicht messbar“) or „gescheitert“ (no pose, or one with almost no overlap or edges that almost all disagree); a scan placed surely against an unsure one is „unsicher“ too. Unsure and failed scans stay out unless `--auch-unsichere` (failed ones always). The colours of the scans are matched, the points thinned to `--voxel` (default 0.01 m, a coloured point wins) and the surfaces smoothed together (`--ohne-glaetten` keeps them as merged). Writes `modell.las` (scan number in `point_source_id`) and `modell.json` (per scan: its folders, absolute and relative to the model folder, pose, method, verdict, overlap, residual, wall residual (left out where the walls could not be measured), fit of the point pairs, colour gain; the warnings; runtime, peak memory) into `-o`, the JSON last, with `--ply` also `modell.ply` (property `scan`); a folder that already holds a model is refused. `--punktpaare` takes three or more points marked by hand in two scans (a `punktpaare.toml` as the desktop program writes it, map folders relative to the file); they replace the automatic alignment of those two scans and are refined by ICP; such a scan is „sicher“ when the pairs lie within 3 cm (RMS) of the refined pose and the residuals are within their limits, however little the scans overlap (a door, a short corridor), and also where no wall can be measured (the reason then says „Wände nicht messbar“). An entry the program cannot use (a hand edit), or a switched-on one that names no two of the maps, is skipped with a warning |
+| `driftless surface --model <model-dir> [-o <dir>] [--voxel M] [--no-texture] [--gpu auto\|an\|aus] [--obj]` | The surface of a merged model: as `surface` above, but the mesh comes from the points of all scans in the model and the texture from the images of all of them, with one exposure levelling over all scans, so places one scan missed are filled. Default `-o` is `<model-dir>/oberflaeche`. Needs the maps the model was merged from unchanged and a model of this program's merge (`version` in `modell.json`); otherwise it stops with a message to merge again |
 | `driftless export <source> -o <file> [--format NAME] [--ueberschreiben]` | Writes a map, model, surface or run, or a single cloud or mesh file, in an open format chosen by the extension of `-o` (or `--format`): LAS, LAZ, E57, PLY, PCD for points; glb, OBJ, PLY mesh (`--format ply-netz`) for a surface; TUM or CSV for a trajectory. An existing target is only replaced with `--ueberschreiben`, the source itself never. See [Export](#export) |
 | `driftless view <folder> --cloud <file.las>` | Shows a point cloud (e.g. `color.las`) in the debug viewer (`--features debug-viewer`, see above), with its colours or gray by intensity, evenly thinned to at most 5 million points |
 | `driftless export-glim <folder> -o <dir>` | Writes `imu.bin` and `lidar.bin` for the GLIM spike (`spikes/glim/`) |
@@ -118,7 +118,9 @@ removes what it had begun (a step already writing its files finishes them) and t
 code 130. A second Ctrl+C ends it at once; the `.tmp` files left then are removed by the next run of
 the step, which also removes those of a crash or power loss. Each step writes its report (`slam.json`,
 `map.json`, `oberflaeche.json`, `modell.json`) last and removes an old one before its first write, so
-nothing half-written ever counts as done.
+nothing half-written ever counts as done. A reuse (`slam --reuse`) replaces a finished run, so it writes
+its new files beside the old ones and puts them in place only once all are written: stopped or failed,
+the run stays as it was.
 
 One folder per scan for its run, map and surface: `<scan>/driftless`, the default of `driftless merge`.
 Typical correction loop:
@@ -279,59 +281,70 @@ slim status bar:
   iCloud Drive (also `~/Documents` and `~/Desktop` with „Schreibtisch & Dokumente“), OneDrive or
   another cloud storage opens with a warning: large results get uploaded and moved off the disk, and
   load slowly again.
-- **1 Daten:** under the project line the size of the project and the free space of its drive (below
-  10 GB a warning, also in the Protokoll; a step that will need more than is free is warned about when it
+- **1 Daten:** under the project line the size of the project and the free space of its drive (below 10
+  GB a warning, also in the Protokoll; a step that will need more than is free is warned about when it
   starts); every run, map, surface and model in the tree shows the size of its folder (measured in the
   background). A card per scan with its state (neu, wartet, rechnet, fertig, veraltet) and „Scan
-  hinzufügen …“ below the cards. A right click on a scan's card: „Umbenennen …“ (only the name shown), „Ordner neu
-  zuordnen …“ for a scan whose folder is missing (moved, drive not attached; only the same scan is
-  taken: the same LiDAR bags by name and size, recorded at the times of its runs) and „Aus Projekt
-  entfernen“ (only the entry: the raw data and the results under `scans/<id>` stay). A right click on a
-  run, map, surface or model: „Löschen …“ asks with the size, what lies in the folder and which models
-  use it, and moves the folder to the system's trash – never deleted for good without asking: on
-  Windows a folder too large for the Recycle Bin makes Windows ask whether to delete it permanently
-  (choose „Nein“, then nothing is deleted; the same for „Aufräumen“), and a network or removable drive,
-  which has no trash, is refused. It is locked while a step works on it, also one of another window or
-  program (its `.in-arbeit` in the folder or below it, looked at again right before the folder goes);
-  while the view shows it, the question offers „Aus der Ansicht nehmen“ first. A run made with the
-  command line and added by hand is only taken out of the project. What a job cut off by a crash, a force quit or
-  a power cut left behind – a run, map, surface or model folder without its report, a stale
-  `<name>.tmp` – is listed as „unvollständig“ (not as a run or map that waits) and „Aufräumen“ moves it
-  to the trash; a folder a job still writes is marked `.in-arbeit` (touched every 10 s) and left
-  alone, as is anything written to in the last two minutes. The tree is read again when the window
-  gets the focus back (a scan drive attached again, results of another window). The precision
-  Schnell · Genau · Maximal sets only the voxel size of the map (0.02 /
-  0.01 / 0.005 m; Maximal needs over 4 GB of memory on large scans, another voxel shows „Eigene“). „Alle
-  rechnen“ queues every new or stale scan and computes them one after the other; with a scan selected,
-  „Rechnen“ computes only that one. The runs and maps of a scan unfold below its card; a click on a
-  map shows its best cloud. „Zusammenführen …“ scrolls its field into view, start button included.
-  „Erweitert“ at the bottom of the field holds the rest: the switches of `driftless map` with the voxel
-  as a number, the single steps („Prüfen“, „SLAM rechnen“, „Neu rechnen (aus Teilkarten)“, „Karte
-  rechnen“), the corrections (loops:
-  „Stellen wählen“ and two clicks on the trajectory, „Schleife eintragen“, „Jetzt neu rechnen“ from
-  `submaps.bin`; „Automatische Schleifen“ lists every loop SLAM accepted with a switch „verwenden“:
-  off leaves a wrong one out of the pose graph – a `[[reject]]` entry in `corrections.toml` by the
-  start times of its two submaps, which `driftless slam --reuse` respects too – and recomputes the
-  run at once), before/after („Vergleichen“ of two states or of the odometry against the corrected
-  trajectory, with the numbers of `driftless compare`; „Diesen Stand wiederherstellen“), and the layers
-  „Teilkarten“ and „Verworfene Kandidaten“.
-- **Models (in 1 Daten):** once two scans have a finished map, „Zusammenführen …“ merges the ticked
-  scans into a new model (`modelle/modell-NNN`, the first ticked scan is the „Bezug“; „Auch unsichere
-  übernehmen“ = `--auch-unsichere`). Under „Modelle“ each scan of a model shows its verdict, overlap
-  and residual („Punktpaare“ in front if placed by hand; the fit of the pairs and the wall residual on hover); an unsure or failed one has „Von Hand ausrichten“: click three or more same places in
-  the model and in the scan beside it, „Übernehmen und neu zusammenführen“ saves them in
-  `modelle/punktpaare.toml` and merges again into a new model. Point pairs can be switched off and on,
-  never deleted; one the merge cannot use is marked „nicht nutzbar“. A model's surface is computed in „2 Bilder“ like that of a map, from the images of all
-  its scans; the colour mode „je Scan“ colours a model by scan. „Datei öffnen …“ and dropping a
-  file show a point cloud (LAS, LAZ, E57, PLY, PCD; an E57 with several scans can be coloured „je
-  Scan“) or a surface (glb, OBJ), also without a project. A variant that cannot be read (a PCD saved
-  „binary_compressed“, a glb with Draco) gives a German message in the status bar.
+  hinzufügen …“ below the cards. A right click on a scan's card: „Umbenennen …“ (only the name shown),
+  „Ordner neu zuordnen …“ for a scan whose folder is missing (moved, drive not attached; only the same
+  scan is taken: the same LiDAR bags by name and size, recorded at the times of its runs; the models of
+  the scan take the new folder too: the photos of their surface, whether they are stale) and „Aus Projekt
+  entfernen“ (only the entry: the raw data and the results under `scans/<id>` stay; added again, the scan
+  gets them back, while another scan folder of the same name gets an id of its own, e.g. `EG-2`, and
+  takes nothing over). A right click on a run, map, surface or model: „Löschen …“ asks with the size,
+  what lies in the folder and which models use it, and moves the folder to the system's trash – never
+  deleted for good without asking: on Windows a folder too large for the Recycle Bin makes Windows ask
+  whether to delete it permanently (choose „Nein“, then nothing is deleted; the same for „Aufräumen“),
+  and a network or removable drive, which has no trash, is refused. It is locked while a step works on
+  it, also one of another window or program (its `.in-arbeit` in the folder or below it, looked at again
+  right before the folder goes); while the view shows it, the question offers „Aus der Ansicht nehmen“
+  first. A run made with the command line and added by hand is only taken out of the project. What a job
+  cut off by a crash, a force quit or a power cut left behind – a run, map, surface or model folder
+  without its report (also a surface with its glb but without `oberflaeche.json`: cut off between the
+  two), a stale `<name>.tmp` – is listed as „unvollständig“ (not as a run or map that waits) and
+  „Aufräumen“ moves it to the trash; a run or map folder without its report that still holds finished
+  results (maps, surfaces, the history of a run) is no leftover: it stays in the tree as „unvollständig –
+  neu rechnen“, why and what to do on hover, and „Aufräumen“ never takes finished results along; a folder
+  a job still writes is marked `.in-arbeit` (touched every 10 s) and left alone, as is anything written
+  to in the last two minutes. The tree is read again when the window gets the focus back (a scan drive
+  attached again, results of another window). The precision Schnell · Genau · Maximal sets only the voxel
+  size of the map (0.02 / 0.01 / 0.005 m; Maximal needs over 4 GB of memory on large scans, another voxel
+  shows „Eigene“). „Alle rechnen“ queues every new or stale scan and computes them one after the other;
+  with a scan selected, „Rechnen“ computes only that one. A map is never computed anew in its own folder:
+  one that is current is taken as it is („Karte ist aktuell“), any other map – also a single step under
+  „Erweitert“ – goes into a new `karte-NNN`, and the old one stays. The runs and maps of a scan unfold
+  below its card; a click on a map shows its best cloud. „Zusammenführen …“ scrolls its field into view,
+  start button included. „Erweitert“ at the bottom of the field holds the rest: the switches of
+  `driftless map` with the voxel as a number, the single steps („Prüfen“, „SLAM rechnen“, „Neu rechnen
+  (aus Teilkarten)“, „Karte rechnen“), the corrections (loops: „Stellen wählen“ and two clicks on the
+  trajectory, „Schleife eintragen“, „Jetzt neu rechnen“ from `submaps.bin`; „Automatische Schleifen“
+  lists every loop SLAM accepted with a switch „verwenden“: off leaves a wrong one out of the pose graph
+  – a `[[reject]]` entry in `corrections.toml` by the start times of its two submaps, which
+  `driftless slam --reuse` respects too – and recomputes the run at once), before/after („Vergleichen“ of
+  two states or of the odometry against the corrected trajectory, with the numbers of
+  `driftless compare`; „Diesen Stand wiederherstellen“), and the layers „Teilkarten“ and „Verworfene
+  Kandidaten“.
+- **Models (in 1 Daten):** once two scans have a finished map, „Zusammenführen …“ merges the ticked scans
+  into a new model (`modelle/modell-NNN`, the first ticked scan is the „Bezug“; „Auch unsichere
+  übernehmen“ = `--auch-unsichere`). Under „Modelle“ each scan of a model shows its verdict, overlap and
+  residual („Punktpaare“ in front if placed by hand; the fit of the pairs and the wall residual – or
+  „Wände nicht messbar“ – on hover; a model whose map was computed anew since, or that another program
+  version merged, is marked „veraltet“ and merged anew); an unsure or failed one has „Von Hand
+  ausrichten“: click three or more same places in the model and in the scan beside it, „Übernehmen und
+  neu zusammenführen“ saves them in `modelle/punktpaare.toml` and merges again into a new model. Point
+  pairs can be switched off and on, never deleted; one the merge cannot use is marked „nicht nutzbar“. A
+  model's surface is computed in „2 Bilder“ like that of a map, from the images of all its scans; the
+  colour mode „je Scan“ colours a model by scan. „Datei öffnen …“ and dropping a file show a point cloud
+  (LAS, LAZ, E57, PLY, PCD; an E57 with several scans can be coloured „je Scan“) or a surface (glb, OBJ),
+  also without a project. A variant that cannot be read (a PCD saved „binary_compressed“, a glb with
+  Draco) gives a German message in the status bar.
 - **2 Bilder:** a card per map with its surfaces below it (one that no longer fits its map is marked
-  „veraltet – Karte oder Lauf neu gerechnet“); a click shows it (on a map card: its newest fitting
-  surface, else its cloud). The fineness 1 · 1,5 · 2 cm applies to
-  the next surface; „Alle Oberflächen rechnen“ queues every map without a current surface, „Oberfläche
-  rechnen“ only the selected one, into `karte-NNN/oberflaeche-NNN`. „ohne Fotos“ (= `--no-texture`) is
-  under „Erweitert“. Entering the step shows the surface; Daten and Planung show the points.
+  „veraltet – Karte oder Lauf neu gerechnet“; a hint of its `oberflaeche.json` shows small below it as a
+  „Hinweis“, e.g. „Stellenweise offen“, and in full once it is selected); a click shows it (on a map
+  card: its newest fitting surface, else its cloud). The fineness 1 · 1,5 · 2 cm applies to the next
+  surface; „Alle Oberflächen rechnen“ queues every map without a current surface, „Oberfläche rechnen“
+  only the selected one, into `karte-NNN/oberflaeche-NNN`. „ohne Fotos“ (= `--no-texture`) is under
+  „Erweitert“. Entering the step shows the surface; Daten and Planung show the points.
 - **3 Planung:** the measurements of the tool „Messen“ (not saved yet) and „Messungen löschen“; floor
   plan, measures and DWG export follow in a later milestone.
 - **3D view:** top left an info (what is shown, the points drawn and the frame time, what a click does

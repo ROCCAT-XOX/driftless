@@ -164,7 +164,9 @@ unten die Statusleiste mit „Protokoll“ und „Abbrechen“.
    schiefe Räume?
 5. **Oberfläche rechnen.** Links „Bilder“ wählen, bei „Feinheit“ „2 cm“ lassen und „Alle Oberflächen
    rechnen“ drücken. Danach unter der Karte „Oberfläche 001“ anklicken. Oben rechts in der Ansicht
-   zwischen „Fläche“, „Punkte“ und „beides“ wechseln (Taste `O`).
+   zwischen „Fläche“, „Punkte“ und „beides“ wechseln (Taste `O`). Bleibt die Oberfläche stellenweise
+   offen, steht unter ihr klein ein „Hinweis“ („Stellenweise offen“); angeklickt erklärt „Diese
+   Oberfläche“ den Grund.
 6. **Messen, wenn nötig.** Unten in der Ansicht „Messen“ wählen und zwei Punkte anklicken: Driftless
    zeigt den Abstand in Metern. Die Messungen stehen in „Planung“; sie werden noch nicht gespeichert.
    Gegen ein Maßband oder einen Laser-Entfernungsmesser ist Driftless noch nicht geprüft (Abschnitt 10).
@@ -227,7 +229,7 @@ braucht dafür eine fertige Karte.
 | Urteil | heißt | was tun |
 |---|---|---|
 | „sicher“ | Die Lage passt. | nichts |
-| „unsicher“ | Eine Lage ist gefunden, aber nicht sicher genug, zum Beispiel zu wenig gemeinsamer Bereich, versetzte Wände oder eine zweite Lage fast so gut. Der Grund steht, wenn die Maus darauf zeigt. | „Von Hand ausrichten“, oder „Auch unsichere übernehmen“, wenn das Ergebnis selbst geprüft ist |
+| „unsicher“ | Eine Lage ist gefunden, aber nicht sicher genug, zum Beispiel zu wenig gemeinsamer Bereich, versetzte Wände, Wände nicht messbar oder eine zweite Lage fast so gut. Der Grund steht, wenn die Maus darauf zeigt. | „Von Hand ausrichten“, oder „Auch unsichere übernehmen“, wenn das Ergebnis selbst geprüft ist |
 | „gescheitert“ | Keine brauchbare Lage. | „Von Hand ausrichten“ |
 
 Unsichere und gescheiterte Scans sind „nicht im Modell“. „Auch unsichere übernehmen“ nimmt die
@@ -246,7 +248,8 @@ rechnen“ drücken: Die Oberfläche entsteht aus den Bildern aller Scans. In �
 „Farbart“ „je Scan“ jeden Scan anders; so sieht man, wo welcher liegt.
 
 Wird die Karte eines Scans neu gerechnet, ist das Modell „veraltet – Karte eines Scans neu gerechnet“:
-in „Daten“ neu zusammenführen.
+in „Daten“ neu zusammenführen. Ein Modell aus einer anderen Programmversion heißt „veraltet – mit anderer
+Programmversion zusammengeführt“; auch das in „Daten“ neu zusammenführen.
 
 Drei Scans eines Raums, gemessen auf dem Testrechner mit RTX 5080
 ([Baustein 1](ergebnisse/2026-10-27-baustein-1.md)):
@@ -279,8 +282,8 @@ Projekts und sind nicht mitgewandert, zeigt die Kachel des Scans „fehlt“: da
 | Eintrag | Was er tut |
 |---|---|
 | „Umbenennen …“ | Ändert nur den angezeigten Namen; Ordner und Ergebnisse bleiben. |
-| „Ordner neu zuordnen …“ | Nur für einen Scan, dessen Ordner fehlt (verschoben, Laufwerk nicht angesteckt). Driftless nimmt nur denselben Scan: dieselben Laserdateien, aufgenommen zur selben Zeit. |
-| „Aus Projekt entfernen“ | Entfernt nur den Eintrag. Die Rohdaten und die Ergebnisse unter `scans/<id>` bleiben; wird der Scan wieder hinzugefügt, sind sie wieder da. |
+| „Ordner neu zuordnen …“ | Nur für einen Scan, dessen Ordner fehlt (verschoben, Laufwerk nicht angesteckt). Driftless nimmt nur denselben Scan: dieselben Laserdateien, aufgenommen zur selben Zeit. Modelle aus diesem Scan nehmen den neuen Ordner mit: die Fotos ihrer Oberfläche und ob sie „veraltet“ sind. |
+| „Aus Projekt entfernen“ | Entfernt nur den Eintrag. Die Rohdaten und die Ergebnisse unter `scans/<id>` bleiben; wird der Scan wieder hinzugefügt, sind sie wieder da. Ein anderer Scan-Ordner mit demselben Namen bekommt eine eigene Kennung und übernimmt nichts davon. |
 
 **Löschen.** Rechtsklick auf einen Lauf, eine Karte, eine Oberfläche oder ein Modell → „Löschen …“. Die
 Frage nennt die Größe, was darin liegt und welche Modelle davon abhängen. „In den Papierkorb“ legt den
@@ -302,8 +305,13 @@ auf dem Laufwerk; jeder Lauf, jede Karte, Oberfläche und jedes Modell zeigt sei
 | ein Schritt braucht voraussichtlich mehr, als frei ist | Warnung beim Start des Schritts |
 
 **Nach einem Absturz oder Stromausfall.** Was ein abgebrochener Schritt halb geschrieben hat, steht
-unter dem Projektnamen als „unvollständig“, mit Größe. „Aufräumen“ legt es in den Papierkorb. Ordner,
-an denen gerade ein Schritt schreibt, bleiben in Ruhe.
+unter dem Projektnamen als „unvollständig“, mit Größe. Dazu gehört eine Oberfläche ohne ihren Bericht
+`oberflaeche.json`. „Aufräumen“ legt es in den Papierkorb. Ordner, an denen gerade ein Schritt schreibt,
+auch in einem anderen Fenster, bleiben in Ruhe. Fertiges nimmt „Aufräumen“ nie mit: Fehlt einem Lauf
+oder einer Karte der Bericht, enthält der Ordner aber fertige Karten, Oberflächen oder einen Verlauf,
+bleibt er im Baum und heißt „unvollständig – neu rechnen“. Wenn die Maus darauf zeigt, steht, was zu tun
+ist: einen Lauf mit „Neu rechnen (aus Teilkarten)“ oder einem Stand im Verlauf wieder vollständig
+machen; statt einer Karte rechnet „Rechnen“ eine neue.
 
 **Läufe der Kommandozeile.** ☰ → „Lauf hinzufügen …“ holt einen Lauf, der mit der Kommandozeile
 gerechnet wurde, zu einem Scan. Dafür zuerst in „Daten“ den Scan wählen.
@@ -338,8 +346,10 @@ auseinander:
 2. „Stellen wählen“ drücken, dann in der Ansicht auf die Laufbahn klicken: Der erste Klick setzt „Stelle
    A“, der zweite „Stelle B“. Die Zeiten lassen sich auch eintippen (Sekunden ab Scan-Beginn). Eine
    „Notiz“ ist freiwillig.
-3. „Schleife eintragen“, dann „Jetzt neu rechnen“. Das dauert Sekunden.
-4. Danach ist die Karte „veraltet“: „Rechnen“ oder „Alle rechnen“ rechnet sie neu.
+3. „Schleife eintragen“, dann „Jetzt neu rechnen“. Das dauert Sekunden. Wird es abgebrochen oder schlägt
+   es fehl (zum Beispiel bei vollem Datenträger), bleibt der Lauf, wie er war.
+4. Danach ist die Karte „veraltet“: „Rechnen“ oder „Alle rechnen“ rechnet eine neue, zum Beispiel
+   „Karte 002“. Die alte bleibt, bis sie gelöscht wird.
 
 Jeder Eintrag in der Liste darunter lässt sich mit seinem Haken ab- und wieder einschalten, danach
 „Jetzt neu rechnen“; gelöscht wird keiner.
@@ -409,6 +419,7 @@ Dieselbe Liste steht im [CHANGELOG](../CHANGELOG.md).
 | Kein Wegschneiden | Ein schlechtes Stück der Laufbahn lässt sich nicht verwerfen. Es gibt nur Schleifen von Hand und das Abschalten automatischer Schleifen. |
 | Nicht signiert | Die Programme sind nicht signiert und nicht bei Apple beglaubigt. Der erste Start braucht deshalb einen Schritt mehr (siehe Installieren). |
 | Windows nur automatisch geprüft | Bauen, Tests und Installieren laufen unter Windows in der CI. Von Hand auf einem echten Windows-PC ist Driftless noch nicht geprüft. |
+| SharePoint-Bibliotheken | Mit OneDrive abgeglichene SharePoint-Bibliotheken (unter `%USERPROFILE%\<Firmenname>`) erkennt Driftless nicht als Cloud-Ordner und warnt dort nicht; das tut es nur bei OneDrive selbst. Projekte nicht dort ablegen. |
 | Mac ohne echte Scans | Mit dieser Version wurden echte Scans noch nicht auf einem Mac gerechnet, nur auf einem Linux-Rechner mit RTX 5080. |
 | 1 cm braucht viel Speicher | Eine Oberfläche mit 1 cm braucht bei großen Aufnahmen bis 9 GB Arbeitsspeicher (Büro: 8,2 GB, 21 Minuten). |
 | Verfehlte Qualitätsziele | Bei 1 cm bleiben in großen und in dunklen Räumen Stellen der Oberfläche offen: von oben gesehen im Büro 31 % (Ziel höchstens 30 %), in einem dunklen Raum 9,7 % (Ziel höchstens 6 %). 2 cm schließt mehr. Die Übergänge zwischen zwei Fotos (Nähte) sind deutlicher zu sehen als geplant. Die Oberflächen-Datei eines Raums ist bei 1 cm rund 100 MB groß statt höchstens 60 MB. Dieselbe Wand, mehrmals abgelaufen, liegt vor dem Glätten einige Millimeter auseinander (Ziel höchstens 5 mm); die Ursache ist offen, das Glätten legt sie wieder auf eine Fläche. |

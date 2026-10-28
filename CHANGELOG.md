@@ -44,15 +44,17 @@ Die erste Version für echte Aufträge. Wie man sie installiert und benutzt, ste
 - Einfärben auf der Grafikkarte (Metal, Vulkan, DirectX 12), ohne taugliche Grafikkarte auf dem
   Prozessor; in ⚙ „Grafikkarte nutzen“.
 - Eine Karte mit denselben Eingaben und Einstellungen wird nicht noch einmal gerechnet („Karte ist
-  aktuell“).
+  aktuell“). Jede andere Karte rechnet das Programm in einen neuen Ordner („Karte 002“); die alte bleibt,
+  bis sie gelöscht wird.
+- „Abbrechen“ und Strg+C halten auch das Glätten der Wände sofort an.
 
 #### Fotoähnliche Oberfläche
 
 - Eine geschlossene Fläche mit den Kamerabildern als Textur, in den Feinheiten 1, 1,5 und 2 cm. Löcher in
   Wänden und Böden bis 2 m Umfang werden eben geschlossen.
 - Auf der Grafikkarte; große Räume in mehreren Durchläufen.
-- `oberflaeche.json` und die Kommandozeile nennen Hinweise, zum Beispiel wenn ein großer Raum
-  stellenweise offen bleibt.
+- `oberflaeche.json`, die Kommandozeile und das Desktop-Programm nennen Hinweise, zum Beispiel wenn ein
+  großer Raum stellenweise offen bleibt. Im Programm steht der Hinweis klein unter der Oberfläche.
 
 #### Scans zusammenführen
 
@@ -61,6 +63,12 @@ Die erste Version für echte Aufträge. Wie man sie installiert und benutzt, ste
 - „Von Hand ausrichten“ mit Punktpaaren, auch bei wenig gemeinsamem Bereich (Tür, kurzer Flur).
 - Die Farben der Scans werden angeglichen und ihre Wände gemeinsam geglättet. Die Oberfläche eines
   Modells entsteht aus den Bildern aller seiner Scans (`driftless surface --model`).
+- Findet die automatische Ausrichtung keine Wand, an der sie den Versatz messen kann, ist der Scan
+  „unsicher“ und der Grund heißt „Wände nicht messbar“. Mit Punktpaaren zählen die Paare, der Grund nennt
+  es trotzdem.
+- Ein Modell aus einer anderen Programmversion gilt als „veraltet“: in „Daten“ neu zusammenführen.
+  `driftless surface --model` lehnt es ab.
+- „Abbrechen“ und Strg+C halten auch das gemeinsame Glätten sofort an.
 
 #### Export und Dateien öffnen
 
@@ -82,7 +90,12 @@ Die erste Version für echte Aufträge. Wie man sie installiert und benutzt, ste
 - Die Größe jedes Ergebnisses und der freie Platz; eine Warnung unter 10 GB frei.
 - Eine Warnung bei Projekten in iCloud Drive, OneDrive und anderen Cloud-Ordnern; die Dialoge beginnen im
   Ordner „Driftless Projekte“.
-- Reste abgebrochener Schritte heißen „unvollständig“; „Aufräumen“ legt sie in den Papierkorb.
+- Reste abgebrochener Schritte heißen „unvollständig“, auch eine Oberfläche, die nach dem glb, aber vor
+  ihrem Bericht abgebrochen wurde; „Aufräumen“ legt sie in den Papierkorb. Fertige Karten, Oberflächen
+  und den Verlauf nimmt es nie mit: Ein Lauf oder eine Karte, deren Bericht fehlt, die aber Fertiges
+  enthält, bleibt im Baum als „unvollständig – neu rechnen“.
+- Schlägt „Jetzt neu rechnen“ fehl (zum Beispiel bei vollem Datenträger) oder wird es abgebrochen, bleibt
+  der Lauf, wie er war; ebenso `driftless slam --reuse`.
 - Ein Projektordner lässt sich umbenennen, verschieben und kopieren; Pfade werden auch relativ
   gespeichert.
 - Zwei Fenster, oder Fenster und Kommandozeile, an einem Projekt verlieren keine Änderung des anderen.
@@ -133,6 +146,9 @@ Die erste Version für echte Aufträge. Wie man sie installiert und benutzt, ste
   braucht deshalb einen Schritt mehr (siehe Installieren).
 - **Windows nur automatisch geprüft:** Bauen, Tests und Installieren laufen unter Windows in der CI. Von
   Hand auf einem echten Windows-PC ist Driftless noch nicht geprüft.
+- **SharePoint-Bibliotheken:** Mit OneDrive abgeglichene SharePoint-Bibliotheken (unter
+  `%USERPROFILE%\<Firmenname>`) erkennt Driftless nicht als Cloud-Ordner und warnt dort nicht; das tut
+  es nur bei OneDrive selbst. Projekte nicht dort ablegen.
 - **Mac ohne echte Scans:** Mit dieser Version wurden echte Scans noch nicht auf einem Mac gerechnet, nur
   auf einem Linux-Rechner mit RTX 5080.
 - **1 cm braucht viel Speicher:** Eine Oberfläche mit 1 cm braucht bei großen Aufnahmen bis 9 GB
