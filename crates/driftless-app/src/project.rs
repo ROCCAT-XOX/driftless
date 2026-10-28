@@ -81,9 +81,9 @@ use driftless_slam::align::AlignConfig;
 use driftless_steps::correct::utc_now;
 use driftless_steps::history::{self, HistoryEntry};
 use driftless_steps::map::{
-    clean_stage_id, current_map, fitting_stages, folder_fits, hex, map_input_for, recompute_map,
-    take_current_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches, CLEAN_BIN,
-    DENSE_BIN, REPORT,
+    clean_stage_id, current_map, fitting_stages, folder_fits, hex, map_input_for,
+    recompute_map_from, take_current_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches,
+    CLEAN_BIN, DENSE_BIN, REPORT,
 };
 use driftless_steps::merge::{
     read_model, run_merge, version_fits, MergeMember, MergeRequest, ModelReport,
@@ -1510,7 +1510,7 @@ pub fn map_dir_for(
     if let Some(dir) = current_map_dir(run, input) {
         return Ok(StepDir::existing(dir));
     }
-    new_map_dir(run, input, progress)
+    Ok(new_map_dir(run, input, progress)?.0)
 }
 
 /// The youngest `karte-NNN` of `run` whose whole map of `input` is current ([`current_map`];
@@ -1532,8 +1532,14 @@ fn current_map_dir(run: &RunInfo, input: &MapInput) -> Option<PathBuf> {
 
 /// A new `karte-NNN` after the last of `run`, into which the stages the step of `input` would
 /// take over (`dense.bin` for clean, `clean.bin` or else `dense.bin` for color) are linked
-/// from the youngest map folder (or else the run folder) that has one that fits.
-fn new_map_dir(run: &RunInfo, input: &MapInput, progress: &Progress) -> Result<StepDir, StepError> {
+/// from the youngest map folder (or else the run folder) that has one that fits. Returns it
+/// with that folder, whose `map.json` gives the entries of the steps the stage stands for
+/// ([`recompute_map_from`]).
+fn new_map_dir(
+    run: &RunInfo,
+    input: &MapInput,
+    progress: &Progress,
+) -> Result<(StepDir, Option<PathBuf>), StepError> {
     let maps = numbered(&run.dir, MAP_PREFIX);
     let target = create_numbered(&run.dir, MAP_PREFIX)?;
     let wanted: &[&str] = match input.map.step {
@@ -1541,6 +1547,7 @@ fn new_map_dir(run: &RunInfo, input: &MapInput, progress: &Progress) -> Result<S
         MapStep::Clean => &[DENSE_BIN],
         MapStep::Color => &[CLEAN_BIN, DENSE_BIN],
     };
+    let mut taken_from = None;
     if !wanted.is_empty() {
         // youngest first, up to the first that has a fitting stage; the run folder holds a
         // map made by the CLI
@@ -1561,13 +1568,14 @@ fn new_map_dir(run: &RunInfo, input: &MapInput, progress: &Progress) -> Result<S
             })?;
             let from = src.file_name().unwrap_or_default().to_string_lossy();
             progress.info(format!("{file} aus {from} übernommen"));
+            taken_from = Some(src);
             break;
         }
         if progress.is_cancelled() {
             return Err(StepError::Cancelled);
         }
     }
-    Ok(target)
+    Ok((target, taken_from))
 }
 
 /// The [`MapStatus`] of `map` of `run`, made from the scan folder `scan`. Reads `map.json`,
@@ -1773,8 +1781,10 @@ pub fn restore_job(
 
 /// Makes a map of `run` from the scan folder `scan` into the folder [`map_dir_for`] picks: a
 /// map that is current already is taken as it is (nothing written), any other is computed
-/// into a new folder, which is removed again if the map is cancelled or fails. Refused like a
-/// reuse for a run without `lauf.toml` whose cache needs other than the default settings.
+/// into a new folder, which is removed again if the map is cancelled or fails. Its
+/// `map.json` takes the entries of the steps a single step builds on from the map their stage
+/// was linked from, so that it counts as current. Refused like a reuse for a run without
+/// `lauf.toml` whose cache needs other than the default settings.
 pub fn run_map_job(
     run: &RunInfo,
     scan: &Path,
@@ -1795,18 +1805,14 @@ pub fn run_map_job(
         // one cloud to look at; the rest comes from „Exportieren …“
         all_files: false,
     };
-    let mut dir = map_dir_for(run, &input, progress)?;
-    if !dir.is_new() {
-        if let Some(report) = take_current_map(&request(dir.path()), progress) {
-            return Ok(MapDone {
-                dir: dir.keep(),
-                report,
-            });
+    if let Some(dir) = current_map_dir(run, &input) {
+        if let Some(report) = take_current_map(&request(&dir), progress) {
+            return Ok(MapDone { dir, report });
         }
         // changed since it was picked (another window or program): never in place
-        dir = new_map_dir(run, &input, progress)?;
     }
-    let report = recompute_map(&request(dir.path()), progress)?;
+    let (dir, stages_from) = new_map_dir(run, &input, progress)?;
+    let report = recompute_map_from(&request(dir.path()), stages_from.as_deref(), progress)?;
     Ok(MapDone {
         dir: dir.keep(),
         report,

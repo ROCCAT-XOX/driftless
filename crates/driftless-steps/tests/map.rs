@@ -1,11 +1,12 @@
-//! `run_map` and `folder_fits` on synthetic scans (no camera images: colouring is skipped).
+//! `run_map` and `folder_fits` on synthetic scans (most without camera images: colouring is
+//! skipped).
 
 use driftless_io::progress::{Progress, ProgressSnapshot};
-use driftless_io::testscan::{furnished_room_bag, room_bag, room_bag_secs, tmp};
+use driftless_io::testscan::{furnished_room_bag, room_bag, room_bag_secs, scan_with_images, tmp};
 use driftless_map::SMOOTH_CHUNK;
 use driftless_steps::map::{
     clean_stage_id, current_map, dense_stage_id, fitting_stages, folder_fits, recompute_map,
-    run_map, MapInput, MapRequest, MapSettings, MapStep, CLEAN_BIN, DENSE_BIN,
+    recompute_map_from, run_map, MapInput, MapRequest, MapSettings, MapStep, CLEAN_BIN, DENSE_BIN,
 };
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::{correct, StepError};
@@ -555,4 +556,69 @@ fn repeated_map_is_current() {
         .take_log()
         .iter()
         .any(|l| matches!(l, LogLine::Info(i) if i.starts_with("Dicht: "))));
+}
+
+/// A map computed into a new folder into which a stage of another map was linked keeps the
+/// entries of the steps the requested one builds on: from that map's `map.json`, with their
+/// numbers ([`recompute_map_from`]), listing only the files that are in the new folder; with no
+/// report to take them from, as reused all the same (the stage taken over is of the current
+/// input). Such a folder fits, and nothing in it is called stale. The step after the one
+/// computed is not taken from the other map: its cloud is not in the folder.
+#[test]
+fn stages_taken_over_keep_their_entries() {
+    use serde_json::json;
+    let dir = tmp("steps-map-taken-over");
+    scan_with_images(&dir);
+    let slam_dir = dir.join("slam");
+    slam(&dir, &slam_dir, false);
+    let k1 = dir.join("karte-001");
+    let req = request(&dir, &slam_dir, &k1, MapStep::All);
+    let whole = run_map(&req, &Progress::new()).unwrap();
+    let take_over = |name: &str, stage: &str| {
+        let d = dir.join(name);
+        fs::create_dir_all(&d).unwrap();
+        fs::copy(k1.join(stage), d.join(stage)).unwrap();
+        d
+    };
+    let all = input(&dir, &slam_dir, MapStep::All);
+
+    let k2 = take_over("karte-002", CLEAN_BIN);
+    let req = request(&dir, &slam_dir, &k2, MapStep::Color);
+    let report = recompute_map_from(&req, Some(&k1), &Progress::new()).unwrap();
+    let steps = &report["steps"];
+    for step in ["dense", "clean"] {
+        assert_eq!(steps[step]["reused"], true, "{step}");
+        assert_eq!(
+            steps[step]["stats"], whole["steps"][step]["stats"],
+            "{step}"
+        );
+    }
+    assert_eq!(steps["dense"]["files"], json!([]));
+    assert_eq!(steps["clean"]["files"], json!([CLEAN_BIN]));
+    assert_eq!(steps["color"]["reused"], false);
+    assert_eq!(report["stale"], json!([]));
+    assert!(folder_fits(&all, &k2));
+
+    let k3 = take_over("karte-003", CLEAN_BIN);
+    let req = request(&dir, &slam_dir, &k3, MapStep::Color);
+    let report = recompute_map(&req, &Progress::new()).unwrap();
+    let steps = &report["steps"];
+    for step in ["dense", "clean"] {
+        assert_eq!(steps[step]["input_id"], whole["steps"][step]["input_id"]);
+        assert_eq!(steps[step]["reused"], true, "{step}");
+        assert!(steps[step].get("stats").is_none(), "{step}: none to take");
+    }
+    assert_eq!(steps["clean"]["files"], json!([CLEAN_BIN]));
+    assert_eq!(report["stale"], json!([]));
+    assert!(folder_fits(&all, &k3));
+
+    let k4 = take_over("karte-004", DENSE_BIN);
+    let req = request(&dir, &slam_dir, &k4, MapStep::Clean);
+    let report = recompute_map_from(&req, Some(&k1), &Progress::new()).unwrap();
+    let steps = &report["steps"];
+    assert_eq!(steps["dense"]["stats"], whole["steps"]["dense"]["stats"]);
+    assert_eq!(steps["dense"]["files"], json!([DENSE_BIN]));
+    assert!(steps.get("color").is_none(), "{steps}");
+    assert_eq!(report["stale"], json!([]));
+    assert!(folder_fits(&all, &k4));
 }

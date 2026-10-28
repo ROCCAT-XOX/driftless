@@ -20,11 +20,14 @@
 //!
 //! The requested step always runs; the step before it is taken from its `*.bin` in the folder
 //! if that was written for the same input and settings (input id as in `submaps.bin`), and
-//! rebuilt otherwise. Only a whole map ([`MapStep::All`]) that is current already
-//! ([`current_map`]) is not computed again: [`run_map`] says so and returns its `map.json`
-//! ([`recompute_map`] computes it all the same). The `*.bin` files hold the cloud at full precision with the frame index
-//! of every point (and, in `dense.bin`, the sensor rays the cleaning needs); LAS rounds
-//! coordinates and intensity and has no frame column, so it is export only.
+//! rebuilt otherwise. `map.json` keeps the entries of the steps that did not run while their
+//! input fits; in a new folder those the requested step builds on come from the map its
+//! stages were taken from ([`recompute_map_from`]). Only a whole map ([`MapStep::All`]) that
+//! is current already ([`current_map`]) is not computed again: [`run_map`] says so and
+//! returns its `map.json` ([`recompute_map`] computes it all the same). The `*.bin` files
+//! hold the cloud at full precision with the frame index of every point (and, in
+//! `dense.bin`, the sensor rays the cleaning needs); LAS rounds coordinates and intensity and
+//! has no frame column, so it is export only.
 //!
 //! The trajectory is read from the SLAM folder; the results go to the output folder (the CLI
 //! uses the SLAM folder for both).
@@ -708,6 +711,9 @@ struct MapRun<'a> {
     ids: Ids,
     /// `map.json` of an earlier run (`Null` if there is none).
     previous: Value,
+    /// `map.json` of the map folder the stages in `out` were taken from
+    /// ([`recompute_map_from`]; `Null` if none).
+    earlier: Value,
     steps: BTreeMap<&'static str, Value>,
     /// [`MapRequest::all_files`].
     all_files: bool,
@@ -779,16 +785,49 @@ impl MapRun<'_> {
 
     /// The earlier entry of `step` if it was written for input `id`.
     fn previous_entry(&self, step: &str, id: &str) -> Option<Value> {
-        let e = &self.previous["steps"][step];
-        (e["input_id"].as_str() == Some(hex(id).as_str())).then(|| e.clone())
+        entry_for(&self.previous, step, id)
     }
 
-    /// Entry of a step whose result was taken from the folder.
-    fn record_reused(&mut self, step: &'static str, id: &str) {
+    /// Whether the requested step builds on `step` (comes after it), so that its input is the
+    /// current one once the requested step has its own.
+    fn builds_on(&self, step: &str) -> bool {
+        let requested = match self.input.map.step {
+            MapStep::Dense => 0,
+            MapStep::Clean => 1,
+            MapStep::Color => 2,
+            MapStep::All => 3,
+        };
+        STEP_FILES
+            .iter()
+            .position(|(s, _, _)| *s == step)
+            .is_some_and(|i| i < requested)
+    }
+
+    /// The entry of `step` for input `id` that a run takes over as reused: the folder's own
+    /// earlier one, or else – for a step the requested one builds on – that of the map its
+    /// stages were taken from ([`MapRun::earlier`]: the same input, so the same result and
+    /// numbers). It lists only those of its files that are in the folder.
+    fn carried_entry(&self, step: &str, id: &str) -> Option<Value> {
         let mut e = self
             .previous_entry(step, id)
-            .unwrap_or_else(|| json!({"input_id": hex(id)}));
+            .or_else(|| entry_for(&self.earlier, step, id).filter(|_| self.builds_on(step)))?;
+        if let Some(files) = e["files"].as_array() {
+            let here: Vec<Value> = files
+                .iter()
+                .filter(|f| f.as_str().is_some_and(|f| self.path(f).is_file()))
+                .cloned()
+                .collect();
+            e["files"] = Value::Array(here);
+        }
         e["reused"] = json!(true);
+        Some(e)
+    }
+
+    /// Entry of a step whose result, the stage `file`, was taken from the folder.
+    fn record_reused(&mut self, step: &'static str, id: &str, file: &str) {
+        let e = self
+            .carried_entry(step, id)
+            .unwrap_or_else(|| json!({"input_id": hex(id), "reused": true, "files": [file]}));
         self.steps.insert(step, e);
     }
 
@@ -877,7 +916,7 @@ impl MapRun<'_> {
     fn dense_input(&mut self) -> Result<(Cloud, RaySource), StepError> {
         let id = self.ids.dense.clone();
         if let Some((cloud, Some(rays))) = self.try_reuse("Dicht", DENSE_BIN, &id, true) {
-            self.record_reused("dense", &id);
+            self.record_reused("dense", &id, DENSE_BIN);
             return Ok((cloud, rays));
         }
         self.run_dense(false)
@@ -941,7 +980,7 @@ impl MapRun<'_> {
     fn clean_input(&mut self) -> Result<Cloud, StepError> {
         let id = self.ids.clean.clone();
         if let Some((cloud, _)) = self.try_reuse("Bereinigt", CLEAN_BIN, &id, false) {
-            self.record_reused("clean", &id);
+            self.record_reused("clean", &id, CLEAN_BIN);
             return Ok(cloud);
         }
         let (cloud, rays) = self.dense_input()?;
@@ -1053,6 +1092,20 @@ const STEP_FILES: [(&str, &[&str], &str); 3] = [
 /// Whether a map writes the file `name` (one of [`STEP_FILES`] or `map.json`).
 fn owns(name: &str) -> bool {
     name == REPORT || STEP_FILES.iter().any(|(_, files, _)| files.contains(&name))
+}
+
+/// The `map.json` in `dir`; `Null` if there is none or it cannot be read.
+fn read_report(dir: &Path) -> Value {
+    fs::read_to_string(dir.join(REPORT))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null)
+}
+
+/// The entry of `step` in the `map.json` `report` if it was written for input `id`.
+fn entry_for(report: &Value, step: &str, id: &str) -> Option<Value> {
+    let e = &report["steps"][step];
+    (e["input_id"].as_str() == Some(hex(id).as_str())).then(|| e.clone())
 }
 
 /// Output files in `out` that the current entry of their step in `steps` does not list (its
@@ -1323,6 +1376,19 @@ pub fn take_current_map(req: &MapRequest, progress: &Progress) -> Option<Value> 
 /// [`run_map`] without the check whether the map is current: every requested step runs
 /// (`driftless map --neu`).
 pub fn recompute_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError> {
+    recompute_map_from(req, None, progress)
+}
+
+/// [`recompute_map`] into a folder into which stages of the map folder `stages_from` were
+/// taken over (the app computes every map into a new folder and links them there): the
+/// steps the requested one builds on keep their entries of its `map.json` – the same input,
+/// so the same numbers – listing the files that are in the new folder. The new `map.json`
+/// says what the map was made from, so the map counts as current ([`folder_fits`]).
+pub fn recompute_map_from(
+    req: &MapRequest,
+    stages_from: Option<&Path>,
+    progress: &Progress,
+) -> Result<Value, StepError> {
     let start = Instant::now();
     let input = &req.input;
     let switches = &input.map.switches;
@@ -1358,10 +1424,8 @@ pub fn recompute_map(req: &MapRequest, progress: &Progress) -> Result<Value, Ste
         .as_ref()
         .ok()
         .map(|c| color_id(&clean_id, &c.id, &color_cfg));
-    let previous = fs::read_to_string(req.out_dir.join(REPORT))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or(Value::Null);
+    let previous = read_report(&req.out_dir);
+    let earlier = stages_from.map_or(Value::Null, read_report);
 
     let settings = settings_json(&input.slam, &odom, &dense_cfg, &clean_cfg, &color_cfg);
     let mut run = MapRun {
@@ -1380,6 +1444,7 @@ pub fn recompute_map(req: &MapRequest, progress: &Progress) -> Result<Value, Ste
             color: color_id,
         },
         previous,
+        earlier,
         steps: BTreeMap::new(),
         all_files: req.all_files,
         report_removed: false,
@@ -1420,18 +1485,27 @@ pub fn recompute_map(req: &MapRequest, progress: &Progress) -> Result<Value, Ste
         }
     }
 
-    // Steps that did not run now stay in map.json while their input still fits.
+    // Steps that did not run now stay in map.json while their input still fits (those the
+    // requested step builds on also from the map its stages were taken from). One it builds
+    // on without such an entry is reused all the same: the stage taken over after it is of
+    // the current input, which includes its own.
     let current = [
-        ("dense", Some(run.ids.dense.clone())),
-        ("clean", Some(run.ids.clean.clone())),
-        ("color", run.ids.color.clone()),
+        ("dense", Some(run.ids.dense.clone()), Some(DENSE_BIN)),
+        ("clean", Some(run.ids.clean.clone()), Some(CLEAN_BIN)),
+        ("color", run.ids.color.clone(), None),
     ];
-    for (step, id) in current {
-        if run.steps.contains_key(step) {
+    for (step, id, stage) in current {
+        let Some(id) = id.filter(|_| !run.steps.contains_key(step)) else {
             continue;
-        }
-        if let Some(mut e) = id.and_then(|id| run.previous_entry(step, &id)) {
-            e["reused"] = json!(true);
+        };
+        if let Some(e) = run.carried_entry(step, &id) {
+            run.steps.insert(step, e);
+        } else if run.builds_on(step) {
+            let files: Vec<&str> = stage
+                .filter(|f| stage_fits(&run.path(f), &id))
+                .into_iter()
+                .collect();
+            let e = json!({"input_id": hex(&id), "reused": true, "files": files});
             run.steps.insert(step, e);
         }
     }

@@ -3,15 +3,18 @@
 
 use driftless_app::leftovers;
 use driftless_app::project::{
-    map_dir_for, model_picks, model_status, model_surface_status, point_pairs, restore_job,
-    run_map_job, run_merge_job, run_model_surface_job, run_pairs_merge_job, run_slam_job,
-    set_point_pair_enabled, MergePick, Project, ScanState, SlamJob, SurfaceSettings,
+    map_dir_for, map_status, model_picks, model_status, model_surface_status, point_pairs,
+    restore_job, run_map_job, run_merge_job, run_model_surface_job, run_pairs_merge_job,
+    run_slam_job, run_surface_job, set_point_pair_enabled, surface_status, MergePick, Project,
+    ScanState, SlamJob, SurfaceSettings,
 };
 use driftless_app::ui::read_tree;
 use driftless_gpu::GpuPref;
 use driftless_io::progress::{Progress, ProgressSnapshot};
 use driftless_io::testdir::SharedDir;
-use driftless_io::testscan::{furnished_room_bag, room_bag_at, room_bag_secs, shared, tmp};
+use driftless_io::testscan::{
+    furnished_room_bag, room_bag_at, room_bag_secs, scan_with_images, shared, tmp,
+};
 use driftless_map::surface::SurfaceConfig;
 use driftless_steps::correct;
 use driftless_steps::history::HistoryKind;
@@ -522,6 +525,108 @@ fn cancelled_map_recompute_keeps_the_map() {
     let done = run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
     assert_eq!(done.dir, run.dir.join("karte-002"));
     assert_eq!(files(&k1), before, "karte-001 untouched");
+}
+
+/// A single step under „Erweitert“ goes into a new folder with the stage it takes over linked,
+/// and its `map.json` carries the entries of the steps before it, with their numbers, from the
+/// map that stage came from: the map counts as current (not „veraltet“), so „Oberfläche
+/// rechnen“ is open for it and its surface fits; nothing in it is called stale. „Einfärben“
+/// alone with the same and with other colour switches, „Bereinigen“ alone (the review's probe
+/// of the fix of I1). The step after the one computed is not carried: its cloud is not there.
+#[test]
+fn single_map_steps_give_a_current_map() {
+    let dir = tmp("app-map-single-steps");
+    let raw = dir.join("rohdaten");
+    fs::create_dir_all(&raw).unwrap();
+    scan_with_images(&raw);
+    let mut p = Project::create(&dir.join("projekt"), "Test").unwrap();
+    let id = p.add_scan(&raw).unwrap();
+    p.save().unwrap();
+    let full = SlamJob::Full(SlamSettings::default());
+    run_slam_job(&p, &id, &full, &Progress::new()).unwrap();
+    let scan_dir = p.scans[0].path.clone();
+    let run = p.runs(&id).remove(0);
+    let whole = run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
+    let k1 = files(&whole.dir);
+    let other_colours = MapSettings {
+        step: MapStep::Color,
+        switches: MapSwitches {
+            highlights: true,
+            ..MapSwitches::default()
+        },
+    };
+    let colored: &[&str] = &["clean.bin", "color.las", "map.json"];
+    let cases: [(&str, MapSettings, &[&str], &[&str]); 3] = [
+        (
+            "karte-002",
+            settings(MapStep::Color),
+            colored,
+            &["dense", "clean"],
+        ),
+        ("karte-003", other_colours, colored, &["dense", "clean"]),
+        (
+            "karte-004",
+            settings(MapStep::Clean),
+            &[
+                "clean.bin",
+                "clean.las",
+                "dense.bin",
+                "map.json",
+                "removed.las",
+            ],
+            &["dense"],
+        ),
+    ];
+    for (folder, step, in_folder, carried) in cases {
+        let run = p.runs(&id).remove(0);
+        let done = run_map_job(&run, &scan_dir, &step, &Progress::new()).unwrap();
+        assert_eq!(done.dir, run.dir.join(folder));
+        assert_eq!(names(&done.dir), in_folder, "{folder}");
+        let steps = &done.report["steps"];
+        for s in carried {
+            assert_eq!(steps[s]["reused"], true, "{folder} {s}: {steps}");
+            assert_eq!(
+                steps[s]["stats"], whole.report["steps"][s]["stats"],
+                "{folder} {s}: the numbers of the map it was made from"
+            );
+        }
+        let computed = if step.step == MapStep::Clean {
+            assert!(steps.get("color").is_none(), "{folder}: {steps}");
+            "clean"
+        } else {
+            "color"
+        };
+        assert_eq!(steps[computed]["reused"], false, "{folder}: {steps}");
+        assert_eq!(done.report["stale"], serde_json::json!([]), "{folder}");
+        let run = p.runs(&id).remove(0);
+        let map = run.maps.iter().find(|m| m.dir == done.dir).unwrap();
+        assert!(
+            !map_status(&scan_dir, &run, map).stale,
+            "{folder} counts as stale: {steps}"
+        );
+    }
+    assert_eq!(files(&run.dir.join("karte-001")), k1, "karte-001 untouched");
+
+    // „Oberfläche rechnen“ on the coloured map of the single step: computed, and current
+    let run = p.runs(&id).remove(0);
+    let map = &run.maps[1];
+    let quick = SurfaceSettings {
+        config: SurfaceConfig {
+            voxel: 0.15,
+            min_weight: 1,
+            min_component_faces: 10,
+            page_size: 256,
+            simplify_error: 0.01,
+            ..SurfaceConfig::default()
+        },
+        texture: true,
+    };
+    let surface =
+        run_surface_job(&run, &scan_dir, map, &quick, GpuPref::Off, &Progress::new()).unwrap();
+    assert_eq!(surface.dir, map.dir.join("oberflaeche-001"));
+    let run = p.runs(&id).remove(0);
+    let map = &run.maps[1];
+    assert!(!surface_status(&scan_dir, &run, map, &map.surfaces[0]).stale);
 }
 
 /// A reuse of a run whose `map.las` cannot be written (as on a full disk) puts every file of
