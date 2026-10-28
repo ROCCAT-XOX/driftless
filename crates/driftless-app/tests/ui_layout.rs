@@ -1,7 +1,7 @@
 //! The layout of the window: the rail with ☰, the three steps and ⚙, the field of the active
 //! step, the settings window, the empty states and the stored layout.
 
-use driftless_app::project::{Project, ScanEntry, ScanState};
+use driftless_app::project::{MapInfo, Project, RunInfo, ScanEntry, ScanState};
 use driftless_app::render::{ColorMode, PointSize, ShowMode};
 use driftless_app::ui::{
     rail, steps, text, Action, AppState, DriftlessApp, ScanNode, Selection, Step, SurfaceSummary,
@@ -80,6 +80,30 @@ fn project_state() -> AppState {
     }
 }
 
+/// [`project_state`] with the map „Karte 001“ of the run „SLAM 001“ (not read from disk).
+fn with_map() -> AppState {
+    let mut state = project_state();
+    state.scans[0].runs.push(RunInfo {
+        dir: "/p/scans/buero/slam-001".into(),
+        label: "SLAM 001".into(),
+        settings: Default::default(),
+        has_result: true,
+        has_cache: false,
+        has_previous: false,
+        has_odometry: false,
+        cloud: None,
+        maps: vec![MapInfo {
+            dir: "/p/scans/buero/slam-001/karte-001".into(),
+            label: "Karte 001".into(),
+            settings: None,
+            clouds: Vec::new(),
+            surfaces: Vec::new(),
+        }],
+        history: Vec::new(),
+    });
+    state
+}
+
 #[test]
 fn rail_switches_step() {
     let mut h = window(app());
@@ -124,8 +148,17 @@ fn step_sets_show_mode() {
     app.apply(Action::SetStep(Step::Bilder));
     assert_eq!(app.state().view.show, ShowMode::Surface);
 
-    // without a surface the cloud stays, with a hint
+    // without a surface the cloud stays, with a hint where there is a map to compute one from
     let mut h = window(self::app());
+    h.state_mut().apply(Action::SetStep(Step::Bilder));
+    h.run();
+    assert!(
+        h.query_by_label(text::NO_SURFACE_YET).is_none(),
+        "no map yet"
+    );
+    h.state_mut().state_mut().scans = with_map().scans;
+    h.state_mut().apply(Action::SetStep(Step::Daten));
+    h.run();
     h.state_mut().apply(Action::SetStep(Step::Bilder));
     h.run();
     assert_eq!(h.state().state().step, Step::Bilder);

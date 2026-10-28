@@ -198,7 +198,7 @@ slim status bar:
 
 - **Rail:** ☰ opens the project menu („Neues Projekt …“ in an empty folder, „Projekt öffnen …“,
   „Scan hinzufügen …“ for a scan folder as above, „Lauf hinzufügen …“ for a run made with the command
-  line, „Datei öffnen …“ for any point cloud or surface file, „Exportieren …“ for what the view shows,
+  line (to the scan selected; only here), „Datei öffnen …“ for any point cloud or surface file, „Exportieren …“ for what the view shows,
   „Über Driftless …“; see [Export](#export) and [Opening files](#opening-files)). Below it the three steps, and
   ⚙ at the bottom. The dialogs open in `~/Driftless Projekte` (Windows `%USERPROFILE%\Driftless
   Projekte`, made when first needed), later in the folder each was last used in. A project is read in
@@ -227,7 +227,8 @@ slim status bar:
   Schnell · Genau · Maximal sets only the voxel size of the map (0.02 /
   0.01 / 0.005 m; Maximal needs over 4 GB of memory on large scans, another voxel shows „Eigene“). „Alle
   rechnen“ queues every new or stale scan and computes them one after the other; with a scan selected,
-  „Rechnen“ computes only that one. The runs and maps of a scan unfold below its card. „▸ Erweitert“
+  „Rechnen“ computes only that one. The runs and maps of a scan unfold below its card; a click on a
+  map shows its best cloud. „Zusammenführen …“ scrolls its field into view, start button included. „▸ Erweitert“
   holds the rest: the switches of `driftless map` with the voxel as a number, the single steps
   („Prüfen“, „SLAM rechnen“, „Neu rechnen (aus Teilkarten)“, „Karte rechnen“), the corrections (loops:
   „Stellen wählen“ and two clicks on the trajectory, „Schleife eintragen“, „Jetzt neu rechnen“ from
@@ -249,7 +250,8 @@ slim status bar:
   Scan“) or a surface (glb, OBJ), also without a project. A variant that cannot be read (a PCD saved
   „binary_compressed“, a glb with Draco) gives a German message in the status bar.
 - **2 Bilder:** a card per map with its surfaces below it (one that no longer fits its map is marked
-  „veraltet – Karte oder Lauf neu gerechnet“); a click shows it. The fineness 1 · 1,5 · 2 cm applies to
+  „veraltet – Karte oder Lauf neu gerechnet“); a click shows it (on a map card: its newest fitting
+  surface, else its cloud). The fineness 1 · 1,5 · 2 cm applies to
   the next surface; „Alle Oberflächen rechnen“ queues every map without a current surface, „Oberfläche
   rechnen“ only the selected one, into `karte-NNN/oberflaeche-NNN`. „ohne Fotos“ (= `--no-texture`) is
   under „▸ Erweitert“. Entering the step shows the surface; Daten and Planung show the points.

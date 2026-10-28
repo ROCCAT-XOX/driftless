@@ -207,10 +207,10 @@ fn main_button_computes_all_or_the_selected_scan() {
         click(&mut h, text::COMPUTE_ALL),
         Some(Action::ComputeAllMaps)
     );
-    // the selected scan shows its runs and maps below it
+    // the selected scan shows its runs and maps below it; „Lauf hinzufügen …“ is in ☰ only
     h.get_by_label("SLAM 001");
     h.get_by_label("Karte 001");
-    h.get_by_label(text::ADD_RUN);
+    assert!(h.query_by_label(text::ADD_RUN).is_none());
 }
 
 #[test]
@@ -1003,4 +1003,41 @@ fn selecting_model_loads_it_coloured_by_scan() {
     app.state_mut().view.color_mode = ColorMode::Intensity;
     settle(&mut app);
     assert_eq!(app.state().view.color_mode, ColorMode::Intensity);
+}
+
+/// „Zusammenführen …“ opens its field at the end of the list: the field scrolls into view, so
+/// that its start button is not hidden under the pinned main button (b-report #7).
+#[test]
+fn merge_start_is_in_view_when_the_field_opens() {
+    let mut state = mergeable();
+    // a field short enough that the list scrolls
+    let mut h = Harness::builder().with_size([320.0, 420.0]).build_ui_state(
+        |ui, (state, action): &mut (AppState, Option<Action>)| {
+            if let Some(a) = steps::show(ui, state) {
+                *action = Some(a);
+            }
+        },
+        (std::mem::take(&mut state), None),
+    );
+    h.run();
+    assert_eq!(click(&mut h, text::MERGE_OPEN), Some(Action::OpenMerge));
+    h.state_mut().0.open_merge();
+    h.run();
+    let bounds = |h: &H, label: &str| {
+        h.get_by_label(label)
+            .accesskit_node()
+            .bounding_box()
+            .expect("placed")
+    };
+    let start = bounds(&h, text::MERGE_START);
+    let pinned = bounds(&h, text::COMPUTE_ALL);
+    assert!(
+        start.y1 <= pinned.y0 && start.y0 >= 0.0,
+        "start {start:?} under the pinned bottom {pinned:?}"
+    );
+    assert!(h.state().0.merge.picks(&h.state().0).len() >= 2);
+    assert!(matches!(
+        click(&mut h, text::MERGE_START),
+        Some(Action::RunMerge { .. })
+    ));
 }

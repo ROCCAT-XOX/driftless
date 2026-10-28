@@ -46,8 +46,8 @@ pub fn drop_unsupported(name: &str) -> String {
     format!("{DROP_UNSUPPORTED}: {name} (LAS, LAZ, E57, PLY, PCD, GLB oder OBJ)")
 }
 
-pub const PLAN_COMING: &str = "Hier entstehen Grundriss, Maße und der DWG-Export. Das folgt in \
-     einem späteren Baustein.";
+pub const PLAN_COMING: &str =
+    "Hier entstehen später Grundriss, Maße und der DWG-Export; heute geht das Messen in der Ansicht.";
 pub const ADD_RUN_NEEDS_SCAN: &str = "Zuerst im Feld „Daten“ einen Scan wählen";
 pub const ADD_SCAN_NEEDS_PROJECT: &str = "Zuerst ein Projekt öffnen";
 
@@ -74,6 +74,8 @@ pub const COMPUTE_ALL: &str = "Alle rechnen";
 pub const COMPUTE_ONE: &str = "Rechnen";
 pub const COMPUTE_HINT: &str =
     "Rechnet je Scan zuerst SLAM, falls nötig, dann die Punktwolke mit der gewählten Genauigkeit";
+/// The tooltip of „Scan hinzufügen …“ as the main button of an empty project.
+pub const ADD_SCAN_HINT: &str = "Ordner mit LIDAR_*.bag wählen";
 pub const ALL_COMPUTED: &str = "Alle Scans sind gerechnet";
 /// With every scan done, but their maps of another precision than the one chosen.
 pub const RECOMPUTE_HINT: &str = "Scan wählen und „Rechnen“ drücken";
@@ -246,7 +248,7 @@ pub fn pair_cloud_name(member: &str) -> String {
 
 /// A point pair of a model: „Paar 1 · Scan 1 und 3 · 4 Punkte“ (the numbers of its scans).
 pub fn pair_row(nr: usize, a: usize, b: usize, points: usize) -> String {
-    format!("Paar {nr} · Scan {a} und {b} · {points} Punkte")
+    format!("Paar {nr} · Scan {a} und {b} · {}", self::points(points))
 }
 
 /// Beside a point pair the merge cannot use (a hand edit of the file); the reason on hover.
@@ -300,6 +302,8 @@ pub const WITH_THIS_FINENESS: &str = "Mit dieser Feinheit";
 pub const PANEL_STEPS: &str = "Schritte";
 pub const PANEL_PROPERTIES: &str = "Eigenschaften";
 pub const VIEW_EMPTY: &str = "Keine Wolke geladen – links eine Karte oder Wolke wählen";
+/// The empty view without a project.
+pub const VIEW_NO_PROJECT: &str = "Projekt öffnen oder Datei hineinziehen";
 
 // Steps (right panel); the step names are also the labels of their jobs
 pub const STEP_INSPECT: &str = "Prüfen";
@@ -583,7 +587,8 @@ pub const TOOL_NEEDS_CLOUD: &str = "Messen und Punkt wählen brauchen eine Punkt
 pub const MEASUREMENTS: &str = "Messungen";
 pub const NO_MEASUREMENTS: &str =
     "Noch keine Messungen. Unten in der Ansicht „Messen“ wählen und zwei Punkte anklicken.";
-pub const MEASUREMENTS_NOT_SAVED: &str = "Messungen werden noch nicht gespeichert (Baustein 5).";
+pub const MEASUREMENTS_NOT_SAVED: &str =
+    "Messungen werden noch nicht gespeichert: sie gehen beim Schließen verloren.";
 pub const CLEAR_MEASUREMENTS: &str = "Messungen löschen";
 /// The legend of the quality colours in the view.
 pub const QUALITY_LEGEND: &str = "Güte";
@@ -1245,7 +1250,7 @@ pub fn measurement_name(nr: usize) -> String {
 
 /// The info at the top left of the view: „Punktwolke · 6,0 Mio. Punkte“.
 pub fn info_cloud(points: usize) -> String {
-    format!("Punktwolke · {} Punkte", point_count(points))
+    format!("Punktwolke · {}", self::points(points))
 }
 
 /// „Oberfläche · 712.218 Dreiecke“.
@@ -1357,11 +1362,19 @@ pub fn cloud_loaded(path: &std::path::Path, points: usize, load_s: f64, build_s:
         |n| n.to_string_lossy().into_owned(),
     );
     format!(
-        "{name} geladen: {} Punkte (Laden {} s, Detailstufen {} s)",
-        point_count(points),
+        "{name} geladen: {} (Laden {} s, Detailstufen {} s)",
+        self::points(points),
         decimal(load_s, 1),
         decimal(build_s, 1)
     )
+}
+
+/// „1 Punkt“, „12.345 Punkte“, „15,6 Mio. Punkte“.
+pub fn points(n: usize) -> String {
+    match n {
+        1 => "1 Punkt".into(),
+        n => format!("{} Punkte", point_count(n)),
+    }
 }
 
 // Comparison and history

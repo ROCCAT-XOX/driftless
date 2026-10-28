@@ -35,6 +35,9 @@ pub struct MergeState {
     pub include_unsure: bool,
     /// Ticks were preset (the first opening ticks every scan that can be merged).
     preset: bool,
+    /// The field just opened: it scrolls into view once, so that its start button is not
+    /// hidden under the pinned main button.
+    scroll: bool,
 }
 
 /// A map that can be merged: finished, with cleaned points, still fitting its run.
@@ -90,6 +93,7 @@ impl MergeState {
             self.preset = true;
         }
         self.open = true;
+        self.scroll = true;
     }
 
     /// The map of `scan` to merge: the chosen one if it is still offered, else the newest.
@@ -126,7 +130,7 @@ impl MergeState {
 pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     let mut action = None;
     let mut merge = std::mem::take(&mut state.merge);
-    crate::ui::theme::card_frame(true).show(ui, |ui| {
+    let card = crate::ui::theme::card_frame(true).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.strong(text::MERGE_TITLE);
         ui.add(egui::Label::new(RichText::new(text::MERGE_HINT).color(DARK.text_dim)).wrap());
@@ -155,6 +159,10 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
             }
         });
     });
+    // its bottom (the start button and „Schließen“) at the bottom of what the list shows
+    if std::mem::take(&mut merge.scroll) {
+        card.response.scroll_to_me(Some(egui::Align::Max));
+    }
     state.merge = merge;
     action
 }

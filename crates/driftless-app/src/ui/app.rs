@@ -1198,9 +1198,24 @@ impl DriftlessApp {
     }
 
     /// Loads the cloud or surface of `selection` if it is one, a cloud with the quality of
-    /// its run.
+    /// its run; for a map its best cloud, in „Bilder“ its newest fitting surface if it has one.
     fn load_selected(&mut self) {
         match self.state.selection.clone() {
+            Selection::Map(dir) => {
+                let surface = self
+                    .state
+                    .map(&dir)
+                    .filter(|_| self.state.step == Step::Bilder)
+                    .and_then(|(_, _, m)| m.surfaces.iter().rev().find(|s| !s.stale))
+                    .map(|s| s.dir.clone());
+                match surface {
+                    Some(surface) => {
+                        self.surface_by_hand = true;
+                        self.load_surface(&surface);
+                    }
+                    None => self.load_best_of_map(&dir),
+                }
+            }
             Selection::Cloud(path) if self.is_model_cloud(&path) => self.load_model_cloud(path),
             Selection::Cloud(path) => {
                 let run = self.state.selected_run().map(|(_, r)| r.dir.clone());
@@ -2734,7 +2749,16 @@ impl DriftlessApp {
     /// In „Bilder“ without a surface: a hint over the top of the view that the cloud stays
     /// until one is computed.
     fn no_surface_hint(&self, ctx: &egui::Context, view: egui::Rect) {
+        // without a map there is nothing to compute one from (the field says what to do)
+        let maps = self
+            .state
+            .scans
+            .iter()
+            .flat_map(|s| &s.runs)
+            .any(|r| !r.maps.is_empty())
+            || !self.state.models.is_empty();
         if self.state.step != Step::Bilder
+            || !maps
             || self.state.surface.is_some()
             || self.is_loading_surface()
         {
@@ -2859,7 +2883,11 @@ impl DriftlessApp {
                     ui.centered_and_justified(|ui| ui.weak(text::VIEW_NO_GPU));
                 }
                 (_, false) => {
-                    ui.centered_and_justified(|ui| ui.weak(text::VIEW_EMPTY));
+                    let hint = match self.state.project {
+                        Some(_) => text::VIEW_EMPTY,
+                        None => text::VIEW_NO_PROJECT,
+                    };
+                    ui.centered_and_justified(|ui| ui.weak(hint));
                 }
             });
         self.no_surface_hint(&ctx, central.response.rect);

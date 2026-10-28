@@ -166,7 +166,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     leftover_lines(ui, state, &mut action);
     if state.scans.is_empty() {
         hint(ui, text::EMPTY_NO_SCANS);
-        if main_button(ui, text::ADD_SCAN, None, text::COMPUTE_HINT) {
+        if main_button(ui, text::ADD_SCAN, None, text::ADD_SCAN_HINT) {
             action = Some(Action::PickAddScan);
         }
         return action;
@@ -308,9 +308,6 @@ fn scan_card(ui: &mut Ui, state: &AppState, scan: &ScanNode, action: &mut Option
             }
             for run in &scan.runs {
                 tree::run_node(ui, state, run, action);
-            }
-            if ui.small_button(text::ADD_RUN).clicked() {
-                *action = Some(Action::PickAddRun(scan.id.clone()));
             }
         });
     }
