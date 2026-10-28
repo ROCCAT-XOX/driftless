@@ -448,17 +448,20 @@ pub struct Tree {
 
 /// Reads the tree of `project` from disk: every scan folder, run, map, surface and model, and
 /// what jobs cut off left behind. A run without its `slam.json` or a map without its `map.json`
-/// (one being computed, or a leftover) is not in the tree. Can take seconds on a network share
-/// or with files iCloud moved away: call it off the UI thread.
+/// (one being computed, or a leftover) is not in the tree – unless it holds finished results
+/// (maps, surfaces, the history of a run): then it stays, marked incomplete
+/// ([`RunInfo::incomplete`], [`crate::project::MapInfo::incomplete`]; see
+/// [`crate::leftovers`]). Can take seconds on a network share or with files iCloud moved away:
+/// call it off the UI thread.
 pub fn read_tree(project: &Project) -> Tree {
+    use crate::leftovers::holds_results;
     let complete = |s: &crate::project::ScanEntry, mut run: RunInfo| {
         // a run made by the CLI and added by hand stays as it is
         let added = s.extra_runs.contains(&run.dir);
-        if !added && !run.dir.join("slam.json").is_file() {
+        if !added && run.incomplete && !holds_results(&run.dir) {
             return None;
         }
-        run.maps
-            .retain(|m| m.dir.join(driftless_steps::map::REPORT).is_file());
+        run.maps.retain(|m| !m.incomplete || holds_results(&m.dir));
         Some(run)
     };
     let scans = project
@@ -1151,10 +1154,13 @@ impl AppState {
     }
 
     /// How many maps [`Action::ComputeAllSurfaces`] leaves out because they wait for „Daten“:
-    /// the map no longer fits its run, has no `map.json` yet, or its scan cannot be read.
+    /// the map no longer fits its run, has no readable `map.json`, or its scan cannot be read.
+    /// A map kept without its report for its surfaces ([`crate::project::MapInfo::incomplete`])
+    /// waits for nothing: „Daten“ computes a new one.
     pub fn maps_waiting_for_data(&self) -> usize {
         use steps::bilder::SurfaceStatus;
         self.all_maps()
+            .filter(|m| !m.incomplete)
             .filter(|m| {
                 matches!(
                     steps::bilder::surface_status(self, m),

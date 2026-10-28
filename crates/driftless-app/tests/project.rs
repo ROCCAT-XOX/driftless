@@ -1,11 +1,13 @@
 //! The project model on synthetic scans: `project.toml`, run folders, map folders, CLI
 //! folders added as runs, missing scan folders, models merged from several scans.
 
+use driftless_app::leftovers;
 use driftless_app::project::{
-    map_dir_for, model_picks, model_status, model_surface_status, point_pairs, run_map_job,
-    run_merge_job, run_model_surface_job, run_pairs_merge_job, run_slam_job,
+    map_dir_for, model_picks, model_status, model_surface_status, point_pairs, restore_job,
+    run_map_job, run_merge_job, run_model_surface_job, run_pairs_merge_job, run_slam_job,
     set_point_pair_enabled, MergePick, Project, ScanState, SlamJob, SurfaceSettings,
 };
+use driftless_app::ui::read_tree;
 use driftless_gpu::GpuPref;
 use driftless_io::progress::{Progress, ProgressSnapshot};
 use driftless_io::testdir::SharedDir;
@@ -25,7 +27,8 @@ use driftless_steps::StepError;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 fn canon(p: &Path) -> PathBuf {
     driftless_app::project::canonical(p).unwrap()
@@ -432,31 +435,156 @@ fn map_dir_reused_when_settings_and_traj_fit() {
     let scan_dir = p.scans[0].path.clone();
     let done = run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
     assert_eq!(done.dir, run.dir.join("karte-001"));
-    let dense = fs::read(done.dir.join("dense.bin")).unwrap();
+    let k1 = files(&done.dir);
 
-    // same switches, another step: the same folder
+    // the same map again: current, nothing computed or written, the same folder
     let run = p.runs(&id).remove(0);
-    let done = run_map_job(&run, &scan_dir, &settings(MapStep::Clean), &Progress::new()).unwrap();
+    let done = run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
     assert_eq!(done.dir, run.dir.join("karte-001"));
-    assert_eq!(done.report["steps"]["dense"]["reused"], true);
-    assert_eq!(fs::read(done.dir.join("dense.bin")).unwrap(), dense);
-    let run = p.runs(&id).remove(0);
-    assert_eq!(run.maps.len(), 1);
-    assert_eq!(run.maps[0].label, "Karte 001");
-    assert_eq!(run.maps[0].settings, Some(MapSwitches::default()));
+    assert_eq!(files(&done.dir), k1);
 
-    // map_dir_for on its own: the fitting folder, nothing created
+    // map_dir_for on its own: the current folder, nothing created
     let input = MapInput {
         scan: scan_dir.clone(),
         slam_dir: run.dir.clone(),
         slam: run.settings.clone(),
-        map: settings(MapStep::Color),
+        map: settings(MapStep::All),
     };
     let target = map_dir_for(&run, &input, &Progress::new()).unwrap();
     assert!(!target.is_new());
     assert_eq!(target.path(), run.dir.join("karte-001"));
     drop(target);
     assert!(run.dir.join("karte-001/map.json").exists(), "kept on drop");
+
+    // same switches, another step: it writes, so never into the map's own folder – a new one,
+    // with the stage it takes over linked from the old one, which stays as it was
+    let done = run_map_job(&run, &scan_dir, &settings(MapStep::Clean), &Progress::new()).unwrap();
+    assert_eq!(done.dir, run.dir.join("karte-002"));
+    assert_eq!(done.report["steps"]["dense"]["reused"], true);
+    assert_eq!(
+        fs::read(done.dir.join("dense.bin")).unwrap(),
+        k1["dense.bin"]
+    );
+    assert_eq!(files(&run.dir.join("karte-001")), k1, "karte-001 untouched");
+    let run = p.runs(&id).remove(0);
+    let labels: Vec<&str> = run.maps.iter().map(|m| m.label.as_str()).collect();
+    assert_eq!(labels, ["Karte 001", "Karte 002"]);
+    assert_eq!(run.maps[0].settings, Some(MapSwitches::default()));
+}
+
+/// A map whose files no longer fit it all (here `dense.bin`, deleted to save space) is
+/// computed anew into a new folder, never into its own: cancelled in the clean step, the old
+/// map keeps its report and its surface and stays in the tree, and nothing is offered for
+/// „Aufräumen“ (the review's probe of I1). Computed to its end, the new map has a folder of
+/// its own as well.
+#[test]
+fn cancelled_map_recompute_keeps_the_map() {
+    let dir = tmp("app-map-recompute-cancel");
+    let (p, id) = project_with_run(&dir, 1.5);
+    let scan_dir = p.scans[0].path.clone();
+    let run = p.runs(&id).remove(0);
+    run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
+    let k1 = run.dir.join("karte-001");
+    let surface = k1.join("oberflaeche-001");
+    fs::create_dir_all(&surface).unwrap();
+    fs::write(surface.join("oberflaeche.glb"), b"glb").unwrap();
+    fs::write(surface.join("oberflaeche.json"), b"{}").unwrap();
+    fs::remove_file(k1.join("dense.bin")).unwrap();
+    let before = files(&k1);
+
+    let progress = Progress::new();
+    let handle = progress.clone();
+    let progress = progress.with_observer(move |s: &ProgressSnapshot| {
+        if s.phase == "Geister" {
+            handle.cancel();
+        }
+    });
+    let run = p.runs(&id).remove(0);
+    let err = run_map_job(&run, &scan_dir, &settings(MapStep::All), &progress).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    assert_eq!(files(&k1), before, "karte-001 untouched");
+    assert_eq!(files(&surface).len(), 2, "its surface too");
+    assert!(
+        !run.dir.join("karte-002").exists(),
+        "the new folder goes again"
+    );
+    let tree = read_tree(&p);
+    let run_node = &tree.scans[0].runs[0];
+    let maps: Vec<&Path> = run_node.maps.iter().map(|m| m.dir.as_path()).collect();
+    assert_eq!(maps, [k1.as_path()]);
+    assert!(!run_node.maps[0].incomplete);
+    assert_eq!(run_node.maps[0].surfaces.len(), 1);
+    assert_eq!(
+        leftovers::find(&p.dir, std::slice::from_ref(&id)),
+        Vec::new()
+    );
+
+    let done = run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
+    assert_eq!(done.dir, run.dir.join("karte-002"));
+    assert_eq!(files(&k1), before, "karte-001 untouched");
+}
+
+/// A reuse of a run whose `map.las` cannot be written (as on a full disk) puts every file of
+/// the run back: it keeps its report, its trajectory and its history, stays in the tree with
+/// its map, and nothing is offered for „Aufräumen“ (the review's probe of I1).
+#[test]
+fn failed_reuse_keeps_the_run() {
+    let dir = tmp("app-reuse-fails");
+    let (p, id) = project_with_run(&dir, 1.5);
+    let scan_dir = p.scans[0].path.clone();
+    let run = p.runs(&id).remove(0);
+    run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
+    let run = p.runs(&id).remove(0);
+    let before = files(&run.dir);
+    let states = run.history.len();
+    // a folder in the way of the temporary file of the new map.las: its write fails
+    let blocked = run.dir.join("map.las.tmp");
+    fs::create_dir_all(blocked.join("x")).unwrap();
+    let err = run_slam_job(&p, &id, &SlamJob::Reuse(run.clone()), &Progress::new()).unwrap_err();
+    assert!(err.to_string().contains("wie vorher"), "{err}");
+    fs::remove_dir_all(&blocked).unwrap();
+    assert_eq!(files(&run.dir), before);
+    let tree = read_tree(&p);
+    let node = &tree.scans[0].runs[0];
+    assert!(node.has_result && !node.incomplete);
+    assert_eq!(node.maps.len(), 1);
+    assert_eq!(node.history.len(), states);
+    assert_eq!(leftovers::find(&p.dir, &[id]), Vec::new());
+}
+
+/// A reuse and „Diesen Stand wiederherstellen“ write into the run's own folder: while they
+/// run, the folder carries the busy mark, so another window neither offers it for „Aufräumen“
+/// nor deletes it; afterwards the mark is gone.
+#[test]
+fn jobs_in_the_run_folder_mark_it_busy() {
+    let dir = tmp("app-reuse-busy");
+    let (p, id) = project_with_run(&dir, 1.5);
+    let run = p.runs(&id).remove(0);
+    let mark = run.dir.join(leftovers::BUSY_FILE);
+    let watching = |seen: Arc<AtomicBool>| {
+        let mark = mark.clone();
+        Progress::new().with_observer(move |s: &ProgressSnapshot| {
+            if s.phase == "Schleifen schließen" && mark.is_file() {
+                seen.store(true, Ordering::SeqCst);
+            }
+        })
+    };
+    let seen = Arc::new(AtomicBool::new(false));
+    run_slam_job(
+        &p,
+        &id,
+        &SlamJob::Reuse(run.clone()),
+        &watching(seen.clone()),
+    )
+    .unwrap();
+    assert!(seen.load(Ordering::SeqCst), "marked while it ran");
+    assert!(!mark.exists(), "the mark goes afterwards");
+
+    let seen = Arc::new(AtomicBool::new(false));
+    let run = p.runs(&id).remove(0);
+    restore_job(&p, &id, &run, 1, &watching(seen.clone())).unwrap();
+    assert!(seen.load(Ordering::SeqCst), "marked while it ran");
+    assert!(!mark.exists(), "the mark goes afterwards");
 }
 
 #[test]

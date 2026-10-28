@@ -10,7 +10,9 @@
 //! with its switch, as the loops of a run; one the merge cannot use marked „nicht nutzbar“, why
 //! on hover), `modell.las` and the surfaces of the model. Names too long for the field end in „…“;
 //! the full name and the folder show on hover. A run, a map, a model and a surface have
-//! „Exportieren …“ in their context menu (right click, [`Action::OpenExport`]).
+//! „Exportieren …“ in their context menu (right click, [`Action::OpenExport`]). A run or map
+//! whose report is missing but which holds finished results is marked „unvollständig – neu
+//! rechnen“, why and what to do on hover ([`crate::leftovers`]).
 
 use super::{badge, model_stale_hint};
 use crate::project::{MapInfo, ModelInfo, RunInfo, SurfaceInfo};
@@ -35,8 +37,12 @@ pub(super) fn run_node(ui: &mut Ui, state: &AppState, run: &RunInfo, action: &mu
     let selected = state.selection == Selection::Run(run.dir.clone());
     let label = sized(state, &run.label, &run.dir);
     let header = |ui: &mut Ui| {
-        let hover = format!("{label}\n{}", run.dir.display());
-        entry(ui, selected, label.clone(), &hover)
+        if run.incomplete {
+            incomplete_entry(ui, selected, &label, text::RUN_INCOMPLETE_HINT, &run.dir)
+        } else {
+            let hover = format!("{label}\n{}", run.dir.display());
+            entry(ui, selected, label.clone(), &hover)
+        }
     };
     let header = if run.cloud.is_none() && run.maps.is_empty() && run.history.is_empty() {
         leaf(ui, header)
@@ -105,8 +111,12 @@ fn map_node(ui: &mut Ui, state: &AppState, map: &MapInfo, action: &mut Option<Ac
     let selected = state.selection == Selection::Map(map.dir.clone());
     let label = sized(state, &map.label, &map.dir);
     let header = |ui: &mut Ui| {
-        let hover = format!("{label}\n{}", map.dir.display());
-        entry(ui, selected, label.clone(), &hover)
+        if map.incomplete {
+            incomplete_entry(ui, selected, &label, text::MAP_INCOMPLETE_HINT, &map.dir)
+        } else {
+            let hover = format!("{label}\n{}", map.dir.display());
+            entry(ui, selected, label.clone(), &hover)
+        }
     };
     let header = if map.clouds.is_empty() && map.surfaces.is_empty() {
         leaf(ui, header)
@@ -463,6 +473,15 @@ fn sized(state: &AppState, label: &str, dir: &Path) -> String {
         Some(bytes) => text::with_size(label, bytes),
         None => label.to_string(),
     }
+}
+
+/// A run or map without its report that holds finished results: „SLAM 001 · unvollständig –
+/// neu rechnen“ in the colour of a warning, what happened and what to do on hover.
+fn incomplete_entry(ui: &mut Ui, selected: bool, label: &str, why: &str, dir: &Path) -> Response {
+    let name = text::incomplete_folder(label);
+    let hover = format!("{name}\n{why}\n{}", dir.display());
+    let warn = ui.visuals().warn_fg_color;
+    entry(ui, selected, RichText::new(name).color(warn), &hover)
 }
 
 /// A selectable name, cut with „…“ where the panel ends, the full text on hover.

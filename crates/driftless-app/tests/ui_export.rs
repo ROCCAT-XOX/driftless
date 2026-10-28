@@ -97,8 +97,10 @@ fn tree_state() -> AppState {
                         settings: None,
                         hints: Vec::new(),
                     }],
+                    incomplete: false,
                 }],
                 history: Vec::new(),
+                incomplete: false,
             }],
         }],
         models: vec![ModelInfo {

@@ -161,6 +161,10 @@ fn map_list(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
         let status = surface_status(state, map);
         let why = match status {
             SurfaceStatus::MapStale => Some(text::STATUS_MAP_STALE_HINT.to_string()),
+            // kept for its surfaces; „Daten“ computes a new map
+            SurfaceStatus::MapNotReady if map.incomplete => {
+                Some(text::MAP_INCOMPLETE_HINT.to_string())
+            }
             SurfaceStatus::MapNotReady => Some(text::SURFACE_NEEDS_MAP.to_string()),
             SurfaceStatus::ScanMissing => state.map(&map.dir).and_then(|(scan, _, _)| match &scan
                 .state

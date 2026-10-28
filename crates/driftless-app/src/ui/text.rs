@@ -968,6 +968,28 @@ pub fn incomplete_more(count: usize) -> String {
     format!("und {count} weitere")
 }
 
+/// Beside a run or map in the tree whose report is missing but which holds finished results
+/// (maps, surfaces, the history): it stays, and is computed again.
+pub const INCOMPLETE_RECOMPUTE: &str = "unvollständig – neu rechnen";
+
+/// „SLAM 001 · unvollständig – neu rechnen“.
+pub fn incomplete_folder(label: &str) -> String {
+    format!("{label} · {INCOMPLETE_RECOMPUTE}")
+}
+
+/// On hover over such a run.
+pub const RUN_INCOMPLETE_HINT: &str = "Der Bericht slam.json fehlt: das Neu-Rechnen dieses \
+     Laufs wurde unterbrochen (Absturz, Stromausfall). Was darin fertig ist – Karten, \
+     Oberflächen, der Verlauf –, bleibt und wird nicht aufgeräumt. Vollständig wird der Lauf \
+     wieder mit „Neu rechnen (aus Teilkarten)“ unter „Erweitert“ oder mit „Diesen Stand \
+     wiederherstellen“ im Verlauf.";
+
+/// On hover over such a map.
+pub const MAP_INCOMPLETE_HINT: &str = "Der Bericht map.json fehlt: die Karte wurde nicht \
+     fertig gerechnet (Absturz, Stromausfall, ein älteres Programm). Ihre fertigen Oberflächen \
+     bleiben und werden nicht aufgeräumt. „Rechnen“ macht eine neue, vollständige Karte; diese \
+     lässt sich mit „Löschen …“ entfernen, sobald ihre Oberflächen nicht mehr gebraucht werden.";
+
 /// After „Aufräumen“.
 pub fn cleaned_up(count: usize, bytes: u64) -> String {
     format!(

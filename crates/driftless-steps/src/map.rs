@@ -1301,16 +1301,23 @@ pub fn current_map(req: &MapRequest) -> Option<Value> {
 /// steps finished before it keep their files, `map.json` is not written.
 pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError> {
     req.input.map.check()?;
-    if let Some(report) = current_map(req) {
-        remove_stale_tmp(&req.out_dir, owns, progress);
-        progress.info(format!(
-            "Karte ist aktuell: gleiche Eingaben und Einstellungen wie in {}, nichts neu \
-             gerechnet",
-            req.out_dir.join(REPORT).display()
-        ));
+    if let Some(report) = take_current_map(req, progress) {
         return Ok(report);
     }
     recompute_map(req, progress)
+}
+
+/// The `map.json` in [`MapRequest::out_dir`] if the map of `req` is current there
+/// ([`current_map`]): then the step says so and removes what a killed run of it left
+/// (`.tmp`), and writes no file of the map. `None` if it would have to be computed.
+pub fn take_current_map(req: &MapRequest, progress: &Progress) -> Option<Value> {
+    let report = current_map(req)?;
+    remove_stale_tmp(&req.out_dir, owns, progress);
+    progress.info(format!(
+        "Karte ist aktuell: gleiche Eingaben und Einstellungen wie in {}, nichts neu gerechnet",
+        req.out_dir.join(REPORT).display()
+    ));
+    Some(report)
 }
 
 /// [`run_map`] without the check whether the map is current: every requested step runs

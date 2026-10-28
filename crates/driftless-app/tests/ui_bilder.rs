@@ -68,6 +68,7 @@ fn map(dir: &str, surfaces: Vec<SurfaceInfo>) -> MapInfo {
         settings: Some(MapSwitches::default()),
         clouds: Vec::new(),
         surfaces,
+        incomplete: false,
     }
 }
 
@@ -83,6 +84,7 @@ fn run(dir: &str, maps: Vec<MapInfo>) -> RunInfo {
         cloud: None,
         maps,
         history: Vec::new(),
+        incomplete: false,
     }
 }
 

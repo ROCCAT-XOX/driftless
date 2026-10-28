@@ -706,6 +706,11 @@ impl DriftlessApp {
         if self.state.correct.run.as_ref() != Some(&loaded.run) {
             return;
         }
+        // a run without its report: the tree says so („unvollständig – neu rechnen“)
+        let incomplete = self
+            .state
+            .run(&loaded.run)
+            .is_some_and(|(_, r)| r.incomplete);
         self.state.correct.corrections = Some(loaded.corrections);
         let c = &mut self.state.correct;
         (c.auto_loops, c.submap_starts) = match &loaded.overlay {
@@ -723,7 +728,9 @@ impl DriftlessApp {
             }
             Err(e) => {
                 self.overlay = None;
-                self.error(e);
+                if !incomplete {
+                    self.error(e);
+                }
             }
         }
         self.overlay_version += 1;
@@ -1821,6 +1828,11 @@ impl DriftlessApp {
                 self.helper.start(text::CLEAN_UP_JOB, move |_| {
                     let (mut moved, mut failed) = (Vec::new(), Vec::new());
                     for (path, bytes) in leftovers {
+                        // a job that started in it, or finished results that came meanwhile,
+                        // keep a folder where it is
+                        if !crate::leftovers::may_clean_up(&path) {
+                            continue;
+                        }
                         match trash(&path) {
                             Ok(()) => moved.push(bytes),
                             Err(e) => failed.push(e),

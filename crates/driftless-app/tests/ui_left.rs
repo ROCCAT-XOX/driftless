@@ -20,6 +20,7 @@ fn run(dir: &str, label: &str, maps: Vec<MapInfo>) -> RunInfo {
         cloud: None,
         maps,
         history: Vec::new(),
+        incomplete: false,
     }
 }
 
@@ -40,6 +41,7 @@ fn unselected() -> AppState {
         settings: None,
         clouds: vec![PathBuf::from("/p/scans/buero/slam-001/karte-001/color.las")],
         surfaces: Vec::new(),
+        incomplete: false,
     };
     let project = Project {
         dir: PathBuf::from("/p"),

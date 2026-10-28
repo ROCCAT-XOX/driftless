@@ -53,11 +53,17 @@
 //!
 //! Folders for results are only created by the jobs ([`run_slam_job`], [`run_map_job`]), never
 //! on the UI thread, and a job removes a folder it created when it is cancelled or fails. A
-//! full SLAM run always gets a new `slam-NNN` (so no earlier `traj.tum` is replaced), and a map
-//! is written only into a `karte-NNN` whose `map.json` fits the request, or into a new one. A
+//! full SLAM run always gets a new `slam-NNN` (so no earlier `traj.tum` is replaced); a reuse
+//! recomputes a run in its folder and, if it fails, leaves it as it was
+//! ([`driftless_steps::slam`]). A map is never computed into an existing `karte-NNN`: one whose
+//! map is current is taken as it is, any other map goes into a new one ([`map_dir_for`]). A
 //! surface is only computed if no `oberflaeche-NNN` of the map fits the request, and then into a
 //! new one ([`run_surface_job`]); a folder without `oberflaeche.json` is no surface, even with
-//! its glb (the report is written last). Every merge gets a new `modell-NNN`
+//! its glb (the report is written last). A job that writes into an existing folder (a reuse)
+//! marks it busy as a job's new folder is ([`StepDir`], [`mark_busy`]). A run or map folder
+//! without its report that holds finished results (maps, surfaces, the history of a run) is
+//! no leftover: it stays in the tree as „unvollständig“ ([`crate::leftovers::holds_results`]).
+//! Every merge gets a new `modell-NNN`
 //! ([`run_merge_job`]); a folder without `modell.json` is no model (the report is written
 //! last). `project.toml`
 //! does not list the models: [`Project::models`] reads the folder. Point pairs marked by hand
@@ -75,8 +81,9 @@ use driftless_slam::align::AlignConfig;
 use driftless_steps::correct::utc_now;
 use driftless_steps::history::{self, HistoryEntry};
 use driftless_steps::map::{
-    clean_stage_id, fitting_stages, folder_fits, hex, map_input_for, run_map, MapInput, MapRequest,
-    MapSettings, MapStep, MapSwitches, CLEAN_BIN, DENSE_BIN, REPORT,
+    clean_stage_id, current_map, fitting_stages, folder_fits, hex, map_input_for, recompute_map,
+    take_current_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches, CLEAN_BIN,
+    DENSE_BIN, REPORT,
 };
 use driftless_steps::merge::{
     read_model, run_merge, version_fits, MergeMember, MergeRequest, ModelReport,
@@ -113,7 +120,7 @@ const FORMAT: i64 = 1;
 pub(crate) const RUN_PREFIX: &str = "slam-";
 pub(crate) const MAP_PREFIX: &str = "karte-";
 /// Surfaces of a map: `oberflaeche-NNN` made here, other `oberflaeche…` folders by the CLI.
-const SURFACE_PREFIX: &str = "oberflaeche";
+pub(crate) const SURFACE_PREFIX: &str = "oberflaeche";
 pub(crate) const SURFACE_NUMBERED: &str = "oberflaeche-";
 /// The clouds of a map folder that can be shown, best first.
 const MAP_CLOUDS: [&str; 4] = ["color.las", "clean.las", "dense.las", "removed.las"];
@@ -182,6 +189,10 @@ pub struct RunInfo {
     pub settings: SlamSettings,
     /// `slam.json` and `traj.tum` exist.
     pub has_result: bool,
+    /// Its report `slam.json` is missing (a recompute was cut off, or an older program's):
+    /// the tree keeps such a run only while it holds finished results, as „unvollständig – neu
+    /// rechnen“ ([`crate::leftovers::holds_results`]).
+    pub incomplete: bool,
     /// `submaps.bin` exists: the run can be recomputed.
     pub has_cache: bool,
     /// `traj.vorher.tum` exists.
@@ -206,6 +217,10 @@ pub struct MapInfo {
     /// The surfaces of the map: its subfolders `oberflaeche…` with an `oberflaeche.json` (the
     /// step writes it last; one without it is cut off, see [`crate::leftovers`]).
     pub surfaces: Vec<SurfaceInfo>,
+    /// Its report `map.json` is missing (computed in its folder by an older program or the
+    /// command line, and cut off): the tree keeps such a map only while it holds finished
+    /// surfaces, as „unvollständig – neu rechnen“ ([`crate::leftovers::holds_results`]).
+    pub incomplete: bool,
 }
 
 /// A surface folder of a map.
@@ -412,7 +427,7 @@ pub struct MapStatus {
 /// A folder a job writes into. One the job created ([`StepDir::is_new`]) is removed again
 /// when the guard is dropped without [`StepDir::keep`], i.e. when the job is cancelled or
 /// fails; while the job runs it is marked busy ([`crate::leftovers::BUSY_FILE`]), so that no
-/// window offers it for „Aufräumen“.
+/// window offers it for „Aufräumen“ or „Löschen …“.
 #[must_use]
 #[derive(Debug)]
 pub struct StepDir {
@@ -431,6 +446,16 @@ impl StepDir {
         }
     }
 
+    /// The existing folder `path`, which a job takes as it is (a current map: nothing is
+    /// written); never removed.
+    fn existing(path: PathBuf) -> StepDir {
+        StepDir {
+            path,
+            new: false,
+            beat: None,
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -442,9 +467,8 @@ impl StepDir {
 
     /// Keeps the folder; returns its path.
     pub fn keep(mut self) -> PathBuf {
-        if self.beat.take().is_some() {
-            let _ = fs::remove_file(self.path.join(crate::leftovers::BUSY_FILE));
-        }
+        // the mark goes with it
+        self.beat = None;
         self.new = false;
         std::mem::take(&mut self.path)
     }
@@ -459,11 +483,29 @@ impl Drop for StepDir {
     }
 }
 
+/// The mark of a folder a job writes into in place (a reuse of a run, „Diesen Stand
+/// wiederherstellen“): [`crate::leftovers::BUSY_FILE`] while the guard lives, so that another
+/// window neither offers the folder for „Aufräumen“ nor lets it be deleted.
+#[must_use]
+#[derive(Debug)]
+pub struct BusyMark {
+    _beat: Option<Beat>,
+}
+
+/// Marks the existing folder `dir` busy until the guard is dropped (nothing if the mark
+/// cannot be written: the job runs all the same).
+pub fn mark_busy(dir: &Path) -> BusyMark {
+    BusyMark {
+        _beat: Beat::start(dir),
+    }
+}
+
 /// The mark of a busy folder ([`crate::leftovers::BUSY_FILE`], naming the process): written at
 /// once, then touched every [`crate::leftovers::BUSY_BEAT`] by a thread of its own until this
-/// is dropped.
+/// is dropped; then it is removed.
 #[derive(Debug)]
 struct Beat {
+    file: PathBuf,
     stop: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -475,16 +517,21 @@ impl Beat {
         let file = dir.join(BUSY_FILE);
         fs::write(&file, driftless_io::lock::holder_text()).ok()?;
         let (stop, wait) = channel::<()>();
+        let touch = file.clone();
         let thread = std::thread::Builder::new()
             .name("in-arbeit".into())
             .spawn(move || {
                 while let Err(RecvTimeoutError::Timeout) = wait.recv_timeout(BUSY_BEAT) {
-                    let touched = fs::File::options().write(true).open(&file);
+                    let touched = fs::File::options().write(true).open(&touch);
                     let _ = touched.and_then(|f| f.set_modified(std::time::SystemTime::now()));
                 }
-            })
-            .ok()?;
+            });
+        let Ok(thread) = thread else {
+            let _ = fs::remove_file(&file);
+            return None;
+        };
         Some(Beat {
+            file,
             stop: Some(stop),
             thread: Some(thread),
         })
@@ -498,6 +545,7 @@ impl Drop for Beat {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        let _ = fs::remove_file(&self.file);
     }
 }
 
@@ -840,6 +888,7 @@ fn map_info(dir: &Path, label: String) -> MapInfo {
             .filter(|p| p.is_file())
             .collect(),
         surfaces: surfaces_of(dir),
+        incomplete: !dir.join(REPORT).is_file(),
     }
 }
 
@@ -863,6 +912,7 @@ fn run_info(dir: &Path, label: String) -> RunInfo {
         label,
         settings,
         has_result: file("slam.json") && file("traj.tum"),
+        incomplete: !file("slam.json"),
         has_cache: file(CACHE_FILE),
         has_previous: file("traj.vorher.tum"),
         has_odometry: file("traj_odom.tum"),
@@ -1374,26 +1424,46 @@ fn link_or_copy(from: &Path, to: &Path) -> io::Result<()> {
     fs::hard_link(from, to).or_else(|_| fs::copy(from, to).map(|_| ()))
 }
 
-/// The map folder for `input` in the run: the youngest `karte-NNN` that fits it
-/// ([`folder_fits`]), else a new `karte-NNN` after the last. Into a new folder the stages
-/// the step would take over (`dense.bin` for clean, `clean.bin` or else `dense.bin` for
-/// color) are linked from the youngest map folder (or else the run folder) that has one
-/// that fits.
-/// The map in the run folder itself is never written into. For a job: reads `traj.tum`,
-/// may copy large files.
+/// The map folder for `input` in the run: an existing `karte-NNN` only if its map of `input`
+/// is current already ([`current_map`]: computing it would write nothing), else a new
+/// `karte-NNN` after the last ([`new_map_dir`]). A map is never computed anew in its own
+/// folder: one that stopped half-way (cancelled, a full disk) would have lost its report, and
+/// with it the surfaces in it ([`crate::leftovers`]); the old map stays as it is. The map in
+/// the run folder itself is never written into. For a job: reads `traj.tum`, may copy large
+/// files.
 pub fn map_dir_for(
     run: &RunInfo,
     input: &MapInput,
     progress: &Progress,
 ) -> Result<StepDir, StepError> {
-    let maps = numbered(&run.dir, MAP_PREFIX);
-    if let Some((_, _, dir)) = maps.iter().rev().find(|(_, _, d)| folder_fits(input, d)) {
-        return Ok(StepDir {
-            path: dir.clone(),
-            new: false,
-            beat: None,
-        });
+    if let Some(dir) = current_map_dir(run, input) {
+        return Ok(StepDir::existing(dir));
     }
+    new_map_dir(run, input, progress)
+}
+
+/// The youngest `karte-NNN` of `run` whose whole map of `input` is current ([`current_map`];
+/// never for a single step, which always writes).
+fn current_map_dir(run: &RunInfo, input: &MapInput) -> Option<PathBuf> {
+    numbered(&run.dir, MAP_PREFIX)
+        .into_iter()
+        .rev()
+        .map(|(_, _, dir)| dir)
+        .find(|dir| {
+            let req = MapRequest {
+                input: input.clone(),
+                out_dir: dir.clone(),
+                all_files: false,
+            };
+            current_map(&req).is_some()
+        })
+}
+
+/// A new `karte-NNN` after the last of `run`, into which the stages the step of `input` would
+/// take over (`dense.bin` for clean, `clean.bin` or else `dense.bin` for color) are linked
+/// from the youngest map folder (or else the run folder) that has one that fits.
+fn new_map_dir(run: &RunInfo, input: &MapInput, progress: &Progress) -> Result<StepDir, StepError> {
+    let maps = numbered(&run.dir, MAP_PREFIX);
     let target = create_numbered(&run.dir, MAP_PREFIX)?;
     let wanted: &[&str] = match input.map.step {
         MapStep::Dense | MapStep::All => &[],
@@ -1507,21 +1577,29 @@ pub fn run_slam_job(
             })
         }
         SlamJob::Reuse(run) => {
-            let req = SlamRequest {
-                scan,
-                out: run.dir.clone(),
-                settings: run.settings.clone(),
-                reuse: true,
-                history: true,
-            };
-            reuse_refusal(&req)?;
-            let outcome = run_slam(&req, progress)?;
-            Ok(SlamDone {
-                run_dir: run.dir.clone(),
-                outcome,
-            })
+            // in place: another window must not offer or delete the folder meanwhile
+            let _busy = mark_busy(&run.dir);
+            reuse(scan, run, progress)
         }
     }
+}
+
+/// Recomputes `run` of the scan folder `scan` from its `submaps.bin`, in its folder, with
+/// history; a failure or a cancel leaves it as it was ([`run_slam`]).
+fn reuse(scan: PathBuf, run: &RunInfo, progress: &Progress) -> Result<SlamDone, StepError> {
+    let req = SlamRequest {
+        scan,
+        out: run.dir.clone(),
+        settings: run.settings.clone(),
+        reuse: true,
+        history: true,
+    };
+    reuse_refusal(&req)?;
+    let outcome = run_slam(&req, progress)?;
+    Ok(SlamDone {
+        run_dir: run.dir.clone(),
+        outcome,
+    })
 }
 
 /// Why a reuse of a run cannot be computed here: an added CLI run has no `lauf.toml`, its
@@ -1587,12 +1665,14 @@ pub fn restore_job(
         .path
         .clone();
     reuse_refusal(&SlamRequest {
-        scan,
+        scan: scan.clone(),
         out: run.dir.clone(),
         settings: run.settings.clone(),
         reuse: true,
         history: true,
     })?;
+    // in place: another window must not offer or delete the folder meanwhile
+    let _busy = mark_busy(&run.dir);
     let path = run.dir.join(CORRECTIONS_FILE);
     let before = match fs::read(&path) {
         Ok(bytes) => Some(bytes),
@@ -1600,7 +1680,7 @@ pub fn restore_job(
         Err(e) => return Err(text::io_error("Korrekturen nicht lesbar", &path, &e).into()),
     };
     history::restore_flags(&run.dir, nr)?;
-    let done = run_slam_job(project, scan_id, &SlamJob::Reuse(run.clone()), progress);
+    let done = reuse(scan, run, progress);
     if done.is_err() {
         let _lock = lock(&path)?;
         let back = match &before {
@@ -1620,9 +1700,10 @@ pub fn restore_job(
     done
 }
 
-/// Makes a map of `run` from the scan folder `scan` into the folder [`map_dir_for`] picks; a
-/// new folder is removed again if the map is cancelled or fails. Refused like a reuse for a
-/// run without `lauf.toml` whose cache needs other than the default settings.
+/// Makes a map of `run` from the scan folder `scan` into the folder [`map_dir_for`] picks: a
+/// map that is current already is taken as it is (nothing written), any other is computed
+/// into a new folder, which is removed again if the map is cancelled or fails. Refused like a
+/// reuse for a run without `lauf.toml` whose cache needs other than the default settings.
 pub fn run_map_job(
     run: &RunInfo,
     scan: &Path,
@@ -1637,14 +1718,24 @@ pub fn run_map_job(
         slam: run.settings.clone(),
         map: settings.clone(),
     };
-    let dir = map_dir_for(run, &input, progress)?;
-    let req = MapRequest {
-        input,
-        out_dir: dir.path().to_path_buf(),
+    let request = |dir: &Path| MapRequest {
+        input: input.clone(),
+        out_dir: dir.to_path_buf(),
         // one cloud to look at; the rest comes from „Exportieren …“
         all_files: false,
     };
-    let report = run_map(&req, progress)?;
+    let mut dir = map_dir_for(run, &input, progress)?;
+    if !dir.is_new() {
+        if let Some(report) = take_current_map(&request(dir.path()), progress) {
+            return Ok(MapDone {
+                dir: dir.keep(),
+                report,
+            });
+        }
+        // changed since it was picked (another window or program): never in place
+        dir = new_map_dir(run, &input, progress)?;
+    }
+    let report = recompute_map(&request(dir.path()), progress)?;
     Ok(MapDone {
         dir: dir.keep(),
         report,

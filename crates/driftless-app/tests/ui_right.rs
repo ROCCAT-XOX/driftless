@@ -31,6 +31,7 @@ fn run(has_cache: bool, maps: Vec<MapInfo>) -> RunInfo {
         cloud: None,
         maps,
         history: Vec::new(),
+        incomplete: false,
     }
 }
 
@@ -41,6 +42,7 @@ fn map(switches: Option<MapSwitches>) -> MapInfo {
         settings: switches,
         clouds: Vec::new(),
         surfaces: Vec::new(),
+        incomplete: false,
     }
 }
 

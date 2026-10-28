@@ -167,6 +167,100 @@ fn finds_what_a_cut_off_job_left() {
     assert_eq!(leftovers::find(&project, &ids).len(), 6);
 }
 
+/// What a recompute cut off in a run's or a map's own folder leaves (by a crash, or by an
+/// older program): the run without its report, but with its history and its finished map; a
+/// second map without its report, but with a finished surface – and in it a surface cut off; a
+/// third map with nothing finished in it.
+fn cut_off_in_place(run: &Path) {
+    fs::remove_file(run.join("slam.json")).unwrap();
+    fs::create_dir_all(run.join("verlauf/001")).unwrap();
+    let k2 = run.join("karte-002");
+    file(&k2, "clean.bin", 50);
+    file(&k2.join("oberflaeche-001"), "oberflaeche.glb", 10);
+    file(&k2.join("oberflaeche-001"), "oberflaeche.json", 10);
+    fs::create_dir_all(k2.join("oberflaeche-002")).unwrap();
+    file(&run.join("karte-003"), "dense.bin.tmp", 20);
+}
+
+/// A run or map folder without its report that still holds finished results – maps or
+/// surfaces with their reports, the history of a run – is no leftover: only what in it is
+/// incomplete is offered (I1 of the final review).
+#[test]
+fn finished_results_are_never_leftovers() {
+    let dir = tmp("reste-fertiges");
+    let (project, run) = project(&dir);
+    cut_off_in_place(&run);
+    let ids = ["halle".to_string()];
+    assert_eq!(
+        labels(&leftovers::find(&project, &ids)),
+        [
+            (LeftoverKind::Map, "Karte 003 (SLAM 001)".into(), 20),
+            (
+                LeftoverKind::Surface,
+                "Oberfläche 002 (Karte 002)".into(),
+                0
+            ),
+        ]
+    );
+    // each kind of finished result keeps the run on its own
+    for (keep, path) in [
+        ("history", "verlauf"),
+        ("map", "karte-001/map.json"),
+        ("surface", "karte-002/oberflaeche-001/oberflaeche.json"),
+    ] {
+        let only = tmp(&format!("reste-fertiges-{keep}"));
+        let (project, run) = project_with(&only, &run, path);
+        assert!(
+            leftovers::holds_results(&run),
+            "{keep}: {:?}",
+            leftovers::find(&project, &ids)
+        );
+        assert!(
+            !leftovers::find(&project, &ids)
+                .iter()
+                .any(|l| l.kind == LeftoverKind::Run),
+            "{keep}"
+        );
+    }
+    // the tree keeps them, marked incomplete; the map with nothing finished is not in it
+    let p = Project::open(&project).unwrap();
+    let tree = driftless_app::ui::read_tree(&p);
+    let node = &tree.scans[0].runs[0];
+    assert!(node.incomplete && !node.has_result);
+    let maps: Vec<(&Path, bool)> = node
+        .maps
+        .iter()
+        .map(|m| (m.dir.as_path(), m.incomplete))
+        .collect();
+    assert_eq!(
+        maps,
+        [
+            (run.join("karte-001").as_path(), false),
+            (run.join("karte-002").as_path(), true)
+        ]
+    );
+    assert_eq!(node.maps[1].surfaces.len(), 1);
+}
+
+/// A copy of the run `run` of [`project`] in a new project in `dir`, of which only `keep` (a
+/// path inside the run) is finished: the report of the run is gone, and so is every other
+/// finished result.
+fn project_with(dir: &Path, run: &Path, keep: &str) -> (PathBuf, PathBuf) {
+    let (project, copy) = project(dir);
+    fs::remove_file(copy.join("slam.json")).unwrap();
+    fs::remove_file(copy.join("karte-001/map.json")).unwrap();
+    fs::remove_file(copy.join("karte-001/oberflaeche-001/oberflaeche.json")).unwrap();
+    let source = run.join(keep);
+    let target = copy.join(keep);
+    if source.is_dir() {
+        fs::create_dir_all(&target).unwrap();
+    } else {
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(&source, &target).unwrap();
+    }
+    (project, copy)
+}
+
 /// A folder a running job marks as busy ([`BUSY_FILE`], touched while it runs) is left alone
 /// with what lies in it; a mark that is no longer touched (the job was cut off) is not.
 #[test]
@@ -319,6 +413,87 @@ fn leftovers_are_listed_and_cleaned_up() {
         matches!(&last, Some(UiMessage::Info(t)) if t.contains("Papierkorb")),
         "{last:?}"
     );
+}
+
+/// A run and a map kept for their finished results stay in the tree as „unvollständig – neu
+/// rechnen“, why and what to do on hover; „Aufräumen“ moves only what in them is incomplete.
+#[test]
+fn incomplete_folders_stay_in_the_tree() {
+    let dir = tmp("reste-unvollstaendig");
+    let (project, run) = project(&dir);
+    cut_off_in_place(&run);
+    let mut h = window(&project);
+    h.ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.0);
+    run_action(&mut h, Action::Select(Selection::Scan("halle".into())));
+    // „SLAM 001 · 1,2 KB · unvollständig – neu rechnen“ (the size once measured)
+    let marked = |name: &'static str| {
+        move |n: &egui_kittest::kittest::AccessKitNode<'_>| {
+            n.label()
+                .is_some_and(|l| l.starts_with(name) && l.ends_with(&text::incomplete_folder("")))
+        }
+    };
+    let count = h
+        .query_all_by_label_contains(text::INCOMPLETE_RECOMPUTE)
+        .count();
+    assert_eq!(count, 2, "the run and the second map");
+    h.get_by(marked("SLAM 001")).hover();
+    h.run();
+    h.get_by_label_contains(text::RUN_INCOMPLETE_HINT);
+    h.get_by(marked("Karte 002")).hover();
+    h.run();
+    h.get_by_label_contains(text::MAP_INCOMPLETE_HINT);
+    // the complete map is not marked
+    assert!(h.query_by(marked("Karte 001")).is_none());
+
+    h.get_by_label(text::CLEAN_UP).click();
+    settle(&mut h);
+    assert_eq!(trashed(&dir), ["karte-003", "oberflaeche-002"]);
+    for kept in [
+        "verlauf/001",
+        "karte-001/map.json",
+        "karte-002/oberflaeche-001/oberflaeche.json",
+    ] {
+        assert!(run.join(kept).exists(), "{kept}");
+    }
+    assert_eq!(
+        h.query_all_by_label_contains(text::INCOMPLETE_RECOMPUTE)
+            .count(),
+        2
+    );
+}
+
+/// „Aufräumen“ looks again when it moves a folder: one that holds finished results by then,
+/// that has its report by now, or that a job (another window) marked busy since the list was
+/// made, stays.
+#[test]
+fn clean_up_looks_again_before_it_moves() {
+    let dir = tmp("reste-nochmal");
+    let (project, run) = project(&dir);
+    crash(&project, &run);
+    let mut h = window(&project);
+    // meanwhile a surface of the cut-off map is finished, the surface cut off after its glb
+    // gets its report (a step of the command line finished it), and another window starts a
+    // job in the cut-off run
+    let k2 = run.join("karte-002");
+    file(&k2.join("oberflaeche-001"), "oberflaeche.json", 10);
+    file(
+        &run.join("karte-001/oberflaeche-003"),
+        "oberflaeche.json",
+        10,
+    );
+    file(&project.join("scans/halle/slam-002"), BUSY_FILE, 10);
+    h.get_by_label(text::CLEAN_UP).click();
+    settle(&mut h);
+    let moved = trashed(&dir);
+    for kept in ["karte-002", "oberflaeche-003", "slam-002"] {
+        assert!(!moved.contains(&kept.to_string()), "{kept}: {moved:?}");
+    }
+    assert!(moved.contains(&"modell-001".to_string()), "{moved:?}");
+    assert!(moved.contains(&"oberflaeche-002".to_string()), "{moved:?}");
+    assert!(k2.join("oberflaeche-001/oberflaeche.json").is_file());
+    assert!(run
+        .join("karte-001/oberflaeche-003/oberflaeche.glb")
+        .is_file());
 }
 
 /// While a step runs in the window, „Aufräumen“ waits (the reason on hover).

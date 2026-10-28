@@ -4,15 +4,20 @@
 //! manual loops of `corrections.toml` in the output folder are always applied.
 //!
 //! A reuse skips the odometry: it loads `submaps.bin`, solves the pose graph again and keeps
-//! the previous `traj.tum` as `traj.vorher.tum`.
+//! the previous `traj.tum` as `traj.vorher.tum`. It replaces a finished run, so it writes its
+//! new files beside the old ones first (`<name>.tmp`) and puts them in place together only
+//! once all are written: the old ones aside (`<name>.alt.tmp`), the new ones in, `slam.json`
+//! last. A failure on the way – a full disk, a file in the way, the history state that cannot
+//! be recorded – puts every file back as it was, so the run keeps its result.
 //!
 //! A full run into a folder that holds the run of another scan is refused: its frames (from
 //! `slam.json`) lie outside the times of this scan's LiDAR bags ([`run_fits_scan`]). Its
 //! corrections would be applied to this scan and its results replaced.
 //!
-//! A run removes the `.tmp` files a killed run of its files left ([`RUN_FILES`]) at its
-//! start, and `slam.json` before it writes its first file; `slam.json` comes last again, so
-//! a folder with a `slam.json` holds the files of one finished run.
+//! A run removes the `.tmp` files a killed run of its files left ([`RUN_FILES`], also those a
+//! killed reuse staged or put aside) at its start; a full run removes `slam.json` before it
+//! writes its first file. `slam.json` comes last again, so a folder with a `slam.json` holds
+//! the files of one finished run.
 
 use crate::error::{check_cancel, failed, StepError};
 use crate::history::{self, HistoryKind};
@@ -34,6 +39,7 @@ use driftless_traj::write_tum;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -49,6 +55,22 @@ pub const RUN_FILES: [&str; 5] = [
     "map.las",
     SLAM_REPORT,
 ];
+/// The trajectory before the last reuse.
+pub const PREVIOUS_TRAJ: &str = "traj.vorher.tum";
+/// The files a reuse writes anew, in the order they are put in place: the report last.
+const REUSE_FILES: [&str; 4] = ["traj.tum", "traj_odom.tum", "map.las", SLAM_REPORT];
+
+/// Whether a stale `<name>.tmp` in a run folder is the run's own: a file of [`RUN_FILES`]
+/// being written (`traj.tum.tmp`), staged by a reuse (`traj.tum.tmp`, `map.las.tmp.tmp` while
+/// it is written) or put aside by it (`slam.json.alt.tmp`, `traj.vorher.tum.alt.tmp`).
+fn owns_tmp(name: &str) -> bool {
+    let file = name
+        .strip_suffix(".tmp")
+        .or_else(|| name.strip_suffix(".alt"))
+        .unwrap_or(name);
+    RUN_FILES.contains(&file) || file == PREVIOUS_TRAJ
+}
+
 /// How far (s) a run's frames may lie outside the bag times of its scan: frame stamps come
 /// from the sensor, bag times from the recorder.
 pub const RUN_TIME_TOLERANCE: f64 = 5.0;
@@ -206,10 +228,11 @@ pub fn cache_fits(req: &SlamRequest) -> bool {
 /// „Schleifen schließen“, „Schreiben“.
 ///
 /// A cancel is honoured while the frames are read and right after them, before
-/// `submaps.bin` is written (full run), and after the pose graph, before `traj.tum` is
-/// renamed to `traj.vorher.tum` (reuse). A cancelled run leaves the output folder as it was
-/// (a full run into a new folder leaves it empty). From the replaced `submaps.bin` or the
-/// rename on the run is not interruptible and finishes, also when cancelled meanwhile.
+/// `submaps.bin` is written (full run), and for a reuse until its new files are written,
+/// before they are put in place. A cancelled run leaves the output folder as it was (a full
+/// run into a new folder leaves it empty). From the replaced `submaps.bin` on a full run is
+/// not interruptible and finishes, also when cancelled meanwhile. A reuse that fails leaves
+/// the folder as it was as well (see the module documentation).
 ///
 /// A full run into a folder with the run of another scan is refused before anything is read
 /// (see the module documentation).
@@ -223,7 +246,7 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
             return Err(why.into());
         }
     }
-    remove_stale_tmp(out, |name| RUN_FILES.contains(&name), progress);
+    remove_stale_tmp(out, owns_tmp, progress);
     let input = input_id(&project.lidar_bags, &req.settings, &cfg)?;
     let cache = out.join(CACHE_FILE);
     let corrections = Corrections::load(&out.join(CORRECTIONS_FILE))?;
@@ -235,91 +258,99 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
     let solve_hint = |e: driftless_slam::ManualLoopError| StepError::BadCorrection(e.to_string());
     check_cancel(progress)?;
 
-    let result = if req.reuse {
+    if req.reuse {
         progress.phase("Zwischenspeicher laden", None);
         let (submaps, odom_anchors) = load_cache(&cache, &input).map_err(failed)?;
-        let traj = out.join("traj.tum");
         // A result the history does not hold (a run made without history, e.g. by the CLI, or
         // one recomputed by the CLI after the last state) is kept before it is replaced, with
         // the corrections it was computed with.
-        let import = (req.history && traj.exists() && !history::holds_current(out))
+        let import = (req.history && out.join("traj.tum").exists() && !history::holds_current(out))
             .then(|| corrections_of_run(out, &submaps, &corrections));
         progress.phase("Schleifen schließen", None);
         let result =
             solve_with(submaps, odom_anchors, &manual, &rejected, &cfg).map_err(solve_hint)?;
-        // The last check: renaming, writing and recording belong together.
         check_cancel(progress)?;
-        if let Some(then) = &import {
-            history::record_with(out, HistoryKind::Imported, 0.0, Some(then))?;
-        }
-        remove_report(&out.join(SLAM_REPORT))?;
-        let previous = out.join("traj.vorher.tum");
-        if traj.exists() {
-            fs::rename(&traj, &previous).map_err(|e| {
-                format!(
-                    "{} nicht in {} umbenennbar: {e}",
-                    traj.display(),
-                    previous.display()
-                )
-            })?;
-        }
         progress.info(format!(
             "Zwischenspeicher {CACHE_FILE}: {} Teilkarten, {} manuelle Schleifen",
             result.submaps.len(),
             manual.len()
         ));
-        result
-    } else {
-        fs::create_dir_all(out).map_err(failed)?;
-        let (imu, bad) = read_imu(
-            &project.lidar_bags,
-            req.settings.imu_topic.as_deref(),
-            progress,
-        )?;
-        let ((submaps, stats), read) = with_lidar_frames(
-            &project.lidar_bags,
-            req.settings.lidar_topic.as_deref(),
-            progress,
-            |frames| build_submaps(frames, &imu, &cfg),
-        )?;
-        // After a cancel the frames stopped early: the result is incomplete.
+        progress.phase("Schreiben", None);
+        // the new files beside the old ones; removed again unless they are put in place
+        let staged = Staged::write(out, &result)?;
+        // The last check: recording, putting in place and recording again belong together.
         check_cancel(progress)?;
-        require_frames(&stats)?;
-        let odom_anchors: Vec<_> = submaps.iter().map(|m| m.anchor).collect();
-        remove_report(&out.join(SLAM_REPORT))?;
-        save_cache(&cache, &submaps, &odom_anchors, &input)
-            .map_err(|e| format!("Zwischenspeicher {} nicht schreibbar: {e}", cache.display()))?;
-        progress.phase("Schleifen schließen", None);
-        let result =
-            solve_with(submaps, odom_anchors, &manual, &rejected, &cfg).map_err(solve_hint)?;
-        warn_if_not_static(&stats, progress);
-        progress.info(format!(
-            "{} Posen aus {} LiDAR-Frames ({} übersprungen), {} IMU-Messungen, \
-             {} nicht lesbare Nachrichten",
-            stats.frames_used,
-            stats.frames_in,
-            stats.frames_skipped,
-            imu.len(),
-            bad + read.bad
-        ));
-        result
-    };
+        if let Some(then) = &import {
+            history::record_with(out, HistoryKind::Imported, 0.0, Some(then))
+                .map_err(|e| unchanged(&e))?;
+        }
+        let swap = staged.put_in_place()?;
+        let seconds = start.elapsed().as_secs_f64();
+        // the corrections read at the start: a change written meanwhile was not applied; if
+        // the state cannot be recorded, `swap` puts every file back (and `staged` removes the
+        // new ones)
+        let history = if req.history {
+            Some(
+                history::record_with(out, HistoryKind::Reuse, seconds, Some(&corrections))
+                    .map_err(|e| unchanged(&e))?,
+            )
+        } else {
+            None
+        };
+        swap.keep();
+        print_summary(&result, &staged.report, staged.points, progress);
+        progress.info(format!("Laufzeit {seconds:.1} s → {}", out.display()));
+        return Ok(SlamOutcome {
+            report: staged.report.clone(),
+            map_points: staged.points,
+            seconds,
+            history,
+        });
+    }
+
+    fs::create_dir_all(out).map_err(failed)?;
+    let (imu, bad) = read_imu(
+        &project.lidar_bags,
+        req.settings.imu_topic.as_deref(),
+        progress,
+    )?;
+    let ((submaps, stats), read) = with_lidar_frames(
+        &project.lidar_bags,
+        req.settings.lidar_topic.as_deref(),
+        progress,
+        |frames| build_submaps(frames, &imu, &cfg),
+    )?;
+    // After a cancel the frames stopped early: the result is incomplete.
+    check_cancel(progress)?;
+    require_frames(&stats)?;
+    let odom_anchors: Vec<_> = submaps.iter().map(|m| m.anchor).collect();
+    remove_report(&out.join(SLAM_REPORT))?;
+    save_cache(&cache, &submaps, &odom_anchors, &input)
+        .map_err(|e| format!("Zwischenspeicher {} nicht schreibbar: {e}", cache.display()))?;
+    progress.phase("Schleifen schließen", None);
+    let result = solve_with(submaps, odom_anchors, &manual, &rejected, &cfg).map_err(solve_hint)?;
+    warn_if_not_static(&stats, progress);
+    progress.info(format!(
+        "{} Posen aus {} LiDAR-Frames ({} übersprungen), {} IMU-Messungen, \
+         {} nicht lesbare Nachrichten",
+        stats.frames_used,
+        stats.frames_in,
+        stats.frames_skipped,
+        imu.len(),
+        bad + read.bad
+    ));
 
     progress.phase("Schreiben", None);
-    let (report, map_points) = write_outputs(out, &result)?;
+    let report = SlamReport::new(&result);
+    let map_points = write_files(&result, &report, |name| out.join(name))?;
     print_summary(&result, &report, map_points, progress);
     let seconds = start.elapsed().as_secs_f64();
     progress.info(format!("Laufzeit {seconds:.1} s → {}", out.display()));
     let history = if req.history {
-        let kind = if req.reuse {
-            HistoryKind::Reuse
-        } else {
-            HistoryKind::Full
-        };
         // the corrections read at the start: a change written meanwhile was not applied
         Some(history::record_with(
             out,
-            kind,
+            HistoryKind::Full,
             seconds,
             Some(&corrections),
         )?)
@@ -332,6 +363,129 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
         seconds,
         history,
     })
+}
+
+/// A reuse that failed before its new files were all in place: every file is back as it was.
+fn unchanged(e: &StepError) -> StepError {
+    match e {
+        StepError::Cancelled => StepError::Cancelled,
+        e => StepError::Failed(format!("{e}; nichts geändert, der Lauf ist wie vorher")),
+    }
+}
+
+/// `<name>.tmp` in `out`: a new file of a reuse, written but not yet in place.
+fn staged_path(out: &Path, name: &str) -> PathBuf {
+    out.join(format!("{name}.tmp"))
+}
+
+/// `<name>.alt.tmp` in `out`: an old file a reuse put aside while it puts the new ones in.
+fn aside_path(out: &Path, name: &str) -> PathBuf {
+    out.join(format!("{name}.alt.tmp"))
+}
+
+/// The new files of a reuse ([`REUSE_FILES`]) written beside the run's own as `<name>.tmp`,
+/// each complete on the disk. Dropped, they are removed: those not put in place, or put back
+/// by [`Swap`].
+struct Staged<'a> {
+    out: &'a Path,
+    report: SlamReport,
+    points: usize,
+}
+
+impl<'a> Staged<'a> {
+    /// Writes them; on an error nothing of them stays, and the run is as it was.
+    fn write(out: &'a Path, result: &SlamResult) -> Result<Staged<'a>, StepError> {
+        let mut staged = Staged {
+            out,
+            report: SlamReport::new(result),
+            points: 0,
+        };
+        staged.points = write_files(result, &staged.report, |name| staged_path(out, name))
+            .map_err(|e| unchanged(&e))?;
+        Ok(staged)
+    }
+
+    /// Puts them in place of the old ones: the report out of the way first, the old files
+    /// aside (`<name>.alt.tmp`; the trajectory becomes [`PREVIOUS_TRAJ`], whose own old one
+    /// goes aside), then the new ones in, the report last. All or nothing: on an error what
+    /// was renamed goes back.
+    fn put_in_place(&self) -> Result<Swap, StepError> {
+        let out = self.out;
+        let file = |name: &str| out.join(name);
+        let mut swap = Swap {
+            done: Vec::new(),
+            kept: false,
+        };
+        for name in [SLAM_REPORT, "traj_odom.tum", "map.las"] {
+            if file(name).is_file() {
+                swap.rename(file(name), aside_path(out, name))?;
+            }
+        }
+        if file("traj.tum").is_file() {
+            if file(PREVIOUS_TRAJ).is_file() {
+                swap.rename(file(PREVIOUS_TRAJ), aside_path(out, PREVIOUS_TRAJ))?;
+            }
+            swap.rename(file("traj.tum"), file(PREVIOUS_TRAJ))?;
+        }
+        for name in REUSE_FILES {
+            swap.rename(staged_path(out, name), file(name))?;
+        }
+        Ok(swap)
+    }
+}
+
+impl Drop for Staged<'_> {
+    fn drop(&mut self) {
+        for name in REUSE_FILES {
+            let _ = fs::remove_file(staged_path(self.out, name));
+        }
+    }
+}
+
+/// The renames that put the new files of a reuse in place ([`Staged::put_in_place`]). Dropped
+/// without [`Swap::keep`] they are undone, newest first: every file is back as it was.
+struct Swap {
+    /// (from, to) of every rename done.
+    done: Vec<(PathBuf, PathBuf)>,
+    kept: bool,
+}
+
+impl Swap {
+    fn rename(&mut self, from: PathBuf, to: PathBuf) -> Result<(), StepError> {
+        fs::rename(&from, &to).map_err(|e: io::Error| {
+            unchanged(&StepError::Failed(format!(
+                "{} nicht in {} umbenennbar: {e}",
+                from.display(),
+                to.display()
+            )))
+        })?;
+        self.done.push((from, to));
+        Ok(())
+    }
+
+    /// Keeps the new files; the old ones put aside go.
+    fn keep(mut self) {
+        self.kept = true;
+        for (_, to) in &self.done {
+            let aside = to
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".alt.tmp"));
+            if aside {
+                let _ = fs::remove_file(to);
+            }
+        }
+    }
+}
+
+impl Drop for Swap {
+    fn drop(&mut self) {
+        if !self.kept {
+            for (from, to) in self.done.iter().rev() {
+                let _ = fs::rename(to, from);
+            }
+        }
+    }
 }
 
 /// The corrections of `current` with the switches of the run whose `slam.json` lies in
@@ -390,19 +544,22 @@ fn corrections_of_run(out: &Path, submaps: &[Submap], current: &Corrections) -> 
     then
 }
 
-/// Writes everything but the cache, each file through a `.tmp`, [`SLAM_REPORT`] last;
-/// returns the report and the number of map points.
-fn write_outputs(out: &Path, result: &SlamResult) -> Result<(SlamReport, usize), StepError> {
-    let write = || -> Result<(SlamReport, usize), Box<dyn std::error::Error>> {
-        let report = SlamReport::new(result);
-        write_tum(&out.join("traj.tum"), &result.poses())?;
-        write_tum(&out.join("traj_odom.tum"), &result.odom_poses())?;
+/// Writes every file of `result` but the cache, each through a `.tmp`, [`SLAM_REPORT`] last,
+/// to `path(name)`; returns the number of map points.
+fn write_files(
+    result: &SlamResult,
+    report: &SlamReport,
+    path: impl Fn(&str) -> PathBuf,
+) -> Result<usize, StepError> {
+    let write = || -> Result<usize, Box<dyn std::error::Error>> {
+        write_tum(&path("traj.tum"), &result.poses())?;
+        write_tum(&path("traj_odom.tum"), &result.odom_poses())?;
         let map = result.map_points();
-        write_las(&out.join("map.las"), &map)?;
-        let path = out.join(SLAM_REPORT);
-        atomic_write(&path, crate::report_text(&report)?.as_bytes())
-            .map_err(|e| format!("{} nicht schreibbar: {e}", path.display()))?;
-        Ok((report, map.len()))
+        write_las(&path("map.las"), &map)?;
+        let report_path = path(SLAM_REPORT);
+        atomic_write(&report_path, crate::report_text(report)?.as_bytes())
+            .map_err(|e| format!("{} nicht schreibbar: {e}", report_path.display()))?;
+        Ok(map.len())
     };
     Ok(write()?)
 }

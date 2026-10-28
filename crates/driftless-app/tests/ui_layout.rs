@@ -98,8 +98,10 @@ fn with_map() -> AppState {
             settings: None,
             clouds: Vec::new(),
             surfaces: Vec::new(),
+            incomplete: false,
         }],
         history: Vec::new(),
+        incomplete: false,
     });
     state
 }

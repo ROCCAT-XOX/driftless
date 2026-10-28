@@ -1,9 +1,9 @@
 //! `driftless slam <ordner> -o <out_dir> [--reuse | --ueberschreiben]`: odometry, submaps,
 //! loop closure. Writes `traj.tum`, `traj_odom.tum`, `map.las`, `slam.json` and `submaps.bin`;
 //! `--reuse` only recomputes from `submaps.bin` and keeps the previous `traj.tum` as
-//! `traj.vorher.tum`. A full run into a folder that holds a run is refused without
-//! `--ueberschreiben`, one into a folder with the run of another scan always. The run itself
-//! is [`driftless_steps::slam::run_slam`].
+//! `traj.vorher.tum`; if it fails (a full disk) or is stopped, the run stays as it was. A full
+//! run into a folder that holds a run is refused without `--ueberschreiben`, one into a folder
+//! with the run of another scan always. The run itself is [`driftless_steps::slam::run_slam`].
 
 use driftless_steps::scan::extrinsic_values;
 use driftless_steps::slam::{
@@ -21,7 +21,8 @@ pub struct Args {
     out: PathBuf,
     /// Nur neu rechnen: Teilkarten aus submaps.bin laden, Korrekturen anwenden, Ausgaben neu
     /// schreiben (Sekunden statt Minuten). Die bisherige traj.tum wird zu traj.vorher.tum;
-    /// eine ältere traj.vorher.tum wird dabei ersetzt.
+    /// eine ältere traj.vorher.tum wird dabei ersetzt. Schlägt das Schreiben fehl (Datenträger
+    /// voll) oder wird abgebrochen, bleibt der Lauf wie vorher.
     #[arg(long)]
     reuse: bool,
     /// Einen Lauf im Zielordner durch einen vollen Lauf ersetzen; ohne das wird ein

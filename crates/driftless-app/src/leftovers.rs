@@ -6,14 +6,21 @@
 //! folder itself ([`crate::project::StepDir`]); these are what remains when the program had no
 //! chance to. „Daten“ lists them as „unvollständig“, „Aufräumen“ moves them to the trash.
 //!
+//! A run or map folder without its report that still holds finished results – maps or
+//! surfaces with their reports, the history of a run ([`holds_results`]) – is no leftover: it
+//! stays in the tree, marked „unvollständig – neu rechnen“, and only what in it is incomplete is
+//! offered. „Aufräumen“ never takes finished results along with a folder, also when they came
+//! after the list was made ([`may_clean_up`]).
+//!
 //! What a job may still write is left alone: a folder a running job marks busy ([`BUSY_FILE`],
 //! touched every [`BUSY_BEAT`]; this window's, another window's), and what was written to within
 //! [`QUIET`] (a job of the command line, which does not mark its folders; see [`settled`]).
 
 use crate::disk::folder_size;
-use crate::project::SURFACE_NUMBERED;
 use crate::project::{numbered, MAP_PREFIX, MODELS_DIR, MODEL_PREFIX, RUN_PREFIX, SCANS_DIR};
+use crate::project::{SURFACE_NUMBERED, SURFACE_PREFIX};
 use crate::ui::text;
+use driftless_steps::history::HISTORY_DIR;
 use driftless_steps::map::REPORT as MAP_REPORT;
 use driftless_steps::merge::MODEL_REPORT;
 use driftless_steps::surface::SURFACE_REPORT;
@@ -76,7 +83,8 @@ pub fn find(dir: &Path, scan_ids: &[String]) -> Vec<Leftover> {
             if busy(&run) {
                 continue;
             }
-            if !run.join(SLAM_REPORT).is_file() {
+            // without its report, but with finished results in it: kept, see above
+            if !run.join(SLAM_REPORT).is_file() && !holds_results(&run) {
                 out.push(folder(LeftoverKind::Run, &run, run_label));
                 continue;
             }
@@ -86,7 +94,7 @@ pub fn find(dir: &Path, scan_ids: &[String]) -> Vec<Leftover> {
                 if busy(&map) {
                     continue;
                 }
-                if !map.join(MAP_REPORT).is_file() {
+                if !map.join(MAP_REPORT).is_file() && !holds_results(&map) {
                     let label = format!("{map_label} ({run_label})");
                     out.push(folder(LeftoverKind::Map, &map, label));
                     continue;
@@ -180,6 +188,46 @@ fn newest(dir: &Path) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
+/// Whether the run or map folder `dir` holds finished results: the history of a run
+/// (`verlauf/`), a map with its `map.json` (a `karte-NNN`, or one the command line wrote into
+/// the run folder), a surface (`oberflaeche…`) with its `oberflaeche.json`; also further down
+/// (a surface in a map folder without its report). Such a folder without its own report is no
+/// leftover. Reads folders: call it off the UI thread.
+pub fn holds_results(dir: &Path) -> bool {
+    if dir.join(HISTORY_DIR).is_dir() || dir.join(MAP_REPORT).is_file() {
+        return true;
+    }
+    let maps = numbered(dir, MAP_PREFIX);
+    if maps
+        .iter()
+        .any(|(_, _, map)| map.join(MAP_REPORT).is_file() || holds_results(map))
+    {
+        return true;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let surface = e
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(SURFACE_PREFIX));
+        surface && e.path().join(SURFACE_REPORT).is_file()
+    })
+}
+
+/// Whether „Aufräumen“ may move the leftover `path` to the trash now: a file always; a folder
+/// unless a job marks it or a folder in it busy ([`busy_below`]), it has its report by now (a
+/// step finished it), or it holds finished results ([`holds_results`]) – each may have come
+/// after the leftovers were listed.
+pub fn may_clean_up(path: &Path) -> bool {
+    let reports = [SLAM_REPORT, MAP_REPORT, SURFACE_REPORT, MODEL_REPORT];
+    !path.is_dir()
+        || (busy_below(path).is_none()
+            && !reports.iter().any(|r| path.join(r).is_file())
+            && !holds_results(path))
+}
+
 /// Whether a running job marks the folder `dir` busy: its [`BUSY_FILE`] was touched within
 /// [`BUSY_STALE`].
 fn busy(dir: &Path) -> bool {
@@ -189,4 +237,24 @@ fn busy(dir: &Path) -> bool {
             .duration_since(t)
             .map_or(true, |age| age < BUSY_STALE)
     })
+}
+
+/// Whether a running job – of this window, another window or program – marks the folder `dir`
+/// or a folder in it busy ([`BUSY_FILE`], touched within [`BUSY_STALE`]): who, as the mark
+/// names it („Prozess 1234 · Benutzer anna · Rechner Werkstatt-PC“), else „unbekannt“. Walks
+/// the folder: call it off the UI thread.
+pub fn busy_below(dir: &Path) -> Option<String> {
+    if busy(dir) {
+        let holder = fs::read_to_string(dir.join(BUSY_FILE)).unwrap_or_default();
+        let holder = holder.trim();
+        return Some(if holder.is_empty() {
+            "unbekannt".to_string()
+        } else {
+            holder.to_string()
+        });
+    }
+    let entries = fs::read_dir(dir).into_iter().flatten().flatten();
+    entries
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .find_map(|e| busy_below(&e.path()))
 }
