@@ -161,6 +161,15 @@ fn surface_end_to_end() {
         serde_json::from_str(&fs::read_to_string(dest.join(SURFACE_REPORT)).unwrap()).unwrap();
     assert_eq!(on_disk, report);
     assert_eq!(report["programm"], program());
+    // Hints for the app (German): one when many faces of the coarse grid were dropped.
+    let s = &report["stats"];
+    let dropped = s["faces_unsupported"].as_f64().unwrap();
+    let open = dropped / (dropped + s["faces_final"].as_f64().unwrap());
+    assert_eq!(
+        report["hinweise"].as_array().unwrap().is_empty(),
+        open < 0.15,
+        "{report}"
+    );
     assert!(surface_fits(&req));
 }
 

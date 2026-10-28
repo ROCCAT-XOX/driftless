@@ -13,6 +13,10 @@
 //! every file it lists (`bytes`), so a folder with a report holds a complete surface and one
 //! with a file of another run next to the report does not fit ([`surface_fits`]).
 //!
+//! The report names under `hinweise` short German hints for the user (the app can show
+//! them): when the setting `max_fill_gap` leaves the surface open in many places, why and
+//! what helps ([`OPEN_HINT_SHARE`]).
+//!
 //! The surface of a merged model ([`run_model_surface`]) is made the same way from the
 //! `clean.bin` of every scan in the model, moved by its `T_i`, with the LiDAR positions and
 //! the camera images of every such scan (one texture source each). Its input id is the
@@ -52,6 +56,13 @@ pub const SURFACE_REPORT: &str = "oberflaeche.json";
 const SURFACE_VERSION: u32 = 13;
 /// File stem of the glb and the obj.
 const STEM: &str = "oberflaeche";
+/// Share of the faces the coarse grid offered that were dropped for lack of a point within
+/// `max_fill_gap` (`faces_unsupported` of all faces) from which the report carries a hint:
+/// the surface stays open there. Measured at the default 2 cm on the real scans of the
+/// release (`oberflaeche.json`): black room S1–S3 7–11 %, its model 9 %, office B 23–27 %
+/// (22.9 % holes from above, of which the setting makes 4.3 points:
+/// docs/ergebnisse/2026-10-25-qualitaetsrunde.md).
+const OPEN_HINT_SHARE: f64 = 0.15;
 const AXES: &str = "glb: Y oben; obj: Z oben";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -173,6 +184,25 @@ fn owns(name: &str) -> bool {
         SURFACE_REPORT.to_string(),
     ];
     fixed.iter().any(|f| f == name) || is_page_of(name.as_ref(), STEM.as_ref())
+}
+
+/// Short German hints about the surface for the user (the app can show them), in the report
+/// under `hinweise`: why a surface stays open in many places, when the cause is the setting
+/// `max_fill_gap` ([`OPEN_HINT_SHARE`]).
+fn hints(stats: &SurfaceStats, config: &SurfaceConfig) -> Vec<String> {
+    let dropped = stats.faces_unsupported as f64;
+    let share = dropped / (dropped + stats.faces_final as f64).max(1.0);
+    if share < OPEN_HINT_SHARE {
+        return Vec::new();
+    }
+    vec![format!(
+        "Stellenweise offen: an {:.0} % der dünn gemessenen Flächen lag kein Messpunkt näher \
+         als {:.1} cm (Einstellung max_fill_gap), dort bleibt die Oberfläche offen statt \
+         erfunden – in großen Räumen üblich; schließen lässt sie sich nur durch dichteres \
+         Scannen dieser Stellen (näher, langsamer), nicht durch eine feinere Feinheit",
+        100.0 * share,
+        100.0 * config.max_fill_gap
+    )]
 }
 
 fn settings_json(c: &SurfaceConfig, texture: bool) -> Value {
@@ -463,6 +493,7 @@ fn make_surface(
         "files": files,
         "bytes": bytes,
         "stale": stale,
+        "hinweise": hints(&stats, target.config),
     });
     if let Some((key, value)) = target.extra {
         report[key] = value;
@@ -485,6 +516,9 @@ fn make_surface(
         all.p95_mm,
         walls.median_mm
     ));
+    for hint in hints(&stats, target.config) {
+        progress.info(format!("Hinweis: {hint}"));
+    }
     let ram = peak.map_or_else(
         || "Spitzen-RAM unbekannt".to_string(),
         |b| format!("Spitzen-RAM {:.2} GB", b as f64 / 1e9),
@@ -796,4 +830,36 @@ pub fn run_model_surface(
         obj: req.obj,
     };
     make_surface(points, sources, gpu, target, start, progress)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(faces_final: usize, faces_unsupported: usize) -> SurfaceStats {
+        SurfaceStats {
+            faces_final,
+            faces_unsupported,
+            ..SurfaceStats::default()
+        }
+    }
+
+    /// The figures of the real scans at the default 2 cm: the office B (2.0 of 8.6 million
+    /// faces dropped, 23 %) gets the hint, the black room S1 (8 %) does not.
+    #[test]
+    fn open_surface_gets_a_hint() {
+        let cfg = SurfaceConfig::default();
+        assert!(hints(&stats(1_153_721, 98_911), &cfg).is_empty());
+        assert!(hints(&stats(0, 0), &cfg).is_empty());
+        let h = hints(&stats(6_640_042, 2_004_445), &cfg);
+        assert_eq!(h.len(), 1, "{h:?}");
+        assert!(
+            h[0].starts_with(
+                "Stellenweise offen: an 23 % der dünn gemessenen Flächen lag kein \
+                 Messpunkt näher als 1.5 cm (Einstellung max_fill_gap)"
+            ),
+            "{h:?}"
+        );
+        assert!(h[0].contains("nicht durch eine feinere Feinheit"), "{h:?}");
+    }
 }
