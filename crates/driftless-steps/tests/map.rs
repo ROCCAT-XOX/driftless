@@ -3,8 +3,8 @@
 use driftless_io::progress::{Progress, ProgressSnapshot};
 use driftless_io::testscan::{room_bag, room_bag_secs, tmp};
 use driftless_steps::map::{
-    fitting_stages, folder_fits, run_map, MapInput, MapRequest, MapSettings, MapStep, CLEAN_BIN,
-    DENSE_BIN,
+    clean_stage_id, dense_stage_id, fitting_stages, folder_fits, run_map, MapInput, MapRequest,
+    MapSettings, MapStep, CLEAN_BIN, DENSE_BIN,
 };
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::{correct, StepError};
@@ -203,6 +203,26 @@ fn fitting_stages_check_the_input() {
     let mut other = input(&dir, &slam_dir, MapStep::All);
     other.map.switches.downscale = 4;
     assert_eq!(fitting_stages(&other, &map_dir), [DENSE_BIN, CLEAN_BIN]);
+}
+
+/// No stage id holds the program version: a new release keeps every map that still fits.
+/// Each holds the version of its step instead.
+#[test]
+fn stage_ids_hold_no_program_version() {
+    let dir = tmp("steps-map-ids");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    slam(&dir, &out, false);
+    let input = input(&dir, &out, MapStep::All);
+    let dense = dense_stage_id(&input).unwrap();
+    let clean = clean_stage_id(&input).unwrap();
+    for id in [&dense, &clean] {
+        assert!(!id.contains(env!("CARGO_PKG_VERSION")), "{id}");
+        assert!(!id.contains("driftless"), "{id}");
+    }
+    assert!(dense.starts_with("map dense v1\n"), "{dense}");
+    assert!(clean.starts_with(&dense), "{clean}");
+    assert!(clean.contains("clean v3 "), "{clean}");
 }
 
 #[test]

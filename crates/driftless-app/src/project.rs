@@ -1251,7 +1251,7 @@ fn surface_request(
 
 /// The status of `surface` of `map` of `run`, made from the scan folder `scan`: its runtime
 /// (`seconds_total` of `oberflaeche.json`), and stale if it no longer fits the map
-/// ([`surface_fits`]: the map, the run, the images or the program changed since). A report
+/// ([`surface_fits`]: the map, the run, the images or the surface step changed since). A report
 /// whose settings cannot be read in full was written by an earlier version of the program and
 /// is stale too, and so is a folder without a report (the step writes it last: it was
 /// stopped before, or the folder was copied incompletely). Reads the lists of bags, the

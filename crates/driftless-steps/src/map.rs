@@ -45,6 +45,12 @@ type BoxError = Box<dyn std::error::Error>;
 
 pub const DENSE_BIN: &str = "dense.bin";
 pub const CLEAN_BIN: &str = "clean.bin";
+// The version of each step in its input id. The program version is part of no id (stage,
+// cache, `*_fits`): a new release keeps every result that still fits. Raise a step's version
+// only when that step gives another result (or other files) for the same input and
+// settings; the ids of the steps after it change with it.
+/// Part of the dense step's input id (see the rule above). 1: the first release.
+const DENSE_VERSION: u32 = 1;
 /// Part of the clean step's input id: raised whenever the cleaning gives another result
 /// (or other files) for the same settings, so an older `clean.bin` / `removed.las` is
 /// rebuilt instead of reused. 2: removal reasons in `removed.las`, points seen through
@@ -352,7 +358,8 @@ pub fn hex(id: &str) -> String {
     format!("{:016x}", content_hash(id.as_bytes()))
 }
 
-/// Input id of the dense step: LiDAR bags, topics, odometry, trajectory and dense settings.
+/// Input id of the dense step: [`DENSE_VERSION`], LiDAR bags, topics, odometry, trajectory
+/// and dense settings.
 fn dense_id(
     project: &Project,
     slam: &SlamSettings,
@@ -361,9 +368,8 @@ fn dense_id(
     dense_cfg: &DenseConfig,
 ) -> Result<String, String> {
     Ok(format!(
-        "driftless {} map dense\n{}lidar_topic {:?}\nimu_topic {:?}\n{odom:?}\ntraj {:016x} {}\n\
-         {dense_cfg:?}\n",
-        env!("CARGO_PKG_VERSION"),
+        "map dense v{DENSE_VERSION}\n{}lidar_topic {:?}\nimu_topic {:?}\n{odom:?}\n\
+         traj {:016x} {}\n{dense_cfg:?}\n",
         bag_list(&project.lidar_bags)?,
         slam.lidar_topic,
         slam.imu_topic,

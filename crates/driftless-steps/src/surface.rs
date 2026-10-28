@@ -39,7 +39,8 @@ use std::time::Instant;
 
 pub const SURFACE_REPORT: &str = "oberflaeche.json";
 /// Part of the input id: raised whenever the surface gives another result for the same
-/// settings, so an older folder counts as stale.
+/// settings, so an older folder counts as stale. Only then: the program version is no part
+/// of the id (see the rule at the step versions in [`crate::map`]).
 const SURFACE_VERSION: u32 = 13;
 /// File stem of the glb and the obj.
 const STEM: &str = "oberflaeche";

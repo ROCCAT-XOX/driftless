@@ -62,7 +62,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// Part of the input id: raised whenever the merge gives another result for the same
-/// request, so an older model counts as stale.
+/// request, so an older model counts as stale. Only then: the program version is no part of
+/// the id (see the rule at the step versions in [`crate::map`]).
 pub const MERGE_VERSION: u32 = 2;
 pub const MODEL_REPORT: &str = "modell.json";
 pub const MODEL_LAS: &str = "modell.las";
@@ -272,10 +273,7 @@ fn pairs_between(
 
 /// Full text of the input id and the clean id of every member.
 fn input_text(req: &MergeRequest) -> Result<(String, Vec<String>), StepError> {
-    let mut id = format!(
-        "driftless {} merge v{MERGE_VERSION}\n",
-        env!("CARGO_PKG_VERSION")
-    );
+    let mut id = format!("merge v{MERGE_VERSION}\n");
     let mut clean_ids = Vec::with_capacity(req.members.len());
     for (k, m) in req.members.iter().enumerate() {
         let input = map_input_for(&m.scan, &m.slam_dir, &m.map_dir, m.slam.clone());
@@ -1041,6 +1039,56 @@ mod tests {
             warnings[0].contains("mindestens drei") && warnings[0].contains("s1/karte"),
             "{warnings:?}"
         );
+    }
+
+    /// The input id of a merge holds [`MERGE_VERSION`] and the stage ids of the maps, never
+    /// the program version: a new release keeps every model whose maps still fit.
+    #[test]
+    fn input_id_holds_no_program_version() {
+        use crate::map::{run_map, MapRequest, MapStep};
+        use crate::slam::{run_slam, SlamRequest};
+        let dir = driftless_io::testscan::tmp("steps-merge-id");
+        driftless_io::testscan::room_bag(&dir, true);
+        let out = dir.join("out");
+        let slam = SlamRequest {
+            scan: dir.clone(),
+            out: out.clone(),
+            settings: SlamSettings::default(),
+            reuse: false,
+            history: false,
+        };
+        run_slam(&slam, &Progress::new()).unwrap();
+        let mut input = map_input_for(&dir, &out, &out, SlamSettings::default());
+        input.map.step = MapStep::Clean;
+        let map = MapRequest {
+            input,
+            out_dir: out.clone(),
+        };
+        run_map(&map, &Progress::new()).unwrap();
+        let member = MergeMember {
+            scan: dir.clone(),
+            slam_dir: out.clone(),
+            map_dir: out,
+            slam: SlamSettings::default(),
+        };
+        let req = MergeRequest {
+            members: vec![member.clone(), member],
+            out_dir: dir.join("modell"),
+            align: AlignConfig::default(),
+            voxel: 0.01,
+            smooth: true,
+            include_unsure: false,
+            pairs: Vec::new(),
+        };
+        let (text, clean_ids) = input_text(&req).unwrap();
+        assert!(!text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        assert!(!text.contains("driftless"), "{text}");
+        assert!(
+            text.starts_with(&format!("merge v{MERGE_VERSION}\n")),
+            "{text}"
+        );
+        assert!(text.contains(&clean_ids[0]), "{text}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
