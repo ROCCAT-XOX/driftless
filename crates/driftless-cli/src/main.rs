@@ -11,6 +11,11 @@ mod merge;
 mod odom;
 mod slam;
 mod surface;
+// The rerun viewer only with `--features debug-viewer`; else `view` says where to look.
+#[cfg(feature = "debug-viewer")]
+mod view;
+#[cfg(not(feature = "debug-viewer"))]
+#[path = "view_off.rs"]
 mod view;
 
 use clap::{Parser, Subcommand};
@@ -51,7 +56,15 @@ enum Command {
     Inspect(inspect::Args),
     /// Vergleicht zwei Trajektorien (TUM): Abweichung, Start↔Ende, Länge
     Compare(compare::Args),
-    /// Fehlersuche-Viewer (rerun): Punkte, IMU, Bilder, Trajektorie
+    #[cfg_attr(
+        feature = "debug-viewer",
+        doc = "Fehlersuche-Viewer (rerun): Punkte, IMU, Bilder, Trajektorie"
+    )]
+    #[cfg_attr(
+        not(feature = "debug-viewer"),
+        doc = "Fehlersuche-Viewer: nicht enthalten (bauen mit --features debug-viewer); \
+               Wolken zeigt die Desktop-App"
+    )]
     View(view::Args),
     /// Spike: LiDAR- und IMU-Daten als Binärstrom für den GLIM-Treiber (spikes/glim)
     ExportGlim(export_glim::Args),

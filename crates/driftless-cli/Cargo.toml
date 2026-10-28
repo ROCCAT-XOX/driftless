@@ -37,7 +37,13 @@ png = "0.18"
 rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rerun = { version = "0.38.1", default-features = false, features = ["sdk", "rrd", "server"] }
+# The debug viewer of `driftless view` (about 290 crates of its own): only with the feature.
+rerun = { version = "0.38.1", default-features = false, features = ["sdk", "rrd", "server"], optional = true }
+
+[features]
+# `driftless view` with the rerun viewer, for development. Off by default and so in the
+# packages (packaging/): the desktop program shows the clouds.
+debug-viewer = ["dep:rerun"]
 
 [dev-dependencies]
 assert_cmd = "2"
