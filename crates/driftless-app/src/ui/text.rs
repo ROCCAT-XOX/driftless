@@ -1113,6 +1113,11 @@ pub fn unknown_map(dir: &std::path::Path) -> String {
     format!("{UNKNOWN_MAP}: {}", dir.display())
 }
 
+/// A folder to delete that is no longer in the tree (gone meanwhile).
+pub fn not_in_tree(dir: &std::path::Path) -> String {
+    about_path("Nicht mehr im Projekt", dir)
+}
+
 /// „Einfärben wird übersprungen: keine Kamerabilder …“ (step „Alles“ on a scan without them).
 pub fn color_skipped(why: &str) -> String {
     format!("{STEP_COLOR} wird übersprungen: {why}")

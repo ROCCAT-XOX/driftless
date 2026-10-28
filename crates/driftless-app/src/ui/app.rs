@@ -1736,6 +1736,16 @@ impl DriftlessApp {
     }
 
     fn start_helper(&mut self, task: HelperTask) {
+        // what is shown or computed now: a step may have started since the click
+        let blocked = match &task {
+            HelperTask::Trash { dir, .. } => self.state.delete_blocked(dir),
+            HelperTask::CleanUp(_) => self.state.clean_up_blocked().map(str::to_string),
+            _ => None,
+        };
+        if let Some(why) = blocked {
+            self.error(why);
+            return;
+        }
         let started = match &task {
             HelperTask::MapStatus(_) => {
                 let job = self.state.map_status_job();
@@ -2410,7 +2420,7 @@ impl DriftlessApp {
             Action::Delete(dir) => {
                 self.state.ask = None;
                 let Some(question) = self.state.delete_question(&dir) else {
-                    self.error(text::unknown_map(&dir));
+                    self.error(text::not_in_tree(&dir));
                     return;
                 };
                 // what is shown or computed now (it may have changed since the question)

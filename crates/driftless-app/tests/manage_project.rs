@@ -557,3 +557,21 @@ fn system_trash_takes_a_folder() {
     driftless_app::trash::system_trash(&probe).unwrap();
     assert!(!probe.exists());
 }
+
+/// A step that starts between the click and the move to the trash keeps the folder: the
+/// check is made again when the trash is about to take it.
+#[test]
+fn a_step_started_meanwhile_keeps_the_folder() {
+    let dir = tmp("verwalten-inzwischen");
+    let (mut h, run_dir, map) = project_with_surface(&dir, test_trash);
+    run(&mut h, Action::Unshow(map.clone()));
+    h.state_mut().apply(Action::Delete(map.clone()));
+    h.state_mut().state_mut().running = Some(Action::RunMap(run_dir.clone()));
+    h.step();
+    h.state_mut().state_mut().running = None;
+    settle(&mut h);
+    assert!(map.join("map.json").is_file());
+    let e = errors(h.state());
+    assert_eq!(e.len(), 1, "{e:?}");
+    assert!(e[0].starts_with("Wird gerade gerechnet"), "{e:?}");
+}

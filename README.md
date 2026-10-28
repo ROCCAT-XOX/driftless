@@ -198,7 +198,8 @@ slim status bar:
 
 - **Rail:** ☰ opens the project menu („Neues Projekt …“ in an empty folder, „Projekt öffnen …“,
   „Scan hinzufügen …“ for a scan folder as above, „Lauf hinzufügen …“ for a run made with the command
-  line (to the scan selected; only here), „Datei öffnen …“ for any point cloud or surface file, „Exportieren …“ for what the view shows,
+  line (to the scan selected; only here), „Datei öffnen …“ for any point cloud or surface file,
+  „Exportieren …“ for what the view shows,
   „Über Driftless …“; see [Export](#export) and [Opening files](#opening-files)). Below it the three steps, and
   ⚙ at the bottom. The dialogs open in `~/Driftless Projekte` (Windows `%USERPROFILE%\Driftless
   Projekte`, made when first needed), later in the folder each was last used in. A project is read in
@@ -228,7 +229,8 @@ slim status bar:
   0.01 / 0.005 m; Maximal needs over 4 GB of memory on large scans, another voxel shows „Eigene“). „Alle
   rechnen“ queues every new or stale scan and computes them one after the other; with a scan selected,
   „Rechnen“ computes only that one. The runs and maps of a scan unfold below its card; a click on a
-  map shows its best cloud. „Zusammenführen …“ scrolls its field into view, start button included. „▸ Erweitert“
+  map shows its best cloud. „Zusammenführen …“ scrolls its field into view, start button included.
+  „▸ Erweitert“
   holds the rest: the switches of `driftless map` with the voxel as a number, the single steps
   („Prüfen“, „SLAM rechnen“, „Neu rechnen (aus Teilkarten)“, „Karte rechnen“), the corrections (loops:
   „Stellen wählen“ and two clicks on the trajectory, „Schleife eintragen“, „Jetzt neu rechnen“ from
