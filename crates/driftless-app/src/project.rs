@@ -22,12 +22,31 @@
 //! path = "rohdaten/buero"        # relative to the project folder if inside it, else absolute
 //! name = "Büro, Erdgeschoss"
 //! extra_runs = ["/pfad/zu/cli-lauf"]  # run folders made by the CLI, added by hand
+//!
+//! [[scan]]
+//! id = "halle"
+//! path = "/Volumes/Daten/Rohdaten/halle"
+//! path_rel = "../Rohdaten/halle" # beside an absolute path: relative to the project folder
+//! name = "Halle"
+//! extra_runs = ["/Volumes/Daten/cli/lauf"]
+//! extra_runs_rel = ["../cli/lauf"]  # one per entry of `extra_runs`, "" where none
 //! ```
 //!
 //! Relative paths are written with `/` and read with `/` or `\`, so a project works on macOS
-//! and Windows alike. `lauf.toml` holds `scan` (stored the same way), `erstellt` (UTC) and the
-//! [`SlamSettings`] under `[slam]`; `erstellt` is the only value that differs between two equal
-//! runs (like `erstellt`/`sekunden` in `stand.toml` and the runtimes in `map.json`).
+//! and Windows alike. A path outside the project folder is written absolute and, where one can
+//! be computed (the same volume, drive or share), relative to the project folder as well
+//! (`path_rel`, `extra_runs_rel`); reading takes the relative one where that folder exists,
+//! else the absolute one. So a project moved or copied together with its raw data still finds
+//! them, and one moved alone finds them where they were. `extra_runs_rel` counts only with as
+//! many entries as `extra_runs`. `lauf.toml` holds `scan` (stored the same way, with
+//! `scan_rel`), `erstellt` (UTC) and the [`SlamSettings`] under `[slam]`; `erstellt` is the
+//! only value that differs between two equal runs (like `erstellt`/`sekunden` in `stand.toml`
+//! and the runtimes in `map.json`).
+//!
+//! The paths in `modell.json` are relative to the model folder as well
+//! ([`driftless_steps::merge`]). A model written before that has absolute paths only: if the
+//! project folder was renamed, moved or copied since, [`Project::models`] takes the folders
+//! that lay in the project folder then into the project folder now ([`merged_in`]).
 //!
 //! A scan folder that is gone (an unplugged drive) is reported by [`Project::scan_state`];
 //! the project still opens and its runs are still listed.
@@ -48,7 +67,7 @@ use crate::ui::text;
 use driftless_gpu::GpuPref;
 use driftless_io::atomic_write;
 use driftless_io::bag::BagReader;
-use driftless_io::paths::relative_text;
+use driftless_io::paths::{relative_text, relative_to};
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_map::surface::SurfaceConfig;
@@ -340,15 +359,27 @@ struct ProjectFile {
 #[derive(Serialize, Deserialize)]
 struct ScanFile {
     id: String,
+    /// Relative to the project folder if inside it, else absolute.
     path: String,
+    /// Beside an absolute [`Self::path`]: relative to the project folder, if one can be
+    /// computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path_rel: Option<String>,
     name: String,
     #[serde(default)]
     extra_runs: Vec<String>,
+    /// One per entry of [`Self::extra_runs`]: the relative path beside an absolute one, `""`
+    /// where there is none. Written only if one entry has one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    extra_runs_rel: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct RunFile {
     scan: String,
+    /// As [`ScanFile::path_rel`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scan_rel: Option<String>,
     erstellt: String,
     #[serde(default)]
     slam: SlamSettings,
@@ -359,9 +390,10 @@ struct RunFile {
 /// mapped drive). Paths in a [`Project`] are always in this form.
 pub use driftless_io::paths::canonical;
 
-/// `path` as written to a project file: relative to `base` with `/` if inside it, else
-/// absolute. Compared as text, so a share of Windows counts as well.
-fn to_stored(base: &Path, path: &Path) -> Result<String, ProjectError> {
+/// `path` as written to a project file: relative to `base` with `/` if inside it; else
+/// absolute, and beside it relative to `base` where one can be computed (the same volume,
+/// drive or share, [`relative_to`]). Compared as text, so a share of Windows counts as well.
+fn to_stored(base: &Path, path: &Path) -> Result<(String, Option<String>), ProjectError> {
     let text = path
         .to_str()
         .ok_or_else(|| ProjectError(format!("Pfad {} ist kein gültiger Text", path.display())))?;
@@ -369,7 +401,23 @@ fn to_stored(base: &Path, path: &Path) -> Result<String, ProjectError> {
         .to_str()
         .and_then(|b| relative_text(b, text))
         .filter(|rel| rel != "." && rel != ".." && !rel.starts_with("../"));
-    Ok(inside.unwrap_or_else(|| text.to_string()))
+    Ok(match inside {
+        Some(rel) => (rel, None),
+        None => (
+            text.to_string(),
+            relative_to(base, path).filter(|rel| rel != "."),
+        ),
+    })
+}
+
+/// A path of a project file as written by [`to_stored`]: the relative one beside it (if
+/// any, and not empty) where that folder exists, else the path itself; both relative to
+/// `base` if relative.
+fn from_stored_pair(base: &Path, path: &str, rel: Option<&str>) -> PathBuf {
+    rel.filter(|r| !r.is_empty())
+        .map(|r| from_stored(base, r))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| from_stored(base, path))
 }
 
 /// Windows device names, which name no folder whatever the extension.
@@ -629,6 +677,55 @@ pub fn run_label(dir: &Path) -> String {
     }
 }
 
+/// The project folder an old model (one without relative paths in `modell.json`) was merged
+/// in: the folder its runs `<projekt>/scans/<id>/slam-NNN` lay in then, if every such run
+/// says the same (runs elsewhere, added from the command line, say nothing).
+fn merged_in(report: &ModelReport) -> Option<PathBuf> {
+    let mut then: Option<&Path> = None;
+    for m in &report.members {
+        let run = &m.slam_dir;
+        let numbered_run = run
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix(RUN_PREFIX))
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+        let scans = run.parent().and_then(Path::parent);
+        let Some(project) = scans
+            .filter(|s| numbered_run && s.file_name().is_some_and(|n| n == SCANS_DIR))
+            .and_then(Path::parent)
+        else {
+            continue;
+        };
+        if then.is_some_and(|t| t != project) {
+            return None;
+        }
+        then = Some(project);
+    }
+    then.map(Path::to_path_buf)
+}
+
+/// An old model ([`merged_in`]) of a project renamed, moved or copied since: every folder of
+/// its scans that lay in the project folder then is taken in the project folder `now`, where
+/// it exists there (else it stays as written). A model with relative paths needs none of
+/// this ([`read_model`]).
+fn rebase_old_model(report: &mut ModelReport, now: &Path) {
+    let relative = report
+        .members
+        .iter()
+        .any(|m| m.scan_rel.is_some() || m.slam_dir_rel.is_some() || m.map_dir_rel.is_some());
+    let Some(then) = merged_in(report).filter(|then| !relative && then != now) else {
+        return;
+    };
+    for m in &mut report.members {
+        for p in [&mut m.scan, &mut m.slam_dir, &mut m.map_dir] {
+            let moved = p.strip_prefix(&then).ok().map(|rest| now.join(rest));
+            if let Some(found) = moved.filter(|f| f.is_dir()) {
+                *p = found;
+            }
+        }
+    }
+}
+
 impl Project {
     /// A new project in `dir` (created if missing; an existing folder must be empty apart
     /// from hidden files). `project.toml` is written right away.
@@ -690,11 +787,24 @@ impl Project {
         let scans = pf
             .scans
             .into_iter()
-            .map(|s| ScanEntry {
-                path: from_stored(&dir, &s.path),
-                extra_runs: s.extra_runs.iter().map(|r| from_stored(&dir, r)).collect(),
-                id: s.id,
-                name: s.name,
+            .map(|s| {
+                // the relative paths of the runs count only one per run
+                let runs_rel =
+                    (s.extra_runs_rel.len() == s.extra_runs.len()).then_some(&s.extra_runs_rel);
+                ScanEntry {
+                    path: from_stored_pair(&dir, &s.path, s.path_rel.as_deref()),
+                    extra_runs: s
+                        .extra_runs
+                        .iter()
+                        .enumerate()
+                        .map(|(k, r)| {
+                            let rel = runs_rel.map(|v| v[k].as_str());
+                            from_stored_pair(&dir, r, rel)
+                        })
+                        .collect(),
+                    id: s.id,
+                    name: s.name,
+                }
             })
             .collect::<Vec<_>>();
         check_ids(&scans).map_err(|e| bad(&e))?;
@@ -712,15 +822,26 @@ impl Project {
             .scans
             .iter()
             .map(|s| {
+                let (path, path_rel) = to_stored(&self.dir, &s.path)?;
+                let runs = s
+                    .extra_runs
+                    .iter()
+                    .map(|r| to_stored(&self.dir, r))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let extra_runs_rel = if runs.iter().any(|(_, rel)| rel.is_some()) {
+                    runs.iter()
+                        .map(|(_, rel)| rel.clone().unwrap_or_default())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 Ok(ScanFile {
                     id: s.id.clone(),
-                    path: to_stored(&self.dir, &s.path)?,
+                    path,
+                    path_rel,
                     name: s.name.clone(),
-                    extra_runs: s
-                        .extra_runs
-                        .iter()
-                        .map(|r| to_stored(&self.dir, r))
-                        .collect::<Result<_, _>>()?,
+                    extra_runs: runs.into_iter().map(|(text, _)| text).collect(),
+                    extra_runs_rel,
                 })
             })
             .collect::<Result<_, ProjectError>>()?;
@@ -885,13 +1006,16 @@ impl Project {
     }
 
     /// The models of the project: `modelle/modell-NNN` with a readable `modell.json`, by
-    /// number (a folder without one is a merge still running, stopped or broken). Reads each
-    /// report; call it when the tree is read, not every frame.
+    /// number (a folder without one is a merge still running, stopped or broken), with the
+    /// folders of their scans as found ([`read_model`]; an old model of a project renamed,
+    /// moved or copied since, see [`rebase_old_model`]). Reads each report; call it when the
+    /// tree is read, not every frame.
     pub fn models(&self) -> Vec<ModelInfo> {
         numbered(&self.dir.join(MODELS_DIR), MODEL_PREFIX)
             .into_iter()
             .filter_map(|(_, digits, dir)| {
-                let report = read_model(&dir).ok()?;
+                let mut report = read_model(&dir).ok()?;
+                rebase_old_model(&mut report, &self.dir);
                 Some(ModelInfo {
                     label: text::model_label(&digits),
                     surfaces: surfaces_of(&dir),
@@ -911,8 +1035,10 @@ impl Project {
     ) -> Result<StepDir, ProjectError> {
         let scan = self.scan(scan_id).ok_or_else(|| Self::unknown(scan_id))?;
         let dir = create_numbered(&self.runs_dir(scan_id)?, RUN_PREFIX)?;
+        let (scan_text, scan_rel) = to_stored(&self.dir, &scan.path)?;
         let run = RunFile {
-            scan: to_stored(&self.dir, &scan.path)?,
+            scan: scan_text,
+            scan_rel,
             erstellt: utc_now(),
             slam: settings.clone(),
         };
@@ -1479,6 +1605,8 @@ fn model_surface_request(
 ) -> ModelSurfaceRequest {
     ModelSurfaceRequest {
         model_dir: model.dir.clone(),
+        // the scans' folders as the project found them
+        model: Some(model.report.clone()),
         out_dir: out_dir.to_path_buf(),
         config: settings.config.clone(),
         texture: settings.texture,
@@ -1585,8 +1713,11 @@ mod tests {
     #[test]
     fn stored_paths() {
         let base = Path::new("/p");
-        assert_eq!(to_stored(base, Path::new("/p/a/b")).unwrap(), "a/b");
-        assert_eq!(to_stored(base, Path::new("/q/a")).unwrap(), "/q/a");
+        let stored = |p: &str| to_stored(base, Path::new(p)).unwrap();
+        assert_eq!(stored("/p/a/b"), ("a/b".into(), None));
+        // outside: absolute, and relative beside it
+        assert_eq!(stored("/q/a"), ("/q/a".into(), Some("../q/a".into())));
+        assert_eq!(stored("/p"), ("/p".into(), None));
         assert_eq!(from_stored(base, "a/b"), Path::new("/p/a/b"));
         assert_eq!(from_stored(base, "a\\b"), Path::new("/p/a/b"));
         assert_eq!(from_stored(base, "./a//b/"), Path::new("/p/a/b"));

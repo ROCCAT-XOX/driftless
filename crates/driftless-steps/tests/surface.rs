@@ -418,6 +418,7 @@ fn model_scene() -> &'static ModelScene {
 fn model_request(model: &Path, out: &Path) -> ModelSurfaceRequest {
     ModelSurfaceRequest {
         model_dir: model.to_path_buf(),
+        model: None,
         out_dir: out.to_path_buf(),
         config: small_config(),
         texture: true,

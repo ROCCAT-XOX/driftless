@@ -10,7 +10,7 @@ use driftless_slam::align::AlignConfig;
 use driftless_steps::map::{clean_stage_id, map_input_for, run_map, MapRequest, CLEAN_BIN};
 use driftless_steps::merge::{
     member_transform, merge_input_id, read_model, run_merge, MergeMember, MergeRequest,
-    ModelReport, MODEL_LAS, MODEL_PLY, MODEL_REPORT,
+    ModelMember, ModelReport, MODEL_LAS, MODEL_PLY, MODEL_REPORT,
 };
 use driftless_steps::pairs::{PointPairEntry, PointPairs, POINT_PAIRS_FILE};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
@@ -205,6 +205,21 @@ fn merges_two_scans() {
     assert_eq!(back.input_id, report.input_id);
     assert_eq!(back.input_id, merge_input_id(&req).unwrap());
     assert_eq!(back.members.len(), 2);
+    // Every folder absolute and resolved (in its plain form on Windows), and relative to the
+    // model folder beside it.
+    let canon = |p: &Path| driftless_io::paths::canonical(p).unwrap();
+    for (m, scan) in back.members.iter().zip([&s.a, &s.b]) {
+        let name = scan.file_name().unwrap().to_str().unwrap();
+        assert_eq!(m.scan, canon(scan));
+        assert_eq!(m.map_dir, canon(&scan.join("driftless")));
+        assert_eq!(
+            m.scan_rel.as_deref(),
+            Some(format!("../../{name}").as_str())
+        );
+        let run = format!("../../{name}/driftless");
+        assert_eq!(m.slam_dir_rel.as_deref(), Some(run.as_str()));
+        assert_eq!(m.map_dir_rel.as_deref(), Some(run.as_str()));
+    }
     assert_eq!(back.members[1].transform, b.transform);
     assert_eq!(back.points, report.points);
     assert!(!out.join(format!("{MODEL_LAS}.tmp")).exists());
@@ -225,6 +240,86 @@ fn merges_two_scans() {
         matches!(&err, StepError::Failed(m) if m.contains("schon ein Modell")),
         "{err}"
     );
+}
+
+/// A member of a hand-written model with the folders `abs` and, relative to the model
+/// folder, `rel`.
+fn written_member(abs: &Path, rel: Option<&str>) -> ModelMember {
+    ModelMember {
+        scan: abs.to_path_buf(),
+        scan_rel: rel.map(String::from),
+        slam_dir: abs.to_path_buf(),
+        slam_dir_rel: rel.map(String::from),
+        map_dir: abs.to_path_buf(),
+        map_dir_rel: rel.map(String::from),
+        slam: SlamSettings::default(),
+        transform: std::array::from_fn(|k| if k % 5 == 0 { 1.0 } else { 0.0 }),
+        placed_against: None,
+        method: "bezug".into(),
+        verdict: "sicher".into(),
+        reason: None,
+        overlap: 1.0,
+        residual_median_mm: 0.0,
+        residual_rms_mm: 0.0,
+        agreement: 1.0,
+        wall_residual_mm: 0.0,
+        pair_rms_mm: None,
+        included: true,
+        color_gain: [1.0; 3],
+        points: 1,
+        clean_id: None,
+    }
+}
+
+/// `read_model` takes a relative folder (below the model folder) where it exists, also when
+/// the absolute one exists too (a copy of a project), else the absolute one; a model written
+/// before the relative paths reads as written.
+#[test]
+fn read_model_takes_the_relative_folder_first() {
+    let dir = driftless_io::paths::canonical(&tmp("modell-relativ")).unwrap();
+    let old = dir.join("alt").join("scans").join("a");
+    let new = dir.join("neu").join("scans").join("a");
+    let model = dir.join("neu").join("modelle").join("modell-001");
+    for d in [&old, &new, &model] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let write = |members: Vec<ModelMember>| {
+        let report = ModelReport {
+            version: 2,
+            input_id: "0".into(),
+            members,
+            points: 1,
+            seconds_total: 0.0,
+            peak_rss_bytes: 0,
+            include_unsure: false,
+            warnings: Vec::new(),
+        };
+        let text = serde_json::to_string_pretty(&report).unwrap();
+        fs::write(model.join(MODEL_REPORT), text).unwrap();
+    };
+    write(vec![written_member(&old, Some("../../scans/a"))]);
+    let m = read_model(&model).unwrap().members.remove(0);
+    assert_eq!((&m.scan, &m.slam_dir, &m.map_dir), (&new, &new, &new));
+    assert_eq!(
+        m.map_dir_rel.as_deref(),
+        Some("../../scans/a"),
+        "kept as read"
+    );
+    // The relative folder is gone: the absolute one.
+    fs::remove_dir_all(&new).unwrap();
+    assert_eq!(read_model(&model).unwrap().members[0].map_dir, old);
+    // Written before the relative paths: no keys at all, read as written.
+    write(vec![written_member(&old, None)]);
+    let text = fs::read_to_string(model.join(MODEL_REPORT)).unwrap();
+    let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    for key in ["scan_rel", "slam_dir_rel", "map_dir_rel"] {
+        json["members"][0].as_object_mut().unwrap().remove(key);
+    }
+    json.as_object_mut().unwrap().remove("warnings");
+    fs::write(model.join(MODEL_REPORT), json.to_string()).unwrap();
+    let back = read_model(&model).unwrap();
+    assert_eq!(back.members[0].map_dir, old);
+    assert!(back.members[0].map_dir_rel.is_none() && back.warnings.is_empty());
 }
 
 #[test]

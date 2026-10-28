@@ -92,6 +92,7 @@ fn request(args: &Args) -> Result<SurfaceRequest, Box<dyn std::error::Error>> {
 fn model_request(args: &Args, model: &Path) -> ModelSurfaceRequest {
     ModelSurfaceRequest {
         model_dir: model.to_path_buf(),
+        model: None,
         out_dir: args
             .output
             .clone()

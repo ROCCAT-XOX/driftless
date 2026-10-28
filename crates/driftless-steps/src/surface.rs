@@ -19,12 +19,12 @@ use crate::map::{
     clean_stage_id, color_input, dense_stage_id, fallback_reason, gpu_json, hex, map_input_for,
     peak_rss_bytes, read_traj, ColorInput, MapInput, CLEAN_BIN, DENSE_BIN,
 };
-use crate::merge::{member_transform, read_model, ModelMember};
+use crate::merge::{member_transform, read_model, ModelMember, ModelReport};
 use driftless_export::mesh;
 use driftless_gpu::{GpuChoice, GpuContext, GpuPref};
-use driftless_io::atomic_write;
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
+use driftless_io::{atomic_write, paths};
 use driftless_map::surface::{
     build_mesh, encode_pages, sensors_for_frames, texture_mesh, Accuracy, AccuracySplit,
     SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
@@ -483,6 +483,10 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
 pub struct ModelSurfaceRequest {
     /// Folder of the model: `modell.json` of `driftless merge` is read from it.
     pub model_dir: PathBuf,
+    /// The model as read from [`Self::model_dir`], its folders as the caller found them (the
+    /// program takes a model older than the relative paths onto its project folder);
+    /// `None`: read here ([`read_model`]).
+    pub model: Option<ModelReport>,
     /// Where the surface files go.
     pub out_dir: PathBuf,
     pub config: SurfaceConfig,
@@ -525,7 +529,10 @@ fn stale_member(name: &str) -> StepError {
 }
 
 fn model_plan(req: &ModelSurfaceRequest, progress: &Progress) -> Result<ModelPlan, StepError> {
-    let model = read_model(&req.model_dir)?;
+    let model = match &req.model {
+        Some(m) => m.clone(),
+        None => read_model(&req.model_dir)?,
+    };
     let mut id = format!("model {}\nsurface v{SURFACE_VERSION}\n", model.input_id);
     let mut members = Vec::new();
     for (k, m) in model.members.iter().enumerate().filter(|(_, m)| m.included) {
@@ -664,6 +671,14 @@ fn model_points(
     Ok((points, sources))
 }
 
+/// The model folder relative to the surface folder (`..` for one inside it), if one can be
+/// computed ([`paths::relative_to`]; both made absolute as given, the surface folder may not
+/// exist yet).
+fn model_dir_rel(req: &ModelSurfaceRequest) -> Option<String> {
+    let out = std::path::absolute(&req.out_dir).ok()?;
+    paths::relative_to(&out, &std::path::absolute(&req.model_dir).ok()?)
+}
+
 /// Runs the surface of the model in [`ModelSurfaceRequest::model_dir`] as
 /// `driftless surface --model` does: the points, LiDAR positions and camera images of every
 /// scan in the model (`included`), in the model frame. Without `dense.bin` the accuracy is
@@ -693,6 +708,7 @@ pub fn run_model_surface(
             "model",
             json!({
                 "dir": req.model_dir.display().to_string(),
+                "dir_rel": model_dir_rel(req),
                 "members": names,
             }),
         )),

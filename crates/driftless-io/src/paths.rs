@@ -174,6 +174,30 @@ pub fn relative_text(base: &str, path: &str) -> Option<String> {
     })
 }
 
+/// Whether `a` and `b` lie on the same volume as far as the system can tell: on Unix the
+/// device of both (where both can be read); on Windows the drive or share, which
+/// [`relative_text`] compares.
+fn same_volume(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(x), Ok(y)) = (fs::metadata(a), fs::metadata(b)) {
+            return x.dev() == y.dev();
+        }
+    }
+    let _ = (a, b);
+    true
+}
+
+/// `path` relative to the folder `base` ([`relative_text`]) to store next to the absolute
+/// path, if one can be computed: both on the same volume, drive or share, both valid text.
+pub fn relative_to(base: &Path, path: &Path) -> Option<String> {
+    if !same_volume(base, path) {
+        return None;
+    }
+    relative_text(base.to_str()?, path.to_str()?)
+}
+
 /// A path read from a project file: absolute as written (a verbatim Windows path in its plain
 /// form), else relative to `base`, with `/` or `\` between the parts. Absolute is also a path
 /// of the other system: a Windows one read on Unix, and one that starts at the root (`/…`,
@@ -369,6 +393,11 @@ mod tests {
         assert!(!p.to_string_lossy().starts_with(r"\\?\"), "{}", p.display());
         assert_eq!(p, canonical(&dir.join("a")).unwrap());
         assert!(canonical(&dir.join("fehlt")).is_err());
+        let base = canonical(&dir).unwrap();
+        assert_eq!(relative_to(&base, &p).as_deref(), Some("a"));
+        assert_eq!(relative_to(&p, &base).as_deref(), Some(".."));
+        // Not resolved or no text: none.
+        assert_eq!(relative_to(Path::new("rel"), &p), None);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

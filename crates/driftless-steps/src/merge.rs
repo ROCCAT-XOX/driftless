@@ -35,6 +35,13 @@
 //! a temporary file each, `modell.json` last and atomically: a folder with a report holds a
 //! complete model. A folder that already holds a report is refused, nothing is overwritten.
 //! Every step is deterministic: the same request gives the same files.
+//!
+//! `modell.json` names the folders of every scan twice: absolute and resolved (`scan`,
+//! `slam_dir`, `map_dir`) and relative to the model folder (`scan_rel`, `slam_dir_rel`,
+//! `map_dir_rel`, with `/` and `..`; `null` where none can be computed: another volume, drive
+//! or share). [`read_model`] takes the relative one where that folder exists, else the
+//! absolute one: a project renamed, moved or copied with its model reads the maps in its own
+//! folder.
 
 use crate::error::{check_cancel, failed, StepError};
 use crate::map::{clean_stage_id, hex, map_input_for, peak_rss_bytes, CLEAN_BIN, REPORT};
@@ -114,11 +121,26 @@ pub struct MergeRequest {
 }
 
 /// Where a member sits in the model and how sure that is.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ModelMember {
+    /// Scan folder, absolute; as [`read_model`] gives it, the folder found (see
+    /// [`Self::scan_rel`]).
     pub scan: PathBuf,
+    /// [`Self::scan`] relative to the model folder, with `/` and `..`, as merged; `None`
+    /// where none could be computed (another volume, drive or share) and in a model written
+    /// before the field. Taken before the absolute path where its folder exists.
+    #[serde(default)]
+    pub scan_rel: Option<String>,
+    /// SLAM folder, as [`Self::scan`].
     pub slam_dir: PathBuf,
+    /// [`Self::slam_dir`] relative to the model folder, as [`Self::scan_rel`].
+    #[serde(default)]
+    pub slam_dir_rel: Option<String>,
+    /// Map folder, as [`Self::scan`].
     pub map_dir: PathBuf,
+    /// [`Self::map_dir`] relative to the model folder, as [`Self::scan_rel`].
+    #[serde(default)]
+    pub map_dir_rel: Option<String>,
     pub slam: SlamSettings,
     /// `T_i`: world of this scan → model, 4 × 4 row by row.
     pub transform: [f64; 16],
@@ -156,7 +178,7 @@ pub struct ModelMember {
     pub clean_id: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ModelReport {
     /// [`MERGE_VERSION`].
     pub version: u32,
@@ -192,12 +214,41 @@ fn transform_rows(pose: &Isometry3<f64>) -> [f64; 16] {
     std::array::from_fn(|k| h[(k / 4, k % 4)])
 }
 
-/// Reads `modell.json` of the model folder `dir`.
+/// Reads `modell.json` of the model folder `dir`, with the folders of every scan as found:
+/// the relative path below `dir` where that folder exists, else the absolute one (see the
+/// module documentation).
 pub fn read_model(dir: &Path) -> Result<ModelReport, StepError> {
     let path = dir.join(MODEL_REPORT);
     let text = fs::read_to_string(&path)
         .map_err(|e| format!("Modell {} nicht lesbar: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("Modell {}: {e}", path.display()).into())
+    let mut report: ModelReport = serde_json::from_str(&text)
+        .map_err(|e| StepError::from(format!("Modell {}: {e}", path.display())))?;
+    let base = canonical(dir);
+    for m in &mut report.members {
+        let stored = [
+            (&mut m.scan, &m.scan_rel),
+            (&mut m.slam_dir, &m.slam_dir_rel),
+            (&mut m.map_dir, &m.map_dir_rel),
+        ];
+        for (abs, rel) in stored {
+            if let Some(found) = rel
+                .as_deref()
+                .map(|r| paths::stored_path(&base, r))
+                .filter(|p| p.is_dir())
+            {
+                *abs = found;
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// `path` as `modell.json` keeps it: absolute and resolved (as given where that fails), and
+/// relative to the model folder `out` (resolved) where one can be computed.
+fn stored_member_path(out: &Path, path: &Path) -> (PathBuf, Option<String>) {
+    let abs = canonical(path);
+    let rel = paths::relative_to(out, &abs);
+    (abs, rel)
 }
 
 /// Name of a scan for messages: its folder name.
@@ -881,6 +932,7 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
     let points = model.len() as u64;
     drop((model, sources));
 
+    let out_abs = canonical(out);
     let members = req
         .members
         .iter()
@@ -888,7 +940,7 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
         .enumerate()
         .map(|(k, (m, p))| {
             let anchor = p.unsure_anchor.map(|j| name(&req.members[j]));
-            model_member(m, p, anchor, gains[k], counts[k], &clean_ids[k])
+            model_member(m, &out_abs, p, anchor, gains[k], counts[k], &clean_ids[k])
         })
         .collect();
     let peak = peak_rss_bytes();
@@ -933,10 +985,12 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
     serde_json::from_str(&text).map_err(failed)
 }
 
-/// The report of member `m` placed at `p`; `unsure_anchor` names the unsurely placed member
-/// its place depends on ([`Placement::unsure_anchor`]).
+/// The report of member `m` of the model in the folder `out` (resolved), placed at `p`;
+/// `unsure_anchor` names the unsurely placed member its place depends on
+/// ([`Placement::unsure_anchor`]).
 fn model_member(
     m: &MergeMember,
+    out: &Path,
     p: &Placement,
     unsure_anchor: Option<String>,
     gain: [f32; 3],
@@ -959,10 +1013,16 @@ fn model_member(
             (method_word(a.method), word, reason, Some(a))
         }
     };
+    let (scan, scan_rel) = stored_member_path(out, &m.scan);
+    let (slam_dir, slam_dir_rel) = stored_member_path(out, &m.slam_dir);
+    let (map_dir, map_dir_rel) = stored_member_path(out, &m.map_dir);
     ModelMember {
-        scan: m.scan.clone(),
-        slam_dir: m.slam_dir.clone(),
-        map_dir: m.map_dir.clone(),
+        scan,
+        scan_rel,
+        slam_dir,
+        slam_dir_rel,
+        map_dir,
+        map_dir_rel,
         slam: m.slam.clone(),
         transform: transform_rows(&p.pose),
         placed_against: p.against,
@@ -1134,8 +1194,11 @@ mod tests {
         );
         let m = ModelMember {
             scan: "a".into(),
+            scan_rel: None,
             slam_dir: "a/d".into(),
+            slam_dir_rel: None,
             map_dir: "a/d".into(),
+            map_dir_rel: None,
             slam: SlamSettings::default(),
             transform: transform_rows(&pose),
             placed_against: Some(0),
@@ -1192,12 +1255,13 @@ mod tests {
             included: true,
             unsure_anchor: None,
         };
-        let alone = model_member(&m, &p, None, [1.0; 3], 5, "id");
+        let out = Path::new("m");
+        let alone = model_member(&m, out, &p, None, [1.0; 3], 5, "id");
         assert_eq!(alone.verdict, "sicher");
         assert!(alone.reason.is_none());
         assert_eq!(alone.wall_residual_mm, 2.1);
         p.unsure_anchor = Some(1);
-        let inherited = model_member(&m, &p, Some("s1".into()), [1.0; 3], 5, "id");
+        let inherited = model_member(&m, out, &p, Some("s1".into()), [1.0; 3], 5, "id");
         assert_eq!(inherited.verdict, "unsicher");
         assert!(
             inherited

@@ -823,8 +823,11 @@ fn member(scan: &str, verdict: &str, included: bool) -> ModelMember {
     let run = PathBuf::from(format!("/p/scans/{scan}/slam-001"));
     ModelMember {
         scan: PathBuf::from(format!("/daten/{scan}")),
+        scan_rel: None,
         slam_dir: run.clone(),
+        slam_dir_rel: None,
         map_dir: run.join("karte-001"),
+        map_dir_rel: None,
         slam: SlamSettings::default(),
         transform: [
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,

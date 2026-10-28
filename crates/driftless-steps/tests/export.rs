@@ -79,8 +79,11 @@ fn member(scan: &str, pose: &Isometry3<f64>, included: bool) -> ModelMember {
     let h = pose.to_homogeneous();
     ModelMember {
         scan: PathBuf::from("/scans").join(scan),
+        scan_rel: None,
         slam_dir: PathBuf::from("/scans").join(scan).join("driftless"),
+        slam_dir_rel: None,
         map_dir: PathBuf::from("/scans").join(scan).join("driftless"),
+        map_dir_rel: None,
         slam: SlamSettings::default(),
         transform: std::array::from_fn(|k| h[(k / 4, k % 4)]),
         placed_against: None,

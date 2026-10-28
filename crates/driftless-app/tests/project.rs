@@ -587,6 +587,79 @@ fn relative_and_windows_style_paths() {
     assert_eq!(r.scan_state(&a), ScanState::Ready);
 }
 
+/// A scan and a run outside the project: absolute, and relative to the project beside it
+/// (also in `lauf.toml`). The relative path is read first where it exists, else the absolute
+/// one; a list of relative run paths that does not match the runs is ignored.
+#[test]
+fn outside_paths_are_kept_relative_too() {
+    let dir = tmp("app-paths-outside");
+    let pdir = dir.join("projekte").join("p");
+    let mut p = Project::create(&pdir, "P").unwrap();
+    let outside = scan(&dir.join("rohdaten"), "aussen", 0.5);
+    let id = p.add_scan(&outside).unwrap();
+    let cli = dir.join("cli").join("lauf");
+    fake_run(&cli);
+    p.add_run(&id, &cli).unwrap();
+    p.save().unwrap();
+    let text = fs::read_to_string(pdir.join("project.toml")).unwrap();
+    let t: toml::Table = toml::from_str(&text).unwrap();
+    let s = &t["scan"][0];
+    assert_eq!(Path::new(s["path"].as_str().unwrap()), canon(&outside));
+    assert_eq!(s["path_rel"].as_str(), Some("../../rohdaten/aussen"));
+    assert_eq!(Path::new(s["extra_runs"][0].as_str().unwrap()), canon(&cli));
+    assert_eq!(s["extra_runs_rel"][0].as_str(), Some("../../cli/lauf"));
+    let run = p.new_run_dir(&id, &SlamSettings::default()).unwrap();
+    let lauf: toml::Table =
+        toml::from_str(&fs::read_to_string(run.path().join("lauf.toml")).unwrap()).unwrap();
+    assert_eq!(Path::new(lauf["scan"].as_str().unwrap()), canon(&outside));
+    assert_eq!(lauf["scan_rel"].as_str(), Some("../../rohdaten/aussen"));
+    drop(run);
+
+    // Everything moved together: only the relative paths lead to the folders.
+    let moved = tmp("app-paths-outside-moved");
+    fs::remove_dir_all(&moved).unwrap();
+    fs::rename(&dir, &moved).unwrap();
+    let q = Project::open(&moved.join("projekte").join("p")).unwrap();
+    assert_eq!(
+        q.scans[0].path,
+        canon(&moved.join("rohdaten").join("aussen"))
+    );
+    assert_eq!(
+        q.scans[0].extra_runs,
+        [canon(&moved.join("cli").join("lauf"))]
+    );
+    assert_eq!(q.scan_state(&id), ScanState::Ready);
+    // Saved again: the paths of the new place.
+    q.save().unwrap();
+    let r = Project::open(&moved.join("projekte").join("p")).unwrap();
+    assert_eq!(r.scans, q.scans);
+
+    // The project alone moved elsewhere: the relative paths lead nowhere, the absolute ones
+    // are taken.
+    let alone = moved.join("woanders").join("tiefer").join("p");
+    fs::create_dir_all(alone.parent().unwrap()).unwrap();
+    fs::rename(moved.join("projekte").join("p"), &alone).unwrap();
+    let r = Project::open(&alone).unwrap();
+    assert_eq!(r.scans[0].path, q.scans[0].path);
+    assert_eq!(r.scans[0].extra_runs, q.scans[0].extra_runs);
+
+    // A hand edit left another number of relative run paths than runs: they are not used,
+    // although the first would lead to a folder (another one).
+    let file = alone.join("project.toml");
+    let mut t: toml::Table = toml::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    let wrong = toml::Value::Array(vec!["../../../rohdaten/aussen".into(), "".into()]);
+    t["scan"].as_array_mut().unwrap()[0]
+        .as_table_mut()
+        .unwrap()
+        .insert("extra_runs_rel".into(), wrong);
+    fs::write(&file, toml::to_string(&t).unwrap()).unwrap();
+    assert!(alone.join("../../../rohdaten/aussen").is_dir());
+    assert_eq!(
+        Project::open(&alone).unwrap().scans[0].extra_runs,
+        q.scans[0].extra_runs
+    );
+}
+
 #[test]
 fn bad_scan_ids_are_refused() {
     let dir = tmp("app-bad-ids");

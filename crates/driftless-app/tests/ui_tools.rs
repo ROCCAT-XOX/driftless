@@ -683,8 +683,11 @@ fn model_member(root: &Path, name: &str, pose: &Isometry3<f64>, verdict: &str) -
     let run = root.join(name);
     ModelMember {
         scan: PathBuf::from(format!("/daten/{name}")),
+        scan_rel: None,
         slam_dir: run.clone(),
+        slam_dir_rel: None,
         map_dir: run.join("karte"),
+        map_dir_rel: None,
         slam: SlamSettings::default(),
         transform: rows(pose),
         placed_against: (verdict != "bezug").then_some(0),
