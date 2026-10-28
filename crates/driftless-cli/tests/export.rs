@@ -48,6 +48,27 @@ fn export_writes_laz() {
     assert_eq!(read_points(&out, &Progress::new()).unwrap().len(), 1500);
 }
 
+/// Into a folder that is not there: a German message with the folder, not the system's
+/// „No such file or directory (os error 2)“ (a-report #10).
+#[test]
+fn export_into_missing_folder_says_so() {
+    let dir = tmp("export-kein-ordner");
+    let src = source(&dir);
+    let out = dir.join("gibt es nicht").join("karte.laz");
+    driftless(&[
+        "export".as_ref(),
+        src.as_os_str(),
+        "-o".as_ref(),
+        out.as_os_str(),
+    ])
+    .failure()
+    .stderr(predicate::str::contains(format!(
+        "Fehler: Zielordner {} gibt es nicht",
+        dir.join("gibt es nicht").display()
+    )))
+    .stderr(predicate::str::contains("os error").not());
+}
+
 #[test]
 fn export_needs_ueberschreiben() {
     let dir = tmp("export-exists");

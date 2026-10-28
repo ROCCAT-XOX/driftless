@@ -104,7 +104,10 @@ fn images_part(
     match images_of(&req.map.scan, &odom.lidar_to_imu, progress)? {
         Ok(c) => Ok((c.id.clone(), Some(c))),
         Err(why) => {
-            progress.warn(format!("Oberfläche ohne Textur, {why}"));
+            progress.warn(format!(
+                "{why} – Oberfläche ohne Textur, alle Flächen grau; fehlt das nur in der Kopie, \
+                 es vom Gerät dazukopieren und die Oberfläche neu rechnen"
+            ));
             Ok(("no images\n".into(), None))
         }
     }
@@ -433,7 +436,8 @@ fn make_surface(
             ("stammen", "gehören")
         };
         progress.warn(format!(
-            "{} {verb} aus einem früheren Lauf und {belongs} nicht mehr zur Oberfläche",
+            "{} {verb} aus einem früheren Lauf und {belongs} nicht mehr zur Oberfläche – nicht \
+             verwenden; gelöscht wird nichts, bei Bedarf von Hand löschen",
             stale.join(", ")
         ));
     }
@@ -622,7 +626,10 @@ fn model_plan(req: &ModelSurfaceRequest, progress: &Progress) -> Result<ModelPla
             match images_of(&m.scan, &lidar_to_imu, progress)? {
                 Ok(c) => (c.id.clone(), Some(c)),
                 Err(why) => {
-                    progress.warn(format!("{name} trägt nichts zur Textur bei, {why}"));
+                    progress.warn(format!(
+                        "{name}: {why} – trägt nichts zur Textur bei, die anderen Scans färben \
+                         das Modell"
+                    ));
                     ("no images\n".to_string(), None)
                 }
             }

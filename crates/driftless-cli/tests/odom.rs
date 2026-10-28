@@ -306,8 +306,10 @@ fn odom_truncated_bag_warns_and_keeps_data() {
     fs::write(dir.join("LIDAR_0.bag"), bytes).unwrap();
     odom(&dir, &[])
         .success()
-        .stderr(predicate::str::contains("Warnung"))
-        .stderr(predicate::str::contains("truncated"));
+        .stderr(predicate::str::contains(
+            "Warnung: LIDAR_0.bag abgeschnitten (",
+        ))
+        .stderr(predicate::str::contains("neu vom Gerät kopieren"));
     let traj = driftless_traj::read_tum(&dir.join("out/traj.tum")).unwrap();
     assert!(!traj.is_empty() && traj.len() < 15, "{} poses", traj.len());
 }

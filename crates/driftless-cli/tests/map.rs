@@ -247,11 +247,11 @@ fn map_skipped_color_marks_old_color_stale() {
     fs::remove_dir_all(dir.join("calibration")).unwrap();
     map(&dir, &out, &[])
         .success()
+        .stderr(predicate::str::contains("Warnung: keine Kalibrierung: "))
+        .stderr(predicate::str::contains("Karte nicht eingefärbt"))
         .stderr(predicate::str::contains(
-            "nicht eingefärbt, keine Kalibrierung",
-        ))
-        .stderr(predicate::str::contains(
-            "color.las stammt aus einem früheren Lauf und passt nicht mehr zu clean.bin",
+            "color.las stammt aus einem früheren Lauf und passt nicht mehr zu clean.bin – \
+             nicht verwenden; gelöscht wird nichts",
         ))
         .stderr(predicate::str::contains("fehlen").not());
     let json = map_json(&out);

@@ -746,6 +746,37 @@ fn stale_tmp_files_of_the_target_are_removed() {
     assert!(leftovers(out.parent().unwrap()).is_empty());
 }
 
+/// A target in a folder that is not there: refused in German before anything is read, not
+/// with the system's English message from the writer.
+#[test]
+fn missing_target_folder_is_refused_in_german() {
+    let map = map_dir("export-kein-ordner", true);
+    let base = map.parent().unwrap().to_path_buf();
+    let missing = base.join("gibt es nicht");
+    let m = failed(
+        ExportSource::Map(map.clone()),
+        &missing.join("karte.laz"),
+        ExportFormat::Laz,
+        false,
+    );
+    assert_eq!(
+        m,
+        format!(
+            "Zielordner {} gibt es nicht – einen vorhandenen Ordner wählen oder ihn erst anlegen",
+            missing.display()
+        )
+    );
+    assert!(!missing.exists());
+    fs::write(base.join("datei"), b"").unwrap();
+    let m = failed(
+        ExportSource::Map(map),
+        &base.join("datei").join("karte.laz"),
+        ExportFormat::Laz,
+        true,
+    );
+    assert!(m.contains("ist kein Ordner"), "{m}");
+}
+
 #[test]
 fn cancel_keeps_old_files() {
     let surface = surface_dir("export-cancel", 2);

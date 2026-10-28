@@ -219,8 +219,10 @@ fn export_glim_truncated_bag_warns_and_keeps_data() {
     fs::write(dir.join("LIDAR_0.bag"), bytes).unwrap();
     export(&dir, &[])
         .success()
-        .stderr(predicate::str::contains("Warnung"))
-        .stderr(predicate::str::contains("truncated"));
+        .stderr(predicate::str::contains(
+            "Warnung: LIDAR_0.bag abgeschnitten (",
+        ))
+        .stderr(predicate::str::contains("neu vom Gerät kopieren"));
     let lidar = fs::read(dir.join("out/lidar.bin")).unwrap();
     assert!(lidar.len() > 8);
 }

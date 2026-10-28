@@ -331,7 +331,8 @@ pub(crate) fn color_input(
     for (name, c) in &calib.cameras {
         let Some(lidar_to_cam) = c.lidar_to_cam else {
             progress.warn(format!(
-                "Kamera {name} hat keine transform_matrix, übersprungen"
+                "Kamera {name} ohne transform_matrix in calib.json: übersprungen, sie färbt \
+                 nichts – die Kalibrierung vom Gerät prüfen (calibration/calib.json)"
             ));
             continue;
         };
@@ -489,27 +490,35 @@ fn clean_json(s: &CleanStats) -> Value {
     })
 }
 
-/// Warnings about a colour run that the user should see (German, without the "Warnung: ").
+/// Warnings about a colour run that the user should see (German, without the "Warnung: "):
+/// the reason first, then what it means and what to do.
 fn color_warnings(s: &ColorStats) -> Vec<String> {
     let mut out = Vec::new();
     if s.image_bags_truncated > 0 {
         out.push(format!(
-            "{} Bilddatei(en) sind abgeschnitten, die Bilder bis dahin wurden genutzt",
+            "{} Bilddatei(en) abgeschnitten (Aufnahme unterbrochen oder Kopie unvollständig): \
+             nur die Bilder bis dahin genutzt – ist nur die Kopie unvollständig, die \
+             IMAGE_*.bag neu vom Gerät kopieren und die Karte neu rechnen",
             s.image_bags_truncated
         ));
     }
     let cameras: BTreeSet<&str> = s.gains.iter().map(|g| g.camera.as_str()).collect();
     if cameras.len() > 1 && s.camera_difference_points == 0 {
         out.push(
-            "die Kameras sehen keine gemeinsamen Punkte, Belichtung zwischen ihnen nicht \
-             abgeglichen"
+            "Die Kameras sehen keine gemeinsamen Punkte (sehr kurzer Scan, oder die \
+             Kalibrierung passt nicht zum Gerät): Belichtung zwischen ihnen nicht abgeglichen, \
+             die Farben können je Kamera abweichen – bei einem längeren Scan die Kalibrierung \
+             prüfen (driftless calib-check)"
                 .into(),
         );
     }
     // More than 1 % of the images.
     if s.images_gain_clamped * 100 > s.images_used {
         out.push(format!(
-            "{} Bilder ({:.0} %) stoßen an die Grenze des Belichtungsabgleichs",
+            "{} Bilder ({:.0} %) viel heller oder dunkler als ihre Nachbarn (Fenster, \
+             Gegenlicht, Lampen): der Belichtungsabgleich gleicht sie nur bis zu seiner Grenze \
+             an, dort können die Farben fleckig wirken – meist nichts zu tun; stört es, bei \
+             gleichmäßigerem Licht neu scannen",
             s.images_gain_clamped,
             100.0 * s.images_gain_clamped as f64 / s.images_used.max(1) as f64
         ));
@@ -1081,7 +1090,8 @@ fn warn_stale(
         };
         let fits = if found.len() == 1 { "passt" } else { "passen" };
         progress.warn(format!(
-            "{} {verb} aus einem früheren Lauf und {fits} nicht mehr zu {source}",
+            "{} {verb} aus einem früheren Lauf und {fits} nicht mehr zu {source} – nicht \
+             verwenden; gelöscht wird nichts, bei Bedarf von Hand löschen",
             found.join(", ")
         ));
         stale.extend(found.iter().map(|f| f.to_string()));
@@ -1393,7 +1403,10 @@ pub fn recompute_map(req: &MapRequest, progress: &Progress) -> Result<Value, Ste
                     run.run_color(cloud, input, device.expect("opened with the colour input"))?
                 }
                 Err(why) => {
-                    progress.warn(format!("nicht eingefärbt, {why}"));
+                    progress.warn(format!(
+                        "{why} – Karte nicht eingefärbt (clean.las statt color.las); fehlt das \
+                         nur in der Kopie, es vom Gerät dazukopieren und die Karte neu rechnen"
+                    ));
                     run.steps.insert("color", json!({"skipped": why}));
                 }
             }
@@ -1496,6 +1509,7 @@ mod tests {
         assert_eq!(color_warnings(&clamped(3)).len(), 1);
     }
 
+    /// The reason first (very bright or dark images), then what it means and what to do.
     #[test]
     fn warns_about_clamped_gains() {
         let s = ColorStats {
@@ -1506,7 +1520,12 @@ mod tests {
         let w = color_warnings(&s);
         assert_eq!(
             w,
-            vec!["26 Bilder (13 %) stoßen an die Grenze des Belichtungsabgleichs"]
+            vec![
+                "26 Bilder (13 %) viel heller oder dunkler als ihre Nachbarn (Fenster, \
+                 Gegenlicht, Lampen): der Belichtungsabgleich gleicht sie nur bis zu seiner \
+                 Grenze an, dort können die Farben fleckig wirken – meist nichts zu tun; stört \
+                 es, bei gleichmäßigerem Licht neu scannen"
+            ]
         );
     }
 }

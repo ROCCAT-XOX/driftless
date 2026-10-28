@@ -145,10 +145,12 @@ fn map_out_dir_separate_from_slam_dir() {
         "{report}"
     );
     assert!(report["steps"]["color"]["skipped"].is_string(), "{report}");
-    // no images: a warning, as on the console
+    // no images: a warning, as on the console; the reason first, then what to do
     assert!(p.take_log().iter().any(|l| matches!(
         l,
-        driftless_io::progress::LogLine::Warning(w) if w.starts_with("nicht eingefärbt, ")
+        driftless_io::progress::LogLine::Warning(w) if w.starts_with("keine Kamerabilder: ")
+            && w.contains(" – Karte nicht eingefärbt (clean.las statt color.las); ")
+            && w.ends_with("die Karte neu rechnen")
     )));
 }
 

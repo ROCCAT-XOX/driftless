@@ -419,8 +419,9 @@ pub fn existing_targets(req: &ExportRequest) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The checks before anything is read: the format fits the source and no target is a file
-/// of the source. The existing targets are not checked here ([`existing_targets`]).
+/// The checks before anything is read: the format fits the source, the folder of the target
+/// is there and no target is a file of the source. The existing targets are not checked here
+/// ([`existing_targets`]).
 pub fn check_export(req: &ExportRequest) -> Result<(), StepError> {
     let kind = req.source.kind();
     if req.format.kind() != kind {
@@ -429,6 +430,20 @@ pub fn check_export(req: &ExportRequest) -> Result<(), StepError> {
             req.format.label(),
             req.source.noun(),
             ExportFormat::labels_of(kind)
+        )
+        .into());
+    }
+    // In German before anything is read; the writer would fail with the system's message.
+    let dir = target_dir(&req.out);
+    if !dir.is_dir() {
+        let why = if dir.exists() {
+            "ist kein Ordner"
+        } else {
+            "gibt es nicht"
+        };
+        return Err(format!(
+            "Zielordner {} {why} – einen vorhandenen Ordner wählen oder ihn erst anlegen",
+            dir.display()
         )
         .into());
     }
