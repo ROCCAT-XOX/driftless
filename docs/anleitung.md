@@ -180,39 +180,34 @@ Ebenen, zum Beispiel „Laufbahn“ und „Schleifen“.
 
 ## 5. Welche Einstellung?
 
-Zwei Schalter entscheiden über Zeit, Arbeitsspeicher und Platz: die „Genauigkeit“ der Karte in „Daten“
-und die „Feinheit“ der Oberfläche in „Bilder“. Die Vorgabe „Genau“ und „2 cm“ passt für die meisten
-Räume. Die Zeiten sind auf einem Testrechner (Linux) mit der Grafikkarte NVIDIA RTX 5080 gemessen,
-außer bei den Werten mit dem Zusatz (Mac). Auf einem Büro-PC oder Laptop kann es länger dauern.
+Zwei Schalter entscheiden über Zeit, Arbeitsspeicher und Platz:
+- die „Genauigkeit“ der Karte in „Daten“
+- die „Feinheit“ der Oberfläche in „Bilder“
 
-**Karte** („Genauigkeit“ in „Daten“), gemessen am Büro-Scan (10 Minuten Aufnahme):
+Die Vorgaben „Genau“ und „2 cm“ passen für die meisten Räume.
 
-| „Genauigkeit“ | Punktabstand | gut für | Zeit | Arbeitsspeicher | Platz | Quelle |
-|---|---|---|---|---|---|---|
-| „Schnell“ | 2 cm | schnell ansehen; aus der Nähe löchrig | nicht gemessen | nicht gemessen | nicht gemessen | – |
-| „Genau“ (Vorgabe) | 1 cm | die meisten Räume | 7 min (Mac)¹ | 4,1 GB (Mac)¹ | nicht gemessen | [Meilenstein 5](ergebnisse/2026-10-22-meilenstein-5.md) |
-| „Maximal“ | 0,5 cm | genauere Wände und Kanten, feine Teile | nicht gemessen | über 4 GB² | nicht gemessen | Hinweis im Programm |
+Die Zahlen sind auf einem Testrechner gemessen: Linux mit der Grafikkarte NVIDIA RTX 5080, Version 0.1.0
+([Ergebnisse](ergebnisse/2026-10-28-version-0-1.md)). Auf einem Büro-PC oder Laptop dauert es länger.
+Auf dem Mac sind sie noch nicht nachgemessen.
 
-¹ Auf dem Mac (M4 Pro) gemessen, als das Einfärben noch ohne Grafikkarte lief; dieser Teil ist auf dem
-Mac seitdem 5,7-mal schneller ([Baustein GPU](ergebnisse/2026-10-23-baustein-gpu.md)).
-² So steht es unter „Maximal“ im Programm; eine Messung im Ergebnisbericht gibt es nicht.
+**Karte** („Genauigkeit“ in „Daten“):
 
-**Oberfläche** („Feinheit“ in „Bilder“), auf dem Testrechner mit RTX 5080:
+| „Genauigkeit“ | Punktabstand | gut für | Kleiner Raum (6 min Aufnahme): Zeit · Speicher · Platz | Büro (10 min Aufnahme): Zeit · Speicher · Platz |
+|---|---|---|---|---|
+| „Schnell“ | 2 cm | schnell ansehen; aus der Nähe löchrig | 1,0 min · 0,7 GB · 0,2 GB | 1,9 min · 1,4 GB · 0,7 GB |
+| „Genau“ (Vorgabe) | 1 cm | die meisten Räume | 1,4 min · 1,4 GB · 0,6 GB | 2,7 min · 2,7 GB · 1,5 GB |
+| „Maximal“ | 0,5 cm | genauere Wände und Kanten, feine Teile | 2,6 min · 2,3 GB · 1,2 GB | 3,8 min · 3,8 GB · 2,2 GB |
 
-| „Feinheit“ | gut für | Kleiner Raum (6 min Aufnahme): Zeit · Speicher · Datei | Büro (10 min Aufnahme): Zeit · Speicher · Datei |
+**Oberfläche** („Feinheit“ in „Bilder“), aus der Karte „Genau“:
+
+| „Feinheit“ | gut für | Kleiner Raum: Zeit · Speicher · Datei | Büro: Zeit · Speicher · Datei |
 |---|---|---|---|
-| „2 cm“ (Vorgabe) | geschlossene Flächen, kleine Dateien | 2 min · 1,2 GB · 49 MB | 7 min · 3,2 GB · 284 MB³ |
-| „1,5 cm“ | dazwischen | nicht gemessen | nicht gemessen |
-| „1 cm“ | genauere Kanten; in großen und dunklen Räumen mehr offene Stellen | 4 min · 2,7 GB · 110 MB | 21 min · 8,2 GB · 609 MB³ |
+| „2 cm“ (Vorgabe) | geschlossene Flächen, kleine Dateien | 1,9 min · 1,1 GB · 52 MB | 7,0 min · 3,6 GB · 293 MB |
+| „1,5 cm“ | dazwischen | 2,7 min · 1,5 GB · 76 MB | 12,6 min · 5,6 GB · 431 MB |
+| „1 cm“ | genauere Kanten; in großen und dunklen Räumen mehr offene Stellen | 4,3 min · 2,6 GB · 130 MB | 20,2 min · 7,7 GB · 631 MB |
 
-Quellen: kleiner Raum und Büro bei „1 cm“: [Baustein 1](ergebnisse/2026-10-27-baustein-1.md); Büro bei
-„2 cm“: [Qualitätsrunde](ergebnisse/2026-10-25-qualitaetsrunde.md); Dateigrößen Büro:
-[Schritt F](ergebnisse/2026-10-26-qualitaet-f.md).
-³ Die Büro-Dateien sind vor Baustein 1 gemessen. Seitdem sind die Dateien etwas größer (kleiner Raum bei
-„1 cm“: vorher 96 MB, nachher 110 MB, siehe Baustein 1).
-
-Die Laufbahn vor der Karte braucht nur Sekunden. Den freien Platz für die Ergebnisse nennt
-[Voraussetzungen](#voraussetzungen).
+Die Laufbahn vor der Karte braucht nur Sekunden: 9 s im kleinen Raum, 34 s im Büro. Den freien Platz für
+die Ergebnisse nennt [Voraussetzungen](#voraussetzungen).
 
 ## 6. Mehrere Scans zusammenführen
 
