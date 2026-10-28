@@ -979,7 +979,7 @@ fn surface_hint_in_the_tree() {
 }
 
 /// On hover over a scan of a model: the residual on the walls, or that they could not be
-/// measured (never „Wände 0,0 mm“).
+/// measured (never „Wände 0,0 mm“) – once: not again when the reason says so.
 #[test]
 fn member_hover_names_the_walls() {
     let mut state = with_model();
@@ -997,6 +997,29 @@ fn member_hover_names_the_walls() {
         .query_by_label_contains(text::WALLS_UNMEASURABLE)
         .is_none());
     assert_eq!(text::member_walls(1.9), "Wände 1,9 mm");
+
+    // unsure only because of the walls: the reason says it, the line below it does not again
+    let mut state = with_model();
+    let unsure = &mut state.models[0].report.members[2];
+    unsure.wall_residual_mm = None;
+    unsure.reason = Some(text::WALLS_UNMEASURABLE.into());
+    let mut h = panel(state);
+    h.ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.0);
+    h.get_by_label("3 · Scan 13:35").hover();
+    h.run();
+    // a label keeps its text as its value
+    let hover = h
+        .get_by_label_contains(text::VERDICT_HINT)
+        .accesskit_node()
+        .value()
+        .unwrap_or_default();
+    let reason = format!("{}: {}", text::VERDICT_UNSURE, text::WALLS_UNMEASURABLE);
+    assert!(hover.contains(&reason), "{hover}");
+    assert_eq!(
+        hover.matches(text::WALLS_UNMEASURABLE).count(),
+        1,
+        "{hover}"
+    );
 }
 
 #[test]

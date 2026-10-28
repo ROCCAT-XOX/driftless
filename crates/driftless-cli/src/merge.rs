@@ -127,8 +127,8 @@ fn folder_name(p: &Path) -> String {
 }
 
 /// One line per scan: name, verdict (with the fit of the point pairs that placed it), overlap,
-/// residual over all points and on the walls („Wände nicht messbar“ without them), and why it
-/// is unsure.
+/// residual over all points and on the walls („Wände nicht messbar“ without them, unless the
+/// reason says so already), and why it is unsure.
 fn lines(report: &ModelReport) -> Vec<String> {
     report
         .members
@@ -145,12 +145,18 @@ fn lines(report: &ModelReport) -> Vec<String> {
                 _ if m.method == "punktpaare" => " (Punktpaare)".to_string(),
                 _ => String::new(),
             };
-            let walls = m.wall_residual_mm.map_or_else(
-                || WALLS_UNMEASURABLE.to_string(),
-                |w| format!("Wände {w:.1} mm"),
-            );
+            // „Wände nicht messbar“ only once: the reason may say it already
+            let said = m
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains(WALLS_UNMEASURABLE));
+            let walls = match m.wall_residual_mm {
+                Some(w) => format!(", Wände {w:.1} mm"),
+                None if said => String::new(),
+                None => format!(", {WALLS_UNMEASURABLE}"),
+            };
             let mut line = format!(
-                "{name}: {}{by_hand}, Überlappung {:.0} %, Restfehler {:.1} mm, {walls}",
+                "{name}: {}{by_hand}, Überlappung {:.0} %, Restfehler {:.1} mm{walls}",
                 m.verdict,
                 100.0 * m.overlap,
                 m.residual_median_mm,
@@ -290,7 +296,7 @@ mod tests {
     }
 
     /// The line of a scan names the residual on the walls, or that they could not be measured
-    /// (never „Wände 0.0 mm“).
+    /// (never „Wände 0.0 mm“) – once: not again when the reason says so.
     #[test]
     fn lines_say_when_walls_are_not_measurable() {
         let member = |name: &str, walls: Option<f64>, reason: Option<&str>| {
@@ -310,12 +316,16 @@ mod tests {
         };
         let mut reference = member("a", None, None);
         reference["placed_against"] = serde_json::Value::Null;
+        let mut unsure = member("d", None, Some("Überlappung nur 40 %; Wände nicht messbar"));
+        unsure["verdict"] = "unsicher".into();
         let report: ModelReport = serde_json::from_value(serde_json::json!({
             "version": driftless_steps::merge::MERGE_VERSION, "input_id": "0",
             "members": [
                 reference,
                 member("b", Some(1.84), None),
                 member("c", None, Some(WALLS_UNMEASURABLE)),
+                unsure,
+                member("e", None, None),
             ],
             "points": 30, "seconds_total": 1.0, "peak_rss_bytes": 0,
         }))
@@ -325,8 +335,16 @@ mod tests {
         assert!(lines[1].ends_with(", Wände 1.8 mm"), "{}", lines[1]);
         assert_eq!(
             lines[2],
-            "c: sicher, Überlappung 98 %, Restfehler 1.8 mm, Wände nicht messbar – Wände nicht \
-             messbar"
+            "c: sicher, Überlappung 98 %, Restfehler 1.8 mm – Wände nicht messbar"
+        );
+        assert_eq!(
+            lines[3],
+            "d: unsicher, Überlappung 98 %, Restfehler 1.8 mm – Überlappung nur 40 %; Wände \
+             nicht messbar"
+        );
+        assert_eq!(
+            lines[4],
+            "e: sicher, Überlappung 98 %, Restfehler 1.8 mm, Wände nicht messbar"
         );
     }
 

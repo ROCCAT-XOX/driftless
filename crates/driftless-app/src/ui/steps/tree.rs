@@ -240,10 +240,17 @@ fn member_rows(ui: &mut Ui, state: &AppState, k: usize, m: &ModelMember) {
         hover += &format!("\n{}", text::member_pairs_fit(rms));
     }
     if !reference {
-        let walls = m
-            .wall_residual_mm
-            .map_or_else(|| text::WALLS_UNMEASURABLE.to_string(), text::member_walls);
-        hover += &format!("\n{walls}\n{}", text::VERDICT_HINT);
+        // „Wände nicht messbar“ only once: the reason may say it already
+        let said = m
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains(text::WALLS_UNMEASURABLE));
+        match m.wall_residual_mm {
+            Some(w) => hover += &format!("\n{}", text::member_walls(w)),
+            None if said => {}
+            None => hover += &format!("\n{}", text::WALLS_UNMEASURABLE),
+        }
+        hover += &format!("\n{}", text::VERDICT_HINT);
     }
     let [r, g, b] = SCAN_COLORS[k % SCAN_COLORS.len()];
     let row = ui
