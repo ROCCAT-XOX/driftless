@@ -65,6 +65,61 @@ fn a_stale_lock_is_taken_over() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A left lock that cannot be removed – here in a folder this program may not write, as on a
+/// share where it is another user's – is waited for like a held one and then refused, never
+/// tried again at once (before, the loop spun forever at full load); the German message names
+/// the lock file and says to delete it by hand once no one else has the project open.
+#[cfg(unix)]
+#[test]
+fn a_stale_lock_that_cannot_be_removed_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp("sperre-nicht-entfernbar");
+    let file = dir.join("project.toml");
+    let lock_file = dir.join("project.toml.lock");
+    fs::write(&lock_file, "Prozess 1 · Benutzer anna").unwrap();
+    let old = SystemTime::now() - LOCK_STALE - Duration::from_secs(5);
+    fs::File::options()
+        .write(true)
+        .open(&lock_file)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let writable = |mode: u32| fs::set_permissions(&dir, fs::Permissions::from_mode(mode));
+    writable(0o555).unwrap();
+    // as root the folder stays writable: nothing to check then
+    if fs::write(dir.join("probe"), b"").is_ok() {
+        writable(0o755).unwrap();
+        eprintln!("Ordner bleibt beschreibbar (root?): übersprungen");
+        return;
+    }
+    let started = std::time::Instant::now();
+    let wait = Duration::from_millis(200);
+    let result = FileLock::acquire_within(&file, wait, LOCK_STALE);
+    let took = started.elapsed();
+    writable(0o755).unwrap();
+    let e = result.unwrap_err();
+    assert!(took >= wait, "{took:?}");
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    let message = e.to_string();
+    assert!(
+        message.starts_with(
+            "project.toml nicht sperrbar: die liegen gebliebene Sperrdatei project.toml.lock \
+             (Prozess 1 · Benutzer anna) lässt sich nicht entfernen ("
+        ),
+        "{message}"
+    );
+    assert!(
+        message.contains("hat niemand sonst das Projekt offen, sie von Hand löschen"),
+        "{message}"
+    );
+    assert!(
+        message.ends_with(&format!("\n{}", lock_file.display())),
+        "{message}"
+    );
+    assert!(e.stuck.is_some());
+    assert!(lock_file.is_file(), "nothing else removed it");
+}
+
 /// Two threads that each read, change and write the same file under the lock lose nothing.
 #[test]
 fn writers_under_the_lock_lose_nothing() {

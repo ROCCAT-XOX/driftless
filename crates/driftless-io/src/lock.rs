@@ -2,7 +2,10 @@
 //! project, the window and the command line on one run, two colleagues on a project on a
 //! network share. `<name>.lock` next to the file says who holds it; it is held only while the
 //! file is read, changed and written (milliseconds), and a lock older than [`LOCK_STALE`] is
-//! taken to be left by a program that ended without removing it.
+//! taken to be left by a program that ended without removing it. A left lock that cannot be
+//! removed (another user's on a share, a folder without the right to write, a file a sync
+//! client holds) is waited for like a held one, then refused with a message that says to
+//! delete it by hand.
 
 use std::fmt;
 use std::fs;
@@ -32,6 +35,9 @@ pub struct LockError {
     pub holder: Option<String>,
     /// Why the lock file could not be made, if that was the reason.
     pub error: Option<io::Error>,
+    /// The lock file was left behind (older than [`LOCK_STALE`]) but could not be removed:
+    /// why. It must be deleted by hand.
+    pub stuck: Option<io::Error>,
 }
 
 impl fmt::Display for LockError {
@@ -40,6 +46,18 @@ impl fmt::Display for LockError {
             || self.file.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
         );
+        if let Some(e) = &self.stuck {
+            let lock = lock_path(&self.file);
+            let lock_name = lock.file_name().unwrap_or_default().to_string_lossy();
+            let holder = self.holder.as_deref().unwrap_or("unbekannt");
+            return write!(
+                f,
+                "{name} nicht sperrbar: die liegen gebliebene Sperrdatei {lock_name} ({holder}) \
+                 lässt sich nicht entfernen ({e}); hat niemand sonst das Projekt offen, sie von \
+                 Hand löschen\n{}",
+                lock.display()
+            );
+        }
         match (&self.holder, &self.error) {
             (Some(holder), _) => write!(
                 f,
@@ -91,7 +109,8 @@ fn is_stale(path: &Path, stale: Duration) -> bool {
 
 impl FileLock {
     /// Takes the lock of `file`, waiting up to [`LOCK_WAIT`] while another holds it; a lock
-    /// left behind ([`LOCK_STALE`]) is taken over.
+    /// left behind ([`LOCK_STALE`]) is taken over if it can be removed, else waited for as
+    /// well and then refused ([`LockError::stuck`]).
     pub fn acquire(file: &Path) -> Result<FileLock, LockError> {
         FileLock::acquire_within(file, LOCK_WAIT, LOCK_STALE)
     }
@@ -116,9 +135,16 @@ impl FileLock {
                     return Ok(FileLock { path });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    // a left lock: taken over, i.e. tried again at once, only once it is really
+                    // gone (removed here, or by another); one that cannot be removed is waited
+                    // for like a held one
+                    let mut stuck = None;
                     if is_stale(&path, stale) {
-                        let _ = fs::remove_file(&path);
-                        continue;
+                        match fs::remove_file(&path) {
+                            Ok(()) => continue,
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                            Err(e) => stuck = Some(e),
+                        }
                     }
                     if Instant::now() >= deadline {
                         let holder = fs::read_to_string(&path)
@@ -130,6 +156,7 @@ impl FileLock {
                             file: file.to_path_buf(),
                             holder: Some(holder),
                             error: None,
+                            stuck,
                         });
                     }
                     std::thread::sleep(RETRY);
@@ -139,6 +166,7 @@ impl FileLock {
                         file: file.to_path_buf(),
                         holder: None,
                         error: Some(e),
+                        stuck: None,
                     })
                 }
             }
