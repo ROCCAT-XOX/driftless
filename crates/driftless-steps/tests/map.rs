@@ -621,4 +621,20 @@ fn stages_taken_over_keep_their_entries() {
     assert!(steps.get("color").is_none(), "{steps}");
     assert_eq!(report["stale"], json!([]));
     assert!(folder_fits(&all, &k4));
+
+    // a map of an older version whose entry lists no files: the stage taken over is listed
+    let older = dir.join("karte-aelter");
+    fs::create_dir_all(&older).unwrap();
+    let mut old_report = whole.clone();
+    old_report["steps"]["clean"]
+        .as_object_mut()
+        .unwrap()
+        .remove("files");
+    fs::write(older.join("map.json"), old_report.to_string()).unwrap();
+    let k5 = take_over("karte-005", CLEAN_BIN);
+    let req = request(&dir, &slam_dir, &k5, MapStep::Color);
+    let report = recompute_map_from(&req, Some(&older), &Progress::new()).unwrap();
+    assert_eq!(report["steps"]["clean"]["files"], json!([CLEAN_BIN]));
+    assert_eq!(report["stale"], json!([]));
+    assert!(folder_fits(&all, &k5));
 }

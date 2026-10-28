@@ -825,9 +825,15 @@ impl MapRun<'_> {
 
     /// Entry of a step whose result, the stage `file`, was taken from the folder.
     fn record_reused(&mut self, step: &'static str, id: &str, file: &str) {
-        let e = self
+        let mut e = self
             .carried_entry(step, id)
-            .unwrap_or_else(|| json!({"input_id": hex(id), "reused": true, "files": [file]}));
+            .unwrap_or_else(|| json!({"input_id": hex(id), "reused": true}));
+        // the stage is in the folder, also when an entry of an older version lists no files
+        match e["files"].as_array_mut() {
+            Some(files) if !files.iter().any(|f| f == file) => files.push(json!(file)),
+            Some(_) => {}
+            None => e["files"] = json!([file]),
+        }
         self.steps.insert(step, e);
     }
 
