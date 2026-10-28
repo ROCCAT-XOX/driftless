@@ -1,7 +1,8 @@
 //! `run_map` and `folder_fits` on synthetic scans (no camera images: colouring is skipped).
 
 use driftless_io::progress::{Progress, ProgressSnapshot};
-use driftless_io::testscan::{room_bag, room_bag_secs, tmp};
+use driftless_io::testscan::{furnished_room_bag, room_bag, room_bag_secs, tmp};
+use driftless_map::SMOOTH_CHUNK;
 use driftless_steps::map::{
     clean_stage_id, current_map, dense_stage_id, fitting_stages, folder_fits, recompute_map,
     run_map, MapInput, MapRequest, MapSettings, MapStep, CLEAN_BIN, DENSE_BIN,
@@ -11,6 +12,7 @@ use driftless_steps::{correct, StepError};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 fn slam(scan: &Path, out: &Path, reuse: bool) {
     let req = SlamRequest {
@@ -95,6 +97,44 @@ fn map_cancelled_writes_nothing() {
     let err = run_map(&request(&dir, &out, &out, MapStep::All), &p).unwrap_err();
     assert_eq!(err, StepError::Cancelled);
     assert_eq!(files(&out), before);
+}
+
+/// „Abbrechen“ while the clean step smooths the walls stops it after its next chunk of points
+/// (before, the smoothing ran to its end: about 90 s on a real scan at 0,5 cm), and the step
+/// writes nothing – as for the merge's smoothing.
+#[test]
+fn map_smoothing_can_be_cancelled() {
+    let dir = tmp("steps-map-glaetten");
+    // the furnished room at 0,5 cm (Maximal): points for more than two chunks
+    furnished_room_bag(&dir, true, [0.0; 3], 0.0);
+    let out = dir.join("out");
+    slam(&dir, &out, false);
+    let fine = |step| {
+        let mut req = request(&dir, &out, &out, step);
+        req.input.map.switches.voxel = 0.005;
+        req
+    };
+    run_map(&fine(MapStep::Dense), &Progress::new()).unwrap();
+    let before = files(&out);
+    let p = Progress::new();
+    let handle = p.clone();
+    let seen = Arc::new(Mutex::new(ProgressSnapshot::default()));
+    let last = seen.clone();
+    let p = p.with_observer(move |s: &ProgressSnapshot| {
+        if s.phase == "Glätten" {
+            *last.lock().unwrap() = s.clone();
+            if s.done > 0 {
+                handle.cancel();
+            }
+        }
+    });
+    let err = run_map(&fine(MapStep::Clean), &p).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    assert_eq!(files(&out), before, "nothing of the clean step written");
+    let seen = seen.lock().unwrap().clone();
+    let total = seen.total.expect("the points to smooth");
+    assert!(total > 2 * SMOOTH_CHUNK as u64, "{seen:?}");
+    assert_eq!(seen.done, SMOOTH_CHUNK as u64, "{seen:?}");
 }
 
 #[test]
