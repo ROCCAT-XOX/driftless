@@ -34,8 +34,9 @@
 //!
 //! A cancel is honoured up to the writing. `modell.las` and `modell.ply` are written through
 //! a temporary file each, `modell.json` last and atomically: a folder with a report holds a
-//! complete model. A folder that already holds a report is refused, nothing is overwritten.
-//! Every step is deterministic: the same request gives the same files.
+//! complete model. A folder that already holds a report is refused, nothing is overwritten;
+//! the `.tmp` files a killed merge left in it are removed at the start. Every step is
+//! deterministic: the same request gives the same files.
 //!
 //! `modell.json` names the folders of every scan twice: absolute and resolved (`scan`,
 //! `slam_dir`, `map_dir`) and relative to the model folder (`scan_rel`, `slam_dir_rel`,
@@ -45,6 +46,7 @@
 //! folder.
 
 use crate::error::{check_cancel, failed, StepError};
+use crate::leftovers::remove_stale_tmp;
 use crate::map::{clean_stage_id, hex, map_input_for, peak_rss_bytes, CLEAN_BIN, REPORT};
 use crate::pairs::PointPairEntry;
 use crate::slam::SlamSettings;
@@ -52,7 +54,7 @@ use driftless_io::progress::Progress;
 use driftless_io::{atomic_write, paths};
 use driftless_map::{
     intensity_grays, load_stage, smooth_surfaces, stage_fits, write_las_sources, write_ply_sources,
-    Cloud, MapError, SmoothConfig,
+    Cloud, SmoothConfig,
 };
 use driftless_odom::voxel_map::{voxel_key, FixedState, VoxelKey};
 use driftless_slam::align::{
@@ -811,24 +813,6 @@ fn assemble(clouds: Vec<Cloud>, keep: &[Vec<bool>]) -> (Cloud, Vec<u16>) {
     (out, sources)
 }
 
-/// Writes `file` in `dir` through `<file>.tmp` with `write`, so that no half file is left.
-fn write_whole(
-    dir: &Path,
-    file: &str,
-    write: impl FnOnce(&Path) -> Result<(), MapError>,
-) -> Result<(), StepError> {
-    let path = dir.join(file);
-    let tmp = dir.join(format!("{file}.tmp"));
-    let result = write(&tmp).map_err(failed).and_then(|()| {
-        fs::rename(&tmp, &path)
-            .map_err(|e| failed(format!("{} nicht schreibbar: {e}", path.display())))
-    });
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
-}
-
 /// Merges the scans of `req` into one model as `driftless merge` does; every console line
 /// goes to `progress`. Returns the `modell.json` written to [`MergeRequest::out_dir`].
 ///
@@ -848,6 +832,8 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
         )
         .into());
     }
+    let owns = |name: &str| [MODEL_LAS, MODEL_PLY, MODEL_REPORT].contains(&name);
+    remove_stale_tmp(out, owns, progress);
     let n = req.members.len();
     let (by_hand, mut warnings) = hand_pairs(req);
     for w in &warnings {
@@ -930,9 +916,10 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
     check_cancel(progress)?;
     progress.phase("Schreiben", None);
     fs::create_dir_all(out).map_err(|e| format!("{} nicht anlegbar: {e}", out.display()))?;
-    write_whole(out, MODEL_LAS, |p| write_las_sources(p, &model, &sources))?;
+    // Each through `<name>.tmp` (the writers' own), so that no half file is left.
+    write_las_sources(&out.join(MODEL_LAS), &model, &sources).map_err(failed)?;
     if req.ply {
-        write_whole(out, MODEL_PLY, |p| write_ply_sources(p, &model, &sources))?;
+        write_ply_sources(&out.join(MODEL_PLY), &model, &sources).map_err(failed)?;
     }
     let points = model.len() as u64;
     drop((model, sources));
@@ -959,7 +946,7 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
         include_unsure: req.include_unsure,
         warnings,
     };
-    let text = serde_json::to_string_pretty(&report).map_err(failed)? + "\n";
+    let text = crate::report_text(&report)?;
     atomic_write(&report_path, text.as_bytes())
         .map_err(|e| format!("{} nicht schreibbar: {e}", report_path.display()))?;
 

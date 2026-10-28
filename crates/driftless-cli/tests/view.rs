@@ -1,3 +1,7 @@
+//! `driftless view` with the debug viewer (`--features debug-viewer`): the recordings it
+//! writes with `--dry-run`.
+#![cfg(feature = "debug-viewer")]
+
 use assert_cmd::Command;
 use driftless_io::bag::writer::{BagWriter, Compression};
 use driftless_io::bag::Time;

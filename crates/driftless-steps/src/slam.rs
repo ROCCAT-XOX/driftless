@@ -9,12 +9,18 @@
 //! A full run into a folder that holds the run of another scan is refused: its frames (from
 //! `slam.json`) lie outside the times of this scan's LiDAR bags ([`run_fits_scan`]). Its
 //! corrections would be applied to this scan and its results replaced.
+//!
+//! A run removes the `.tmp` files a killed run of its files left ([`RUN_FILES`]) at its
+//! start, and `slam.json` before it writes its first file; `slam.json` comes last again, so
+//! a folder with a `slam.json` holds the files of one finished run.
 
 use crate::error::{check_cancel, failed, StepError};
 use crate::history::{self, HistoryKind};
+use crate::leftovers::{remove_report, remove_stale_tmp};
 use crate::scan::{
     parse_extrinsic, read_imu, require_frames, warn_if_not_static, with_lidar_frames, write_las,
 };
+use driftless_io::atomic_write;
 use driftless_io::bag::BagReader;
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
@@ -33,6 +39,16 @@ use std::time::Instant;
 
 pub const CACHE_FILE: &str = "submaps.bin";
 pub const CORRECTIONS_FILE: &str = "corrections.toml";
+/// The report of a run, written last.
+pub const SLAM_REPORT: &str = "slam.json";
+/// The files a run writes into its folder (besides `verlauf/`), the report last.
+pub const RUN_FILES: [&str; 5] = [
+    CACHE_FILE,
+    "traj.tum",
+    "traj_odom.tum",
+    "map.las",
+    SLAM_REPORT,
+];
 /// How far (s) a run's frames may lie outside the bag times of its scan: frame stamps come
 /// from the sensor, bag times from the recorder.
 pub const RUN_TIME_TOLERANCE: f64 = 5.0;
@@ -87,6 +103,23 @@ fn foreign_run(req: &SlamRequest, bags: &[PathBuf]) -> Option<String> {
             req.scan.join("driftless").display()
         )
     })
+}
+
+/// Why a full run of `req` cannot go into `req.out` because the folder holds the run of
+/// another scan, as [`run_slam`] refuses it (for a check before it).
+pub fn other_scan_refusal(req: &SlamRequest) -> Option<String> {
+    let project = discover_project(&req.scan).ok()?;
+    foreign_run(req, &project.lidar_bags)
+}
+
+/// The [`RUN_FILES`] in `dir`: a full run would replace them (the CLI asks for
+/// `--ueberschreiben` then).
+pub fn run_files_in(dir: &Path) -> Vec<&'static str> {
+    RUN_FILES
+        .iter()
+        .copied()
+        .filter(|f| dir.join(f).is_file())
+        .collect()
 }
 
 /// Settings of the odometry that a run depends on (the same for `slam` and `map`).
@@ -190,6 +223,7 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
             return Err(why.into());
         }
     }
+    remove_stale_tmp(out, |name| RUN_FILES.contains(&name), progress);
     let input = input_id(&project.lidar_bags, &req.settings, &cfg)?;
     let cache = out.join(CACHE_FILE);
     let corrections = Corrections::load(&out.join(CORRECTIONS_FILE))?;
@@ -218,6 +252,7 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
         if let Some(then) = &import {
             history::record_with(out, HistoryKind::Imported, 0.0, Some(then))?;
         }
+        remove_report(&out.join(SLAM_REPORT))?;
         let previous = out.join("traj.vorher.tum");
         if traj.exists() {
             fs::rename(&traj, &previous).map_err(|e| {
@@ -251,6 +286,7 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
         check_cancel(progress)?;
         require_frames(&stats)?;
         let odom_anchors: Vec<_> = submaps.iter().map(|m| m.anchor).collect();
+        remove_report(&out.join(SLAM_REPORT))?;
         save_cache(&cache, &submaps, &odom_anchors, &input)
             .map_err(|e| format!("Zwischenspeicher {} nicht schreibbar: {e}", cache.display()))?;
         progress.phase("Schleifen schließen", None);
@@ -354,7 +390,8 @@ fn corrections_of_run(out: &Path, submaps: &[Submap], current: &Corrections) -> 
     then
 }
 
-/// Writes everything but the cache; returns the report and the number of map points.
+/// Writes everything but the cache, each file through a `.tmp`, [`SLAM_REPORT`] last;
+/// returns the report and the number of map points.
 fn write_outputs(out: &Path, result: &SlamResult) -> Result<(SlamReport, usize), StepError> {
     let write = || -> Result<(SlamReport, usize), Box<dyn std::error::Error>> {
         let report = SlamReport::new(result);
@@ -362,10 +399,9 @@ fn write_outputs(out: &Path, result: &SlamResult) -> Result<(SlamReport, usize),
         write_tum(&out.join("traj_odom.tum"), &result.odom_poses())?;
         let map = result.map_points();
         write_las(&out.join("map.las"), &map)?;
-        fs::write(
-            out.join("slam.json"),
-            serde_json::to_string_pretty(&report)? + "\n",
-        )?;
+        let path = out.join(SLAM_REPORT);
+        atomic_write(&path, crate::report_text(&report)?.as_bytes())
+            .map_err(|e| format!("{} nicht schreibbar: {e}", path.display()))?;
         Ok((report, map.len()))
     };
     Ok(write()?)

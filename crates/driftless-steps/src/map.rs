@@ -9,6 +9,10 @@
 //! `stale` the files of earlier runs that no longer fit; they get a warning, nothing is ever
 //! deleted).
 //!
+//! A run removes the `.tmp` files a killed run of its files left at its start, and
+//! `map.json` before it writes its first file; `map.json` comes last again, so a folder with
+//! a `map.json` holds what it describes.
+//!
 //! Of the clouds to look at, a run writes one: the LAS of its last step, so `color.las`, or
 //! `clean.las` where the scan cannot be coloured (and `dense.las` for the dense step alone).
 //! [`MapRequest::all_files`] (`driftless map --alle-dateien`) writes the files in brackets
@@ -16,7 +20,9 @@
 //!
 //! The requested step always runs; the step before it is taken from its `*.bin` in the folder
 //! if that was written for the same input and settings (input id as in `submaps.bin`), and
-//! rebuilt otherwise. The `*.bin` files hold the cloud at full precision with the frame index
+//! rebuilt otherwise. Only a whole map ([`MapStep::All`]) that is current already
+//! ([`current_map`]) is not computed again: [`run_map`] says so and returns its `map.json`
+//! ([`recompute_map`] computes it all the same). The `*.bin` files hold the cloud at full precision with the frame index
 //! of every point (and, in `dense.bin`, the sensor rays the cleaning needs); LAS rounds
 //! coordinates and intensity and has no frame column, so it is export only.
 //!
@@ -24,9 +30,12 @@
 //! uses the SLAM folder for both).
 
 use crate::error::{check_cancel, failed, StepError};
+use crate::leftovers::{remove_report, remove_stale_tmp};
 use crate::scan::{image_topics, read_imu, warn_if_not_static, with_lidar_frames, IMAGE_TYPE};
 use crate::slam::SlamSettings;
+use crate::{PROGRAM, PROGRAM_KEY};
 use driftless_gpu::{CpuFallback, GpuChoice, GpuContext, GpuPref};
+use driftless_io::atomic_write;
 use driftless_io::calib::load_calibration;
 use driftless_io::camera::Camera;
 use driftless_io::progress::Progress;
@@ -322,7 +331,8 @@ pub(crate) fn color_input(
     for (name, c) in &calib.cameras {
         let Some(lidar_to_cam) = c.lidar_to_cam else {
             progress.warn(format!(
-                "Kamera {name} hat keine transform_matrix, übersprungen"
+                "Kamera {name} ohne transform_matrix in calib.json: übersprungen, sie färbt \
+                 nichts – die Kalibrierung vom Gerät prüfen (calibration/calib.json)"
             ));
             continue;
         };
@@ -390,6 +400,12 @@ fn dense_id(
 /// Input id of the clean step: the dense input and the clean settings.
 fn clean_id(dense_id: &str, clean_cfg: &CleanConfig) -> String {
     format!("{dense_id}clean v{CLEAN_VERSION} {clean_cfg:?}\n")
+}
+
+/// Input id of the color step: the clean input, the images and calibration
+/// ([`ColorInput::id`]) and the colour settings.
+fn color_id(clean_id: &str, images: &str, color_cfg: &ColorConfig) -> String {
+    format!("{clean_id}{images}color v{COLOR_VERSION} {color_cfg:?}\n")
 }
 
 /// Peak resident memory of this process so far (bytes), if the platform reports it.
@@ -474,27 +490,35 @@ fn clean_json(s: &CleanStats) -> Value {
     })
 }
 
-/// Warnings about a colour run that the user should see (German, without the "Warnung: ").
+/// Warnings about a colour run that the user should see (German, without the "Warnung: "):
+/// the reason first, then what it means and what to do.
 fn color_warnings(s: &ColorStats) -> Vec<String> {
     let mut out = Vec::new();
     if s.image_bags_truncated > 0 {
         out.push(format!(
-            "{} Bilddatei(en) sind abgeschnitten, die Bilder bis dahin wurden genutzt",
+            "{} Bilddatei(en) abgeschnitten (Aufnahme unterbrochen oder Kopie unvollständig): \
+             nur die Bilder bis dahin genutzt – ist nur die Kopie unvollständig, die \
+             IMAGE_*.bag neu vom Gerät kopieren und die Karte neu rechnen",
             s.image_bags_truncated
         ));
     }
     let cameras: BTreeSet<&str> = s.gains.iter().map(|g| g.camera.as_str()).collect();
     if cameras.len() > 1 && s.camera_difference_points == 0 {
         out.push(
-            "die Kameras sehen keine gemeinsamen Punkte, Belichtung zwischen ihnen nicht \
-             abgeglichen"
+            "Die Kameras sehen keine gemeinsamen Punkte (sehr kurzer Scan, oder die \
+             Kalibrierung passt nicht zum Gerät): Belichtung zwischen ihnen nicht abgeglichen, \
+             die Farben können je Kamera abweichen – bei einem längeren Scan die Kalibrierung \
+             prüfen (driftless calib-check)"
                 .into(),
         );
     }
     // More than 1 % of the images.
     if s.images_gain_clamped * 100 > s.images_used {
         out.push(format!(
-            "{} Bilder ({:.0} %) stoßen an die Grenze des Belichtungsabgleichs",
+            "{} Bilder ({:.0} %) viel heller oder dunkler als ihre Nachbarn (Fenster, \
+             Gegenlicht, Lampen): der Belichtungsabgleich gleicht sie nur bis zu seiner Grenze \
+             an, dort können die Farben fleckig wirken – meist nichts zu tun; stört es, bei \
+             gleichmäßigerem Licht neu scannen",
             s.images_gain_clamped,
             100.0 * s.images_gain_clamped as f64 / s.images_used.max(1) as f64
         ));
@@ -687,6 +711,8 @@ struct MapRun<'a> {
     steps: BTreeMap<&'static str, Value>,
     /// [`MapRequest::all_files`].
     all_files: bool,
+    /// `map.json` of an earlier run is gone (before the first file is written).
+    report_removed: bool,
 }
 
 fn seconds(start: Instant) -> f64 {
@@ -698,11 +724,16 @@ impl MapRun<'_> {
         self.out.join(file)
     }
 
-    /// Last check before a step writes its files; creates the output folder.
-    fn ready_to_write(&self) -> Result<(), StepError> {
+    /// Last check before a step writes its files; creates the output folder and, before the
+    /// first file of the run, removes `map.json` (written again last).
+    fn ready_to_write(&mut self) -> Result<(), StepError> {
         check_cancel(self.progress)?;
         fs::create_dir_all(&self.out)
             .map_err(|e| format!("{} nicht anlegbar: {e}", self.out.display()))?;
+        if !self.report_removed {
+            remove_report(&self.path(REPORT))?;
+            self.report_removed = true;
+        }
         Ok(())
     }
 
@@ -1019,6 +1050,11 @@ const STEP_FILES: [(&str, &[&str], &str); 3] = [
     ("color", &["color.las", "color.ply"], CLEAN_BIN),
 ];
 
+/// Whether a map writes the file `name` (one of [`STEP_FILES`] or `map.json`).
+fn owns(name: &str) -> bool {
+    name == REPORT || STEP_FILES.iter().any(|(_, files, _)| files.contains(&name))
+}
+
 /// Output files in `out` that the current entry of their step in `steps` does not list (its
 /// `files`): the step has none (not run and no longer fitting, or skipped), or did not write
 /// them for its input (`dense.las` of an earlier `--alle-dateien` run, say). They are from an
@@ -1054,7 +1090,8 @@ fn warn_stale(
         };
         let fits = if found.len() == 1 { "passt" } else { "passen" };
         progress.warn(format!(
-            "{} {verb} aus einem früheren Lauf und {fits} nicht mehr zu {source}",
+            "{} {verb} aus einem früheren Lauf und {fits} nicht mehr zu {source} – nicht \
+             verwenden; gelöscht wird nichts, bei Bedarf von Hand löschen",
             found.join(", ")
         ));
         stale.extend(found.iter().map(|f| f.to_string()));
@@ -1078,7 +1115,9 @@ pub(crate) fn read_traj(slam_dir: &Path) -> Result<(Vec<u8>, Vec<Pose>), String>
 
 /// Whether `dir` holds a map of `input`: its `map.json` has the same switches (the step does
 /// not matter) and a dense entry for the current LiDAR bags, odometry settings and
-/// trajectory.
+/// trajectory, and the stages it claims as current (`dense.bin`, `clean.bin`) are those, if
+/// they are there: one of another run next to the report – what a run of an older version
+/// left when it was killed between its files – does not fit. Reads only their headers.
 pub fn folder_fits(input: &MapInput, dir: &Path) -> bool {
     let fits = || -> Option<bool> {
         let text = fs::read_to_string(dir.join(REPORT)).ok()?;
@@ -1089,9 +1128,29 @@ pub fn folder_fits(input: &MapInput, dir: &Path) -> bool {
         let odom = input.slam.config().ok()?.odom;
         let project = discover_project(&input.scan).ok()?;
         let traj_bytes = fs::read(input.slam_dir.join("traj.tum")).ok()?;
-        let dense_cfg = input.map.switches.dense_config();
-        let id = dense_id(&project, &input.slam, &odom, &traj_bytes, &dense_cfg).ok()?;
-        Some(report["steps"]["dense"]["input_id"].as_str() == Some(hex(&id).as_str()))
+        let switches = &input.map.switches;
+        let dense = dense_id(
+            &project,
+            &input.slam,
+            &odom,
+            &traj_bytes,
+            &switches.dense_config(),
+        )
+        .ok()?;
+        let clean = clean_id(&dense, &switches.clean_config());
+        let claims = |step: &str, id: &str| {
+            report["steps"][step]["input_id"].as_str() == Some(hex(id).as_str())
+        };
+        // A stage that is not there is no reason: `dense.bin` may go to save space.
+        let stage_agrees = |file: &str, id: &str| {
+            let path = dir.join(file);
+            !path.exists() || stage_fits(&path, id)
+        };
+        Some(
+            claims("dense", &dense)
+                && stage_agrees(DENSE_BIN, &dense)
+                && (!claims("clean", &clean) || stage_agrees(CLEAN_BIN, &clean)),
+        )
     };
     fits().unwrap_or(false)
 }
@@ -1158,12 +1217,105 @@ pub fn fitting_stages(input: &MapInput, dir: &Path) -> Vec<&'static str> {
         .collect()
 }
 
+/// The `map.json` in [`MapRequest::out_dir`] if a whole map ([`MapStep::All`]) of `req` is
+/// there already, so that computing it again would give the same files: the same switches;
+/// an entry of the current input for every step (colour: skipped for the same reason, if
+/// the scan cannot be coloured); `dense.bin` and `clean.bin` of that input; every file the
+/// entries list, and every file `req` writes among them (with [`MapRequest::all_files`] the
+/// LAS of every step and `color.ply`). Cheap: the input ids (bag sizes, `traj.tum`, the
+/// calibration), the stage headers and the files' existence.
+pub fn current_map(req: &MapRequest) -> Option<Value> {
+    let input = &req.input;
+    if input.map.step != MapStep::All {
+        return None;
+    }
+    let dir = &req.out_dir;
+    let report: Value = serde_json::from_str(&fs::read_to_string(dir.join(REPORT)).ok()?).ok()?;
+    let switches = &input.map.switches;
+    if !MapSwitches::from_map_json(&report)?.same_map(switches) {
+        return None;
+    }
+    let odom = input.slam.config().ok()?.odom;
+    let project = discover_project(&input.scan).ok()?;
+    let traj_bytes = fs::read(input.slam_dir.join("traj.tum")).ok()?;
+    let dense = dense_id(
+        &project,
+        &input.slam,
+        &odom,
+        &traj_bytes,
+        &switches.dense_config(),
+    )
+    .ok()?;
+    let clean = clean_id(&dense, &switches.clean_config());
+    // Its warnings were given when the map was made.
+    let color = color_input(&input.scan, &project, &odom.lidar_to_imu, &Progress::new())
+        .map(|c| color_id(&clean, &c.id, &switches.color_config()));
+    let steps = &report["steps"];
+    let current = |step: &str, id: &str| {
+        steps[step].get("skipped").is_none()
+            && steps[step]["input_id"].as_str() == Some(hex(id).as_str())
+    };
+    let color_current = match &color {
+        Ok(id) => current("color", id),
+        Err(why) => steps["color"]["skipped"].as_str() == Some(why.as_str()),
+    };
+    if !(current("dense", &dense)
+        && current("clean", &clean)
+        && color_current
+        && stage_fits(&dir.join(DENSE_BIN), &dense)
+        && stage_fits(&dir.join(CLEAN_BIN), &clean))
+    {
+        return None;
+    }
+    let listed: Vec<&str> = ["dense", "clean", "color"]
+        .iter()
+        .filter_map(|s| steps[*s]["files"].as_array())
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let mut wanted = vec![DENSE_BIN, "removed.las", CLEAN_BIN];
+    wanted.push(if color.is_ok() {
+        "color.las"
+    } else {
+        "clean.las"
+    });
+    if req.all_files {
+        wanted.extend(["dense.las", "clean.las"]);
+        if color.is_ok() {
+            wanted.push("color.ply");
+        }
+    }
+    let complete =
+        wanted.iter().all(|f| listed.contains(f)) && listed.iter().all(|f| dir.join(f).is_file());
+    complete.then_some(report)
+}
+
 /// Runs the map as `driftless map` does; every console line goes to `progress` in the same
 /// order. Returns the `map.json` written to [`MapRequest::out_dir`].
+///
+/// A whole map ([`MapStep::All`]) that is current already ([`current_map`]) is not computed
+/// again: the step says so and returns the `map.json` that is there. [`recompute_map`]
+/// computes it all the same.
 ///
 /// A cancel is honoured before each step writes its files: a cancelled step writes nothing,
 /// steps finished before it keep their files, `map.json` is not written.
 pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError> {
+    req.input.map.check()?;
+    if let Some(report) = current_map(req) {
+        remove_stale_tmp(&req.out_dir, owns, progress);
+        progress.info(format!(
+            "Karte ist aktuell: gleiche Eingaben und Einstellungen wie in {}, nichts neu \
+             gerechnet",
+            req.out_dir.join(REPORT).display()
+        ));
+        return Ok(report);
+    }
+    recompute_map(req, progress)
+}
+
+/// [`run_map`] without the check whether the map is current: every requested step runs
+/// (`driftless map --neu`).
+pub fn recompute_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError> {
     let start = Instant::now();
     let input = &req.input;
     let switches = &input.map.switches;
@@ -1189,6 +1341,7 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
     };
 
     let (traj_bytes, poses) = read_traj(&input.slam_dir)?;
+    remove_stale_tmp(&req.out_dir, owns, progress);
     let dense_cfg = switches.dense_config();
     let clean_cfg = switches.clean_config();
     let color_cfg = switches.color_config();
@@ -1197,7 +1350,7 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
     let color_id = color
         .as_ref()
         .ok()
-        .map(|c| format!("{clean_id}{}color v{COLOR_VERSION} {color_cfg:?}\n", c.id));
+        .map(|c| color_id(&clean_id, &c.id, &color_cfg));
     let previous = fs::read_to_string(req.out_dir.join(REPORT))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -1222,6 +1375,7 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
         previous,
         steps: BTreeMap::new(),
         all_files: req.all_files,
+        report_removed: false,
     };
 
     match step {
@@ -1249,7 +1403,10 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
                     run.run_color(cloud, input, device.expect("opened with the colour input"))?
                 }
                 Err(why) => {
-                    progress.warn(format!("nicht eingefärbt, {why}"));
+                    progress.warn(format!(
+                        "{why} – Karte nicht eingefärbt (clean.las statt color.las); fehlt das \
+                         nur in der Kopie, es vom Gerät dazukopieren und die Karte neu rechnen"
+                    ));
                     run.steps.insert("color", json!({"skipped": why}));
                 }
             }
@@ -1275,16 +1432,17 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
     let stale = warn_stale(&run.out, &run.steps, progress);
 
     let peak = peak_rss_bytes();
-    let report = json!({
+    let mut report = json!({
         "settings": settings,
         "steps": run.steps,
         "seconds_total": seconds(start),
         "stale": stale,
         "peak_rss_bytes": peak,
     });
+    report[PROGRAM_KEY] = json!(PROGRAM);
     let report_path = run.path(REPORT);
     let text = serde_json::to_string_pretty(&report).map_err(failed)? + "\n";
-    fs::write(&report_path, text)
+    atomic_write(&report_path, text.as_bytes())
         .map_err(|e| format!("{} nicht schreibbar: {e}", report_path.display()))?;
     let ram = peak.map_or_else(
         || "Spitzen-RAM unbekannt".to_string(),
@@ -1351,6 +1509,7 @@ mod tests {
         assert_eq!(color_warnings(&clamped(3)).len(), 1);
     }
 
+    /// The reason first (very bright or dark images), then what it means and what to do.
     #[test]
     fn warns_about_clamped_gains() {
         let s = ColorStats {
@@ -1361,7 +1520,12 @@ mod tests {
         let w = color_warnings(&s);
         assert_eq!(
             w,
-            vec!["26 Bilder (13 %) stoßen an die Grenze des Belichtungsabgleichs"]
+            vec![
+                "26 Bilder (13 %) viel heller oder dunkler als ihre Nachbarn (Fenster, \
+                 Gegenlicht, Lampen): der Belichtungsabgleich gleicht sie nur bis zu seiner \
+                 Grenze an, dort können die Farben fleckig wirken – meist nichts zu tun; stört \
+                 es, bei gleichmäßigerem Licht neu scannen"
+            ]
         );
     }
 }

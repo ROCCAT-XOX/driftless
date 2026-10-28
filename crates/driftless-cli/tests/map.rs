@@ -247,11 +247,11 @@ fn map_skipped_color_marks_old_color_stale() {
     fs::remove_dir_all(dir.join("calibration")).unwrap();
     map(&dir, &out, &[])
         .success()
+        .stderr(predicate::str::contains("Warnung: keine Kalibrierung: "))
+        .stderr(predicate::str::contains("Karte nicht eingefärbt"))
         .stderr(predicate::str::contains(
-            "nicht eingefärbt, keine Kalibrierung",
-        ))
-        .stderr(predicate::str::contains(
-            "color.las stammt aus einem früheren Lauf und passt nicht mehr zu clean.bin",
+            "color.las stammt aus einem früheren Lauf und passt nicht mehr zu clean.bin – \
+             nicht verwenden; gelöscht wird nichts",
         ))
         .stderr(predicate::str::contains("fehlen").not());
     let json = map_json(&out);
@@ -690,4 +690,28 @@ fn map_json_says_why_auto_took_the_cpu() {
     assert_eq!(gpu["fallback"], "keine Grafikkarte gefunden", "{gpu}");
     map(&dir, &out, &["--step", "color", "--gpu", "aus"]).success();
     assert!(map_json(&out)["steps"]["color"]["gpu"]["fallback"].is_null());
+}
+
+/// The same `driftless map` again is „aktuell“: nothing computed, nothing written. The GPU
+/// switch does not matter (an equivalent map); `--neu` computes it anyway.
+#[test]
+fn map_twice_is_current() {
+    let dir = tmp("map-zweimal");
+    scan_with_images(&dir);
+    let out = dir.join("out");
+    slam(&dir, &out);
+    map(&dir, &out, &[]).success();
+    let json = fs::read(out.join("map.json")).unwrap();
+    for args in [&[][..], &["--gpu", "aus"]] {
+        map(&dir, &out, args)
+            .success()
+            .stdout(predicate::str::contains("Karte ist aktuell"))
+            .stdout(predicate::str::contains("Dicht:").not());
+    }
+    assert_eq!(fs::read(out.join("map.json")).unwrap(), json);
+    map(&dir, &out, &["--neu"])
+        .success()
+        .stdout(predicate::str::contains("Dicht:"))
+        .stdout(predicate::str::contains("Eingefärbt:"))
+        .stdout(predicate::str::contains("Karte ist aktuell").not());
 }
