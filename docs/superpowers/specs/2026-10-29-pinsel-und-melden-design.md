@@ -142,8 +142,9 @@ Erfolg heißt:
 - „Bilder neu einspielen“ braucht die Kamerabilder und Lagen der Scans aus den Rohdaten. Fehlen die
   Rohdaten, etwa weil das Laufwerk abgezogen ist, ist die Aktion aus, mit Hinweis. Glätten geht
   trotzdem.
-- Die Grafikkarte wird genutzt, wo sie da ist, wie beim Einfärben und bei der Oberfläche; sonst
-  rechnet der Prozessor.
+- Die Grafikkarte zeichnet die Ansicht, die Markierung und Vorher/Nachher. Die Nacharbeit selbst rechnet
+  der Prozessor: Sie betrifft nur eine Stelle, ist damit klein, und so fällt sie auf jedem Rechner Byte
+  für Byte gleich aus (die Grafikkarte rechnet nur bis auf Rundung gleich).
 - Gleiche Stellen und Schritte ergeben dasselbe Ergebnis, Byte für Byte wie der Rest der Kette.
 - Schwere Läufe mit echten Daten laufen auf VM 101 (6 Threads, `nice 10`).
 - Scandaten, Meldungen und Kundennamen kommen nie ins Repository.
