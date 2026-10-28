@@ -8,16 +8,18 @@
 //! new files beside the old ones first (`<name>.tmp`) and puts them in place together only
 //! once all are written: the old ones aside (`<name>.alt.tmp`), the new ones in, `slam.json`
 //! last. A failure on the way – a full disk, a file in the way, the history state that cannot
-//! be recorded – puts every file back as it was, so the run keeps its result.
+//! be recorded – puts every file back as it was, so the run keeps its result. A reuse killed
+//! while it put them in place (a crash, a power cut) leaves the run without `slam.json`, its
+//! old files aside: the next run puts them back first ([`reuse_cut_off`]).
 //!
 //! A full run into a folder that holds the run of another scan is refused: its frames (from
 //! `slam.json`) lie outside the times of this scan's LiDAR bags ([`run_fits_scan`]). Its
 //! corrections would be applied to this scan and its results replaced.
 //!
 //! A run removes the `.tmp` files a killed run of its files left ([`RUN_FILES`], also those a
-//! killed reuse staged or put aside) at its start; a full run removes `slam.json` before it
-//! writes its first file. `slam.json` comes last again, so a folder with a `slam.json` holds
-//! the files of one finished run.
+//! killed reuse staged, and the old files it put aside once they no longer belong to the run)
+//! at its start; a full run removes `slam.json` before it writes its first file. `slam.json`
+//! comes last again, so a folder with a `slam.json` holds the files of one finished run.
 
 use crate::error::{check_cancel, failed, StepError};
 use crate::history::{self, HistoryKind};
@@ -241,6 +243,8 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
     let out = &req.out;
     let cfg = req.settings.config()?;
     let project = discover_project(&req.scan).map_err(failed)?;
+    // the run a reuse was cut off in first: what is checked and kept below is that run
+    put_back(out, progress)?;
     if !req.reuse {
         if let Some(why) = foreign_run(req, &project.lidar_bags) {
             return Err(why.into());
@@ -383,6 +387,68 @@ fn aside_path(out: &Path, name: &str) -> PathBuf {
     out.join(format!("{name}.alt.tmp"))
 }
 
+/// Whether a reuse was cut off in `dir` while it put its new files in place (a crash, a power
+/// cut) and left old files of the run aside that the next run puts back ([`put_back`]): the
+/// report is missing and lies aside (`slam.json.alt.tmp`), or the trajectory before the last
+/// reuse does (`traj.vorher.tum.alt.tmp`). Until then its `.tmp` files are no leftovers.
+pub fn reuse_cut_off(dir: &Path) -> bool {
+    put_aside(dir, SLAM_REPORT) || put_aside(dir, PREVIOUS_TRAJ)
+}
+
+/// Whether the file `name` of the run in `dir` is missing and lies aside (`<name>.alt.tmp`).
+fn put_aside(dir: &Path, name: &str) -> bool {
+    !dir.join(name).exists() && aside_path(dir, name).is_file()
+}
+
+/// Puts back what a reuse cut off while it put its new files in place left aside
+/// ([`reuse_cut_off`]), so that the run is as before that reuse: with the report aside, the
+/// old trajectory comes back from [`PREVIOUS_TRAJ`] (over a new one in place), the other old
+/// files from `<name>.alt.tmp`, the report last; then the trajectory before the last reuse,
+/// if it lies aside and none is in place. What the reuse staged stays as `<name>.tmp`, a stale
+/// file of the run. A rename that fails stops the run before anything is removed: the old
+/// files stay aside for the next start.
+fn put_back(out: &Path, progress: &Progress) -> Result<(), StepError> {
+    let file = |name: &str| out.join(name);
+    let back = |from: PathBuf, to: PathBuf| -> Result<(), StepError> {
+        fs::rename(&from, &to).map_err(|e| {
+            StepError::Failed(format!(
+                "{} nicht in {} zurückbenennbar ({e}): der Lauf vor dem unterbrochenen \
+                 Neu-Rechnen liegt noch als *.alt.tmp in {}; nichts gerechnet",
+                from.display(),
+                to.display(),
+                out.display()
+            ))
+        })
+    };
+    let mut names = Vec::new();
+    if put_aside(out, SLAM_REPORT) {
+        // the trajectory before the last reuse went aside before the report: what is in its
+        // place now is the old trajectory
+        if file(PREVIOUS_TRAJ).is_file() {
+            back(file(PREVIOUS_TRAJ), file("traj.tum"))?;
+            names.push("traj.tum");
+        }
+        for name in ["traj_odom.tum", "map.las", SLAM_REPORT] {
+            if aside_path(out, name).is_file() {
+                back(aside_path(out, name), file(name))?;
+                names.push(name);
+            }
+        }
+    }
+    if put_aside(out, PREVIOUS_TRAJ) {
+        back(aside_path(out, PREVIOUS_TRAJ), file(PREVIOUS_TRAJ))?;
+        names.push(PREVIOUS_TRAJ);
+    }
+    if !names.is_empty() {
+        progress.info(format!(
+            "Das letzte Neu-Rechnen von {} wurde unterbrochen: den Lauf davor zurückgeholt ({})",
+            out.display(),
+            names.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// The new files of a reuse ([`REUSE_FILES`]) written beside the run's own as `<name>.tmp`,
 /// each complete on the disk. Dropped, they are removed: those not put in place, or put back
 /// by [`Swap`].
@@ -405,33 +471,40 @@ impl<'a> Staged<'a> {
         Ok(staged)
     }
 
-    /// Puts them in place of the old ones: the report out of the way first, the old files
-    /// aside (`<name>.alt.tmp`; the trajectory becomes [`PREVIOUS_TRAJ`], whose own old one
-    /// goes aside), then the new ones in, the report last. All or nothing: on an error what
-    /// was renamed goes back.
+    /// Puts them in place of the old ones: the trajectory before the last reuse aside first
+    /// ([`PREVIOUS_TRAJ`] as `<name>.alt.tmp`), the report out of the way, the other old files
+    /// aside, the old trajectory to [`PREVIOUS_TRAJ`], then the new ones in, the report last.
+    /// So after a kill [`put_back`] can tell where each old file is: once the report is aside,
+    /// a [`PREVIOUS_TRAJ`] in place can only be the old trajectory. All or nothing: on an
+    /// error what was renamed goes back.
     fn put_in_place(&self) -> Result<Swap, StepError> {
-        let out = self.out;
-        let file = |name: &str| out.join(name);
         let mut swap = Swap {
             done: Vec::new(),
             kept: false,
         };
-        for name in [SLAM_REPORT, "traj_odom.tum", "map.las"] {
-            if file(name).is_file() {
-                swap.rename(file(name), aside_path(out, name))?;
-            }
-        }
-        if file("traj.tum").is_file() {
-            if file(PREVIOUS_TRAJ).is_file() {
-                swap.rename(file(PREVIOUS_TRAJ), aside_path(out, PREVIOUS_TRAJ))?;
-            }
-            swap.rename(file("traj.tum"), file(PREVIOUS_TRAJ))?;
-        }
-        for name in REUSE_FILES {
-            swap.rename(staged_path(out, name), file(name))?;
+        for (from, to) in swap_plan(self.out) {
+            swap.rename(from, to)?;
         }
         Ok(swap)
     }
+}
+
+/// The renames of [`Staged::put_in_place`] in `out`, in their order (from, to).
+fn swap_plan(out: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let file = |name: &str| out.join(name);
+    let mut plan = Vec::new();
+    for name in [PREVIOUS_TRAJ, SLAM_REPORT, "traj_odom.tum", "map.las"] {
+        if file(name).is_file() {
+            plan.push((file(name), aside_path(out, name)));
+        }
+    }
+    if file("traj.tum").is_file() {
+        plan.push((file("traj.tum"), file(PREVIOUS_TRAJ)));
+    }
+    for name in REUSE_FILES {
+        plan.push((staged_path(out, name), file(name)));
+    }
+    plan
 }
 
 impl Drop for Staged<'_> {
@@ -609,4 +682,107 @@ fn print_summary(result: &SlamResult, report: &SlamReport, points: usize, progre
         report.path_length.before,
         report.path_length.after
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use driftless_io::testdir::TestDir;
+    use std::collections::BTreeMap;
+
+    /// Every file directly in `dir` (name → contents).
+    fn files(dir: &Path) -> BTreeMap<String, String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                (name, fs::read_to_string(e.path()).unwrap())
+            })
+            .collect()
+    }
+
+    /// A finished run in `dir` (with the trajectory before an earlier reuse if `previous`) and
+    /// the new files a reuse staged beside it; returns the files of the run.
+    fn run_with_staged(dir: &Path, previous: bool) -> BTreeMap<String, String> {
+        fs::create_dir_all(dir).unwrap();
+        let mut old = vec![
+            (SLAM_REPORT, "alter Bericht"),
+            ("traj.tum", "alte Laufbahn"),
+            ("traj_odom.tum", "alte Odometrie"),
+            ("map.las", "alte Karte"),
+        ];
+        if previous {
+            old.push((PREVIOUS_TRAJ, "Laufbahn davor"));
+        }
+        for (name, text) in &old {
+            fs::write(dir.join(name), text).unwrap();
+        }
+        for name in REUSE_FILES {
+            fs::write(staged_path(dir, name), format!("neu: {name}")).unwrap();
+        }
+        old.iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect()
+    }
+
+    /// A reuse cut off after any number of the renames that put its files in place (files
+    /// only, no real kill): the start of the next run puts the run back as it was before that
+    /// reuse – also the trajectory before the last reuse – and then removes what the reuse
+    /// staged. Cut off after its last rename, the new run stays, as a finished reuse leaves
+    /// it. A rename that fails stops it with the old files still aside; the next start
+    /// finishes it.
+    #[test]
+    fn a_reuse_cut_off_while_swapping_is_put_back() {
+        let root = TestDir::new(format!("driftless-slam-put-back-{}", std::process::id()));
+        for previous in [true, false] {
+            let plan = root.join(format!("plan-{previous}"));
+            run_with_staged(&plan, previous);
+            // the old files aside (one more with a trajectory before), the trajectory, the
+            // new files in
+            let n = swap_plan(&plan).len();
+            assert_eq!(n, if previous { 9 } else { 8 });
+            for k in 0..=n {
+                let dir = root.join(format!("{previous}-{k}"));
+                let old = run_with_staged(&dir, previous);
+                for (from, to) in swap_plan(&dir).into_iter().take(k) {
+                    fs::rename(from, to).unwrap();
+                }
+                assert_eq!(reuse_cut_off(&dir), 0 < k && k < n, "{previous} {k}");
+                let p = Progress::new();
+                put_back(&dir, &p).unwrap();
+                remove_stale_tmp(&dir, owns_tmp, &p);
+                if k < n {
+                    assert_eq!(files(&dir), old, "{previous}: cut off after {k} of {n}");
+                } else {
+                    let mut new: BTreeMap<String, String> = REUSE_FILES
+                        .iter()
+                        .map(|f| (f.to_string(), format!("neu: {f}")))
+                        .collect();
+                    new.insert(PREVIOUS_TRAJ.into(), "alte Laufbahn".into());
+                    assert_eq!(files(&dir), new, "{previous}: after the last rename");
+                }
+            }
+        }
+
+        // the old map.las cannot go back (a folder in its place): stopped, the report still
+        // aside; with the folder gone the next start puts the rest back
+        let dir = root.join("im-weg");
+        let old = run_with_staged(&dir, true);
+        for (from, to) in swap_plan(&dir).into_iter().take(4) {
+            fs::rename(from, to).unwrap();
+        }
+        fs::create_dir_all(dir.join("map.las").join("x")).unwrap();
+        let err = put_back(&dir, &Progress::new()).unwrap_err().to_string();
+        assert!(
+            err.contains("map.las") && err.contains("*.alt.tmp"),
+            "{err}"
+        );
+        assert!(reuse_cut_off(&dir));
+        fs::remove_dir_all(dir.join("map.las")).unwrap();
+        let p = Progress::new();
+        put_back(&dir, &p).unwrap();
+        remove_stale_tmp(&dir, owns_tmp, &p);
+        assert_eq!(files(&dir), old);
+    }
 }

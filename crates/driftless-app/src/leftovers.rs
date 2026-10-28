@@ -10,7 +10,9 @@
 //! surfaces with their reports, the history of a run ([`holds_results`]) – is no leftover: it
 //! stays in the tree, marked „unvollständig – neu rechnen“, and only what in it is incomplete is
 //! offered. „Aufräumen“ never takes finished results along with a folder, also when they came
-//! after the list was made ([`may_clean_up`]).
+//! after the list was made ([`may_clean_up`]). A run whose reuse was cut off while it put its
+//! new files in place holds its old result aside (`<name>.alt.tmp`): the next run puts it back
+//! ([`reuse_cut_off`]), so its `.tmp` files are left alone.
 //!
 //! What a job may still write is left alone: a folder a running job marks busy ([`BUSY_FILE`],
 //! touched every [`BUSY_BEAT`]; this window's, another window's), and what was written to within
@@ -23,6 +25,7 @@ use crate::ui::text;
 use driftless_steps::history::HISTORY_DIR;
 use driftless_steps::map::REPORT as MAP_REPORT;
 use driftless_steps::merge::MODEL_REPORT;
+use driftless_steps::slam::reuse_cut_off;
 use driftless_steps::surface::SURFACE_REPORT;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -88,7 +91,10 @@ pub fn find(dir: &Path, scan_ids: &[String]) -> Vec<Leftover> {
                 out.push(folder(LeftoverKind::Run, &run, run_label));
                 continue;
             }
-            temps(&run, Some(&run_label), &mut out);
+            // the old files of a reuse cut off and what it staged: the next run sorts them out
+            if !reuse_cut_off(&run) {
+                temps(&run, Some(&run_label), &mut out);
+            }
             for (_, digits, map) in numbered(&run, MAP_PREFIX) {
                 let map_label = format!("Karte {digits}");
                 if busy(&map) {
@@ -189,12 +195,13 @@ fn newest(dir: &Path) -> SystemTime {
 }
 
 /// Whether the run or map folder `dir` holds finished results: the history of a run
-/// (`verlauf/`), a map with its `map.json` (a `karte-NNN`, or one the command line wrote into
-/// the run folder), a surface (`oberflaeche…`) with its `oberflaeche.json`; also further down
-/// (a surface in a map folder without its report). Such a folder without its own report is no
-/// leftover. Reads folders: call it off the UI thread.
+/// (`verlauf/`), the old result of a run whose reuse was cut off ([`reuse_cut_off`]), a map
+/// with its `map.json` (a `karte-NNN`, or one the command line wrote into the run folder), a
+/// surface (`oberflaeche…`) with its `oberflaeche.json`; also further down (a surface in a map
+/// folder without its report). Such a folder without its own report is no leftover. Reads
+/// folders: call it off the UI thread.
 pub fn holds_results(dir: &Path) -> bool {
-    if dir.join(HISTORY_DIR).is_dir() || dir.join(MAP_REPORT).is_file() {
+    if dir.join(HISTORY_DIR).is_dir() || reuse_cut_off(dir) || dir.join(MAP_REPORT).is_file() {
         return true;
     }
     let maps = numbered(dir, MAP_PREFIX);
@@ -216,16 +223,19 @@ pub fn holds_results(dir: &Path) -> bool {
     })
 }
 
-/// Whether „Aufräumen“ may move the leftover `path` to the trash now: a file always; a folder
-/// unless a job marks it or a folder in it busy ([`busy_below`]), it has its report by now (a
-/// step finished it), or it holds finished results ([`holds_results`]) – each may have come
-/// after the leftovers were listed.
+/// Whether „Aufräumen“ may move the leftover `path` to the trash now: a file unless it lies in
+/// a run whose reuse was cut off ([`reuse_cut_off`]: the next run puts its old files back); a
+/// folder unless a job marks it or a folder in it busy ([`busy_below`]), it has its report by
+/// now (a step finished it), or it holds finished results ([`holds_results`]) – each may have
+/// come after the leftovers were listed.
 pub fn may_clean_up(path: &Path) -> bool {
     let reports = [SLAM_REPORT, MAP_REPORT, SURFACE_REPORT, MODEL_REPORT];
-    !path.is_dir()
-        || (busy_below(path).is_none()
-            && !reports.iter().any(|r| path.join(r).is_file())
-            && !holds_results(path))
+    if !path.is_dir() {
+        return !path.parent().is_some_and(reuse_cut_off);
+    }
+    busy_below(path).is_none()
+        && !reports.iter().any(|r| path.join(r).is_file())
+        && !holds_results(path)
 }
 
 /// Whether a running job marks the folder `dir` busy: its [`BUSY_FILE`] was touched within

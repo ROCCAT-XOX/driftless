@@ -6,9 +6,11 @@
 //! the window gets the focus back (debounced): a scan folder that came back is no longer missing.
 
 use driftless_app::leftovers::{self, Leftover, LeftoverKind, BUSY_FILE, BUSY_STALE};
-use driftless_app::project::{canonical, new_surface_dir, Project, StepDir};
+use driftless_app::project::{canonical, new_surface_dir, run_slam_job, Project, SlamJob, StepDir};
 use driftless_app::ui::{text, Action, DriftlessApp, Selection, UiMessage, FOCUS_GAP};
+use driftless_io::progress::Progress;
 use driftless_io::testscan::{room_bag_secs, tmp};
+use driftless_steps::slam::SlamSettings;
 use eframe::egui;
 use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
@@ -494,6 +496,84 @@ fn clean_up_looks_again_before_it_moves() {
     assert!(run
         .join("karte-001/oberflaeche-003/oberflaeche.glb")
         .is_file());
+}
+
+/// What a reuse of `run` cut off after six of its renames leaves (files only, no real kill):
+/// the trajectory before the last reuse, the report, the odometry and the map aside as
+/// `<name>.alt.tmp`, the old trajectory moved to `traj.vorher.tum`, the new one in, the other
+/// new files still staged as `<name>.tmp`.
+fn cut_off_reuse(run: &Path) {
+    for name in ["traj.vorher.tum", "slam.json", "traj_odom.tum", "map.las"] {
+        fs::rename(run.join(name), run.join(format!("{name}.alt.tmp"))).unwrap();
+    }
+    fs::rename(run.join("traj.tum"), run.join("traj.vorher.tum")).unwrap();
+    file(run, "traj.tum", 10);
+    for name in ["traj_odom.tum", "map.las", "slam.json"] {
+        file(run, &format!("{name}.tmp"), 10);
+    }
+}
+
+/// A reuse cut off while it put its new files in place leaves the run without its report, the
+/// old files aside and the new ones half in place. None of its `.tmp` files is a leftover – not
+/// even without the history of the run is the folder one – and „Aufräumen“ never moves them,
+/// also one listed before the reuse was cut off; the run stays in the tree as „unvollständig –
+/// neu rechnen“. The next run of the step puts the old files back and computes as usual (the
+/// re-review of the final fix round).
+#[test]
+fn a_reuse_cut_off_is_left_for_the_next_run() {
+    let dir = tmp("reste-tausch");
+    let raw = dir.join("halle");
+    fs::create_dir_all(&raw).unwrap();
+    room_bag_secs(&raw, true, 1.5);
+    let mut p = Project::create(&dir.join("projekt"), "Halle").unwrap();
+    p.add_scan(&raw).unwrap();
+    p.save().unwrap();
+    let full = SlamJob::Full(SlamSettings::default());
+    run_slam_job(&p, "halle", &full, &Progress::new()).unwrap();
+    let run = p.runs("halle").remove(0);
+    // reused once: its trajectory before the last reuse is in place
+    let reuse = SlamJob::Reuse(run.clone());
+    run_slam_job(&p, "halle", &reuse, &Progress::new()).unwrap();
+    let traj = fs::read(run.dir.join("traj.tum")).unwrap();
+    // a stale file of an earlier crash, offered for „Aufräumen“
+    file(&run.dir, "map.las.tmp", 10);
+    let project = canonical(&p.dir).unwrap();
+    let mut h = window(&project);
+    h.get_by_label(&text::incomplete_entry("map.las.tmp (SLAM 001)", 10));
+
+    cut_off_reuse(&run.dir);
+    let ids = ["halle".to_string()];
+    assert_eq!(leftovers::find(&project, &ids), Vec::new());
+    for name in ["slam.json.alt.tmp", "map.las.tmp"] {
+        assert!(!leftovers::may_clean_up(&run.dir.join(name)), "{name}");
+    }
+    let history = run.dir.join("verlauf");
+    fs::rename(&history, dir.join("verlauf")).unwrap();
+    assert!(leftovers::holds_results(&run.dir));
+    assert_eq!(leftovers::find(&project, &ids), Vec::new());
+    fs::rename(dir.join("verlauf"), &history).unwrap();
+
+    h.get_by_label(text::CLEAN_UP).click();
+    settle(&mut h);
+    assert_eq!(trashed(&dir), Vec::<String>::new());
+    assert_eq!(errors(h.state()), Vec::<String>::new());
+    for name in [
+        "slam.json.alt.tmp",
+        "traj.vorher.tum.alt.tmp",
+        "map.las.tmp",
+    ] {
+        assert!(run.dir.join(name).is_file(), "{name}");
+    }
+    let state = h.state().state();
+    assert!(state.leftovers.is_empty(), "{:?}", state.leftovers);
+    let node = &state.scans[0].runs[0];
+    assert!(node.incomplete, "in the tree, marked");
+
+    let run = p.runs("halle").remove(0);
+    run_slam_job(&p, "halle", &SlamJob::Reuse(run.clone()), &Progress::new()).unwrap();
+    assert_eq!(fs::read(run.dir.join("traj.vorher.tum")).unwrap(), traj);
+    assert_eq!(leftovers::find(&project, &ids), Vec::new());
+    assert!(p.runs("halle")[0].has_result);
 }
 
 /// While a step runs in the window, „Aufräumen“ waits (the reason on hover).

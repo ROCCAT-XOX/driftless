@@ -262,14 +262,18 @@ fn reuse_cancelled_while_writing_keeps_the_run() {
     assert_eq!(files(&out), before);
 }
 
-/// What a reuse that was killed while it wrote leaves (its new files under temporary names,
-/// the old ones it had put aside) goes at the start of the next run; the run itself stays.
+/// What a reuse that was killed while it wrote leaves (its new files under temporary names)
+/// or once its new files were in place (the old ones it had put aside) goes at the start of
+/// the next run; the run itself stays.
 #[test]
 fn files_of_a_killed_reuse_are_removed() {
     let dir = tmp("steps-reuse-killed");
     room_bag(&dir, true);
     let out = dir.join("out");
     run_slam(&request(&dir, &out, false), &Progress::new()).unwrap();
+    // a reuse first: the run has its trajectory before the last reuse in place
+    run_slam(&request(&dir, &out, true), &Progress::new()).unwrap();
+    let before = files(&out);
     let left = [
         "traj.tum.tmp",
         "map.las.tmp.tmp",
@@ -279,11 +283,61 @@ fn files_of_a_killed_reuse_are_removed() {
     for f in left {
         fs::write(out.join(f), b"halb").unwrap();
     }
+    // the start of the next run (cancelled right after it)
+    let p = Progress::new();
+    p.cancel();
+    let err = run_slam(&request(&dir, &out, true), &p).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    assert_eq!(files(&out), before);
     run_slam(&request(&dir, &out, true), &Progress::new()).unwrap();
     for f in left {
         assert!(!out.join(f).exists(), "{f} left");
     }
     assert!(out.join("slam.json").is_file());
+}
+
+/// A reuse killed while it put its new files in place (here, as files: the trajectory before
+/// the last reuse, the report, the odometry and the map aside as `<name>.alt.tmp`, the old
+/// trajectory moved to `traj.vorher.tum`, the new one in, the rest still staged) leaves the
+/// run without `slam.json`. The start of the next run puts the old files back instead of
+/// removing them: the run is as before, byte for byte, and the log says so; a reuse then
+/// works as usual.
+#[test]
+fn reuse_cut_off_while_swapping_is_put_back() {
+    let dir = tmp("steps-reuse-cut-off");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    run_slam(&request(&dir, &out, false), &Progress::new()).unwrap();
+    run_slam(&request(&dir, &out, true), &Progress::new()).unwrap();
+    let before = files(&out);
+    for name in ["traj.vorher.tum", "slam.json", "traj_odom.tum", "map.las"] {
+        fs::rename(out.join(name), out.join(format!("{name}.alt.tmp"))).unwrap();
+    }
+    fs::rename(out.join("traj.tum"), out.join("traj.vorher.tum")).unwrap();
+    fs::write(out.join("traj.tum"), b"neu").unwrap();
+    for name in ["traj_odom.tum", "map.las", "slam.json"] {
+        fs::write(out.join(format!("{name}.tmp")), b"neu").unwrap();
+    }
+    assert!(driftless_steps::slam::reuse_cut_off(&out));
+
+    let p = Progress::new();
+    p.cancel();
+    let err = run_slam(&request(&dir, &out, true), &p).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    assert_eq!(files(&out), before);
+    assert!(!driftless_steps::slam::reuse_cut_off(&out));
+    let log = p.take_log();
+    assert!(
+        log.iter().any(|l| matches!(
+            l,
+            LogLine::Info(i) if i.contains("wurde unterbrochen: den Lauf davor zurückgeholt")
+        )),
+        "{log:?}"
+    );
+
+    let traj = fs::read(out.join("traj.tum")).unwrap();
+    run_slam(&request(&dir, &out, true), &Progress::new()).unwrap();
+    assert_eq!(fs::read(out.join("traj.vorher.tum")).unwrap(), traj);
 }
 
 #[test]
