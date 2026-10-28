@@ -11,7 +11,7 @@ use eframe::egui;
 use egui_kittest::kittest::Queryable;
 use egui_kittest::Harness;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,7 +38,7 @@ fn frames_until(h: &mut H, what: &str, cond: impl Fn(&DriftlessApp) -> bool) {
 /// that the reader waiting for it ends before the window is dropped and waits for it).
 #[cfg(unix)]
 struct Writer {
-    path: PathBuf,
+    path: std::path::PathBuf,
     text: &'static str,
     done: bool,
 }
