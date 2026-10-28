@@ -142,7 +142,7 @@ fn pairs_start(dir: &Path) {
         .iter()
         .filter_map(|m| match m {
             UiMessage::Error(e) => Some(e),
-            UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect();
     assert!(errors.is_empty(), "{errors:?}");

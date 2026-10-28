@@ -24,8 +24,13 @@ pub enum TrajError {
         path: String,
         source: std::io::Error,
     },
-    #[error("Zeile {line}: {msg}")]
-    Parse { line: usize, msg: String },
+    /// A line that is no pose; `path` is the file.
+    #[error("{path} ist beschädigt (Zeile {line}: {msg})")]
+    Parse {
+        path: String,
+        line: usize,
+        msg: String,
+    },
     #[error("zu wenige zugeordnete Posen: {found} (mindestens {needed} nötig, max. Zeitabstand {max_dt} s)")]
     TooFewMatches {
         found: usize,

@@ -33,7 +33,6 @@ use crate::project::{
 };
 use crate::render::{ColorMode, PointSize, ShowMode};
 use driftless_gpu::GpuPref;
-use driftless_io::progress::LogLine;
 use driftless_steps::export::{ExportRequest, ExportSource};
 use driftless_steps::inspect;
 use driftless_steps::map::MapSettings;
@@ -205,6 +204,8 @@ pub enum Action {
     ConfirmExport(ExportRequest),
     /// Export as asked, as a step (also without a project).
     RunExport(ExportRequest),
+    /// ☰ „Protokoll-Ordner öffnen“: the folder of the log file in Finder or Explorer.
+    OpenLogFolder,
 }
 
 /// What the queue of [`AppState::queue`] computes one after the other.
@@ -217,11 +218,43 @@ pub enum Queued {
     Surface(PathBuf),
 }
 
-/// A message for the status bar (German).
+/// A message for the status bar (German). Warnings and errors also go into the Protokoll, and
+/// every message into the log file (`crate::logfile`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiMessage {
     Info(String),
+    /// Something to look at that stops nothing (a project in iCloud Drive, little space).
+    Warning(String),
     Error(String),
+}
+
+impl UiMessage {
+    pub fn text(&self) -> &str {
+        match self {
+            UiMessage::Info(t) | UiMessage::Warning(t) | UiMessage::Error(t) => t,
+        }
+    }
+}
+
+/// How a line of the Protokoll is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogKind {
+    /// A message of a step.
+    Info,
+    /// A warning of a step, or of the window.
+    Warning,
+    /// An error of the window (a step that failed, a file that could not be read).
+    Error,
+}
+
+/// A line of the Protokoll: what a step said, or a warning or error of the status bar, with
+/// the local time it came („14:03:12“). The text is as shown: system errors in German
+/// ([`text::german`]), symbols the fonts lack replaced ([`text::shown`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogEntry {
+    pub time: String,
+    pub kind: LogKind,
+    pub text: String,
 }
 
 /// How the 3D view draws.
@@ -370,8 +403,9 @@ pub struct AppState {
     pub messages: Vec<UiMessage>,
     /// The running step, as of this frame.
     pub job: Option<JobStatus>,
-    /// Messages of the steps, oldest first.
-    pub log: Vec<LogLine>,
+    /// The Protokoll: messages of the steps, and the warnings and errors of the status bar,
+    /// oldest first.
+    pub log: Vec<LogEntry>,
     /// The step action that is running (set by [`actions::start_step`]).
     pub running: Option<Action>,
     /// The step of the work shown in the field next to the rail.

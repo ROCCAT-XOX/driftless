@@ -4,9 +4,8 @@
 //! total, phase, runtime, „Abbrechen“).
 
 use super::theme::{icon, DARK};
-use super::{text, Action, AppState, UiMessage};
+use super::{text, Action, AppState, LogKind, UiMessage};
 use crate::jobs::JobStatus;
-use driftless_io::progress::LogLine;
 use eframe::egui::{self, Align, Layout, RichText, Ui};
 
 /// Width of the progress bar (points).
@@ -56,7 +55,8 @@ fn log_toggle(ui: &mut Ui, open: bool, lines: usize) -> bool {
     ui.add(egui::Button::new(label).frame(false)).clicked()
 }
 
-/// The lines of the log, newest at the bottom.
+/// The lines of the log, newest at the bottom: the time, then the text with paths cut to
+/// their names (all of it on hover); warnings in the warning colour, errors red.
 fn log(ui: &mut Ui, state: &AppState) {
     // Only the visible lines are laid out: the log holds up to 10 000.
     let row = ui.text_style_height(&egui::TextStyle::Body);
@@ -65,13 +65,23 @@ fn log(ui: &mut Ui, state: &AppState) {
         .auto_shrink([false, true])
         .stick_to_bottom(true)
         .show_rows(ui, row, state.log.len(), |ui, rows| {
-            for line in &state.log[rows] {
-                let label = match line {
-                    LogLine::Info(t) => egui::Label::new(t),
-                    LogLine::Warning(t) => egui::Label::new(RichText::new(t).color(DARK.warn)),
+            for entry in &state.log[rows] {
+                let color = match entry.kind {
+                    LogKind::Info => DARK.text,
+                    LogKind::Warning => DARK.warn,
+                    LogKind::Error => DARK.error,
                 };
                 // one row per line, so that the row height holds
-                ui.add(label.truncate());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&entry.time).color(DARK.text_dim));
+                    let short = text::short_paths(&entry.text);
+                    let first = short.lines().next().unwrap_or_default().to_string();
+                    let label = egui::Label::new(RichText::new(first).color(color)).truncate();
+                    let r = ui.add(label);
+                    if short != entry.text || entry.text.contains('\n') {
+                        r.on_hover_text(&entry.text);
+                    }
+                });
             }
         });
 }
@@ -116,14 +126,26 @@ fn job_line(ui: &mut Ui, job: &JobStatus, action: &mut Option<Action>) {
     }
 }
 
-/// The last message (cut with „…“), else „Bereit“.
+/// The last message, its first line with paths cut to their names (cut with „…“; all of it
+/// on hover), else „Bereit“.
 fn message_line(ui: &mut Ui, last: Option<&UiMessage>) {
-    let line = match last {
-        None => RichText::new(text::READY).color(DARK.text_dim),
-        Some(UiMessage::Info(t)) => RichText::new(t),
-        Some(UiMessage::Error(t)) => RichText::new(t).color(DARK.error),
+    let Some(message) = last else {
+        let ready = RichText::new(text::READY).color(DARK.text_dim);
+        ui.add(egui::Label::new(ready).truncate());
+        return;
     };
-    ui.add(egui::Label::new(line).truncate());
+    let color = match message {
+        UiMessage::Info(_) => DARK.text,
+        UiMessage::Warning(_) => DARK.warn,
+        UiMessage::Error(_) => DARK.error,
+    };
+    let full = message.text();
+    let short = text::short_paths(full);
+    let first = short.lines().next().unwrap_or_default().to_string();
+    let r = ui.add(egui::Label::new(RichText::new(first).color(color)).truncate());
+    if short != full || full.contains('\n') {
+        r.on_hover_text(full);
+    }
 }
 
 /// `1234567` → „1.234.567“.

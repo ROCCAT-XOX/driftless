@@ -393,7 +393,7 @@ pub use driftless_io::paths::canonical;
 fn to_stored(base: &Path, path: &Path) -> Result<(String, Option<String>), ProjectError> {
     let text = path
         .to_str()
-        .ok_or_else(|| ProjectError(format!("Pfad {} ist kein gültiger Text", path.display())))?;
+        .ok_or_else(|| ProjectError(text::about_path("Pfad ist kein gültiger Text", path)))?;
     let inside = base
         .to_str()
         .and_then(|b| relative_text(b, text))
@@ -474,10 +474,18 @@ fn check_run_scan(run: &Path, scan: &Path) -> Result<(), ProjectError> {
     let report: serde_json::Value = fs::read_to_string(&file)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
-        .ok_or_else(|| ProjectError(format!("{} nicht lesbar", file.display())))?;
-    let start = report["scan_start"]
-        .as_f64()
-        .ok_or_else(|| ProjectError(format!("{}: scan_start fehlt", file.display())))?;
+        .ok_or_else(|| {
+            ProjectError(text::about_path(
+                "Kein lesbarer SLAM-Bericht (slam.json fehlt oder ist beschädigt)",
+                &file,
+            ))
+        })?;
+    let start = report["scan_start"].as_f64().ok_or_else(|| {
+        ProjectError(text::about_path(
+            "slam.json ist beschädigt: „scan_start“ fehlt",
+            &file,
+        ))
+    })?;
     let end = start
         + report["submaps"]
             .as_array()
@@ -493,8 +501,9 @@ fn check_run_scan(run: &Path, scan: &Path) -> Result<(), ProjectError> {
         Ok(())
     } else {
         Err(ProjectError(format!(
-            "Lauf {} gehört nicht zum Scan {}: er umfasst {start:.1}–{end:.1} s, der Scan \
-             {lo:.1}–{hi:.1} s",
+            "Lauf gehört nicht zu diesem Scan: er umfasst {start:.1}–{end:.1} s, der Scan \
+             {lo:.1}–{hi:.1} s: {}\nLauf: {}\nScan: {}",
+            run.file_name().unwrap_or_default().to_string_lossy(),
             run.display(),
             scan.display()
         )))
@@ -531,7 +540,7 @@ fn numbered(dir: &Path, prefix: &str) -> Vec<(u64, String, PathBuf)> {
 /// Creates the next free `<prefix>NNN` in `dir` after the numbers present.
 fn create_numbered(dir: &Path, prefix: &str) -> Result<StepDir, ProjectError> {
     fs::create_dir_all(dir)
-        .map_err(|e| ProjectError(format!("{} nicht anlegbar: {e}", dir.display())))?;
+        .map_err(|e| ProjectError(text::io_error("Ordner nicht anlegbar", dir, &e)))?;
     let mut n = numbered(dir, prefix).last().map_or(0, |m| m.0) + 1;
     loop {
         let path = dir.join(format!("{prefix}{n:03}"));
@@ -539,9 +548,10 @@ fn create_numbered(dir: &Path, prefix: &str) -> Result<StepDir, ProjectError> {
             Ok(()) => return Ok(StepDir { path, new: true }),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
             Err(e) => {
-                return Err(ProjectError(format!(
-                    "{} nicht anlegbar: {e}",
-                    path.display()
+                return Err(ProjectError(text::io_error(
+                    "Ordner nicht anlegbar",
+                    &path,
+                    &e,
                 )))
             }
         }
@@ -721,29 +731,29 @@ impl Project {
     /// from hidden files). `project.toml` is written right away.
     pub fn create(dir: &Path, name: &str) -> Result<Project, ProjectError> {
         if dir.join(PROJECT_FILE).exists() {
-            return Err(ProjectError(format!(
-                "Projekt existiert schon: {}",
-                dir.join(PROJECT_FILE).display()
+            return Err(ProjectError(text::about_path(
+                "Hier ist schon ein Projekt – „Projekt öffnen …“ nehmen",
+                dir,
             )));
         }
         if dir.exists() {
             let entries = fs::read_dir(dir)
-                .map_err(|e| ProjectError(format!("{} nicht lesbar: {e}", dir.display())))?;
+                .map_err(|e| ProjectError(text::io_error("Ordner nicht lesbar", dir, &e)))?;
             let busy = entries
                 .filter_map(Result::ok)
                 .any(|e| !e.file_name().to_string_lossy().starts_with('.'));
             if busy {
-                return Err(ProjectError(format!(
-                    "Ordner {} ist nicht leer; ein neues Projekt braucht einen leeren Ordner",
-                    dir.display()
+                return Err(ProjectError(text::about_path(
+                    "Ordner ist nicht leer – ein neues Projekt braucht einen leeren Ordner",
+                    dir,
                 )));
             }
         }
         fs::create_dir_all(dir)
-            .map_err(|e| ProjectError(format!("{} nicht anlegbar: {e}", dir.display())))?;
+            .map_err(|e| ProjectError(text::io_error("Ordner nicht anlegbar", dir, &e)))?;
         let project = Project {
             dir: canonical(dir)
-                .map_err(|e| ProjectError(format!("{} nicht lesbar: {e}", dir.display())))?,
+                .map_err(|e| ProjectError(text::io_error("Ordner nicht lesbar", dir, &e)))?,
             name: name.to_string(),
             scans: Vec::new(),
         };
@@ -754,26 +764,34 @@ impl Project {
     /// Reads `dir/project.toml`.
     pub fn open(dir: &Path) -> Result<Project, ProjectError> {
         let file = dir.join(PROJECT_FILE);
-        let text = fs::read_to_string(&file).map_err(|e| {
+        let content = fs::read_to_string(&file).map_err(|e| {
             ProjectError(if e.kind() == io::ErrorKind::NotFound {
-                format!("Kein Projekt: {} fehlt", file.display())
+                text::about_path("Kein Projekt: project.toml fehlt", dir)
             } else {
-                format!("{} nicht lesbar: {e}", file.display())
+                text::io_error("project.toml nicht lesbar", &file, &e)
             })
         })?;
-        let bad = |e: &dyn fmt::Display| ProjectError(format!("{}: {e}", file.display()));
-        let table: toml::Table = toml::from_str(&text).map_err(|e| bad(&e))?;
+        let bad = |what: &str| ProjectError(text::about_path(what, &file));
+        let table: toml::Table = toml::from_str(&content)
+            .map_err(|e| ProjectError(text::damaged_toml(&file, &content, &e)))?;
         match table.get("format").and_then(toml::Value::as_integer) {
             Some(FORMAT) => {}
             Some(n) => {
                 return Err(bad(&format!(
-                    "Projektformat {n} wird von diesem Programm nicht unterstützt"
+                    "Projektformat {n} wird von diesem Programm nicht unterstützt (neueres \
+                     Driftless nötig)"
                 )))
             }
-            None => return Err(bad(&"`format` fehlt")),
+            None => return Err(bad("project.toml ist beschädigt: „format“ fehlt")),
         }
-        let pf: ProjectFile = table.try_into().map_err(|e| bad(&e))?;
-        let dir = canonical(dir).map_err(|e| bad(&e))?;
+        let pf: ProjectFile = table.try_into().map_err(|e: toml::de::Error| {
+            bad(&format!(
+                "project.toml ist beschädigt: {}",
+                e.message().lines().next().unwrap_or_default()
+            ))
+        })?;
+        let dir = canonical(dir)
+            .map_err(|e| ProjectError(text::io_error("Projektordner nicht lesbar", dir, &e)))?;
         let scans = pf
             .scans
             .into_iter()
@@ -797,7 +815,7 @@ impl Project {
                 }
             })
             .collect::<Vec<_>>();
-        check_ids(&scans).map_err(|e| bad(&e))?;
+        check_ids(&scans).map_err(|e| bad(&format!("project.toml ist beschädigt: {e}")))?;
         Ok(Project {
             dir,
             name: pf.name,
@@ -841,10 +859,10 @@ impl Project {
             scans,
         };
         let file = self.dir.join(PROJECT_FILE);
-        let text =
-            toml::to_string(&pf).map_err(|e| ProjectError(format!("{}: {e}", file.display())))?;
-        atomic_write(&file, text.as_bytes())
-            .map_err(|e| ProjectError(format!("{} nicht schreibbar: {e}", file.display())))
+        let content = toml::to_string(&pf)
+            .map_err(|e| ProjectError(text::about_path(&e.to_string(), &file)))?;
+        atomic_write(&file, content.as_bytes())
+            .map_err(|e| ProjectError(text::io_error("project.toml nicht schreibbar", &file, &e)))
     }
 
     pub fn scan(&self, id: &str) -> Option<&ScanEntry> {
@@ -859,15 +877,13 @@ impl Project {
     /// `-2`, `-3`, … if taken (ignoring case). The same folder twice is refused. Call [`Project::save`]
     /// afterwards.
     pub fn add_scan(&mut self, scan_dir: &Path) -> Result<String, ProjectError> {
-        let path = canonical(scan_dir).map_err(|_| {
-            ProjectError(format!("Scan-Ordner {} nicht gefunden", scan_dir.display()))
-        })?;
+        let path = canonical(scan_dir)
+            .map_err(|_| ProjectError(text::about_path("Scan-Ordner nicht gefunden", scan_dir)))?;
         discover_project(&path).map_err(|e| ProjectError(e.to_string()))?;
         if let Some(s) = self.scans.iter().find(|s| same_dir(&s.path, &path)) {
-            return Err(ProjectError(format!(
-                "Scan {} ist schon im Projekt (als {})",
-                path.display(),
-                s.id
+            return Err(ProjectError(text::about_path(
+                &format!("Scan ist schon im Projekt (als „{}“)", s.name),
+                &path,
             )));
         }
         let base = path
@@ -904,19 +920,18 @@ impl Project {
             .iter_mut()
             .find(|s| s.id == scan_id)
             .ok_or_else(|| Self::unknown(scan_id))?;
-        let path = canonical(run_dir).map_err(|_| {
-            ProjectError(format!("Lauf-Ordner {} nicht gefunden", run_dir.display()))
-        })?;
+        let path = canonical(run_dir)
+            .map_err(|_| ProjectError(text::about_path("Lauf-Ordner nicht gefunden", run_dir)))?;
         if !path.join("slam.json").is_file() {
-            return Err(ProjectError(format!(
-                "{} ist kein SLAM-Lauf: slam.json fehlt",
-                path.display()
+            return Err(ProjectError(text::about_path(
+                "Kein SLAM-Lauf: slam.json fehlt",
+                &path,
             )));
         }
         if known.iter().any(|k| same_dir(k, &path)) {
-            return Err(ProjectError(format!(
-                "Lauf {} ist schon im Projekt",
-                path.display()
+            return Err(ProjectError(text::about_path(
+                "Lauf ist schon im Projekt",
+                &path,
             )));
         }
         check_run_scan(&path, &scan.path)?;
@@ -930,10 +945,7 @@ impl Project {
             return ScanState::Missing(Self::unknown(scan_id).0);
         };
         if !scan.path.is_dir() {
-            return ScanState::Missing(format!(
-                "Scan-Ordner {} nicht gefunden",
-                scan.path.display()
-            ));
+            return ScanState::Missing(text::about_path("Scan-Ordner nicht gefunden", &scan.path));
         }
         match discover_project(&scan.path) {
             Ok(_) => ScanState::Ready,
@@ -1033,10 +1045,10 @@ impl Project {
             slam: settings.clone(),
         };
         let file = dir.path().join(RUN_FILE);
-        let text =
-            toml::to_string(&run).map_err(|e| ProjectError(format!("{}: {e}", file.display())))?;
-        atomic_write(&file, text.as_bytes())
-            .map_err(|e| ProjectError(format!("{} nicht schreibbar: {e}", file.display())))?;
+        let content = toml::to_string(&run)
+            .map_err(|e| ProjectError(text::about_path(&e.to_string(), &file)))?;
+        atomic_write(&file, content.as_bytes())
+            .map_err(|e| ProjectError(text::io_error("lauf.toml nicht schreibbar", &file, &e)))?;
         Ok(dir)
     }
 }
@@ -1088,11 +1100,7 @@ pub fn map_dir_for(
             };
             progress.phase("Zwischenstände übernehmen", None);
             link_or_copy(&src.join(file), &target.path().join(file)).map_err(|e| {
-                format!(
-                    "{} nicht nach {} kopierbar: {e}",
-                    src.join(file).display(),
-                    target.path().display()
-                )
+                text::io_error("Zwischenstand nicht kopierbar", &src.join(file), &e)
             })?;
             let from = src.file_name().unwrap_or_default().to_string_lossy();
             progress.info(format!("{file} aus {from} übernommen"));
@@ -1204,11 +1212,12 @@ pub fn run_slam_job(
 /// settings are only assumed, and its cache needs others.
 fn reuse_refusal(req: &SlamRequest) -> Result<(), StepError> {
     if settings_differ(req) {
-        return Err(format!(
-            "Lauf wurde mit anderen Einstellungen gerechnet als den Standardwerten (z. B. \
-             --lidar-to-imu, --lidar-topic oder --imu-topic) und lässt sich hier nicht neu \
-             rechnen; mit `driftless slam <scan> -o {} --reuse` und denselben Angaben neu rechnen",
-            req.out.display()
+        return Err(text::about_path(
+            "Nicht neu rechenbar: der Lauf wurde mit anderen SLAM-Einstellungen als den \
+             Standardwerten gerechnet (LiDAR-Lage oder Topics), die nicht bei ihm stehen; den \
+             Scan mit diesen Einstellungen neu rechnen (Scan wählen, „Erweitert“, \
+             SLAM-Einstellungen, „SLAM rechnen“)",
+            &req.out,
         )
         .into());
     }
@@ -1226,11 +1235,12 @@ fn map_refusal(run: &RunInfo, scan: &Path) -> Result<(), StepError> {
         history: false,
     };
     if settings_differ(&req) {
-        return Err(format!(
-            "Lauf wurde mit anderen Einstellungen gerechnet als den Standardwerten (z. B. \
-             --lidar-to-imu, --lidar-topic oder --imu-topic); die Karte lässt sich hier nicht \
-             rechnen; mit `driftless map <scan> --slam {}` und denselben Angaben rechnen",
-            run.dir.display()
+        return Err(text::about_path(
+            "Karte nicht rechenbar: der Lauf wurde mit anderen SLAM-Einstellungen als den \
+             Standardwerten gerechnet (LiDAR-Lage oder Topics), die nicht bei ihm stehen; den \
+             Scan mit diesen Einstellungen neu rechnen (Scan wählen, „Erweitert“, \
+             SLAM-Einstellungen, „SLAM rechnen“)",
+            &run.dir,
         )
         .into());
     }
@@ -1271,7 +1281,7 @@ pub fn restore_job(
     let before = match fs::read(&path) {
         Ok(bytes) => Some(bytes),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("{} nicht lesbar: {e}", path.display()).into()),
+        Err(e) => return Err(text::io_error("Korrekturen nicht lesbar", &path, &e).into()),
     };
     history::restore_flags(&run.dir, nr)?;
     let done = run_slam_job(project, scan_id, &SlamJob::Reuse(run.clone()), progress);
@@ -1282,9 +1292,10 @@ pub fn restore_job(
             None => Ok(()),
         };
         if let Err(e) = back {
-            return Err(format!(
-                "Neu rechnen fehlgeschlagen und {} nicht zurückgeschrieben: {e}",
-                path.display()
+            return Err(text::io_error(
+                "Neu rechnen fehlgeschlagen und Korrekturen nicht zurückgeschrieben",
+                &path,
+                &e,
             )
             .into());
         }
@@ -1585,7 +1596,7 @@ pub fn run_pairs_merge_job(
         return Err(StepError::Cancelled);
     }
     fs::create_dir_all(&models)
-        .map_err(|e| ProjectError(format!("{} nicht anlegbar: {e}", models.display())))?;
+        .map_err(|e| ProjectError(text::io_error("Ordner nicht anlegbar", &models, &e)))?;
     pairs.save(&file)?;
     progress.info(text::PAIRS_SAVED.to_string());
     run_merge_job(project, &picks, include_unsure, progress)

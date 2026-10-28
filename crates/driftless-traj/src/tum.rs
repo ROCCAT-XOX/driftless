@@ -5,8 +5,12 @@ use nalgebra::{Quaternion, UnitQuaternion, Vector3};
 use std::fmt::Write as _;
 use std::path::Path;
 
-fn parse_line(line: usize, text: &str) -> Result<Pose, TrajError> {
-    let err = |msg: String| TrajError::Parse { line, msg };
+fn parse_line(path: &Path, line: usize, text: &str) -> Result<Pose, TrajError> {
+    let err = |msg: String| TrajError::Parse {
+        path: path.display().to_string(),
+        line,
+        msg,
+    };
     let fields: Vec<&str> = text.split_whitespace().collect();
     if fields.len() != 8 {
         return Err(err(format!("8 Felder erwartet, {} gefunden", fields.len())));
@@ -41,7 +45,7 @@ pub fn read_tum(path: &Path) -> Result<Vec<Pose>, TrajError> {
         if l.is_empty() || l.starts_with('#') {
             continue;
         }
-        out.push(parse_line(i + 1, l)?);
+        out.push(parse_line(path, i + 1, l)?);
     }
     Ok(out)
 }

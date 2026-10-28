@@ -8,17 +8,19 @@ use super::tools::{self, PairSession, ScreenLayout, Tool};
 use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
     actions, rail, settings, status, steps, text, theme, Action, AppState, CloudSummary,
-    InspectResult, Queued, Selection, Step, SurfaceSummary, UiMessage, ViewSettings, ViewStats,
+    InspectResult, LogEntry, LogKind, Queued, Selection, Step, SurfaceSummary, UiMessage,
+    ViewSettings, ViewStats,
 };
 use crate::cloud::{load_cloud, load_pair_cloud, LoadedCloud};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
+use crate::logfile::{self, Level, LogFile};
 use crate::overlay::RunOverlay;
 use crate::project::{canonical, set_point_pair_enabled, Project};
 use crate::render::ShowMode;
 use crate::surface::{load_mesh, surface_glb};
 use crate::synthetic::synthetic_cloud;
 use driftless_gpu::GpuPref;
-use driftless_io::progress::Progress;
+use driftless_io::progress::{LogLine, Progress};
 use driftless_steps::export::{file_kind, ExportKind, MESH_EXTENSIONS, POINT_EXTENSIONS};
 use driftless_steps::merge::MODEL_LAS;
 use driftless_steps::{correct, StepError};
@@ -322,6 +324,9 @@ pub struct DriftlessApp {
     themed: bool,
     /// Where the panels and the floating bars were in the last frame.
     layout: ScreenLayout,
+    /// The log file of this start: every message of the status bar and every line of the
+    /// Protokoll goes into it as it comes ([`DriftlessApp::say`], [`DriftlessApp::protocol`]).
+    log_file: Option<Arc<LogFile>>,
 }
 
 impl DriftlessApp {
@@ -359,22 +364,51 @@ impl DriftlessApp {
             forget_last: false,
             themed: false,
             layout: ScreenLayout::default(),
+            log_file: None,
         }
     }
 
-    /// For eframe: opens the project of `args`, else the project opened last, and starts
-    /// generating the synthetic cloud if asked for.
-    pub fn from_creation_context(cc: &eframe::CreationContext<'_>, args: Args) -> Self {
+    /// With the log file of this start: what the window says goes into it as well.
+    pub fn with_log_file(mut self, log: Arc<LogFile>) -> Self {
+        self.log_file = Some(log);
+        self
+    }
+
+    /// For eframe: writes the start line into the log file `log` (with the graphics adapter
+    /// eframe chose and the project to open), opens the project of `args`, else the project
+    /// opened last, and starts generating the synthetic cloud if asked for.
+    pub fn from_creation_context(
+        cc: &eframe::CreationContext<'_>,
+        args: Args,
+        log: Option<Arc<LogFile>>,
+    ) -> Self {
         let ctx = cc.egui_ctx.clone();
         super::theme::apply(&cc.egui_ctx);
         let mut app = DriftlessApp::new(Arc::new(move || ctx.request_repaint()));
+        app.log_file = log;
         app.themed = true;
         app.render_state = cc.wgpu_render_state.clone();
         app.restore_ui(&cc.egui_ctx, cc.storage);
+        let last = cc
+            .storage
+            .and_then(|s| s.get_string(LAST_PROJECT_KEY))
+            .filter(|s| !s.is_empty());
+        if let Some(file) = &app.log_file {
+            let gpu = cc.wgpu_render_state.as_ref().map(|rs| {
+                let info = rs.adapter.get_info();
+                let details = [
+                    format!("{:?}", info.backend),
+                    format!("{:?}", info.device_type),
+                    format!("{} {}", info.driver, info.driver_info),
+                ];
+                logfile::gpu_text(&info.name, &details)
+            });
+            let project = args.project.clone().or(last.clone().map(PathBuf::from));
+            file.write_start(gpu.as_deref(), project.as_deref());
+        }
         if let Some(dir) = args.project {
             app.apply(Action::OpenProject(dir));
         } else {
-            let last = cc.storage.and_then(|s| s.get_string(LAST_PROJECT_KEY));
             app.restore_last(last.as_deref());
         }
         if let Some(n) = args.synthetic {
@@ -496,7 +530,8 @@ impl DriftlessApp {
         self.overlay_version += 1;
     }
 
-    /// A change of the corrections ended: its answer goes into the panel unchanged.
+    /// A change of the corrections ended: its answer goes into the panel (a refusal also into
+    /// the Protokoll and the log file).
     fn corrected(&mut self, action: &Action, result: Result<JobOutput, StepError>) {
         let c = &mut self.state.correct;
         c.busy = false;
@@ -515,13 +550,31 @@ impl DriftlessApp {
                         c.clear_places();
                     }
                     c.corrections = Some(Ok(done.corrections));
-                    c.message = Some(UiMessage::Info(done.message));
+                    c.message = Some(UiMessage::Info(text::shown(&done.message).into_owned()));
                 }
             }
             Ok(_) => {}
-            Err(e) if shown => c.message = Some(UiMessage::Error(e.to_string())),
+            Err(e) if shown => {
+                let m = UiMessage::Error(text::shown(&text::german(&e.to_string())).into_owned());
+                self.note(&m);
+                self.state.correct.message = Some(m);
+            }
             Err(e) => self.error(e.to_string()),
         }
+    }
+
+    /// A warning or an error shown in a panel, not on the status bar: into the Protokoll and
+    /// the log file as well.
+    fn note(&mut self, m: &UiMessage) {
+        let (level, kind) = match m {
+            UiMessage::Info(_) => return,
+            UiMessage::Warning(_) => (Level::Warning, LogKind::Warning),
+            UiMessage::Error(_) => (Level::Error, LogKind::Error),
+        };
+        if let Some(file) = &self.log_file {
+            file.write(level, m.text());
+        }
+        self.protocol(kind, m.text());
     }
 
     /// Queues a change of the corrections (one at a time).
@@ -1259,18 +1312,22 @@ impl DriftlessApp {
 
     /// Once per frame: takes a finished step, the new log lines and the progress.
     pub fn tick(&mut self) {
+        // the lines of a step before its end, so that its summary comes before „fertig“
+        let lines = self.jobs.take_log();
+        self.take_lines(lines);
         if let Some(finished) = self.jobs.poll() {
+            let lines = self.jobs.take_log();
+            self.take_lines(lines);
             self.finished(finished);
         }
-        self.state.log.extend(self.jobs.take_log());
         self.state.job = self.jobs.status();
         self.tick_loader();
         self.tick_surface_loader();
         // what the readers say about a file they read anyway (a missing OBJ texture, …)
-        self.state.log.extend(self.loader.take_log());
-        self.state.log.extend(self.surface_loader.take_log());
-        let over = self.state.log.len().saturating_sub(LOG_LIMIT);
-        self.state.log.drain(..over);
+        let lines = self.loader.take_log();
+        self.take_lines(lines);
+        let lines = self.surface_loader.take_log();
+        self.take_lines(lines);
         self.sync_run();
         self.sync_compare();
         self.tick_helper();
@@ -1645,6 +1702,11 @@ impl DriftlessApp {
                 self.surface_loader.cancel();
             }
             Action::DismissMessages => self.state.messages.clear(),
+            Action::OpenLogFolder => {
+                if let Err(e) = super::about::open_log_folder() {
+                    self.error(e);
+                }
+            }
             Action::FrameAll => self.view.frame_all(),
             step @ (Action::Inspect(_)
             | Action::RunSlam(_)
@@ -1808,18 +1870,71 @@ impl DriftlessApp {
     }
 
     fn info(&mut self, text: String) {
-        self.message(UiMessage::Info(text));
+        self.say(UiMessage::Info(text));
     }
 
     fn error(&mut self, text: String) {
-        self.message(UiMessage::Error(text));
+        self.say(UiMessage::Error(text));
     }
 
-    fn message(&mut self, m: UiMessage) {
+    /// Every message of the status bar comes here, in German ([`text::german`]): into the
+    /// log file, onto the status bar (the same as the last one only once), and a warning or an
+    /// error into the Protokoll as well.
+    fn say(&mut self, m: UiMessage) {
+        let (level, kind) = match &m {
+            UiMessage::Info(_) => (Level::Message, None),
+            UiMessage::Warning(_) => (Level::Warning, Some(LogKind::Warning)),
+            UiMessage::Error(_) => (Level::Error, Some(LogKind::Error)),
+        };
+        let german = text::german(m.text());
+        if let Some(file) = &self.log_file {
+            file.write(level, &german);
+        }
+        let shown = text::shown(&german).into_owned();
+        let m = match m {
+            UiMessage::Info(_) => UiMessage::Info(shown),
+            UiMessage::Warning(_) => UiMessage::Warning(shown),
+            UiMessage::Error(_) => UiMessage::Error(shown),
+        };
+        if self.state.messages.last() == Some(&m) {
+            return;
+        }
+        if let Some(kind) = kind {
+            self.protocol(kind, m.text());
+        }
         let messages = &mut self.state.messages;
         messages.push(m);
         let over = messages.len().saturating_sub(MESSAGE_LIMIT);
         messages.drain(..over);
+    }
+
+    /// A line of the Protokoll as shown, with the time; the oldest go beyond [`LOG_LIMIT`].
+    /// Not into the log file: that is the caller's ([`DriftlessApp::say`],
+    /// [`DriftlessApp::take_lines`]).
+    fn protocol(&mut self, kind: LogKind, shown: &str) {
+        let log = &mut self.state.log;
+        log.push(LogEntry {
+            time: chrono::Local::now().format("%H:%M:%S").to_string(),
+            kind,
+            text: shown.to_string(),
+        });
+        let over = log.len().saturating_sub(LOG_LIMIT);
+        log.drain(..over);
+    }
+
+    /// What the steps and the loaders said: in German into the log file and the Protokoll.
+    fn take_lines(&mut self, lines: Vec<LogLine>) {
+        for line in lines {
+            let (level, kind, said) = match line {
+                LogLine::Info(t) => (Level::Info, LogKind::Info, t),
+                LogLine::Warning(t) => (Level::Warning, LogKind::Warning, t),
+            };
+            let german = text::german(&said);
+            if let Some(file) = &self.log_file {
+                file.write(level, &german);
+            }
+            self.protocol(kind, &text::shown(&german));
+        }
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
@@ -2088,6 +2203,12 @@ fn change_corrections(action: &Action) -> Result<Corrected, StepError> {
 impl eframe::App for DriftlessApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.show(ui);
+    }
+
+    fn on_exit(&mut self) {
+        if let Some(file) = &self.log_file {
+            file.write(Level::Info, logfile::END_TEXT);
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

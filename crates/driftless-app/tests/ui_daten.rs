@@ -323,7 +323,7 @@ fn errors(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             driftless_app::ui::UiMessage::Error(e) => Some(e.clone()),
-            driftless_app::ui::UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect()
 }

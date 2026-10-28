@@ -294,7 +294,7 @@ fn errors(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             UiMessage::Error(e) => Some(e.clone()),
-            UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect()
 }
@@ -534,7 +534,7 @@ fn infos(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             UiMessage::Info(i) => Some(i.clone()),
-            UiMessage::Error(_) => None,
+            _ => None,
         })
         .collect()
 }

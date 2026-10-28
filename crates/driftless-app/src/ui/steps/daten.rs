@@ -270,8 +270,16 @@ fn model_list(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
     ui.add_space(6.0);
     ui.label(RichText::new(text::MODELS).strong());
     if let Some(e) = &state.point_pairs_error {
+        // the reason in one line, the reader's whole answer on hover
         let color = ui.visuals().error_fg_color;
-        ui.add(egui::Label::new(RichText::new(e).color(color)).wrap());
+        let e = text::german(e);
+        let first = text::short_paths(&e)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        ui.add(egui::Label::new(RichText::new(first).color(color)).wrap())
+            .on_hover_text(e);
     }
     for model in &state.models {
         tree::model_node(ui, state, model, action);

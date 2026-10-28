@@ -40,6 +40,8 @@ egui-wgpu = "0.36"
 egui-phosphor = "0.14"
 # Decoding the JPEG and PNG pages of a surface.
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+# The warnings of wgpu, eframe and winit into the log file (`logfile::install_library_logger`).
+log = "0.4"
 mimalloc = { version = "0.1", default-features = false }
 # Writing the program symbol (`icon`) as PNG, also inside the .ico and .icns.
 png = "0.18"

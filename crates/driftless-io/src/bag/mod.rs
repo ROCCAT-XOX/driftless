@@ -14,14 +14,14 @@ pub use record::Time;
 /// Errors produced while reading a bag.
 #[derive(Debug, thiserror::Error)]
 pub enum BagError {
-    #[error("I/O error: {0}")]
+    #[error("Bag-Datei nicht lesbar: {0}")]
     Io(#[from] std::io::Error),
-    #[error("not a ROS1 bag (missing `#ROSBAG V2.0` magic)")]
+    #[error("keine ROS1-Bag-Datei (Kennung `#ROSBAG V2.0` fehlt)")]
     NotABag,
-    #[error("bag is truncated: record at byte offset {offset} is incomplete")]
+    #[error("Bag-Datei abgeschnitten: Eintrag bei Byte {offset} unvollständig")]
     Truncated { offset: u64 },
-    #[error("unsupported chunk compression `{0}`")]
+    #[error("Kompression „{0}“ der Bag-Datei nicht unterstützt")]
     UnsupportedCompression(String),
-    #[error("malformed bag: {0}")]
+    #[error("Bag-Datei ist beschädigt: {0}")]
     Malformed(String),
 }

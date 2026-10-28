@@ -1,7 +1,9 @@
 //! The log file of the program, for when something fails on another PC: what goes into the
-//! „Protokoll“ and the status bar (messages, warnings and errors of the steps), at each start a
-//! line with version, commit, system, graphics adapter and project, and every panic with its
-//! place and backtrace ([`install_panic_hook`]).
+//! „Protokoll“ and the status bar (messages, warnings and errors of the steps; the window writes
+//! each as it comes), at each start a line with version, commit, system, graphics adapter and
+//! project, every panic with its place and backtrace ([`install_panic_hook`]), and the warnings
+//! and errors the libraries (wgpu, eframe, winit) report through the `log` facade
+//! ([`install_library_logger`]; they stay out of the Protokoll on screen).
 //!
 //! - macOS: `~/Library/Logs/Driftless/driftless.log`
 //! - Windows: `%LOCALAPPDATA%\Driftless\Logs\driftless.log`
@@ -15,7 +17,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// The name of the file of this start.
@@ -26,6 +28,12 @@ pub const KEEP: usize = 5;
 pub const MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// The last line of a start that ended normally.
 pub const END_TEXT: &str = "Programm beendet";
+/// At most this many lines of the libraries per start ([`install_library_logger`]): a
+/// warning that comes every frame must not fill the disk.
+pub const LIBRARY_LINES: usize = 500;
+/// After [`LIBRARY_LINES`]: the last line of the libraries.
+pub const LIBRARY_LIMIT_TEXT: &str =
+    "weitere Warnungen der Bibliotheken in dieser Sitzung nicht geschrieben";
 
 /// The folder of the log files: on macOS in `~/Library/Logs`, on Windows in `%LOCALAPPDATA%`
 /// (elsewhere the XDG state folder); `None` if that folder is unknown.
@@ -230,6 +238,8 @@ pub struct LogFile {
     program: String,
     /// The start line was written.
     started: AtomicBool,
+    /// Lines of the libraries written ([`LIBRARY_LINES`]).
+    library_lines: AtomicUsize,
 }
 
 impl LogFile {
@@ -251,6 +261,7 @@ impl LogFile {
             max_bytes,
             program: program.to_string(),
             started: AtomicBool::new(false),
+            library_lines: AtomicUsize::new(0),
         })
     }
 
@@ -299,6 +310,63 @@ impl LogFile {
         self.start_once(None, None, false);
         self.put(Level::Panic, text, false);
     }
+
+    /// A line of a library, from any thread ([`install_library_logger`]): like a panic it
+    /// never moves the files on; after [`LIBRARY_LINES`] one last line says that more came.
+    pub fn write_library(&self, level: Level, target: &str, message: &str) {
+        let n = self.library_lines.fetch_add(1, Ordering::AcqRel);
+        if n > LIBRARY_LINES {
+            return;
+        }
+        self.start_once(None, None, false);
+        if n == LIBRARY_LINES {
+            self.put(Level::Warning, LIBRARY_LIMIT_TEXT, false);
+        } else {
+            self.put(level, &library_text(target, message), false);
+        }
+    }
+}
+
+/// A line of a library: „[wgpu_core::device] …“ (the module that reported it, then its text).
+pub fn library_text(target: &str, message: &str) -> String {
+    format!("[{target}] {message}")
+}
+
+/// The logger of the `log` facade: the warnings and errors of the libraries (wgpu, eframe,
+/// egui, winit, …) into the log file, nothing into the Protokoll on screen.
+struct LibraryLogger {
+    log: Arc<LogFile>,
+}
+
+impl log::Log for LibraryLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let level = match record.level() {
+            log::Level::Error => Level::Error,
+            _ => Level::Warning,
+        };
+        let message = record.args().to_string();
+        self.log.write_library(level, record.target(), &message);
+    }
+
+    fn flush(&self) {}
+}
+
+/// Makes the warnings and errors that wgpu, eframe, winit and the other libraries report
+/// through the `log` facade go into `log` (at most [`LIBRARY_LINES`] per start). One logger per
+/// process: false if one was installed before (nothing changes then).
+pub fn install_library_logger(log: Arc<LogFile>) -> bool {
+    let installed = log::set_boxed_logger(Box::new(LibraryLogger { log })).is_ok();
+    if installed {
+        log::set_max_level(log::LevelFilter::Warn);
+    }
+    installed
 }
 
 /// Every panic goes into `log` first (thread, message, place, backtrace), then to the hook that
@@ -322,48 +390,6 @@ fn panic_text(info: &PanicHookInfo<'_>) -> String {
         .map_or_else(|| "unbekannt".to_string(), |l| l.to_string());
     let backtrace = std::backtrace::Backtrace::force_capture();
     format!("Thread „{thread}“: {message}\nOrt: {place}\nBacktrace:\n{backtrace}")
-}
-
-/// Tells which entries of a list kept by the window are new since the last look: of the
-/// Protokoll and of the messages of the status bar. Such a list only grows at its end; it loses
-/// entries at its start (only the newest are kept) or all at once („Schließen“). So an entry is
-/// told by the text buffer of its `String`, which stays while the entry moves in the list; an
-/// empty text has no buffer of its own and is left out.
-#[derive(Debug, Default)]
-pub struct NewEntries {
-    /// Text buffer (address) and text of the newest entry seen.
-    last: Option<(usize, String)>,
-}
-
-impl NewEntries {
-    /// The entries of `list` after the newest one seen last time (all of them if that one is
-    /// gone), without empty ones; from then on the newest of `list` counts as seen.
-    pub fn take<'a, T>(&mut self, list: &'a [T], text: impl Fn(&T) -> &str) -> Vec<&'a T> {
-        if list.is_empty() {
-            // Emptied: a new entry may get the buffer of the one seen.
-            self.last = None;
-            return Vec::new();
-        }
-        let start = self
-            .last
-            .as_ref()
-            .and_then(|(at, seen)| {
-                list.iter().rposition(|e| {
-                    let t = text(e);
-                    t.as_ptr().addr() == *at && t == seen
-                })
-            })
-            .map_or(0, |i| i + 1);
-        let new: Vec<&T> = list[start..]
-            .iter()
-            .filter(|e| !text(e).is_empty())
-            .collect();
-        if let Some(e) = new.last() {
-            let t = text(e);
-            self.last = Some((t.as_ptr().addr(), t.to_string()));
-        }
-        new
-    }
 }
 
 #[cfg(test)]
@@ -590,40 +616,5 @@ mod tests {
         assert_eq!(plist_string(plist, "ProductName").as_deref(), Some("macOS"));
         assert_eq!(plist_string(plist, "BuildVersion"), None);
         assert!(os_version().is_some());
-    }
-
-    #[test]
-    fn new_entries_are_those_after_the_newest_seen() {
-        let text = String::as_str;
-        let mut seen = NewEntries::default();
-        let mut list: Vec<String> = vec!["a".into(), "b".into()];
-        assert_eq!(seen.take(&list, text), [&list[0], &list[1]]);
-        assert!(seen.take(&list, text).is_empty(), "nothing new");
-
-        // the same text again is a new entry
-        list.push("b".into());
-        assert_eq!(seen.take(&list, text), [&list[2]]);
-
-        // the oldest dropped and a new one added: same length, one new
-        list.remove(0);
-        list.push("c".into());
-        assert_eq!(seen.take(&list, text), [&"c".to_string()]);
-
-        // more new ones than the list keeps: all that are there are new
-        list.clear();
-        list.extend(["d".to_string(), "e".to_string()]);
-        assert_eq!(seen.take(&list, text), [&list[0], &list[1]]);
-
-        // emptied („Schließen“), then the same text again
-        list.clear();
-        assert!(seen.take(&list, text).is_empty());
-        list.push("e".into());
-        assert_eq!(seen.take(&list, text), [&list[0]]);
-
-        // empty texts are left out
-        list.push(String::new());
-        assert!(seen.take(&list, text).is_empty());
-        list.push("f".into());
-        assert_eq!(seen.take(&list, text), [&"f".to_string()]);
     }
 }

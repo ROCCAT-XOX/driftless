@@ -38,7 +38,7 @@ fn errors(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             UiMessage::Error(e) => Some(e.clone()),
-            UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect()
 }
@@ -680,7 +680,7 @@ fn restore_of_a_cli_run_with_other_settings_changes_nothing() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("Lauf wurde mit anderen Einstellungen gerechnet")),
+            .any(|e| e.contains("der Lauf wurde mit anderen SLAM-Einstellungen")),
         "{errors:?}"
     );
     assert_eq!(files(&run), before, "nothing changed on disk");

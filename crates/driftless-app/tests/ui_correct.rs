@@ -33,7 +33,7 @@ fn errors(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             UiMessage::Error(e) => Some(e.clone()),
-            UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect()
 }
@@ -204,7 +204,8 @@ fn pick_two_places_adds_loop() {
     assert!(row.starts_with("1   aktiv"), "{row}");
     assert!(row.contains(&format!("{ta:.1}")) && row.contains(&format!("{tb:.1}")));
     // in the panel: the message, the entry, the hint to recompute; places cleared
-    h.get_by_label(&correct::added_message(1, ta, tb));
+    // the arrow of the message drawn by the icon font
+    h.get_by_label(&text::shown(&correct::added_message(1, ta, tb)));
     h.get_by_label(&text::place_time(ta));
     h.get_by_label(&entry.added);
     h.get_by_label(text::CHANGED_RECOMPUTE);
@@ -240,10 +241,11 @@ fn invalid_loop_shows_error_and_writes_nothing() {
         click(&mut h, text::ADD_LOOP);
         wait_written(&mut h);
 
-        // the message of the check, unchanged
+        // the message of the check, as shown (its arrow drawn by the icon font)
         let expected = correct::check_new_loop(&run, &correct::load(&run).unwrap(), ta, tb)
             .unwrap_err()
             .to_string();
+        let expected = text::shown(&text::german(&expected)).into_owned();
         assert_eq!(
             h.state().state().correct.message,
             Some(UiMessage::Error(expected.clone())),

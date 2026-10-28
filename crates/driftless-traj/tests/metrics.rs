@@ -243,6 +243,8 @@ fn tum_malformed_lines_name_the_line() {
             Err(e) => {
                 let msg = e.to_string();
                 assert!(msg.contains(&format!("Zeile {line}")), "{msg}");
+                // the file is named, so a message in the window says which one
+                assert!(msg.contains("bad.tum ist beschädigt"), "{msg}");
             }
             Ok(_) => panic!("accepted: {text:?}"),
         }

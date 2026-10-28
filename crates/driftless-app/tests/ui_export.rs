@@ -125,7 +125,7 @@ fn errors(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             UiMessage::Error(e) => Some(e.clone()),
-            UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect()
 }

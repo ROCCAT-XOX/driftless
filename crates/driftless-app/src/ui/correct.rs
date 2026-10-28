@@ -266,6 +266,10 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
             let color = ui.visuals().error_fg_color;
             ui.label(RichText::new(e).color(color));
         }
+        Some(UiMessage::Warning(m)) => {
+            let color = ui.visuals().warn_fg_color;
+            ui.label(RichText::new(m).color(color));
+        }
         Some(UiMessage::Info(m)) => {
             ui.label(m);
         }

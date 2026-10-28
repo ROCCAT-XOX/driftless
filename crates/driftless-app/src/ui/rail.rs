@@ -83,9 +83,7 @@ fn project_menu(ui: &mut Ui, state: &mut AppState, action: &mut Option<Action>) 
     r.on_disabled_hover_text(text::EXPORT_NEEDS_VIEW);
     ui.separator();
     if ui.button(text::OPEN_LOG_FOLDER).clicked() {
-        if let Err(e) = super::about::open_log_folder() {
-            state.messages.push(super::UiMessage::Error(e));
-        }
+        *action = Some(Action::OpenLogFolder);
     }
     if ui.button(text::ABOUT).clicked() {
         state.about_open = true;

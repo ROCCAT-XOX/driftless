@@ -3,8 +3,9 @@
 
 use driftless_app::jobs::JobOutput;
 use driftless_app::project::{canonical, Project};
-use driftless_app::ui::{parse_args, text, Action, Args, DriftlessApp, Selection, UiMessage};
-use driftless_io::progress::LogLine;
+use driftless_app::ui::{
+    parse_args, text, Action, Args, DriftlessApp, LogKind, Selection, UiMessage,
+};
 use driftless_io::testscan::{room_bag_secs, tmp};
 use driftless_steps::StepError;
 use egui_kittest::kittest::Queryable;
@@ -37,7 +38,7 @@ fn errors(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             UiMessage::Error(e) => Some(e.clone()),
-            UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect()
 }
@@ -103,7 +104,12 @@ fn job_progress_log_and_result_reach_state() {
     app.tick();
     let job = app.state().job.clone().unwrap();
     assert_eq!((job.progress.done, job.progress.total), (3, Some(10)));
-    assert_eq!(app.state().log, vec![LogLine::Warning("Achtung".into())]);
+    let log = &app.state().log;
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert_eq!(
+        (log[0].kind, log[0].text.as_str()),
+        (LogKind::Warning, "Achtung")
+    );
     assert!(app.wants_repaint_while_busy());
     tx.send(()).unwrap();
     tick_until(&mut app, |a| a.state().job.is_none());
@@ -292,10 +298,17 @@ fn gone_last_project_is_reported_once() {
 #[test]
 fn messages_are_capped() {
     let mut app = app();
-    for _ in 0..250 {
-        app.apply(Action::Inspect("x".into()));
+    // 250 different messages („Scan nicht im Projekt: x7“)
+    for i in 0..250 {
+        app.apply(Action::ComputeMap(format!("x{i}")));
     }
     assert_eq!(app.state().messages.len(), 100);
+    // the same message again and again stands once
+    app.apply(Action::DismissMessages);
+    for _ in 0..5 {
+        app.apply(Action::Inspect("x".into()));
+    }
+    assert_eq!(app.state().messages.len(), 1);
 }
 
 #[test]
@@ -678,9 +691,9 @@ fn dropped_obj_loads_surface() {
     assert_eq!(errors(h.state()), Vec::<String>::new());
     let log = &h.state().state().log;
     assert!(
-        log.iter().any(
-            |l| matches!(l, LogLine::Warning(w) if w.contains("Textur fehlt") && w.contains("Netz_seite_01.jpg"))
-        ),
+        log.iter().any(|l| l.kind == LogKind::Warning
+            && l.text.contains("Textur fehlt")
+            && l.text.contains("Netz_seite_01.jpg")),
         "{log:?}"
     );
 }

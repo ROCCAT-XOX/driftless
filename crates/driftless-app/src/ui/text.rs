@@ -1,5 +1,11 @@
 //! Every text the program shows, in one place (German): fixed texts as constants, texts
-//! with values as small functions.
+//! with values as small functions. Messages of the steps and of the system pass through
+//! [`german`] (system errors in German, the window's actions instead of command lines), and
+//! what the window shows of them through [`shown`] (symbols its fonts lack) and
+//! [`short_paths`] (file names instead of whole paths, the reason stays in view).
+
+use std::borrow::Cow;
+use std::path::Path;
 
 pub const APP_TITLE: &str = "Driftless";
 /// Name of a new project whose folder has no name (a drive root).
@@ -238,9 +244,9 @@ pub fn pair_cloud_name(member: &str) -> String {
     format!("Modell und {member}")
 }
 
-/// A point pair of a model: „Paar 1 · 1 ↔ 3 · 4 Punkte“ (the numbers of its scans).
+/// A point pair of a model: „Paar 1 · Scan 1 und 3 · 4 Punkte“ (the numbers of its scans).
 pub fn pair_row(nr: usize, a: usize, b: usize, points: usize) -> String {
-    format!("Paar {nr} · {a} ↔ {b} · {points} Punkte")
+    format!("Paar {nr} · Scan {a} und {b} · {points} Punkte")
 }
 
 /// Beside a point pair the merge cannot use (a hand edit of the file); the reason on hover.
@@ -515,7 +521,7 @@ pub const SHOW_MODE: &str = "Ansicht";
 pub const SHOW_SURFACE: &str = "Fläche";
 pub const SHOW_CLOUD: &str = "Punkte";
 pub const SHOW_BOTH: &str = "beides";
-pub const SHOW_MODE_KEY_HINT: &str = "Taste O: Fläche → Punkte → beides";
+pub const SHOW_MODE_KEY_HINT: &str = "Taste O wechselt der Reihe nach: Fläche, Punkte, beides";
 /// Why „Punkte“ and „beides“ are locked while only a surface is loaded.
 pub const SHOW_NEEDS_CLOUD: &str = "Keine Punktwolke geladen – nur die Fläche";
 /// A glb that cannot be read from disk because it is not there.
@@ -1067,7 +1073,7 @@ pub const CHOOSE: &str = "wählen …";
 pub const COMPARING: &str = "Wird verglichen …";
 pub const COMPARE_JOB: &str = "Laufbahnen vergleichen";
 pub const COMPARE_ATE: &str = "Abweichung (ATE, RMSE)";
-pub const COMPARE_GAP: &str = "Start↔Ende A/B";
+pub const COMPARE_GAP: &str = "Start–Ende A/B";
 pub const COMPARE_LENGTH: &str = "Länge A/B";
 pub const COMPARE_MATCHED: &str = "Zugeordnete Posen";
 pub const LAYER_COMPARE: &str = "Vergleich (A)";
@@ -1134,7 +1140,7 @@ pub fn stamp(created: &str) -> String {
 }
 
 /// A state of the history in the tree: „Stand 003 · neu gerechnet · 21.10.2026 16:03 ·
-/// Start↔Ende 0,123 m“ (without the gap if `slam.json` could not be read).
+/// Start–Ende 0,123 m“ (without the gap if `slam.json` could not be read).
 pub fn history_entry(e: &driftless_steps::history::HistoryEntry, gap: Option<f64>) -> String {
     let mut s = format!(
         "{} · {} · {}",
@@ -1143,7 +1149,7 @@ pub fn history_entry(e: &driftless_steps::history::HistoryEntry, gap: Option<f64
         stamp(&e.created)
     );
     if let Some(g) = gap {
-        s.push_str(&format!(" · Start↔Ende {}", compare_metres(g)));
+        s.push_str(&format!(" · Start–Ende {}", compare_metres(g)));
     }
     s
 }
@@ -1152,4 +1158,304 @@ pub const HISTORY_GAPS_JOB: &str = "Verlauf lesen";
 /// The legend of a comparison in the view: „A: SLAM 001 Odometrie“.
 pub fn legend(which: &str, name: &str) -> String {
     format!("{which}: {name}")
+}
+
+// Messages: system errors in German, symbols the fonts lack, paths shortened
+
+/// The reason of a system error in German, by its kind; `None` for a kind without one (its
+/// own text then stays).
+pub fn io_reason(kind: std::io::ErrorKind) -> Option<&'static str> {
+    use std::io::ErrorKind as K;
+    Some(match kind {
+        K::NotFound => "nicht gefunden",
+        K::PermissionDenied => "keine Berechtigung",
+        K::AlreadyExists => "gibt es schon",
+        K::StorageFull | K::QuotaExceeded => "Datenträger voll",
+        K::ReadOnlyFilesystem => "Datenträger schreibgeschützt",
+        K::TimedOut => "keine Antwort (Netzlaufwerk oder iCloud nicht erreichbar?)",
+        K::NotADirectory => "kein Ordner",
+        K::IsADirectory => "ist ein Ordner",
+        K::DirectoryNotEmpty => "Ordner nicht leer",
+        K::InvalidFilename => "ungültiger Name",
+        K::FileTooLarge => "Datei zu groß",
+        K::ResourceBusy | K::ExecutableFileBusy => "wird gerade von einem anderen Programm benutzt",
+        K::StaleNetworkFileHandle
+        | K::NetworkUnreachable
+        | K::NetworkDown
+        | K::HostUnreachable
+        | K::NotConnected
+        | K::ConnectionReset
+        | K::ConnectionAborted => "Netzlaufwerk nicht erreichbar",
+        K::CrossesDevices => "liegt auf einem anderen Laufwerk",
+        K::UnexpectedEof => "Datei endet zu früh (beschädigt?)",
+        K::InvalidData => "Inhalt beschädigt",
+        K::OutOfMemory => "Arbeitsspeicher reicht nicht",
+        K::Interrupted => "unterbrochen",
+        _ => return None,
+    })
+}
+
+/// The command-line hints of the steps and what to do in the window instead.
+const APP_HINTS: [(&str, &str); 4] = [
+    (
+        "; mit `driftless slam` neu erzeugen",
+        "; den Scan neu rechnen (Scan wählen, „Rechnen“)",
+    ),
+    (
+        "zuerst `driftless slam <scan> -o <ziel>` laufen lassen",
+        "zuerst den Scan rechnen (Scan wählen, „Rechnen“)",
+    ),
+    (
+        "zuerst `driftless map <scan> --slam <ziel>` laufen lassen",
+        "zuerst die Karte rechnen (Scan wählen, „Rechnen“)",
+    ),
+    (
+        "mit `driftless slam` neu rechnen",
+        "den Scan neu rechnen (Scan wählen, „Rechnen“)",
+    ),
+];
+
+/// `message` as the window says it: every system error („Permission denied (os error 13)“)
+/// as its German reason ([`io_reason`]), a command-line hint of a step as the action in the
+/// window ([`APP_HINTS`]; one that names its own folders: „zuerst den Scan rechnen“).
+pub fn german(message: &str) -> String {
+    let mut out = message.to_string();
+    // „<system text> (os error N)“: the text is the system's own for N
+    let mut from = 0;
+    while let Some(at) = out[from..].find("(os error ") {
+        let start = from + at;
+        let digits: String = out[start + 10..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '-')
+            .collect();
+        let end = start + 10 + digits.len();
+        let Some(code) = digits
+            .parse::<i32>()
+            .ok()
+            .filter(|_| out[end..].starts_with(')'))
+        else {
+            from = end;
+            continue;
+        };
+        let system = std::io::Error::from_raw_os_error(code);
+        let english = system.to_string();
+        let reason = io_reason(system.kind());
+        match (reason, out[..end + 1].rfind(&english)) {
+            (Some(reason), Some(begin)) if begin + english.len() == end + 1 => {
+                out.replace_range(begin..end + 1, reason);
+                from = begin + reason.len();
+            }
+            _ => from = end + 1,
+        }
+    }
+    for (cli, app) in APP_HINTS {
+        out = out.replace(cli, app);
+    }
+    // the readers of TOML and JSON: where in the file
+    out = places(
+        &out,
+        "TOML parse error at line ",
+        ", column ",
+        "beschädigt (Zeile ",
+    );
+    out = places(&out, " at line ", " column ", " (Zeile ");
+    // any other: „zuerst `driftless …` laufen lassen“
+    while let Some(start) = out.find("zuerst `driftless ") {
+        let Some(len) = out[start..].find("` laufen lassen") else {
+            break;
+        };
+        let end = start + len + "` laufen lassen".len();
+        out.replace_range(
+            start..end,
+            "zuerst den Scan rechnen (Scan wählen, „Rechnen“)",
+        );
+    }
+    out
+}
+
+/// `text` with „<from>N<sep>M“ (two numbers) as „<to>N, Spalte M)“: where a reader of TOML
+/// or JSON stopped, in German.
+fn places(text: &str, from: &str, sep: &str, to: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(from) {
+        let after = &rest[at + from.len()..];
+        let line: String = after.chars().take_while(char::is_ascii_digit).collect();
+        let after_line = &after[line.len()..];
+        let column = after_line
+            .strip_prefix(sep)
+            .map(|c| {
+                c.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        if line.is_empty() || column.is_empty() {
+            out.push_str(&rest[..at + from.len()]);
+            rest = after;
+            continue;
+        }
+        out.push_str(&rest[..at]);
+        out.push_str(&format!("{to}{line}, Spalte {column})"));
+        rest = &after_line[sep.len() + column.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The symbols the fonts of the window lack (they come in the messages of the steps, which
+/// a terminal shows as they are), with the symbol of the icon font in their place.
+const SYMBOLS: [(char, &str); 12] = [
+    ('→', egui_phosphor::regular::ARROW_RIGHT),
+    ('←', egui_phosphor::regular::ARROW_LEFT),
+    ('↔', egui_phosphor::regular::ARROWS_LEFT_RIGHT),
+    ('↑', egui_phosphor::regular::ARROW_UP),
+    ('↓', egui_phosphor::regular::ARROW_DOWN),
+    ('✓', egui_phosphor::regular::CHECK),
+    ('✔', egui_phosphor::regular::CHECK),
+    ('✗', egui_phosphor::regular::X),
+    ('✘', egui_phosphor::regular::X),
+    ('⚠', egui_phosphor::regular::WARNING),
+    ('▸', egui_phosphor::regular::CARET_RIGHT),
+    ('▾', egui_phosphor::regular::CARET_DOWN),
+];
+
+/// `text` with the symbols the fonts lack ([`SYMBOLS`]) drawn by the icon font.
+pub fn shown(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(|c| SYMBOLS.iter().any(|(s, _)| *s == c)) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match SYMBOLS.iter().find(|(s, _)| *s == c) {
+            Some((_, icon)) => out.push_str(icon),
+            None => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Whether `word` starts an absolute path: `/…` (not `//` alone), `C:\…`, `C:/…` or `\\…`.
+fn starts_path(word: &str) -> bool {
+    let b = word.as_bytes();
+    let drive =
+        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
+    (b.len() > 1 && b[0] == b'/') || drive || word.starts_with(r"\\")
+}
+
+/// `text` with every absolute path cut to its last part (the file or folder name): a
+/// message then says its reason within one line. A path ends before a space unless the next
+/// word goes on with `/` or `\` (a folder name with spaces, „/Projekte/Halle 2026/scans“),
+/// and before a closing „:“, „;“, „,“ or „)“.
+pub fn short_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (k, line) in text.split('\n').enumerate() {
+        if k > 0 {
+            out.push('\n');
+        }
+        let words: Vec<&str> = line.split(' ').collect();
+        let mut i = 0;
+        while i < words.len() {
+            if i > 0 {
+                out.push(' ');
+            }
+            let (lead, word) = split_lead(words[i]);
+            if !starts_path(word) {
+                out.push_str(words[i]);
+                i += 1;
+                continue;
+            }
+            // the words of the path: further words while they go on with a separator
+            let mut path = word.to_string();
+            let mut j = i + 1;
+            while j < words.len() && !ends_path(&path) {
+                let next = words[j];
+                let continues = next
+                    .find(['/', '\\'])
+                    .is_some_and(|at| !next[..at].contains([':', ';', ',', ')']));
+                if !continues {
+                    break;
+                }
+                path.push(' ');
+                path.push_str(next);
+                j += 1;
+            }
+            let (path, tail) = split_tail(&path);
+            out.push_str(lead);
+            out.push_str(last_part(path));
+            out.push_str(tail);
+            i = j;
+        }
+    }
+    out
+}
+
+/// An opening bracket or quote before a path, and the rest.
+fn split_lead(word: &str) -> (&str, &str) {
+    let at = word
+        .find(|c: char| !matches!(c, '(' | '„' | '"' | '\''))
+        .unwrap_or(word.len());
+    word.split_at(at)
+}
+
+/// Whether a path read so far already ends with what closes it („:“ and the like).
+fn ends_path(path: &str) -> bool {
+    path.ends_with([':', ';', ',', ')', '“', '"'])
+}
+
+/// The path and what closes it (punctuation that belongs to the sentence).
+fn split_tail(path: &str) -> (&str, &str) {
+    let trimmed = path.trim_end_matches([':', ';', ',', ')', '“', '"', '.']);
+    path.split_at(trimmed.len())
+}
+
+/// The last part of `path` (`/` or `\` separated), the path itself if it ends with one.
+fn last_part(path: &str) -> &str {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|p| !p.is_empty())
+        .unwrap_or(path)
+}
+
+/// A message about `path`: the reason first, then the name of the file or folder, the whole
+/// path on the next line (the window shows it on hover, the Protokoll and the log file in
+/// full): „Ordner ist nicht leer: Projekte\n/Users/…/Projekte“.
+pub fn about_path(reason: &str, path: &Path) -> String {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    format!("{reason}: {name}\n{}", path.display())
+}
+
+/// [`about_path`] for a system error with the file it was about: „keine Berechtigung:
+/// karte.laz\n…“ (the reason of [`io_reason`], else the system's text).
+pub fn io_error(what: &str, path: &Path, e: &std::io::Error) -> String {
+    let reason = io_reason(e.kind()).map_or_else(|| german(&e.to_string()), str::to_string);
+    about_path(&format!("{what}: {reason}"), path)
+}
+
+/// The line and column (from 1) of byte `at` of `text`.
+pub fn line_column(text: &str, at: usize) -> (usize, usize) {
+    let before = &text[..at.min(text.len())];
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    (line, column)
+}
+
+/// A TOML file that cannot be read: „project.toml ist beschädigt (Zeile 3, Spalte 7):
+/// <what the reader says>“, the whole path on the next line.
+pub fn damaged_toml(path: &Path, text: &str, e: &toml::de::Error) -> String {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let place = e.span().map(|span| line_column(text, span.start));
+    let what = e.message().lines().next().unwrap_or_default().trim();
+    let head = match place {
+        Some((line, column)) => format!("{name} ist beschädigt (Zeile {line}, Spalte {column})"),
+        None => format!("{name} ist beschädigt"),
+    };
+    format!("{head}: {what}\n{}", path.display())
 }

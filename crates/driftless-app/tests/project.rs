@@ -151,7 +151,7 @@ fn create_refuses_existing_project() {
     Project::create(&dir.join("p"), "eins").unwrap();
     let err = Project::create(&dir.join("p"), "zwei").unwrap_err();
     assert!(
-        err.to_string().starts_with("Projekt existiert schon"),
+        err.to_string().starts_with("Hier ist schon ein Projekt"),
         "{err}"
     );
     assert_eq!(Project::open(&dir.join("p")).unwrap().name, "eins");
@@ -396,8 +396,8 @@ fn missing_scan_folder_is_reported_not_fatal() {
     let p = Project::open(&p.dir).unwrap();
     match p.scan_state(&id) {
         ScanState::Missing(why) => {
-            assert!(why.starts_with("Scan-Ordner "), "{why}");
-            assert!(why.ends_with(" nicht gefunden"), "{why}");
+            // the reason first, then the folder
+            assert!(why.starts_with("Scan-Ordner nicht gefunden: "), "{why}");
             assert!(why.contains("rohdaten"), "{why}");
         }
         ScanState::Ready => panic!("scan folder is gone"),
@@ -769,10 +769,12 @@ fn reuse_of_cli_run_with_other_settings_explains_why() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.starts_with("Lauf wurde mit anderen Einstellungen gerechnet"),
+        err.starts_with("Nicht neu rechenbar: der Lauf wurde mit anderen SLAM-Einstellungen"),
         "{err}"
     );
-    assert!(err.contains("--reuse"), "{err}");
+    // what to do in the window, no command line
+    assert!(err.contains("„SLAM rechnen“"), "{err}");
+    assert!(!err.contains("driftless "), "{err}");
     assert_eq!(files(&out), before);
     assert!(!out.join("verlauf").exists());
 }
@@ -806,10 +808,10 @@ fn map_of_cli_run_with_other_settings_is_refused() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.starts_with("Lauf wurde mit anderen Einstellungen gerechnet"),
+        err.starts_with("Karte nicht rechenbar: der Lauf wurde mit anderen SLAM-Einstellungen"),
         "{err}"
     );
-    assert!(err.contains("Karte"), "{err}");
+    assert!(!err.contains("driftless "), "{err}");
     assert_eq!(files(&out), before);
     assert_eq!(names(&out), entries, "no map folder");
 
@@ -858,7 +860,7 @@ fn add_run_checks_the_scan() {
     let id_a = p.add_scan(&a).unwrap();
     let id_b = p.add_scan(&b).unwrap();
     let err = p.add_run(&id_b, &lauf).unwrap_err().to_string();
-    assert!(err.contains("gehört nicht zum Scan"), "{err}");
+    assert!(err.starts_with("Lauf gehört nicht zu diesem Scan"), "{err}");
     assert!(p.scans[1].extra_runs.is_empty());
     p.add_run(&id_a, &lauf).unwrap();
 }
