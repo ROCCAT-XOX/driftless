@@ -223,6 +223,23 @@ fn merges_two_scans() {
     assert_eq!(back.members[1].transform, b.transform);
     assert_eq!(back.points, report.points);
     assert!(!out.join(format!("{MODEL_LAS}.tmp")).exists());
+    // The program that made it, beside the report (informational, part of no id).
+    let on_disk: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(out.join(MODEL_REPORT)).unwrap()).unwrap();
+    assert_eq!(
+        on_disk["programm"],
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "commit": driftless_steps::PROGRAM.commit,
+        })
+    );
+    let mut without = on_disk.clone();
+    without.as_object_mut().unwrap().remove("programm");
+    assert_eq!(
+        serde_json::from_value::<ModelReport>(without).unwrap(),
+        report,
+        "a model written before the field reads the same"
+    );
 
     // The same request gives the same files; `ply` adds `modell.ply` (the id stays).
     let again = out_dir("zwei-nochmal");

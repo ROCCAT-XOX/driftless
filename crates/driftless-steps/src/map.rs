@@ -26,6 +26,7 @@
 use crate::error::{check_cancel, failed, StepError};
 use crate::scan::{image_topics, read_imu, warn_if_not_static, with_lidar_frames, IMAGE_TYPE};
 use crate::slam::SlamSettings;
+use crate::{PROGRAM, PROGRAM_KEY};
 use driftless_gpu::{CpuFallback, GpuChoice, GpuContext, GpuPref};
 use driftless_io::calib::load_calibration;
 use driftless_io::camera::Camera;
@@ -1275,13 +1276,14 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
     let stale = warn_stale(&run.out, &run.steps, progress);
 
     let peak = peak_rss_bytes();
-    let report = json!({
+    let mut report = json!({
         "settings": settings,
         "steps": run.steps,
         "seconds_total": seconds(start),
         "stale": stale,
         "peak_rss_bytes": peak,
     });
+    report[PROGRAM_KEY] = json!(PROGRAM);
     let report_path = run.path(REPORT);
     let text = serde_json::to_string_pretty(&report).map_err(failed)? + "\n";
     fs::write(&report_path, text)

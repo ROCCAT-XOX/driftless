@@ -71,9 +71,25 @@ fn slam_writes_cli_outputs() {
     assert!(outcome.map_points > 1000, "{}", outcome.map_points);
     assert!(outcome.seconds > 0.0);
     assert_eq!(outcome.history, None);
+    // The report as returned, then the program that made it (informational).
+    let text = fs::read_to_string(out.join("slam.json")).unwrap();
+    let plain = serde_json::to_string_pretty(&outcome.report).unwrap();
+    assert!(
+        text.starts_with(plain.strip_suffix("\n}").unwrap()),
+        "{text}"
+    );
+    let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
-        fs::read_to_string(out.join("slam.json")).unwrap(),
-        serde_json::to_string_pretty(&outcome.report).unwrap() + "\n"
+        json["programm"],
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "commit": driftless_steps::PROGRAM.commit,
+        })
+    );
+    json.as_object_mut().unwrap().remove("programm");
+    assert_eq!(
+        json,
+        serde_json::from_str::<serde_json::Value>(&plain).unwrap()
     );
 
     // the console lines of `driftless slam`, in order

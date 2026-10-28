@@ -22,6 +22,7 @@ use crate::map::{
     peak_rss_bytes, read_traj, ColorInput, MapInput, CLEAN_BIN, DENSE_BIN,
 };
 use crate::merge::{member_transform, read_model, ModelMember, ModelReport};
+use crate::{PROGRAM, PROGRAM_KEY};
 use driftless_export::mesh;
 use driftless_gpu::{GpuChoice, GpuContext, GpuPref};
 use driftless_io::progress::Progress;
@@ -413,6 +414,7 @@ fn make_surface(
     if let Some((key, value)) = target.extra {
         report[key] = value;
     }
+    report[PROGRAM_KEY] = json!(PROGRAM);
     let text = serde_json::to_string_pretty(&report).map_err(failed)? + "\n";
     atomic_write(&report_path, text.as_bytes())
         .map_err(|e| format!("{} nicht schreibbar: {e}", report_path.display()))?;

@@ -959,7 +959,7 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
         include_unsure: req.include_unsure,
         warnings,
     };
-    let text = serde_json::to_string_pretty(&report).map_err(failed)? + "\n";
+    let text = crate::report_text(&report)?;
     atomic_write(&report_path, text.as_bytes())
         .map_err(|e| format!("{} nicht schreibbar: {e}", report_path.display()))?;
 

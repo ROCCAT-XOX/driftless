@@ -64,6 +64,10 @@ Build with `cargo build --release`; the binaries are `driftless` (command line) 
 | `driftless export-glim <folder> -o <dir>` | Writes `imu.bin` and `lidar.bin` for the GLIM spike (`spikes/glim/`) |
 | `driftless compare <a.tum> <b.tum> [--json]` | Trajectory yardstick: ATE after alignment, path length, start-to-end gap |
 
+Every result JSON (`slam.json`, `map.json`, `oberflaeche.json`, `modell.json`, `calib_check.json`) names
+the program that made it under `programm`: version and commit, as `driftless --version` prints them. It is
+informational only and part of no input id: a result of another version that fits stays current.
+
 Typical correction loop:
 
 ```sh

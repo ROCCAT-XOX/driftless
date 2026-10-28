@@ -460,6 +460,8 @@ struct Report {
     summary: Summary,
     per_camera_best: BTreeMap<String, Score>,
     variants: Vec<VariantReport>,
+    /// The program that made it (informational).
+    programm: driftless_steps::Program,
 }
 
 fn make_score(v: Variant, readings: &[CalibReading], (sum, n): (f64, u64)) -> Score {
@@ -752,6 +754,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         summary,
         per_camera_best,
         variants: reports,
+        programm: driftless_steps::PROGRAM,
     };
     fs::write(
         args.out.join("calib_check.json"),

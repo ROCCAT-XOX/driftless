@@ -132,6 +132,13 @@ fn map_out_dir_separate_from_slam_dir() {
     let json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(map_dir.join("map.json")).unwrap()).unwrap();
     assert_eq!(json, report);
+    assert_eq!(
+        report["programm"],
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "commit": driftless_steps::PROGRAM.commit,
+        })
+    );
     assert_eq!(report["steps"]["dense"]["reused"], false);
     assert!(
         report["steps"]["clean"]["stats"]["dense_quality"]["patches"].is_number(),
@@ -322,6 +329,28 @@ fn stage_ids_hold_no_program_version() {
     assert!(dense.starts_with("map dense v1\n"), "{dense}");
     assert!(clean.starts_with(&dense), "{clean}");
     assert!(clean.contains("clean v3 "), "{clean}");
+}
+
+/// `programm` in `map.json` only says which build made the map: a map of another build, or
+/// one written before the field, still fits.
+#[test]
+fn program_is_part_of_no_id() {
+    let dir = tmp("steps-map-programm");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    slam(&dir, &out, false);
+    let all = input(&dir, &out, MapStep::All);
+    run_map(&request(&dir, &out, &out, MapStep::All), &Progress::new()).unwrap();
+    assert!(folder_fits(&all, &out));
+    let path = out.join("map.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    json["programm"] = serde_json::json!({"version": "0.0.1", "commit": "anderer"});
+    fs::write(&path, json.to_string()).unwrap();
+    assert!(folder_fits(&all, &out), "another build");
+    json.as_object_mut().unwrap().remove("programm");
+    fs::write(&path, json.to_string()).unwrap();
+    assert!(folder_fits(&all, &out), "written before the field");
 }
 
 #[test]

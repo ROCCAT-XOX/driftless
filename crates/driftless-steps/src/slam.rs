@@ -348,10 +348,7 @@ fn write_outputs(out: &Path, result: &SlamResult) -> Result<(SlamReport, usize),
         write_tum(&out.join("traj_odom.tum"), &result.odom_poses())?;
         let map = result.map_points();
         write_las(&out.join("map.las"), &map)?;
-        fs::write(
-            out.join("slam.json"),
-            serde_json::to_string_pretty(&report)? + "\n",
-        )?;
+        fs::write(out.join("slam.json"), crate::report_text(&report)?)?;
         Ok((report, map.len()))
     };
     Ok(write()?)

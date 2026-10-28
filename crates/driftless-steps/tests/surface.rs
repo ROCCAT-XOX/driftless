@@ -160,7 +160,16 @@ fn surface_end_to_end() {
     let on_disk: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dest.join(SURFACE_REPORT)).unwrap()).unwrap();
     assert_eq!(on_disk, report);
+    assert_eq!(report["programm"], program());
     assert!(surface_fits(&req));
+}
+
+/// `programm` of the reports: version and commit of this build.
+fn program() -> Value {
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": driftless_steps::PROGRAM.commit,
+    })
 }
 
 /// Without `obj` a surface is its glb and its report; an OBJ of an earlier run is listed as
@@ -341,6 +350,16 @@ fn surface_fits_after_run() {
     let mut other = request(&dir, &out, &dest);
     other.config.voxel = 0.2;
     assert!(!surface_fits(&other), "other settings");
+    // `programm` is part of no id: a surface of another build, or one written before the
+    // field, still fits.
+    let path = dest.join(SURFACE_REPORT);
+    let mut report: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    report["programm"] = serde_json::json!({"version": "0.0.1", "commit": "anderer"});
+    fs::write(&path, report.to_string()).unwrap();
+    assert!(surface_fits(&req), "another build");
+    report.as_object_mut().unwrap().remove("programm");
+    fs::write(&path, report.to_string()).unwrap();
+    assert!(surface_fits(&req), "written before the field");
     let traj = fs::read_to_string(out.join("traj.tum")).unwrap();
     fs::write(out.join("traj.tum"), format!("{traj}# changed\n")).unwrap();
     assert!(!surface_fits(&req), "other trajectory");
@@ -532,6 +551,7 @@ fn model_surface_textures_both_scans() {
     let on_disk: Value =
         serde_json::from_str(&fs::read_to_string(dest.join(SURFACE_REPORT)).unwrap()).unwrap();
     assert_eq!(on_disk, report);
+    assert_eq!(report["programm"], program());
 }
 
 #[test]
