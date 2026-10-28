@@ -1,0 +1,63 @@
+# cargo-about: the third-party licence notices of the packages, THIRD-PARTY-NOTICES.html. The
+# package scripts generate them (packaging/macos/build-dmg.sh, packaging/windows/build-setup.ps1):
+#
+#   cargo about generate --workspace --locked --fail -c packaging/about.toml \
+#       -o target/package/THIRD-PARTY-NOTICES.html packaging/about.hbs
+#
+# The template packaging/about.hbs leaves out the workspace's own crates and adds the fonts and
+# the icon font that the program embeds.
+
+# The same licences, in the same order (the first one a crate offers is taken), as [licenses]
+# allow in deny.toml; change both together.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+# The platforms of the packages, as [graph] targets in deny.toml.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+# Only what is linked into the programs.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# The default fonts of egui (epaint `FontDefinitions::default`, eframe feature `default_fonts`):
+# Hack, Noto Emoji, Ubuntu Light and emoji-icon-font. The licence files of the fonts are in the
+# crate; the automatic scan misses the one of Hack (MIT together with the Bitstream Vera licence
+# of its base). A new version of the crate changes the checksums: then check the fonts and their
+# files again. If a checksum no longer fits, cargo-about only warns and drops this clarification,
+# so the package checks look for the texts in the generated file.
+[epaint_default_fonts.clarify]
+license = "(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0"
+
+[[epaint_default_fonts.clarify.files]]
+path = "fonts/Hack-Regular.txt"
+license = "MIT"
+checksum = "47c0cccbeec7e8614548cc485588b28149e7874188df5f41b36efebcee285c87"
+
+[[epaint_default_fonts.clarify.files]]
+path = "fonts/emoji-icon-font-mit-license.txt"
+license = "MIT"
+checksum = "b9d2c1d909aa149996fd4c91dcb92b2362a04431640c1d200959da94caf8cde1"
+
+[[epaint_default_fonts.clarify.files]]
+path = "fonts/OFL.txt"
+license = "OFL-1.1"
+checksum = "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+
+[[epaint_default_fonts.clarify.files]]
+path = "fonts/UFL.txt"
+license = "Ubuntu-font-1.0"
+checksum = "2f0015108d68627bd788d313f529c21ff4da2c2c42a5e1f3883acc83480f9002"

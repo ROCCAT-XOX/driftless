@@ -1,6 +1,7 @@
 ﻿# Checks a setup of build-setup.ps1: size, silent install for the current user, the installed
-# files, `--version` of both programs, the Start menu entry, silent uninstall. Exit != 0 on any
-# fault. Leaves nothing installed behind when it passes.
+# files, that both programs bring their C runtime with them, `--version` of both programs, the
+# Start menu entry, silent uninstall. Exit != 0 on any fault. Leaves nothing installed behind
+# when it passes.
 #
 #   packaging\windows\check-setup.ps1 target\package\Driftless-<version>-setup.exe
 #
@@ -12,6 +13,8 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# Get-PeImports
+. (Join-Path $PSScriptRoot 'pe-imports.ps1')
 
 if (-not $Setup -or -not (Test-Path -LiteralPath $Setup -PathType Leaf)) {
     [Console]::Error.WriteLine('Aufruf: check-setup.ps1 <Driftless-…-setup.exe>')
@@ -101,7 +104,7 @@ Ok "stille Installation nach $dir"
 
 # 2. The files, both programs and the Start menu entry.
 $expected = 'driftless-app.exe', 'driftless.exe', 'driftless.ico', 'LICENSE-APACHE',
-    'LICENSE-MIT', 'unins000.exe'
+    'LICENSE-MIT', 'THIRD-PARTY-NOTICES.html', 'unins000.exe'
 foreach ($name in $expected) {
     if (-not (Test-Path -LiteralPath (Join-Path $dir $name) -PathType Leaf)) {
         Fail "$name fehlt in $dir"
@@ -109,8 +112,30 @@ foreach ($name in $expected) {
 }
 Ok "Dateien: $($expected -join ', ')"
 
+# The licence notices, with the texts of the embedded fonts: they are missing if the
+# clarification of epaint_default_fonts in packaging\about.toml no longer fits.
+$notices = Join-Path $dir 'THIRD-PARTY-NOTICES.html'
+$noticesSize = (Get-Item -LiteralPath $notices).Length
+if ($noticesSize -eq 0) { Fail "$notices ist leer" }
+$noticesText = [IO.File]::ReadAllText($notices)
+foreach ($text in 'BITSTREAM VERA LICENSE', 'SIL OPEN FONT LICENSE Version 1.1',
+    'UBUNTU FONT LICENCE Version 1.0', 'Copyright (c) 2020 Phosphor Icons') {
+    if (-not $noticesText.Contains($text)) { Fail "THIRD-PARTY-NOTICES.html enthält nicht: $text" }
+}
+Ok "Lizenzen Dritter: THIRD-PARTY-NOTICES.html ($([math]::Round($noticesSize / 1KB)) KB)"
+
 $cli = Join-Path $dir 'driftless.exe'
 $app = Join-Path $dir 'driftless-app.exe'
+# The C runtime is linked in (.cargo/config.toml): the Visual C++ runtime is not part of Windows,
+# and this runner has it installed, so only the import tables can show the need for it.
+foreach ($exe in $cli, $app) {
+    $runtime = @(Get-PeImports $exe | Where-Object { $_ -match '^(vcruntime|msvcp|api-ms-win-crt-)' })
+    if ($runtime.Count -gt 0) {
+        Fail "$(Split-Path -Leaf $exe) braucht die Visual-C++-Laufzeit ($($runtime -join ', ')): target-feature=+crt-static in .cargo/config.toml?"
+    }
+}
+Ok 'C-Laufzeit eingebunden: kein VCRUNTIME*, MSVCP* oder api-ms-win-crt-* in driftless.exe und driftless-app.exe'
+
 $cliVersion = Get-ProgramOutput $cli @('--version')
 if ($cliVersion -notmatch "^driftless $([regex]::Escape($version)) \(") {
     Fail "driftless.exe --version: `"$cliVersion`", erwartet `"driftless $version (…)`""

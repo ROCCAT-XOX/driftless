@@ -1,7 +1,9 @@
 name: Release
 
-# A tag `v<version>` builds and checks both installers (package.yml) and puts them into a
-# release DRAFT. Publishing the draft stays a manual step on GitHub.
+# A tag `v<version>` builds and checks both installers (package.yml) and puts them, with the
+# licence notices of the third-party parts, into a release DRAFT whose text is the install steps
+# of packaging/release-notes.md followed by GitHub's list of changes. Publishing the draft stays
+# a manual step on GitHub.
 on:
   push:
     tags: ['v*']
@@ -18,7 +20,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: version
         run: |
           # The version of [workspace.package] in Cargo.toml.
@@ -43,7 +45,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Checked again here: the draft never goes out under a tag that does not match.
       - name: Tag = Version
         env:
@@ -53,13 +55,17 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME passt nicht zur Version \"$VERSION\"."
             exit 1
           fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: driftless-macos
           path: dist
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: driftless-windows
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: driftless-notices
           path: dist
       - name: Release-Entwurf
         env:
@@ -68,9 +74,20 @@ jobs:
         run: |
           dmg="dist/Driftless-$VERSION-macos-arm64.dmg"
           setup="dist/Driftless-$VERSION-setup.exe"
+          notices="dist/THIRD-PARTY-NOTICES.html"
           ls -l dist
           test -f "$dmg"
           test -f "$setup"
+          test -s "$notices"
+          # The install steps (packaging/release-notes.md) first, GitHub's list of changes after.
+          notes="$RUNNER_TEMP/release-notes.md"
+          sed -e "s|@VERSION@|$VERSION|g" -e "s|@REPO@|$GITHUB_SERVER_URL/$GITHUB_REPOSITORY|g" \
+            packaging/release-notes.md > "$notes"
+          if grep -n '@[A-Z][A-Z_]*@' "$notes"; then
+            echo "::error::packaging/release-notes.md: Platzhalter nicht ersetzt."
+            exit 1
+          fi
           # Always a draft: publishing stays by hand.
           gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
-            --title "Driftless $VERSION" --generate-notes "$dmg" "$setup"
+            --title "Driftless $VERSION" --notes-file "$notes" --generate-notes \
+            "$dmg" "$setup" "$notices"

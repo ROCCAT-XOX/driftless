@@ -51,6 +51,9 @@ Source: "..\..\target\release\driftless.exe"; DestDir: "{app}"; Flags: ignorever
 Source: "..\..\assets\icon\driftless.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\LICENSE-APACHE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\LICENSE-MIT"; DestDir: "{app}"; Flags: ignoreversion
+; The licence notices of the third-party parts, written by build-setup.ps1 (cargo-about);
+; "Ueber Driftless" opens them next to the program.
+Source: "..\..\target\package\THIRD-PARTY-NOTICES.html"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Driftless"; Filename: "{app}\driftless-app.exe"; IconFilename: "{app}\driftless.ico"
