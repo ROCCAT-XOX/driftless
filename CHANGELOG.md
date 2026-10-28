@@ -4,7 +4,7 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
 [Keep a Changelog](https://keepachangelog.com/de/1.1.0/), die Nummern folgen
 [Semantic Versioning](https://semver.org/lang/de/).
 
-## [0.1.0] – unveröffentlicht
+## [0.1.0] – 2026-10-28
 
 Die erste Version für echte Aufträge. Wie man sie installiert und benutzt, steht in der
 [Anleitung](https://github.com/ROCCAT-XOX/driftless/blob/main/docs/anleitung.md).
@@ -149,8 +149,6 @@ Die erste Version für echte Aufträge. Wie man sie installiert und benutzt, ste
 - **SharePoint-Bibliotheken:** Mit OneDrive abgeglichene SharePoint-Bibliotheken (unter
   `%USERPROFILE%\<Firmenname>`) erkennt Driftless nicht als Cloud-Ordner und warnt dort nicht; das tut
   es nur bei OneDrive selbst. Projekte nicht dort ablegen.
-- **Mac ohne echte Scans:** Mit dieser Version wurden echte Scans noch nicht auf einem Mac gerechnet, nur
-  auf einem Linux-Rechner mit RTX 5080.
 - **1 cm braucht viel Speicher:** Eine Oberfläche mit 1 cm braucht bei großen Aufnahmen bis 9 GB
   Arbeitsspeicher (Büro: 7,7 GB, 20 Minuten).
 - **Verfehlte Qualitätsziele:**

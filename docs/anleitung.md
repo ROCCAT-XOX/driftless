@@ -188,7 +188,9 @@ Die Vorgaben „Genau“ und „2 cm“ passen für die meisten Räume.
 
 Die Zahlen sind auf einem Testrechner gemessen: Linux mit der Grafikkarte NVIDIA RTX 5080, Version 0.1.0
 ([Ergebnisse](ergebnisse/2026-10-28-version-0-1.md)). Auf einem Büro-PC oder Laptop dauert es länger.
-Auf dem Mac sind sie noch nicht nachgemessen.
+Auf einem MacBook Pro mit M4 Pro sind die Oberflächen gleich schnell. Die Karte eines kleinen Raums
+dauert dort bis 2,5-mal so lange (2,3 statt 1,4 min), die des Büros nicht. Alle vier Scans samt Modell
+dauerten auf dem Mac 28 statt 24 Minuten.
 
 **Karte** („Genauigkeit“ in „Daten“):
 
@@ -206,7 +208,8 @@ Auf dem Mac sind sie noch nicht nachgemessen.
 | „1,5 cm“ | dazwischen | 2,7 min · 1,5 GB · 76 MB | 12,6 min · 5,6 GB · 431 MB |
 | „1 cm“ | genauere Kanten; in großen und dunklen Räumen mehr offene Stellen | 4,3 min · 2,6 GB · 130 MB | 20,2 min · 7,7 GB · 631 MB |
 
-Die Laufbahn vor der Karte braucht nur Sekunden: 9 s im kleinen Raum, 34 s im Büro. Den freien Platz für
+Die Laufbahn vor der Karte braucht nur Sekunden: 9 s im kleinen Raum, 34 s im Büro (auf dem Mac 25 s und
+62 s). Den freien Platz für
 die Ergebnisse nennt [Voraussetzungen](#voraussetzungen).
 
 ## 6. Mehrere Scans zusammenführen
@@ -415,7 +418,6 @@ Dieselbe Liste steht im [CHANGELOG](../CHANGELOG.md).
 | Nicht signiert | Die Programme sind nicht signiert und nicht bei Apple beglaubigt. Der erste Start braucht deshalb einen Schritt mehr (siehe Installieren). |
 | Windows nur automatisch geprüft | Bauen, Tests und Installieren laufen unter Windows in der CI. Von Hand auf einem echten Windows-PC ist Driftless noch nicht geprüft. |
 | SharePoint-Bibliotheken | Mit OneDrive abgeglichene SharePoint-Bibliotheken (unter `%USERPROFILE%\<Firmenname>`) erkennt Driftless nicht als Cloud-Ordner und warnt dort nicht; das tut es nur bei OneDrive selbst. Projekte nicht dort ablegen. |
-| Mac ohne echte Scans | Mit dieser Version wurden echte Scans noch nicht auf einem Mac gerechnet, nur auf einem Linux-Rechner mit RTX 5080. |
 | 1 cm braucht viel Speicher | Eine Oberfläche mit 1 cm braucht bei großen Aufnahmen bis 9 GB Arbeitsspeicher (Büro: 7,7 GB, 20 Minuten). |
 | Verfehlte Qualitätsziele | Bei 1 cm bleiben in großen und in dunklen Räumen Stellen der Oberfläche offen: von oben gesehen im Büro 31 % (Ziel höchstens 30 %), in einem dunklen Raum 9,7 % (Ziel höchstens 6 %). 2 cm schließt mehr. Die Übergänge zwischen zwei Fotos (Nähte) sind deutlicher zu sehen als geplant. Die Oberflächen-Datei eines Raums ist bei 1 cm rund 100 MB groß statt höchstens 60 MB. Dieselbe Wand, mehrmals abgelaufen, liegt vor dem Glätten einige Millimeter auseinander (Ziel höchstens 5 mm); die Ursache ist offen, das Glätten legt sie wieder auf eine Fläche. |
 
