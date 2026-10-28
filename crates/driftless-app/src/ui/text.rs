@@ -67,7 +67,7 @@ pub const PRECISION_FAST: &str = "Schnell";
 pub const PRECISION_EXACT: &str = "Genau";
 pub const PRECISION_MAX: &str = "Maximal";
 pub const PRECISION_CUSTOM: &str = "Eigene";
-pub const PRECISION_MAX_HINT: &str = "braucht bei großen Aufnahmen knapp 4 GB Arbeitsspeicher";
+pub const PRECISION_MAX_HINT: &str = "braucht bei großen Aufnahmen etwa 4 GB Arbeitsspeicher";
 /// The main button without a selected scan: every new or stale scan, one after the other.
 pub const COMPUTE_ALL: &str = "Alle rechnen";
 /// The main button with a scan selected: only that scan.

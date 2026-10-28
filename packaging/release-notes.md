@@ -43,7 +43,7 @@ Die Kommandozeile `driftless` ist in beiden Paketen dabei, aber nicht im Suchpfa
 
 - Mac mit Apple-Chip (M1 oder neuer) und macOS 14 oder neuer; Intel-Macs gehen nicht.
 - Windows 10 oder 11 (64 Bit) mit einer Grafikkarte für DirectX 12 oder Vulkan.
-- Arbeitsspeicher: 16 GB empfohlen. „Maximal“ braucht bei großen Aufnahmen knapp 4 GB, eine
+- Arbeitsspeicher: 16 GB empfohlen. „Maximal“ braucht bei großen Aufnahmen etwa 4 GB, eine
   Oberfläche mit 1 cm bis 9 GB.
 - Freier Platz: je Scan 1 bis 6 GB für die Ergebnisse, je nach Genauigkeit.
 

@@ -76,8 +76,8 @@ Beides ist nach jeder neuen Version noch einmal nötig.
 
 | Einstellung | Arbeitsspeicher bei großen Aufnahmen |
 |---|---|
-| Karte mit „Maximal“ | knapp 4 GB |
-| Oberfläche mit „1 cm“ | bis 8 GB |
+| Karte mit „Maximal“ | etwa 4 GB |
+| Oberfläche mit „1 cm“ | bis 9 GB |
 
 ### Kommandozeile
 
