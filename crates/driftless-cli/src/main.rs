@@ -15,7 +15,10 @@ mod view;
 
 use clap::{Parser, Subcommand};
 use driftless_io::progress::{LogLine, Progress};
+use driftless_steps::StepError;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 /// The system allocator keeps the per-image buffers of `map` mapped (peak 9.9 GB on a 10 min
 /// scan); mimalloc returns them (3 GB).
@@ -77,16 +80,95 @@ enum Command {
     Export(export::Args),
 }
 
+impl Command {
+    /// Whether it runs a step that stops cleanly when its progress is cancelled: Ctrl+C
+    /// cancels it ([`stop_on_ctrl_c`]). The others end at once, as without a handler.
+    fn runs_a_step(&self) -> bool {
+        matches!(
+            self,
+            Command::Slam(_)
+                | Command::Map(_)
+                | Command::Surface(_)
+                | Command::Merge(_)
+                | Command::Export(_)
+        )
+    }
+}
+
+/// Exit code of a step stopped with Ctrl+C: 128 + SIGINT, as a shell reports a program that
+/// Ctrl+C ended.
+const EXIT_CANCELLED: u8 = 130;
+
+/// The progress of the step this command runs (all clones of one): Ctrl+C cancels it.
+static CONSOLE: OnceLock<Progress> = OnceLock::new();
+
 /// Progress of a step on the console: messages to stdout, warnings as „Warnung: …“ to stderr.
 fn console() -> Progress {
-    Progress::with_log(|line| match line {
-        LogLine::Info(s) => println!("{s}"),
-        LogLine::Warning(s) => eprintln!("Warnung: {s}"),
+    CONSOLE
+        .get_or_init(|| {
+            halt_for_tests(Progress::with_log(|line| match line {
+                LogLine::Info(s) => println!("{s}"),
+                LogLine::Warning(s) => eprintln!("Warnung: {s}"),
+            }))
+        })
+        .clone()
+}
+
+/// Ctrl+C cancels the step through [`console`]: it stops at its next check and cleans up as
+/// on any cancel (a step that is writing its files finishes them). A second Ctrl+C ends the
+/// program at once; the `.tmp` files left then are removed by the next run of the step.
+fn stop_on_ctrl_c() {
+    let progress = console();
+    let pressed = AtomicBool::new(false);
+    let installed = ctrlc::set_handler(move || {
+        if pressed.swap(true, Ordering::SeqCst) {
+            eprintln!(
+                "Strg+C zum zweiten Mal: sofort beendet; halb geschriebene Dateien (*.tmp) \
+                 entfernt der nächste Lauf"
+            );
+            std::process::exit(EXIT_CANCELLED.into());
+        }
+        eprintln!(
+            "Strg+C: wird abgebrochen, sobald der Schritt anhalten kann – noch einmal Strg+C \
+             beendet sofort"
+        );
+        progress.cancel();
+    });
+    if let Err(e) = installed {
+        eprintln!("Warnung: Strg+C lässt sich nicht abfangen ({e}), es beendet sofort");
+    }
+}
+
+/// For the Ctrl+C tests, in debug builds only: with `DRIFTLESS_TEST_HALT=<phase>` the step
+/// says so on stderr when that phase starts and waits there until it is cancelled (with
+/// `DRIFTLESS_TEST_HALT_STUR` set: for good).
+#[cfg(debug_assertions)]
+fn halt_for_tests(progress: Progress) -> Progress {
+    let Ok(phase) = std::env::var("DRIFTLESS_TEST_HALT") else {
+        return progress;
+    };
+    let stubborn = std::env::var_os("DRIFTLESS_TEST_HALT_STUR").is_some();
+    let handle = progress.clone();
+    progress.with_observer(move |s| {
+        if s.phase == phase && s.done == 0 {
+            eprintln!("Test: hält in Phase {phase}");
+            while stubborn || !handle.is_cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
     })
+}
+
+#[cfg(not(debug_assertions))]
+fn halt_for_tests(progress: Progress) -> Progress {
+    progress
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.command.runs_a_step() {
+        stop_on_ctrl_c();
+    }
     let result = match cli.command {
         Command::Inspect(args) => inspect::run(&args),
         Command::Compare(args) => compare::run(&args),
@@ -101,8 +183,24 @@ fn main() -> ExitCode {
         Command::Merge(args) => merge::run(&args),
         Command::Export(args) => export::run(&args),
     };
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
+    let cancelled = CONSOLE.get().is_some_and(Progress::is_cancelled);
+    match result.map_err(StepError::from) {
+        Ok(()) => {
+            if cancelled {
+                eprintln!(
+                    "Strg+C kam zu spät (der Schritt schrieb schon): das Ergebnis ist \
+                     vollständig geschrieben"
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(StepError::Cancelled) => {
+            eprintln!(
+                "Abgebrochen mit Strg+C: nichts Halbes geschrieben; denselben Befehl erneut \
+                 starten, um fertig zu rechnen"
+            );
+            ExitCode::from(EXIT_CANCELLED)
+        }
         Err(e) => {
             eprintln!("Fehler: {e}");
             ExitCode::FAILURE

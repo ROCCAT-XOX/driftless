@@ -68,6 +68,11 @@ Every result JSON (`slam.json`, `map.json`, `oberflaeche.json`, `modell.json`, `
 the program that made it under `programm`: version and commit, as `driftless --version` prints them. It is
 informational only and part of no input id: a result of another version that fits stays current.
 
+Ctrl+C stops `slam`, `map`, `surface`, `merge` and `export` cleanly: the step stops at its next check,
+removes what it had begun (a step already writing its files finishes them) and the program exits with
+code 130. A second Ctrl+C ends it at once; the `.tmp` files left then are removed by the next run of
+the step, which also removes those of a crash or power loss.
+
 Typical correction loop:
 
 ```sh
