@@ -20,9 +20,9 @@ use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_odom::OdomConfig;
 use driftless_slam::{
-    build_submaps, cache_fits as cache_header_fits, load_cache, match_manual_loops, save_cache,
-    solve, Corrections, LoopVerdict, ManualLoop, SlamConfig, SlamReport, SlamResult, Submap,
-    POSITION_ONLY,
+    build_submaps, cache_fits as cache_header_fits, load_cache, match_manual_loops,
+    match_rejected_loops, save_cache, solve_with, Corrections, LoopVerdict, ManualLoop,
+    RejectedLoop, SlamConfig, SlamReport, SlamResult, Submap, POSITION_ONLY, VETOED,
 };
 use driftless_traj::write_tum;
 use serde::{Deserialize, Serialize};
@@ -194,6 +194,8 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
     let cache = out.join(CACHE_FILE);
     let corrections = Corrections::load(&out.join(CORRECTIONS_FILE))?;
     let manual = corrections.manual_loops();
+    // automatic loops switched off by hand stay out of the pose graph
+    let rejected = corrections.rejected_loops();
     // A bad correction fails only in `solve`; the cache is written by then. The CLI and the
     // app each add their own hint how to switch it off.
     let solve_hint = |e: driftless_slam::ManualLoopError| StepError::BadCorrection(e.to_string());
@@ -209,7 +211,8 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
         let import = (req.history && traj.exists() && !history::holds_current(out))
             .then(|| corrections_of_run(out, &submaps, &corrections));
         progress.phase("Schleifen schließen", None);
-        let result = solve(submaps, odom_anchors, &manual, &cfg).map_err(solve_hint)?;
+        let result =
+            solve_with(submaps, odom_anchors, &manual, &rejected, &cfg).map_err(solve_hint)?;
         // The last check: renaming, writing and recording belong together.
         check_cancel(progress)?;
         if let Some(then) = &import {
@@ -251,7 +254,8 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
         save_cache(&cache, &submaps, &odom_anchors, &input)
             .map_err(|e| format!("Zwischenspeicher {} nicht schreibbar: {e}", cache.display()))?;
         progress.phase("Schleifen schließen", None);
-        let result = solve(submaps, odom_anchors, &manual, &cfg).map_err(solve_hint)?;
+        let result =
+            solve_with(submaps, odom_anchors, &manual, &rejected, &cfg).map_err(solve_hint)?;
         warn_if_not_static(&stats, progress);
         progress.info(format!(
             "{} Posen aus {} LiDAR-Frames ({} übersprungen), {} IMU-Messungen, \
@@ -307,17 +311,21 @@ fn corrections_of_run(out: &Path, submaps: &[Submap], current: &Corrections) -> 
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs_f64());
-    let pairs: BTreeSet<(usize, usize)> = fs::read_to_string(&json)
+    let report = fs::read_to_string(&json)
         .ok()
-        .and_then(|t| serde_json::from_str::<SlamReport>(&t).ok())
-        .map(|r| {
+        .and_then(|t| serde_json::from_str::<SlamReport>(&t).ok());
+    let pairs_where = |keep: &dyn Fn(&driftless_slam::report::LoopReport) -> bool| {
+        report.as_ref().map_or_else(BTreeSet::new, |r| {
             r.loops
                 .iter()
-                .filter(|l| l.manual)
+                .filter(|l| keep(l))
                 .map(|l| (l.a.min(l.b), l.a.max(l.b)))
-                .collect()
+                .collect::<BTreeSet<(usize, usize)>>()
         })
-        .unwrap_or_default();
+    };
+    let pairs = pairs_where(&|l| l.manual);
+    // the automatic loops that run left out by hand
+    let vetoed = pairs_where(&|l| !l.manual && l.reason.as_deref() == Some(VETOED));
     let mut used = BTreeSet::new();
     let mut then = current.clone();
     let pair_of = |l: &driftless_slam::LoopEntry| {
@@ -337,6 +345,12 @@ fn corrections_of_run(out: &Path, submaps: &[Submap], current: &Corrections) -> 
             }
         }
     }
+    // a reject counts if that run left its loop out
+    then.rejects.retain(|r| {
+        match_rejected_loops(submaps, &[RejectedLoop { a_t: r.a, b_t: r.b }])
+            .ok()
+            .is_some_and(|p| vetoed.contains(&p[0]))
+    });
     then
 }
 
@@ -375,13 +389,21 @@ fn print_summary(result: &SlamResult, report: &SlamReport, points: usize, progre
         .count();
     let rejected = result.loops.len() - accepted;
     let manual = result.loops.iter().filter(|l| l.manual).count();
-    let loops = if accepted == 0 {
+    let vetoed = result
+        .loops
+        .iter()
+        .filter(|l| l.verdict == LoopVerdict::Rejected(VETOED))
+        .count();
+    let mut loops = if accepted == 0 {
         format!("keine Schleife gefunden ({rejected} Kandidaten verworfen)")
     } else if manual == 0 {
         format!("Schleifen: {accepted} akzeptiert, {rejected} verworfen")
     } else {
         format!("Schleifen: {accepted} akzeptiert ({manual} manuell), {rejected} verworfen")
     };
+    if vetoed > 0 {
+        loops += &format!(", davon {vetoed} von Hand abgeschaltet");
+    }
     progress.info(format!(
         "{} Teilkarten, {} Kartenpunkte, {loops}",
         result.submaps.len(),

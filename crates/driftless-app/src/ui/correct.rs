@@ -4,16 +4,69 @@
 //! `driftless correct` writes. Below, every entry as `driftless correct <lauf> list` shows it,
 //! each with its switch, and after a change the hint to recompute the run.
 //!
-//! The panel only asks ([`Action::AddLoop`], [`Action::SetLoopEnabled`], [`Action::Reuse`]);
-//! the program checks and writes in the background (the check reads `submaps.bin`) and puts
-//! the answer of the check, unchanged, into [`CorrectState::message`].
+//! Below them the automatic loops of the run ([`AutoLoop`], from its `slam.json`), each with a
+//! switch „verwenden“: off writes a `[[reject]]` entry and the program recomputes the run from
+//! its submaps at once; on removes it again.
+//!
+//! The panel only asks ([`Action::AddLoop`], [`Action::SetLoopEnabled`],
+//! [`Action::SetLoopUsed`], [`Action::Reuse`]); the program checks and writes in the
+//! background (the check reads `submaps.bin`) and puts the answer of the check, unchanged,
+//! into [`CorrectState::message`].
 
 use super::{text, Action, AppState, UiMessage};
 use crate::overlay::RunOverlay;
-use driftless_slam::Corrections;
+use driftless_slam::{Corrections, SlamReport, VETOED};
 use eframe::egui::{self, RichText, Ui};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+/// An automatic loop of the run, as „Korrekturen“ lists it: in the pose graph, or left out
+/// because it was switched off by hand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoLoop {
+    /// Its two submaps (`a < b`) and their starts (seconds since the start of the scan).
+    pub a: usize,
+    pub b: usize,
+    pub a_t: f64,
+    pub b_t: f64,
+    /// In the pose graph of the last computation (else switched off by hand then).
+    pub used: bool,
+    /// The share of points with a match (`inlier_ratio`).
+    pub overlap: f64,
+}
+
+/// The automatic loops of `report` that can be switched: the accepted ones and the ones
+/// switched off by hand, by their submaps.
+pub fn auto_loops(report: &SlamReport) -> Vec<AutoLoop> {
+    let start = |s: usize| report.submaps.get(s).map(|m| m.t_start);
+    let mut out: Vec<AutoLoop> = report
+        .loops
+        .iter()
+        .filter(|l| !l.manual && (l.accepted || l.reason.as_deref() == Some(VETOED)))
+        .filter_map(|l| {
+            let (a, b) = (l.a.min(l.b), l.a.max(l.b));
+            Some(AutoLoop {
+                a,
+                b,
+                a_t: start(a)?,
+                b_t: start(b)?,
+                used: l.accepted,
+                overlap: l.inlier_ratio,
+            })
+        })
+        .collect();
+    out.sort_by_key(|l| (l.a, l.b));
+    out.dedup_by_key(|l| (l.a, l.b));
+    out
+}
+
+/// The pair of submaps (`a < b`) the times `a` and `b` (seconds since the start of the scan)
+/// fall into, by the starts of the submaps; `None` for both in one.
+pub fn submap_pair(starts: &[f64], a: f64, b: f64) -> Option<(usize, usize)> {
+    let of = |t: f64| starts.partition_point(|&s| s <= t + 1e-6).checked_sub(1);
+    let (x, y) = (of(a)?, of(b)?);
+    (x != y).then(|| (x.min(y), x.max(y)))
+}
 
 /// One of the two places of a loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -63,6 +116,10 @@ pub struct CorrectState {
     /// The run of the reuse that runs, with its count of [`CorrectState::writes`] at the start:
     /// a change written later was not applied.
     pub reuse_writes: Option<(PathBuf, u64)>,
+    /// The automatic loops of the run ([`auto_loops`]), as its `slam.json` was last read.
+    pub auto_loops: Vec<AutoLoop>,
+    /// The starts of the submaps of the run (s), to tell which loop a reject names.
+    pub submap_starts: Vec<f64>,
 }
 
 impl CorrectState {
@@ -347,5 +404,116 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
                 });
         }
     }
+    let no_cache = (!has_cache).then(|| text::NO_CACHE.to_string());
+    let blocked = locked.or(no_cache);
+    if let Some(a) = auto_loop_list(ui, c, &dir, can_switch, blocked) {
+        action = Some(a);
+    }
+    action
+}
+
+/// „Automatische Schleifen“: each automatic loop of the run with its switch „verwenden“ (off
+/// where `corrections.toml` rejects it), its submaps, their starts and its overlap; a reject
+/// whose loop the last computation did not list follows with its times. Switching asks for
+/// [`Action::SetLoopUsed`]; locked while a change is written, a step of the run runs, or the
+/// run cannot be recomputed (`blocked`, the reason on hover).
+fn auto_loop_list(
+    ui: &mut Ui,
+    c: &CorrectState,
+    run: &Path,
+    can_switch: bool,
+    blocked: Option<String>,
+) -> Option<Action> {
+    let mut action = None;
+    ui.add_space(6.0);
+    ui.strong(text::AUTO_LOOPS);
+    ui.add(egui::Label::new(RichText::new(text::AUTO_LOOPS_HINT).weak()).wrap());
+    let rejects = match &c.corrections {
+        Some(Ok(list)) => list.rejects.clone(),
+        _ => Vec::new(),
+    };
+    let rejected: BTreeSet<(usize, usize)> = rejects
+        .iter()
+        .filter_map(|r| submap_pair(&c.submap_starts, r.a, r.b))
+        .collect();
+    /// A row: the submaps (if known), their starts, the overlap (if listed) and the switch.
+    struct Row {
+        pair: Option<(usize, usize)>,
+        a_t: f64,
+        b_t: f64,
+        overlap: Option<f64>,
+        on: bool,
+    }
+    let mut rows: Vec<Row> = c
+        .auto_loops
+        .iter()
+        .map(|l| Row {
+            pair: Some((l.a, l.b)),
+            a_t: l.a_t,
+            b_t: l.b_t,
+            overlap: Some(l.overlap),
+            on: !rejected.contains(&(l.a, l.b)),
+        })
+        .collect();
+    for r in &rejects {
+        let pair = submap_pair(&c.submap_starts, r.a, r.b);
+        if !c.auto_loops.iter().any(|l| Some((l.a, l.b)) == pair) {
+            rows.push(Row {
+                pair,
+                a_t: r.a,
+                b_t: r.b,
+                overlap: None,
+                on: false,
+            });
+        }
+    }
+    if rows.is_empty() {
+        ui.weak(text::NO_AUTO_LOOPS);
+        return None;
+    }
+    let enabled = can_switch && blocked.is_none();
+    egui::Grid::new("automatische_schleifen")
+        .num_columns(4)
+        .striped(true)
+        .show(ui, |ui| {
+            for head in text::AUTO_LOOP_COLUMNS {
+                ui.strong(head);
+            }
+            ui.end_row();
+            for Row {
+                pair,
+                a_t,
+                b_t,
+                overlap,
+                on,
+            } in rows
+            {
+                let mut now = on;
+                let switch = ui.add_enabled(enabled, egui::Checkbox::without_text(&mut now));
+                let name = pair.map_or_else(
+                    || text::auto_loop_times(a_t, b_t),
+                    |(a, b)| text::auto_loop_switch(a, b),
+                );
+                switch.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, now, &name)
+                });
+                if switch.changed() {
+                    action = Some(Action::SetLoopUsed {
+                        run: run.to_path_buf(),
+                        a: a_t,
+                        b: b_t,
+                        used: now,
+                    });
+                }
+                let switch = switch.on_hover_text(text::AUTO_LOOP_SWITCH_HINT);
+                if let Some(why) = &blocked {
+                    switch.on_disabled_hover_text(why);
+                }
+                ui.label(pair.map_or_else(String::new, |(a, b)| text::auto_loop_pair(a, b)));
+                ui.label(text::auto_loop_times(a_t, b_t));
+                ui.label(overlap.map_or_else(String::new, text::percent));
+                ui.end_row();
+            }
+        });
     action
 }

@@ -5,8 +5,8 @@ use driftless_odom::testutil::{
 };
 use driftless_odom::OdomConfig;
 use driftless_slam::{
-    close_loops, run_slam, solve, LoopCheck, LoopConfig, LoopVerdict, ManualLoop, SlamConfig,
-    SlamReport, SlamResult, Submap,
+    close_loops, run_slam, scan_start, solve, solve_with, LoopCheck, LoopConfig, LoopVerdict,
+    ManualLoop, ManualLoopError, RejectedLoop, SlamConfig, SlamReport, SlamResult, Submap, VETOED,
 };
 use driftless_traj::nalgebra::{Isometry3, Matrix6, Translation3, UnitQuaternion, Vector3};
 use driftless_traj::{start_end_gap, Pose};
@@ -470,4 +470,110 @@ fn no_accepted_loop_keeps_odometry() {
     let (anchors, report) = close_loops(&odom, &vec![1.0; odom.len() - 1], &mut loops);
     assert_eq!(anchors, odom);
     assert!(report.is_none());
+}
+
+/// The trust of each odometry edge, as the pipeline weighs it: the worse of submap `s` and
+/// the first frame of `s + 1`.
+fn edge_quality(submaps: &[Submap]) -> Vec<f32> {
+    submaps
+        .windows(2)
+        .map(|w| w[0].quality().min(w[1].frames[0].quality.score()))
+        .collect()
+}
+
+/// A loop the user switched off (a `[[reject]]` of `corrections.toml`, by the start times of
+/// its two submaps) is verified as before but stays out of the pose graph, with its reason in
+/// the report; the other loops stay. The anchors are those of a graph without it.
+#[test]
+fn rejected_loop_is_not_in_the_graph() {
+    let r = room_loop();
+    let (submaps, anchors) = with_injected_drift(&r);
+    let cfg = SlamConfig::default();
+    let auto = solve(submaps.clone(), anchors.clone(), &[], &cfg).unwrap();
+    let accepted: Vec<(usize, usize)> = auto
+        .loops
+        .iter()
+        .filter(|l| l.verdict == LoopVerdict::Accepted && !l.manual)
+        .map(|l| (l.a, l.b))
+        .collect();
+    assert!(accepted.len() >= 2, "{:?}", auto.loops);
+    let (a, b) = accepted[0];
+    let t0 = scan_start(&submaps);
+    let start = |s: usize| submaps[s].frames[0].t - t0;
+    let veto = RejectedLoop {
+        a_t: start(a),
+        b_t: start(b),
+    };
+    let d = solve_with(submaps.clone(), anchors.clone(), &[], &[veto], &cfg).unwrap();
+    let vetoed: Vec<&LoopCheck> = d.loops.iter().filter(|l| (l.a, l.b) == (a, b)).collect();
+    assert_eq!(vetoed.len(), 1, "{:?}", d.loops);
+    assert_eq!(vetoed[0].verdict, LoopVerdict::Rejected(VETOED));
+    assert!(!vetoed[0].manual);
+    // the other loops are still used
+    assert!(d
+        .loops
+        .iter()
+        .any(|l| l.verdict == LoopVerdict::Accepted && (l.a, l.b) != (a, b)));
+    // the report says why
+    let report = SlamReport::new(&d);
+    let line = report.loops.iter().find(|l| (l.a, l.b) == (a, b)).unwrap();
+    assert!(!line.accepted);
+    assert_eq!(line.reason.as_deref(), Some(VETOED));
+    // not in the graph: the same anchors as a graph of the other loops alone
+    let mut others: Vec<LoopCheck> = d
+        .loops
+        .iter()
+        .filter(|l| (l.a, l.b) != (a, b))
+        .cloned()
+        .collect();
+    let (without, _) = close_loops(&d.odom_anchors, &edge_quality(&d.submaps), &mut others);
+    for (x, y) in d.anchors.iter().zip(&without) {
+        assert!(
+            (x.translation.vector - y.translation.vector).norm() < 1e-9,
+            "{x} vs {y}"
+        );
+    }
+    // the reverse order of the times, and any time inside the two submaps, name the same loop
+    let mid = |s: usize| (submaps[s].frames[0].t + submaps[s].frames[4].t) / 2.0 - t0;
+    let veto = RejectedLoop {
+        a_t: mid(b),
+        b_t: mid(a),
+    };
+    let e = solve_with(submaps.clone(), anchors.clone(), &[], &[veto], &cfg).unwrap();
+    assert_eq!(e.loops, d.loops);
+}
+
+/// A reject names two different submaps of the scan; a manual loop of the same pair stays (the
+/// veto is for automatic loops).
+#[test]
+fn rejects_are_checked_and_leave_manual_loops() {
+    let r = room_loop();
+    let (submaps, anchors) = with_injected_drift(&r);
+    let cfg = SlamConfig::default();
+    let t0 = scan_start(&submaps);
+    let end = submaps.last().unwrap().frames.last().unwrap().t - t0;
+    let outside = RejectedLoop {
+        a_t: 0.0,
+        b_t: end + 5.0,
+    };
+    let e = solve_with(submaps.clone(), anchors.clone(), &[], &[outside], &cfg).unwrap_err();
+    assert!(matches!(e, ManualLoopError::OutsideScan { .. }), "{e:?}");
+    let same = RejectedLoop { a_t: 0.0, b_t: 0.1 };
+    let e = solve_with(submaps.clone(), anchors.clone(), &[], &[same], &cfg).unwrap_err();
+    assert!(matches!(e, ManualLoopError::SameSubmap { .. }), "{e:?}");
+
+    let last = submaps.len() - 1;
+    let start = |s: usize| submaps[s].frames[0].t - t0;
+    let manual = ManualLoop {
+        a_t: start(0) + 0.5,
+        b_t: start(last) + 0.5,
+    };
+    let veto = RejectedLoop {
+        a_t: start(0),
+        b_t: start(last),
+    };
+    let d = solve_with(submaps, anchors, &[manual], &[veto], &cfg).unwrap();
+    let manual = d.loops.iter().find(|l| l.manual).unwrap();
+    assert_eq!((manual.a, manual.b), (0, last));
+    assert_ne!(manual.verdict, LoopVerdict::Rejected(VETOED));
 }

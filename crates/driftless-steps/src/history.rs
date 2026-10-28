@@ -170,8 +170,9 @@ pub fn holds_current(out: &Path) -> bool {
 }
 
 /// Switches the corrections of `out` back to state `nr`: entry i gets the switch it had in
-/// that state, entries added after it are switched off. Nothing is removed. Returns the
-/// number of entries that changed.
+/// that state, entries added after it are switched off, and the automatic loops switched off
+/// are those of the state (its reject entries). No manual loop is removed. Returns the number
+/// of entries that changed (each reject added or removed counts).
 pub fn restore_flags(out: &Path, nr: u32) -> Result<usize, StepError> {
     let entry = list(out).into_iter().find(|e| e.nr == nr).ok_or_else(|| {
         format!(
@@ -189,6 +190,12 @@ pub fn restore_flags(out: &Path, nr: u32) -> Result<usize, StepError> {
             l.enabled = enabled;
             changed += 1;
         }
+    }
+    if now.rejects != then.rejects {
+        let gone = now.rejects.iter().filter(|r| !then.rejects.contains(r));
+        let back = then.rejects.iter().filter(|r| !now.rejects.contains(r));
+        changed += gone.count() + back.count();
+        now.rejects = then.rejects.clone();
     }
     if changed > 0 {
         now.save(&path).map_err(failed)?;

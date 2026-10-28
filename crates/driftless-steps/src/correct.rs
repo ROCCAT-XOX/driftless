@@ -1,9 +1,14 @@
-//! Manual corrections of a SLAM run in `<lauf>/corrections.toml`. Entries are only appended
-//! or switched off and on, never removed; a reuse of the run applies them in seconds.
+//! Manual corrections of a SLAM run in `<lauf>/corrections.toml`. Manual loops are only
+//! appended or switched off and on, never removed; an automatic loop switched off is a reject
+//! entry, removed when it is switched on again ([`set_loop_used`]). A reuse of the run applies
+//! them in seconds.
 
 use crate::error::{failed, StepError};
 use crate::slam::{CACHE_FILE, CORRECTIONS_FILE};
-use driftless_slam::{match_manual_loops, read_cache, CacheError, Corrections, ManualLoop};
+use driftless_slam::{
+    match_manual_loops, match_rejected_loops, read_cache, CacheError, Corrections, ManualLoop,
+    RejectedLoop, Submap,
+};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -93,6 +98,82 @@ pub fn set_enabled(run: &Path, nr: usize, enabled: bool) -> Result<bool, StepErr
     Ok(changed)
 }
 
+/// The submaps of `submaps.bin` of the run, if it has one.
+fn cached_submaps(run: &Path) -> Result<Option<Vec<Submap>>, StepError> {
+    match read_cache(&run.join(CACHE_FILE)) {
+        Ok(cache) => Ok(Some(cache.submaps)),
+        Err(CacheError::Missing(_)) => Ok(None),
+        Err(e) => Err(failed(e)),
+    }
+}
+
+/// The pair of submaps the times `a` and `b` lie in.
+fn pair_of(submaps: &[Submap], a: f64, b: f64) -> Result<(usize, usize), StepError> {
+    let pairs =
+        match_rejected_loops(submaps, &[RejectedLoop { a_t: a, b_t: b }]).map_err(failed)?;
+    Ok(pairs[0])
+}
+
+/// Switches the automatic loop between the submaps at times `a` and `b` (seconds since the
+/// start of the scan, any time inside each submap) on (`used`) or off, and saves the file;
+/// returns whether it changed. Off adds a reject entry with these times unless one names the
+/// same pair of submaps; on removes every reject entry of that pair. With `submaps.bin` the
+/// times are checked (inside the scan, two submaps) and compared by their submaps, without it
+/// only as written. The next reuse of the run applies it.
+pub fn set_loop_used(run: &Path, a: f64, b: f64, used: bool) -> Result<bool, StepError> {
+    set_loop_used_at(run, a, b, used, &utc_now())
+}
+
+/// [`set_loop_used`] with the time stamp `added` (for tests).
+#[doc(hidden)]
+pub fn set_loop_used_at(
+    run: &Path,
+    a: f64,
+    b: f64,
+    used: bool,
+    added: &str,
+) -> Result<bool, StepError> {
+    let mut c = load(run)?;
+    let submaps = cached_submaps(run)?;
+    let changed = match &submaps {
+        Some(submaps) => {
+            let pair = pair_of(submaps, a, b)?;
+            let of_pair = |r: &driftless_slam::RejectEntry| {
+                pair_of(submaps, r.a, r.b).is_ok_and(|p| p == pair)
+            };
+            if used {
+                let before = c.rejects.len();
+                c.rejects.retain(|r| !of_pair(r));
+                c.rejects.len() != before
+            } else if c.rejects.iter().any(of_pair) {
+                false
+            } else {
+                c.reject_loop(a, b, added)
+            }
+        }
+        None if used => c.allow_loop(a, b),
+        None => c.reject_loop(a, b, added),
+    };
+    if changed {
+        c.save(&run.join(CORRECTIONS_FILE))?;
+    }
+    Ok(changed)
+}
+
+/// What the program and `driftless correct` answer after [`set_loop_used`].
+pub fn loop_used_message(a: f64, b: f64, used: bool, changed: bool) -> String {
+    let what = if used {
+        "wird verwendet"
+    } else {
+        "abgeschaltet"
+    };
+    if changed {
+        format!("Automatische Schleife {a:.1} s ↔ {b:.1} s {what}")
+    } else {
+        format!("Automatische Schleife {a:.1} s ↔ {b:.1} s ist schon {what}; nichts geändert")
+    }
+}
+
 /// The status of an entry as the list and the messages name it.
 pub fn status_text(enabled: bool) -> &'static str {
     if enabled {
@@ -118,16 +199,18 @@ pub fn switched_message(nr: usize, enabled: bool, changed: bool) -> String {
     }
 }
 
-/// The corrections as `driftless correct <lauf> list` prints them (`path`: their file).
+/// The corrections as `driftless correct <lauf> list` prints them (`path`: their file): the
+/// manual loops by number, then the automatic loops switched off.
 pub fn render_list(c: &Corrections, path: &Path) -> String {
-    if c.loops.is_empty() {
+    if c.loops.is_empty() && c.rejects.is_empty() {
         return format!("keine Korrekturen in {}\n", path.display());
     }
-    let mut s =
-        String::from("Nr  Status       Art       a (s)      b (s)  hinzugefügt           Notiz\n");
+    let mut s = String::from(
+        "Nr  Status       Art           a (s)      b (s)  hinzugefügt           Notiz\n",
+    );
     for (i, l) in c.loops.iter().enumerate() {
         s += &format!(
-            "{:<3} {:<12} {:<8} {:>6.1} {:>10.1}  {:<21} {}\n",
+            "{:<3} {:<12} {:<12} {:>6.1} {:>10.1}  {:<21} {}\n",
             i + 1,
             status_text(l.enabled),
             "Schleife",
@@ -135,6 +218,12 @@ pub fn render_list(c: &Corrections, path: &Path) -> String {
             l.b,
             l.added,
             l.note
+        );
+    }
+    for r in &c.rejects {
+        s += &format!(
+            "{:<3} {:<12} {:<12} {:>6.1} {:>10.1}  {:<21}\n",
+            "–", "abgeschaltet", "automatisch", r.a, r.b, r.added
         );
     }
     s

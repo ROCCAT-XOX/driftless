@@ -627,6 +627,36 @@ pub const CORRECTION_BUSY: &str = "Korrektur wird gespeichert …";
 pub const CORRECTION_COLUMNS: [&str; 6] =
     ["Nr", "Status", "a (s)", "b (s)", "hinzugefügt", "Notiz"];
 pub const LOOP_SWITCH_HINT: &str = "Ein- oder ausschalten; gilt beim nächsten Neurechnen";
+/// The automatic loops of the run in „Korrekturen“, each with its switch.
+pub const AUTO_LOOPS: &str = "Automatische Schleifen";
+pub const AUTO_LOOPS_HINT: &str = "Eine Schleife, die zwei verschiedene Stellen verbindet, \
+     abschalten: der Lauf wird gleich neu gerechnet (nur der Posengraph, wenige Sekunden).";
+pub const NO_AUTO_LOOPS: &str = "Keine automatische Schleife";
+/// The columns of the list of the automatic loops.
+pub const AUTO_LOOP_COLUMNS: [&str; 4] = ["verwenden", "Teilkarten", "Beginn (s)", "Überlappung"];
+pub const AUTO_LOOP_SWITCH_HINT: &str = "Aus: die Schleife bleibt beim Neurechnen außen vor \
+     (corrections.toml, [[reject]]); an: sie zählt wieder";
+
+/// The accessible name of the switch of the automatic loop between submaps `a` and `b`.
+pub fn auto_loop_switch(a: usize, b: usize) -> String {
+    format!("Schleife Teilkarte {a} und {b} verwenden")
+}
+
+/// The submaps of an automatic loop: „3 und 17“.
+pub fn auto_loop_pair(a: usize, b: usize) -> String {
+    format!("{a} und {b}")
+}
+
+/// The starts of its two submaps: „12,3 / 250,1“.
+pub fn auto_loop_times(a: f64, b: f64) -> String {
+    format!("{} / {}", decimal(a, 1), decimal(b, 1))
+}
+
+/// Overlap of a loop in percent: „34 %“.
+pub fn percent(share: f64) -> String {
+    format!("{} %", (share * 100.0).round() as i64)
+}
+
 /// Labels of the background jobs of the corrections (not shown in the status bar).
 pub const LOAD_RUN_JOB: &str = "Lauf lesen";
 pub const CORRECT_JOB: &str = "Korrektur speichern";

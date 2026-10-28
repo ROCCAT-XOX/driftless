@@ -229,7 +229,8 @@ enum HelperTask {
     HistoryGaps(u64),
     /// The overlay and the corrections of a run folder.
     LoadRun(PathBuf),
-    /// [`Action::AddLoop`] or [`Action::SetLoopEnabled`]: they read `submaps.bin`.
+    /// [`Action::AddLoop`], [`Action::SetLoopEnabled`] or [`Action::SetLoopUsed`]: they read
+    /// `submaps.bin`.
     Correct(Action),
     /// Two trajectories compared (reads both, well below a second).
     Compare(TrajRef, TrajRef),
@@ -516,6 +517,14 @@ impl DriftlessApp {
             return;
         }
         self.state.correct.corrections = Some(loaded.corrections);
+        let c = &mut self.state.correct;
+        (c.auto_loops, c.submap_starts) = match &loaded.overlay {
+            Ok(o) => (
+                super::correct::auto_loops(&o.report),
+                o.report.submaps.iter().map(|m| m.t_start).collect(),
+            ),
+            Err(_) => (Vec::new(), Vec::new()),
+        };
         match loaded.overlay {
             Ok(mut o) => {
                 o.set_origin(self.view_origin());
@@ -531,11 +540,15 @@ impl DriftlessApp {
     }
 
     /// A change of the corrections ended: its answer goes into the panel (a refusal also into
-    /// the Protokoll and the log file).
+    /// the Protokoll and the log file). An automatic loop switched on or off recomputes the
+    /// run at once if no step runs (else „Jetzt neu rechnen“ waits).
     fn corrected(&mut self, action: &Action, result: Result<JobOutput, StepError>) {
         let c = &mut self.state.correct;
         c.busy = false;
-        let (Action::AddLoop { run, .. } | Action::SetLoopEnabled { run, .. }) = action else {
+        let (Action::AddLoop { run, .. }
+        | Action::SetLoopEnabled { run, .. }
+        | Action::SetLoopUsed { run, .. }) = action
+        else {
             return;
         };
         let shown = c.run.as_ref() == Some(run);
@@ -551,6 +564,10 @@ impl DriftlessApp {
                     }
                     c.corrections = Some(Ok(done.corrections));
                     c.message = Some(UiMessage::Info(text::shown(&done.message).into_owned()));
+                }
+                let switched = matches!(action, Action::SetLoopUsed { .. });
+                if switched && done.changed && !self.jobs.is_busy() {
+                    self.apply(Action::Reuse(done.run));
                 }
             }
             Ok(_) => {}
@@ -1753,9 +1770,9 @@ impl DriftlessApp {
             Action::OpenMerge => self.state.open_merge(),
             Action::StartPairs { model, member } => self.start_pairs(&model, member),
             Action::SetPairEnabled { index, enabled } => self.switch_pair(index, enabled),
-            change @ (Action::AddLoop { .. } | Action::SetLoopEnabled { .. }) => {
-                self.change_corrections(change)
-            }
+            change @ (Action::AddLoop { .. }
+            | Action::SetLoopEnabled { .. }
+            | Action::SetLoopUsed { .. }) => self.change_corrections(change),
             Action::Compare { a, b } => self.start_compare(a, b),
             Action::CompareMaps { a, b } => self.start_compare_maps(a, b),
             Action::SetStep(step) => self.set_step(step),
@@ -2209,6 +2226,15 @@ fn change_corrections(action: &Action) -> Result<Corrected, StepError> {
             (
                 run,
                 correct::switched_message(*nr, *enabled, changed),
+                changed,
+                false,
+            )
+        }
+        Action::SetLoopUsed { run, a, b, used } => {
+            let changed = correct::set_loop_used(run, *a, *b, *used)?;
+            (
+                run,
+                correct::loop_used_message(*a, *b, *used, changed),
                 changed,
                 false,
             )

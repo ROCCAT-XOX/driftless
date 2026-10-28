@@ -163,6 +163,15 @@ pub enum Action {
         nr: usize,
         enabled: bool,
     },
+    /// Switches the automatic loop between the submaps at times `a` and `b` (seconds since the
+    /// start of the scan) of the run on or off (`[[reject]]` of `corrections.toml`), then
+    /// recomputes the run from its submaps.
+    SetLoopUsed {
+        run: PathBuf,
+        a: f64,
+        b: f64,
+        used: bool,
+    },
     /// Switch the corrections of the run back as in state `nr`, then recompute it (a new
     /// state; the old ones stay).
     RestoreHistory {

@@ -3,8 +3,9 @@
 //! points inside a submap never move; only the anchors do.
 
 use crate::loops::{
-    find_candidates, match_manual_loops, position_only_relative, verify, verify_manual, LoopCheck,
-    LoopConfig, LoopVerdict, ManualLoop, ManualLoopError, ManualMatch,
+    find_candidates, match_manual_loops, match_rejected_loops, position_only_relative, verify,
+    verify_manual, LoopCheck, LoopConfig, LoopVerdict, ManualLoop, ManualLoopError, ManualMatch,
+    RejectedLoop,
 };
 use crate::submap::{Submap, SubmapBuilder, SubmapConfig};
 use driftless_graph::se3::residual;
@@ -39,6 +40,8 @@ const MAX_LOOP_RESIDUAL: f64 = 3.0;
 const MAX_ITER: u32 = 100;
 /// Verdict of a loop the optimised graph does not fit.
 pub const INCONSISTENT: &str = "widerspricht anderen Schleifen";
+/// Verdict of an automatic loop the user switched off (`[[reject]]` of `corrections.toml`).
+pub const VETOED: &str = "von Hand abgeschaltet";
 
 #[derive(Debug, Clone)]
 pub struct SlamConfig {
@@ -141,7 +144,7 @@ pub fn run_slam(
 ) -> (SlamResult, OdomStats) {
     let (submaps, stats) = build_submaps(frames, imu, cfg);
     let odom_anchors = submaps.iter().map(|m| m.anchor).collect();
-    (solve_matched(submaps, odom_anchors, &[], cfg), stats)
+    (solve_matched(submaps, odom_anchors, &[], &[], cfg), stats)
 }
 
 /// The graph part of the pipeline on finished submaps: `cfg.rounds` rounds of loop search
@@ -160,14 +163,31 @@ pub fn solve(
     manual: &[ManualLoop],
     cfg: &SlamConfig,
 ) -> Result<SlamResult, ManualLoopError> {
+    solve_with(submaps, odom_anchors, manual, &[], cfg)
+}
+
+/// [`solve`] with the automatic loops the user switched off (`rejected`, the `[[reject]]`
+/// entries of `corrections.toml`): such a loop is verified as before, so the report lists it
+/// with its numbers, but gets the verdict `Rejected(`[`VETOED`]`)` and so stays out of the
+/// pose graph. Manual loops are never touched by it. Fails also if a rejected loop does not
+/// name two different submaps ([`match_rejected_loops`]).
+pub fn solve_with(
+    submaps: Vec<Submap>,
+    odom_anchors: Vec<Isometry3<f64>>,
+    manual: &[ManualLoop],
+    rejected: &[RejectedLoop],
+    cfg: &SlamConfig,
+) -> Result<SlamResult, ManualLoopError> {
     let manual = match_manual_loops(&submaps, manual)?;
-    Ok(solve_matched(submaps, odom_anchors, &manual, cfg))
+    let vetoed = match_rejected_loops(&submaps, rejected)?;
+    Ok(solve_matched(submaps, odom_anchors, &manual, &vetoed, cfg))
 }
 
 fn solve_matched(
     submaps: Vec<Submap>,
     odom_anchors: Vec<Isometry3<f64>>,
     manual: &[ManualMatch],
+    vetoed: &[(usize, usize)],
     cfg: &SlamConfig,
 ) -> SlamResult {
     assert_eq!(submaps.len(), odom_anchors.len(), "one anchor per submap");
@@ -180,7 +200,14 @@ fn solve_matched(
             .into_iter()
             .filter(|c| !manual.iter().any(|m| (m.a, m.b) == (c.a, c.b)));
         let checks = candidates
-            .map(|c| verify(&submaps, &anchors, &c, &cfg.loops))
+            .map(|c| {
+                let mut check = verify(&submaps, &anchors, &c, &cfg.loops);
+                // switched off by hand: verified for the report, never in the graph
+                if vetoed.contains(&(check.a, check.b)) {
+                    check.verdict = LoopVerdict::Rejected(VETOED);
+                }
+                check
+            })
             .chain(
                 manual
                     .iter()

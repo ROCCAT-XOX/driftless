@@ -55,6 +55,8 @@ toml = "1"
 
 [dev-dependencies]
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
+# Scan folders of a walk that closes loops (`testutil::walk_bag`).
+driftless-odom = { path = "../driftless-odom", features = ["test-util"] }
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
 # Foreign LAS files in the tests.
 las = "0.11"
