@@ -87,7 +87,8 @@ fn file(dir: &Path, name: &str, bytes: usize) -> PathBuf {
 }
 
 /// A project with the scan `halle` and a run `slam-001` with a map `karte-001` and a surface
-/// `oberflaeche-001` as complete folders would be (their reports, here empty files).
+/// `oberflaeche-001` as complete folders would be (their reports – the surface's after its
+/// glb –, here files of a few bytes).
 fn project(dir: &Path) -> (PathBuf, PathBuf) {
     let raw = dir.join("halle");
     fs::create_dir_all(&raw).unwrap();
@@ -101,22 +102,26 @@ fn project(dir: &Path) -> (PathBuf, PathBuf) {
     file(&run, "slam.json", 10);
     file(&run, "traj.tum", 10);
     file(&run.join("karte-001"), "map.json", 10);
-    file(
-        &run.join("karte-001/oberflaeche-001"),
-        "oberflaeche.glb",
-        10,
-    );
+    let surface = run.join("karte-001/oberflaeche-001");
+    file(&surface, "oberflaeche.glb", 10);
+    file(&surface, "oberflaeche.json", 10);
     (project, run)
 }
 
 /// What a crash leaves in `project` (run `run`): a run with only `lauf.toml`, a map with only
-/// a stage being written, a stale stage of a complete map, a surface folder without its glb, a
-/// model without its report.
+/// a stage being written, a stale stage of a complete map, a surface folder with nothing in
+/// it, one with its glb but without its report (cut off between the two), a model without its
+/// report.
 fn crash(project: &Path, run: &Path) {
     file(&project.join("scans/halle/slam-002"), "lauf.toml", 100);
     file(&run.join("karte-002"), "dense.bin.tmp", 2000);
     file(&run.join("karte-001"), "clean.bin.tmp", 1000);
     fs::create_dir_all(run.join("karte-001/oberflaeche-002")).unwrap();
+    file(
+        &run.join("karte-001/oberflaeche-003"),
+        "oberflaeche.glb",
+        300,
+    );
     file(&project.join("modelle/modell-001"), "modell.las.tmp", 500);
 }
 
@@ -147,6 +152,11 @@ fn finds_what_a_cut_off_job_left() {
                 "Oberfläche 002 (Karte 001)".into(),
                 0
             ),
+            (
+                LeftoverKind::Surface,
+                "Oberfläche 003 (Karte 001)".into(),
+                300
+            ),
             (LeftoverKind::Run, "SLAM 002".into(), 100),
             (LeftoverKind::Temp, "clean.bin.tmp (Karte 001)".into(), 1000),
         ]
@@ -154,7 +164,7 @@ fn finds_what_a_cut_off_job_left() {
     // a run of another scan id, or folders of other names, are not the project's
     file(&project.join("scans/anderer/slam-001"), "lauf.toml", 1);
     file(&project.join("scans/halle/notizen"), "a.txt", 1);
-    assert_eq!(leftovers::find(&project, &ids).len(), 5);
+    assert_eq!(leftovers::find(&project, &ids).len(), 6);
 }
 
 /// A folder a running job marks as busy ([`BUSY_FILE`], touched while it runs) is left alone
@@ -209,9 +219,9 @@ fn what_was_just_written_is_not_offered_yet() {
     assert_eq!(shown(Duration::from_secs(120), now), 0);
     assert_eq!(
         shown(Duration::from_secs(120), now + Duration::from_secs(180)),
-        5
+        6
     );
-    assert_eq!(shown(Duration::ZERO, now + Duration::from_secs(1)), 5);
+    assert_eq!(shown(Duration::ZERO, now + Duration::from_secs(1)), 6);
 }
 
 type Window = H;
@@ -275,6 +285,14 @@ fn leftovers_are_listed_and_cleaned_up() {
         .map(|m| m.dir.as_path())
         .collect();
     assert_eq!(maps, [run.join("karte-001")]);
+    // a surface cut off between its glb and its report is no surface of the map: not listed,
+    // so neither shown nor loaded as finished
+    let surfaces: Vec<&Path> = state.scans[0].runs[0].maps[0]
+        .surfaces
+        .iter()
+        .map(|s| s.dir.as_path())
+        .collect();
+    assert_eq!(surfaces, [run.join("karte-001/oberflaeche-001")]);
     // listed as „unvollständig“, with their sizes
     h.get_by_label_contains(text::INCOMPLETE_TITLE);
     h.get_by_label(&text::incomplete_entry("SLAM 002", 100));
@@ -288,6 +306,7 @@ fn leftovers_are_listed_and_cleaned_up() {
             "karte-002",
             "modell-001",
             "oberflaeche-002",
+            "oberflaeche-003",
             "slam-002"
         ]
     );

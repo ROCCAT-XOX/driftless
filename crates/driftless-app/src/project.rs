@@ -56,13 +56,14 @@
 //! full SLAM run always gets a new `slam-NNN` (so no earlier `traj.tum` is replaced), and a map
 //! is written only into a `karte-NNN` whose `map.json` fits the request, or into a new one. A
 //! surface is only computed if no `oberflaeche-NNN` of the map fits the request, and then into a
-//! new one ([`run_surface_job`]). Every merge gets a new `modell-NNN` ([`run_merge_job`]); a
-//! folder without `modell.json` is no model (the report is written last). `project.toml`
+//! new one ([`run_surface_job`]); a folder without `oberflaeche.json` is no surface, even with
+//! its glb (the report is written last). Every merge gets a new `modell-NNN`
+//! ([`run_merge_job`]); a folder without `modell.json` is no model (the report is written
+//! last). `project.toml`
 //! does not list the models: [`Project::models`] reads the folder. Point pairs marked by hand
 //! are kept in `modelle/punktpaare.toml` ([`driftless_steps::pairs`], paths relative to that
 //! folder) and count in every merge of the project.
 
-use crate::surface::SURFACE_GLB;
 use crate::ui::text;
 use driftless_gpu::GpuPref;
 use driftless_io::atomic_write;
@@ -202,7 +203,8 @@ pub struct MapInfo {
     pub settings: Option<MapSwitches>,
     /// The existing ones of `color.las`, `clean.las`, `dense.las`, `removed.las`, in this order.
     pub clouds: Vec<PathBuf>,
-    /// The surfaces of the map: its subfolders `oberflaeche…` with an `oberflaeche.glb`.
+    /// The surfaces of the map: its subfolders `oberflaeche…` with an `oberflaeche.json` (the
+    /// step writes it last; one without it is cut off, see [`crate::leftovers`]).
     pub surfaces: Vec<SurfaceInfo>,
 }
 
@@ -231,7 +233,7 @@ pub struct ModelInfo {
     pub label: String,
     /// Its `modell.json`: where each scan sits and how sure that is.
     pub report: ModelReport,
-    /// Its surfaces: subfolders `oberflaeche…` with an `oberflaeche.glb`.
+    /// Its surfaces: subfolders `oberflaeche…` with an `oberflaeche.json`, as for a map.
     pub surfaces: Vec<SurfaceInfo>,
 }
 
@@ -764,7 +766,10 @@ fn create_numbered(dir: &Path, prefix: &str) -> Result<StepDir, ProjectError> {
 }
 
 /// The surfaces in the map folder `dir`: `oberflaeche-NNN` by number, then other folders
-/// `oberflaeche…` (made with `driftless surface -o`) by name; only those with a glb.
+/// `oberflaeche…` (made with `driftless surface -o`) by name; only those with their report
+/// `oberflaeche.json`. The surface step writes it after the glb: a folder with the glb but
+/// without the report was cut off between the two and is no finished surface (it is offered
+/// for „Aufräumen“, [`crate::leftovers`]).
 fn surfaces_of(dir: &Path) -> Vec<SurfaceInfo> {
     let numbered = numbered(dir, SURFACE_NUMBERED);
     let mut others: Vec<PathBuf> = fs::read_dir(dir)
@@ -792,7 +797,7 @@ fn surfaces_of(dir: &Path) -> Vec<SurfaceInfo> {
             (name, p)
         }));
     labelled
-        .filter(|(_, p)| p.join(SURFACE_GLB).is_file())
+        .filter(|(_, p)| p.join(SURFACE_REPORT).is_file())
         .map(|(label, dir)| {
             let report = fs::read_to_string(dir.join(SURFACE_REPORT))
                 .ok()

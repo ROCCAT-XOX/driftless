@@ -1,9 +1,10 @@
 //! What a job cut off left behind (a crash, a force quit, a power cut): a run, map, surface or
-//! model folder without its final report (`slam.json`, `map.json`, `oberflaeche.glb`,
-//! `modell.json`), or a stale `<name>.tmp` beside a file being written. A cancelled or failed
-//! job removes its new folder itself ([`crate::project::StepDir`]); these are what remains when
-//! the program had no chance to. „Daten“ lists them as „unvollständig“, „Aufräumen“ moves them
-//! to the trash.
+//! model folder without its final report (`slam.json`, `map.json`, `oberflaeche.json`,
+//! `modell.json`; each step writes it last), or a stale `<name>.tmp` beside a file being
+//! written. A surface folder with its glb but without its report was cut off between the two:
+//! it is a leftover too, never a finished surface. A cancelled or failed job removes its new
+//! folder itself ([`crate::project::StepDir`]); these are what remains when the program had no
+//! chance to. „Daten“ lists them as „unvollständig“, „Aufräumen“ moves them to the trash.
 //!
 //! What a job may still write is left alone: a folder a running job marks busy ([`BUSY_FILE`],
 //! touched every [`BUSY_BEAT`]; this window's, another window's), and what was written to within
@@ -12,10 +13,10 @@
 use crate::disk::folder_size;
 use crate::project::SURFACE_NUMBERED;
 use crate::project::{numbered, MAP_PREFIX, MODELS_DIR, MODEL_PREFIX, RUN_PREFIX, SCANS_DIR};
-use crate::surface::SURFACE_GLB;
 use crate::ui::text;
 use driftless_steps::map::REPORT as MAP_REPORT;
 use driftless_steps::merge::MODEL_REPORT;
+use driftless_steps::surface::SURFACE_REPORT;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -114,14 +115,15 @@ pub fn find(dir: &Path, scan_ids: &[String]) -> Vec<Leftover> {
 }
 
 /// The surfaces `oberflaeche-NNN` of the map or model folder `dir` (named `parent`): one
-/// without its glb whole, else its stale `.tmp` files.
+/// without its report (`oberflaeche.json`, written after the glb) whole, else its stale `.tmp`
+/// files.
 fn surfaces(dir: &Path, parent: &str, out: &mut Vec<Leftover>) {
     for (_, digits, surface) in numbered(dir, SURFACE_NUMBERED) {
         let label = text::surface_label(&digits);
         if busy(&surface) {
             continue;
         }
-        if surface.join(SURFACE_GLB).is_file() {
+        if surface.join(SURFACE_REPORT).is_file() {
             temps(&surface, Some(&label), out);
         } else {
             let label = format!("{label} ({parent})");
