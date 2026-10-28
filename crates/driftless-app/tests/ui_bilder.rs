@@ -123,6 +123,7 @@ fn four_maps() -> AppState {
                     path: PathBuf::from(format!("/daten/{id}")),
                     name: format!("Scan {id}"),
                     extra_runs: Vec::new(),
+                    bags: Vec::new(),
                 })
                 .collect(),
         }),

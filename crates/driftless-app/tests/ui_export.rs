@@ -68,6 +68,7 @@ fn tree_state() -> AppState {
                 path: PathBuf::from("/daten/halle"),
                 name: "Halle".into(),
                 extra_runs: Vec::new(),
+                bags: Vec::new(),
             }],
         }),
         scans: vec![ScanNode {

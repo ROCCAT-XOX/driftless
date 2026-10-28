@@ -210,7 +210,15 @@ slim status bar:
   10 GB a warning, also in the Protokoll; a step that will need more than is free is warned about when it
   starts); every run, map, surface and model in the tree shows the size of its folder (measured in the
   background). A card per scan with its state (neu, wartet, rechnet, fertig ✓, veraltet) and „+ Scan
-  hinzufügen“; the precision Schnell · Genau · Maximal sets only the voxel size of the map (0.02 /
+  hinzufügen“. A right click on a scan's card: „Umbenennen …“ (only the name shown), „Ordner neu
+  zuordnen …“ for a scan whose folder is missing (moved, drive not attached; only the same scan is
+  taken: the same LiDAR bags by name and size, recorded at the times of its runs) and „Aus Projekt
+  entfernen“ (only the entry: the raw data and the results under `scans/<id>` stay). A right click on a
+  run, map, surface or model: „Löschen …“ asks with the size, what lies in the folder and which models
+  use it, and moves the folder to the system's trash – never deleted for good; on Windows a network or
+  removable drive, which has no trash, is refused. It is locked while a step works on it; while the
+  view shows it, the question offers „Aus der Ansicht nehmen“ first. A run made with the command line
+  and added by hand is only taken out of the project. The precision Schnell · Genau · Maximal sets only the voxel size of the map (0.02 /
   0.01 / 0.005 m; Maximal needs over 4 GB of memory on large scans, another voxel shows „Eigene“). „Alle
   rechnen“ queues every new or stale scan and computes them one after the other; with a scan selected,
   „Rechnen“ computes only that one. The runs and maps of a scan unfold below its card. „▸ Erweitert“

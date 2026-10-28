@@ -49,6 +49,7 @@ fn unselected() -> AppState {
             path: PathBuf::from("/daten/buero"),
             name: "buero".into(),
             extra_runs: Vec::new(),
+            bags: Vec::new(),
         }],
     };
     AppState {
@@ -162,6 +163,7 @@ fn missing_scan_is_marked() {
             path: gone.to_path_buf(),
             name: "buero".into(),
             extra_runs: Vec::new(),
+            bags: Vec::new(),
         }],
     };
     let mut state = AppState::default();

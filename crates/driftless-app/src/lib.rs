@@ -19,4 +19,5 @@ pub mod project;
 pub mod render;
 pub mod surface;
 pub mod synthetic;
+pub mod trash;
 pub mod ui;

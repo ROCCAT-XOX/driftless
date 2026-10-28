@@ -395,6 +395,7 @@ fn small_window_no_overlap() {
                 path: PathBuf::from("/daten/s"),
                 name: name.clone(),
                 extra_runs: Vec::new(),
+                bags: Vec::new(),
             }],
         }),
         scans: vec![ScanNode {
@@ -762,6 +763,7 @@ fn pair_state() -> AppState {
                 path: PathBuf::from("/daten/s"),
                 name: "s".into(),
                 extra_runs: Vec::new(),
+                bags: Vec::new(),
             }],
         }),
         scans: vec![ScanNode {

@@ -23,7 +23,7 @@ use super::{
 use crate::project::{MapInfo, RunInfo, ScanState};
 use crate::ui::status::count;
 use crate::ui::theme::{icon, DARK};
-use crate::ui::{compare, correct, text, Action, AppState, Queued, ScanNode, Selection, Step};
+use crate::ui::{compare, correct, text, Action, AppState, Ask, Queued, ScanNode, Selection, Step};
 use driftless_steps::history::HistoryKind;
 use driftless_steps::map::{MapSettings, MapStep};
 use driftless_steps::slam::SlamSettings;
@@ -253,6 +253,7 @@ fn scan_card(ui: &mut Ui, state: &AppState, scan: &ScanNode, action: &mut Option
     let r = card(ui, ("scan", &scan.id), selected, name, &hover, |ui| {
         status_label(ui, status);
     });
+    scan_menu(&r, state, scan, action);
     if r.clicked() {
         let selection = if selected {
             Selection::None
@@ -275,6 +276,44 @@ fn scan_card(ui: &mut Ui, state: &AppState, scan: &ScanNode, action: &mut Option
             }
         });
     }
+}
+
+/// The context menu of a scan's card: „Umbenennen …“, „Ordner neu zuordnen …“ (only for a
+/// missing scan folder) and „Aus Projekt entfernen“; locked while a step of the scan runs or
+/// waits, the reason on hover.
+fn scan_menu(
+    card: &egui::Response,
+    state: &AppState,
+    scan: &ScanNode,
+    action: &mut Option<Action>,
+) {
+    let busy = state.scan_busy(&scan.id);
+    let missing = matches!(scan.state, ScanState::Missing(_));
+    card.context_menu(|ui| {
+        let item = |ui: &mut Ui, label: &str, locked: Option<String>| {
+            let r = ui.add_enabled(locked.is_none(), egui::Button::new(label));
+            let clicked = r.clicked();
+            if let Some(why) = locked {
+                r.on_disabled_hover_text(why);
+            }
+            clicked
+        };
+        if item(ui, text::RENAME_SCAN, busy.clone()) {
+            *action = Some(Action::Ask(Ask::RenameScan {
+                id: scan.id.clone(),
+                name: scan.name.clone(),
+            }));
+        }
+        let only_missing = (!missing).then(|| text::RELINK_ONLY_MISSING.to_string());
+        if item(ui, text::RELINK_SCAN, busy.clone().or(only_missing)) {
+            *action = Some(Action::PickRelinkScan(scan.id.clone()));
+        }
+        if item(ui, text::REMOVE_SCAN, busy) {
+            *action = Some(Action::Ask(Ask::RemoveScan {
+                id: scan.id.clone(),
+            }));
+        }
+    });
 }
 
 /// „Modelle“ with each model of the project, if there are any.

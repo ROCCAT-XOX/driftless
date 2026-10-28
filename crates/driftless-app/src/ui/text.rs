@@ -757,6 +757,153 @@ pub const PROJECT_CHANGED_ELSEWHERE: &str = "project.toml war inzwischen von ein
 /// Label of the background job that writes `auswahl.toml`.
 pub const CHOICES_JOB: &str = "Auswahl speichern";
 
+// Managing the project: scans, and folders to the trash
+pub const RENAME_SCAN: &str = "Umbenennen …";
+pub const RELINK_SCAN: &str = "Ordner neu zuordnen …";
+pub const RELINK_ONLY_MISSING: &str =
+    "Nur für einen Scan, dessen Ordner fehlt (verschoben, Laufwerk nicht angesteckt)";
+pub const REMOVE_SCAN: &str = "Aus Projekt entfernen";
+pub const REMOVE_RUN: &str = "Aus Projekt entfernen";
+pub const DELETE: &str = "Löschen …";
+/// The window „Scan umbenennen“ and its field.
+pub const RENAME_TITLE: &str = "Scan umbenennen";
+pub const SCAN_NAME: &str = "Name";
+pub const SCAN_NAME_EMPTY: &str = "Der Name darf nicht leer sein";
+pub const RENAME_CONFIRM: &str = "Umbenennen";
+pub const REMOVE_TITLE: &str = "Aus Projekt entfernen";
+pub const REMOVE_CONFIRM: &str = "Entfernen";
+pub const DELETE_TITLE: &str = "Löschen";
+pub const DELETE_CONFIRM: &str = "In den Papierkorb";
+/// In the question „Löschen“ while the view shows something of the folder.
+pub const UNSHOW: &str = "Aus der Ansicht nehmen";
+pub const ASK_CANCEL: &str = "Abbrechen";
+pub const DIALOG_RELINK_SCAN: &str = "Neuen Ordner des Scans wählen (mit LIDAR_*.bag)";
+/// Label of the background work that assigns a scan folder or moves a folder to the trash.
+pub const RELINK_JOB: &str = "Scan zuordnen";
+pub const TRASH_JOB: &str = "In den Papierkorb";
+/// Why a scan cannot be changed now: a step of it runs or waits.
+pub const SCAN_BUSY: &str = "Ein Schritt dieses Scans läuft oder wartet – erst danach";
+/// A run in the run folder itself (made by the CLI): it is the run folder.
+pub const MAP_IN_RUN: &str = "Liegt im Lauf-Ordner: mit dem Lauf löschen";
+
+/// The question before „Aus Projekt entfernen“ of a scan.
+pub fn remove_scan_question(
+    name: &str,
+    raw: &std::path::Path,
+    results: &std::path::Path,
+) -> String {
+    format!(
+        "Scan „{name}“ aus dem Projekt entfernen? Nur der Eintrag geht. Die Rohdaten bleiben \
+         unberührt ({}), ebenso die Ergebnisse unter {}: wird der Scan wieder hinzugefügt, sind \
+         sie wieder da.",
+        raw.display(),
+        results.display()
+    )
+}
+
+/// The question before „Löschen …“: „Karte 001 löschen? Der Ordner (640 MB) wandert in den
+/// Papierkorb.“ (without a size while it is not measured).
+pub fn delete_question(label: &str, bytes: Option<u64>) -> String {
+    match bytes {
+        Some(bytes) => format!(
+            "„{label}“ löschen? Der Ordner ({}) wandert in den Papierkorb und lässt sich von dort \
+             zurückholen.",
+            size(bytes)
+        ),
+        None => format!(
+            "„{label}“ löschen? Der Ordner wandert in den Papierkorb und lässt sich von dort \
+             zurückholen."
+        ),
+    }
+}
+
+/// What lies in a folder to delete: „Darin: Karte 001, Oberfläche 001“.
+pub fn delete_contains(list: &[String]) -> String {
+    format!("Darin: {}", list.join(", "))
+}
+
+/// The models that use a map to delete.
+pub fn delete_used_by(list: &[String]) -> String {
+    format!(
+        "Davon hängt ab: {} – ihre Oberfläche und „Von Hand ausrichten“ gehen danach nicht mehr \
+         (das Modell selbst bleibt sichtbar).",
+        list.join(", ")
+    )
+}
+
+/// After a folder went to the trash.
+pub fn deleted(label: &str, bytes: Option<u64>) -> String {
+    match bytes {
+        Some(bytes) => format!("„{label}“ in den Papierkorb gelegt ({})", size(bytes)),
+        None => format!("„{label}“ in den Papierkorb gelegt"),
+    }
+}
+
+/// Why a folder cannot go to the trash now: it, or something that depends on it, is shown.
+pub fn delete_shown(what: &str) -> String {
+    format!("Wird gerade angezeigt ({what}) – erst „{UNSHOW}“")
+}
+
+/// Why a folder cannot go to the trash now: a step works on it, or it waits in the queue.
+pub fn delete_computing(label: &str) -> String {
+    format!("Wird gerade gerechnet ({label}) – nach dem Schritt oder „Abbrechen“")
+}
+
+/// A folder the trash cannot take (a network share, a removable drive on Windows).
+pub fn trash_unavailable(path: &std::path::Path, why: &str) -> String {
+    about_path(
+        &format!("Kein Papierkorb für diesen Ordner ({why}); nichts gelöscht"),
+        path,
+    )
+}
+
+/// The trash of the system refused (German reason first, the system's text below).
+pub fn trash_failed(path: &std::path::Path, error: &str) -> String {
+    format!(
+        "{}\n{error}",
+        about_path("Nicht in den Papierkorb gelegt; nichts gelöscht", path)
+    )
+}
+
+/// After „Ordner neu zuordnen …“.
+pub fn relinked(name: &str, checked: bool) -> String {
+    if checked {
+        format!("Scan „{name}“ liest jetzt aus dem neuen Ordner")
+    } else {
+        format!(
+            "Scan „{name}“ liest jetzt aus dem neuen Ordner (nicht prüfbar: der Scan hat noch \
+             keinen Lauf)"
+        )
+    }
+}
+
+/// A folder of another scan: the bags differ.
+pub fn other_scan_bags(then: &[(String, u64)], now: &[(String, u64)]) -> String {
+    let list = |bags: &[(String, u64)]| {
+        bags.iter()
+            .map(|(name, bytes)| format!("{name} {}", size(*bytes)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "Anderer Scan: die LiDAR-Aufnahmen unterscheiden sich (vorher {}, hier {})",
+        list(then),
+        list(now)
+    )
+}
+
+/// A folder of another scan: recorded at other times than the runs of the scan.
+pub fn other_scan_times(run: (f64, f64), scan: (f64, f64)) -> String {
+    format!(
+        "Anderer Scan: zu anderer Zeit aufgenommen (der Lauf des Scans umfasst {}–{} s, dieser \
+         Ordner {}–{} s)",
+        decimal(run.0, 1),
+        decimal(run.1, 1),
+        decimal(scan.0, 1),
+        decimal(scan.1, 1)
+    )
+}
+
 /// The label of the read of a project folder (status bar while a project is opened).
 pub const READ_PROJECT_JOB: &str = "Projekt lesen";
 /// In the field while a project is being opened.

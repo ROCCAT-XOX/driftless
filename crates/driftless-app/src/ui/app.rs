@@ -288,6 +288,15 @@ enum HelperTask {
     SaveChoices(PathBuf, Choices),
     /// The disk use of the project for this tree version.
     DiskUse(u64),
+    /// „Ordner neu zuordnen …“: points the scan (id) at the folder, if it holds the same scan
+    /// (reads its bags).
+    Relink { id: String, dir: PathBuf },
+    /// „Löschen …“: the folder to the trash, with its name and size for the message.
+    Trash {
+        dir: PathBuf,
+        label: String,
+        bytes: Option<u64>,
+    },
 }
 
 /// What a „compute all“ button puts into the queue.
@@ -434,6 +443,8 @@ pub struct DriftlessApp {
     free_space: crate::disk::FreeSpace,
     /// Little free space was told (again only once there was enough in between).
     low_space_told: bool,
+    /// How folders go to the trash ([`crate::trash::system_trash`]).
+    trash: crate::trash::Trash,
 }
 
 impl DriftlessApp {
@@ -485,7 +496,14 @@ impl DriftlessApp {
             disk_asked: 0,
             free_space: crate::disk::free_space,
             low_space_told: false,
+            trash: crate::trash::system_trash,
         }
+    }
+
+    /// With another trash (tests: not the system's).
+    pub fn with_trash(mut self, trash: crate::trash::Trash) -> Self {
+        self.trash = trash;
+        self
     }
 
     /// With another way to tell the free space of a drive (tests).
@@ -1619,6 +1637,17 @@ impl DriftlessApp {
                     self.pair_switched(index, enabled, result.map(|_| ()));
                 }
                 (Some(HelperTask::SaveChoices(..)), Err(e)) => self.error(e.to_string()),
+                (Some(HelperTask::Relink { id, .. }), result) => self.relinked(&id, result),
+                (Some(HelperTask::Trash { dir, label, bytes }), result) => match result {
+                    Ok(_) => {
+                        if self.selection_in(&dir) {
+                            self.state.selection = Selection::None;
+                        }
+                        self.info(text::deleted(&label, bytes));
+                        self.refresh_tree();
+                    }
+                    Err(e) => self.error(text::step_error(&e)),
+                },
                 (Some(HelperTask::DiskUse(v)), Ok(JobOutput::DiskUse(disk))) => {
                     // a measure of an older tree still says the free space
                     if v == self.state.tree_version || self.state.disk.is_none() {
@@ -1714,6 +1743,26 @@ impl DriftlessApp {
                 }),
                 None => Ok(()),
             },
+            HelperTask::Relink { id, dir } => {
+                let project = self.state.project.as_ref().map(|p| p.dir.clone());
+                let (id, dir) = (id.clone(), dir.clone());
+                self.helper.start(text::RELINK_JOB, move |_| {
+                    let project = project.ok_or(text::NO_PROJECT)?;
+                    let (project, _, checked) =
+                        change_project(&project, None, |p| p.relink_scan(&id, &dir))?;
+                    Ok(JobOutput::Relinked {
+                        project: Box::new(project),
+                        checked,
+                    })
+                })
+            }
+            HelperTask::Trash { dir, .. } => {
+                let (dir, trash) = (dir.clone(), self.trash);
+                self.helper.start(text::TRASH_JOB, move |_| {
+                    trash(&dir)?;
+                    Ok(JobOutput::Done)
+                })
+            }
             HelperTask::SaveChoices(dir, choices) => {
                 let (dir, choices) = (dir.clone(), choices.clone());
                 self.helper.start(text::CHOICES_JOB, move |_| {
@@ -1750,6 +1799,10 @@ impl DriftlessApp {
                 }
                 // tried again with the next change
                 HelperTask::SaveChoices(..) => self.saved_choices = None,
+                HelperTask::Relink { id, .. } => {
+                    let id = id.clone();
+                    self.relinked(&id, Err(StepError::Failed(e.to_string())))
+                }
                 _ => self.error(e.to_string()),
             },
         }
@@ -2225,6 +2278,71 @@ impl DriftlessApp {
                 self.sync_tree_state();
             }
             Action::DismissMessages => self.state.messages.clear(),
+            Action::Ask(ask) => self.state.ask = Some(ask),
+            Action::AskDelete(dir) => {
+                self.state.ask = self.state.delete_question(&dir).map(super::Ask::Delete)
+            }
+            Action::CloseAsk => self.state.ask = None,
+            Action::RenameScan { id, name } => {
+                self.state.ask = None;
+                match self.state.scan_busy(&id) {
+                    Some(why) => self.error(why),
+                    None => {
+                        let keep = self.state.selection.clone();
+                        self.change_project(|p| {
+                            p.rename_scan(&id, &name)?;
+                            Ok(keep)
+                        });
+                    }
+                }
+            }
+            Action::RemoveScan(id) => {
+                self.state.ask = None;
+                match self.state.scan_busy(&id) {
+                    Some(why) => self.error(why),
+                    None => self.change_project(|p| {
+                        p.remove_scan(&id)?;
+                        Ok(Selection::None)
+                    }),
+                }
+            }
+            Action::RemoveRun { scan, run } => match self.state.scan_busy(&scan) {
+                Some(why) => self.error(why),
+                None => self.change_project(|p| {
+                    p.remove_run(&scan, &run)?;
+                    Ok(Selection::Scan(scan.clone()))
+                }),
+            },
+            Action::PickRelinkScan(id) => {
+                if let Some(dir) = self
+                    .dialog(DialogFolder::Scans, text::DIALOG_RELINK_SCAN)
+                    .pick_folder()
+                {
+                    self.remember_folder(DialogFolder::Scans, dir.parent());
+                    self.apply(Action::RelinkScan { id, dir });
+                }
+            }
+            Action::RelinkScan { id, dir } => match self.state.scan_busy(&id) {
+                Some(why) => self.error(why),
+                None => self.helper_queue.push_back(HelperTask::Relink { id, dir }),
+            },
+            Action::Unshow(dir) => self.unshow(&dir),
+            Action::Delete(dir) => {
+                self.state.ask = None;
+                let Some(question) = self.state.delete_question(&dir) else {
+                    self.error(text::unknown_map(&dir));
+                    return;
+                };
+                // what is shown or computed now (it may have changed since the question)
+                match self.state.delete_blocked(&dir) {
+                    Some(why) => self.error(why),
+                    None => self.helper_queue.push_back(HelperTask::Trash {
+                        dir,
+                        label: question.label,
+                        bytes: question.bytes,
+                    }),
+                }
+            }
             Action::OpenLogFolder => {
                 if let Err(e) = super::about::open_log_folder() {
                     self.error(e);
@@ -2343,6 +2461,67 @@ impl DriftlessApp {
             Step::Bilder if surface => ShowMode::Surface,
             _ => ShowMode::Cloud,
         };
+    }
+
+    /// „Aus der Ansicht nehmen“: what the view shows from the folder `dir` or from a model that
+    /// uses it goes (the cloud, the surface, „Von Hand ausrichten“), and the selection if it
+    /// lies there; the run drawn follows ([`Self::sync_run`]).
+    fn unshow(&mut self, dir: &Path) {
+        let mut touched = vec![dir.to_path_buf()];
+        touched.extend(self.state.model_users_dirs(dir));
+        let hit = |p: &Path| touched.iter().any(|t| p.starts_with(t));
+        let drawn = self.state.selected_run().is_some_and(|(_, r)| hit(&r.dir));
+        if drawn || touched.iter().any(|t| self.selection_in(t)) {
+            self.state.selection = Selection::None;
+        }
+        if self.state.cloud.as_ref().is_some_and(|c| hit(&c.path)) {
+            self.cloud = None;
+            self.cloud_run = None;
+            self.state.cloud = None;
+            self.state.view.cut = None;
+            self.state.picked = None;
+            self.state.view_stats = None;
+            self.view.cloud_replaced();
+        }
+        if self.state.surface.as_ref().is_some_and(|s| hit(&s.path)) {
+            self.drop_surface();
+        }
+        if self.state.pairs.as_ref().is_some_and(|p| hit(&p.model)) {
+            tools::end_pairs(&mut self.state);
+        }
+        self.sync_run();
+    }
+
+    /// Whether the selection lies in the folder `dir`.
+    fn selection_in(&self, dir: &Path) -> bool {
+        match &self.state.selection {
+            Selection::Run(p)
+            | Selection::Map(p)
+            | Selection::Cloud(p)
+            | Selection::Surface(p)
+            | Selection::Model(p)
+            | Selection::History { run: p, .. } => p.starts_with(dir),
+            Selection::None | Selection::Scan(_) => false,
+        }
+    }
+
+    /// „Ordner neu zuordnen …“ of the scan `id` ended: the project as written and the tree
+    /// read again, or the reason it was refused.
+    fn relinked(&mut self, id: &str, result: Result<JobOutput, StepError>) {
+        match result {
+            Ok(JobOutput::Relinked { project, checked }) => {
+                let name = project
+                    .scan(id)
+                    .map_or_else(|| id.to_string(), |s| s.name.clone());
+                if self.is_shown(&project.dir) {
+                    self.state.project = Some(*project);
+                    self.refresh_tree();
+                }
+                self.info(text::relinked(&name, checked));
+            }
+            Ok(_) => {}
+            Err(e) => self.error(text::step_error(&e)),
+        }
     }
 
     /// Whether `dir` is the folder of the project shown (as stored, without resolving it).
@@ -2575,6 +2754,7 @@ impl DriftlessApp {
         settings::show(&ctx, &mut self.state);
         super::about::show(&ctx, &mut self.state.about_open);
         actions.extend(export::show(&ctx, &mut self.state));
+        actions.extend(super::manage::show(&ctx, &mut self.state));
         self.view.set_tool(self.state.tool);
         self.view
             .set_picked(self.state.picked.as_ref().map(|p| p.index));

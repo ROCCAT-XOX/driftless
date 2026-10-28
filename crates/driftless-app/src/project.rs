@@ -157,6 +157,10 @@ pub struct ScanEntry {
     pub name: String,
     /// Run folders made by the CLI and added by hand (absolute).
     pub extra_runs: Vec<PathBuf>,
+    /// The LiDAR bags of the scan when it was added (name, bytes): what tells it from another
+    /// scan when its folder is assigned anew ([`Project::relink_scan`]). Empty for a scan added
+    /// before this was kept.
+    pub bags: Vec<(String, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -449,6 +453,9 @@ struct ScanFile {
     /// where there is none. Written only if one entry has one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     extra_runs_rel: Vec<String>,
+    /// [`ScanEntry::bags`] as „<name> <bytes>“.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    bags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -588,6 +595,54 @@ fn check_run_scan(run: &Path, scan: &Path) -> Result<(), ProjectError> {
             scan.display()
         )))
     }
+}
+
+/// The LiDAR bags of a scan folder: name and bytes.
+fn bag_stamps(found: &driftless_io::project::Project) -> Vec<(String, u64)> {
+    found
+        .lidar_bags
+        .iter()
+        .map(|b| {
+            let name = b
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let bytes = fs::metadata(b).map_or(0, |m| m.len());
+            (name, bytes)
+        })
+        .collect()
+}
+
+/// Whether the scan folder `found` holds the scan `scan` with the runs `runs` ([`Project::
+/// relink_scan`]): the same bags by name and size as when it was added, and recorded at the
+/// times of its runs. `Ok(false)`: nothing to tell it by (added before the bags were kept, and
+/// no run yet).
+fn same_scan(
+    scan: &ScanEntry,
+    runs: &[RunInfo],
+    found: &driftless_io::project::Project,
+) -> Result<bool, ProjectError> {
+    let different = |why: String| ProjectError(text::about_path(&why, &found.root));
+    let mut checked = false;
+    if !scan.bags.is_empty() {
+        let now = bag_stamps(found);
+        if now != scan.bags {
+            return Err(different(text::other_scan_bags(&scan.bags, &now)));
+        }
+        checked = true;
+    }
+    // the recording times of a run (from the start of the scan to the end of its last submap)
+    let run = runs
+        .iter()
+        .find_map(|r| driftless_steps::slam::run_times(&r.dir));
+    if let (Some(run), Some(times)) = (run, scan_times(&found.lidar_bags)) {
+        if !run_fits_scan(run, times) {
+            return Err(different(text::other_scan_times(run, times)));
+        }
+        checked = true;
+    }
+    Ok(checked)
 }
 
 /// Two paths name the same folder (resolved where they exist).
@@ -890,6 +945,14 @@ impl Project {
                             from_stored_pair(&dir, r, rel)
                         })
                         .collect(),
+                    bags: s
+                        .bags
+                        .iter()
+                        .filter_map(|b| {
+                            let (name, bytes) = b.rsplit_once(' ')?;
+                            Some((name.to_string(), bytes.parse().ok()?))
+                        })
+                        .collect(),
                     id: s.id,
                     name: s.name,
                 }
@@ -930,6 +993,11 @@ impl Project {
                     name: s.name.clone(),
                     extra_runs: runs.into_iter().map(|(text, _)| text).collect(),
                     extra_runs_rel,
+                    bags: s
+                        .bags
+                        .iter()
+                        .map(|(name, bytes)| format!("{name} {bytes}"))
+                        .collect(),
                 })
             })
             .collect::<Result<_, ProjectError>>()?;
@@ -959,7 +1027,7 @@ impl Project {
     pub fn add_scan(&mut self, scan_dir: &Path) -> Result<String, ProjectError> {
         let path = canonical(scan_dir)
             .map_err(|_| ProjectError(text::about_path("Scan-Ordner nicht gefunden", scan_dir)))?;
-        discover_project(&path).map_err(|e| ProjectError(e.to_string()))?;
+        let found = discover_project(&path).map_err(|e| ProjectError(e.to_string()))?;
         if let Some(s) = self.scans.iter().find(|s| same_dir(&s.path, &path)) {
             return Err(ProjectError(text::about_path(
                 &format!("Scan ist schon im Projekt (als „{}“)", s.name),
@@ -986,8 +1054,88 @@ impl Project {
             path,
             name: base,
             extra_runs: Vec::new(),
+            bags: bag_stamps(&found),
         });
         Ok(id)
+    }
+
+    /// Gives the scan `id` the shown name `name` (trimmed, not empty); its folder and id stay.
+    /// Call [`Project::save`] afterwards.
+    pub fn rename_scan(&mut self, id: &str, name: &str) -> Result<(), ProjectError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ProjectError(text::SCAN_NAME_EMPTY.into()));
+        }
+        let scan = self
+            .scans
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or_else(|| Self::unknown(id))?;
+        scan.name = name.to_string();
+        Ok(())
+    }
+
+    /// Takes the scan `id` out of the project: only its entry; the raw data and the results
+    /// under `scans/<id>` stay (added again, the scan gets them back). Call [`Project::save`]
+    /// afterwards.
+    pub fn remove_scan(&mut self, id: &str) -> Result<ScanEntry, ProjectError> {
+        let k = self
+            .scans
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or_else(|| Self::unknown(id))?;
+        Ok(self.scans.remove(k))
+    }
+
+    /// Takes the run folder `run` made by the CLI out of the scan `id` (only the entry; the
+    /// folder stays). Call [`Project::save`] afterwards.
+    pub fn remove_run(&mut self, id: &str, run: &Path) -> Result<(), ProjectError> {
+        let scan = self
+            .scans
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or_else(|| Self::unknown(id))?;
+        let before = scan.extra_runs.len();
+        scan.extra_runs.retain(|r| !same_dir(r, run));
+        if scan.extra_runs.len() == before {
+            return Err(ProjectError(text::unknown_run(run)));
+        }
+        Ok(())
+    }
+
+    /// Points the scan `id` at the folder `dir` (its data moved: another drive, another
+    /// computer), if that holds the same scan: the same LiDAR bags by name and size as when it
+    /// was added, and recorded at the times of its runs ([`run_fits_scan`]). A different scan
+    /// is refused with the reason. Returns whether it could be checked (a scan without runs,
+    /// added before the bags were kept, cannot be). Reads the bags: call it off the UI thread.
+    /// Call [`Project::save`] afterwards.
+    pub fn relink_scan(&mut self, id: &str, dir: &Path) -> Result<bool, ProjectError> {
+        let path = canonical(dir)
+            .map_err(|_| ProjectError(text::about_path("Scan-Ordner nicht gefunden", dir)))?;
+        let found = discover_project(&path).map_err(|e| ProjectError(e.to_string()))?;
+        if let Some(other) = self
+            .scans
+            .iter()
+            .find(|s| s.id != id && same_dir(&s.path, &path))
+        {
+            return Err(ProjectError(text::about_path(
+                &format!("Ordner ist schon der Scan „{}“", other.name),
+                &path,
+            )));
+        }
+        let runs = self.runs(id);
+        let scan = self.scan(id).ok_or_else(|| Self::unknown(id))?;
+        let checked = same_scan(scan, &runs, &found)?;
+        let scan = self
+            .scans
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or_else(|| Self::unknown(id))?;
+        scan.path = path;
+        if scan.bags.is_empty() {
+            scan.bags = bag_stamps(&found);
+        }
+        Ok(checked)
     }
 
     /// Adds a run folder made by the CLI (`driftless slam -o`, with `slam.json`) to the scan

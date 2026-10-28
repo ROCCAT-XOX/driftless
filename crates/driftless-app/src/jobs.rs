@@ -69,6 +69,12 @@ pub enum JobOutput {
     ProjectRead(Box<crate::ui::ProjectRead>),
     /// The disk use of the project (helper runner).
     DiskUse(Box<crate::disk::DiskUse>),
+    /// A scan pointed at another folder: the project as written, and whether it could be
+    /// checked to be the same scan (helper runner).
+    Relinked {
+        project: Box<crate::project::Project>,
+        checked: bool,
+    },
     /// Two trajectories compared (helper runner).
     Compare(Box<Comparison>),
     /// Two `map.json` side by side (helper runner).

@@ -104,6 +104,7 @@ fn three_scans() -> AppState {
                     path: PathBuf::from(format!("/daten/{id}")),
                     name: name.into(),
                     extra_runs: Vec::new(),
+                    bags: Vec::new(),
                 })
                 .collect(),
         }),

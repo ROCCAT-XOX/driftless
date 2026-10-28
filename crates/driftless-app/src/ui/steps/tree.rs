@@ -22,7 +22,7 @@ use eframe::egui::{
     self, collapsing_header::CollapsingState, Align, Color32, Id, Layout, Response, RichText,
     Sense, Ui,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Height of the line of a scan of a model (points).
 const MEMBER_ROW_HEIGHT: f32 = 18.0;
@@ -52,7 +52,26 @@ pub(super) fn run_node(ui: &mut Ui, state: &AppState, run: &RunInfo, action: &mu
             }
         })
     };
-    export_menu(&header, || ExportSource::Run(run.dir.clone()), action);
+    // a run of the project goes to the trash; one the CLI made and was added by hand is only
+    // taken out (its folder is the user's)
+    let added = |id: &str| {
+        let entry = state.project.as_ref().and_then(|p| p.scan(id));
+        entry.is_some_and(|e| e.extra_runs.contains(&run.dir))
+    };
+    let manage = match state.run(&run.dir) {
+        Some((scan, _)) if added(&scan.id) => Manage::RemoveRun {
+            scan: scan.id.clone(),
+            run: run.dir.clone(),
+        },
+        _ => Manage::Delete(run.dir.clone()),
+    };
+    entry_menu(
+        &header,
+        state,
+        || ExportSource::Run(run.dir.clone()),
+        manage,
+        action,
+    );
     if header.clicked() {
         *action = Some(Action::Select(Selection::Run(run.dir.clone())));
     }
@@ -100,7 +119,20 @@ fn map_node(ui: &mut Ui, state: &AppState, map: &MapInfo, action: &mut Option<Ac
             }
         })
     };
-    export_menu(&header, || ExportSource::Map(map.dir.clone()), action);
+    // a map the CLI wrote into the run folder is the run folder
+    let in_run = state.run(&map.dir).is_some();
+    let manage = if in_run {
+        Manage::Locked(text::MAP_IN_RUN.to_string())
+    } else {
+        Manage::Delete(map.dir.clone())
+    };
+    entry_menu(
+        &header,
+        state,
+        || ExportSource::Map(map.dir.clone()),
+        manage,
+        action,
+    );
     if header.clicked() {
         *action = Some(Action::Select(Selection::Map(map.dir.clone())));
     }
@@ -154,7 +186,14 @@ pub(super) fn model_node(
             surface_leaf(ui, state, surface, action);
         }
     });
-    export_menu(&header, || ExportSource::Model(model.dir.clone()), action);
+    let manage = Manage::Delete(model.dir.clone());
+    entry_menu(
+        &header,
+        state,
+        || ExportSource::Model(model.dir.clone()),
+        manage,
+        action,
+    );
     if header.clicked() {
         *action = Some(Action::Select(Selection::Model(model.dir.clone())));
     }
@@ -326,21 +365,65 @@ pub(super) fn surface_leaf(
             entry(ui, selected, label.clone(), &hover)
         }
     });
-    export_menu(&r, || ExportSource::Surface(surface.dir.clone()), action);
+    let manage = Manage::Delete(surface.dir.clone());
+    entry_menu(
+        &r,
+        state,
+        || ExportSource::Surface(surface.dir.clone()),
+        manage,
+        action,
+    );
     if r.clicked() {
         *action = Some(Action::Select(Selection::Surface(surface.dir.clone())));
     }
 }
 
-/// The context menu (right click) of `entry`: „Exportieren …“ opens the window for `source`.
-fn export_menu(
+/// What the context menu of an entry offers besides „Exportieren …“.
+enum Manage {
+    /// „Löschen …“ of the folder (to the trash), locked while it is shown or computed.
+    Delete(PathBuf),
+    /// „Löschen …“ locked for good, with the reason.
+    Locked(String),
+    /// „Aus Projekt entfernen“ of a run the CLI made: only the entry.
+    RemoveRun { scan: String, run: PathBuf },
+}
+
+/// The context menu (right click) of `entry`: „Exportieren …“ opens the window for `source`;
+/// then „Löschen …“ (asks first, [`Action::AskDelete`]; locked with the reason while a step
+/// works on the folder or on something depending on it) or „Aus Projekt entfernen“.
+fn entry_menu(
     entry: &Response,
+    state: &AppState,
     source: impl FnOnce() -> ExportSource,
+    manage: Manage,
     action: &mut Option<Action>,
 ) {
     entry.context_menu(|ui| {
         if ui.button(text::EXPORT).clicked() {
             *action = Some(Action::OpenExport(source()));
+        }
+        ui.separator();
+        match manage {
+            Manage::Delete(dir) => {
+                // what is only shown, the question offers to take out of the view
+                let blocked = state.delete_computing(&dir);
+                let r = ui.add_enabled(blocked.is_none(), egui::Button::new(text::DELETE));
+                if r.clicked() {
+                    *action = Some(Action::AskDelete(dir));
+                }
+                if let Some(why) = blocked {
+                    r.on_disabled_hover_text(why);
+                }
+            }
+            Manage::Locked(why) => {
+                ui.add_enabled(false, egui::Button::new(text::DELETE))
+                    .on_disabled_hover_text(why);
+            }
+            Manage::RemoveRun { scan, run } => {
+                if ui.button(text::REMOVE_RUN).clicked() {
+                    *action = Some(Action::RemoveRun { scan, run });
+                }
+            }
         }
     });
 }

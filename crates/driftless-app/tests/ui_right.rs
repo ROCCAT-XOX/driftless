@@ -54,6 +54,7 @@ fn state(run: RunInfo, selection: Selection) -> AppState {
             path: PathBuf::from("/daten/buero"),
             name: "buero".into(),
             extra_runs: Vec::new(),
+            bags: Vec::new(),
         }],
     };
     AppState {

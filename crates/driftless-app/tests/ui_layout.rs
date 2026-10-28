@@ -65,6 +65,7 @@ fn project_state() -> AppState {
                 path: PathBuf::from("/daten/buero"),
                 name: "buero".into(),
                 extra_runs: Vec::new(),
+                bags: Vec::new(),
             }],
         }),
         scans: vec![ScanNode {
