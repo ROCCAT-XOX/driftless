@@ -105,6 +105,23 @@ fn foreign_run(req: &SlamRequest, bags: &[PathBuf]) -> Option<String> {
     })
 }
 
+/// Why a full run of `req` cannot go into `req.out` because the folder holds the run of
+/// another scan, as [`run_slam`] refuses it (for a check before it).
+pub fn other_scan_refusal(req: &SlamRequest) -> Option<String> {
+    let project = discover_project(&req.scan).ok()?;
+    foreign_run(req, &project.lidar_bags)
+}
+
+/// The [`RUN_FILES`] in `dir`: a full run would replace them (the CLI asks for
+/// `--ueberschreiben` then).
+pub fn run_files_in(dir: &Path) -> Vec<&'static str> {
+    RUN_FILES
+        .iter()
+        .copied()
+        .filter(|f| dir.join(f).is_file())
+        .collect()
+}
+
 /// Settings of the odometry that a run depends on (the same for `slam` and `map`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlamSettings {

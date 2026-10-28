@@ -115,3 +115,66 @@ fn slam_refuses_the_folder_of_another_scan() {
     assert_eq!(fs::read(out.join("traj.tum")).unwrap(), traj);
     slam(&b, &b.join("driftless")).success();
 }
+
+/// A full run into a folder that holds a run is refused: its trajectory (and a map made from
+/// it) would be replaced without a word. `--ueberschreiben` replaces it, `--reuse` only
+/// recomputes it; a folder with other files only is fine, an unfinished run needs
+/// `--ueberschreiben` too.
+#[test]
+fn slam_refuses_an_existing_run() {
+    let dir = tmp("slam-vorhanden");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    slam(&dir, &out).success();
+    let traj = fs::read(out.join("traj.tum")).unwrap();
+    // A trajectory changed since (corrections, other settings): it must stay.
+    let changed = [traj.as_slice(), b"# geaendert\n"].concat();
+    fs::write(out.join("traj.tum"), &changed).unwrap();
+    slam(&dir, &out)
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "Fehler: {} enthält schon einen Lauf (submaps.bin, traj.tum, traj_odom.tum, \
+             map.las, slam.json) und wird nicht überschrieben",
+            out.display()
+        )))
+        .stderr(predicate::str::contains("--ueberschreiben"))
+        .stderr(predicate::str::contains("--reuse"));
+    assert_eq!(fs::read(out.join("traj.tum")).unwrap(), changed);
+
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .arg("slam")
+        .arg(&dir)
+        .arg("-o")
+        .arg(&out)
+        .arg("--ueberschreiben")
+        .assert()
+        .success();
+    assert_eq!(fs::read(out.join("traj.tum")).unwrap(), traj);
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .arg("slam")
+        .arg(&dir)
+        .arg("-o")
+        .arg(&out)
+        .arg("--reuse")
+        .assert()
+        .success();
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .args(["slam", "x", "-o", "y", "--reuse", "--ueberschreiben"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--ueberschreiben"));
+
+    // Unfinished (killed before `slam.json`): said so, refused as well.
+    fs::remove_file(out.join("slam.json")).unwrap();
+    slam(&dir, &out).failure().stderr(predicate::str::contains(
+        "enthält schon einen unfertigen Lauf",
+    ));
+    // Other files only (no run file): fine.
+    let fresh = dir.join("andere-dateien");
+    fs::create_dir_all(&fresh).unwrap();
+    fs::write(fresh.join("notiz.txt"), "").unwrap();
+    slam(&dir, &fresh).success();
+}
