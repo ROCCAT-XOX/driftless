@@ -5,6 +5,7 @@ pub mod bag;
 pub mod calib;
 pub mod camera;
 pub mod images;
+pub mod lock;
 pub mod msg;
 pub mod paths;
 pub mod progress;

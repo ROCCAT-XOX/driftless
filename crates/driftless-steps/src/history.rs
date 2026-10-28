@@ -182,6 +182,9 @@ pub fn restore_flags(out: &Path, nr: u32) -> Result<usize, StepError> {
     })?;
     let then = Corrections::load(&entry.dir.join(CORRECTIONS_FILE))?;
     let path = out.join(CORRECTIONS_FILE);
+    // another window or `driftless correct` may change the file at the same time
+    let _lock = driftless_io::lock::FileLock::acquire(&path)
+        .map_err(|e| StepError::Failed(e.to_string()))?;
     let mut now = Corrections::load(&path)?;
     let mut changed = 0;
     for (i, l) in now.loops.iter_mut().enumerate() {

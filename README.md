@@ -275,7 +275,14 @@ Project folder:
 <project>/modelle/modell-001/                    scans merged into one model, the same files as `driftless merge -o`
                   modell-001/oberflaeche-001/    a surface of the model (`driftless surface --model`)
 <project>/modelle/punktpaare.toml                point pairs marked by hand (only appended or switched off)
+<project>/auswahl.toml                           the precision, fineness and „ohne Fotos“ chosen last in the project
 ```
+
+Two windows, or the window and the command line, may work on one project: `project.toml`,
+`corrections.toml`, `punktpaare.toml` and `auswahl.toml` are changed under a lock file
+(`<name>.lock`, held for milliseconds, taken over after 30 s), and a change of `project.toml` is made
+on what is on disk at that moment, so neither loses the other's change; while another holds the lock
+the change is refused with a German message naming the holder.
 
 Not yet: a cache for the levels of detail (they are rebuilt on every load), more than one step at a
 time.

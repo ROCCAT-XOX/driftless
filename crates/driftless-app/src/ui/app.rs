@@ -15,7 +15,7 @@ use crate::cloud::{load_cloud, load_pair_cloud, LoadedCloud};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
 use crate::logfile::{self, Level, LogFile};
 use crate::overlay::RunOverlay;
-use crate::project::{canonical, set_point_pair_enabled, Project};
+use crate::project::{canonical, change_project, set_point_pair_enabled, Choices, Project};
 use crate::render::ShowMode;
 use crate::surface::{load_mesh, surface_glb};
 use crate::synthetic::synthetic_cloud;
@@ -284,6 +284,8 @@ enum HelperTask {
     CompareMaps(PathBuf, PathBuf),
     /// [`Action::SetPairEnabled`]: entry (from 0), on or off.
     SwitchPair(usize, bool),
+    /// Writes the choices into `auswahl.toml` of the project in the folder.
+    SaveChoices(PathBuf, Choices),
 }
 
 /// What a „compute all“ button puts into the queue.
@@ -421,6 +423,9 @@ pub struct DriftlessApp {
     /// before (`~/Driftless Projekte`; `None`: the system's choice).
     folders: LastFolders,
     projects_home: Option<PathBuf>,
+    /// The choices last written into (or read from) the project in the folder: they are
+    /// written again when they differ ([`DriftlessApp::keep_choices`]).
+    saved_choices: Option<(PathBuf, Choices)>,
 }
 
 impl DriftlessApp {
@@ -468,6 +473,7 @@ impl DriftlessApp {
             cloud_told: BTreeSet::new(),
             folders: LastFolders::default(),
             projects_home: crate::places::projects_home(),
+            saved_choices: None,
         }
     }
 
@@ -1295,6 +1301,7 @@ impl DriftlessApp {
                             project,
                             tree,
                             cloud,
+                            ..
                         } = *read;
                         self.state.project = Some(project);
                         self.state.set_tree(tree);
@@ -1330,11 +1337,51 @@ impl DriftlessApp {
             project,
             tree,
             cloud,
+            choices,
         } = read;
         let (name, dir) = (project.name.clone(), project.dir.clone());
         self.state.show_project(project, tree);
+        // what was chosen in it last, else the defaults
+        let choices = choices.unwrap_or_else(|| {
+            Choices::of(
+                &driftless_steps::map::MapSettings::default(),
+                &crate::project::SurfaceSettings::default(),
+            )
+        });
+        choices.apply(
+            &mut self.state.map_settings,
+            &mut self.state.surface_settings,
+        );
+        self.saved_choices = Some((
+            dir.clone(),
+            Choices::of(&self.state.map_settings, &self.state.surface_settings),
+        ));
         self.info(text::project_opened(&name));
         self.tell_cloud(&dir, cloud);
+    }
+
+    /// Writes the precision, fineness and „ohne Fotos“ chosen into `auswahl.toml` of the
+    /// project once they differ from what it holds (in the background, the newest only).
+    fn keep_choices(&mut self) {
+        let Some(dir) = self.state.project.as_ref().map(|p| p.dir.clone()) else {
+            return;
+        };
+        if self.state.opening.is_some() {
+            return;
+        }
+        let now = Choices::of(&self.state.map_settings, &self.state.surface_settings);
+        if self
+            .saved_choices
+            .as_ref()
+            .is_some_and(|(d, c)| *d == dir && *c == now)
+        {
+            return;
+        }
+        self.saved_choices = Some((dir.clone(), now.clone()));
+        self.helper_queue
+            .retain(|t| !matches!(t, HelperTask::SaveChoices(..)));
+        self.helper_queue
+            .push_back(HelperTask::SaveChoices(dir, now));
     }
 
     /// Warns once per session and project folder that it lies in cloud storage.
@@ -1482,6 +1529,7 @@ impl DriftlessApp {
                 (Some(HelperTask::SwitchPair(index, enabled)), result) => {
                     self.pair_switched(index, enabled, result.map(|_| ()));
                 }
+                (Some(HelperTask::SaveChoices(..)), Err(e)) => self.error(e.to_string()),
                 (Some(HelperTask::CompareMaps(a, b)), result) => {
                     let c = &mut self.state.compare;
                     if c.map_a.as_ref() == Some(&a) && c.map_b.as_ref() == Some(&b) {
@@ -1561,6 +1609,13 @@ impl DriftlessApp {
                     Ok(JobOutput::Done)
                 })
             }
+            HelperTask::SaveChoices(dir, choices) => {
+                let (dir, choices) = (dir.clone(), choices.clone());
+                self.helper.start(text::CHOICES_JOB, move |_| {
+                    choices.save(&dir)?;
+                    Ok(JobOutput::Done)
+                })
+            }
         };
         match started {
             Ok(()) => {
@@ -1582,6 +1637,8 @@ impl DriftlessApp {
                 &HelperTask::SwitchPair(index, enabled) => {
                     self.pair_switched(index, enabled, Err(StepError::Failed(e.to_string())))
                 }
+                // tried again with the next change
+                HelperTask::SaveChoices(..) => self.saved_choices = None,
                 _ => self.error(e.to_string()),
             },
         }
@@ -1617,6 +1674,7 @@ impl DriftlessApp {
         let lines = self.surface_loader.take_log();
         self.take_lines(lines);
         self.tick_tree();
+        self.keep_choices();
         // the read of a project being opened, where no cloud or surface is being loaded
         if self.state.loading.is_none() && self.state.opening.is_some() {
             self.state.loading = self.tree_loader.status();
@@ -1947,6 +2005,7 @@ impl DriftlessApp {
                         project: p,
                         tree: Tree::default(),
                         cloud: None,
+                        choices: None,
                     };
                     self.opened(read);
                     self.refresh_tree();
@@ -2182,18 +2241,23 @@ impl DriftlessApp {
         }
     }
 
-    /// Changes a copy of the project and saves it; only a saved change is shown, so the
-    /// project on screen always matches `project.toml`. The tree is read again in the
-    /// background.
+    /// Changes the project as `project.toml` is on disk now, under its lock, and saves it
+    /// ([`change_project`]): a change another window or program saved meanwhile is kept (and
+    /// said), a lock another holds refuses the change with its reason. Only a saved change is
+    /// shown, so the project on screen always matches `project.toml`. The tree is read again
+    /// in the background.
     fn change_project(
         &mut self,
         change: impl FnOnce(&mut Project) -> Result<Selection, crate::project::ProjectError>,
     ) {
-        let Some(mut project) = self.state.project.clone() else {
+        let Some(dir) = self.state.project.as_ref().map(|p| p.dir.clone()) else {
             return;
         };
-        match change(&mut project).and_then(|sel| project.save().map(|()| sel)) {
-            Ok(selection) => {
+        match change_project(&dir, self.state.project.as_ref(), change) {
+            Ok((project, changed_meanwhile, selection)) => {
+                if changed_meanwhile {
+                    self.info(text::PROJECT_CHANGED_ELSEWHERE.to_string());
+                }
                 self.state.project = Some(project);
                 self.refresh_tree();
                 self.state.selection = selection;

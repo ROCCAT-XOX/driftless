@@ -411,12 +411,14 @@ pub fn read_tree(project: &Project) -> Tree {
 }
 
 /// What reading a project folder found: the project as its `project.toml` says now, its tree,
-/// and the cloud storage it lies in (`cloud`, see [`crate::places::cloud_storage`]).
+/// the cloud storage it lies in (`cloud`, see [`crate::places::cloud_storage`]) and what was
+/// chosen in it last (`auswahl.toml`).
 #[derive(Debug, Clone)]
 pub struct ProjectRead {
     pub project: Project,
     pub tree: Tree,
     pub cloud: Option<String>,
+    pub choices: Option<crate::project::Choices>,
 }
 
 /// How the window tells whether a folder lies in cloud storage (the system's way, or a test's).
@@ -429,10 +431,12 @@ pub fn read_project(dir: &Path, cloud: CloudCheck) -> Result<ProjectRead, Projec
     let project = Project::open(dir)?;
     let tree = read_tree(&project);
     let cloud = cloud(&project.dir);
+    let choices = crate::project::Choices::read(&project.dir);
     Ok(ProjectRead {
         project,
         tree,
         cloud,
+        choices,
     })
 }
 

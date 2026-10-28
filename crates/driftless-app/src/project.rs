@@ -97,6 +97,8 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 pub const PROJECT_FILE: &str = "project.toml";
+/// The choices of the project's last session: `<projekt>/auswahl.toml` ([`Choices`]).
+pub const CHOICES_FILE: &str = "auswahl.toml";
 pub const RUN_FILE: &str = "lauf.toml";
 pub const SCANS_DIR: &str = "scans";
 /// The models of the project: `modelle/modell-NNN`.
@@ -297,6 +299,84 @@ impl SurfaceSettings {
             config,
             texture: s["texture"].as_bool()?,
         })
+    }
+}
+
+/// The lock of the file `file` while it is read, changed and written: another window of the
+/// program or the command line may change it at the same time.
+fn lock(file: &Path) -> Result<driftless_io::lock::FileLock, ProjectError> {
+    driftless_io::lock::FileLock::acquire(file).map_err(|e| ProjectError(e.to_string()))
+}
+
+/// Changes `project.toml` of the project in `dir` with `change`: under its lock, on the
+/// project as it is on disk now (so a change another window or program saved meanwhile is
+/// kept), then saved. Returns the project as written, whether the file differed from `known`
+/// (what the window showed) before the change, and what `change` returned.
+pub fn change_project<T>(
+    dir: &Path,
+    known: Option<&Project>,
+    change: impl FnOnce(&mut Project) -> Result<T, ProjectError>,
+) -> Result<(Project, bool, T), ProjectError> {
+    let _lock = lock(&dir.join(PROJECT_FILE))?;
+    let mut project = Project::open(dir)?;
+    let changed_meanwhile = known.is_some_and(|k| *k != project);
+    let out = change(&mut project)?;
+    project.save()?;
+    Ok((project, changed_meanwhile, out))
+}
+
+/// What was chosen in a project for the next map and surface, kept in its folder
+/// (`auswahl.toml`), so that the project opens with them again, also on another computer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Choices {
+    /// „Genauigkeit“: the voxel size of the next map (m).
+    pub genauigkeit: f64,
+    /// „Feinheit“: the voxel size of the next surface (m).
+    pub feinheit: f64,
+    /// „ohne Fotos (graue Fläche)“.
+    pub ohne_fotos: bool,
+}
+
+/// The comment at the top of `auswahl.toml`.
+const CHOICES_HEADER: &str =
+    "# Driftless: die zuletzt in diesem Projekt gewählte Genauigkeit und Feinheit.\n";
+
+impl Choices {
+    /// The choices in `settings` (map) and `surface`.
+    pub fn of(map: &MapSettings, surface: &SurfaceSettings) -> Choices {
+        Choices {
+            genauigkeit: map.switches.voxel,
+            feinheit: surface.config.voxel,
+            ohne_fotos: !surface.texture,
+        }
+    }
+
+    /// Sets them in `map` and `surface`; a value that is no valid size keeps the one there.
+    pub fn apply(&self, map: &mut MapSettings, surface: &mut SurfaceSettings) {
+        let valid = |v: f64| v.is_finite() && v > 0.0;
+        if valid(self.genauigkeit) {
+            map.switches.voxel = self.genauigkeit;
+        }
+        if valid(self.feinheit) {
+            surface.config.voxel = self.feinheit;
+        }
+        surface.texture = !self.ohne_fotos;
+    }
+
+    /// The choices of the project in `dir`; `None` without a readable `auswahl.toml`.
+    pub fn read(dir: &Path) -> Option<Choices> {
+        let text = fs::read_to_string(dir.join(CHOICES_FILE)).ok()?;
+        toml::from_str(&text).ok()
+    }
+
+    /// Writes them into the project in `dir`, under the lock of the file.
+    pub fn save(&self, dir: &Path) -> Result<(), ProjectError> {
+        let file = dir.join(CHOICES_FILE);
+        let _lock = lock(&file)?;
+        let body = toml::to_string(self)
+            .map_err(|e| ProjectError(text::about_path(&e.to_string(), &file)))?;
+        atomic_write(&file, format!("{CHOICES_HEADER}{body}").as_bytes())
+            .map_err(|e| ProjectError(text::io_error("auswahl.toml nicht schreibbar", &file, &e)))
     }
 }
 
@@ -1286,6 +1366,7 @@ pub fn restore_job(
     history::restore_flags(&run.dir, nr)?;
     let done = run_slam_job(project, scan_id, &SlamJob::Reuse(run.clone()), progress);
     if done.is_err() {
+        let _lock = lock(&path)?;
         let back = match &before {
             Some(bytes) => atomic_write(&path, bytes),
             None if path.exists() => fs::remove_file(&path),
@@ -1541,6 +1622,7 @@ pub fn set_point_pair_enabled(
     enabled: bool,
 ) -> Result<(), StepError> {
     let file = point_pairs_file(project);
+    let _lock = lock(&file)?;
     let mut pairs = PointPairs::load(&file)?;
     pairs.set_enabled(index, enabled)?;
     pairs.save(&file)
@@ -1585,6 +1667,9 @@ pub fn run_pairs_merge_job(
     let include_unsure = model.report.include_unsure;
     let file = point_pairs_file(project);
     let models = project.dir.join(MODELS_DIR);
+    fs::create_dir_all(&models)
+        .map_err(|e| ProjectError(text::io_error("Ordner nicht anlegbar", &models, &e)))?;
+    let lock = lock(&file)?;
     let mut pairs = PointPairs::load(&file)?;
     pairs.add(PointPairEntry {
         a: PathBuf::from(stored_text(&models, &entry.a)?),
@@ -1595,9 +1680,8 @@ pub fn run_pairs_merge_job(
     if progress.is_cancelled() {
         return Err(StepError::Cancelled);
     }
-    fs::create_dir_all(&models)
-        .map_err(|e| ProjectError(text::io_error("Ordner nicht anlegbar", &models, &e)))?;
     pairs.save(&file)?;
+    drop(lock);
     progress.info(text::PAIRS_SAVED.to_string());
     run_merge_job(project, &picks, include_unsure, progress)
 }

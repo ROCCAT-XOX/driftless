@@ -25,6 +25,17 @@ pub fn load(run: &Path) -> Result<Corrections, StepError> {
     Ok(Corrections::load(&run.join(CORRECTIONS_FILE))?)
 }
 
+/// The lock of `corrections.toml` of `run` while it is read, changed and written: another
+/// window or `driftless correct` may change it at the same time
+/// ([`driftless_io::lock::FileLock`]). A missing run folder gives the message of [`load`].
+fn lock(run: &Path) -> Result<driftless_io::lock::FileLock, StepError> {
+    if !run.is_dir() {
+        load(run)?;
+    }
+    driftless_io::lock::FileLock::acquire(&run.join(CORRECTIONS_FILE))
+        .map_err(|e| StepError::Failed(e.to_string()))
+}
+
 /// Checks a new loop together with the active ones against the submaps of `submaps.bin`
 /// (times inside the scan, two different submaps, no second loop between the same pair).
 /// Without a cache only the times themselves and exact repeats are checked.
@@ -72,6 +83,7 @@ pub fn add_loop_at(
     note: &str,
     added: &str,
 ) -> Result<usize, StepError> {
+    let _lock = lock(run)?;
     let mut c = load(run)?;
     check_new_loop(run, &c, a, b)?;
     let nr = c.add_loop(a, b, note, added);
@@ -82,6 +94,7 @@ pub fn add_loop_at(
 /// Switches entry `nr` (from 1) on or off and saves the file; returns whether it changed.
 /// Switching an entry back on is checked like a new loop against the active ones.
 pub fn set_enabled(run: &Path, nr: usize, enabled: bool) -> Result<bool, StepError> {
+    let _lock = lock(run)?;
     let mut c = load(run)?;
     if let Some(l) = c
         .loops
@@ -133,6 +146,7 @@ pub fn set_loop_used_at(
     used: bool,
     added: &str,
 ) -> Result<bool, StepError> {
+    let _lock = lock(run)?;
     let mut c = load(run)?;
     let submaps = cached_submaps(run)?;
     let changed = match &submaps {

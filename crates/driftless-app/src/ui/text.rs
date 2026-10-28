@@ -750,6 +750,13 @@ pub fn project_opened(name: &str) -> String {
     format!("Projekt „{name}“ geöffnet")
 }
 
+/// After a change of the project when `project.toml` had been changed by another window or
+/// program since it was read: the change was made on what that wrote.
+pub const PROJECT_CHANGED_ELSEWHERE: &str = "project.toml war inzwischen von einem anderen \
+     Fenster oder Programm geändert; die Änderung ist auf dessen Stand gemacht, beides bleibt";
+/// Label of the background job that writes `auswahl.toml`.
+pub const CHOICES_JOB: &str = "Auswahl speichern";
+
 /// The label of the read of a project folder (status bar while a project is opened).
 pub const READ_PROJECT_JOB: &str = "Projekt lesen";
 /// In the field while a project is being opened.
