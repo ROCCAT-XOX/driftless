@@ -4,6 +4,8 @@
 #   packaging/macos/build-dmg.sh [--ohne-bauen]
 #
 # --ohne-bauen: take the release programs already in target/release (no cargo build).
+# The programs are built for the oldest macOS that Info.plist names (LSMinimumSystemVersion, as
+# MACOSX_DEPLOYMENT_TARGET); check-dmg.sh checks both, also for programs taken with --ohne-bauen.
 # The bundle gets an ad-hoc signature only (no Apple account): Gatekeeper blocks the first start;
 # then System Settings → „Datenschutz & Sicherheit“ → „Dennoch öffnen“, or
 # `xattr -dr com.apple.quarantine /Applications/Driftless.app`. Check the result with
@@ -33,6 +35,15 @@ version="$(awk '
 ' Cargo.toml)"
 if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
     echo "Keine Version in [workspace.package] von Cargo.toml gefunden." >&2
+    exit 1
+fi
+
+# The oldest macOS: LSMinimumSystemVersion of Info.plist, so that macOS opens the app on every
+# system the programs are built for.
+floor="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' packaging/macos/Info.plist.in)"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$floor}"
+if [ "$MACOSX_DEPLOYMENT_TARGET" != "$floor" ]; then
+    echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET passt nicht zu LSMinimumSystemVersion $floor in packaging/macos/Info.plist.in." >&2
     exit 1
 fi
 

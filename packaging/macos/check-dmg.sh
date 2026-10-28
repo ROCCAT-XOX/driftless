@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Checks a disk image of build-dmg.sh: mounts it read-only, then the files of the bundle,
-# Info.plist, the signature, `--version` of both programs and the size. Exit ≠ 0 on any fault.
+# Info.plist, the oldest macOS of both programs, the signature, `--version` of both programs and
+# the size. Exit ≠ 0 on any fault.
 #
 #   packaging/macos/check-dmg.sh target/package/Driftless-<version>-macos-arm64.dmg
 set -euo pipefail
@@ -11,6 +12,8 @@ if [ $# -ne 1 ] || [ ! -f "$1" ]; then
 fi
 dmg="$1"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+# The oldest macOS: LSMinimumSystemVersion, and what the programs are built for.
+floor="14.0"
 
 fail() {
     echo "FEHLER: $*" >&2
@@ -62,9 +65,21 @@ plist() { /usr/libexec/PlistBuddy -c "Print :$1" "$app/Contents/Info.plist"; }
 [ "$(plist CFBundleIdentifier)" = "io.github.roccat-xox.driftless" ] || fail "CFBundleIdentifier"
 [ "$(plist CFBundleIconFile)" = "driftless" ] || fail "CFBundleIconFile"
 [ "$(plist CFBundleShortVersionString)" = "$version" ] || fail "Version in Info.plist ≠ $version"
-[ "$(plist LSMinimumSystemVersion)" = "15.0" ] || fail "LSMinimumSystemVersion"
+[ "$(plist LSMinimumSystemVersion)" = "$floor" ] || fail "LSMinimumSystemVersion ≠ $floor"
 [ "$(plist NSHighResolutionCapable)" = "true" ] || fail "NSHighResolutionCapable"
-ok "Info.plist (Version $version)"
+ok "Info.plist (Version $version, ab macOS $floor)"
+
+# Built for the same oldest macOS (MACOSX_DEPLOYMENT_TARGET of build-dmg.sh): `minos` of
+# LC_BUILD_VERSION.
+for bin in driftless driftless-app; do
+    # awk reads to the end: an early exit could stop otool with SIGPIPE (pipefail).
+    minos="$(otool -l "$app/Contents/MacOS/$bin" \
+        | awk '$1 == "cmd" { build = ($2 == "LC_BUILD_VERSION") }
+               build && $1 == "minos" && minos == "" { minos = $2 }
+               END { print minos }')"
+    [ "$minos" = "$floor" ] || fail "$bin ist für macOS ${minos:-?} gebaut, nicht für $floor (MACOSX_DEPLOYMENT_TARGET)"
+done
+ok "beide Programme für macOS $floor gebaut (minos)"
 
 codesign --verify --deep --strict "$app" || fail "Signatur ungültig"
 ok "Signatur (ad-hoc) gültig"

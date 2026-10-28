@@ -18,7 +18,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: version
         run: |
           # The version of [workspace.package] in Cargo.toml.
@@ -43,7 +43,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Checked again here: the draft never goes out under a tag that does not match.
       - name: Tag = Version
         env:
@@ -53,11 +53,11 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME passt nicht zur Version \"$VERSION\"."
             exit 1
           fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: driftless-macos
           path: dist
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: driftless-windows
           path: dist
