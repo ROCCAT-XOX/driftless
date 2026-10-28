@@ -8,9 +8,11 @@
 //! new files beside the old ones first (`<name>.tmp`) and puts them in place together only
 //! once all are written: the old ones aside (`<name>.alt.tmp`), the new ones in, `slam.json`
 //! last. A failure on the way – a full disk, a file in the way, the history state that cannot
-//! be recorded – puts every file back as it was, so the run keeps its result. A reuse killed
-//! while it put them in place (a crash, a power cut) leaves the run without `slam.json`, its
-//! old files aside: the next run puts them back first ([`reuse_cut_off`]).
+//! be recorded – puts every file back as it was, so the run keeps its result; a file that
+//! cannot go back stops that, and the next run finishes it as after a kill. A reuse killed
+//! while it put them in place (a crash, a power cut) leaves the run without `slam.json` or
+//! `traj.vorher.tum`, its old files aside: the next run puts them back first
+//! ([`reuse_cut_off`]).
 //!
 //! A full run into a folder that holds the run of another scan is refused: its frames (from
 //! `slam.json`) lie outside the times of this scan's LiDAR bags ([`run_fits_scan`]). Its
@@ -41,7 +43,6 @@ use driftless_traj::write_tum;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -288,7 +289,7 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
             history::record_with(out, HistoryKind::Imported, 0.0, Some(then))
                 .map_err(|e| unchanged(&e))?;
         }
-        let swap = staged.put_in_place()?;
+        let mut swap = staged.put_in_place()?;
         let seconds = start.elapsed().as_secs_f64();
         // the corrections read at the start: a change written meanwhile was not applied; if
         // the state cannot be recorded, `swap` puts every file back (and `staged` removes the
@@ -296,7 +297,7 @@ pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, S
         let history = if req.history {
             Some(
                 history::record_with(out, HistoryKind::Reuse, seconds, Some(&corrections))
-                    .map_err(|e| unchanged(&e))?,
+                    .map_err(|e| swap.undone(&e))?,
             )
         } else {
             None
@@ -479,6 +480,7 @@ impl<'a> Staged<'a> {
     /// error what was renamed goes back.
     fn put_in_place(&self) -> Result<Swap, StepError> {
         let mut swap = Swap {
+            out: self.out.to_path_buf(),
             done: Vec::new(),
             kept: false,
         };
@@ -516,8 +518,10 @@ impl Drop for Staged<'_> {
 }
 
 /// The renames that put the new files of a reuse in place ([`Staged::put_in_place`]). Dropped
-/// without [`Swap::keep`] they are undone, newest first: every file is back as it was.
+/// without [`Swap::keep`] they are undone ([`Swap::undo`]): every file is back as it was.
 struct Swap {
+    /// The run folder.
+    out: PathBuf,
     /// (from, to) of every rename done.
     done: Vec<(PathBuf, PathBuf)>,
     kept: bool,
@@ -525,15 +529,42 @@ struct Swap {
 
 impl Swap {
     fn rename(&mut self, from: PathBuf, to: PathBuf) -> Result<(), StepError> {
-        fs::rename(&from, &to).map_err(|e: io::Error| {
-            unchanged(&StepError::Failed(format!(
+        if let Err(e) = fs::rename(&from, &to) {
+            return Err(self.undone(&StepError::Failed(format!(
                 "{} nicht in {} umbenennbar: {e}",
                 from.display(),
                 to.display()
-            )))
-        })?;
+            ))));
+        }
         self.done.push((from, to));
         Ok(())
+    }
+
+    /// Undoes the renames done, newest first. It stops at the first that fails, so that what
+    /// is left is a reuse cut off after its first renames, which [`put_back`] finishes at the
+    /// next start; going on would put files back over others that are not yet back (the old
+    /// trajectory in [`PREVIOUS_TRAJ`]). Whether every rename was undone.
+    fn undo(&mut self) -> bool {
+        while let Some((from, to)) = self.done.pop() {
+            if fs::rename(&to, &from).is_err() {
+                self.done.clear();
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `e` after undoing the renames ([`Swap::undo`]), saying where the old run is.
+    fn undone(&mut self, e: &StepError) -> StepError {
+        if self.undo() {
+            unchanged(e)
+        } else {
+            StepError::Failed(format!(
+                "{e}; der Lauf davor liegt noch zum Teil als *.alt.tmp in {}: der nächste Start \
+                 holt ihn zurück",
+                self.out.display()
+            ))
+        }
     }
 
     /// Keeps the new files; the old ones put aside go.
@@ -554,9 +585,7 @@ impl Swap {
 impl Drop for Swap {
     fn drop(&mut self) {
         if !self.kept {
-            for (from, to) in self.done.iter().rev() {
-                let _ = fs::rename(to, from);
-            }
+            self.undo();
         }
     }
 }
@@ -780,6 +809,49 @@ mod tests {
         );
         assert!(reuse_cut_off(&dir));
         fs::remove_dir_all(dir.join("map.las")).unwrap();
+        let p = Progress::new();
+        put_back(&dir, &p).unwrap();
+        remove_stale_tmp(&dir, owns_tmp, &p);
+        assert_eq!(files(&dir), old);
+    }
+
+    /// A rename that fails while the new files go in, and then one that fails while they go
+    /// back (a folder in the way of both): the undo stops there, so the files are those of a
+    /// reuse cut off after its first renames, and the error says that the next start puts the
+    /// run back. Going on would put the trajectory before the last reuse back over the old
+    /// trajectory. With the folder gone, the next start puts back the old run.
+    #[test]
+    fn an_undo_that_fails_leaves_what_the_next_start_puts_back() {
+        let root = TestDir::new(format!("driftless-slam-undo-{}", std::process::id()));
+        let dir = root.join("lauf");
+        let old = run_with_staged(&dir, true);
+        let mut swap = Swap {
+            out: dir.clone(),
+            done: Vec::new(),
+            kept: false,
+        };
+        let mut err = None;
+        for (from, to) in swap_plan(&dir) {
+            let old_traj = from == dir.join("traj.tum");
+            if let Err(e) = swap.rename(from, to) {
+                err = Some(e.to_string());
+                break;
+            }
+            if old_traj {
+                // the new trajectory cannot go in, and the old one cannot come back
+                fs::create_dir_all(dir.join("traj.tum").join("x")).unwrap();
+            }
+        }
+        drop(swap);
+        let err = err.expect("the new trajectory cannot go in");
+        assert!(err.contains("der nächste Start holt ihn zurück"), "{err}");
+        assert!(!err.contains("nichts geändert"), "{err}");
+        assert!(reuse_cut_off(&dir));
+        assert_eq!(
+            fs::read_to_string(dir.join(PREVIOUS_TRAJ)).unwrap(),
+            "alte Laufbahn"
+        );
+        fs::remove_dir_all(dir.join("traj.tum")).unwrap();
         let p = Progress::new();
         put_back(&dir, &p).unwrap();
         remove_stale_tmp(&dir, owns_tmp, &p);

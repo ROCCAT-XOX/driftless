@@ -121,8 +121,8 @@ the step, which also removes those of a crash or power loss. Each step writes it
 `map.json`, `oberflaeche.json`, `modell.json`) last and removes an old one before its first write, so
 nothing half-written ever counts as done. A reuse (`slam --reuse`) replaces a finished run, so it writes
 its new files beside the old ones and puts them in place only once all are written: stopped or failed,
-the run stays as it was. Cut off while it puts them in place (a power loss), the run has no `slam.json`
-until the next run of the step puts the old files back first.
+the run stays as it was. Cut off while it puts them in place (a power loss), the run lacks `slam.json` or
+`traj.vorher.tum` until the next run of the step puts the old files back first.
 
 One folder per scan for its run, map and surface: `<scan>/driftless`, the default of `driftless merge`.
 Typical correction loop:
