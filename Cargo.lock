@@ -1652,6 +1652,8 @@ dependencies = [
  "log",
  "mimalloc",
  "nalgebra",
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
  "png",
  "pollster 0.4.0",
  "rayon",

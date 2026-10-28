@@ -7,9 +7,9 @@ use super::export::{self, ExportDialog};
 use super::tools::{self, PairSession, ScreenLayout, Tool};
 use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
-    actions, rail, settings, status, steps, text, theme, Action, AppState, CloudSummary,
-    InspectResult, LogEntry, LogKind, Queued, Selection, Step, SurfaceSummary, UiMessage,
-    ViewSettings, ViewStats,
+    actions, rail, read_project, settings, status, steps, text, theme, Action, AppState,
+    CloudCheck, CloudSummary, InspectResult, LogEntry, LogKind, ProjectRead, Queued, Selection,
+    Step, SurfaceSummary, Tree, UiMessage, ViewSettings, ViewStats,
 };
 use crate::cloud::{load_cloud, load_pair_cloud, LoadedCloud};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
@@ -25,7 +25,7 @@ use driftless_steps::export::{file_kind, ExportKind, MESH_EXTENSIONS, POINT_EXTE
 use driftless_steps::merge::MODEL_LAS;
 use driftless_steps::{correct, StepError};
 use eframe::egui;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,6 +120,50 @@ struct StoredUi {
     point_m: Option<f32>,
     /// „Grafikkarte nutzen“ as its CLI word (`auto`, `an`, `aus`).
     gpu: String,
+    /// The folders the dialogs were last used in ([`LastFolders`]).
+    folders: LastFolders,
+}
+
+/// Which dialogs share their start folder ([`DriftlessApp::dialog_folder`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogFolder {
+    /// „Neues Projekt …“, „Projekt öffnen …“.
+    Projects,
+    /// „Scan hinzufügen …“, „Lauf hinzufügen …“.
+    Scans,
+    /// „Datei öffnen …“, the target of „Exportieren …“.
+    Files,
+}
+
+/// The folders the dialogs were last used in (the parent of a picked project or scan, the
+/// folder of a picked file), kept between starts.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LastFolders {
+    pub projects: Option<PathBuf>,
+    pub scans: Option<PathBuf>,
+    pub files: Option<PathBuf>,
+}
+
+impl LastFolders {
+    fn get(&self, kind: DialogFolder) -> Option<&Path> {
+        match kind {
+            DialogFolder::Projects => self.projects.as_deref(),
+            DialogFolder::Scans => self.scans.as_deref(),
+            DialogFolder::Files => self.files.as_deref(),
+        }
+    }
+
+    fn set(&mut self, kind: DialogFolder, dir: Option<&Path>) {
+        let slot = match kind {
+            DialogFolder::Projects => &mut self.projects,
+            DialogFolder::Scans => &mut self.scans,
+            DialogFolder::Files => &mut self.files,
+        };
+        if let Some(dir) = dir.filter(|d| !d.as_os_str().is_empty()) {
+            *slot = Some(dir.to_path_buf());
+        }
+    }
 }
 
 impl Default for StoredUi {
@@ -128,13 +172,15 @@ impl Default for StoredUi {
             Step::default(),
             &ViewSettings::default(),
             GpuPref::default(),
+            &LastFolders::default(),
         )
     }
 }
 
 impl StoredUi {
-    fn of(step: Step, v: &ViewSettings, gpu: GpuPref) -> Self {
+    fn of(step: Step, v: &ViewSettings, gpu: GpuPref, folders: &LastFolders) -> Self {
         StoredUi {
+            folders: folders.clone(),
             step,
             color_mode: v.color_mode,
             point_px: v.point_px,
@@ -259,6 +305,35 @@ struct QueueSettings {
     hand_loads: u64,
 }
 
+/// What a read of a project folder is for ([`DriftlessApp::read_folder`]).
+#[derive(Debug, Clone, PartialEq)]
+enum TreeTask {
+    /// Opening the project in this folder; `restore`: the project opened last (forgotten if
+    /// it cannot be read).
+    Open { dir: PathBuf, restore: bool },
+    /// Reading the open project again (its folder).
+    Refresh(PathBuf),
+}
+
+impl TreeTask {
+    fn dir(&self) -> &Path {
+        match self {
+            TreeTask::Open { dir, .. } | TreeTask::Refresh(dir) => dir,
+        }
+    }
+}
+
+/// The end of a step, kept until the tree read after it has arrived: then the result is
+/// selected and shown and the queue goes on ([`DriftlessApp::finish_step`]).
+#[derive(Debug)]
+struct StepEnd {
+    step: Option<Action>,
+    output: Option<JobOutput>,
+    /// It computed the head of the queue.
+    queued: bool,
+    seconds: f64,
+}
+
 pub struct DriftlessApp {
     state: AppState,
     /// The processing steps, one at a time. Dropping it (closing the window) cancels the
@@ -328,6 +403,24 @@ pub struct DriftlessApp {
     /// The log file of this start: every message of the status bar and every line of the
     /// Protokoll goes into it as it comes ([`DriftlessApp::say`], [`DriftlessApp::protocol`]).
     log_file: Option<Arc<LogFile>>,
+    /// Reads project folders (`project.toml` and the tree) off the UI thread.
+    tree_loader: JobRunner,
+    /// What the read that runs is for, and the read to start once it has ended (the newest
+    /// asked for; an open goes before a refresh).
+    tree_task: Option<TreeTask>,
+    tree_next: Option<TreeTask>,
+    /// The result of the read that runs is not wanted any more (an open cancelled).
+    tree_discard: bool,
+    /// A finished step waiting for the tree read after it.
+    step_end: Option<StepEnd>,
+    /// How a folder is told to be in cloud storage ([`crate::places::cloud_storage`]).
+    cloud_check: CloudCheck,
+    /// The project folders whose cloud storage was told in this session (once each).
+    cloud_told: BTreeSet<PathBuf>,
+    /// The folders the dialogs were last used in, and the projects folder they start in
+    /// before (`~/Driftless Projekte`; `None`: the system's choice).
+    folders: LastFolders,
+    projects_home: Option<PathBuf>,
 }
 
 impl DriftlessApp {
@@ -340,7 +433,7 @@ impl DriftlessApp {
             helper_queue: VecDeque::new(),
             helper_running: None,
             loader: JobRunner::new(repaint.clone()),
-            surface_loader: JobRunner::new(repaint),
+            surface_loader: JobRunner::new(repaint.clone()),
             surface_loading: None,
             next_surface: None,
             surface_stamp: None,
@@ -366,7 +459,48 @@ impl DriftlessApp {
             themed: false,
             layout: ScreenLayout::default(),
             log_file: None,
+            tree_loader: JobRunner::new(repaint),
+            tree_task: None,
+            tree_next: None,
+            tree_discard: false,
+            step_end: None,
+            cloud_check: crate::places::cloud_storage,
+            cloud_told: BTreeSet::new(),
+            folders: LastFolders::default(),
+            projects_home: crate::places::projects_home(),
         }
+    }
+
+    /// With another projects folder for the dialogs to start in (tests: not the home folder).
+    pub fn with_projects_home(mut self, dir: Option<PathBuf>) -> Self {
+        self.projects_home = dir;
+        self
+    }
+
+    /// The folder the dialogs of `kind` open in: the one they were last used in if it is still
+    /// there, else the projects folder (`~/Driftless Projekte`, made now if missing).
+    pub fn dialog_folder(&self, kind: DialogFolder) -> Option<PathBuf> {
+        crate::places::start_folder(self.folders.get(kind), self.projects_home.clone())
+    }
+
+    /// Remembers where a dialog of `kind` was used: the folder `dir`.
+    pub fn remember_folder(&mut self, kind: DialogFolder, dir: Option<&Path>) {
+        self.folders.set(kind, dir);
+    }
+
+    /// A folder dialog of `kind` with its title, opening in [`DriftlessApp::dialog_folder`].
+    fn dialog(&self, kind: DialogFolder, title: &str) -> rfd::FileDialog {
+        let dialog = rfd::FileDialog::new().set_title(title);
+        match self.dialog_folder(kind) {
+            Some(dir) => dialog.set_directory(dir),
+            None => dialog,
+        }
+    }
+
+    /// With another way to tell cloud storage (tests).
+    pub fn with_cloud_check(mut self, check: CloudCheck) -> Self {
+        self.cloud_check = check;
+        self
     }
 
     /// With the log file of this start: what the window says goes into it as well.
@@ -1068,17 +1202,146 @@ impl DriftlessApp {
         }
     }
 
-    /// Opens the stored last project (an empty value is none). If it cannot be opened, the
-    /// message is shown once and the value is forgotten ([`DriftlessApp::last_to_store`]).
+    /// Opens the stored last project (an empty value is none), in the background. If it cannot
+    /// be opened, the message is shown once and the value is forgotten
+    /// ([`DriftlessApp::last_to_store`]).
     pub fn restore_last(&mut self, stored: Option<&str>) {
         let Some(last) = stored.filter(|s| !s.is_empty()) else {
             return;
         };
-        match Project::open(Path::new(last)) {
-            Ok(p) => self.set_project(p),
-            Err(e) => {
-                self.error(text::last_project_gone(&e.to_string()));
-                self.forget_last = true;
+        self.read_folder(TreeTask::Open {
+            dir: PathBuf::from(last),
+            restore: true,
+        });
+    }
+
+    /// Reads a project folder in the background for `task`; while a read runs, it is read once
+    /// that has ended (the newest task wins, an open goes before a refresh).
+    fn read_folder(&mut self, task: TreeTask) {
+        if self.tree_loader.is_busy() {
+            let open_waits = matches!(self.tree_next, Some(TreeTask::Open { .. }));
+            if !(open_waits && matches!(task, TreeTask::Refresh(_))) {
+                self.tree_next = Some(task);
+            }
+            // a read of another folder for an open is not wanted any more
+            self.tree_discard = matches!(self.tree_next, Some(TreeTask::Open { .. }));
+            self.sync_tree_state();
+            return;
+        }
+        let dir = task.dir().to_path_buf();
+        let cloud = self.cloud_check;
+        let started = self.tree_loader.start(text::READ_PROJECT_JOB, move |_| {
+            Ok(JobOutput::ProjectRead(Box::new(read_project(&dir, cloud)?)))
+        });
+        match started {
+            Ok(()) => {
+                self.tree_task = Some(task);
+                self.tree_discard = false;
+            }
+            Err(e) => self.error(e.to_string()),
+        }
+        self.sync_tree_state();
+    }
+
+    /// Reads the open project again in the background (after a change, a step, the window
+    /// coming to the front); its tree stays shown until the new one is there.
+    fn refresh_tree(&mut self) {
+        if let Some(dir) = self.state.project.as_ref().map(|p| p.dir.clone()) {
+            self.read_folder(TreeTask::Refresh(dir));
+        }
+    }
+
+    /// Whether a read of a project folder runs or waits.
+    fn tree_pending(&self) -> bool {
+        self.tree_loader.is_busy() || self.tree_next.is_some()
+    }
+
+    /// [`AppState::opening`] and [`AppState::tree_pending`] as the reads stand.
+    fn sync_tree_state(&mut self) {
+        let open = |t: &Option<TreeTask>| match t {
+            Some(TreeTask::Open { dir, .. }) => Some(dir.clone()),
+            _ => None,
+        };
+        let running = open(&self.tree_task).filter(|_| !self.tree_discard);
+        self.state.opening = open(&self.tree_next).or(running);
+        self.state.tree_pending = self.tree_pending();
+    }
+
+    /// Takes a project folder that has been read: an opened project is shown, a read of the
+    /// open one replaces its tree; then a waiting read starts, and once none is left the end
+    /// of a step that waited for it is carried out and the queue goes on.
+    fn tick_tree(&mut self) {
+        if let Some(f) = self.tree_loader.poll() {
+            let task = self.tree_task.take();
+            let discard = std::mem::take(&mut self.tree_discard);
+            match (task, f.result) {
+                (_, _) if discard => {}
+                (Some(TreeTask::Open { .. }), Ok(JobOutput::ProjectRead(read))) => {
+                    self.opened(*read)
+                }
+                (Some(TreeTask::Open { restore, .. }), Err(e)) => {
+                    let e = text::step_error(&e);
+                    if restore {
+                        self.error(text::last_project_gone(&e));
+                        self.forget_last = true;
+                    } else {
+                        self.error(e);
+                    }
+                }
+                // a read of the project shown (another one may have been opened since)
+                (Some(TreeTask::Refresh(dir)), result) if self.is_shown(&dir) => match result {
+                    Ok(JobOutput::ProjectRead(read)) => {
+                        let ProjectRead {
+                            project,
+                            tree,
+                            cloud,
+                        } = *read;
+                        self.state.project = Some(project);
+                        self.state.set_tree(tree);
+                        self.tell_cloud(&dir, cloud);
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.error(text::step_error(&e)),
+                },
+                _ => {}
+            }
+            if let Some(next) = self.tree_next.take() {
+                self.read_folder(next);
+            }
+        }
+        self.sync_tree_state();
+        if !self.tree_pending() {
+            if let Some(end) = self.step_end.take() {
+                self.finish_step(end);
+            }
+            self.advance_queue();
+        }
+    }
+
+    /// An opened project: shown from now on, nothing selected; a queue of the project before
+    /// stops, its measurements and surface go.
+    fn opened(&mut self, read: ProjectRead) {
+        self.stop_queue();
+        // the measurements belong to the project shown (they are not saved yet)
+        self.state.measurements.clear();
+        self.state.measure_a = None;
+        self.drop_surface();
+        let ProjectRead {
+            project,
+            tree,
+            cloud,
+        } = read;
+        let (name, dir) = (project.name.clone(), project.dir.clone());
+        self.state.show_project(project, tree);
+        self.info(text::project_opened(&name));
+        self.tell_cloud(&dir, cloud);
+    }
+
+    /// Warns once per session and project folder that it lies in cloud storage.
+    fn tell_cloud(&mut self, dir: &Path, cloud: Option<String>) {
+        if let Some(cloud) = cloud {
+            if self.cloud_told.insert(dir.to_path_buf()) {
+                self.warn(text::project_in_cloud(&cloud, dir));
             }
         }
     }
@@ -1096,6 +1359,7 @@ impl DriftlessApp {
                 self.state.step = ui.step;
                 ui.apply_to(&mut self.state.view);
                 self.state.gpu = ui.gpu();
+                self.folders = ui.folders;
             }
             None => ctx.memory_mut(|m| {
                 m.data.clear();
@@ -1106,7 +1370,12 @@ impl DriftlessApp {
 
     /// The layout to store under [`UI_KEY`].
     pub fn ui_to_store(&self) -> String {
-        let ui = StoredUi::of(self.state.step, &self.state.view, self.state.gpu);
+        let ui = StoredUi::of(
+            self.state.step,
+            &self.state.view,
+            self.state.gpu,
+            &self.folders,
+        );
         serde_json::to_string(&ui).unwrap_or_default()
     }
 
@@ -1174,6 +1443,8 @@ impl DriftlessApp {
             || !self.helper_queue.is_empty()
             || self.is_loading()
             || self.surface_loader.is_busy()
+            || self.tree_pending()
+            || self.step_end.is_some()
             || self.status_asked != self.state.tree_version
             || self.gaps_asked != self.state.tree_version
     }
@@ -1345,6 +1616,11 @@ impl DriftlessApp {
         self.take_lines(lines);
         let lines = self.surface_loader.take_log();
         self.take_lines(lines);
+        self.tick_tree();
+        // the read of a project being opened, where no cloud or surface is being loaded
+        if self.state.loading.is_none() && self.state.opening.is_some() {
+            self.state.loading = self.tree_loader.status();
+        }
         self.sync_run();
         self.sync_compare();
         self.tick_helper();
@@ -1383,8 +1659,28 @@ impl DriftlessApp {
                 None
             }
         };
-        // the step may have added runs or maps
-        self.reload_project();
+        let end = StepEnd {
+            step,
+            output,
+            queued,
+            seconds: f.seconds,
+        };
+        // the step may have added runs or maps: its result is shown once the tree is read
+        // again (also after a check or an export: whatever changed on disk meanwhile shows)
+        self.step_end = Some(end);
+        self.refresh_tree();
+    }
+
+    /// The end of a step, once the tree after it is read: the queue counts it, its result is
+    /// selected and shown (a step of a queue only as its last), and a waiting switch of the
+    /// project follows.
+    fn finish_step(&mut self, end: StepEnd) {
+        let StepEnd {
+            step,
+            output,
+            queued,
+            seconds,
+        } = end;
         let hand_loads = self.queue_settings.as_ref().map(|q| q.hand_loads);
         if queued {
             self.queue_step_done(step.as_ref(), output.is_some());
@@ -1455,7 +1751,7 @@ impl DriftlessApp {
                 self.state.inspect = Some(InspectResult {
                     scan,
                     report: *report,
-                    seconds: f.seconds,
+                    seconds,
                 });
             }
             _ => {}
@@ -1492,10 +1788,13 @@ impl DriftlessApp {
         self.compute_all_waiting = None;
     }
 
-    /// Whether the map statuses of the current tree are still being checked.
+    /// Whether the map statuses of the current tree are still being checked (or the tree is
+    /// still being read).
     fn map_status_pending(&self) -> bool {
         self.status_asked != self.state.tree_version
             || matches!(self.helper_running, Some(HelperTask::MapStatus(_)))
+            || self.tree_pending()
+            || self.step_end.is_some()
     }
 
     /// [`Action::ComputeAllMaps`] (the new and stale scans) or [`Action::ComputeAllSurfaces`]
@@ -1555,7 +1854,12 @@ impl DriftlessApp {
     /// Starts the next step of the queue unless a step runs, with the settings the queue
     /// started with. A step that cannot start stops the queue with its reason.
     fn advance_queue(&mut self) {
-        if self.jobs.is_busy() || self.state.queue.is_empty() {
+        // the next step is told from the tree: wait for the read after a step or a change
+        if self.jobs.is_busy()
+            || self.state.queue.is_empty()
+            || self.tree_pending()
+            || self.step_end.is_some()
+        {
             return;
         }
         let started = match self.state.next_queued_step() {
@@ -1589,10 +1893,11 @@ impl DriftlessApp {
     pub fn apply(&mut self, action: Action) {
         match action {
             Action::PickNewProject => {
-                if let Some(dir) = rfd::FileDialog::new()
-                    .set_title(text::DIALOG_NEW_PROJECT)
+                if let Some(dir) = self
+                    .dialog(DialogFolder::Projects, text::DIALOG_NEW_PROJECT)
                     .pick_folder()
                 {
+                    self.remember_folder(DialogFolder::Projects, dir.parent());
                     let name = dir.file_name().map_or_else(
                         || text::DEFAULT_PROJECT_NAME.into(),
                         |n| n.to_string_lossy().into_owned(),
@@ -1601,18 +1906,19 @@ impl DriftlessApp {
                 }
             }
             Action::PickOpenProject => {
-                if let Some(dir) = rfd::FileDialog::new()
-                    .set_title(text::DIALOG_OPEN_PROJECT)
+                if let Some(dir) = self
+                    .dialog(DialogFolder::Projects, text::DIALOG_OPEN_PROJECT)
                     .pick_folder()
                 {
+                    self.remember_folder(DialogFolder::Projects, dir.parent());
                     self.apply(Action::OpenProject(dir));
                 }
             }
             Action::OpenProject(dir) if self.is_open(&dir) => {
                 // already shown: nothing to switch, nothing to cancel (a pending switch to
-                // another project is dropped, the user chose this one)
+                // another project is dropped, the user chose this one); read it again
                 self.pending = None;
-                self.state.refresh();
+                self.refresh_tree();
             }
             switch @ (Action::OpenProject(_) | Action::NewProject { .. })
                 if self.jobs.is_busy() =>
@@ -1623,20 +1929,37 @@ impl DriftlessApp {
                 self.pending = Some(switch);
                 self.info(text::SWITCH_AFTER_CANCEL.to_string());
             }
-            Action::OpenProject(dir) => match Project::open(&dir) {
-                Ok(p) => self.set_project(p),
-                Err(e) => self.error(e.to_string()),
-            },
+            // the end of a step of the old project is still to show: switch after it
+            switch @ (Action::OpenProject(_) | Action::NewProject { .. })
+                if self.step_end.is_some() =>
+            {
+                self.pending = Some(switch);
+            }
+            Action::OpenProject(dir) => self.read_folder(TreeTask::Open {
+                dir,
+                restore: false,
+            }),
             Action::NewProject { dir, name } => match Project::create(&dir, &name) {
-                Ok(p) => self.set_project(p),
+                Ok(p) => {
+                    // a new project has no tree yet; its folder is read once for the check of
+                    // cloud storage
+                    let read = ProjectRead {
+                        project: p,
+                        tree: Tree::default(),
+                        cloud: None,
+                    };
+                    self.opened(read);
+                    self.refresh_tree();
+                }
                 Err(e) => self.error(e.to_string()),
             },
             Action::PickAddScan => {
                 if self.state.project.is_some() {
-                    if let Some(dir) = rfd::FileDialog::new()
-                        .set_title(text::DIALOG_ADD_SCAN)
+                    if let Some(dir) = self
+                        .dialog(DialogFolder::Scans, text::DIALOG_ADD_SCAN)
                         .pick_folder()
                     {
+                        self.remember_folder(DialogFolder::Scans, dir.parent());
                         self.apply(Action::AddScan(dir));
                     }
                 }
@@ -1647,10 +1970,11 @@ impl DriftlessApp {
             }),
             Action::PickAddRun(scan) => {
                 if self.state.project.is_some() {
-                    if let Some(dir) = rfd::FileDialog::new()
-                        .set_title(text::DIALOG_ADD_RUN)
+                    if let Some(dir) = self
+                        .dialog(DialogFolder::Scans, text::DIALOG_ADD_RUN)
                         .pick_folder()
                     {
+                        self.remember_folder(DialogFolder::Scans, dir.parent());
                         self.change_project(|p| {
                             p.add_run(&scan, &dir)?;
                             Ok(Selection::Scan(scan.clone()))
@@ -1680,13 +2004,14 @@ impl DriftlessApp {
                     .chain(&MESH_EXTENSIONS)
                     .copied()
                     .collect();
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title(text::DIALOG_OPEN_FILE)
+                if let Some(path) = self
+                    .dialog(DialogFolder::Files, text::DIALOG_OPEN_FILE)
                     .add_filter(text::FILTER_ALL, &all)
                     .add_filter(text::FILTER_CLOUD, &POINT_EXTENSIONS)
                     .add_filter(text::FILTER_MESH, &MESH_EXTENSIONS)
                     .pick_file()
                 {
+                    self.remember_folder(DialogFolder::Files, path.parent());
                     // picked again: a surface shown is read again
                     match open_file(&path, true) {
                         Ok(action) => self.apply(action),
@@ -1717,6 +2042,14 @@ impl DriftlessApp {
                 self.loader.cancel();
                 self.next_surface = None;
                 self.surface_loader.cancel();
+                // a project being opened is not opened (its read ends unseen)
+                if matches!(self.tree_next, Some(TreeTask::Open { .. })) {
+                    self.tree_next = None;
+                }
+                if matches!(self.tree_task, Some(TreeTask::Open { .. })) {
+                    self.tree_discard = true;
+                }
+                self.sync_tree_state();
             }
             Action::DismissMessages => self.state.messages.clear(),
             Action::OpenLogFolder => {
@@ -1801,14 +2134,15 @@ impl DriftlessApp {
         };
         let format = dialog.format;
         let name = format!("{}.{}", dialog.source().default_name(), format.extension());
-        let Some(path) = rfd::FileDialog::new()
-            .set_title(text::EXPORT_TITLE)
+        let Some(path) = self
+            .dialog(DialogFolder::Files, text::EXPORT_TITLE)
             .set_file_name(name)
             .add_filter(format.label(), &[format.extension()])
             .save_file()
         else {
             return;
         };
+        self.remember_folder(DialogFolder::Files, path.parent());
         match export::target_picked(&mut self.state, path) {
             Ok(Some(action)) => self.apply(action),
             // asked in the window
@@ -1836,28 +2170,9 @@ impl DriftlessApp {
         };
     }
 
-    /// Reads the open project again from disk, keeping the selection.
-    fn reload_project(&mut self) {
-        let Some(dir) = self.state.project.as_ref().map(|p| p.dir.clone()) else {
-            return;
-        };
-        match Project::open(&dir) {
-            Ok(p) => {
-                self.state.project = Some(p);
-                self.state.refresh();
-            }
-            Err(e) => self.error(e.to_string()),
-        }
-    }
-
-    fn set_project(&mut self, project: Project) {
-        self.stop_queue();
-        // the measurements belong to the project shown (they are not saved yet)
-        self.state.measurements.clear();
-        self.state.measure_a = None;
-        self.info(text::project_opened(&project.name));
-        self.drop_surface();
-        self.state.set_project(project);
+    /// Whether `dir` is the folder of the project shown (as stored, without resolving it).
+    fn is_shown(&self, dir: &Path) -> bool {
+        self.state.project.as_ref().is_some_and(|p| p.dir == dir)
     }
 
     fn is_open(&self, dir: &Path) -> bool {
@@ -1868,7 +2183,8 @@ impl DriftlessApp {
     }
 
     /// Changes a copy of the project and saves it; only a saved change is shown, so the
-    /// project on screen always matches `project.toml`.
+    /// project on screen always matches `project.toml`. The tree is read again in the
+    /// background.
     fn change_project(
         &mut self,
         change: impl FnOnce(&mut Project) -> Result<Selection, crate::project::ProjectError>,
@@ -1879,7 +2195,7 @@ impl DriftlessApp {
         match change(&mut project).and_then(|sel| project.save().map(|()| sel)) {
             Ok(selection) => {
                 self.state.project = Some(project);
-                self.state.refresh();
+                self.refresh_tree();
                 self.state.selection = selection;
             }
             Err(e) => self.error(e.to_string()),
@@ -1888,6 +2204,10 @@ impl DriftlessApp {
 
     fn info(&mut self, text: String) {
         self.say(UiMessage::Info(text));
+    }
+
+    fn warn(&mut self, text: String) {
+        self.say(UiMessage::Warning(text));
     }
 
     fn error(&mut self, text: String) {

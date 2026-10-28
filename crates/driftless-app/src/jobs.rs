@@ -65,6 +65,8 @@ pub enum JobOutput {
     Run(Box<RunLoaded>),
     /// `corrections.toml` after a change (helper runner).
     Corrected(Box<Corrected>),
+    /// A project folder read: `project.toml` and the tree (tree reader).
+    ProjectRead(Box<crate::ui::ProjectRead>),
     /// Two trajectories compared (helper runner).
     Compare(Box<Comparison>),
     /// Two `map.json` side by side (helper runner).

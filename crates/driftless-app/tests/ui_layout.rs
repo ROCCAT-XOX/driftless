@@ -480,6 +480,13 @@ fn projects_of_disk_show_in_daten() {
     Project::create(&dir, "Leer").unwrap();
     let mut app = app();
     app.apply(Action::OpenProject(dir));
+    // read in the background
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while app.wants_repaint_while_busy() {
+        assert!(std::time::Instant::now() < deadline, "project not read");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        app.tick();
+    }
     let h = window(app);
     h.get_by_label(&text::project_line("Leer", 0));
     h.get_by_label(text::EMPTY_NO_SCANS);

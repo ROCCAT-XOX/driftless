@@ -13,6 +13,7 @@ pub mod lod;
 pub mod logfile;
 pub mod overlay;
 pub mod pick;
+pub mod places;
 pub mod project;
 pub mod render;
 pub mod surface;

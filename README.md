@@ -200,7 +200,12 @@ slim status bar:
   „Scan hinzufügen …“ for a scan folder as above, „Lauf hinzufügen …“ for a run made with the command
   line, „Datei öffnen …“ for any point cloud or surface file, „Exportieren …“ for what the view shows,
   „Über Driftless …“; see [Export](#export) and [Opening files](#opening-files)). Below it the three steps, and
-  ⚙ at the bottom.
+  ⚙ at the bottom. The dialogs open in `~/Driftless Projekte` (Windows `%USERPROFILE%\Driftless
+  Projekte`, made when first needed), later in the folder each was last used in. A project is read in
+  the background („Projekt wird gelesen …“), so a slow drive or share never stops the window; one in
+  iCloud Drive (also `~/Documents` and `~/Desktop` with „Schreibtisch & Dokumente“), OneDrive or
+  another cloud storage opens with a warning: large results get uploaded and moved off the disk, and
+  load slowly again.
 - **1 Daten:** a card per scan with its state (neu, wartet, rechnet, fertig ✓, veraltet) and „+ Scan
   hinzufügen“; the precision Schnell · Genau · Maximal sets only the voxel size of the map (0.02 /
   0.01 / 0.005 m; Maximal needs over 4 GB of memory on large scans, another voxel shows „Eigene“). „Alle

@@ -23,13 +23,13 @@ pub mod theme;
 pub mod tools;
 pub mod view3d;
 
-pub use app::{parse_args, Args, DriftlessApp, UI_KEY};
+pub use app::{parse_args, Args, DialogFolder, DriftlessApp, LastFolders, UI_KEY};
 
 use crate::camera::CameraMode;
 use crate::jobs::JobStatus;
 use crate::project::{
     map_status, model_status, model_surface_status, point_pairs, state_gap, surface_status,
-    MapStatus, MergePick, ModelInfo, Project, RunInfo, ScanState, SurfaceSettings,
+    MapStatus, MergePick, ModelInfo, Project, ProjectError, RunInfo, ScanState, SurfaceSettings,
 };
 use crate::render::{ColorMode, PointSize, ShowMode};
 use driftless_gpu::GpuPref;
@@ -39,7 +39,7 @@ use driftless_steps::map::MapSettings;
 use driftless_steps::pairs::PointPairEntry;
 use driftless_steps::slam::SlamSettings;
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The steps of the work, in the order they are done; the rail switches between them.
 #[derive(
@@ -372,6 +372,70 @@ pub struct ScanNode {
     pub runs: Vec<RunInfo>,
 }
 
+/// The tree of a project as the field shows it: its scans with their runs, its models and the
+/// point pairs. Read from disk off the UI thread ([`read_tree`]), shown by
+/// [`AppState::set_tree`].
+#[derive(Debug, Clone, Default)]
+pub struct Tree {
+    pub scans: Vec<ScanNode>,
+    pub models: Vec<ModelInfo>,
+    pub point_pairs: Vec<PointPairEntry>,
+    /// Why `modelle/punktpaare.toml` cannot be read.
+    pub point_pairs_error: Option<String>,
+}
+
+/// Reads the tree of `project` from disk: every scan folder, run, map, surface and model. Can
+/// take seconds on a network share or with files iCloud moved away: call it off the UI thread.
+pub fn read_tree(project: &Project) -> Tree {
+    let scans = project
+        .scans
+        .iter()
+        .map(|s| ScanNode {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            state: project.scan_state(&s.id),
+            no_color: project.color_missing(&s.id),
+            runs: project.runs(&s.id),
+        })
+        .collect();
+    let (point_pairs, point_pairs_error) = match point_pairs(project) {
+        Ok(pairs) => (pairs, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    Tree {
+        scans,
+        models: project.models(),
+        point_pairs,
+        point_pairs_error,
+    }
+}
+
+/// What reading a project folder found: the project as its `project.toml` says now, its tree,
+/// and the cloud storage it lies in (`cloud`, see [`crate::places::cloud_storage`]).
+#[derive(Debug, Clone)]
+pub struct ProjectRead {
+    pub project: Project,
+    pub tree: Tree,
+    pub cloud: Option<String>,
+}
+
+/// How the window tells whether a folder lies in cloud storage (the system's way, or a test's).
+pub type CloudCheck = fn(&Path) -> Option<String>;
+
+/// Opens the project in `dir` and reads its tree ([`read_tree`]); `cloud` tells the cloud
+/// storage of its folder. Off the UI thread: `project.toml`, the tree and the cloud check may
+/// each wait for a slow disk.
+pub fn read_project(dir: &Path, cloud: CloudCheck) -> Result<ProjectRead, ProjectError> {
+    let project = Project::open(dir)?;
+    let tree = read_tree(&project);
+    let cloud = cloud(&project.dir);
+    Ok(ProjectRead {
+        project,
+        tree,
+        cloud,
+    })
+}
+
 /// The last check of a scan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InspectResult {
@@ -465,17 +529,30 @@ pub struct AppState {
     pub correct: correct::CorrectState,
     /// The comparison of two trajectories and of two maps.
     pub compare: compare::CompareState,
+    /// The folder of the project being opened: its `project.toml` and tree are read in the
+    /// background, the field says so meanwhile.
+    pub opening: Option<PathBuf>,
+    /// The tree is being read again (after a change, a step, the window coming to the front):
+    /// the tree shown is the one read before, and „Alle rechnen“ waits for the new one.
+    pub tree_pending: bool,
 }
 
 impl AppState {
-    /// Shows `project` from now on: nothing selected, tree read from disk.
+    /// Shows `project` from now on: nothing selected, its tree read from disk here (the window
+    /// reads it in the background and calls [`AppState::show_project`]).
     pub fn set_project(&mut self, project: Project) {
+        let tree = read_tree(&project);
+        self.show_project(project, tree);
+    }
+
+    /// Shows `project` with its `tree` from now on: nothing selected.
+    pub fn show_project(&mut self, project: Project, tree: Tree) {
         self.project = Some(project);
         self.selection = Selection::None;
         self.inspect = None;
         self.merge = steps::merge::MergeState::default();
         tools::end_pairs(self);
-        self.refresh();
+        self.set_tree(tree);
     }
 
     /// Reads `modelle/punktpaare.toml` again ([`AppState::point_pairs`]).
@@ -503,22 +580,20 @@ impl AppState {
             })
     }
 
-    /// Reads the scans' state and runs again (after opening, adding, and after each step).
+    /// Reads the tree of the project again, here and now ([`read_tree`]; the window does it in
+    /// the background).
     pub fn refresh(&mut self) {
-        self.scans = self.project.as_ref().map_or_else(Vec::new, |p| {
-            p.scans
-                .iter()
-                .map(|s| ScanNode {
-                    id: s.id.clone(),
-                    name: s.name.clone(),
-                    state: p.scan_state(&s.id),
-                    no_color: p.color_missing(&s.id),
-                    runs: p.runs(&s.id),
-                })
-                .collect()
-        });
-        self.models = self.project.as_ref().map_or_else(Vec::new, Project::models);
-        self.refresh_pairs();
+        let tree = self.project.as_ref().map(read_tree).unwrap_or_default();
+        self.set_tree(tree);
+    }
+
+    /// Shows `tree` as the tree of the project; the statuses of what is still in it stay until
+    /// the background check replaces them.
+    pub fn set_tree(&mut self, tree: Tree) {
+        self.scans = tree.scans;
+        self.models = tree.models;
+        self.point_pairs = tree.point_pairs;
+        self.point_pairs_error = tree.point_pairs_error;
         // „Von Hand ausrichten“ of a model that is gone ends
         let gone = self
             .pairs

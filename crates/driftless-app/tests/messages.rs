@@ -210,20 +210,29 @@ fn messages_and_lines_go_into_the_log_file_as_they_come() {
     let log = Arc::new(LogFile::start(&dir.join("logs"), "Driftless 0.1.0 (test)").unwrap());
     let mut app = DriftlessApp::new(Arc::new(|| {})).with_log_file(log.clone());
     // an error, cleared at once by „Schließen“ in the same frame
-    app.apply(Action::OpenProject(dir.join("gibt-es-nicht")));
+    app.apply(Action::ComputeMap("gibt-es-nicht".into()));
     app.apply(Action::DismissMessages);
     assert!(app.state().messages.is_empty());
     let text = read(log.path());
     assert!(
         text.lines()
-            .any(|l| l.contains(" Fehler  Kein Projekt: project.toml fehlt")),
+            .any(|l| l.contains(" Fehler  Scan nicht im Projekt: gibt-es-nicht")),
         "{text}"
     );
-    // … and it is in the Protokoll
+    // … and it is in the Protokoll, with its time
     let entry = app.state().log.last().cloned().unwrap();
     assert_eq!(entry.kind, LogKind::Error);
-    assert!(entry.text.starts_with("Kein Projekt"), "{entry:?}");
+    assert_eq!(entry.text, "Scan nicht im Projekt: gibt-es-nicht");
     assert_eq!(entry.time.len(), 8, "{entry:?}");
+    // an error of the background (a project folder without project), in German
+    app.apply(Action::OpenProject(dir.join("gibt-es-nicht")));
+    settle(&mut app);
+    let text = read(log.path());
+    assert!(
+        text.lines()
+            .any(|l| l.contains(" Fehler  Kein Projekt: project.toml fehlt: gibt-es-nicht")),
+        "{text}"
+    );
 
     // the lines of a step, and its end
     app.start_job("zählen", |p| {
@@ -262,9 +271,10 @@ fn messages_and_lines_go_into_the_log_file_as_they_come() {
     ));
 
     // the same error twice: once on the status bar and in the Protokoll
+    app.apply(Action::DismissMessages);
     let before = app.state().log.len();
-    app.apply(Action::OpenProject(dir.join("gibt-es-nicht")));
-    app.apply(Action::OpenProject(dir.join("gibt-es-nicht")));
+    app.apply(Action::ComputeMap("auch-nicht".into()));
+    app.apply(Action::ComputeMap("auch-nicht".into()));
     let errors = app
         .state()
         .messages

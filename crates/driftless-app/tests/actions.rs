@@ -31,6 +31,8 @@ fn app_with_scan(dir: &Path) -> DriftlessApp {
     });
     app.apply(Action::AddScan(scan));
     assert_eq!(errors(&app), Vec::<String>::new());
+    // the tree is read in the background
+    settle(&mut app);
     app
 }
 
@@ -157,6 +159,7 @@ fn reuse_action_records_history() {
     // without submaps.bin: refused with the reason, nothing started
     fs::remove_file(run.join("submaps.bin")).unwrap();
     app.apply(Action::OpenProject(dir.join("projekt")));
+    settle(&mut app);
     app.apply(Action::Reuse(run.clone()));
     assert_eq!(errors(&app), [text::NO_CACHE]);
     assert!(app.state().job.is_none());

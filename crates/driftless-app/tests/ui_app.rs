@@ -32,6 +32,11 @@ fn tick_until(app: &mut DriftlessApp, mut cond: impl FnMut(&DriftlessApp) -> boo
     }
 }
 
+/// Ticks until no step and no background work is left (the tree is read in the background).
+fn settle(app: &mut DriftlessApp) {
+    tick_until(app, |a| !a.wants_repaint_while_busy());
+}
+
 fn errors(app: &DriftlessApp) -> Vec<String> {
     app.state()
         .messages
@@ -57,6 +62,11 @@ fn new_project_add_scan_shows_tree() {
     assert_eq!(errors(&app), Vec::<String>::new());
     app.apply(Action::AddScan(scan.clone()));
     assert_eq!(errors(&app), Vec::<String>::new());
+    // saved at once; the tree is read in the background
+    assert_eq!(app.state().project.as_ref().unwrap().scans.len(), 1);
+    assert!(app.state().tree_pending);
+    settle(&mut app);
+    assert!(!app.state().tree_pending);
     let s = app.state();
     assert_eq!(s.project.as_ref().unwrap().name, "Halle");
     assert_eq!(s.scans.len(), 1);
@@ -77,7 +87,11 @@ fn new_project_add_scan_shows_tree() {
 fn open_missing_project_reports_error() {
     let dir = tmp("ui-kein-projekt");
     let mut app = app();
-    app.apply(Action::OpenProject(dir));
+    app.apply(Action::OpenProject(dir.clone()));
+    // read in the background: the field says so meanwhile
+    assert_eq!(app.state().opening, Some(dir));
+    settle(&mut app);
+    assert_eq!(app.state().opening, None);
     assert!(app.state().project.is_none());
     let e = errors(&app);
     assert_eq!(e.len(), 1);
@@ -167,6 +181,7 @@ fn two_projects(name: &str) -> (DriftlessApp, PathBuf, PathBuf) {
     Project::create(&b, "B").unwrap();
     let mut app = app();
     app.apply(Action::OpenProject(a.clone()));
+    settle(&mut app);
     assert_eq!(app.state().project.as_ref().unwrap().name, "A");
     (app, a, b)
 }
@@ -189,6 +204,8 @@ fn switching_project_cancels_job() {
 
     release.send(()).unwrap();
     tick_until(&mut app, |a| a.state().job.is_none());
+    // then B is read and opened
+    settle(&mut app);
     let p = app.state().project.as_ref().unwrap();
     assert_eq!(p.name, "B");
     assert_eq!(p.dir, canonical(&b).unwrap());
@@ -272,6 +289,7 @@ fn gone_last_project_is_reported_once() {
     let dir = tmp("ui-letztes");
     let mut app = app();
     app.restore_last(Some(dir.join("weg").to_str().unwrap()));
+    settle(&mut app);
     let e = errors(&app);
     assert_eq!(e.len(), 1);
     assert!(
@@ -291,6 +309,7 @@ fn gone_last_project_is_reported_once() {
     let p = dir.join("p");
     Project::create(&p, "P").unwrap();
     app.restore_last(Some(p.to_str().unwrap()));
+    settle(&mut app);
     let stored = app.last_to_store().unwrap();
     assert_eq!(PathBuf::from(stored), canonical(&p).unwrap());
 }

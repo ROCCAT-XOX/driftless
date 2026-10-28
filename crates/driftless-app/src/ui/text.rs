@@ -747,7 +747,23 @@ pub fn map_of(scan: &str, run: &str, map: &str) -> String {
 }
 
 pub fn project_opened(name: &str) -> String {
-    format!("Projekt {name} geöffnet")
+    format!("Projekt „{name}“ geöffnet")
+}
+
+/// The label of the read of a project folder (status bar while a project is opened).
+pub const READ_PROJECT_JOB: &str = "Projekt lesen";
+/// In the field while a project is being opened.
+pub const PROJECT_READING: &str = "Projekt wird gelesen …";
+
+/// A project in cloud storage: what happens to its files and what to do instead.
+pub fn project_in_cloud(cloud: &str, dir: &std::path::Path) -> String {
+    format!(
+        "Projekt liegt in {cloud}: große Ergebnisse werden hochgeladen und bei knappem Platz \
+         vom Rechner genommen, dann lädt jede Wolke erst langsam wieder herunter. Besser ein \
+         lokaler Ordner, z. B. „{}“ im Benutzerordner.\n{}",
+        crate::places::PROJECTS_FOLDER,
+        dir.display()
+    )
 }
 
 /// Under the heading „Daten“: „Projekt „Halle“ · 3 Scans“.

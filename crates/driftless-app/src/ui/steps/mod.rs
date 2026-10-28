@@ -30,13 +30,39 @@ const SEGMENT_HEIGHT: f32 = 26.0;
 /// The list keeps at least this height in a very small window (points).
 const MIN_LIST_HEIGHT: f32 = 120.0;
 
-/// Shows the field of [`AppState::step`].
+/// Shows the field of [`AppState::step`]; while a project is being opened, that it is read.
 pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
+    if let Some(dir) = &state.opening {
+        let title = match state.step {
+            Step::Daten => text::STEP_DATA,
+            Step::Bilder => text::STEP_IMAGES,
+            Step::Planung => text::STEP_PLAN,
+        };
+        heading(ui, title);
+        opening(ui, dir);
+        return None;
+    }
     match state.step {
         Step::Daten => daten::show(ui, state),
         Step::Bilder => bilder::show(ui, state),
         Step::Planung => planung::show(ui, state),
     }
+}
+
+/// „Projekt wird gelesen …“ with a spinner and the folder (its path on hover): the window
+/// stays usable while a slow disk answers.
+fn opening(ui: &mut Ui, dir: &std::path::Path) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add(egui::Spinner::new());
+        ui.label(text::PROJECT_READING);
+    });
+    let name = dir.file_name().map_or_else(
+        || dir.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    ui.add(egui::Label::new(RichText::new(name).color(DARK.text_dim)).truncate())
+        .on_hover_text(dir.display().to_string());
 }
 
 /// Whether „Erweitert“ of `step` is open (kept in egui's memory).
