@@ -12,7 +12,7 @@ use driftless_app::ui::{
 };
 use driftless_io::testscan::{room_bag_secs, tmp};
 use driftless_steps::map::MapSwitches;
-use driftless_steps::merge::{ModelMember, ModelReport, MODEL_LAS, MODEL_REPORT};
+use driftless_steps::merge::{ModelMember, ModelReport, MERGE_VERSION, MODEL_LAS, MODEL_REPORT};
 use driftless_steps::slam::SlamSettings;
 use eframe::egui::accesskit::Role;
 use egui_kittest::kittest::{NodeT, Queryable};
@@ -862,7 +862,7 @@ fn member(scan: &str, verdict: &str, included: bool) -> ModelMember {
 
 fn report(members: Vec<ModelMember>) -> ModelReport {
     ModelReport {
-        version: 1,
+        version: MERGE_VERSION,
         input_id: "0".into(),
         points: members.iter().map(|m| m.points).sum(),
         members,
@@ -947,8 +947,13 @@ fn model_node_shows_verdicts() {
         )]
         .into(),
     );
-    let h = panel(state);
+    let h = panel(state.clone());
     h.get_by_label(&text::model_stale("Modell 001"));
+    // a model of another version of the merge: the same mark with its own reason
+    state.models[0].report.version = MERGE_VERSION - 1;
+    let h = panel(state);
+    h.get_by_label(&text::model_stale_version("Modell 001"));
+    assert!(h.query_by_label(&text::model_stale("Modell 001")).is_none());
 }
 
 #[test]

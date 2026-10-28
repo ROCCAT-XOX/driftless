@@ -183,6 +183,18 @@ pub fn scan_not_in_project(scan: &std::path::Path) -> String {
     format!("Scan {} ist nicht mehr im Projekt", scan.display())
 }
 
+/// A model merged by another version of the merge than this program's (`version` in
+/// `modell.json`), as [`MODEL_STALE`] and [`STATUS_MODEL_STALE_HINT`] for a changed map.
+pub const MODEL_STALE_VERSION: &str = "veraltet – mit anderer Programmversion zusammengeführt";
+pub const STATUS_MODEL_STALE_VERSION_HINT: &str =
+    "Das Modell stammt aus einer anderen Programmversion – in „Daten“ neu zusammenführen";
+
+/// Such a model in the tree: „Modell 001 · veraltet – mit anderer Programmversion
+/// zusammengeführt“.
+pub fn model_stale_version(label: &str) -> String {
+    format!("{label} · {MODEL_STALE_VERSION}")
+}
+
 // Point pairs by hand („Von Hand ausrichten“)
 /// Under an unsure or failed scan of a model.
 pub const PAIRS_START: &str = "Von Hand ausrichten";

@@ -77,7 +77,9 @@ use driftless_steps::map::{
     clean_stage_id, fitting_stages, folder_fits, hex, map_input_for, run_map, MapInput, MapRequest,
     MapSettings, MapStep, MapSwitches, CLEAN_BIN, DENSE_BIN, REPORT,
 };
-use driftless_steps::merge::{read_model, run_merge, MergeMember, MergeRequest, ModelReport};
+use driftless_steps::merge::{
+    read_model, run_merge, version_fits, MergeMember, MergeRequest, ModelReport,
+};
 use driftless_steps::pairs::{
     stored_path as from_stored, stored_text, PointPairEntry, PointPairs, POINT_PAIRS_FILE,
 };
@@ -228,6 +230,14 @@ pub struct ModelInfo {
     pub report: ModelReport,
     /// Its surfaces: subfolders `oberflaeche…` with an `oberflaeche.glb`.
     pub surfaces: Vec<SurfaceInfo>,
+}
+
+impl ModelInfo {
+    /// Whether it was merged by another version of the merge than this program's
+    /// ([`driftless_steps::merge::version_fits`]): stale whatever its maps, merge anew.
+    pub fn other_version(&self) -> bool {
+        !version_fits(&self.report)
+    }
 }
 
 /// A scan chosen for a model, with the run and the map of it to merge.
@@ -1922,10 +1932,12 @@ fn model_scan_missing(model: &ModelInfo) -> bool {
         .any(|m| discover_project(&m.scan).is_err())
 }
 
-/// The status of `model` itself: its runtime, and stale if the map of a scan in it was
-/// computed anew since the merge (the place of the scan in the model may not fit it any
-/// more: merge anew). Reads `traj.tum` and the bag lists of its scans: call it off the UI
-/// thread. A model whose scan cannot be read is never stale (that cannot be told).
+/// The status of `model` itself: its runtime, and stale if it was merged by another version
+/// of the merge ([`ModelInfo::other_version`]) or the map of a scan in it was computed anew
+/// since the merge (the place of the scan in the model may not fit it any more: merge anew).
+/// Reads `traj.tum` and the bag lists of its scans: call it off the UI thread. Whether a map
+/// changed cannot be told while a scan of the model cannot be read: then only the version
+/// counts.
 pub fn model_status(model: &ModelInfo) -> MapStatus {
     let changed = |m: &driftless_steps::merge::ModelMember| {
         let Some(id) = &m.clean_id else {
@@ -1934,13 +1946,14 @@ pub fn model_status(model: &ModelInfo) -> MapStatus {
         let input = map_input_for(&m.scan, &m.slam_dir, &m.map_dir, m.slam.clone());
         clean_stage_id(&input).map_or(true, |now| hex(&now) != *id)
     };
-    let stale = !model_scan_missing(model)
-        && model
-            .report
-            .members
-            .iter()
-            .filter(|m| m.included)
-            .any(changed);
+    let stale = model.other_version()
+        || (!model_scan_missing(model)
+            && model
+                .report
+                .members
+                .iter()
+                .filter(|m| m.included)
+                .any(changed));
     MapStatus {
         seconds: Some(model.report.seconds_total),
         stale,
@@ -1948,14 +1961,16 @@ pub fn model_status(model: &ModelInfo) -> MapStatus {
 }
 
 /// The status of `surface` of `model`, as [`surface_status`] for a map: stale if it no
-/// longer fits the model ([`model_surface_fits`]), without a readable report or with
-/// settings an earlier program wrote. Call it off the UI thread.
+/// longer fits the model ([`model_surface_fits`]), without a readable report, with settings
+/// an earlier program wrote, or of a model of another merge version. Call it off the UI
+/// thread.
 pub fn model_surface_status(model: &ModelInfo, surface: &SurfaceInfo) -> MapStatus {
     let report = fs::read_to_string(surface.dir.join(SURFACE_REPORT))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
     let seconds = report.as_ref().and_then(|v| v["seconds_total"].as_f64());
     let stale = report.is_none()
+        || model.other_version()
         || (!model_scan_missing(model)
             && surface.settings.as_ref().is_none_or(|settings| {
                 let req = model_surface_request(model, settings, GpuPref::default(), &surface.dir);

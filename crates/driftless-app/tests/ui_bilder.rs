@@ -15,7 +15,7 @@ use driftless_io::images::RgbImage;
 use driftless_io::testscan::{room_bag_secs, tmp};
 use driftless_map::surface::{encode_pages, write_glb, SurfaceConfig, TexturePage, TexturedMesh};
 use driftless_steps::map::{MapStep, MapSwitches};
-use driftless_steps::merge::ModelReport;
+use driftless_steps::merge::{ModelReport, MERGE_VERSION};
 use driftless_steps::slam::SlamSettings;
 use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
@@ -841,7 +841,7 @@ fn with_model(surfaces: Vec<SurfaceInfo>) -> AppState {
         })
     };
     let report: ModelReport = serde_json::from_value(serde_json::json!({
-        "version": 1,
+        "version": MERGE_VERSION,
         "input_id": "0",
         "members": [member("a"), member("b")],
         "points": 20,
@@ -935,10 +935,17 @@ fn model_surface_states() {
         SurfaceStatus::ModelStale
     );
     state.selection = Selection::Model(MODEL.into());
-    let h = panel(state);
+    let h = panel(state.clone());
     assert!(h
         .get_by_label(text::STEP_SURFACE)
         .accesskit_node()
         .is_disabled());
     h.get_by_label(text::STATUS_MODEL_STALE);
+    h.get_by_label(text::STATUS_MODEL_STALE_HINT);
+    // merged by another version of the program: the same state, its own reason
+    state.models[0].report.version = MERGE_VERSION - 1;
+    let h = panel(state);
+    h.get_by_label(text::STATUS_MODEL_STALE);
+    h.get_by_label(text::STATUS_MODEL_STALE_VERSION_HINT);
+    assert!(h.query_by_label(text::STATUS_MODEL_STALE_HINT).is_none());
 }

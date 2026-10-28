@@ -18,7 +18,7 @@ use super::theme::{icon, DARK};
 use super::view3d::PointInfo;
 use super::{text, theme, Action, AppState, ScanNode, Step};
 use crate::jobs::JobStatus;
-use crate::project::ScanState;
+use crate::project::{ModelInfo, ScanState};
 use eframe::egui::{self, Align, Color32, Layout, Response, RichText, Sense, Ui};
 
 /// Height of the main button (points).
@@ -417,6 +417,16 @@ pub(super) fn state_label(ui: &mut Ui, state: StepState) {
             ui.label(RichText::new(what).color(warn))
         }
     };
+}
+
+/// Why the stale `model` is stale, on hover and as the lock of its surface: merged by another
+/// version of the program, or a map of one of its scans computed anew since.
+fn model_stale_hint(model: &ModelInfo) -> &'static str {
+    if model.other_version() {
+        text::STATUS_MODEL_STALE_VERSION_HINT
+    } else {
+        text::STATUS_MODEL_STALE_HINT
+    }
 }
 
 pub(super) fn error_label(ui: &mut Ui, message: &str) {

@@ -21,7 +21,8 @@
 //! `clean.bin` of every scan in the model, moved by its `T_i`, with the LiDAR positions and
 //! the camera images of every such scan (one texture source each). Its input id is the
 //! model's id, the clean id and images of every scan in it, the settings and
-//! [`SURFACE_VERSION`].
+//! [`SURFACE_VERSION`]. A model merged by another version of the merge is refused, like one
+//! whose maps were computed anew since ([`crate::merge::version_fits`]).
 
 use crate::error::{check_cancel, failed, StepError};
 use crate::export::is_page_of;
@@ -30,7 +31,9 @@ use crate::map::{
     clean_stage_id, color_input, dense_stage_id, fallback_reason, gpu_json, hex, map_input_for,
     peak_rss_bytes, read_traj, ColorInput, MapInput, CLEAN_BIN, DENSE_BIN,
 };
-use crate::merge::{member_transform, read_model, ModelMember, ModelReport};
+use crate::merge::{
+    member_transform, read_model, version_fits, ModelMember, ModelReport, MERGE_VERSION,
+};
 use crate::{PROGRAM, PROGRAM_KEY};
 use driftless_export::mesh;
 use driftless_gpu::{GpuChoice, GpuContext, GpuPref};
@@ -637,11 +640,29 @@ fn stale_member(name: &str) -> StepError {
         .into()
 }
 
+/// A model merged by another version of the merge ([`version_fits`]).
+fn other_merge_version(dir: &Path, version: u32) -> StepError {
+    let which = if version < MERGE_VERSION {
+        "älteren"
+    } else {
+        "neueren"
+    };
+    format!(
+        "Modell {} stammt aus einer {which} Programmversion (Zusammenführen v{version}, dieses \
+         Programm v{MERGE_VERSION}) und ist veraltet: erst neu zusammenführen",
+        dir.display()
+    )
+    .into()
+}
+
 fn model_plan(req: &ModelSurfaceRequest, progress: &Progress) -> Result<ModelPlan, StepError> {
     let model = match &req.model {
         Some(m) => m.clone(),
         None => read_model(&req.model_dir)?,
     };
+    if !version_fits(&model) {
+        return Err(other_merge_version(&req.model_dir, model.version));
+    }
     let mut id = format!("model {}\nsurface v{SURFACE_VERSION}\n", model.input_id);
     let mut members = Vec::new();
     for (k, m) in model.members.iter().enumerate().filter(|(_, m)| m.included) {
@@ -687,8 +708,9 @@ fn model_plan(req: &ModelSurfaceRequest, progress: &Progress) -> Result<ModelPla
 }
 
 /// Whether `out_dir` holds the surface of this model request: its report has the current
-/// input id, the files it lists are there with their sizes ([`files_intact`]) and the
-/// `clean.bin` of every scan in the model still fits its map.
+/// input id, the files it lists are there with their sizes ([`files_intact`]), the model is of
+/// this merge version ([`version_fits`]) and the `clean.bin` of every scan in the model still
+/// fits its map.
 pub fn model_surface_fits(req: &ModelSurfaceRequest) -> bool {
     let fits = || -> Option<bool> {
         let text = fs::read_to_string(req.out_dir.join(SURFACE_REPORT)).ok()?;
@@ -799,8 +821,9 @@ fn model_dir_rel(req: &ModelSurfaceRequest) -> Option<String> {
 /// measured against the merged points only. Returns the `oberflaeche.json` written to
 /// [`ModelSurfaceRequest::out_dir`]; it holds `model` (the folder and the scans in it).
 ///
-/// Fails if `modell.json` is missing or the map of a scan in it is missing or was computed
-/// anew after the merge. A cancel before the files are written leaves everything as it was.
+/// Fails if `modell.json` is missing, was written by another version of the merge
+/// ([`version_fits`]), or the map of a scan in it is missing or was computed anew after the
+/// merge. A cancel before the files are written leaves everything as it was.
 pub fn run_model_surface(
     req: &ModelSurfaceRequest,
     progress: &Progress,

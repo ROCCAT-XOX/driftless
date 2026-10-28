@@ -10,11 +10,12 @@
 //! main button computes the surface of the model from the images of all its scans
 //! ([`Action::RunModelSurface`]). A surface that no longer fits its model
 //! ([`driftless_steps::surface::model_surface_fits`], checked in the background) is marked
-//! stale, and a model whose maps were computed anew since the merge waits for „Daten“.
+//! stale, and a model whose maps were computed anew since the merge (or merged by another
+//! version of the program) waits for „Daten“.
 
 use super::{
     badge, below_lines, blocked, card, fraction, heading, hint, job_progress, main_button,
-    no_project, pinned, quiet_button, segments, state_label, tree, StepState,
+    model_stale_hint, no_project, pinned, quiet_button, segments, state_label, tree, StepState,
 };
 use crate::project::{MapInfo, ModelInfo, ScanState, SurfaceInfo, SurfaceSettings};
 use crate::ui::theme::{icon, DARK};
@@ -41,8 +42,8 @@ pub enum SurfaceStatus {
     MapNotReady,
     /// The folder of its scan cannot be read: left out as well.
     ScanMissing,
-    /// A model whose maps were computed anew since the merge: it is merged anew in „Daten“
-    /// first.
+    /// A model whose maps were computed anew since the merge, or merged by another version of
+    /// the program: it is merged anew in „Daten“ first.
     ModelStale,
 }
 
@@ -206,7 +207,7 @@ fn model_list(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
         let hover = match status {
             SurfaceStatus::ModelStale => format!(
                 "{name}\n{}\n{}",
-                text::STATUS_MODEL_STALE_HINT,
+                model_stale_hint(model),
                 model.dir.display()
             ),
             _ => format!("{name}\n{}", model.dir.display()),
@@ -351,7 +352,7 @@ fn compute_buttons(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
     let all_locked = busy.clone().or(invalid.clone()).or(nothing.clone());
     if let Some(model) = state.selected_model() {
         let model_stale = (model_surface_status(state, model) == SurfaceStatus::ModelStale)
-            .then(|| text::STATUS_MODEL_STALE_HINT.to_string());
+            .then(|| model_stale_hint(model).to_string());
         let locked = busy.clone().or(invalid.clone()).or(model_stale.clone());
         let hover = text::COMPUTE_MODEL_SURFACE_HINT;
         if main_button(ui, text::STEP_SURFACE, locked, hover) {

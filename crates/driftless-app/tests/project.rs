@@ -15,7 +15,9 @@ use driftless_steps::history::HistoryKind;
 use driftless_steps::map::{
     map_input_for, run_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches,
 };
-use driftless_steps::merge::{member_transform, read_model, MODEL_LAS, MODEL_REPORT};
+use driftless_steps::merge::{
+    member_transform, read_model, MERGE_VERSION, MODEL_LAS, MODEL_REPORT,
+};
 use driftless_steps::pairs::{PointPairEntry, PointPairs, POINT_PAIRS_FILE};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::StepError;
@@ -1020,6 +1022,47 @@ fn models_listed_with_verdicts() {
     assert!(m.report.members.iter().all(|x| x.included));
     assert_eq!(m.report.members[1].scan, merge_scans().b);
     assert!(!model_status(m).stale);
+}
+
+/// A model merged by an older version of the merge (`version` = [`MERGE_VERSION`] − 1) is
+/// stale, also while a scan of it cannot be read (its maps cannot be told then, its version
+/// can), and so are its surfaces.
+#[test]
+fn model_of_an_older_merge_is_stale() {
+    let dir = tmp("app-merge-version");
+    let p = merge_project(&dir);
+    let made = run_merge_job(&p, &picks(&p), false, &Progress::new()).unwrap();
+    let current = p.models().remove(0);
+    assert!(!current.other_version());
+    assert!(!model_status(&current).stale);
+    let file = made.join(MODEL_REPORT);
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    json["version"] = (MERGE_VERSION - 1).into();
+    fs::write(&file, json.to_string()).unwrap();
+    let old = p.models().remove(0);
+    assert_eq!(old.report.version, MERGE_VERSION - 1);
+    assert!(old.other_version());
+    assert!(model_status(&old).stale);
+    // a scan of it cannot be read: a changed map could not be told, the version still is
+    let mut unplugged = old.clone();
+    unplugged.report.members[1].scan = dir.join("abgesteckt");
+    assert!(model_status(&unplugged).stale);
+    let mut current_unplugged = current.clone();
+    current_unplugged.report.members[1].scan = dir.join("abgesteckt");
+    assert!(!model_status(&current_unplugged).stale);
+    // a surface with a readable report: stale with the model, not without it
+    let surface_dir = made.join("oberflaeche-001");
+    fs::create_dir_all(&surface_dir).unwrap();
+    fs::write(surface_dir.join("oberflaeche.json"), "{}").unwrap();
+    let surface = driftless_app::project::SurfaceInfo {
+        dir: surface_dir,
+        label: "Oberfläche 001".into(),
+        stale: false,
+        settings: None,
+    };
+    assert!(model_surface_status(&unplugged, &surface).stale);
+    assert!(!model_surface_status(&current_unplugged, &surface).stale);
 }
 
 #[test]

@@ -206,6 +206,15 @@ pub struct ModelReport {
     pub warnings: Vec<String>,
 }
 
+/// Whether `report` was merged by this program's merge ([`MERGE_VERSION`]). A model of
+/// another version is stale whatever its maps, like one whose maps were computed anew: the
+/// merge would place its scans or thin its points differently now. The app marks it
+/// „veraltet“, `driftless surface --model` refuses it ([`crate::surface::model_surface_fits`]
+/// does not take it either).
+pub fn version_fits(report: &ModelReport) -> bool {
+    report.version == MERGE_VERSION
+}
+
 /// `T_i` of a member: world of its scan → model.
 pub fn member_transform(m: &ModelMember) -> Isometry3<f64> {
     let h = Matrix4::from_row_slice(&m.transform);

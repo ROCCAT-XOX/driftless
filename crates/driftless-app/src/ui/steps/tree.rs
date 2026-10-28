@@ -11,7 +11,7 @@
 //! the full name and the folder show on hover. A run, a map, a model and a surface have
 //! „Exportieren …“ in their context menu (right click, [`Action::OpenExport`]).
 
-use super::badge;
+use super::{badge, model_stale_hint};
 use crate::project::{MapInfo, ModelInfo, RunInfo, SurfaceInfo};
 use crate::render::SCAN_COLORS;
 use crate::ui::theme::{icon, DARK};
@@ -150,10 +150,14 @@ pub(super) fn model_node(
     let label = sized(state, &model.label, &model.dir);
     let header = |ui: &mut Ui| {
         if stale {
-            let name = text::model_stale(&label);
+            let name = if model.other_version() {
+                text::model_stale_version(&label)
+            } else {
+                text::model_stale(&label)
+            };
             let hover = format!(
                 "{name}\n{}\n{}",
-                text::STATUS_MODEL_STALE_HINT,
+                model_stale_hint(model),
                 model.dir.display()
             );
             let warn = ui.visuals().warn_fg_color;
