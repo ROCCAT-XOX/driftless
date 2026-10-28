@@ -3,8 +3,8 @@
 use driftless_io::progress::{Progress, ProgressSnapshot};
 use driftless_io::testscan::{room_bag, room_bag_secs, tmp};
 use driftless_steps::map::{
-    clean_stage_id, dense_stage_id, fitting_stages, folder_fits, run_map, MapInput, MapRequest,
-    MapSettings, MapStep, CLEAN_BIN, DENSE_BIN,
+    clean_stage_id, current_map, dense_stage_id, fitting_stages, folder_fits, recompute_map,
+    run_map, MapInput, MapRequest, MapSettings, MapStep, CLEAN_BIN, DENSE_BIN,
 };
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::{correct, StepError};
@@ -450,4 +450,67 @@ fn settings_check_names_the_option() {
         s.check().unwrap_err().to_string(),
         "--downscale muss 1, 2 oder 4 sein"
     );
+}
+
+/// A whole map that is current already is not computed again: nothing is written and the
+/// step says so. Any change computes it: other switches, another trajectory, a file of the
+/// report missing, more files wanted, another step; [`recompute_map`] computes it anyway.
+#[test]
+fn repeated_map_is_current() {
+    use driftless_io::progress::LogLine;
+    let dir = tmp("steps-map-aktuell");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    slam(&dir, &out, false);
+    let req = request(&dir, &out, &out, MapStep::All);
+    assert!(current_map(&req).is_none(), "no map yet");
+    let first = run_map(&req, &Progress::new()).unwrap();
+    let before = files(&out);
+    let p = Progress::new();
+    assert_eq!(run_map(&req, &p).unwrap(), first);
+    assert_eq!(files(&out), before, "nothing written");
+    let log = p.take_log();
+    assert!(
+        matches!(&log[..], [LogLine::Info(i)] if i.starts_with("Karte ist aktuell: ")),
+        "{log:?}"
+    );
+    // Computed again when not current.
+    let computes = |req: &MapRequest| {
+        let p = Progress::new();
+        run_map(req, &p).unwrap();
+        p.take_log()
+            .iter()
+            .any(|l| matches!(l, LogLine::Info(i) if i.starts_with("Dicht: ")))
+    };
+    let mut other = req.clone();
+    other.input.map.switches.outliers = false;
+    assert!(current_map(&other).is_none(), "other switches");
+    let mut gpu_off = req.clone();
+    gpu_off.input.map.switches.gpu = driftless_gpu::GpuPref::Off;
+    assert!(
+        current_map(&gpu_off).is_some(),
+        "the GPU gives an equivalent map"
+    );
+    let all_files = MapRequest {
+        all_files: true,
+        ..req.clone()
+    };
+    assert!(current_map(&all_files).is_none(), "more files wanted");
+    assert!(current_map(&request(&dir, &out, &out, MapStep::Clean)).is_none());
+    // No images: `clean.las` is the cloud to look at.
+    fs::remove_file(out.join("clean.las")).unwrap();
+    assert!(current_map(&req).is_none(), "a file of the report missing");
+    assert!(computes(&req));
+    assert!(current_map(&req).is_some());
+    let traj = fs::read_to_string(out.join("traj.tum")).unwrap();
+    fs::write(out.join("traj.tum"), format!("{traj}# geändert\n")).unwrap();
+    assert!(current_map(&req).is_none(), "another trajectory");
+    assert!(computes(&req));
+    // `recompute_map` computes it although it is current.
+    let p = Progress::new();
+    recompute_map(&req, &p).unwrap();
+    assert!(p
+        .take_log()
+        .iter()
+        .any(|l| matches!(l, LogLine::Info(i) if i.starts_with("Dicht: "))));
 }

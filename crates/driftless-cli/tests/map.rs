@@ -691,3 +691,27 @@ fn map_json_says_why_auto_took_the_cpu() {
     map(&dir, &out, &["--step", "color", "--gpu", "aus"]).success();
     assert!(map_json(&out)["steps"]["color"]["gpu"]["fallback"].is_null());
 }
+
+/// The same `driftless map` again is „aktuell“: nothing computed, nothing written. The GPU
+/// switch does not matter (an equivalent map); `--neu` computes it anyway.
+#[test]
+fn map_twice_is_current() {
+    let dir = tmp("map-zweimal");
+    scan_with_images(&dir);
+    let out = dir.join("out");
+    slam(&dir, &out);
+    map(&dir, &out, &[]).success();
+    let json = fs::read(out.join("map.json")).unwrap();
+    for args in [&[][..], &["--gpu", "aus"]] {
+        map(&dir, &out, args)
+            .success()
+            .stdout(predicate::str::contains("Karte ist aktuell"))
+            .stdout(predicate::str::contains("Dicht:").not());
+    }
+    assert_eq!(fs::read(out.join("map.json")).unwrap(), json);
+    map(&dir, &out, &["--neu"])
+        .success()
+        .stdout(predicate::str::contains("Dicht:"))
+        .stdout(predicate::str::contains("Eingefärbt:"))
+        .stdout(predicate::str::contains("Karte ist aktuell").not());
+}

@@ -20,7 +20,9 @@
 //!
 //! The requested step always runs; the step before it is taken from its `*.bin` in the folder
 //! if that was written for the same input and settings (input id as in `submaps.bin`), and
-//! rebuilt otherwise. The `*.bin` files hold the cloud at full precision with the frame index
+//! rebuilt otherwise. Only a whole map ([`MapStep::All`]) that is current already
+//! ([`current_map`]) is not computed again: [`run_map`] says so and returns its `map.json`
+//! ([`recompute_map`] computes it all the same). The `*.bin` files hold the cloud at full precision with the frame index
 //! of every point (and, in `dense.bin`, the sensor rays the cleaning needs); LAS rounds
 //! coordinates and intensity and has no frame column, so it is export only.
 //!
@@ -397,6 +399,12 @@ fn dense_id(
 /// Input id of the clean step: the dense input and the clean settings.
 fn clean_id(dense_id: &str, clean_cfg: &CleanConfig) -> String {
     format!("{dense_id}clean v{CLEAN_VERSION} {clean_cfg:?}\n")
+}
+
+/// Input id of the color step: the clean input, the images and calibration
+/// ([`ColorInput::id`]) and the colour settings.
+fn color_id(clean_id: &str, images: &str, color_cfg: &ColorConfig) -> String {
+    format!("{clean_id}{images}color v{COLOR_VERSION} {color_cfg:?}\n")
 }
 
 /// Peak resident memory of this process so far (bytes), if the platform reports it.
@@ -1199,12 +1207,105 @@ pub fn fitting_stages(input: &MapInput, dir: &Path) -> Vec<&'static str> {
         .collect()
 }
 
+/// The `map.json` in [`MapRequest::out_dir`] if a whole map ([`MapStep::All`]) of `req` is
+/// there already, so that computing it again would give the same files: the same switches;
+/// an entry of the current input for every step (colour: skipped for the same reason, if
+/// the scan cannot be coloured); `dense.bin` and `clean.bin` of that input; every file the
+/// entries list, and every file `req` writes among them (with [`MapRequest::all_files`] the
+/// LAS of every step and `color.ply`). Cheap: the input ids (bag sizes, `traj.tum`, the
+/// calibration), the stage headers and the files' existence.
+pub fn current_map(req: &MapRequest) -> Option<Value> {
+    let input = &req.input;
+    if input.map.step != MapStep::All {
+        return None;
+    }
+    let dir = &req.out_dir;
+    let report: Value = serde_json::from_str(&fs::read_to_string(dir.join(REPORT)).ok()?).ok()?;
+    let switches = &input.map.switches;
+    if !MapSwitches::from_map_json(&report)?.same_map(switches) {
+        return None;
+    }
+    let odom = input.slam.config().ok()?.odom;
+    let project = discover_project(&input.scan).ok()?;
+    let traj_bytes = fs::read(input.slam_dir.join("traj.tum")).ok()?;
+    let dense = dense_id(
+        &project,
+        &input.slam,
+        &odom,
+        &traj_bytes,
+        &switches.dense_config(),
+    )
+    .ok()?;
+    let clean = clean_id(&dense, &switches.clean_config());
+    // Its warnings were given when the map was made.
+    let color = color_input(&input.scan, &project, &odom.lidar_to_imu, &Progress::new())
+        .map(|c| color_id(&clean, &c.id, &switches.color_config()));
+    let steps = &report["steps"];
+    let current = |step: &str, id: &str| {
+        steps[step].get("skipped").is_none()
+            && steps[step]["input_id"].as_str() == Some(hex(id).as_str())
+    };
+    let color_current = match &color {
+        Ok(id) => current("color", id),
+        Err(why) => steps["color"]["skipped"].as_str() == Some(why.as_str()),
+    };
+    if !(current("dense", &dense)
+        && current("clean", &clean)
+        && color_current
+        && stage_fits(&dir.join(DENSE_BIN), &dense)
+        && stage_fits(&dir.join(CLEAN_BIN), &clean))
+    {
+        return None;
+    }
+    let listed: Vec<&str> = ["dense", "clean", "color"]
+        .iter()
+        .filter_map(|s| steps[*s]["files"].as_array())
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let mut wanted = vec![DENSE_BIN, "removed.las", CLEAN_BIN];
+    wanted.push(if color.is_ok() {
+        "color.las"
+    } else {
+        "clean.las"
+    });
+    if req.all_files {
+        wanted.extend(["dense.las", "clean.las"]);
+        if color.is_ok() {
+            wanted.push("color.ply");
+        }
+    }
+    let complete =
+        wanted.iter().all(|f| listed.contains(f)) && listed.iter().all(|f| dir.join(f).is_file());
+    complete.then_some(report)
+}
+
 /// Runs the map as `driftless map` does; every console line goes to `progress` in the same
 /// order. Returns the `map.json` written to [`MapRequest::out_dir`].
+///
+/// A whole map ([`MapStep::All`]) that is current already ([`current_map`]) is not computed
+/// again: the step says so and returns the `map.json` that is there. [`recompute_map`]
+/// computes it all the same.
 ///
 /// A cancel is honoured before each step writes its files: a cancelled step writes nothing,
 /// steps finished before it keep their files, `map.json` is not written.
 pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError> {
+    req.input.map.check()?;
+    if let Some(report) = current_map(req) {
+        remove_stale_tmp(&req.out_dir, owns, progress);
+        progress.info(format!(
+            "Karte ist aktuell: gleiche Eingaben und Einstellungen wie in {}, nichts neu \
+             gerechnet",
+            req.out_dir.join(REPORT).display()
+        ));
+        return Ok(report);
+    }
+    recompute_map(req, progress)
+}
+
+/// [`run_map`] without the check whether the map is current: every requested step runs
+/// (`driftless map --neu`).
+pub fn recompute_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError> {
     let start = Instant::now();
     let input = &req.input;
     let switches = &input.map.switches;
@@ -1239,7 +1340,7 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
     let color_id = color
         .as_ref()
         .ok()
-        .map(|c| format!("{clean_id}{}color v{COLOR_VERSION} {color_cfg:?}\n", c.id));
+        .map(|c| color_id(&clean_id, &c.id, &color_cfg));
     let previous = fs::read_to_string(req.out_dir.join(REPORT))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
