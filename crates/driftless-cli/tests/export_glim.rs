@@ -3,18 +3,15 @@ use driftless_io::bag::writer::{BagWriter, Compression};
 use driftless_io::bag::Time;
 use driftless_io::msg::encode::{encode_imu, encode_pointcloud2};
 use driftless_io::msg::{ImuSample, LidarPoint};
+use driftless_io::testdir::TestDir;
 use predicates::prelude::*;
 use std::fs;
-use std::path::PathBuf;
 
-fn tmp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+fn tmp(name: &str) -> TestDir {
+    TestDir::new(format!(
         "driftless-export-glim-{}-{name}",
         std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    ))
 }
 
 fn time(t: f64) -> Time {
@@ -219,8 +216,10 @@ fn export_glim_truncated_bag_warns_and_keeps_data() {
     fs::write(dir.join("LIDAR_0.bag"), bytes).unwrap();
     export(&dir, &[])
         .success()
-        .stderr(predicate::str::contains("Warnung"))
-        .stderr(predicate::str::contains("truncated"));
+        .stderr(predicate::str::contains(
+            "Warnung: LIDAR_0.bag abgeschnitten (",
+        ))
+        .stderr(predicate::str::contains("neu vom Gerät kopieren"));
     let lidar = fs::read(dir.join("out/lidar.bin")).unwrap();
     assert!(lidar.len() > 8);
 }

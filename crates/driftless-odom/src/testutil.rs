@@ -1,7 +1,12 @@
-//! Synthetic scenes, trajectories and sensors for tests (feature `test-util`).
+//! Synthetic scenes, trajectories and sensors for tests (feature `test-util`), and scan
+//! folders of a walk ([`walk_bag`]) for the tests of the steps and the program.
 
+use driftless_io::bag::writer::{BagWriter, Compression};
+use driftless_io::msg::encode::{encode_imu, encode_pointcloud2};
 use driftless_io::msg::{ImuSample, LidarFrame, LidarPoint};
 use driftless_traj::nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
+use std::f64::consts::{FRAC_PI_2, PI};
+use std::path::Path;
 
 pub const G: f64 = 9.81;
 
@@ -171,6 +176,112 @@ impl Trajectory for Walk {
             UnitQuaternion::from_euler_angles(roll, pitch, yaw),
         )
     }
+}
+
+/// Laps on a circle of `radius` m around the origin of [`room_scene`] (clear of both boxes for
+/// a radius of 2 m), counter-clockwise, heading along the path, at `speed` m/s with a smooth
+/// start and stop of [`CIRCLE_RAMP`] s; still for `still` s at the start and at the end, so it
+/// ends where it started. Two laps or more close loops in SLAM.
+pub struct Circle {
+    pub still: f64,
+    pub radius: f64,
+    pub speed: f64,
+    pub laps: f64,
+}
+
+/// Time a [`Circle`] takes to reach full speed and to stop again (s).
+pub const CIRCLE_RAMP: f64 = 2.0;
+
+impl Circle {
+    fn length(&self) -> f64 {
+        2.0 * PI * self.radius * self.laps
+    }
+
+    /// Distance covered within `tau` seconds of a smooth-step speed ramp.
+    fn ramp(&self, tau: f64) -> f64 {
+        let s = (tau / CIRCLE_RAMP).clamp(0.0, 1.0);
+        self.speed * CIRCLE_RAMP * (s * s * s - 0.5 * s * s * s * s)
+    }
+
+    /// Seconds of motion: both ramps cover half of their duration at full speed.
+    fn moving(&self) -> f64 {
+        self.length() / self.speed + CIRCLE_RAMP
+    }
+
+    /// The whole walk, the still phases included (s).
+    pub fn duration(&self) -> f64 {
+        2.0 * self.still + self.moving()
+    }
+
+    /// Path length covered at time `t`.
+    fn s(&self, t: f64) -> f64 {
+        let tau = t - self.still;
+        let m = self.moving();
+        if tau <= 0.0 {
+            0.0
+        } else if tau < CIRCLE_RAMP {
+            self.ramp(tau)
+        } else if tau < m - CIRCLE_RAMP {
+            self.speed * (0.5 * CIRCLE_RAMP + tau - CIRCLE_RAMP)
+        } else if tau < m {
+            self.length() - self.ramp(m - tau)
+        } else {
+            self.length()
+        }
+    }
+}
+
+impl Trajectory for Circle {
+    fn pose(&self, t: f64) -> Isometry3<f64> {
+        let theta = self.s(t) / self.radius;
+        Isometry3::from_parts(
+            Translation3::new(self.radius * theta.cos(), self.radius * theta.sin(), 0.0),
+            UnitQuaternion::from_euler_angles(0.0, 0.0, theta + FRAC_PI_2),
+        )
+    }
+}
+
+/// A scan folder of a walk: `dir/LIDAR_0.bag` with the LiDAR frames of `scene` seen along
+/// `traj` from 0 to `duration` s (`/lidar`, 10 Hz, [`lidar_frame`] with `az_steps` per
+/// revolution) and its ideal IMU (`/imu`, 200 Hz, from 0.5 s before to 0.5 s after), all
+/// stamped from bag time `start` on. Without camera bags and calibration (SLAM and the map's
+/// clean step only).
+pub fn walk_bag(
+    dir: &Path,
+    scene: &Scene,
+    traj: &dyn Trajectory,
+    duration: f64,
+    az_steps: usize,
+    start: f64,
+) {
+    let mut w = BagWriter::new(Compression::None);
+    let lidar = w.add_connection("/lidar", "sensor_msgs/PointCloud2");
+    let imu = w.add_connection("/imu", "sensor_msgs/Imu");
+    let mut samples = imu_samples(traj, -0.5, duration + 0.5, 200.0)
+        .into_iter()
+        .peekable();
+    let at = |t: f64| driftless_io::testscan::time(start + t);
+    for frame in lidar_frames(scene, traj, 0.0, duration, az_steps, &Isometry3::identity()) {
+        // the IMU up to the frame first, in time order
+        while let Some(s) = samples.next_if(|s| s.stamp <= frame.stamp) {
+            let m = ImuSample {
+                stamp: start + s.stamp,
+                ..s
+            };
+            w.write_message(imu, at(s.stamp), &encode_imu(&m));
+        }
+        let data = encode_pointcloud2(start + frame.stamp, "l", &frame.points);
+        w.write_message(lidar, at(frame.stamp), &data);
+    }
+    for s in samples {
+        let m = ImuSample {
+            stamp: start + s.stamp,
+            ..s
+        };
+        w.write_message(imu, at(s.stamp), &encode_imu(&m));
+    }
+    std::fs::create_dir_all(dir).expect("scan folder");
+    std::fs::write(dir.join("LIDAR_0.bag"), w.finish()).expect("LIDAR_0.bag");
 }
 
 /// Constant angular velocity (rad/s, body frame) about the origin, no translation.

@@ -278,6 +278,12 @@ fn calib_check_finds_synthetic_truth() {
     assert!(json["summary"]["margin_direction"].as_f64().unwrap() > 0.5);
     assert_eq!(json["images"].as_array().unwrap().len(), 4);
     assert_eq!(json["variants"].as_array().unwrap().len(), 4 * 2 * 41);
+    assert_eq!(json["programm"]["version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        json["programm"]["commit"].is_string(),
+        "{}",
+        json["programm"]
+    );
     for label in ["best", "worst"] {
         assert!(out.join(format!("overlay_{label}_left_01.png")).is_file());
     }

@@ -20,6 +20,7 @@ fn run(dir: &str, label: &str, maps: Vec<MapInfo>) -> RunInfo {
         cloud: None,
         maps,
         history: Vec::new(),
+        incomplete: false,
     }
 }
 
@@ -40,6 +41,7 @@ fn unselected() -> AppState {
         settings: None,
         clouds: vec![PathBuf::from("/p/scans/buero/slam-001/karte-001/color.las")],
         surfaces: Vec::new(),
+        incomplete: false,
     };
     let project = Project {
         dir: PathBuf::from("/p"),
@@ -49,6 +51,7 @@ fn unselected() -> AppState {
             path: PathBuf::from("/daten/buero"),
             name: "buero".into(),
             extra_runs: Vec::new(),
+            bags: Vec::new(),
         }],
     };
     AppState {
@@ -96,13 +99,13 @@ fn left_shows_scans_runs_maps() {
         "order {order:?} at {tops:?}"
     );
     h.get_by_label(text::ADD_SCAN);
-    h.get_by_label(text::ADD_RUN);
+    // „Lauf hinzufügen …“ (a command-line matter) is in ☰ only, not under every scan
+    assert!(h.query_by_label(text::ADD_RUN).is_none());
     // without a selection only the scan's card shows
     let mut h = harness(unselected());
     h.run();
     h.get_by_label("buero");
     assert!(h.query_by_label("SLAM 001").is_none());
-    assert!(h.query_by_label(text::ADD_RUN).is_none());
 }
 
 #[test]
@@ -141,11 +144,9 @@ fn clicking_run_selects_it() {
 
 #[test]
 fn add_buttons_return_actions() {
+    // „Lauf hinzufügen …“ is in ☰ (`ui_layout.rs`)
     let mut h = harness(state());
     h.run();
-    h.get_by_label(text::ADD_RUN).click();
-    h.run();
-    assert_eq!(h.state().1, Some(Action::PickAddRun("buero".into())));
     h.get_by_label(text::ADD_SCAN).click();
     h.run();
     assert_eq!(h.state().1, Some(Action::PickAddScan));
@@ -162,6 +163,7 @@ fn missing_scan_is_marked() {
             path: gone.to_path_buf(),
             name: "buero".into(),
             extra_runs: Vec::new(),
+            bags: Vec::new(),
         }],
     };
     let mut state = AppState::default();

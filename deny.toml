@@ -3,6 +3,9 @@ targets = [
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
 ]
+# The debug viewer (`driftless view`, rerun) is not in the packages, but a build with it must
+# pass the same checks: its crates are checked as well.
+features = ["driftless-cli/debug-viewer"]
 
 [licenses]
 # MPL-2.0 only for dependencies we use unmodified (no code taken over).

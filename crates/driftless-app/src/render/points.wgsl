@@ -30,13 +30,19 @@ struct Out {
     @location(1) color: vec3<f32>,
 };
 
-// The quality ramp of `driftless_steps::overlay::quality_color`: red (0) via yellow (0.5)
-// to green (1).
+// The quality ramp of `driftless_steps::overlay::quality_color`: red at QUALITY_RED and below,
+// green at QUALITY_GREEN and above, logarithmic between them (yellow halfway).
+const QUALITY_RED: f32 = 0.01;
+const QUALITY_GREEN: f32 = 0.25;
 fn quality_color(q: f32) -> vec3<f32> {
-    if q < 0.5 {
-        return vec3<f32>(1.0, q * 2.0, 0.0);
+    var t = 0.0;
+    if q > QUALITY_RED {
+        t = clamp(log(q / QUALITY_RED) / log(QUALITY_GREEN / QUALITY_RED), 0.0, 1.0);
     }
-    return vec3<f32>(2.0 - q * 2.0, 1.0, 0.0);
+    if t < 0.5 {
+        return vec3<f32>(1.0, t * 2.0, 0.0);
+    }
+    return vec3<f32>(2.0 - t * 2.0, 1.0, 0.0);
 }
 
 // The colour of scan `scan` (bits 16–31 of `extra`): `SCAN_COLORS` of `render/mod.rs`,

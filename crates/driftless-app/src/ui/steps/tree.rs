@@ -1,17 +1,20 @@
 //! What „Daten“ shows below the card of a scan: its runs („SLAM 001“ …) → maps → clouds and
-//! surfaces („Oberfläche 001“, a stale one with „veraltet – Karte oder Lauf neu gerechnet“), and
+//! surfaces („Oberfläche 001“, a stale one with „veraltet – Karte oder Lauf neu gerechnet“; a
+//! hint of its report small below it, „Hinweis: Stellenweise offen“, in full on hover), and
 //! per run its history („Verlauf“: each state with number, kind, time and start↔end gap). Below
 //! the scans the models („Modell 001“): per scan of a model its number, name and how surely it
 //! was placed (✓ sicher, ⚠ unsicher, ✗ gescheitert, the reason on hover) with overlap and
 //! residual („Punktpaare“ before them if placed by hand, the fit of the pairs and the wall
-//! residual on hover), under an unsure or failed one „Von Hand ausrichten“
-//! ([`Action::StartPairs`]); then the point pairs of the model („Punktpaare“, each with its
-//! switch, as the loops of a run; one the merge cannot use marked „nicht nutzbar“, why on
-//! hover), `modell.las` and the surfaces of the model. Names too long for the field end in „…“;
+//! residual – or „Wände nicht messbar“ – on hover), under an unsure or failed one „Von Hand
+//! ausrichten“ ([`Action::StartPairs`]); then the point pairs of the model („Punktpaare“, each
+//! with its switch, as the loops of a run; one the merge cannot use marked „nicht nutzbar“, why
+//! on hover), `modell.las` and the surfaces of the model. Names too long for the field end in „…“;
 //! the full name and the folder show on hover. A run, a map, a model and a surface have
-//! „Exportieren …“ in their context menu (right click, [`Action::OpenExport`]).
+//! „Exportieren …“ in their context menu (right click, [`Action::OpenExport`]). A run or map
+//! whose report is missing but which holds finished results is marked „unvollständig – neu
+//! rechnen“, why and what to do on hover ([`crate::leftovers`]).
 
-use super::badge;
+use super::{badge, model_stale_hint};
 use crate::project::{MapInfo, ModelInfo, RunInfo, SurfaceInfo};
 use crate::render::SCAN_COLORS;
 use crate::ui::theme::{icon, DARK};
@@ -22,7 +25,7 @@ use eframe::egui::{
     self, collapsing_header::CollapsingState, Align, Color32, Id, Layout, Response, RichText,
     Sense, Ui,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Height of the line of a scan of a model (points).
 const MEMBER_ROW_HEIGHT: f32 = 18.0;
@@ -32,9 +35,14 @@ const DOT: f32 = 8.0;
 /// A run of a scan with its cloud, maps and history, below the scan's card in „Daten“.
 pub(super) fn run_node(ui: &mut Ui, state: &AppState, run: &RunInfo, action: &mut Option<Action>) {
     let selected = state.selection == Selection::Run(run.dir.clone());
+    let label = sized(state, &run.label, &run.dir);
     let header = |ui: &mut Ui| {
-        let hover = format!("{}\n{}", run.label, run.dir.display());
-        entry(ui, selected, run.label.clone(), &hover)
+        if run.incomplete {
+            incomplete_entry(ui, selected, &label, text::RUN_INCOMPLETE_HINT, &run.dir)
+        } else {
+            let hover = format!("{label}\n{}", run.dir.display());
+            entry(ui, selected, label.clone(), &hover)
+        }
     };
     let header = if run.cloud.is_none() && run.maps.is_empty() && run.history.is_empty() {
         leaf(ui, header)
@@ -51,7 +59,26 @@ pub(super) fn run_node(ui: &mut Ui, state: &AppState, run: &RunInfo, action: &mu
             }
         })
     };
-    export_menu(&header, || ExportSource::Run(run.dir.clone()), action);
+    // a run of the project goes to the trash; one the CLI made and was added by hand is only
+    // taken out (its folder is the user's)
+    let added = |id: &str| {
+        let entry = state.project.as_ref().and_then(|p| p.scan(id));
+        entry.is_some_and(|e| e.extra_runs.contains(&run.dir))
+    };
+    let manage = match state.run(&run.dir) {
+        Some((scan, _)) if added(&scan.id) => Manage::RemoveRun {
+            scan: scan.id.clone(),
+            run: run.dir.clone(),
+        },
+        _ => Manage::Delete(run.dir.clone()),
+    };
+    entry_menu(
+        &header,
+        state,
+        || ExportSource::Run(run.dir.clone()),
+        manage,
+        action,
+    );
     if header.clicked() {
         *action = Some(Action::Select(Selection::Run(run.dir.clone())));
     }
@@ -82,9 +109,14 @@ fn history_node(ui: &mut Ui, state: &AppState, run: &RunInfo, action: &mut Optio
 
 fn map_node(ui: &mut Ui, state: &AppState, map: &MapInfo, action: &mut Option<Action>) {
     let selected = state.selection == Selection::Map(map.dir.clone());
+    let label = sized(state, &map.label, &map.dir);
     let header = |ui: &mut Ui| {
-        let hover = format!("{}\n{}", map.label, map.dir.display());
-        entry(ui, selected, map.label.clone(), &hover)
+        if map.incomplete {
+            incomplete_entry(ui, selected, &label, text::MAP_INCOMPLETE_HINT, &map.dir)
+        } else {
+            let hover = format!("{label}\n{}", map.dir.display());
+            entry(ui, selected, label.clone(), &hover)
+        }
     };
     let header = if map.clouds.is_empty() && map.surfaces.is_empty() {
         leaf(ui, header)
@@ -98,7 +130,20 @@ fn map_node(ui: &mut Ui, state: &AppState, map: &MapInfo, action: &mut Option<Ac
             }
         })
     };
-    export_menu(&header, || ExportSource::Map(map.dir.clone()), action);
+    // a map the CLI wrote into the run folder is the run folder
+    let in_run = state.run(&map.dir).is_some();
+    let manage = if in_run {
+        Manage::Locked(text::MAP_IN_RUN.to_string())
+    } else {
+        Manage::Delete(map.dir.clone())
+    };
+    entry_menu(
+        &header,
+        state,
+        || ExportSource::Map(map.dir.clone()),
+        manage,
+        action,
+    );
     if header.clicked() {
         *action = Some(Action::Select(Selection::Map(map.dir.clone())));
     }
@@ -113,19 +158,24 @@ pub(super) fn model_node(
 ) {
     let selected = state.selection == Selection::Model(model.dir.clone());
     let stale = state.map_status.get(&model.dir).is_some_and(|s| s.stale);
+    let label = sized(state, &model.label, &model.dir);
     let header = |ui: &mut Ui| {
         if stale {
-            let name = text::model_stale(&model.label);
+            let name = if model.other_version() {
+                text::model_stale_version(&label)
+            } else {
+                text::model_stale(&label)
+            };
             let hover = format!(
                 "{name}\n{}\n{}",
-                text::STATUS_MODEL_STALE_HINT,
+                model_stale_hint(model),
                 model.dir.display()
             );
             let warn = ui.visuals().warn_fg_color;
             entry(ui, selected, RichText::new(name).color(warn), &hover)
         } else {
-            let hover = format!("{}\n{}", model.label, model.dir.display());
-            entry(ui, selected, model.label.clone(), &hover)
+            let hover = format!("{label}\n{}", model.dir.display());
+            entry(ui, selected, label.clone(), &hover)
         }
     };
     let header = branch(ui, Id::new(("model", &model.dir)), header, |ui| {
@@ -151,7 +201,14 @@ pub(super) fn model_node(
             surface_leaf(ui, state, surface, action);
         }
     });
-    export_menu(&header, || ExportSource::Model(model.dir.clone()), action);
+    let manage = Manage::Delete(model.dir.clone());
+    entry_menu(
+        &header,
+        state,
+        || ExportSource::Model(model.dir.clone()),
+        manage,
+        action,
+    );
     if header.clicked() {
         *action = Some(Action::Select(Selection::Model(model.dir.clone())));
     }
@@ -183,11 +240,17 @@ fn member_rows(ui: &mut Ui, state: &AppState, k: usize, m: &ModelMember) {
         hover += &format!("\n{}", text::member_pairs_fit(rms));
     }
     if !reference {
-        hover += &format!(
-            "\n{}\n{}",
-            text::member_walls(m.wall_residual_mm),
-            text::VERDICT_HINT
-        );
+        // „Wände nicht messbar“ only once: the reason may say it already
+        let said = m
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains(text::WALLS_UNMEASURABLE));
+        match m.wall_residual_mm {
+            Some(w) => hover += &format!("\n{}", text::member_walls(w)),
+            None if said => {}
+            None => hover += &format!("\n{}", text::WALLS_UNMEASURABLE),
+        }
+        hover += &format!("\n{}", text::VERDICT_HINT);
     }
     let [r, g, b] = SCAN_COLORS[k % SCAN_COLORS.len()];
     let row = ui
@@ -311,34 +374,121 @@ pub(super) fn surface_leaf(
     action: &mut Option<Action>,
 ) {
     let selected = state.selection == Selection::Surface(surface.dir.clone());
+    let label = sized(state, &surface.label, &surface.dir);
+    // its hints for the user in full on hover, below the folder
+    let hover = |name: &str| {
+        let mut hover = format!("{name}\n{}", surface.dir.display());
+        for hint in &surface.hints {
+            hover += &format!("\n\n{hint}");
+        }
+        hover
+    };
     let r = leaf(ui, |ui| {
         if surface.stale {
-            let name = text::surface_stale(&surface.label);
-            let hover = format!("{name}\n{}", surface.dir.display());
+            let name = text::surface_stale(&label);
             let warn = ui.visuals().warn_fg_color;
-            entry(ui, selected, RichText::new(name).color(warn), &hover)
+            entry(
+                ui,
+                selected,
+                RichText::new(&name).color(warn),
+                &hover(&name),
+            )
         } else {
-            let hover = format!("{}\n{}", surface.label, surface.dir.display());
-            entry(ui, selected, surface.label.clone(), &hover)
+            entry(ui, selected, label.clone(), &hover(&label))
         }
     });
-    export_menu(&r, || ExportSource::Surface(surface.dir.clone()), action);
+    for hint in &surface.hints {
+        hint_line(ui, hint);
+    }
+    let manage = Manage::Delete(surface.dir.clone());
+    entry_menu(
+        &r,
+        state,
+        || ExportSource::Surface(surface.dir.clone()),
+        manage,
+        action,
+    );
     if r.clicked() {
         *action = Some(Action::Select(Selection::Surface(surface.dir.clone())));
     }
 }
 
-/// The context menu (right click) of `entry`: „Exportieren …“ opens the window for `source`.
-fn export_menu(
+/// A hint of a surface for the user below its entry: small and muted (a hint, not an error),
+/// only its title ([`text::surface_hint_short`]), the whole hint on hover.
+fn hint_line(ui: &mut Ui, hint: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(ui.spacing().indent + ui.spacing().button_padding.x);
+        let line = format!("{} {}", icon::HINT, text::surface_hint_short(hint));
+        let line = RichText::new(line).small().color(DARK.text_dim);
+        ui.add(egui::Label::new(line).wrap()).on_hover_text(hint);
+    });
+}
+
+/// What the context menu of an entry offers besides „Exportieren …“.
+enum Manage {
+    /// „Löschen …“ of the folder (to the trash), locked while it is shown or computed.
+    Delete(PathBuf),
+    /// „Löschen …“ locked for good, with the reason.
+    Locked(String),
+    /// „Aus Projekt entfernen“ of a run the CLI made: only the entry.
+    RemoveRun { scan: String, run: PathBuf },
+}
+
+/// The context menu (right click) of `entry`: „Exportieren …“ opens the window for `source`;
+/// then „Löschen …“ (asks first, [`Action::AskDelete`]; locked with the reason while a step
+/// works on the folder or on something depending on it) or „Aus Projekt entfernen“.
+fn entry_menu(
     entry: &Response,
+    state: &AppState,
     source: impl FnOnce() -> ExportSource,
+    manage: Manage,
     action: &mut Option<Action>,
 ) {
     entry.context_menu(|ui| {
         if ui.button(text::EXPORT).clicked() {
             *action = Some(Action::OpenExport(source()));
         }
+        ui.separator();
+        match manage {
+            Manage::Delete(dir) => {
+                // what is only shown, the question offers to take out of the view
+                let blocked = state.delete_computing(&dir);
+                let r = ui.add_enabled(blocked.is_none(), egui::Button::new(text::DELETE));
+                if r.clicked() {
+                    *action = Some(Action::AskDelete(dir));
+                }
+                if let Some(why) = blocked {
+                    r.on_disabled_hover_text(why);
+                }
+            }
+            Manage::Locked(why) => {
+                ui.add_enabled(false, egui::Button::new(text::DELETE))
+                    .on_disabled_hover_text(why);
+            }
+            Manage::RemoveRun { scan, run } => {
+                if ui.button(text::REMOVE_RUN).clicked() {
+                    *action = Some(Action::RemoveRun { scan, run });
+                }
+            }
+        }
     });
+}
+
+/// The name of an entry with the size of its folder, once measured („Karte 001 · 640 MB“).
+fn sized(state: &AppState, label: &str, dir: &Path) -> String {
+    match state.folder_size(dir) {
+        Some(bytes) => text::with_size(label, bytes),
+        None => label.to_string(),
+    }
+}
+
+/// A run or map without its report that holds finished results: „SLAM 001 · unvollständig –
+/// neu rechnen“ in the colour of a warning, what happened and what to do on hover.
+fn incomplete_entry(ui: &mut Ui, selected: bool, label: &str, why: &str, dir: &Path) -> Response {
+    let name = text::incomplete_folder(label);
+    let hover = format!("{name}\n{why}\n{}", dir.display());
+    let warn = ui.visuals().warn_fg_color;
+    entry(ui, selected, RichText::new(name).color(warn), &hover)
 }
 
 /// A selectable name, cut with „…“ where the panel ends, the full text on hover.

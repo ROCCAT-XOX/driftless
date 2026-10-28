@@ -5,8 +5,12 @@ use std::path::{Path, PathBuf};
 /// Errors that make a folder unusable as a project.
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    /// The folder cannot be listed (no permission, a drive gone, …).
+    #[error("Ordner nicht lesbar: {path} ({source})")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("Ordner nicht gefunden: {0}")]
     NotFound(PathBuf),
     #[error("Kein Ordner: {0}")]
@@ -68,8 +72,12 @@ pub fn discover_project(root: &Path) -> Result<Project, ProjectError> {
     }
     let mut lidar_bags = Vec::new();
     let mut image_bags = Vec::new();
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
+    let unreadable = |source| ProjectError::Io {
+        path: root.to_path_buf(),
+        source,
+    };
+    for entry in std::fs::read_dir(root).map_err(unreadable)? {
+        let entry = entry.map_err(unreadable)?;
         // `Path::is_file` follows symlinks (`DirEntry::file_type` does not).
         if !entry.path().is_file() {
             continue;

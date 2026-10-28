@@ -1,6 +1,6 @@
-//! `driftless surface <scan> --slam <ziel> [--map <karte>] [-o <ziel>]`: the photo-like
-//! surface of a map as glb and obj (`oberflaeche.glb`, `oberflaeche.obj` with `.mtl` and
-//! texture pages, `oberflaeche.json`). The run itself is
+//! `driftless surface <scan> --slam <ziel> [--map <karte>] [-o <ziel>] [--obj]`: the
+//! photo-like surface of a map as glb (`oberflaeche.glb`, `oberflaeche.json`; with `--obj`
+//! also `oberflaeche.obj` with `.mtl` and texture pages). The run itself is
 //! [`driftless_steps::surface::run_surface`]; with `--model <modell>` instead of the scan
 //! the surface of a merged model ([`driftless_steps::surface::run_model_surface`]).
 
@@ -56,6 +56,10 @@ pub struct Args {
     /// CPU mit Hinweis), an (verlangen) oder aus (nur CPU). Das Ergebnis ist gleichwertig.
     #[arg(long, value_name = "auto|an|aus", default_value_t = GpuPref::Auto)]
     gpu: GpuPref,
+    /// Auch oberflaeche.obj mit .mtl und den Texturseiten als JPEG schreiben (Z oben); sonst
+    /// nur oberflaeche.glb (ein OBJ macht auch `driftless export`)
+    #[arg(long)]
+    obj: bool,
 }
 
 fn config(args: &Args) -> SurfaceConfig {
@@ -86,12 +90,14 @@ fn request(args: &Args) -> Result<SurfaceRequest, Box<dyn std::error::Error>> {
         config: config(args),
         texture: !args.no_texture,
         gpu: args.gpu,
+        obj: args.obj,
     })
 }
 
 fn model_request(args: &Args, model: &Path) -> ModelSurfaceRequest {
     ModelSurfaceRequest {
         model_dir: model.to_path_buf(),
+        model: None,
         out_dir: args
             .output
             .clone()
@@ -99,6 +105,7 @@ fn model_request(args: &Args, model: &Path) -> ModelSurfaceRequest {
         config: config(args),
         texture: !args.no_texture,
         gpu: args.gpu,
+        obj: args.obj,
     }
 }
 

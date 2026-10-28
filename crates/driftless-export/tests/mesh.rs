@@ -7,19 +7,17 @@ use driftless_export::mesh::{
 };
 use driftless_export::{ExportError, PHASE_WRITE};
 use driftless_io::progress::{LogLine, Progress};
+use driftless_io::testdir::TestDir;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::{ExtendedColorType, ImageEncoder};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(format!(
         "driftless-export-mesh-{}-{name}",
         std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    ))
 }
 
 /// Names of the files in `dir`, sorted.
@@ -508,8 +506,7 @@ fn glb_foreign_oddities_are_clear_errors() {
 
 #[test]
 fn obj_round_trip() {
-    let dir = temp_dir("obj-round").join("Büro Scan");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = temp_dir("obj-round").inside("Büro Scan");
     let mut mesh = small_mesh();
     // A coordinate f32 cannot hold is written in full.
     mesh.pages[2].positions[3] = [500_000.123_456_789, 5_400_000.987_654_321, 2.5];

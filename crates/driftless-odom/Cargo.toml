@@ -11,8 +11,9 @@ repository.workspace = true
 workspace = true
 
 [features]
-# Exposes `testutil` (synthetic scenes, trajectories, sensors) to other crates' tests.
-test-util = []
+# Exposes `testutil` (synthetic scenes, trajectories, sensors, scan folders of a walk) to
+# other crates' tests.
+test-util = ["driftless-io/test-util"]
 
 [dependencies]
 driftless-io = { path = "../driftless-io" }

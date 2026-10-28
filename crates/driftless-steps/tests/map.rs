@@ -1,16 +1,19 @@
-//! `run_map` and `folder_fits` on synthetic scans (no camera images: colouring is skipped).
+//! `run_map` and `folder_fits` on synthetic scans (most without camera images: colouring is
+//! skipped).
 
 use driftless_io::progress::{Progress, ProgressSnapshot};
-use driftless_io::testscan::{room_bag, room_bag_secs, tmp};
+use driftless_io::testscan::{furnished_room_bag, room_bag, room_bag_secs, scan_with_images, tmp};
+use driftless_map::SMOOTH_CHUNK;
 use driftless_steps::map::{
-    fitting_stages, folder_fits, run_map, MapInput, MapRequest, MapSettings, MapStep, CLEAN_BIN,
-    DENSE_BIN,
+    clean_stage_id, current_map, dense_stage_id, fitting_stages, folder_fits, recompute_map,
+    recompute_map_from, run_map, MapInput, MapRequest, MapSettings, MapStep, CLEAN_BIN, DENSE_BIN,
 };
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::{correct, StepError};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 fn slam(scan: &Path, out: &Path, reuse: bool) {
     let req = SlamRequest {
@@ -39,6 +42,7 @@ fn request(scan: &Path, slam_dir: &Path, out_dir: &Path, step: MapStep) -> MapRe
     MapRequest {
         input: input(scan, slam_dir, step),
         out_dir: out_dir.to_path_buf(),
+        all_files: false,
     }
 }
 
@@ -96,6 +100,44 @@ fn map_cancelled_writes_nothing() {
     assert_eq!(files(&out), before);
 }
 
+/// „Abbrechen“ while the clean step smooths the walls stops it after its next chunk of points
+/// (before, the smoothing ran to its end: about 90 s on a real scan at 0,5 cm), and the step
+/// writes nothing – as for the merge's smoothing.
+#[test]
+fn map_smoothing_can_be_cancelled() {
+    let dir = tmp("steps-map-glaetten");
+    // the furnished room at 0,5 cm (Maximal): points for more than two chunks
+    furnished_room_bag(&dir, true, [0.0; 3], 0.0);
+    let out = dir.join("out");
+    slam(&dir, &out, false);
+    let fine = |step| {
+        let mut req = request(&dir, &out, &out, step);
+        req.input.map.switches.voxel = 0.005;
+        req
+    };
+    run_map(&fine(MapStep::Dense), &Progress::new()).unwrap();
+    let before = files(&out);
+    let p = Progress::new();
+    let handle = p.clone();
+    let seen = Arc::new(Mutex::new(ProgressSnapshot::default()));
+    let last = seen.clone();
+    let p = p.with_observer(move |s: &ProgressSnapshot| {
+        if s.phase == "Glätten" {
+            *last.lock().unwrap() = s.clone();
+            if s.done > 0 {
+                handle.cancel();
+            }
+        }
+    });
+    let err = run_map(&fine(MapStep::Clean), &p).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    assert_eq!(files(&out), before, "nothing of the clean step written");
+    let seen = seen.lock().unwrap().clone();
+    let total = seen.total.expect("the points to smooth");
+    assert!(total > 2 * SMOOTH_CHUNK as u64, "{seen:?}");
+    assert_eq!(seen.done, SMOOTH_CHUNK as u64, "{seen:?}");
+}
+
 #[test]
 fn map_out_dir_separate_from_slam_dir() {
     let dir = tmp("steps-map-out-dir");
@@ -108,6 +150,64 @@ fn map_out_dir_separate_from_slam_dir() {
     let p = Progress::new();
     let report = run_map(&request(&dir, &slam_dir, &map_dir, MapStep::All), &p).unwrap();
     assert_eq!(files(&slam_dir), slam_files, "SLAM folder untouched");
+    // No images: the cleaned cloud is the one to look at; no `dense.las`.
+    let names: Vec<String> = files(&map_dir).into_keys().collect();
+    assert_eq!(
+        names,
+        [
+            "clean.bin",
+            "clean.las",
+            "dense.bin",
+            "map.json",
+            "removed.las"
+        ]
+    );
+    assert_eq!(
+        report["steps"]["dense"]["files"],
+        serde_json::json!(["dense.bin"])
+    );
+    assert_eq!(
+        report["steps"]["clean"]["files"],
+        serde_json::json!(["clean.las", "removed.las", "clean.bin"])
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(map_dir.join("map.json")).unwrap()).unwrap();
+    assert_eq!(json, report);
+    assert_eq!(
+        report["programm"],
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "commit": driftless_steps::PROGRAM.commit,
+        })
+    );
+    assert_eq!(report["steps"]["dense"]["reused"], false);
+    assert!(
+        report["steps"]["clean"]["stats"]["dense_quality"]["patches"].is_number(),
+        "{report}"
+    );
+    assert!(report["steps"]["color"]["skipped"].is_string(), "{report}");
+    // no images: a warning, as on the console; the reason first, then what to do
+    assert!(p.take_log().iter().any(|l| matches!(
+        l,
+        driftless_io::progress::LogLine::Warning(w) if w.starts_with("keine Kamerabilder: ")
+            && w.contains(" – Karte nicht eingefärbt (clean.las statt color.las); ")
+            && w.ends_with("die Karte neu rechnen")
+    )));
+}
+
+/// With `all_files` every step writes its cloud as LAS, as before the first release.
+#[test]
+fn all_files_writes_every_cloud() {
+    let dir = tmp("steps-map-all-files");
+    room_bag(&dir, true);
+    let slam_dir = dir.join("slam");
+    slam(&dir, &slam_dir, false);
+    let map_dir = dir.join("karte");
+    let req = MapRequest {
+        all_files: true,
+        ..request(&dir, &slam_dir, &map_dir, MapStep::All)
+    };
+    let report = run_map(&req, &Progress::new()).unwrap();
     let names: Vec<String> = files(&map_dir).into_keys().collect();
     assert_eq!(
         names,
@@ -120,20 +220,69 @@ fn map_out_dir_separate_from_slam_dir() {
             "removed.las"
         ]
     );
-    let json: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(map_dir.join("map.json")).unwrap()).unwrap();
-    assert_eq!(json, report);
-    assert_eq!(report["steps"]["dense"]["reused"], false);
-    assert!(
-        report["steps"]["clean"]["stats"]["dense_quality"]["patches"].is_number(),
-        "{report}"
+    assert_eq!(
+        report["steps"]["dense"]["files"],
+        serde_json::json!(["dense.las", "dense.bin"])
     );
-    assert!(report["steps"]["color"]["skipped"].is_string(), "{report}");
-    // no images: a warning, as on the console
+    // The same stages as without: the switch is part of no id.
+    let plain = dir.join("karte-ohne");
+    let again = run_map(
+        &request(&dir, &slam_dir, &plain, MapStep::All),
+        &Progress::new(),
+    )
+    .unwrap();
+    for step in ["dense", "clean"] {
+        assert_eq!(
+            again["steps"][step]["input_id"],
+            report["steps"][step]["input_id"]
+        );
+    }
+    for f in ["dense.bin", "clean.bin", "clean.las", "removed.las"] {
+        assert_eq!(
+            fs::read(map_dir.join(f)).unwrap(),
+            fs::read(plain.join(f)).unwrap()
+        );
+    }
+}
+
+/// A cloud an earlier run wrote is listed as current only while it fits: the same input keeps
+/// it, another trajectory makes it stale (warned, not deleted), also when its step ran again
+/// without writing it.
+#[test]
+fn clouds_of_an_earlier_run_fit_only_the_same_input() {
+    let dir = tmp("steps-map-earlier-clouds");
+    room_bag(&dir, true);
+    let slam_dir = dir.join("slam");
+    slam(&dir, &slam_dir, false);
+    let all = MapRequest {
+        all_files: true,
+        ..request(&dir, &slam_dir, &slam_dir, MapStep::All)
+    };
+    run_map(&all, &Progress::new()).unwrap();
+    // The same input without the switch: `dense.las` still fits.
+    let plain = request(&dir, &slam_dir, &slam_dir, MapStep::All);
+    let report = run_map(&plain, &Progress::new()).unwrap();
+    assert_eq!(report["stale"], serde_json::json!([]));
+    assert_eq!(
+        report["steps"]["dense"]["files"],
+        serde_json::json!(["dense.las", "dense.bin"])
+    );
+    // Another trajectory: the dense step runs anew without writing `dense.las`.
+    let traj = fs::read_to_string(slam_dir.join("traj.tum")).unwrap();
+    fs::write(slam_dir.join("traj.tum"), format!("{traj}# geändert\n")).unwrap();
+    let p = Progress::new();
+    let report = run_map(&plain, &p).unwrap();
+    assert_eq!(report["stale"], serde_json::json!(["dense.las"]));
+    assert_eq!(
+        report["steps"]["dense"]["files"],
+        serde_json::json!(["dense.bin"])
+    );
     assert!(p.take_log().iter().any(|l| matches!(
         l,
-        driftless_io::progress::LogLine::Warning(w) if w.starts_with("nicht eingefärbt, ")
+        driftless_io::progress::LogLine::Warning(w)
+            if w.starts_with("dense.las stammt aus einem früheren Lauf")
     )));
+    assert!(slam_dir.join("dense.las").is_file(), "not deleted");
 }
 
 #[test]
@@ -205,6 +354,130 @@ fn fitting_stages_check_the_input() {
     assert_eq!(fitting_stages(&other, &map_dir), [DENSE_BIN, CLEAN_BIN]);
 }
 
+/// No stage id holds the program version: a new release keeps every map that still fits.
+/// Each holds the version of its step instead.
+#[test]
+fn stage_ids_hold_no_program_version() {
+    let dir = tmp("steps-map-ids");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    slam(&dir, &out, false);
+    let input = input(&dir, &out, MapStep::All);
+    let dense = dense_stage_id(&input).unwrap();
+    let clean = clean_stage_id(&input).unwrap();
+    for id in [&dense, &clean] {
+        assert!(!id.contains(env!("CARGO_PKG_VERSION")), "{id}");
+        assert!(!id.contains("driftless"), "{id}");
+    }
+    assert!(dense.starts_with("map dense v1\n"), "{dense}");
+    assert!(clean.starts_with(&dense), "{clean}");
+    assert!(clean.contains("clean v3 "), "{clean}");
+}
+
+/// A killed run leaves `<name>.tmp` files; the next map removes those of its own files at
+/// its start, and only those: in the SLAM folder (where the CLI writes the map) a `.tmp` of
+/// the SLAM run or of a surface stays.
+#[test]
+fn stale_tmp_files_of_the_map_are_removed() {
+    let dir = tmp("steps-map-tmp");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    slam(&dir, &out, false);
+    let own = [
+        "dense.las.tmp",
+        "dense.bin.tmp",
+        "clean.las.tmp",
+        "removed.las.tmp",
+        "clean.bin.tmp",
+        "color.las.tmp",
+        "color.ply.tmp",
+        "map.json.tmp",
+    ];
+    let foreign = ["traj.tum.tmp", "map.las.tmp", "slam.json.tmp", "notiz.tmp"];
+    for f in own.iter().chain(&foreign) {
+        fs::write(out.join(f), b"halb").unwrap();
+    }
+    run_map(&request(&dir, &out, &out, MapStep::All), &Progress::new()).unwrap();
+    for f in own {
+        assert!(!out.join(f).exists(), "{f} left");
+    }
+    for f in foreign {
+        assert!(out.join(f).exists(), "{f} removed");
+    }
+}
+
+/// `map.json` goes before the first file of a map is written and comes back last: a map
+/// that stops in between (here: `removed.las` cannot be replaced, after `dense.bin` was
+/// written) leaves no report and does not fit, also not the input of the old report.
+#[test]
+fn report_goes_before_the_first_write() {
+    let dir = tmp("steps-map-report-first");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    slam(&dir, &out, false);
+    let all = input(&dir, &out, MapStep::All);
+    run_map(&request(&dir, &out, &out, MapStep::All), &Progress::new()).unwrap();
+    assert!(folder_fits(&all, &out));
+    fs::remove_file(out.join("removed.las")).unwrap();
+    fs::create_dir_all(out.join("removed.las").join("x")).unwrap();
+    let mut coarse = request(&dir, &out, &out, MapStep::All);
+    coarse.input.map.switches.voxel *= 2.0;
+    let err = run_map(&coarse, &Progress::new()).unwrap_err();
+    assert!(err.to_string().contains("removed.las"), "{err}");
+    assert!(!out.join("map.json").exists(), "the old report stayed");
+    assert!(!folder_fits(&all, &out));
+    assert!(!folder_fits(&coarse.input, &out));
+    assert!(!files(&out).keys().any(|f| f.ends_with(".tmp")));
+}
+
+/// A stage of another run next to the report of an earlier one (what a run of an older
+/// version left when it was killed between its files) does not fit; a stage that is missing
+/// is no reason (`dense.bin` may be deleted to save space).
+#[test]
+fn stage_of_another_run_next_to_an_old_report_does_not_fit() {
+    let dir = tmp("steps-map-mixed");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    slam(&dir, &out, false);
+    let all = input(&dir, &out, MapStep::All);
+    run_map(&request(&dir, &out, &out, MapStep::All), &Progress::new()).unwrap();
+    let mut coarse = request(&dir, &out, &dir.join("grob"), MapStep::All);
+    coarse.input.map.switches.voxel *= 2.0;
+    run_map(&coarse, &Progress::new()).unwrap();
+    let keep = fs::read(out.join(DENSE_BIN)).unwrap();
+    fs::copy(dir.join("grob").join(DENSE_BIN), out.join(DENSE_BIN)).unwrap();
+    assert!(!folder_fits(&all, &out), "dense.bin of another run");
+    fs::write(out.join(DENSE_BIN), &keep).unwrap();
+    assert!(folder_fits(&all, &out));
+    fs::copy(dir.join("grob").join(CLEAN_BIN), out.join(CLEAN_BIN)).unwrap();
+    assert!(!folder_fits(&all, &out), "clean.bin of another run");
+    fs::remove_file(out.join(CLEAN_BIN)).unwrap();
+    fs::remove_file(out.join(DENSE_BIN)).unwrap();
+    assert!(folder_fits(&all, &out), "missing stages are no reason");
+}
+
+/// `programm` in `map.json` only says which build made the map: a map of another build, or
+/// one written before the field, still fits.
+#[test]
+fn program_is_part_of_no_id() {
+    let dir = tmp("steps-map-programm");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    slam(&dir, &out, false);
+    let all = input(&dir, &out, MapStep::All);
+    run_map(&request(&dir, &out, &out, MapStep::All), &Progress::new()).unwrap();
+    assert!(folder_fits(&all, &out));
+    let path = out.join("map.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    json["programm"] = serde_json::json!({"version": "0.0.1", "commit": "anderer"});
+    fs::write(&path, json.to_string()).unwrap();
+    assert!(folder_fits(&all, &out), "another build");
+    json.as_object_mut().unwrap().remove("programm");
+    fs::write(&path, json.to_string()).unwrap();
+    assert!(folder_fits(&all, &out), "written before the field");
+}
+
 #[test]
 fn settings_check_names_the_option() {
     let mut s = MapSettings::default();
@@ -220,4 +493,148 @@ fn settings_check_names_the_option() {
         s.check().unwrap_err().to_string(),
         "--downscale muss 1, 2 oder 4 sein"
     );
+}
+
+/// A whole map that is current already is not computed again: nothing is written and the
+/// step says so. Any change computes it: other switches, another trajectory, a file of the
+/// report missing, more files wanted, another step; [`recompute_map`] computes it anyway.
+#[test]
+fn repeated_map_is_current() {
+    use driftless_io::progress::LogLine;
+    let dir = tmp("steps-map-aktuell");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    slam(&dir, &out, false);
+    let req = request(&dir, &out, &out, MapStep::All);
+    assert!(current_map(&req).is_none(), "no map yet");
+    let first = run_map(&req, &Progress::new()).unwrap();
+    let before = files(&out);
+    let p = Progress::new();
+    assert_eq!(run_map(&req, &p).unwrap(), first);
+    assert_eq!(files(&out), before, "nothing written");
+    let log = p.take_log();
+    assert!(
+        matches!(&log[..], [LogLine::Info(i)] if i.starts_with("Karte ist aktuell: ")),
+        "{log:?}"
+    );
+    // Computed again when not current.
+    let computes = |req: &MapRequest| {
+        let p = Progress::new();
+        run_map(req, &p).unwrap();
+        p.take_log()
+            .iter()
+            .any(|l| matches!(l, LogLine::Info(i) if i.starts_with("Dicht: ")))
+    };
+    let mut other = req.clone();
+    other.input.map.switches.outliers = false;
+    assert!(current_map(&other).is_none(), "other switches");
+    let mut gpu_off = req.clone();
+    gpu_off.input.map.switches.gpu = driftless_gpu::GpuPref::Off;
+    assert!(
+        current_map(&gpu_off).is_some(),
+        "the GPU gives an equivalent map"
+    );
+    let all_files = MapRequest {
+        all_files: true,
+        ..req.clone()
+    };
+    assert!(current_map(&all_files).is_none(), "more files wanted");
+    assert!(current_map(&request(&dir, &out, &out, MapStep::Clean)).is_none());
+    // No images: `clean.las` is the cloud to look at.
+    fs::remove_file(out.join("clean.las")).unwrap();
+    assert!(current_map(&req).is_none(), "a file of the report missing");
+    assert!(computes(&req));
+    assert!(current_map(&req).is_some());
+    let traj = fs::read_to_string(out.join("traj.tum")).unwrap();
+    fs::write(out.join("traj.tum"), format!("{traj}# geändert\n")).unwrap();
+    assert!(current_map(&req).is_none(), "another trajectory");
+    assert!(computes(&req));
+    // `recompute_map` computes it although it is current.
+    let p = Progress::new();
+    recompute_map(&req, &p).unwrap();
+    assert!(p
+        .take_log()
+        .iter()
+        .any(|l| matches!(l, LogLine::Info(i) if i.starts_with("Dicht: "))));
+}
+
+/// A map computed into a new folder into which a stage of another map was linked keeps the
+/// entries of the steps the requested one builds on: from that map's `map.json`, with their
+/// numbers ([`recompute_map_from`]), listing only the files that are in the new folder; with no
+/// report to take them from, as reused all the same (the stage taken over is of the current
+/// input). Such a folder fits, and nothing in it is called stale. The step after the one
+/// computed is not taken from the other map: its cloud is not in the folder.
+#[test]
+fn stages_taken_over_keep_their_entries() {
+    use serde_json::json;
+    let dir = tmp("steps-map-taken-over");
+    scan_with_images(&dir);
+    let slam_dir = dir.join("slam");
+    slam(&dir, &slam_dir, false);
+    let k1 = dir.join("karte-001");
+    let req = request(&dir, &slam_dir, &k1, MapStep::All);
+    let whole = run_map(&req, &Progress::new()).unwrap();
+    let take_over = |name: &str, stage: &str| {
+        let d = dir.join(name);
+        fs::create_dir_all(&d).unwrap();
+        fs::copy(k1.join(stage), d.join(stage)).unwrap();
+        d
+    };
+    let all = input(&dir, &slam_dir, MapStep::All);
+
+    let k2 = take_over("karte-002", CLEAN_BIN);
+    let req = request(&dir, &slam_dir, &k2, MapStep::Color);
+    let report = recompute_map_from(&req, Some(&k1), &Progress::new()).unwrap();
+    let steps = &report["steps"];
+    for step in ["dense", "clean"] {
+        assert_eq!(steps[step]["reused"], true, "{step}");
+        assert_eq!(
+            steps[step]["stats"], whole["steps"][step]["stats"],
+            "{step}"
+        );
+    }
+    assert_eq!(steps["dense"]["files"], json!([]));
+    assert_eq!(steps["clean"]["files"], json!([CLEAN_BIN]));
+    assert_eq!(steps["color"]["reused"], false);
+    assert_eq!(report["stale"], json!([]));
+    assert!(folder_fits(&all, &k2));
+
+    let k3 = take_over("karte-003", CLEAN_BIN);
+    let req = request(&dir, &slam_dir, &k3, MapStep::Color);
+    let report = recompute_map(&req, &Progress::new()).unwrap();
+    let steps = &report["steps"];
+    for step in ["dense", "clean"] {
+        assert_eq!(steps[step]["input_id"], whole["steps"][step]["input_id"]);
+        assert_eq!(steps[step]["reused"], true, "{step}");
+        assert!(steps[step].get("stats").is_none(), "{step}: none to take");
+    }
+    assert_eq!(steps["clean"]["files"], json!([CLEAN_BIN]));
+    assert_eq!(report["stale"], json!([]));
+    assert!(folder_fits(&all, &k3));
+
+    let k4 = take_over("karte-004", DENSE_BIN);
+    let req = request(&dir, &slam_dir, &k4, MapStep::Clean);
+    let report = recompute_map_from(&req, Some(&k1), &Progress::new()).unwrap();
+    let steps = &report["steps"];
+    assert_eq!(steps["dense"]["stats"], whole["steps"]["dense"]["stats"]);
+    assert_eq!(steps["dense"]["files"], json!([DENSE_BIN]));
+    assert!(steps.get("color").is_none(), "{steps}");
+    assert_eq!(report["stale"], json!([]));
+    assert!(folder_fits(&all, &k4));
+
+    // a map of an older version whose entry lists no files: the stage taken over is listed
+    let older = dir.join("karte-aelter");
+    fs::create_dir_all(&older).unwrap();
+    let mut old_report = whole.clone();
+    old_report["steps"]["clean"]
+        .as_object_mut()
+        .unwrap()
+        .remove("files");
+    fs::write(older.join("map.json"), old_report.to_string()).unwrap();
+    let k5 = take_over("karte-005", CLEAN_BIN);
+    let req = request(&dir, &slam_dir, &k5, MapStep::Color);
+    let report = recompute_map_from(&req, Some(&older), &Progress::new()).unwrap();
+    assert_eq!(report["steps"]["clean"]["files"], json!([CLEAN_BIN]));
+    assert_eq!(report["stale"], json!([]));
+    assert!(folder_fits(&all, &k5));
 }

@@ -145,7 +145,7 @@ fn pose_error(est: &Isometry3<f64>, truth: &Isometry3<f64>, source: &[Vector3<f6
 
 fn describe(a: &Alignment) -> String {
     format!(
-        "{:?} {:?} overlap {:.3} agreement {:.3} residual {:.2} mm walls {:.2} mm tilt {:.2}° \
+        "{:?} {:?} overlap {:.3} agreement {:.3} residual {:.2} mm walls {:?} mm tilt {:.2}° \
          runner-up {:?} pairs {:?} mm",
         a.verdict,
         a.method,
@@ -445,7 +445,7 @@ fn pairs_place_a_narrow_corridor() {
     let cfg = AlignConfig::default();
     let right = pair_quality(&source, &target, &pose, &cfg);
     eprintln!(
-        "right pose: overlap {:.3} agreement {:.3} residual {:.2} mm walls {:.2} mm",
+        "right pose: overlap {:.3} agreement {:.3} residual {:.2} mm walls {:?} mm",
         right.overlap, right.agreement, right.residual_median_mm, right.wall_residual_mm
     );
     assert!(right.overlap < cfg.min_overlap, "{right:?}");

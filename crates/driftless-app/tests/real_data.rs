@@ -274,17 +274,15 @@ fn app_steps_match_cli() {
     let t = Instant::now();
     let map = run_map_job(&run, &scan, &MapSettings::default(), &Progress::new()).unwrap();
     eprintln!("map {:.1} s", t.elapsed().as_secs_f64());
+    // The default files of a map (the reference run must be made with the same program).
     assert_same_files(
         &map.dir,
         &cli,
         &[
-            "dense.las",
             "dense.bin",
-            "clean.las",
             "removed.las",
             "clean.bin",
             "color.las",
-            "color.ply",
             "map.json",
         ],
     );

@@ -31,6 +31,8 @@ fn app_with_scan(dir: &Path) -> DriftlessApp {
     });
     app.apply(Action::AddScan(scan));
     assert_eq!(errors(&app), Vec::<String>::new());
+    // the tree is read in the background
+    settle(&mut app);
     app
 }
 
@@ -40,7 +42,7 @@ fn errors(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             UiMessage::Error(e) => Some(e.clone()),
-            UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect()
 }
@@ -157,6 +159,7 @@ fn reuse_action_records_history() {
     // without submaps.bin: refused with the reason, nothing started
     fs::remove_file(run.join("submaps.bin")).unwrap();
     app.apply(Action::OpenProject(dir.join("projekt")));
+    settle(&mut app);
     app.apply(Action::Reuse(run.clone()));
     assert_eq!(errors(&app), [text::NO_CACHE]);
     assert!(app.state().job.is_none());
@@ -178,15 +181,18 @@ fn map_action_with_new_settings_creates_new_map_dir() {
     assert_eq!(shown(&app), Some(first.join("dense.las")));
     assert!(first.join("dense.las").is_file());
     assert!(first.join("map.json").is_file());
-    // the same settings again: the same folder
-    run_step(&mut app, Action::RunMap(run.clone()));
-    assert_eq!(app.state().selection, Selection::Map(first.clone()));
-    assert!(!run.join("karte-002").exists());
-    // other switches: a new folder, the first one unchanged
+    // the same step again: it writes, so it goes into a new folder – a map is never computed
+    // anew in its own (cut off, it would lose its report) – and the first one stays unchanged
     let before = files(&first);
+    run_step(&mut app, Action::RunMap(run.clone()));
+    let again = run.join("karte-002");
+    assert_eq!(app.state().selection, Selection::Map(again.clone()));
+    assert!(again.join("dense.las").is_file());
+    assert_eq!(files(&first), before);
+    // other switches: a new folder, the first one unchanged
     app.state_mut().map_settings.switches.voxel = 0.1;
     run_step(&mut app, Action::RunMap(run.clone()));
-    let second = run.join("karte-002");
+    let second = run.join("karte-003");
     assert_eq!(app.state().selection, Selection::Map(second.clone()));
     assert!(second.join("dense.las").is_file());
     assert_eq!(files(&first), before);
@@ -210,7 +216,7 @@ fn map_action_with_new_settings_creates_new_map_dir() {
     app.apply(Action::RunMap(run.clone()));
     assert_eq!(errors(&app), ["--voxel: Voxelgröße muss größer als 0 sein"]);
     assert!(app.state().job.is_none());
-    assert!(!run.join("karte-003").exists());
+    assert!(!run.join("karte-004").exists());
 }
 
 #[test]

@@ -48,7 +48,7 @@ pub use exposure::{
 };
 pub use quality::{pass_quality, PassQuality};
 pub use sharpness::sharpness;
-pub use smooth::{smooth_surfaces, SmoothConfig, SmoothStats};
+pub use smooth::{smooth_surfaces, smooth_surfaces_with, SmoothConfig, SmoothStats, SMOOTH_CHUNK};
 pub use stage::{content_hash, load_stage, save_stage, stage_fits, StageError};
 pub use through::find_through;
 

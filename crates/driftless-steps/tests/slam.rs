@@ -1,7 +1,7 @@
 //! `run_slam` on synthetic scans: outputs, progress and cancelling.
 
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
-use driftless_io::testscan::{room_bag, room_bag_secs, tmp};
+use driftless_io::testscan::{room_bag, room_bag_at, room_bag_secs, tmp};
 use driftless_steps::slam::{cache_fits, run_slam, SlamRequest, SlamSettings};
 use driftless_steps::StepError;
 use std::collections::BTreeMap;
@@ -71,9 +71,25 @@ fn slam_writes_cli_outputs() {
     assert!(outcome.map_points > 1000, "{}", outcome.map_points);
     assert!(outcome.seconds > 0.0);
     assert_eq!(outcome.history, None);
+    // The report as returned, then the program that made it (informational).
+    let text = fs::read_to_string(out.join("slam.json")).unwrap();
+    let plain = serde_json::to_string_pretty(&outcome.report).unwrap();
+    assert!(
+        text.starts_with(plain.strip_suffix("\n}").unwrap()),
+        "{text}"
+    );
+    let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
-        fs::read_to_string(out.join("slam.json")).unwrap(),
-        serde_json::to_string_pretty(&outcome.report).unwrap() + "\n"
+        json["programm"],
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "commit": driftless_steps::PROGRAM.commit,
+        })
+    );
+    json.as_object_mut().unwrap().remove("programm");
+    assert_eq!(
+        json,
+        serde_json::from_str::<serde_json::Value>(&plain).unwrap()
     );
 
     // the console lines of `driftless slam`, in order
@@ -174,6 +190,156 @@ fn reuse_cancelled_keeps_traj() {
     assert_eq!(files(&out), before);
 }
 
+/// A reuse writes its new files beside the old ones and puts them in place only once all are
+/// written; a failure on the way – writing `map.las` fails as on a full disk, or `map.las`
+/// cannot be put in place – leaves the run as it was: its report, its trajectory and the one
+/// before it, no file of the new result and no `.tmp`. The same with history: no new state.
+#[test]
+fn failed_reuse_puts_the_run_back() {
+    let dir = tmp("steps-reuse-back");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    run_slam(&request(&dir, &out, false), &Progress::new()).unwrap();
+    // a reuse first, so that there is a trajectory before this one that must stay as well
+    run_slam(&request(&dir, &out, true), &Progress::new()).unwrap();
+    assert!(out.join("traj.vorher.tum").is_file());
+    let before = files(&out);
+
+    // the new map.las cannot be written (a folder in the way of its temporary file)
+    let blocked = out.join("map.las.tmp");
+    fs::create_dir_all(blocked.join("x")).unwrap();
+    let err = run_slam(&request(&dir, &out, true), &Progress::new()).unwrap_err();
+    let StepError::Failed(m) = &err else {
+        panic!("{err:?}");
+    };
+    assert!(m.contains("map.las") && m.contains("wie vorher"), "{m}");
+    fs::remove_dir_all(&blocked).unwrap();
+    assert_eq!(files(&out), before);
+
+    // the new map.las cannot be put in place (a folder where it goes): the files already put
+    // in place go back
+    fs::rename(out.join("map.las"), dir.join("map.las")).unwrap();
+    fs::create_dir_all(out.join("map.las").join("x")).unwrap();
+    let before = files(&out);
+    let err = run_slam(&request(&dir, &out, true), &Progress::new()).unwrap_err();
+    assert!(err.to_string().contains("wie vorher"), "{err}");
+    assert_eq!(files(&out), before);
+    fs::remove_dir_all(out.join("map.las")).unwrap();
+    fs::rename(dir.join("map.las"), out.join("map.las")).unwrap();
+
+    // with history (as the desktop program runs it): no new state either
+    let mut with_history = request(&dir, &out, true);
+    with_history.history = true;
+    run_slam(&with_history, &Progress::new()).unwrap();
+    let before = files(&out);
+    fs::create_dir_all(blocked.join("x")).unwrap();
+    run_slam(&with_history, &Progress::new()).unwrap_err();
+    fs::remove_dir_all(&blocked).unwrap();
+    assert_eq!(files(&out), before);
+
+    // the new state cannot be recorded (a file where its folder goes): the files put in place
+    // go back as well
+    let states = driftless_steps::history::list(&out);
+    let next = format!("{:03}", states.last().unwrap().nr + 1);
+    fs::write(out.join("verlauf").join(&next), b"im Weg").unwrap();
+    let before = files(&out);
+    let err = run_slam(&with_history, &Progress::new()).unwrap_err();
+    assert!(err.to_string().contains("wie vorher"), "{err}");
+    assert_eq!(files(&out), before);
+}
+
+/// „Abbrechen“ while a reuse writes: its new files are written beside the old ones, so the
+/// cancel is honoured until they are put in place, and nothing changes.
+#[test]
+fn reuse_cancelled_while_writing_keeps_the_run() {
+    let dir = tmp("steps-reuse-cancel-write");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    run_slam(&request(&dir, &out, false), &Progress::new()).unwrap();
+    let before = files(&out);
+    let err = run_slam(&request(&dir, &out, true), &cancel_at("Schreiben", 0)).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    assert_eq!(files(&out), before);
+}
+
+/// What a reuse that was killed while it wrote leaves (its new files under temporary names)
+/// or once its new files were in place (the old ones it had put aside) goes at the start of
+/// the next run; the run itself stays.
+#[test]
+fn files_of_a_killed_reuse_are_removed() {
+    let dir = tmp("steps-reuse-killed");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    run_slam(&request(&dir, &out, false), &Progress::new()).unwrap();
+    // a reuse first: the run has its trajectory before the last reuse in place
+    run_slam(&request(&dir, &out, true), &Progress::new()).unwrap();
+    let before = files(&out);
+    let left = [
+        "traj.tum.tmp",
+        "map.las.tmp.tmp",
+        "slam.json.alt.tmp",
+        "traj.vorher.tum.alt.tmp",
+    ];
+    for f in left {
+        fs::write(out.join(f), b"halb").unwrap();
+    }
+    // the start of the next run (cancelled right after it)
+    let p = Progress::new();
+    p.cancel();
+    let err = run_slam(&request(&dir, &out, true), &p).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    assert_eq!(files(&out), before);
+    run_slam(&request(&dir, &out, true), &Progress::new()).unwrap();
+    for f in left {
+        assert!(!out.join(f).exists(), "{f} left");
+    }
+    assert!(out.join("slam.json").is_file());
+}
+
+/// A reuse killed while it put its new files in place (here, as files: the trajectory before
+/// the last reuse, the report, the odometry and the map aside as `<name>.alt.tmp`, the old
+/// trajectory moved to `traj.vorher.tum`, the new one in, the rest still staged) leaves the
+/// run without `slam.json`. The start of the next run puts the old files back instead of
+/// removing them: the run is as before, byte for byte, and the log says so; a reuse then
+/// works as usual.
+#[test]
+fn reuse_cut_off_while_swapping_is_put_back() {
+    let dir = tmp("steps-reuse-cut-off");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    run_slam(&request(&dir, &out, false), &Progress::new()).unwrap();
+    run_slam(&request(&dir, &out, true), &Progress::new()).unwrap();
+    let before = files(&out);
+    for name in ["traj.vorher.tum", "slam.json", "traj_odom.tum", "map.las"] {
+        fs::rename(out.join(name), out.join(format!("{name}.alt.tmp"))).unwrap();
+    }
+    fs::rename(out.join("traj.tum"), out.join("traj.vorher.tum")).unwrap();
+    fs::write(out.join("traj.tum"), b"neu").unwrap();
+    for name in ["traj_odom.tum", "map.las", "slam.json"] {
+        fs::write(out.join(format!("{name}.tmp")), b"neu").unwrap();
+    }
+    assert!(driftless_steps::slam::reuse_cut_off(&out));
+
+    let p = Progress::new();
+    p.cancel();
+    let err = run_slam(&request(&dir, &out, true), &p).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    assert_eq!(files(&out), before);
+    assert!(!driftless_steps::slam::reuse_cut_off(&out));
+    let log = p.take_log();
+    assert!(
+        log.iter().any(|l| matches!(
+            l,
+            LogLine::Info(i) if i.contains("wurde unterbrochen: den Lauf davor zurückgeholt")
+        )),
+        "{log:?}"
+    );
+
+    let traj = fs::read(out.join("traj.tum")).unwrap();
+    run_slam(&request(&dir, &out, true), &Progress::new()).unwrap();
+    assert_eq!(fs::read(out.join("traj.vorher.tum")).unwrap(), traj);
+}
+
 #[test]
 fn progress_counts_frames() {
     let dir = tmp("steps-progress");
@@ -232,4 +398,122 @@ fn bad_correction_fails_after_the_cache() {
     assert!(!m.contains("driftless"), "{m}");
     assert_eq!(err.to_string(), *m);
     assert!(out.join("submaps.bin").exists());
+}
+
+/// A full run into a folder that holds the run of another scan (recorded at another time) is
+/// refused before anything is read or written: its corrections would be applied to this scan
+/// and its results replaced. The same scan again, an empty folder and a folder of a run that
+/// cannot be told are fine.
+#[test]
+fn full_run_refuses_the_folder_of_another_scan() {
+    let dir = tmp("steps-slam-fremd");
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    for d in [&a, &b] {
+        fs::create_dir_all(d).unwrap();
+    }
+    room_bag(&a, true);
+    room_bag_at(&b, true, 5000.0, 1.5);
+    let out = dir.join("out");
+    run_slam(&request(&a, &out, false), &Progress::new()).unwrap();
+    let before = files(&out);
+    let err = run_slam(&request(&b, &out, false), &Progress::new()).unwrap_err();
+    let StepError::Failed(m) = &err else {
+        panic!("expected a refusal, got {err:?}");
+    };
+    assert!(
+        m.contains("Lauf eines anderen Scans") && m.contains("eigenen Zielordner"),
+        "{m}"
+    );
+    assert!(m.contains(&out.display().to_string()), "{m}");
+    assert_eq!(files(&out), before, "nothing written");
+    // The scan of the folder again, and the other scan into a folder of its own.
+    run_slam(&request(&a, &out, false), &Progress::new()).unwrap();
+    run_slam(&request(&b, &dir.join("out-b"), false), &Progress::new()).unwrap();
+    // A `slam.json` that cannot be read tells nothing: the run goes ahead.
+    let unknown = dir.join("unbekannt");
+    fs::create_dir_all(&unknown).unwrap();
+    fs::write(unknown.join("slam.json"), "kaputt").unwrap();
+    run_slam(&request(&b, &unknown, false), &Progress::new()).unwrap();
+}
+
+/// A killed run leaves `<name>.tmp` files; the next run removes those of its own files at its
+/// start, and only those: a `.tmp` of the map or of `driftless correct` in the same folder
+/// stays.
+#[test]
+fn stale_tmp_files_of_the_run_are_removed() {
+    let dir = tmp("steps-slam-tmp");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let own = [
+        "submaps.bin.tmp",
+        "traj.tum.tmp",
+        "traj_odom.tum.tmp",
+        "map.las.tmp",
+        "slam.json.tmp",
+    ];
+    let foreign = ["dense.bin.tmp", "corrections.toml.tmp", "notiz.tmp"];
+    for f in own.iter().chain(&foreign) {
+        fs::write(out.join(f), b"halb").unwrap();
+    }
+    let p = Progress::new();
+    run_slam(&request(&dir, &out, false), &p).unwrap();
+    for f in own {
+        assert!(!out.join(f).exists(), "{f} left");
+    }
+    for f in foreign {
+        assert!(out.join(f).exists(), "{f} removed");
+    }
+    assert!(p.take_log().iter().any(|l| matches!(
+        l,
+        LogLine::Info(i) if i.starts_with("Reste eines abgebrochenen Laufs entfernt: ")
+            && i.contains("traj.tum.tmp")
+    )));
+
+    // A reuse writes the same files.
+    fs::write(out.join("traj.tum.tmp"), b"halb").unwrap();
+    run_slam(&request(&dir, &out, true), &Progress::new()).unwrap();
+    assert!(!out.join("traj.tum.tmp").exists());
+}
+
+/// `slam.json` goes before the first file of a full run is written and comes back last: a
+/// run that stops in between (here: `map.las` cannot be replaced) leaves no report, so the
+/// folder never passes for a finished run of the files in it. A reuse puts every file back
+/// instead.
+#[test]
+fn report_goes_before_the_first_write() {
+    let dir = tmp("steps-slam-report-first");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    run_slam(&request(&dir, &out, false), &Progress::new()).unwrap();
+    assert!(driftless_steps::slam::run_times(&out).is_some());
+    // A folder in the way of map.las: the run fails after traj.tum is written.
+    fs::remove_file(out.join("map.las")).unwrap();
+    fs::create_dir_all(out.join("map.las").join("x")).unwrap();
+    let err = run_slam(&request(&dir, &out, false), &Progress::new()).unwrap_err();
+    assert!(err.to_string().contains("map.las"), "{err}");
+    assert!(!out.join("slam.json").exists(), "the old report stayed");
+    assert!(driftless_steps::slam::run_times(&out).is_none());
+    assert!(out.join("traj.tum").is_file());
+    assert!(!files(&out).keys().any(|f| f.ends_with(".tmp")));
+
+    // A reuse that cannot put map.las in place puts every file back instead
+    // (`failed_reuse_puts_the_run_back`): the run keeps its report.
+    fs::remove_dir_all(out.join("map.las")).unwrap();
+    run_slam(&request(&dir, &out, false), &Progress::new()).unwrap();
+    fs::remove_file(out.join("map.las")).unwrap();
+    fs::create_dir_all(out.join("map.las").join("x")).unwrap();
+    let before = files(&out);
+    run_slam(&request(&dir, &out, true), &Progress::new()).unwrap_err();
+    assert!(out.join("slam.json").is_file());
+    assert!(!out.join("traj.vorher.tum").exists());
+    assert_eq!(files(&out), before);
+
+    // A cancel before anything is written keeps the report.
+    fs::remove_dir_all(out.join("map.las")).unwrap();
+    run_slam(&request(&dir, &out, false), &Progress::new()).unwrap();
+    let before = files(&out);
+    let err = run_slam(&request(&dir, &out, false), &cancel_at("LiDAR lesen", 5)).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    assert_eq!(files(&out), before);
 }

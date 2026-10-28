@@ -23,4 +23,5 @@ serde_json = "1"
 toml = "1"
 
 [dev-dependencies]
+driftless-io = { path = "../driftless-io", features = ["test-util"] }
 driftless-odom = { path = "../driftless-odom", features = ["test-util"] }

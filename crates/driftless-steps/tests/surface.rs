@@ -2,13 +2,14 @@
 //! `run_model_surface` on models of two scans of the furnished room.
 
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
+use driftless_io::testdir::{SharedDir, TestDir};
 use driftless_io::testscan::{
-    furnished_room_bag, furnished_scan_with_images, room_bag, scan_with_images, tmp,
+    furnished_room_bag, furnished_scan_with_images, room_bag, scan_with_images, shared, tmp,
 };
 use driftless_map::surface::SurfaceConfig;
 use driftless_slam::align::AlignConfig;
 use driftless_steps::map::{map_input_for, run_map, MapInput, MapRequest, MapSettings, MapStep};
-use driftless_steps::merge::{run_merge, MergeMember, MergeRequest, MODEL_REPORT};
+use driftless_steps::merge::{run_merge, MergeMember, MergeRequest, MERGE_VERSION, MODEL_REPORT};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::surface::{
     model_surface_fits, run_model_surface, run_surface, surface_fits, ModelSurfaceRequest,
@@ -56,7 +57,7 @@ fn small_config() -> SurfaceConfig {
 }
 
 /// Scan, SLAM and clean map in one folder; returns (scan, folder).
-fn prepared(name: &str, images: bool) -> (PathBuf, PathBuf) {
+fn prepared(name: &str, images: bool) -> (TestDir, PathBuf) {
     let dir = tmp(name);
     if images {
         scan_with_images(&dir);
@@ -68,6 +69,7 @@ fn prepared(name: &str, images: bool) -> (PathBuf, PathBuf) {
     let req = MapRequest {
         input: map_input(&dir, &out),
         out_dir: out.clone(),
+        all_files: false,
     };
     run_map(&req, &Progress::new()).unwrap();
     (dir, out)
@@ -81,6 +83,7 @@ fn request(scan: &Path, map_dir: &Path, out_dir: &Path) -> SurfaceRequest {
         config: small_config(),
         texture: true,
         gpu: driftless_gpu::GpuPref::default(),
+        obj: false,
     }
 }
 
@@ -109,7 +112,10 @@ fn names(dir: &Path) -> Vec<String> {
 fn surface_end_to_end() {
     let (dir, out) = prepared("steps-surface-e2e", true);
     let dest = out.join("oberflaeche");
-    let req = request(&dir, &out, &dest);
+    let req = SurfaceRequest {
+        obj: true,
+        ..request(&dir, &out, &dest)
+    };
     assert!(!surface_fits(&req));
     let report = run_surface(&req, &Progress::new()).unwrap();
     for f in [
@@ -155,7 +161,63 @@ fn surface_end_to_end() {
     let on_disk: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dest.join(SURFACE_REPORT)).unwrap()).unwrap();
     assert_eq!(on_disk, report);
+    assert_eq!(report["programm"], program());
+    // Hints for the app (German): one when many faces of the coarse grid were dropped.
+    let s = &report["stats"];
+    let dropped = s["faces_unsupported"].as_f64().unwrap();
+    let open = dropped / (dropped + s["faces_final"].as_f64().unwrap());
+    assert_eq!(
+        report["hinweise"].as_array().unwrap().is_empty(),
+        open < 0.15,
+        "{report}"
+    );
     assert!(surface_fits(&req));
+}
+
+/// `programm` of the reports: version and commit of this build.
+fn program() -> Value {
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": driftless_steps::PROGRAM.commit,
+    })
+}
+
+/// Without `obj` a surface is its glb and its report; an OBJ of an earlier run is listed as
+/// stale, not deleted. The OBJ is part of no id.
+#[test]
+fn surface_writes_only_the_glb_by_default() {
+    let (dir, out) = prepared("steps-surface-glb", true);
+    let dest = out.join("oberflaeche");
+    let req = request(&dir, &out, &dest);
+    let report = run_surface(&req, &Progress::new()).unwrap();
+    assert_eq!(names(&dest), ["oberflaeche.glb", SURFACE_REPORT]);
+    assert_eq!(
+        report["files"],
+        serde_json::json!(["oberflaeche.glb", SURFACE_REPORT])
+    );
+    let with_obj = SurfaceRequest {
+        obj: true,
+        ..req.clone()
+    };
+    assert!(surface_fits(&with_obj), "the OBJ changes no id");
+    run_surface(&with_obj, &Progress::new()).unwrap();
+    assert!(dest.join("oberflaeche.obj").is_file() && dest.join("oberflaeche.mtl").is_file());
+    let p = Progress::new();
+    let again = run_surface(&req, &p).unwrap();
+    let stale: Vec<&str> = again["stale"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        stale.contains(&"oberflaeche.obj")
+            && stale.contains(&"oberflaeche.mtl")
+            && stale.contains(&"oberflaeche_seite_00.jpg"),
+        "{stale:?}"
+    );
+    assert!(dest.join("oberflaeche.obj").is_file(), "not deleted");
+    assert!(warnings(&p).iter().any(|w| w.contains("früheren Lauf")));
 }
 
 #[test]
@@ -298,9 +360,117 @@ fn surface_fits_after_run() {
     let mut other = request(&dir, &out, &dest);
     other.config.voxel = 0.2;
     assert!(!surface_fits(&other), "other settings");
+    // `programm` is part of no id: a surface of another build, or one written before the
+    // field, still fits.
+    let path = dest.join(SURFACE_REPORT);
+    let mut report: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    report["programm"] = serde_json::json!({"version": "0.0.1", "commit": "anderer"});
+    fs::write(&path, report.to_string()).unwrap();
+    assert!(surface_fits(&req), "another build");
+    report.as_object_mut().unwrap().remove("programm");
+    fs::write(&path, report.to_string()).unwrap();
+    assert!(surface_fits(&req), "written before the field");
     let traj = fs::read_to_string(out.join("traj.tum")).unwrap();
     fs::write(out.join("traj.tum"), format!("{traj}# changed\n")).unwrap();
     assert!(!surface_fits(&req), "other trajectory");
+}
+
+/// A killed run leaves `<name>.tmp` files; the next surface into the folder removes those of
+/// its own files at its start, and only those.
+#[test]
+fn stale_tmp_files_of_the_surface_are_removed() {
+    let (dir, out) = prepared("steps-surface-tmp", false);
+    let dest = out.join("oberflaeche");
+    fs::create_dir_all(&dest).unwrap();
+    let own = [
+        "oberflaeche.glb.tmp",
+        "oberflaeche.obj.tmp",
+        "oberflaeche.mtl.tmp",
+        "oberflaeche_seite_00.jpg.tmp",
+        "oberflaeche_seite_12.png.tmp",
+        SURFACE_REPORT_TMP,
+    ];
+    let foreign = [
+        "oberflaeche_seite_xy.jpg.tmp",
+        "modell.las.tmp",
+        "notiz.tmp",
+    ];
+    for f in own.iter().chain(&foreign) {
+        fs::write(dest.join(f), b"halb").unwrap();
+    }
+    run_surface(&request(&dir, &out, &dest), &Progress::new()).unwrap();
+    for f in own {
+        assert!(!dest.join(f).exists(), "{f} left");
+    }
+    for f in foreign {
+        assert!(dest.join(f).exists(), "{f} removed");
+    }
+}
+
+const SURFACE_REPORT_TMP: &str = "oberflaeche.json.tmp";
+
+/// What a kill of an earlier version could leave: the glb of a new run (other settings) next
+/// to the OBJ and the report of the old one. The report names the sizes of its files, so the
+/// folder does not fit the old request (nor the new one).
+#[test]
+fn new_glb_next_to_an_old_report_does_not_fit() {
+    let (dir, out) = prepared("steps-surface-mixed", true);
+    let dest = out.join("oberflaeche");
+    let old = SurfaceRequest {
+        obj: true,
+        ..request(&dir, &out, &dest)
+    };
+    let report = run_surface(&old, &Progress::new()).unwrap();
+    assert!(surface_fits(&old));
+    let glb = fs::read(dest.join("oberflaeche.glb")).unwrap();
+    assert_eq!(report["bytes"]["oberflaeche.glb"], glb.len() as u64);
+    assert!(report["bytes"]["oberflaeche.obj"].as_u64().unwrap() > 0);
+    let new = SurfaceRequest {
+        config: SurfaceConfig {
+            voxel: 0.3,
+            ..small_config()
+        },
+        obj: false,
+        ..request(&dir, &out, &out.join("neu"))
+    };
+    run_surface(&new, &Progress::new()).unwrap();
+    fs::copy(
+        out.join("neu").join("oberflaeche.glb"),
+        dest.join("oberflaeche.glb"),
+    )
+    .unwrap();
+    assert!(!surface_fits(&old), "new glb, old OBJ and report");
+    assert!(!surface_fits(&SurfaceRequest {
+        out_dir: dest.clone(),
+        ..new.clone()
+    }));
+    fs::write(dest.join("oberflaeche.glb"), &glb).unwrap();
+    assert!(surface_fits(&old));
+    fs::remove_file(dest.join("oberflaeche_seite_00.jpg")).unwrap();
+    assert!(!surface_fits(&old), "a page of the report is missing");
+}
+
+/// `oberflaeche.json` goes before the first file of a surface is written and comes back
+/// last: a surface that stops in between (here: the OBJ cannot be replaced, after the new
+/// glb was written) leaves no report and does not fit.
+#[test]
+fn report_goes_before_the_first_write() {
+    let (dir, out) = prepared("steps-surface-report-first", false);
+    let dest = out.join("oberflaeche");
+    let req = request(&dir, &out, &dest);
+    run_surface(&req, &Progress::new()).unwrap();
+    assert!(surface_fits(&req));
+    fs::create_dir_all(dest.join("oberflaeche.obj").join("x")).unwrap();
+    let with_obj = SurfaceRequest {
+        obj: true,
+        ..req.clone()
+    };
+    let err = run_surface(&with_obj, &Progress::new()).unwrap_err();
+    assert!(err.to_string().contains("oberflaeche.obj"), "{err}");
+    assert!(!dest.join(SURFACE_REPORT).exists(), "the old report stayed");
+    assert!(dest.join("oberflaeche.glb").is_file());
+    assert!(!surface_fits(&req) && !surface_fits(&with_obj));
+    assert!(!names(&dest).iter().any(|n| n.ends_with(".tmp")));
 }
 
 #[test]
@@ -330,6 +500,8 @@ fn old_pages_are_listed_as_stale_not_deleted() {
 // without images.
 
 struct ModelScene {
+    /// Their folder, shared by the tests of this file.
+    _root: SharedDir,
     a: PathBuf,
     /// Model of A (reference) and B.
     both: PathBuf,
@@ -349,6 +521,7 @@ fn prepare_member(scan: &Path) {
         &MapRequest {
             input,
             out_dir: out,
+            all_files: false,
         },
         &Progress::new(),
     )
@@ -374,6 +547,7 @@ fn merged(scans: &[&Path], out: &Path) -> PathBuf {
         smooth: true,
         include_unsure: false,
         pairs: Vec::new(),
+        ply: false,
     };
     let report = run_merge(&req, &Progress::new()).unwrap();
     assert!(
@@ -387,7 +561,7 @@ fn merged(scans: &[&Path], out: &Path) -> PathBuf {
 fn model_scene() -> &'static ModelScene {
     static SCENE: OnceLock<ModelScene> = OnceLock::new();
     SCENE.get_or_init(|| {
-        let root = tmp("steps-model-surface");
+        let root = shared("steps-model-surface");
         let (a, b, c) = (
             root.join("raum-a"),
             root.join("raum-b"),
@@ -407,6 +581,7 @@ fn model_scene() -> &'static ModelScene {
         let images_of_a = merged(&[&a, &c], &root.join("modell-002"));
         let one_imageless = merged(&[&c, &a], &root.join("modell-003"));
         ModelScene {
+            _root: root,
             a,
             both,
             images_of_a,
@@ -418,10 +593,12 @@ fn model_scene() -> &'static ModelScene {
 fn model_request(model: &Path, out: &Path) -> ModelSurfaceRequest {
     ModelSurfaceRequest {
         model_dir: model.to_path_buf(),
+        model: None,
         out_dir: out.to_path_buf(),
         config: small_config(),
         texture: true,
         gpu: driftless_gpu::GpuPref::default(),
+        obj: false,
     }
 }
 
@@ -453,9 +630,13 @@ fn model_surface_textures_both_scans() {
     let p = Progress::new();
     let report = run_model_surface(&model_request(&s.both, &dest), &p).unwrap();
     assert!(warnings(&p).is_empty(), "{:?}", warnings(&p));
-    for f in ["oberflaeche.glb", "oberflaeche.obj", SURFACE_REPORT] {
+    for f in ["oberflaeche.glb", SURFACE_REPORT] {
         assert!(dest.join(f).is_file(), "{f} missing");
     }
+    assert!(
+        !dest.join("oberflaeche.obj").exists(),
+        "the OBJ only on request"
+    );
     assert_eq!(
         report["model"]["members"],
         serde_json::json!(["raum-a", "raum-b"])
@@ -481,6 +662,7 @@ fn model_surface_textures_both_scans() {
     let on_disk: Value =
         serde_json::from_str(&fs::read_to_string(dest.join(SURFACE_REPORT)).unwrap()).unwrap();
     assert_eq!(on_disk, report);
+    assert_eq!(report["programm"], program());
 }
 
 #[test]
@@ -518,6 +700,13 @@ fn model_surface_fits_after_run() {
     let mut gray = model_request(&s.both, &dest);
     gray.texture = false;
     assert!(!model_surface_fits(&gray), "without texture");
+    // A glb other than the one of the report (a kill between the files of two runs).
+    let glb = dest.join("oberflaeche.glb");
+    let bytes = fs::read(&glb).unwrap();
+    fs::write(&glb, &bytes[..bytes.len() / 2]).unwrap();
+    assert!(!model_surface_fits(&req), "glb of another run");
+    fs::write(&glb, &bytes).unwrap();
+    assert!(model_surface_fits(&req));
 }
 
 /// A copy of `modell.json` of the model of A and B in a new folder, changed by `edit`.
@@ -560,6 +749,40 @@ fn model_surface_refuses_a_changed_map_or_no_model() {
     let err =
         run_model_surface(&model_request(&empty, &empty.join("o")), &Progress::new()).unwrap_err();
     assert!(err.to_string().contains("modell.json"), "{err}");
+}
+
+/// A model merged by another version of the merge is stale like one whose map was computed
+/// anew: `surface --model` refuses it, and a surface made while it was current no longer fits.
+#[test]
+fn model_surface_refuses_another_merge_version() {
+    let model = edited_model("version", |_| {});
+    let dest = model.join("oberflaeche");
+    let mut req = model_request(&model, &dest);
+    req.texture = false;
+    run_model_surface(&req, &Progress::new()).unwrap();
+    assert!(model_surface_fits(&req));
+    for (version, which) in [
+        (MERGE_VERSION - 1, "älteren"),
+        (MERGE_VERSION + 1, "neueren"),
+    ] {
+        let file = model.join(MODEL_REPORT);
+        let mut json: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        json["version"] = version.into();
+        fs::write(&file, json.to_string()).unwrap();
+        assert!(!model_surface_fits(&req), "v{version}");
+        let other = model.join(format!("oberflaeche-v{version}"));
+        let mut again = model_request(&model, &other);
+        again.texture = false;
+        let err = run_model_surface(&again, &Progress::new()).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("{which} Programmversion"))
+                && text.contains(&format!("v{version}"))
+                && text.contains("neu zusammenführen"),
+            "{text}"
+        );
+        assert!(!other.exists(), "nothing written");
+    }
 }
 
 #[test]

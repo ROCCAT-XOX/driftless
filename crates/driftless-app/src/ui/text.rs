@@ -1,5 +1,11 @@
 //! Every text the program shows, in one place (German): fixed texts as constants, texts
-//! with values as small functions.
+//! with values as small functions. Messages of the steps and of the system pass through
+//! [`german`] (system errors in German, the window's actions instead of command lines), and
+//! what the window shows of them through [`shown`] (symbols its fonts lack) and
+//! [`short_paths`] (file names instead of whole paths, the reason stays in view).
+
+use std::borrow::Cow;
+use std::path::Path;
 
 pub const APP_TITLE: &str = "Driftless";
 /// Name of a new project whose folder has no name (a drive root).
@@ -40,8 +46,8 @@ pub fn drop_unsupported(name: &str) -> String {
     format!("{DROP_UNSUPPORTED}: {name} (LAS, LAZ, E57, PLY, PCD, GLB oder OBJ)")
 }
 
-pub const PLAN_COMING: &str = "Hier entstehen Grundriss, Maße und der DWG-Export. Das folgt in \
-     einem späteren Baustein.";
+pub const PLAN_COMING: &str =
+    "Hier entstehen später Grundriss, Maße und der DWG-Export; heute geht das Messen in der Ansicht.";
 pub const ADD_RUN_NEEDS_SCAN: &str = "Zuerst im Feld „Daten“ einen Scan wählen";
 pub const ADD_SCAN_NEEDS_PROJECT: &str = "Zuerst ein Projekt öffnen";
 
@@ -61,13 +67,15 @@ pub const PRECISION_FAST: &str = "Schnell";
 pub const PRECISION_EXACT: &str = "Genau";
 pub const PRECISION_MAX: &str = "Maximal";
 pub const PRECISION_CUSTOM: &str = "Eigene";
-pub const PRECISION_MAX_HINT: &str = "braucht bei großen Aufnahmen über 4 GB Arbeitsspeicher";
+pub const PRECISION_MAX_HINT: &str = "braucht bei großen Aufnahmen etwa 4 GB Arbeitsspeicher";
 /// The main button without a selected scan: every new or stale scan, one after the other.
 pub const COMPUTE_ALL: &str = "Alle rechnen";
 /// The main button with a scan selected: only that scan.
 pub const COMPUTE_ONE: &str = "Rechnen";
 pub const COMPUTE_HINT: &str =
     "Rechnet je Scan zuerst SLAM, falls nötig, dann die Punktwolke mit der gewählten Genauigkeit";
+/// The tooltip of „Scan hinzufügen …“ as the main button of an empty project.
+pub const ADD_SCAN_HINT: &str = "Ordner mit LIDAR_*.bag wählen";
 pub const ALL_COMPUTED: &str = "Alle Scans sind gerechnet";
 /// With every scan done, but their maps of another precision than the one chosen.
 pub const RECOMPUTE_HINT: &str = "Scan wählen und „Rechnen“ drücken";
@@ -175,6 +183,23 @@ pub fn scan_not_in_project(scan: &std::path::Path) -> String {
     format!("Scan {} ist nicht mehr im Projekt", scan.display())
 }
 
+/// A model merged by another version of the merge than this program's (`version` in
+/// `modell.json`), as [`MODEL_STALE`] and [`STATUS_MODEL_STALE_HINT`] for a changed map.
+pub const MODEL_STALE_VERSION: &str = "veraltet – mit anderer Programmversion zusammengeführt";
+pub const STATUS_MODEL_STALE_VERSION_HINT: &str =
+    "Das Modell stammt aus einer anderen Programmversion – in „Daten“ neu zusammenführen";
+
+/// Such a model in the tree: „Modell 001 · veraltet – mit anderer Programmversion
+/// zusammengeführt“.
+pub fn model_stale_version(label: &str) -> String {
+    format!("{label} · {MODEL_STALE_VERSION}")
+}
+
+/// On hover over a scan of a model whose walls could not be measured, instead of
+/// [`member_walls`]: automatically placed it is „unsicher“ for that, by point pairs it is
+/// judged without them.
+pub const WALLS_UNMEASURABLE: &str = "Wände nicht messbar";
+
 // Point pairs by hand („Von Hand ausrichten“)
 /// Under an unsure or failed scan of a model.
 pub const PAIRS_START: &str = "Von Hand ausrichten";
@@ -238,9 +263,9 @@ pub fn pair_cloud_name(member: &str) -> String {
     format!("Modell und {member}")
 }
 
-/// A point pair of a model: „Paar 1 · 1 ↔ 3 · 4 Punkte“ (the numbers of its scans).
+/// A point pair of a model: „Paar 1 · Scan 1 und 3 · 4 Punkte“ (the numbers of its scans).
 pub fn pair_row(nr: usize, a: usize, b: usize, points: usize) -> String {
-    format!("Paar {nr} · {a} ↔ {b} · {points} Punkte")
+    format!("Paar {nr} · Scan {a} und {b} · {}", self::points(points))
 }
 
 /// Beside a point pair the merge cannot use (a hand edit of the file); the reason on hover.
@@ -276,7 +301,7 @@ pub const SURFACE_RECOMPUTE_HINT: &str = "Karte wählen und „Oberfläche rechn
 pub const SURFACE_FINENESS: &str = "Feinheit";
 /// Under the switch at 1 cm.
 pub const SURFACE_FINE_HINT: &str =
-    "braucht bei großen Aufnahmen bis 8 GB Arbeitsspeicher und rund 20 Minuten";
+    "braucht bei großen Aufnahmen bis 9 GB Arbeitsspeicher und rund 20 Minuten";
 /// The status of a map whose own map no longer fits its run: its surface waits for „Daten“.
 pub const STATUS_MAP_STALE: &str = "Karte veraltet";
 pub const STATUS_MAP_STALE_HINT: &str =
@@ -289,11 +314,23 @@ pub const STATUS_SCAN_MISSING: &str = "Scan fehlt";
 pub const MAP_GONE: &str = "Karte nicht mehr im Projekt";
 /// Before the state of a surface of the selected map with the fineness chosen now.
 pub const WITH_THIS_FINENESS: &str = "Mit dieser Feinheit";
+/// Before a hint of a surface for the user (`hinweise` in its `oberflaeche.json`): a hint,
+/// not an error.
+pub const SURFACE_HINT: &str = "Hinweis";
+
+/// A hint of a surface short, below its entry: its title before the colon, „Hinweis:
+/// Stellenweise offen“ for „Stellenweise offen: An 23 % …“; without a colon the whole hint.
+pub fn surface_hint_short(hint: &str) -> String {
+    let title = hint.split_once(':').map_or(hint, |(title, _)| title);
+    format!("{SURFACE_HINT}: {title}")
+}
 
 // Panels
 pub const PANEL_STEPS: &str = "Schritte";
 pub const PANEL_PROPERTIES: &str = "Eigenschaften";
 pub const VIEW_EMPTY: &str = "Keine Wolke geladen – links eine Karte oder Wolke wählen";
+/// The empty view without a project.
+pub const VIEW_NO_PROJECT: &str = "Projekt öffnen oder Datei hineinziehen";
 
 // Steps (right panel); the step names are also the labels of their jobs
 pub const STEP_INSPECT: &str = "Prüfen";
@@ -358,7 +395,7 @@ pub const SURFACE_VOXEL_CHOICES: [(f64, &str); 3] =
     [(0.01, "1 cm"), (0.015, "1,5 cm"), (0.02, "2 cm")];
 pub const SURFACE_VOXEL_HINT: &str =
     "Kleiner ist feiner, braucht mehr Speicher und Zeit; 1 cm braucht bei großen Aufnahmen bis \
-     8 GB Arbeitsspeicher und rund 20 Minuten";
+     9 GB Arbeitsspeicher und rund 20 Minuten";
 pub const SURFACE_NO_PHOTOS: &str = "ohne Fotos (graue Fläche)";
 
 // The 3D view and its settings (window ⚙)
@@ -430,6 +467,26 @@ pub const ABOUT: &str = "Über Driftless …";
 pub const ABOUT_TITLE: &str = "Über Driftless";
 pub const ABOUT_LICENSE: &str = "Lizenz: Apache-2.0 OR MIT";
 pub const ABOUT_CLI_MISSING: &str = "Kommandozeile: nicht im Paket (cargo run -p driftless-cli)";
+/// Opens the licence notices of the third-party parts (THIRD-PARTY-NOTICES.html).
+pub const ABOUT_NOTICES: &str = "Lizenzen Dritter …";
+pub const ABOUT_NOTICES_MISSING: &str = "Lizenzen Dritter: nicht im Paket (packaging/about.toml)";
+/// Opens the German guide for colleagues (docs/anleitung.md on GitHub) in the browser.
+pub const ABOUT_GUIDE: &str = "Anleitung";
+/// ☰: the folder of the log file (`crate::logfile`) in the file manager.
+pub const OPEN_LOG_FOLDER: &str = "Protokoll-Ordner öffnen";
+/// „Protokoll-Ordner öffnen“ when the system names no folder for it.
+pub const LOG_FOLDER_UNKNOWN: &str = "Kein Protokoll-Ordner: HOME bzw. LOCALAPPDATA fehlt";
+
+/// A file, folder or address the system could not open: „/Users/…/Logs/Driftless nicht geöffnet:
+/// …“.
+pub fn open_failed(what: &str, error: &str) -> String {
+    format!("{what} nicht geöffnet: {error}")
+}
+
+/// On stderr, when the log file of a start cannot be begun.
+pub fn log_unavailable(dir: &str, error: &str) -> String {
+    format!("Protokolldatei in {dir} nicht anlegbar: {error}")
+}
 
 /// „Driftless 0.1.0“.
 pub fn about_version(version: &str) -> String {
@@ -497,7 +554,7 @@ pub const SHOW_MODE: &str = "Ansicht";
 pub const SHOW_SURFACE: &str = "Fläche";
 pub const SHOW_CLOUD: &str = "Punkte";
 pub const SHOW_BOTH: &str = "beides";
-pub const SHOW_MODE_KEY_HINT: &str = "Taste O: Fläche → Punkte → beides";
+pub const SHOW_MODE_KEY_HINT: &str = "Taste O wechselt der Reihe nach: Fläche, Punkte, beides";
 /// Why „Punkte“ and „beides“ are locked while only a surface is loaded.
 pub const SHOW_NEEDS_CLOUD: &str = "Keine Punktwolke geladen – nur die Fläche";
 /// A glb that cannot be read from disk because it is not there.
@@ -559,8 +616,18 @@ pub const TOOL_NEEDS_CLOUD: &str = "Messen und Punkt wählen brauchen eine Punkt
 pub const MEASUREMENTS: &str = "Messungen";
 pub const NO_MEASUREMENTS: &str =
     "Noch keine Messungen. Unten in der Ansicht „Messen“ wählen und zwei Punkte anklicken.";
-pub const MEASUREMENTS_NOT_SAVED: &str = "Messungen werden noch nicht gespeichert (Baustein 5).";
+pub const MEASUREMENTS_NOT_SAVED: &str =
+    "Messungen werden noch nicht gespeichert: sie gehen beim Schließen verloren.";
 pub const CLEAR_MEASUREMENTS: &str = "Messungen löschen";
+/// The legend of the quality colours in the view.
+pub const QUALITY_LEGEND: &str = "Güte";
+pub const QUALITY_GOOD: &str = "gut verortet";
+pub const QUALITY_WEAK: &str = "wenig Halt – prüfen";
+pub const QUALITY_BAD: &str = "kaum Halt – Lage unsicher";
+pub const QUALITY_LEGEND_HINT: &str = "Wie fest die Umgebung jede Teilkarte der Laufbahn \
+     gehalten hat (ihr schwächster Moment). Gelb und Rot: wenig Wände oder Kanten im Blick, etwa \
+     in einem leeren Flur, in einer Tür oder bei einer schnellen Drehung – dort kann die Laufbahn \
+     verrutscht sein; die Karte an dieser Stelle prüfen.";
 pub const QUALITY_NONE_HINT: &str =
     "Ohne SLAM-Bericht oder ohne Punktzeiten: Güte unbekannt, grau gezeigt";
 
@@ -594,6 +661,36 @@ pub const CORRECTION_BUSY: &str = "Korrektur wird gespeichert …";
 pub const CORRECTION_COLUMNS: [&str; 6] =
     ["Nr", "Status", "a (s)", "b (s)", "hinzugefügt", "Notiz"];
 pub const LOOP_SWITCH_HINT: &str = "Ein- oder ausschalten; gilt beim nächsten Neurechnen";
+/// The automatic loops of the run in „Korrekturen“, each with its switch.
+pub const AUTO_LOOPS: &str = "Automatische Schleifen";
+pub const AUTO_LOOPS_HINT: &str = "Eine Schleife, die zwei verschiedene Stellen verbindet, \
+     abschalten: der Lauf wird gleich neu gerechnet (nur der Posengraph, wenige Sekunden).";
+pub const NO_AUTO_LOOPS: &str = "Keine automatische Schleife";
+/// The columns of the list of the automatic loops.
+pub const AUTO_LOOP_COLUMNS: [&str; 4] = ["verwenden", "Teilkarten", "Beginn (s)", "Überlappung"];
+pub const AUTO_LOOP_SWITCH_HINT: &str = "Aus: die Schleife bleibt beim Neurechnen außen vor \
+     (corrections.toml, [[reject]]); an: sie zählt wieder";
+
+/// The accessible name of the switch of the automatic loop between submaps `a` and `b`.
+pub fn auto_loop_switch(a: usize, b: usize) -> String {
+    format!("Schleife Teilkarte {a} und {b} verwenden")
+}
+
+/// The submaps of an automatic loop: „3 und 17“.
+pub fn auto_loop_pair(a: usize, b: usize) -> String {
+    format!("{a} und {b}")
+}
+
+/// The starts of its two submaps: „12,3 / 250,1“.
+pub fn auto_loop_times(a: f64, b: f64) -> String {
+    format!("{} / {}", decimal(a, 1), decimal(b, 1))
+}
+
+/// Overlap of a loop in percent: „34 %“.
+pub fn percent(share: f64) -> String {
+    format!("{} %", (share * 100.0).round() as i64)
+}
+
 /// Labels of the background jobs of the corrections (not shown in the status bar).
 pub const LOAD_RUN_JOB: &str = "Lauf lesen";
 pub const CORRECT_JOB: &str = "Korrektur speichern";
@@ -684,7 +781,259 @@ pub fn map_of(scan: &str, run: &str, map: &str) -> String {
 }
 
 pub fn project_opened(name: &str) -> String {
-    format!("Projekt {name} geöffnet")
+    format!("Projekt „{name}“ geöffnet")
+}
+
+/// After a change of the project when `project.toml` had been changed by another window or
+/// program since it was read: the change was made on what that wrote.
+pub const PROJECT_CHANGED_ELSEWHERE: &str = "project.toml war inzwischen von einem anderen \
+     Fenster oder Programm geändert; die Änderung ist auf dessen Stand gemacht, beides bleibt";
+/// Label of the background job that writes `auswahl.toml`.
+pub const CHOICES_JOB: &str = "Auswahl speichern";
+
+// Managing the project: scans, and folders to the trash
+pub const RENAME_SCAN: &str = "Umbenennen …";
+pub const RELINK_SCAN: &str = "Ordner neu zuordnen …";
+pub const RELINK_ONLY_MISSING: &str =
+    "Nur für einen Scan, dessen Ordner fehlt (verschoben, Laufwerk nicht angesteckt)";
+pub const REMOVE_SCAN: &str = "Aus Projekt entfernen";
+pub const REMOVE_RUN: &str = "Aus Projekt entfernen";
+pub const DELETE: &str = "Löschen …";
+/// The window „Scan umbenennen“ and its field.
+pub const RENAME_TITLE: &str = "Scan umbenennen";
+pub const SCAN_NAME: &str = "Name";
+pub const SCAN_NAME_EMPTY: &str = "Der Name darf nicht leer sein";
+pub const RENAME_CONFIRM: &str = "Umbenennen";
+pub const REMOVE_TITLE: &str = "Aus Projekt entfernen";
+pub const REMOVE_CONFIRM: &str = "Entfernen";
+pub const DELETE_TITLE: &str = "Löschen";
+pub const DELETE_CONFIRM: &str = "In den Papierkorb";
+/// In the question „Löschen“ while the view shows something of the folder.
+pub const UNSHOW: &str = "Aus der Ansicht nehmen";
+pub const ASK_CANCEL: &str = "Abbrechen";
+pub const DIALOG_RELINK_SCAN: &str = "Neuen Ordner des Scans wählen (mit LIDAR_*.bag)";
+/// Label of the background work that assigns a scan folder or moves a folder to the trash.
+pub const RELINK_JOB: &str = "Scan zuordnen";
+pub const TRASH_JOB: &str = "In den Papierkorb";
+/// Why a scan cannot be changed now: a step of it runs or waits.
+pub const SCAN_BUSY: &str = "Ein Schritt dieses Scans läuft oder wartet – erst danach";
+/// A run in the run folder itself (made by the CLI): it is the run folder.
+pub const MAP_IN_RUN: &str = "Liegt im Lauf-Ordner: mit dem Lauf löschen";
+
+/// The question before „Aus Projekt entfernen“ of a scan.
+pub fn remove_scan_question(
+    name: &str,
+    raw: &std::path::Path,
+    results: &std::path::Path,
+) -> String {
+    format!(
+        "Scan „{name}“ aus dem Projekt entfernen? Nur der Eintrag geht. Die Rohdaten bleiben \
+         unberührt ({}), ebenso die Ergebnisse unter {}: wird der Scan wieder hinzugefügt, sind \
+         sie wieder da.",
+        raw.display(),
+        results.display()
+    )
+}
+
+/// The question before „Löschen …“: „Karte 001 löschen? Der Ordner (640 MB) wandert in den
+/// Papierkorb.“ (without a size while it is not measured); on Windows with
+/// [`DELETE_TOO_BIG_WINDOWS`].
+pub fn delete_question(label: &str, bytes: Option<u64>) -> String {
+    let question = match bytes {
+        Some(bytes) => format!(
+            "„{label}“ löschen? Der Ordner ({}) wandert in den Papierkorb und lässt sich von dort \
+             zurückholen.",
+            size(bytes)
+        ),
+        None => format!(
+            "„{label}“ löschen? Der Ordner wandert in den Papierkorb und lässt sich von dort \
+             zurückholen."
+        ),
+    };
+    if cfg!(windows) {
+        format!("{question} {DELETE_TOO_BIG_WINDOWS}")
+    } else {
+        question
+    }
+}
+
+/// What Windows does with a folder its recycle bin cannot take (larger than the bin may get,
+/// or a drive whose bin is switched off): it asks whether to delete it for good
+/// (`FOF_WANTNUKEWARNING` of the `trash` crate); „Nein“ keeps it.
+pub const DELETE_TOO_BIG_WINDOWS: &str = "Ist er zu groß für den Papierkorb, fragt Windows, ob \
+     er endgültig gelöscht werden soll – dann „Nein“ wählen: es wird nichts gelöscht.";
+
+/// What lies in a folder to delete: „Darin: Karte 001, Oberfläche 001“.
+pub fn delete_contains(list: &[String]) -> String {
+    format!("Darin: {}", list.join(", "))
+}
+
+/// The models that use a map to delete.
+pub fn delete_used_by(list: &[String]) -> String {
+    format!(
+        "Davon hängt ab: {} – ihre Oberfläche und „Von Hand ausrichten“ gehen danach nicht mehr \
+         (das Modell selbst bleibt sichtbar).",
+        list.join(", ")
+    )
+}
+
+/// After a folder went to the trash.
+pub fn deleted(label: &str, bytes: Option<u64>) -> String {
+    match bytes {
+        Some(bytes) => format!("„{label}“ in den Papierkorb gelegt ({})", size(bytes)),
+        None => format!("„{label}“ in den Papierkorb gelegt"),
+    }
+}
+
+/// Why a folder cannot go to the trash now: it, or something that depends on it, is shown.
+pub fn delete_shown(what: &str) -> String {
+    format!("Wird gerade angezeigt ({what}) – erst „{UNSHOW}“")
+}
+
+/// Why a folder cannot go to the trash now: a step works on it, or it waits in the queue.
+pub fn delete_computing(label: &str) -> String {
+    format!("Wird gerade gerechnet ({label}) – nach dem Schritt oder „Abbrechen“")
+}
+
+/// Why a folder cannot go to the trash now: a job of another window or program writes into it
+/// or into a folder in it (its mark names `holder`).
+pub fn delete_busy(holder: &str) -> String {
+    format!(
+        "Wird gerade in einem anderen Fenster oder Programm gerechnet ({holder}) – erst danach \
+         löschen"
+    )
+}
+
+/// A folder the trash cannot take (a network share, a removable drive on Windows).
+pub fn trash_unavailable(path: &std::path::Path, why: &str) -> String {
+    about_path(
+        &format!("Kein Papierkorb für diesen Ordner ({why}); nichts gelöscht"),
+        path,
+    )
+}
+
+/// The trash of the system refused (German reason first, the system's text below).
+pub fn trash_failed(path: &std::path::Path, error: &str) -> String {
+    format!(
+        "{}\n{error}",
+        about_path("Nicht in den Papierkorb gelegt; nichts gelöscht", path)
+    )
+}
+
+/// After „Ordner neu zuordnen …“.
+pub fn relinked(name: &str, checked: bool) -> String {
+    if checked {
+        format!("Scan „{name}“ liest jetzt aus dem neuen Ordner")
+    } else {
+        format!(
+            "Scan „{name}“ liest jetzt aus dem neuen Ordner (nicht prüfbar: der Scan hat noch \
+             keinen Lauf)"
+        )
+    }
+}
+
+/// A folder of another scan: the bags differ.
+pub fn other_scan_bags(then: &[(String, u64)], now: &[(String, u64)]) -> String {
+    let list = |bags: &[(String, u64)]| {
+        bags.iter()
+            .map(|(name, bytes)| format!("{name} {}", size(*bytes)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "Anderer Scan: die LiDAR-Aufnahmen unterscheiden sich (vorher {}, hier {})",
+        list(then),
+        list(now)
+    )
+}
+
+/// A folder of another scan: recorded at other times than the runs of the scan.
+pub fn other_scan_times(run: (f64, f64), scan: (f64, f64)) -> String {
+    format!(
+        "Anderer Scan: zu anderer Zeit aufgenommen (der Lauf des Scans umfasst {}–{} s, dieser \
+         Ordner {}–{} s)",
+        decimal(run.0, 1),
+        decimal(run.1, 1),
+        decimal(scan.0, 1),
+        decimal(scan.1, 1)
+    )
+}
+
+// After an interruption: what jobs cut off left behind
+/// Beside each leftover in „Daten“.
+pub const INCOMPLETE: &str = "unvollständig";
+/// The start of the line above the leftovers.
+pub const INCOMPLETE_TITLE: &str = "Unvollständig";
+pub const CLEAN_UP: &str = "Aufräumen";
+pub const CLEAN_UP_HINT: &str = "Legt diese Reste abgebrochener Schritte in den Papierkorb";
+pub const CLEAN_UP_WAIT: &str = "Erst nach dem Schritt, der gerade läuft oder wartet";
+pub const CLEAN_UP_JOB: &str = "Aufräumen";
+/// At most this many leftovers are listed by name; the rest is counted.
+pub const INCOMPLETE_LISTED: usize = 5;
+
+/// The line above the leftovers: „Unvollständig – Reste abgebrochener Schritte (3 · 2,4 GB)“.
+pub fn incomplete_title(count: usize, bytes: u64) -> String {
+    format!(
+        "{INCOMPLETE_TITLE} – Reste abgebrochener Schritte (Absturz, Stromausfall): {count} · {}",
+        size(bytes)
+    )
+}
+
+/// One leftover: „SLAM 002 · unvollständig · 12 KB“.
+pub fn incomplete_entry(label: &str, bytes: u64) -> String {
+    format!("{label} · {INCOMPLETE} · {}", size(bytes))
+}
+
+/// Below the leftovers listed: „und 4 weitere“.
+pub fn incomplete_more(count: usize) -> String {
+    format!("und {count} weitere")
+}
+
+/// Beside a run or map in the tree whose report is missing but which holds finished results
+/// (maps, surfaces, the history): it stays, and is computed again.
+pub const INCOMPLETE_RECOMPUTE: &str = "unvollständig – neu rechnen";
+
+/// „SLAM 001 · unvollständig – neu rechnen“.
+pub fn incomplete_folder(label: &str) -> String {
+    format!("{label} · {INCOMPLETE_RECOMPUTE}")
+}
+
+/// On hover over such a run.
+pub const RUN_INCOMPLETE_HINT: &str = "Der Bericht slam.json fehlt: das Neu-Rechnen dieses \
+     Laufs wurde unterbrochen (Absturz, Stromausfall). Was darin fertig ist – Karten, \
+     Oberflächen, der Verlauf –, bleibt und wird nicht aufgeräumt. Vollständig wird der Lauf \
+     wieder mit „Neu rechnen (aus Teilkarten)“ unter „Erweitert“ oder mit „Diesen Stand \
+     wiederherstellen“ im Verlauf.";
+
+/// On hover over such a map.
+pub const MAP_INCOMPLETE_HINT: &str = "Der Bericht map.json fehlt: die Karte wurde nicht \
+     fertig gerechnet (Absturz, Stromausfall, ein älteres Programm). Ihre fertigen Oberflächen \
+     bleiben und werden nicht aufgeräumt. „Rechnen“ macht eine neue, vollständige Karte; diese \
+     lässt sich mit „Löschen …“ entfernen, sobald ihre Oberflächen nicht mehr gebraucht werden.";
+
+/// After „Aufräumen“.
+pub fn cleaned_up(count: usize, bytes: u64) -> String {
+    format!(
+        "{count} {} in den Papierkorb gelegt ({})",
+        if count == 1 { "Rest" } else { "Reste" },
+        size(bytes)
+    )
+}
+
+/// The label of the read of a project folder (status bar while a project is opened).
+pub const READ_PROJECT_JOB: &str = "Projekt lesen";
+/// In the field while a project is being opened.
+pub const PROJECT_READING: &str = "Projekt wird gelesen …";
+
+/// A project in cloud storage: what happens to its files and what to do instead.
+pub fn project_in_cloud(cloud: &str, dir: &std::path::Path) -> String {
+    format!(
+        "Projekt liegt in {cloud}: große Ergebnisse werden hochgeladen und bei knappem Platz \
+         vom Rechner genommen, dann lädt jede Wolke erst langsam wieder herunter. Besser ein \
+         lokaler Ordner, z. B. „{}“ im Benutzerordner.\n{}",
+        crate::places::PROJECTS_FOLDER,
+        dir.display()
+    )
 }
 
 /// Under the heading „Daten“: „Projekt „Halle“ · 3 Scans“.
@@ -695,6 +1044,59 @@ pub fn project_line(name: &str, scans: usize) -> String {
     };
     format!("Projekt „{name}“ · {scans}")
 }
+
+/// A size in bytes, decimal units, a decimal only below 10: „3 KB“, „3,4 MB“, „640 MB“,
+/// „1,2 GB“, „85 GB“.
+pub fn size(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b < 1e6 {
+        format!("{} KB", (b / 1e3).ceil() as u64)
+    } else if b < 1e7 {
+        format!("{} MB", decimal(b / 1e6, 1))
+    } else if b < 1e9 {
+        format!("{} MB", (b / 1e6).round() as u64)
+    } else if b < 1e10 {
+        format!("{} GB", decimal(b / 1e9, 1))
+    } else {
+        format!("{} GB", (b / 1e9).round() as u64)
+    }
+}
+
+/// An entry of the tree with the size of its folder: „Karte 001 · 640 MB“.
+pub fn with_size(label: &str, bytes: u64) -> String {
+    format!("{label} · {}", size(bytes))
+}
+
+/// Under the project line: „12,4 GB im Projekt · 85 GB frei“ (without the free space if the
+/// system does not say it).
+pub fn disk_line(total: u64, free: Option<u64>) -> String {
+    match free {
+        Some(free) => format!("{} im Projekt · {} frei", size(total), size(free)),
+        None => format!("{} im Projekt", size(total)),
+    }
+}
+
+/// Little free space on the drive of the project.
+pub fn low_space(free: u64) -> String {
+    format!(
+        "Nur noch {} frei auf dem Laufwerk des Projekts – Karten und Oberflächen brauchen \
+         schnell mehrere GB; Platz schaffen (alte Ergebnisse löschen) oder das Projekt auf ein \
+         größeres Laufwerk legen",
+        size(free)
+    )
+}
+
+/// A step that will need more than is free.
+pub fn needs_room(label: &str, need: u64, free: u64) -> String {
+    format!(
+        "{label} braucht etwa {}, frei sind nur {} – der Schritt läuft, bricht aber ab, wenn \
+         der Datenträger voll wird",
+        size(need),
+        size(free)
+    )
+}
+/// Label of the background measurement of the disk use (not shown in the status bar).
+pub const DISK_JOB: &str = "Platz messen";
 
 /// A precision that is no level: „Eigene (0,013 m)“.
 pub fn precision_custom(voxel: f64) -> String {
@@ -781,6 +1183,11 @@ pub fn unknown_run(dir: &std::path::Path) -> String {
 
 pub fn unknown_map(dir: &std::path::Path) -> String {
     format!("{UNKNOWN_MAP}: {}", dir.display())
+}
+
+/// A folder to delete that is no longer in the tree (gone meanwhile).
+pub fn not_in_tree(dir: &std::path::Path) -> String {
+    about_path("Nicht mehr im Projekt", dir)
 }
 
 /// „Einfärben wird übersprungen: keine Kamerabilder …“ (step „Alles“ on a scan without them).
@@ -920,7 +1327,7 @@ pub fn measurement_name(nr: usize) -> String {
 
 /// The info at the top left of the view: „Punktwolke · 6,0 Mio. Punkte“.
 pub fn info_cloud(points: usize) -> String {
-    format!("Punktwolke · {} Punkte", point_count(points))
+    format!("Punktwolke · {}", self::points(points))
 }
 
 /// „Oberfläche · 712.218 Dreiecke“.
@@ -1032,11 +1439,19 @@ pub fn cloud_loaded(path: &std::path::Path, points: usize, load_s: f64, build_s:
         |n| n.to_string_lossy().into_owned(),
     );
     format!(
-        "{name} geladen: {} Punkte (Laden {} s, Detailstufen {} s)",
-        point_count(points),
+        "{name} geladen: {} (Laden {} s, Detailstufen {} s)",
+        self::points(points),
         decimal(load_s, 1),
         decimal(build_s, 1)
     )
+}
+
+/// „1 Punkt“, „12.345 Punkte“, „15,6 Mio. Punkte“.
+pub fn points(n: usize) -> String {
+    match n {
+        1 => "1 Punkt".into(),
+        n => format!("{} Punkte", point_count(n)),
+    }
 }
 
 // Comparison and history
@@ -1049,7 +1464,7 @@ pub const CHOOSE: &str = "wählen …";
 pub const COMPARING: &str = "Wird verglichen …";
 pub const COMPARE_JOB: &str = "Laufbahnen vergleichen";
 pub const COMPARE_ATE: &str = "Abweichung (ATE, RMSE)";
-pub const COMPARE_GAP: &str = "Start↔Ende A/B";
+pub const COMPARE_GAP: &str = "Start–Ende A/B";
 pub const COMPARE_LENGTH: &str = "Länge A/B";
 pub const COMPARE_MATCHED: &str = "Zugeordnete Posen";
 pub const LAYER_COMPARE: &str = "Vergleich (A)";
@@ -1116,7 +1531,7 @@ pub fn stamp(created: &str) -> String {
 }
 
 /// A state of the history in the tree: „Stand 003 · neu gerechnet · 21.10.2026 16:03 ·
-/// Start↔Ende 0,123 m“ (without the gap if `slam.json` could not be read).
+/// Start–Ende 0,123 m“ (without the gap if `slam.json` could not be read).
 pub fn history_entry(e: &driftless_steps::history::HistoryEntry, gap: Option<f64>) -> String {
     let mut s = format!(
         "{} · {} · {}",
@@ -1125,7 +1540,7 @@ pub fn history_entry(e: &driftless_steps::history::HistoryEntry, gap: Option<f64
         stamp(&e.created)
     );
     if let Some(g) = gap {
-        s.push_str(&format!(" · Start↔Ende {}", compare_metres(g)));
+        s.push_str(&format!(" · Start–Ende {}", compare_metres(g)));
     }
     s
 }
@@ -1134,4 +1549,304 @@ pub const HISTORY_GAPS_JOB: &str = "Verlauf lesen";
 /// The legend of a comparison in the view: „A: SLAM 001 Odometrie“.
 pub fn legend(which: &str, name: &str) -> String {
     format!("{which}: {name}")
+}
+
+// Messages: system errors in German, symbols the fonts lack, paths shortened
+
+/// The reason of a system error in German, by its kind; `None` for a kind without one (its
+/// own text then stays).
+pub fn io_reason(kind: std::io::ErrorKind) -> Option<&'static str> {
+    use std::io::ErrorKind as K;
+    Some(match kind {
+        K::NotFound => "nicht gefunden",
+        K::PermissionDenied => "keine Berechtigung",
+        K::AlreadyExists => "gibt es schon",
+        K::StorageFull | K::QuotaExceeded => "Datenträger voll",
+        K::ReadOnlyFilesystem => "Datenträger schreibgeschützt",
+        K::TimedOut => "keine Antwort (Netzlaufwerk oder iCloud nicht erreichbar?)",
+        K::NotADirectory => "kein Ordner",
+        K::IsADirectory => "ist ein Ordner",
+        K::DirectoryNotEmpty => "Ordner nicht leer",
+        K::InvalidFilename => "ungültiger Name",
+        K::FileTooLarge => "Datei zu groß",
+        K::ResourceBusy | K::ExecutableFileBusy => "wird gerade von einem anderen Programm benutzt",
+        K::StaleNetworkFileHandle
+        | K::NetworkUnreachable
+        | K::NetworkDown
+        | K::HostUnreachable
+        | K::NotConnected
+        | K::ConnectionReset
+        | K::ConnectionAborted => "Netzlaufwerk nicht erreichbar",
+        K::CrossesDevices => "liegt auf einem anderen Laufwerk",
+        K::UnexpectedEof => "Datei endet zu früh (beschädigt?)",
+        K::InvalidData => "Inhalt beschädigt",
+        K::OutOfMemory => "Arbeitsspeicher reicht nicht",
+        K::Interrupted => "unterbrochen",
+        _ => return None,
+    })
+}
+
+/// The command-line hints of the steps and what to do in the window instead.
+const APP_HINTS: [(&str, &str); 4] = [
+    (
+        "; mit `driftless slam` neu erzeugen",
+        "; den Scan neu rechnen (Scan wählen, „Rechnen“)",
+    ),
+    (
+        "zuerst `driftless slam <scan> -o <ziel>` laufen lassen",
+        "zuerst den Scan rechnen (Scan wählen, „Rechnen“)",
+    ),
+    (
+        "zuerst `driftless map <scan> --slam <ziel>` laufen lassen",
+        "zuerst die Karte rechnen (Scan wählen, „Rechnen“)",
+    ),
+    (
+        "mit `driftless slam` neu rechnen",
+        "den Scan neu rechnen (Scan wählen, „Rechnen“)",
+    ),
+];
+
+/// `message` as the window says it: every system error („Permission denied (os error 13)“)
+/// as its German reason ([`io_reason`]), a command-line hint of a step as the action in the
+/// window ([`APP_HINTS`]; one that names its own folders: „zuerst den Scan rechnen“).
+pub fn german(message: &str) -> String {
+    let mut out = message.to_string();
+    // „<system text> (os error N)“: the text is the system's own for N
+    let mut from = 0;
+    while let Some(at) = out[from..].find("(os error ") {
+        let start = from + at;
+        let digits: String = out[start + 10..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '-')
+            .collect();
+        let end = start + 10 + digits.len();
+        let Some(code) = digits
+            .parse::<i32>()
+            .ok()
+            .filter(|_| out[end..].starts_with(')'))
+        else {
+            from = end;
+            continue;
+        };
+        let system = std::io::Error::from_raw_os_error(code);
+        let english = system.to_string();
+        let reason = io_reason(system.kind());
+        match (reason, out[..end + 1].rfind(&english)) {
+            (Some(reason), Some(begin)) if begin + english.len() == end + 1 => {
+                out.replace_range(begin..end + 1, reason);
+                from = begin + reason.len();
+            }
+            _ => from = end + 1,
+        }
+    }
+    for (cli, app) in APP_HINTS {
+        out = out.replace(cli, app);
+    }
+    // the readers of TOML and JSON: where in the file
+    out = places(
+        &out,
+        "TOML parse error at line ",
+        ", column ",
+        "beschädigt (Zeile ",
+    );
+    out = places(&out, " at line ", " column ", " (Zeile ");
+    // any other: „zuerst `driftless …` laufen lassen“
+    while let Some(start) = out.find("zuerst `driftless ") {
+        let Some(len) = out[start..].find("` laufen lassen") else {
+            break;
+        };
+        let end = start + len + "` laufen lassen".len();
+        out.replace_range(
+            start..end,
+            "zuerst den Scan rechnen (Scan wählen, „Rechnen“)",
+        );
+    }
+    out
+}
+
+/// `text` with „<from>N<sep>M“ (two numbers) as „<to>N, Spalte M)“: where a reader of TOML
+/// or JSON stopped, in German.
+fn places(text: &str, from: &str, sep: &str, to: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(from) {
+        let after = &rest[at + from.len()..];
+        let line: String = after.chars().take_while(char::is_ascii_digit).collect();
+        let after_line = &after[line.len()..];
+        let column = after_line
+            .strip_prefix(sep)
+            .map(|c| {
+                c.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        if line.is_empty() || column.is_empty() {
+            out.push_str(&rest[..at + from.len()]);
+            rest = after;
+            continue;
+        }
+        out.push_str(&rest[..at]);
+        out.push_str(&format!("{to}{line}, Spalte {column})"));
+        rest = &after_line[sep.len() + column.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The symbols the fonts of the window lack (they come in the messages of the steps, which
+/// a terminal shows as they are), with the symbol of the icon font in their place.
+const SYMBOLS: [(char, &str); 12] = [
+    ('→', egui_phosphor::regular::ARROW_RIGHT),
+    ('←', egui_phosphor::regular::ARROW_LEFT),
+    ('↔', egui_phosphor::regular::ARROWS_LEFT_RIGHT),
+    ('↑', egui_phosphor::regular::ARROW_UP),
+    ('↓', egui_phosphor::regular::ARROW_DOWN),
+    ('✓', egui_phosphor::regular::CHECK),
+    ('✔', egui_phosphor::regular::CHECK),
+    ('✗', egui_phosphor::regular::X),
+    ('✘', egui_phosphor::regular::X),
+    ('⚠', egui_phosphor::regular::WARNING),
+    ('▸', egui_phosphor::regular::CARET_RIGHT),
+    ('▾', egui_phosphor::regular::CARET_DOWN),
+];
+
+/// `text` with the symbols the fonts lack ([`SYMBOLS`]) drawn by the icon font.
+pub fn shown(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(|c| SYMBOLS.iter().any(|(s, _)| *s == c)) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match SYMBOLS.iter().find(|(s, _)| *s == c) {
+            Some((_, icon)) => out.push_str(icon),
+            None => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Whether `word` starts an absolute path: `/…` (not `//` alone), `C:\…`, `C:/…` or `\\…`.
+fn starts_path(word: &str) -> bool {
+    let b = word.as_bytes();
+    let drive =
+        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
+    (b.len() > 1 && b[0] == b'/') || drive || word.starts_with(r"\\")
+}
+
+/// `text` with every absolute path cut to its last part (the file or folder name): a
+/// message then says its reason within one line. A path ends before a space unless the next
+/// word goes on with `/` or `\` (a folder name with spaces, „/Projekte/Halle 2026/scans“),
+/// and before a closing „:“, „;“, „,“ or „)“.
+pub fn short_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (k, line) in text.split('\n').enumerate() {
+        if k > 0 {
+            out.push('\n');
+        }
+        let words: Vec<&str> = line.split(' ').collect();
+        let mut i = 0;
+        while i < words.len() {
+            if i > 0 {
+                out.push(' ');
+            }
+            let (lead, word) = split_lead(words[i]);
+            if !starts_path(word) {
+                out.push_str(words[i]);
+                i += 1;
+                continue;
+            }
+            // the words of the path: further words while they go on with a separator
+            let mut path = word.to_string();
+            let mut j = i + 1;
+            while j < words.len() && !ends_path(&path) {
+                let next = words[j];
+                let continues = next
+                    .find(['/', '\\'])
+                    .is_some_and(|at| !next[..at].contains([':', ';', ',', ')']));
+                if !continues {
+                    break;
+                }
+                path.push(' ');
+                path.push_str(next);
+                j += 1;
+            }
+            let (path, tail) = split_tail(&path);
+            out.push_str(lead);
+            out.push_str(last_part(path));
+            out.push_str(tail);
+            i = j;
+        }
+    }
+    out
+}
+
+/// An opening bracket or quote before a path, and the rest.
+fn split_lead(word: &str) -> (&str, &str) {
+    let at = word
+        .find(|c: char| !matches!(c, '(' | '„' | '"' | '\''))
+        .unwrap_or(word.len());
+    word.split_at(at)
+}
+
+/// Whether a path read so far already ends with what closes it („:“ and the like).
+fn ends_path(path: &str) -> bool {
+    path.ends_with([':', ';', ',', ')', '“', '"'])
+}
+
+/// The path and what closes it (punctuation that belongs to the sentence).
+fn split_tail(path: &str) -> (&str, &str) {
+    let trimmed = path.trim_end_matches([':', ';', ',', ')', '“', '"', '.']);
+    path.split_at(trimmed.len())
+}
+
+/// The last part of `path` (`/` or `\` separated), the path itself if it ends with one.
+fn last_part(path: &str) -> &str {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|p| !p.is_empty())
+        .unwrap_or(path)
+}
+
+/// A message about `path`: the reason first, then the name of the file or folder, the whole
+/// path on the next line (the window shows it on hover, the Protokoll and the log file in
+/// full): „Ordner ist nicht leer: Projekte\n/Users/…/Projekte“.
+pub fn about_path(reason: &str, path: &Path) -> String {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    format!("{reason}: {name}\n{}", path.display())
+}
+
+/// [`about_path`] for a system error with the file it was about: „keine Berechtigung:
+/// karte.laz\n…“ (the reason of [`io_reason`], else the system's text).
+pub fn io_error(what: &str, path: &Path, e: &std::io::Error) -> String {
+    let reason = io_reason(e.kind()).map_or_else(|| german(&e.to_string()), str::to_string);
+    about_path(&format!("{what}: {reason}"), path)
+}
+
+/// The line and column (from 1) of byte `at` of `text`.
+pub fn line_column(text: &str, at: usize) -> (usize, usize) {
+    let before = &text[..at.min(text.len())];
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    (line, column)
+}
+
+/// A TOML file that cannot be read: „project.toml ist beschädigt (Zeile 3, Spalte 7):
+/// <what the reader says>“, the whole path on the next line.
+pub fn damaged_toml(path: &Path, text: &str, e: &toml::de::Error) -> String {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let place = e.span().map(|span| line_column(text, span.start));
+    let what = e.message().lines().next().unwrap_or_default().trim();
+    let head = match place {
+        Some((line, column)) => format!("{name} ist beschädigt (Zeile {line}, Spalte {column})"),
+        None => format!("{name} ist beschädigt"),
+    };
+    format!("{head}: {what}\n{}", path.display())
 }

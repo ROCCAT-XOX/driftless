@@ -19,6 +19,7 @@ numpy 2.5.4 (Python 3.12).
 |---|---|---|
 | `check_export.py` | `check_export.py <bezug.las> <export>…` | Point clouds (LAS, LAZ, E57, PLY, PCD) against the LAS they came from |
 | `check_mesh.py` | `check_mesh.py <oberflaeche.glb> <export>…` | Meshes (glb, OBJ, PLY mesh) against the glb they came from |
+| `check_traj.py` | `check_traj.py <traj.tum> <export>…` | Trajectories (CSV, TUM) against the `traj.tum` they came from |
 | `make_foreign.py` | `make_foreign.py <ordner>` | Writes the foreign sample files and `expected.json` |
 
 Each check prints one table row per file and exits with a code other than 0 if any file
@@ -50,6 +51,17 @@ deviates.
 - PLY mesh: the mean corner colour is within ±3 of the mean texture colour at the distinct
   positions. The script samples that itself with numpy (bilinear between texel centres).
 
+### `check_traj.py`
+
+- Plain Python, no libraries; numbers compared as decimals, not floats.
+- CSV as German spreadsheets read it: the header `stempel;zeit_s;x;y;z;qx;qy;qz;qw`, `;`
+  between the fields, a decimal comma and no point anywhere, `\n` only.
+- Same number of poses; `stempel` the same double as the time in TUM (Driftless reads it as
+  a double and writes 9 decimals); `zeit_s` the seconds since the first pose within 0.0005
+  (3 decimals); position and quaternion within 2e-9 (the quaternion is normalised when the
+  export reads it).
+- TUM exports: the same times, the other fields within 2e-9.
+
 ### `make_foreign.py`
 
 It writes a scene with a fixed seed: 600 points on three planes, one colour per plane.
@@ -78,4 +90,6 @@ DRIFTLESS_RDIR=driftless-b3 ~/.local/bin/driftless-vm run cargo build --release 
 # then per reference, e.g.:
 driftless export bezug.las -o aus.e57
 ~/venv-export/bin/python -I tools/export/check_export.py bezug.las aus.e57
+driftless export <lauf> -o lauf.csv
+python3 -I tools/export/check_traj.py <lauf>/traj.tum lauf.csv
 ```

@@ -8,16 +8,13 @@ use driftless_export::{
     bounds_of, write_points, Layout, PointFormat, PointSink, Points, ReadStart, SINK_BLOCK,
 };
 use driftless_io::progress::Progress;
-use std::path::PathBuf;
+use driftless_io::testdir::TestDir;
 
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(format!(
         "driftless-export-stream-{}-{name}",
         std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    ))
 }
 
 const ALL: Layout = Layout {

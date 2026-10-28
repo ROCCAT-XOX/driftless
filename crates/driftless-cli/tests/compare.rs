@@ -1,20 +1,25 @@
 use assert_cmd::Command;
+use driftless_io::testdir::TestDir;
 use predicates::prelude::*;
 use serde_json::Value;
 use std::path::PathBuf;
 
-fn tmp(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("driftless-compare-{}-{name}", std::process::id()))
+/// A fresh test folder for `name` and the path of the file `name` in it.
+fn tmp(name: &str) -> (TestDir, PathBuf) {
+    let dir = TestDir::new(format!("driftless-compare-{}-{name}", std::process::id()));
+    let path = dir.join(name);
+    (dir, path)
 }
 
-fn write(name: &str, rows: &[(f64, f64, f64, f64)]) -> PathBuf {
-    let path = tmp(name);
+/// The TUM file `name` with `rows` (time, x, y, z), in its test folder.
+fn write(name: &str, rows: &[(f64, f64, f64, f64)]) -> (TestDir, PathBuf) {
+    let (dir, path) = tmp(name);
     let mut s = String::from("# timestamp tx ty tz qx qy qz qw\n");
     for (t, x, y, z) in rows {
         s.push_str(&format!("{t} {x} {y} {z} 0 0 0 1\n"));
     }
     std::fs::write(&path, s).unwrap();
-    path
+    (dir, path)
 }
 
 fn path_rows(shift: f64) -> Vec<(f64, f64, f64, f64)> {
@@ -28,8 +33,8 @@ fn path_rows(shift: f64) -> Vec<(f64, f64, f64, f64)> {
 
 #[test]
 fn compare_text_output() {
-    let a = write("a.tum", &path_rows(0.0));
-    let b = write("b.tum", &path_rows(3.0));
+    let (_a, a) = write("a.tum", &path_rows(0.0));
+    let (_b, b) = write("b.tum", &path_rows(3.0));
     Command::cargo_bin("driftless")
         .unwrap()
         .args(["compare", a.to_str().unwrap(), b.to_str().unwrap()])
@@ -43,7 +48,7 @@ fn compare_text_output() {
 
 #[test]
 fn compare_json_output() {
-    let a = write("ja.tum", &path_rows(0.0));
+    let (_a, a) = write("ja.tum", &path_rows(0.0));
     let out = Command::cargo_bin("driftless")
         .unwrap()
         .args([
@@ -67,19 +72,19 @@ fn compare_json_output() {
 
 #[test]
 fn compare_reports_unmatched_and_bad_files() {
-    let a = write("ua.tum", &path_rows(0.0));
+    let (_a, a) = write("ua.tum", &path_rows(0.0));
     let far: Vec<_> = path_rows(0.0)
         .into_iter()
         .map(|(t, x, y, z)| (t + 500.0, x, y, z))
         .collect();
-    let b = write("ub.tum", &far);
+    let (_b, b) = write("ub.tum", &far);
     Command::cargo_bin("driftless")
         .unwrap()
         .args(["compare", a.to_str().unwrap(), b.to_str().unwrap()])
         .assert()
         .failure()
         .stderr(predicate::str::contains("zu wenige zugeordnete Posen"));
-    let bad = tmp("bad.tum");
+    let (_bad, bad) = tmp("bad.tum");
     std::fs::write(&bad, "1 2 3\n").unwrap();
     Command::cargo_bin("driftless")
         .unwrap()

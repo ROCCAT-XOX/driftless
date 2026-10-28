@@ -1,11 +1,9 @@
+use driftless_io::testdir::TestDir;
 use driftless_map::{write_las, write_las_sources, write_ply, write_ply_sources, Cloud};
 use las::Reader;
-use std::path::PathBuf;
 
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("driftless-map-{}-{name}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(format!("driftless-map-{}-{name}", std::process::id()))
 }
 
 fn cloud(rgb: bool) -> Cloud {

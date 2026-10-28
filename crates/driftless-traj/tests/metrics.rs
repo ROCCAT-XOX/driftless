@@ -1,3 +1,4 @@
+use driftless_io::testdir::TestDir;
 use driftless_traj::{
     align_umeyama, ate_rmse, match_count, path_length, read_tum, start_end_gap, write_tum, Pose,
     TrajError,
@@ -47,8 +48,11 @@ fn curve(n: usize, rate: f64) -> Vec<Pose> {
         .collect()
 }
 
-fn tmp(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("driftless-traj-{}-{name}", std::process::id()))
+/// A fresh test folder for `name` and the path of the file `name` in it.
+fn tmp(name: &str) -> (TestDir, std::path::PathBuf) {
+    let dir = TestDir::new(format!("driftless-traj-{}-{name}", std::process::id()));
+    let path = dir.join(name);
+    (dir, path)
 }
 
 #[test]
@@ -193,7 +197,7 @@ fn tum_roundtrip() {
             q: UnitQuaternion::from_euler_angles(0.1 * i as f64, 0.2, -0.3),
         })
         .collect();
-    let path = tmp("roundtrip.tum");
+    let (_dir, path) = tmp("roundtrip.tum");
     write_tum(&path, &poses).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.starts_with("# timestamp tx ty tz qx qy qz qw\n"));
@@ -208,11 +212,9 @@ fn tum_roundtrip() {
 }
 
 fn parse(name: &str, text: &str) -> Result<Vec<Pose>, TrajError> {
-    let path = tmp(name);
+    let (_dir, path) = tmp(name);
     std::fs::write(&path, text).unwrap();
-    let r = read_tum(&path);
-    let _ = std::fs::remove_file(path);
-    r
+    read_tum(&path)
 }
 
 #[test]
@@ -243,6 +245,8 @@ fn tum_malformed_lines_name_the_line() {
             Err(e) => {
                 let msg = e.to_string();
                 assert!(msg.contains(&format!("Zeile {line}")), "{msg}");
+                // the file is named, so a message in the window says which one
+                assert!(msg.contains("bad.tum ist beschädigt"), "{msg}");
             }
             Ok(_) => panic!("accepted: {text:?}"),
         }

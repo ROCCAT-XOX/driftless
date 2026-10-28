@@ -26,7 +26,7 @@
 //! gives the same result.
 
 use crate::quality::{pass_quality, PassQuality};
-use crate::smooth::{smooth_surfaces, SmoothConfig, SmoothStats};
+use crate::smooth::{smooth_surfaces_with, SmoothConfig, SmoothStats};
 use crate::{Cloud, MapError, RaySource};
 use driftless_io::progress::Progress;
 use driftless_odom::voxel_map::{voxel_key, FixedState, VoxelKey};
@@ -480,8 +480,9 @@ pub fn clean(
 }
 
 /// [`clean`] with progress: one phase per enabled part („Geister“, „Durchblick“,
-/// „Ausreißer“, „Glätten“). Checks `progress` for a cancel before and after every part and
-/// returns [`MapError::Cancelled`].
+/// „Ausreißer“, „Glätten“; the smoothing counts its points). Checks `progress` for a cancel
+/// before and after every part, and while smoothing before every chunk of points
+/// ([`crate::smooth_surfaces_with`]), and returns [`MapError::Cancelled`].
 ///
 /// # Panics
 /// As [`clean`].
@@ -548,8 +549,9 @@ pub fn clean_with(
     let (mut kept, removed) = cloud.select(&keep);
     drop(cloud);
     let smooth = if cfg.smooth.enabled {
-        progress.phase("Glätten", None);
-        let (xyz, s) = smooth_surfaces(&kept.xyz, &cfg.smooth);
+        // stops at the next chunk of points once cancelled, as the merge's smoothing does
+        progress.phase("Glätten", Some(kept.len() as u64));
+        let (xyz, s) = smooth_surfaces_with(&kept.xyz, &cfg.smooth, progress)?;
         check()?;
         kept.xyz = xyz;
         s

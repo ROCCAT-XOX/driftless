@@ -23,7 +23,7 @@ use super::{
 use crate::project::{MapInfo, RunInfo, ScanState};
 use crate::ui::status::count;
 use crate::ui::theme::{icon, DARK};
-use crate::ui::{compare, correct, text, Action, AppState, Queued, ScanNode, Selection, Step};
+use crate::ui::{compare, correct, text, Action, AppState, Ask, Queued, ScanNode, Selection, Step};
 use driftless_steps::history::HistoryKind;
 use driftless_steps::map::{MapSettings, MapStep};
 use driftless_steps::slam::SlamSettings;
@@ -162,9 +162,11 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     };
     ui.weak(text::project_line(&project.name, state.scans.len()))
         .on_hover_text(project.dir.display().to_string());
+    disk_lines(ui, state);
+    leftover_lines(ui, state, &mut action);
     if state.scans.is_empty() {
         hint(ui, text::EMPTY_NO_SCANS);
-        if main_button(ui, text::ADD_SCAN, None, text::COMPUTE_HINT) {
+        if main_button(ui, text::ADD_SCAN, None, text::ADD_SCAN_HINT) {
             action = Some(Action::PickAddScan);
         }
         return action;
@@ -213,6 +215,57 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     action
 }
 
+/// The disk use of the project and the free space of its drive, once measured; below
+/// [`crate::disk::LOW_SPACE`] a warning what to do.
+fn disk_lines(ui: &mut Ui, state: &AppState) {
+    let Some(disk) = &state.disk else {
+        return;
+    };
+    ui.weak(text::disk_line(disk.total, disk.free));
+    if let Some(free) = disk.free.filter(|&f| f < crate::disk::LOW_SPACE) {
+        let warn =
+            RichText::new(format!("{} {}", icon::UNSURE, text::low_space(free))).color(DARK.warn);
+        ui.add(egui::Label::new(warn).wrap());
+    }
+}
+
+/// What jobs cut off left behind, as „unvollständig“ with their sizes (the path on hover), and
+/// „Aufräumen“ that moves them to the trash; it waits while a step runs or waits.
+fn leftover_lines(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
+    let shown = state.leftovers_shown();
+    if shown.is_empty() {
+        return;
+    }
+    let bytes = shown.iter().map(|l| l.bytes).sum();
+    let title = format!(
+        "{} {}",
+        icon::UNSURE,
+        text::incomplete_title(shown.len(), bytes)
+    );
+    ui.add_space(4.0);
+    ui.add(egui::Label::new(RichText::new(title).color(DARK.warn)).wrap());
+    for leftover in shown.iter().take(text::INCOMPLETE_LISTED) {
+        ui.add(egui::Label::new(text::incomplete_entry(&leftover.label, leftover.bytes)).wrap())
+            .on_hover_text(leftover.path.display().to_string());
+    }
+    if shown.len() > text::INCOMPLETE_LISTED {
+        let rest = &shown[text::INCOMPLETE_LISTED..];
+        let paths: Vec<String> = rest.iter().map(|l| l.path.display().to_string()).collect();
+        ui.weak(text::incomplete_more(rest.len()))
+            .on_hover_text(paths.join("\n"));
+    }
+    let blocked = state.clean_up_blocked();
+    let r = ui.add_enabled(blocked.is_none(), egui::Button::new(text::CLEAN_UP));
+    if r.clicked() {
+        *action = Some(Action::CleanUp);
+    }
+    match blocked {
+        Some(why) => r.on_disabled_hover_text(why),
+        None => r.on_hover_text(text::CLEAN_UP_HINT),
+    };
+    ui.add_space(4.0);
+}
+
 /// The card of a scan: its name and status; a click selects it (again: deselects). While it
 /// or something of it is selected, its runs and maps unfold below it.
 fn scan_card(ui: &mut Ui, state: &AppState, scan: &ScanNode, action: &mut Option<Action>) {
@@ -238,6 +291,7 @@ fn scan_card(ui: &mut Ui, state: &AppState, scan: &ScanNode, action: &mut Option
     let r = card(ui, ("scan", &scan.id), selected, name, &hover, |ui| {
         status_label(ui, status);
     });
+    scan_menu(&r, state, scan, action);
     if r.clicked() {
         let selection = if selected {
             Selection::None
@@ -255,11 +309,46 @@ fn scan_card(ui: &mut Ui, state: &AppState, scan: &ScanNode, action: &mut Option
             for run in &scan.runs {
                 tree::run_node(ui, state, run, action);
             }
-            if ui.small_button(text::ADD_RUN).clicked() {
-                *action = Some(Action::PickAddRun(scan.id.clone()));
-            }
         });
     }
+}
+
+/// The context menu of a scan's card: „Umbenennen …“, „Ordner neu zuordnen …“ (only for a
+/// missing scan folder) and „Aus Projekt entfernen“; locked while a step of the scan runs or
+/// waits, the reason on hover.
+fn scan_menu(
+    card: &egui::Response,
+    state: &AppState,
+    scan: &ScanNode,
+    action: &mut Option<Action>,
+) {
+    let busy = state.scan_busy(&scan.id);
+    let missing = matches!(scan.state, ScanState::Missing(_));
+    card.context_menu(|ui| {
+        let item = |ui: &mut Ui, label: &str, locked: Option<String>| {
+            let r = ui.add_enabled(locked.is_none(), egui::Button::new(label));
+            let clicked = r.clicked();
+            if let Some(why) = locked {
+                r.on_disabled_hover_text(why);
+            }
+            clicked
+        };
+        if item(ui, text::RENAME_SCAN, busy.clone()) {
+            *action = Some(Action::Ask(Ask::RenameScan {
+                id: scan.id.clone(),
+                name: scan.name.clone(),
+            }));
+        }
+        let only_missing = (!missing).then(|| text::RELINK_ONLY_MISSING.to_string());
+        if item(ui, text::RELINK_SCAN, busy.clone().or(only_missing)) {
+            *action = Some(Action::PickRelinkScan(scan.id.clone()));
+        }
+        if item(ui, text::REMOVE_SCAN, busy) {
+            *action = Some(Action::Ask(Ask::RemoveScan {
+                id: scan.id.clone(),
+            }));
+        }
+    });
 }
 
 /// „Modelle“ with each model of the project, if there are any.
@@ -270,8 +359,16 @@ fn model_list(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
     ui.add_space(6.0);
     ui.label(RichText::new(text::MODELS).strong());
     if let Some(e) = &state.point_pairs_error {
+        // the reason in one line, the reader's whole answer on hover
         let color = ui.visuals().error_fg_color;
-        ui.add(egui::Label::new(RichText::new(e).color(color)).wrap());
+        let e = text::german(e);
+        let first = text::short_paths(&e)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        ui.add(egui::Label::new(RichText::new(first).color(color)).wrap())
+            .on_hover_text(e);
     }
     for model in &state.models {
         tree::model_node(ui, state, model, action);

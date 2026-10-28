@@ -1,6 +1,7 @@
 //! Merging several scans into one model: `modell.las` (the scan of each point in
-//! `point_source_id`), `modell.ply` (the same with a property `scan`) and `modell.json`
-//! (where every scan sits in the model and how sure that is).
+//! `point_source_id`) and `modell.json` (where every scan sits in the model and how sure that
+//! is); with [`MergeRequest::ply`] (`driftless merge --ply`) also `modell.ply` (the points
+//! of `modell.las` with a property `scan`).
 //!
 //! The model frame is the world frame of the first member (the reference). Each member's map
 //! is its `clean.bin` (refused if missing or of another input), coloured from `color.las` of
@@ -29,26 +30,37 @@
 //! 3. **Thinning**: one point per [`MergeRequest::voxel`] cell of the model, a coloured one
 //!    before an uncoloured one, then the one of the smaller member number, then the earlier
 //!    one; then, with [`MergeRequest::smooth`], the surfaces of all scans are smoothed
-//!    together ([`smooth_surfaces`]).
+//!    together ([`driftless_map::smooth_surfaces`]).
 //!
-//! A cancel is honoured up to the writing. `modell.las` and `modell.ply` are written through
+//! A cancel is honoured up to the writing, in the smoothing at the next chunk of points
+//! ([`driftless_map::SMOOTH_CHUNK`]). `modell.las` and `modell.ply` are written through
 //! a temporary file each, `modell.json` last and atomically: a folder with a report holds a
-//! complete model. A folder that already holds a report is refused, nothing is overwritten.
-//! Every step is deterministic: the same request gives the same files.
+//! complete model. A folder that already holds a report is refused, nothing is overwritten;
+//! the `.tmp` files a killed merge left in it are removed at the start. Every step is
+//! deterministic: the same request gives the same files.
+//!
+//! `modell.json` names the folders of every scan twice: absolute and resolved (`scan`,
+//! `slam_dir`, `map_dir`) and relative to the model folder (`scan_rel`, `slam_dir_rel`,
+//! `map_dir_rel`, with `/` and `..`; `null` where none can be computed: another volume, drive
+//! or share). [`read_model`] takes the relative one where that folder exists, else the
+//! absolute one: a project renamed, moved or copied with its model reads the maps in its own
+//! folder.
 
 use crate::error::{check_cancel, failed, StepError};
+use crate::leftovers::remove_stale_tmp;
 use crate::map::{clean_stage_id, hex, map_input_for, peak_rss_bytes, CLEAN_BIN, REPORT};
 use crate::pairs::PointPairEntry;
 use crate::slam::SlamSettings;
-use driftless_io::atomic_write;
 use driftless_io::progress::Progress;
+use driftless_io::{atomic_write, paths};
 use driftless_map::{
-    intensity_grays, load_stage, smooth_surfaces, stage_fits, write_las_sources, write_ply_sources,
-    Cloud, MapError, SmoothConfig,
+    intensity_grays, load_stage, smooth_surfaces_with, stage_fits, write_las_sources,
+    write_ply_sources, Cloud, SmoothConfig,
 };
 use driftless_odom::voxel_map::{voxel_key, FixedState, VoxelKey};
 use driftless_slam::align::{
     align_pair, align_with_pairs, AlignConfig, AlignMethod, Alignment, Verdict, MIN_AGREEMENT,
+    WALLS_UNMEASURABLE,
 };
 use driftless_traj::nalgebra::{
     Isometry3, Matrix3, Matrix4, Point3, Rotation3, Translation3, UnitQuaternion, Vector3,
@@ -62,7 +74,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// Part of the input id: raised whenever the merge gives another result for the same
-/// request, so an older model counts as stale.
+/// request, so an older model counts as stale. Only then: the program version is no part of
+/// the id (see the rule at the step versions in [`crate::map`]).
 pub const MERGE_VERSION: u32 = 2;
 pub const MODEL_REPORT: &str = "modell.json";
 pub const MODEL_LAS: &str = "modell.las";
@@ -97,12 +110,12 @@ pub struct MergeMember {
 pub struct MergeRequest {
     /// The scans; the first is the reference (its frame is the model frame).
     pub members: Vec<MergeMember>,
-    /// Where `modell.las`, `modell.ply` and `modell.json` go.
+    /// Where `modell.las`, `modell.json` and, with [`Self::ply`], `modell.ply` go.
     pub out_dir: PathBuf,
     pub align: AlignConfig,
     /// One point per cell of this size (m) in the model.
     pub voxel: f64,
-    /// Smooth the surfaces of the merged points ([`smooth_surfaces`]).
+    /// Smooth the surfaces of the merged points ([`driftless_map::smooth_surfaces`]).
     pub smooth: bool,
     /// Take unsure members into the model as well.
     pub include_unsure: bool,
@@ -110,14 +123,31 @@ pub struct MergeRequest {
     /// ([`crate::pairs::PointPairs::resolved`]). An entry counts if it is switched on and
     /// names the map folders ([`MergeMember::map_dir`]) of two members; others are ignored.
     pub pairs: Vec<PointPairEntry>,
+    /// Also `modell.ply` (`--ply`): the same points. Not part of the input id.
+    pub ply: bool,
 }
 
 /// Where a member sits in the model and how sure that is.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ModelMember {
+    /// Scan folder, absolute; as [`read_model`] gives it, the folder found (see
+    /// [`Self::scan_rel`]).
     pub scan: PathBuf,
+    /// [`Self::scan`] relative to the model folder, with `/` and `..`, as merged; `None`
+    /// where none could be computed (another volume, drive or share) and in a model written
+    /// before the field. Taken before the absolute path where its folder exists.
+    #[serde(default)]
+    pub scan_rel: Option<String>,
+    /// SLAM folder, as [`Self::scan`].
     pub slam_dir: PathBuf,
+    /// [`Self::slam_dir`] relative to the model folder, as [`Self::scan_rel`].
+    #[serde(default)]
+    pub slam_dir_rel: Option<String>,
+    /// Map folder, as [`Self::scan`].
     pub map_dir: PathBuf,
+    /// [`Self::map_dir`] relative to the model folder, as [`Self::scan_rel`].
+    #[serde(default)]
+    pub map_dir_rel: Option<String>,
     pub slam: SlamSettings,
     /// `T_i`: world of this scan → model, 4 × 4 row by row.
     pub transform: [f64; 16],
@@ -127,7 +157,9 @@ pub struct ModelMember {
     pub method: String,
     /// "sicher" | "unsicher" | "gescheitert".
     pub verdict: String,
-    /// Why it is unsure or failed (German).
+    /// Why it is unsure or failed (German). For a scan placed by point pairs whose walls could
+    /// not be measured it also says so ([`WALLS_UNMEASURABLE`], as information: the pairs
+    /// place it), even when it is sure.
     pub reason: Option<String>,
     pub overlap: f64,
     pub residual_median_mm: f64,
@@ -135,10 +167,12 @@ pub struct ModelMember {
     /// Edge agreement ([`driftless_slam::align::PairQuality::agreement`]).
     pub agreement: f64,
     /// Residual on the walls of the worst orientation
-    /// ([`driftless_slam::align::PairQuality::wall_residual_mm`]); 0 in a model written
-    /// before the field.
-    #[serde(default)]
-    pub wall_residual_mm: f64,
+    /// ([`driftless_slam::align::PairQuality::wall_residual_mm`]); `None` (not written) where
+    /// the walls could not be measured ([`WALLS_UNMEASURABLE`]), for the reference and in a
+    /// model written before the field. A model that wrote 0 for walls it could not measure
+    /// reads as `Some(0.0)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_residual_mm: Option<f64>,
     /// For a member placed by point pairs: their RMS distance at its pose
     /// ([`driftless_slam::align::Alignment::pair_rms_mm`]).
     #[serde(default)]
@@ -155,7 +189,7 @@ pub struct ModelMember {
     pub clean_id: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ModelReport {
     /// [`MERGE_VERSION`].
     pub version: u32,
@@ -171,6 +205,20 @@ pub struct ModelReport {
     /// field.
     #[serde(default)]
     pub include_unsure: bool,
+    /// What the merge warned about (German, as in the log): a switched-on point pair entry
+    /// that names no two of the scans or cannot be used, a `color.las` that does not fit its
+    /// map. Empty in a model written before the field.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// Whether `report` was merged by this program's merge ([`MERGE_VERSION`]). A model of
+/// another version is stale whatever its maps, like one whose maps were computed anew: the
+/// merge would place its scans or thin its points differently now. The app marks it
+/// „veraltet“, `driftless surface --model` refuses it ([`crate::surface::model_surface_fits`]
+/// does not take it either).
+pub fn version_fits(report: &ModelReport) -> bool {
+    report.version == MERGE_VERSION
 }
 
 /// `T_i` of a member: world of its scan → model.
@@ -186,12 +234,41 @@ fn transform_rows(pose: &Isometry3<f64>) -> [f64; 16] {
     std::array::from_fn(|k| h[(k / 4, k % 4)])
 }
 
-/// Reads `modell.json` of the model folder `dir`.
+/// Reads `modell.json` of the model folder `dir`, with the folders of every scan as found:
+/// the relative path below `dir` where that folder exists, else the absolute one (see the
+/// module documentation).
 pub fn read_model(dir: &Path) -> Result<ModelReport, StepError> {
     let path = dir.join(MODEL_REPORT);
     let text = fs::read_to_string(&path)
         .map_err(|e| format!("Modell {} nicht lesbar: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("Modell {}: {e}", path.display()).into())
+    let mut report: ModelReport = serde_json::from_str(&text)
+        .map_err(|e| StepError::from(format!("Modell {}: {e}", path.display())))?;
+    let base = canonical(dir);
+    for m in &mut report.members {
+        let stored = [
+            (&mut m.scan, &m.scan_rel),
+            (&mut m.slam_dir, &m.slam_dir_rel),
+            (&mut m.map_dir, &m.map_dir_rel),
+        ];
+        for (abs, rel) in stored {
+            if let Some(found) = rel
+                .as_deref()
+                .map(|r| paths::stored_path(&base, r))
+                .filter(|p| p.is_dir())
+            {
+                *abs = found;
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// `path` as `modell.json` keeps it: absolute and resolved (as given where that fails), and
+/// relative to the model folder `out` (resolved) where one can be computed.
+fn stored_member_path(out: &Path, path: &Path) -> (PathBuf, Option<String>) {
+    let abs = canonical(path);
+    let rel = paths::relative_to(out, &abs);
+    (abs, rel)
 }
 
 /// Name of a scan for messages: its folder name.
@@ -228,13 +305,22 @@ type HandPairs = Vec<(Vector3<f64>, Vector3<f64>)>;
 
 /// The point pairs that count ([`MergeRequest::pairs`]) by members (smaller, larger number),
 /// those of several entries one after another in their order, and a warning (German) for
-/// every switched-on entry of two members that cannot be used ([`PointPairEntry::check`]):
-/// it is left out, as if switched off.
+/// every switched-on entry that is left out, as if switched off: one whose map folders are
+/// not those of two members ([`pair_members`]: another scan, another map of it, or a path
+/// that does not resolve to the member's folder), and one of two members that cannot be used
+/// ([`PointPairEntry::check`]).
 fn hand_pairs(req: &MergeRequest) -> (BTreeMap<(usize, usize), HandPairs>, Vec<String>) {
     let mut out: BTreeMap<(usize, usize), HandPairs> = BTreeMap::new();
     let mut warnings = Vec::new();
-    for e in req.pairs.iter().filter(|e| e.enabled) {
+    for (k, e) in req.pairs.iter().enumerate().filter(|(_, e)| e.enabled) {
         let Some((i, j)) = pair_members(req, e) else {
+            warnings.push(format!(
+                "Punktpaare Eintrag {}: {} und {} sind nicht zwei der gewählten Karten, nicht \
+                 genutzt",
+                k + 1,
+                e.a.display(),
+                e.b.display()
+            ));
             continue;
         };
         if let Err(m) = e.check() {
@@ -272,10 +358,7 @@ fn pairs_between(
 
 /// Full text of the input id and the clean id of every member.
 fn input_text(req: &MergeRequest) -> Result<(String, Vec<String>), StepError> {
-    let mut id = format!(
-        "driftless {} merge v{MERGE_VERSION}\n",
-        env!("CARGO_PKG_VERSION")
-    );
+    let mut id = format!("merge v{MERGE_VERSION}\n");
     let mut clean_ids = Vec::with_capacity(req.members.len());
     for (k, m) in req.members.iter().enumerate() {
         let input = map_input_for(&m.scan, &m.slam_dir, &m.map_dir, m.slam.clone());
@@ -304,9 +387,10 @@ pub fn merge_input_id(req: &MergeRequest) -> Result<String, StepError> {
     Ok(hex(&input_text(req)?.0))
 }
 
-/// The path as the file system resolves it, else as given.
+/// The path as the file system resolves it, in its plain form ([`paths::canonical`]), else
+/// as given.
 fn canonical(p: &Path) -> PathBuf {
-    fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    paths::canonical(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Checks the request; returns the clean id of every member and the input id.
@@ -350,22 +434,25 @@ fn stale_map(m: &MergeMember) -> StepError {
 
 /// Takes the colours of `color.las` in `map_dir` into `cloud` (its `clean.bin`) if it holds
 /// the same points in the same order. Returns whether it did; a file that does not fit
-/// gives a warning.
+/// gives a warning, also kept in `warnings`.
 fn attach_color(
     cloud: &mut Cloud,
     member: &MergeMember,
     progress: &Progress,
+    warnings: &mut Vec<String>,
 ) -> Result<bool, StepError> {
     let path = member.map_dir.join("color.las");
     if !path.is_file() {
         return Ok(false);
     }
-    let unfit = |why: String| {
-        progress.warn(format!(
+    let mut unfit = |why: String| {
+        let w = format!(
             "{}: {} passt nicht zur Karte ({why}), Scan bleibt ungefärbt",
             name(member),
             path.display()
-        ));
+        );
+        progress.warn(w.clone());
+        warnings.push(w);
         Ok(false)
     };
     let err = |e: las::Error| StepError::Failed(format!("{}: {e}", path.display()));
@@ -460,10 +547,12 @@ fn better(a: &Alignment, b: &Alignment) -> bool {
         .is_gt()
 }
 
-/// Step 1 of the module documentation on the thinned points `pts` of the members.
+/// Step 1 of the module documentation on the thinned points `pts` of the members, with the
+/// point pairs that count ([`hand_pairs`]).
 fn chain(
     req: &MergeRequest,
     pts: &[Vec<Vector3<f64>>],
+    by_hand: &BTreeMap<(usize, usize), HandPairs>,
     progress: &Progress,
 ) -> Result<Vec<Placement>, StepError> {
     let n = pts.len();
@@ -476,10 +565,6 @@ fn chain(
         unsure_anchor: None,
     });
     let mut cache: BTreeMap<(usize, usize), Alignment> = BTreeMap::new();
-    let (by_hand, warnings) = hand_pairs(req);
-    for w in warnings {
-        progress.warn(w);
-    }
     // Every pair is aligned at most once, each open member against each anchor: n (n − 1) / 2
     // when every member is in the model, fewer otherwise (the rest is counted at the end).
     let total = (n * (n - 1) / 2) as u64;
@@ -499,7 +584,7 @@ fn chain(
                 if let Entry::Vacant(slot) = cache.entry((i, j)) {
                     check_cancel(progress)?;
                     let start = Instant::now();
-                    let a = match pairs_between(&by_hand, i, j) {
+                    let a = match pairs_between(by_hand, i, j) {
                         Some(pairs) => {
                             align_with_pairs(&pts[i], &pts[j], &pairs, &req.align, progress)
                         }
@@ -743,24 +828,6 @@ fn assemble(clouds: Vec<Cloud>, keep: &[Vec<bool>]) -> (Cloud, Vec<u16>) {
     (out, sources)
 }
 
-/// Writes `file` in `dir` through `<file>.tmp` with `write`, so that no half file is left.
-fn write_whole(
-    dir: &Path,
-    file: &str,
-    write: impl FnOnce(&Path) -> Result<(), MapError>,
-) -> Result<(), StepError> {
-    let path = dir.join(file);
-    let tmp = dir.join(format!("{file}.tmp"));
-    let result = write(&tmp).map_err(failed).and_then(|()| {
-        fs::rename(&tmp, &path)
-            .map_err(|e| failed(format!("{} nicht schreibbar: {e}", path.display())))
-    });
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
-}
-
 /// Merges the scans of `req` into one model as `driftless merge` does; every console line
 /// goes to `progress`. Returns the `modell.json` written to [`MergeRequest::out_dir`].
 ///
@@ -780,7 +847,13 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
         )
         .into());
     }
+    let owns = |name: &str| [MODEL_LAS, MODEL_PLY, MODEL_REPORT].contains(&name);
+    remove_stale_tmp(out, owns, progress);
     let n = req.members.len();
+    let (by_hand, mut warnings) = hand_pairs(req);
+    for w in &warnings {
+        progress.warn(w.clone());
+    }
 
     progress.phase("Karten laden", Some(n as u64));
     let mut clouds = Vec::with_capacity(n);
@@ -791,7 +864,7 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
             progress.info(format!("{}: {e}", m.map_dir.join(CLEAN_BIN).display()));
             stale_map(m)
         })?;
-        let colored = attach_color(&mut cloud, m, progress)?;
+        let colored = attach_color(&mut cloud, m, progress, &mut warnings)?;
         progress.info(format!(
             "{}: {} Punkte{}",
             name(m),
@@ -807,7 +880,7 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
         progress.advance(1);
     }
 
-    let placed = chain(req, &pts, progress)?;
+    let placed = chain(req, &pts, &by_hand, progress)?;
     drop(pts);
     check_cancel(progress)?;
 
@@ -842,8 +915,9 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
     drop(keep);
     check_cancel(progress)?;
     if req.smooth {
-        progress.phase("Glätten", None);
-        let (xyz, stats) = smooth_surfaces(&model.xyz, &SmoothConfig::default());
+        // counted by points; a cancel stops it at the next chunk of them
+        progress.phase("Glätten", Some(model.len() as u64));
+        let (xyz, stats) = smooth_surfaces_with(&model.xyz, &SmoothConfig::default(), progress)?;
         model.xyz = xyz;
         progress.info(format!(
             "Geglättet: {} Punkte um im Mittel {:.1} mm verschoben, Wanddicke {:.1} → {:.1} mm",
@@ -858,11 +932,15 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
     check_cancel(progress)?;
     progress.phase("Schreiben", None);
     fs::create_dir_all(out).map_err(|e| format!("{} nicht anlegbar: {e}", out.display()))?;
-    write_whole(out, MODEL_LAS, |p| write_las_sources(p, &model, &sources))?;
-    write_whole(out, MODEL_PLY, |p| write_ply_sources(p, &model, &sources))?;
+    // Each through `<name>.tmp` (the writers' own), so that no half file is left.
+    write_las_sources(&out.join(MODEL_LAS), &model, &sources).map_err(failed)?;
+    if req.ply {
+        write_ply_sources(&out.join(MODEL_PLY), &model, &sources).map_err(failed)?;
+    }
     let points = model.len() as u64;
     drop((model, sources));
 
+    let out_abs = canonical(out);
     let members = req
         .members
         .iter()
@@ -870,7 +948,7 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
         .enumerate()
         .map(|(k, (m, p))| {
             let anchor = p.unsure_anchor.map(|j| name(&req.members[j]));
-            model_member(m, p, anchor, gains[k], counts[k], &clean_ids[k])
+            model_member(m, &out_abs, p, anchor, gains[k], counts[k], &clean_ids[k])
         })
         .collect();
     let peak = peak_rss_bytes();
@@ -882,8 +960,9 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
         seconds_total: (start.elapsed().as_secs_f64() * 1000.0).round() / 1000.0,
         peak_rss_bytes: peak.unwrap_or(0),
         include_unsure: req.include_unsure,
+        warnings,
     };
-    let text = serde_json::to_string_pretty(&report).map_err(failed)? + "\n";
+    let text = crate::report_text(&report)?;
     atomic_write(&report_path, text.as_bytes())
         .map_err(|e| format!("{} nicht schreibbar: {e}", report_path.display()))?;
 
@@ -914,10 +993,12 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
     serde_json::from_str(&text).map_err(failed)
 }
 
-/// The report of member `m` placed at `p`; `unsure_anchor` names the unsurely placed member
-/// its place depends on ([`Placement::unsure_anchor`]).
+/// The report of member `m` of the model in the folder `out` (resolved), placed at `p`;
+/// `unsure_anchor` names the unsurely placed member its place depends on
+/// ([`Placement::unsure_anchor`]).
 fn model_member(
     m: &MergeMember,
+    out: &Path,
     p: &Placement,
     unsure_anchor: Option<String>,
     gain: [f32; 3],
@@ -937,13 +1018,29 @@ fn model_member(
                 ),
                 (Verdict::Unsure(r) | Verdict::Failed(r), _) => (a.verdict.word(), Some(r.clone())),
             };
+            // Point pairs place a scan without its walls (a door, a short corridor shows none):
+            // that they could not be measured is named, the verdict stays the pairs'.
+            let unmeasured = a.method == AlignMethod::PointPairs
+                && a.quality.wall_residual_mm.is_none()
+                && !matches!(a.verdict, Verdict::Failed(_));
+            let reason = match reason {
+                Some(r) if unmeasured => Some(format!("{r}; {WALLS_UNMEASURABLE}")),
+                None if unmeasured => Some(WALLS_UNMEASURABLE.to_string()),
+                r => r,
+            };
             (method_word(a.method), word, reason, Some(a))
         }
     };
+    let (scan, scan_rel) = stored_member_path(out, &m.scan);
+    let (slam_dir, slam_dir_rel) = stored_member_path(out, &m.slam_dir);
+    let (map_dir, map_dir_rel) = stored_member_path(out, &m.map_dir);
     ModelMember {
-        scan: m.scan.clone(),
-        slam_dir: m.slam_dir.clone(),
-        map_dir: m.map_dir.clone(),
+        scan,
+        scan_rel,
+        slam_dir,
+        slam_dir_rel,
+        map_dir,
+        map_dir_rel,
         slam: m.slam.clone(),
         transform: transform_rows(&p.pose),
         placed_against: p.against,
@@ -954,7 +1051,7 @@ fn model_member(
         residual_median_mm: q.map_or(0.0, |a| a.quality.residual_median_mm),
         residual_rms_mm: q.map_or(0.0, |a| a.quality.residual_rms_mm),
         agreement: q.map_or(1.0, |a| a.quality.agreement),
-        wall_residual_mm: q.map_or(0.0, |a| a.quality.wall_residual_mm),
+        wall_residual_mm: q.and_then(|a| a.quality.wall_residual_mm),
         pair_rms_mm: q.and_then(|a| a.pair_rms_mm),
         included: p.included,
         color_gain: gain,
@@ -1006,18 +1103,33 @@ mod tests {
             voxel: 0.01,
             smooth: false,
             include_unsure: false,
+            ply: false,
             pairs: vec![
                 entry("s2", "s0", 0.0, 3),
                 entry("s1", "s1", 10.0, 3),
                 entry("s0", "s9", 20.0, 3),
                 off,
                 entry("s0", "s2", 30.0, 4),
-                // Not about two members: not checked.
+                // Not about two members: not checked, but warned about.
                 entry("s9", "s0", 40.0, 2),
             ],
         };
         let (by_hand, warnings) = hand_pairs(&req);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        // Switched on, but no two members: one member twice, a folder that is no member's.
+        // The switched-off entry is left out without a word.
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        for (w, (nr, a, b)) in
+            warnings
+                .iter()
+                .zip([(2, "s1", "s1"), (3, "s0", "s9"), (6, "s9", "s0")])
+        {
+            assert!(
+                w.starts_with(&format!(
+                    "Punktpaare Eintrag {nr}: {a}/karte und {b}/karte "
+                )) && w.ends_with("sind nicht zwei der gewählten Karten, nicht genutzt"),
+                "{w}"
+            );
+        }
         assert_eq!(by_hand.keys().copied().collect::<Vec<_>>(), vec![(0, 2)]);
         let x = |v: f64| Vector3::new(v, 0.0, 0.0);
         let y = |v: f64| Vector3::new(0.0, v, 0.0);
@@ -1036,11 +1148,63 @@ mod tests {
         bad.pairs.push(entry("s1", "s2", 60.0, 2));
         let (by_hand, warnings) = hand_pairs(&bad);
         assert_eq!(by_hand.keys().copied().collect::<Vec<_>>(), vec![(0, 2)]);
-        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings.len(), 4);
         assert!(
-            warnings[0].contains("mindestens drei") && warnings[0].contains("s1/karte"),
+            warnings[3].contains("mindestens drei") && warnings[3].contains("s1/karte"),
             "{warnings:?}"
         );
+    }
+
+    /// The input id of a merge holds [`MERGE_VERSION`] and the stage ids of the maps, never
+    /// the program version: a new release keeps every model whose maps still fit.
+    #[test]
+    fn input_id_holds_no_program_version() {
+        use crate::map::{run_map, MapRequest, MapStep};
+        use crate::slam::{run_slam, SlamRequest};
+        let dir = driftless_io::testscan::tmp("steps-merge-id");
+        driftless_io::testscan::room_bag(&dir, true);
+        let out = dir.join("out");
+        let slam = SlamRequest {
+            scan: dir.clone(),
+            out: out.clone(),
+            settings: SlamSettings::default(),
+            reuse: false,
+            history: false,
+        };
+        run_slam(&slam, &Progress::new()).unwrap();
+        let mut input = map_input_for(&dir, &out, &out, SlamSettings::default());
+        input.map.step = MapStep::Clean;
+        let map = MapRequest {
+            input,
+            out_dir: out.clone(),
+            all_files: false,
+        };
+        run_map(&map, &Progress::new()).unwrap();
+        let member = MergeMember {
+            scan: dir.clone(),
+            slam_dir: out.clone(),
+            map_dir: out,
+            slam: SlamSettings::default(),
+        };
+        let req = MergeRequest {
+            members: vec![member.clone(), member],
+            out_dir: dir.join("modell"),
+            align: AlignConfig::default(),
+            voxel: 0.01,
+            smooth: true,
+            include_unsure: false,
+            pairs: Vec::new(),
+            ply: false,
+        };
+        let (text, clean_ids) = input_text(&req).unwrap();
+        assert!(!text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        assert!(!text.contains("driftless"), "{text}");
+        assert!(
+            text.starts_with(&format!("merge v{MERGE_VERSION}\n")),
+            "{text}"
+        );
+        assert!(text.contains(&clean_ids[0]), "{text}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1051,8 +1215,11 @@ mod tests {
         );
         let m = ModelMember {
             scan: "a".into(),
+            scan_rel: None,
             slam_dir: "a/d".into(),
+            slam_dir_rel: None,
             map_dir: "a/d".into(),
+            map_dir_rel: None,
             slam: SlamSettings::default(),
             transform: transform_rows(&pose),
             placed_against: Some(0),
@@ -1063,7 +1230,7 @@ mod tests {
             residual_median_mm: 1.0,
             residual_rms_mm: 2.0,
             agreement: 0.9,
-            wall_residual_mm: 1.0,
+            wall_residual_mm: Some(1.0),
             pair_rms_mm: None,
             included: true,
             color_gain: [1.0; 3],
@@ -1093,7 +1260,7 @@ mod tests {
             residual_rms_mm: 3.0,
             tilt_deg: 0.1,
             agreement: 0.98,
-            wall_residual_mm: 2.1,
+            wall_residual_mm: Some(2.1),
         };
         let mut p = Placement {
             pose: Isometry3::identity(),
@@ -1109,12 +1276,13 @@ mod tests {
             included: true,
             unsure_anchor: None,
         };
-        let alone = model_member(&m, &p, None, [1.0; 3], 5, "id");
+        let out = Path::new("m");
+        let alone = model_member(&m, out, &p, None, [1.0; 3], 5, "id");
         assert_eq!(alone.verdict, "sicher");
         assert!(alone.reason.is_none());
-        assert_eq!(alone.wall_residual_mm, 2.1);
+        assert_eq!(alone.wall_residual_mm, Some(2.1));
         p.unsure_anchor = Some(1);
-        let inherited = model_member(&m, &p, Some("s1".into()), [1.0; 3], 5, "id");
+        let inherited = model_member(&m, out, &p, Some("s1".into()), [1.0; 3], 5, "id");
         assert_eq!(inherited.verdict, "unsicher");
         assert!(
             inherited
@@ -1125,6 +1293,114 @@ mod tests {
             inherited.reason
         );
         assert!(inherited.included);
+    }
+
+    /// Walls that cannot be measured: an automatic placement is unsure for it (the align
+    /// verdict), one by point pairs keeps the verdict of the pairs and names it as information.
+    #[test]
+    fn unmeasurable_walls_in_the_report() {
+        let m = MergeMember {
+            scan: "s2".into(),
+            slam_dir: "s2/d".into(),
+            map_dir: "s2/d".into(),
+            slam: SlamSettings::default(),
+        };
+        let quality = driftless_slam::align::PairQuality {
+            overlap: 0.05,
+            residual_median_mm: 2.0,
+            residual_rms_mm: 3.0,
+            tilt_deg: 0.1,
+            agreement: 0.7,
+            wall_residual_mm: None,
+        };
+        let placed = |method, verdict| Placement {
+            pose: Isometry3::identity(),
+            against: Some(0),
+            alignment: Some(Alignment {
+                pose: Isometry3::identity(),
+                method,
+                quality,
+                verdict,
+                runner_up: None,
+                pair_rms_mm: (method == AlignMethod::PointPairs).then_some(12.0),
+            }),
+            included: true,
+            unsure_anchor: None,
+        };
+        let out = Path::new("m");
+        let member = |p: &Placement| model_member(&m, out, p, None, [1.0; 3], 5, "id");
+        let by_hand = member(&placed(AlignMethod::PointPairs, Verdict::Sure));
+        assert_eq!(by_hand.verdict, "sicher");
+        assert_eq!(by_hand.reason.as_deref(), Some(WALLS_UNMEASURABLE));
+        assert_eq!(by_hand.wall_residual_mm, None);
+        let off = member(&placed(
+            AlignMethod::PointPairs,
+            Verdict::Unsure("Punktpaare liegen im Mittel 8.0 cm neben der Lage".into()),
+        ));
+        assert_eq!(off.verdict, "unsicher");
+        assert_eq!(
+            off.reason.as_deref(),
+            Some("Punktpaare liegen im Mittel 8.0 cm neben der Lage; Wände nicht messbar")
+        );
+        let auto = member(&placed(
+            AlignMethod::Features,
+            Verdict::Unsure(WALLS_UNMEASURABLE.into()),
+        ));
+        assert_eq!(auto.verdict, "unsicher");
+        assert_eq!(auto.reason.as_deref(), Some(WALLS_UNMEASURABLE));
+        let failed = member(&placed(
+            AlignMethod::PointPairs,
+            Verdict::Failed("mindestens drei Punktpaare nötig".into()),
+        ));
+        assert_eq!(
+            failed.reason.as_deref(),
+            Some("mindestens drei Punktpaare nötig")
+        );
+        // not written; the reference has none either
+        let text = serde_json::to_string(&by_hand).unwrap();
+        assert!(!text.contains("wall_residual_mm"), "{text}");
+        let reference = Placement {
+            against: None,
+            alignment: None,
+            ..placed(AlignMethod::Features, Verdict::Sure)
+        };
+        assert_eq!(member(&reference).wall_residual_mm, None);
+    }
+
+    /// `modell.json` of before: 0 reads as 0 (that program wrote 0 also for walls it could
+    /// not measure), a member without the field as not measured.
+    #[test]
+    fn old_wall_residuals_read() {
+        let mut json = serde_json::to_value(model_member(
+            &MergeMember {
+                scan: "s".into(),
+                slam_dir: "s/d".into(),
+                map_dir: "s/d".into(),
+                slam: SlamSettings::default(),
+            },
+            Path::new("m"),
+            &Placement {
+                pose: Isometry3::identity(),
+                against: None,
+                alignment: None,
+                included: true,
+                unsure_anchor: None,
+            },
+            None,
+            [1.0; 3],
+            1,
+            "id",
+        ))
+        .unwrap();
+        json["wall_residual_mm"] = 0.0.into();
+        let zero: ModelMember = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(zero.wall_residual_mm, Some(0.0));
+        json["wall_residual_mm"] = 1.54.into();
+        let measured: ModelMember = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(measured.wall_residual_mm, Some(1.54));
+        json.as_object_mut().unwrap().remove("wall_residual_mm");
+        let missing: ModelMember = serde_json::from_value(json).unwrap();
+        assert_eq!(missing.wall_residual_mm, None);
     }
 
     #[test]

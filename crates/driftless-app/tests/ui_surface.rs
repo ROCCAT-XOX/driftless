@@ -1,6 +1,7 @@
 //! The surface in the project, without a window: the step „Oberfläche rechnen“ on a synthetic
 //! scan, its folder in the tree, the note on a stale surface and the key `O` of the view.
 
+use driftless_app::leftovers::LeftoverKind;
 use driftless_app::project::{canonical, run_surface_job, SurfaceSettings};
 use driftless_app::render::ShowMode;
 use driftless_app::ui::view3d::effective_show;
@@ -30,7 +31,7 @@ fn errors(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             UiMessage::Error(e) => Some(e.clone()),
-            UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect()
 }
@@ -100,6 +101,13 @@ fn project_with_map(dir: &Path) -> (H, PathBuf, PathBuf) {
 }
 
 /// The surfaces of the map `map` in the tree: (folder, label, stale).
+/// The entry of the surface in `dir` as the tree shows it: its label with the size of its
+/// folder, as measured in the background.
+fn entry(state: &AppState, dir: &Path, label: &str) -> String {
+    let bytes = state.folder_size(dir).expect("measured");
+    text::with_size(label, bytes)
+}
+
 fn surfaces(state: &AppState, map: &Path) -> Vec<(PathBuf, String, bool)> {
     state
         .scans
@@ -136,7 +144,7 @@ fn surface_button_runs_step() {
     let shown = state.surface.as_ref().expect("surface loaded");
     assert_eq!(shown.path, surface.join("oberflaeche.glb"));
     assert!(shown.triangles > 0);
-    h.get_by_label("Oberfläche 001");
+    h.get_by_label(&entry(state, &surface, "Oberfläche 001"));
     h.get_by_label(text::THIS_SURFACE);
 
     // the same settings again: no second folder, the surface fits
@@ -158,9 +166,8 @@ fn stale_surface_marked() {
     h.state_mut()
         .apply(Action::Select(Selection::Map(map.clone())));
     h.step();
-    assert!(h
-        .query_by_label(&text::surface_stale("Oberfläche 001"))
-        .is_none());
+    let label = entry(h.state().state(), &surface, "Oberfläche 001");
+    assert!(h.query_by_label(&text::surface_stale(&label)).is_none());
 
     // the run is computed anew; on the static synthetic scan its trajectory may come out
     // the same, so it is changed as well: the map, and with it the surface, no longer fit
@@ -171,9 +178,10 @@ fn stale_surface_marked() {
     run(&mut h, Action::OpenProject(dir.join("projekt")));
     assert_eq!(
         surfaces(h.state().state(), &map),
-        [(surface, "Oberfläche 001".to_string(), true)]
+        [(surface.clone(), "Oberfläche 001".to_string(), true)]
     );
-    h.get_by_label(&text::surface_stale("Oberfläche 001"));
+    let label = entry(h.state().state(), &surface, "Oberfläche 001");
+    h.get_by_label(&text::surface_stale(&label));
 }
 
 fn summaries(state: &mut AppState) {
@@ -237,15 +245,36 @@ fn surface_of_an_older_program_is_stale() {
     assert!(surfaces(h.state().state(), &map)[0].2, "not marked stale");
 }
 
+/// A glb without its report: the step was cut off between the two (it writes the report last),
+/// or the folder copied in part. It is no surface of the map – neither current nor stale, so
+/// nothing shows or loads it as finished – but „unvollständig“, for „Aufräumen“.
 #[test]
-fn surface_without_report_is_stale() {
+fn surface_without_report_is_unfinished() {
     let dir = tmp("ui-oberflaeche-ohne-bericht");
     let (mut h, _, map) = project_with_map(&dir);
     run(&mut h, Action::RunSurface(map.clone()));
-    // a glb without its json: the step was killed between the two, or the folder copied
-    fs::remove_file(map.join("oberflaeche-001/oberflaeche.json")).unwrap();
+    let folder = map.join("oberflaeche-001");
+    let glb = folder.join("oberflaeche.glb");
+    fs::remove_file(folder.join("oberflaeche.json")).unwrap();
+    assert!(glb.is_file());
+    run(&mut h, Action::Unshow(map.clone()));
     run(&mut h, Action::OpenProject(dir.join("projekt")));
-    assert!(surfaces(h.state().state(), &map)[0].2, "not marked stale");
+    let state = h.state().state();
+    assert_eq!(surfaces(state, &map), Vec::new());
+    assert!(
+        state
+            .leftovers
+            .iter()
+            .any(|l| l.path == folder && l.kind == LeftoverKind::Surface),
+        "{:?}",
+        state.leftovers
+    );
+    // a click on the map in „Bilder“ shows its cloud, not that glb
+    run(&mut h, Action::SetStep(Step::Bilder));
+    run(&mut h, Action::Select(Selection::Map(map.clone())));
+    let state = h.state().state();
+    assert_eq!(state.surface.as_ref().map(|s| s.path.clone()), None);
+    assert!(state.cloud.is_some(), "the map's cloud");
 }
 
 #[test]
@@ -261,7 +290,12 @@ fn tree_marks_stale_after_a_step() {
     fs::write(run_dir.join("traj.tum"), traj).unwrap();
     run(&mut h, Action::Inspect("halle".into()));
     assert!(surfaces(h.state().state(), &map)[0].2, "not marked stale");
-    h.get_by_label(&text::surface_stale("Oberfläche 001"));
+    let label = entry(
+        h.state().state(),
+        &map.join("oberflaeche-001"),
+        "Oberfläche 001",
+    );
+    h.get_by_label(&text::surface_stale(&label));
 }
 
 #[test]

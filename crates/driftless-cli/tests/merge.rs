@@ -70,7 +70,10 @@ fn merges_two_scans_and_checks_the_folders() {
     .stdout(predicate::str::contains("Modell:"));
     assert!(out.join("modell.json").is_file());
     assert!(out.join("modell.las").is_file());
-    assert!(out.join("modell.ply").is_file());
+    assert!(
+        !out.join("modell.ply").exists(),
+        "modell.ply only with --ply"
+    );
 
     // Point pairs marked by hand place B: three places in B and the same in A.
     let (sin, cos) = 30f64.to_radians().sin_cos();
@@ -96,6 +99,7 @@ fn merges_two_scans_and_checks_the_folders() {
         by_hand.as_os_str(),
         "--punktpaare".as_ref(),
         file.as_os_str(),
+        "--ply".as_ref(),
     ])
     .success()
     .stdout(predicate::str::contains(
@@ -106,6 +110,7 @@ fn merges_two_scans_and_checks_the_folders() {
         serde_json::from_str(&std::fs::read_to_string(by_hand.join("modell.json")).unwrap())
             .unwrap();
     assert_eq!(report["members"][1]["method"], "punktpaare");
+    assert!(by_hand.join("modell.ply").is_file());
 
     // Nothing is overwritten.
     driftless(&[

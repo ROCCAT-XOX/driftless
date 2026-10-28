@@ -33,7 +33,7 @@ fn errors(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             UiMessage::Error(e) => Some(e.clone()),
-            UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect()
 }
@@ -164,7 +164,8 @@ fn places_fill_a_then_b_and_parse_typed_times() {
 
 #[test]
 fn pick_two_places_adds_loop() {
-    let (app, run) = app_with_run(&tmp("ui-korrektur-klick"));
+    let scratch = tmp("ui-korrektur-klick");
+    let (app, run) = app_with_run(&scratch);
     let mut h = harness(app);
     let overlay = h.state().overlay().expect("trajectory of the run").clone();
     assert_eq!(overlay.run, run);
@@ -204,7 +205,8 @@ fn pick_two_places_adds_loop() {
     assert!(row.starts_with("1   aktiv"), "{row}");
     assert!(row.contains(&format!("{ta:.1}")) && row.contains(&format!("{tb:.1}")));
     // in the panel: the message, the entry, the hint to recompute; places cleared
-    h.get_by_label(&correct::added_message(1, ta, tb));
+    // the arrow of the message drawn by the icon font
+    h.get_by_label(&text::shown(&correct::added_message(1, ta, tb)));
     h.get_by_label(&text::place_time(ta));
     h.get_by_label(&entry.added);
     h.get_by_label(text::CHANGED_RECOMPUTE);
@@ -213,7 +215,8 @@ fn pick_two_places_adds_loop() {
 
 #[test]
 fn invalid_loop_shows_error_and_writes_nothing() {
-    let (app, run) = app_with_run(&tmp("ui-korrektur-falsch"));
+    let scratch = tmp("ui-korrektur-falsch");
+    let (app, run) = app_with_run(&scratch);
     // one loop already there, written as the CLI writes it
     correct::add_loop_at(&run, 1.0, 11.0, "", ADDED).unwrap();
     let before = fs::read(run.join(CORRECTIONS_FILE)).unwrap();
@@ -240,10 +243,11 @@ fn invalid_loop_shows_error_and_writes_nothing() {
         click(&mut h, text::ADD_LOOP);
         wait_written(&mut h);
 
-        // the message of the check, unchanged
+        // the message of the check, as shown (its arrow drawn by the icon font)
         let expected = correct::check_new_loop(&run, &correct::load(&run).unwrap(), ta, tb)
             .unwrap_err()
             .to_string();
+        let expected = text::shown(&text::german(&expected)).into_owned();
         assert_eq!(
             h.state().state().correct.message,
             Some(UiMessage::Error(expected.clone())),
@@ -259,7 +263,8 @@ fn invalid_loop_shows_error_and_writes_nothing() {
 
 #[test]
 fn toggle_entry_and_reuse() {
-    let (app, run) = app_with_run(&tmp("ui-korrektur-schalter"));
+    let scratch = tmp("ui-korrektur-schalter");
+    let (app, run) = app_with_run(&scratch);
     correct::add_loop_at(&run, 1.0, 11.0, "Treppe", ADDED).unwrap();
     let mut app = app;
     reselect(&mut app, &run);
@@ -302,7 +307,8 @@ fn toggle_entry_and_reuse() {
 
 #[test]
 fn cli_written_corrections_are_listed() {
-    let (app, run) = app_with_run(&tmp("ui-korrektur-cli"));
+    let scratch = tmp("ui-korrektur-cli");
+    let (app, run) = app_with_run(&scratch);
     correct::add_loop_at(&run, 1.0, 11.0, "Treppe", ADDED).unwrap();
     correct::set_enabled(&run, 1, false).unwrap();
     correct::add_loop_at(&run, 2.25, 10.75, "Flur Süd", "2026-10-21T12:30:00Z").unwrap();
@@ -346,7 +352,8 @@ fn cli_written_corrections_are_listed() {
 /// its start and its state is recorded with those.
 #[test]
 fn corrections_locked_while_a_step_of_the_run_runs() {
-    let (app, run) = app_with_run(&tmp("ui-korrektur-gesperrt"));
+    let scratch = tmp("ui-korrektur-gesperrt");
+    let (app, run) = app_with_run(&scratch);
     correct::add_loop_at(&run, 1.0, 11.0, "", ADDED).unwrap();
     let mut app = app;
     reselect(&mut app, &run);
@@ -397,7 +404,8 @@ fn corrections_locked_while_a_step_of_the_run_runs() {
 /// it); a change written after a reuse started keeps the hint, it was not applied.
 #[test]
 fn recompute_waits_for_writes_and_later_writes_keep_the_hint() {
-    let (app, run) = app_with_run(&tmp("ui-korrektur-wettlauf"));
+    let scratch = tmp("ui-korrektur-wettlauf");
+    let (app, run) = app_with_run(&scratch);
     correct::add_loop_at(&run, 1.0, 11.0, "", ADDED).unwrap();
     let mut app = app;
     reselect(&mut app, &run);
@@ -465,4 +473,56 @@ fn reuse_with_a_write_since_its_start_is_not_current() {
     assert!(c.computed_current(&run));
     // no reuse recorded (a full run): current
     assert!(c.computed_current(&run));
+}
+
+/// The legend of the quality colours: shown while the trajectory is drawn in them (not while
+/// a comparison draws it in one colour), or the anchors of the submaps, or the points in the
+/// colour mode „Güte“; its three rows say in German what green, yellow and red mean.
+#[test]
+fn quality_legend_follows_what_is_drawn() {
+    let scratch = tmp("ui-guete-legende");
+    let (app, _run) = app_with_run(&scratch);
+    let mut h = harness(app);
+    // whether the window placed the legend in the last frame
+    let placed = |h: &mut H| {
+        h.step();
+        h.state().layout().legend.is_some()
+    };
+    // by default the comparison „Odometrie / aktuell“ draws the run in one colour
+    assert!(h.state().overlay().is_some_and(|o| !o.compare.is_empty()));
+    assert!(!placed(&mut h));
+    h.state_mut().state_mut().view.show_compare = false;
+    assert!(placed(&mut h));
+    // the rows, once the legend has faded in
+    frames_until(&mut h, |_| true);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while h.query_by_label(text::QUALITY_BAD).is_none() {
+        assert!(Instant::now() < deadline, "legend rows not shown");
+        h.step();
+    }
+    for row in [text::QUALITY_LEGEND, text::QUALITY_GOOD, text::QUALITY_WEAK] {
+        h.get_by_label(row);
+    }
+    // its place: in the view, at the left, above the bottom
+    let rect = h.state().layout().legend.expect("legend placed");
+    let view = h.state().layout().view;
+    assert!(view.contains_rect(rect), "{rect:?} in {view:?}");
+    assert!(rect.left() < view.center().x && rect.bottom() > view.center().y);
+    // without the trajectory: gone; the anchors of the submaps bring it back
+    h.state_mut().state_mut().view.show_trajectory = false;
+    assert!(!placed(&mut h));
+    h.state_mut().state_mut().view.show_submaps = true;
+    assert!(placed(&mut h));
+    h.state_mut().state_mut().view.show_submaps = false;
+    // the points in the colour mode „Güte“ (the synthetic cloud carries qualities)
+    h.state_mut().load_synthetic(2_000);
+    // the run's own map.las is shown already: wait for the synthetic cloud itself
+    let synthetic = std::path::PathBuf::from(text::synthetic_name(2_000));
+    frames_until(&mut h, |app| {
+        app.cloud().is_some_and(|c| c.path == synthetic)
+    });
+    h.state_mut().state_mut().view.color_mode = driftless_app::render::ColorMode::Rgb;
+    assert!(!placed(&mut h));
+    h.state_mut().state_mut().view.color_mode = driftless_app::render::ColorMode::Quality;
+    assert!(placed(&mut h));
 }

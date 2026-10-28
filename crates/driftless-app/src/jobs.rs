@@ -65,6 +65,22 @@ pub enum JobOutput {
     Run(Box<RunLoaded>),
     /// `corrections.toml` after a change (helper runner).
     Corrected(Box<Corrected>),
+    /// A project folder read: `project.toml` and the tree (tree reader).
+    ProjectRead(Box<crate::ui::ProjectRead>),
+    /// The disk use of the project (helper runner).
+    DiskUse(Box<crate::disk::DiskUse>),
+    /// „Aufräumen“ ended: the bytes of each leftover moved to the trash, and why others could
+    /// not be (helper runner).
+    CleanedUp {
+        moved: Vec<u64>,
+        failed: Vec<String>,
+    },
+    /// A scan pointed at another folder: the project as written, and whether it could be
+    /// checked to be the same scan (helper runner).
+    Relinked {
+        project: Box<crate::project::Project>,
+        checked: bool,
+    },
     /// Two trajectories compared (helper runner).
     Compare(Box<Comparison>),
     /// Two `map.json` side by side (helper runner).

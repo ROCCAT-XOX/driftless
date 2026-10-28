@@ -38,7 +38,7 @@ fn errors(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             UiMessage::Error(e) => Some(e.clone()),
-            UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect()
 }
@@ -154,7 +154,8 @@ fn chosen(h: &H, label: &str) -> String {
 
 #[test]
 fn previous_vs_current_after_reuse() {
-    let (mut app, run) = app_with_run(&tmp("vergleich-vorher"));
+    let scratch = tmp("vergleich-vorher");
+    let (mut app, run) = app_with_run(&scratch);
     correct::add_loop_at(&run, 1.0, 11.0, "Treppe", ADDED).unwrap();
     app.apply(Action::Reuse(run.clone()));
     settle(&mut app);
@@ -179,7 +180,8 @@ fn previous_vs_current_after_reuse() {
 
 #[test]
 fn odometry_vs_current_default_without_previous() {
-    let (app, run) = app_with_run(&tmp("vergleich-odometrie"));
+    let scratch = tmp("vergleich-odometrie");
+    let (app, run) = app_with_run(&scratch);
     let mut h = harness(app);
     idle(&mut h);
     let (a, b, report) = shown(h.state());
@@ -266,7 +268,8 @@ fn history_refs_resolve() {
     assert_eq!(cli.label(), "ergebnisse aktuell");
 
     // all trajectories of the scan: per run current, odometry, previous, states
-    let (mut app, run) = app_with_run(&tmp("vergleich-verlauf"));
+    let scratch = tmp("vergleich-verlauf");
+    let (mut app, run) = app_with_run(&scratch);
     correct::add_loop_at(&run, 1.0, 11.0, "", ADDED).unwrap();
     app.apply(Action::Reuse(run.clone()));
     settle(&mut app);
@@ -362,7 +365,8 @@ fn history_refs_resolve() {
 
 #[test]
 fn restore_history_creates_new_state() {
-    let (mut app, run) = app_with_run(&tmp("vergleich-wiederherstellen"));
+    let scratch = tmp("vergleich-wiederherstellen");
+    let (mut app, run) = app_with_run(&scratch);
     correct::add_loop_at(&run, 1.0, 11.0, "Treppe", ADDED).unwrap();
     app.apply(Action::Reuse(run.clone()));
     settle(&mut app);
@@ -423,7 +427,8 @@ fn restore_history_creates_new_state() {
 
 #[test]
 fn compare_mismatched_trajectories_reports_error() {
-    let (app, run) = app_with_run(&tmp("vergleich-fehler"));
+    let scratch = tmp("vergleich-fehler");
+    let (app, run) = app_with_run(&scratch);
     // a trajectory 1000 s later: no pose has a partner within 0.01 s
     let mut late = read_tum(&run.join("traj.tum")).unwrap();
     for p in &mut late {
@@ -535,7 +540,8 @@ fn map_rows_side_by_side() {
 
 #[test]
 fn overlay_compare_follows_origin() {
-    let (app, run) = app_with_run(&tmp("vergleich-ursprung"));
+    let scratch = tmp("vergleich-ursprung");
+    let (app, run) = app_with_run(&scratch);
     let h = harness(app);
     let c = compare_refs(
         &TrajRef::Odometry(run.clone()),
@@ -572,7 +578,8 @@ fn files(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
 
 #[test]
 fn failed_restore_writes_the_corrections_back() {
-    let (mut app, run) = app_with_run(&tmp("vergleich-rueckschreiben"));
+    let scratch = tmp("vergleich-rueckschreiben");
+    let (mut app, run) = app_with_run(&scratch);
     correct::add_loop_at(&run, 1.0, 11.0, "Treppe", ADDED).unwrap();
     app.apply(Action::Reuse(run.clone()));
     settle(&mut app);
@@ -626,7 +633,8 @@ fn app_with_cli_run(dir: &Path, settings: SlamSettings) -> (DriftlessApp, PathBu
 
 #[test]
 fn restore_imported_state_of_a_cli_run() {
-    let (mut app, run) = app_with_cli_run(&tmp("vergleich-cli"), SlamSettings::default());
+    let scratch = tmp("vergleich-cli");
+    let (mut app, run) = app_with_cli_run(&scratch, SlamSettings::default());
     let cli_traj = fs::read(run.join("traj.tum")).unwrap();
     // added after the run was computed: not part of the state kept as „übernommen“
     correct::add_loop_at(&run, 1.0, 11.0, "", "2099-01-01T00:00:00Z").unwrap();
@@ -664,7 +672,8 @@ fn restore_of_a_cli_run_with_other_settings_changes_nothing() {
         lidar_topic: Some("/lidar".into()),
         ..SlamSettings::default()
     };
-    let (mut app, run) = app_with_cli_run(&tmp("vergleich-cli-andere"), settings);
+    let scratch = tmp("vergleich-cli-andere");
+    let (mut app, run) = app_with_cli_run(&scratch, settings);
     correct::add_loop_at(&run, 1.0, 11.0, "", ADDED).unwrap();
     // a state kept earlier (as a reuse with these settings on the command line would)
     history::record(&run, HistoryKind::Imported, 0.0).unwrap();
@@ -680,7 +689,7 @@ fn restore_of_a_cli_run_with_other_settings_changes_nothing() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("Lauf wurde mit anderen Einstellungen gerechnet")),
+            .any(|e| e.contains("der Lauf wurde mit anderen SLAM-Einstellungen")),
         "{errors:?}"
     );
     assert_eq!(files(&run), before, "nothing changed on disk");
@@ -688,7 +697,8 @@ fn restore_of_a_cli_run_with_other_settings_changes_nothing() {
 
 #[test]
 fn comparison_follows_a_recomputed_run() {
-    let (mut app, one) = app_with_run(&tmp("vergleich-zwei-laeufe"));
+    let scratch = tmp("vergleich-zwei-laeufe");
+    let (mut app, one) = app_with_run(&scratch);
     app.apply(Action::RunSlam("halle".into()));
     settle(&mut app);
     let two = one.with_file_name("slam-002");

@@ -112,6 +112,8 @@ pub struct ScreenLayout {
     pub show: Option<Rect>,
     pub tools: Option<Rect>,
     pub cut: Option<Rect>,
+    /// The legend of the quality colours ([`quality_legend`]).
+    pub legend: Option<Rect>,
 }
 
 impl Default for ScreenLayout {
@@ -125,6 +127,7 @@ impl Default for ScreenLayout {
             show: None,
             tools: None,
             cut: None,
+            legend: None,
         }
     }
 }
@@ -827,6 +830,56 @@ pub fn paint_measurements(
             painter.extend(egui::Shape::dashed_line(&[a, hover], stroke, 6.0, 4.0));
         }
     }
+}
+
+/// Diameter of the colour dots of the quality legend (points).
+const LEGEND_DOT: f32 = 10.0;
+
+/// The legend of the quality colours at the bottom left of the view, above the tools (and the
+/// cut): green, yellow and red with what they mean, the whole story on hover. Only with `show`
+/// (the trajectory or the points are drawn in the quality colours); its rectangle goes into
+/// `layout`.
+pub fn quality_legend(ctx: &Context, view: Rect, show: bool, layout: &mut ScreenLayout) {
+    layout.legend = None;
+    if !show {
+        return;
+    }
+    use driftless_steps::overlay::{quality_color, QUALITY_GREEN, QUALITY_RED, QUALITY_YELLOW};
+    // above the bars at the bottom, if any
+    let above = [layout.tools, layout.cut]
+        .into_iter()
+        .flatten()
+        .map(|r| r.top() - GAP)
+        .fold(view.bottom() - BOTTOM_MARGIN, f32::min);
+    let pos = egui::pos2(view.left() + MARGIN, above);
+    let rect = float(ctx, "guete_legende", view, pos, Align2::LEFT_BOTTOM, |ui| {
+        ui.spacing_mut().interact_size.y = ROW_HEIGHT;
+        ui.label(
+            RichText::new(text::QUALITY_LEGEND)
+                .color(DARK.text)
+                .strong(),
+        )
+        .on_hover_text(text::QUALITY_LEGEND_HINT);
+        for (quality, meaning) in [
+            (QUALITY_GREEN, text::QUALITY_GOOD),
+            (QUALITY_YELLOW, text::QUALITY_WEAK),
+            (QUALITY_RED, text::QUALITY_BAD),
+        ] {
+            let [r, g, b] = quality_color(quality);
+            ui.horizontal(|ui| {
+                let (dot, _) =
+                    ui.allocate_exact_size(egui::vec2(LEGEND_DOT, LEGEND_DOT), Sense::hover());
+                ui.painter().circle_filled(
+                    dot.center(),
+                    LEGEND_DOT / 2.0,
+                    egui::Color32::from_rgb(r, g, b),
+                );
+                ui.label(RichText::new(meaning).color(DARK.text))
+                    .on_hover_text(text::QUALITY_LEGEND_HINT);
+            });
+        }
+    });
+    layout.legend = Some(rect);
 }
 
 /// Radius of the numbered markers of the point pairs (points).

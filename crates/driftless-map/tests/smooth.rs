@@ -1,6 +1,12 @@
 //! Thinner walls: projection onto the local plane, on synthetic walls, corners and rods.
 
-use driftless_map::{clean, smooth_surfaces, CleanConfig, Cloud, RaySource, SmoothConfig};
+use driftless_io::progress::{Progress, ProgressSnapshot};
+use driftless_map::{
+    clean, smooth_surfaces, smooth_surfaces_with, CleanConfig, Cloud, MapError, RaySource,
+    SmoothConfig, SMOOTH_CHUNK,
+};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Deterministic pseudo-random numbers.
 struct Lcg(u64);
@@ -234,6 +240,43 @@ fn smooth_is_deterministic() {
             assert_eq!(out_s[k], out[i], "point {i}");
         }
     }
+}
+
+/// The smoothing counts its points and stops at the next chunk once cancelled; uncancelled it
+/// gives what [`smooth_surfaces`] gives.
+#[test]
+fn smoothing_can_be_cancelled() {
+    let xyz = noisy_wall(3);
+    assert!(xyz.len() > SMOOTH_CHUNK, "at least two chunks");
+    let cfg = SmoothConfig::default();
+    let progress = Progress::new();
+    let with = smooth_surfaces_with(&xyz, &cfg, &progress).unwrap();
+    assert_eq!(with, smooth_surfaces(&xyz, &cfg));
+    assert_eq!(progress.snapshot().done, xyz.len() as u64);
+    // cancelled before: nothing smoothed
+    let before = Progress::new();
+    before.cancel();
+    assert!(matches!(
+        smooth_surfaces_with(&xyz, &cfg, &before),
+        Err(MapError::Cancelled)
+    ));
+    assert_eq!(before.snapshot().done, 0);
+    // cancelled after the first chunk: no second one
+    let done = Arc::new(AtomicU64::new(0));
+    let seen = done.clone();
+    let progress = Progress::new();
+    let handle = progress.clone();
+    let progress = progress.with_observer(move |s: &ProgressSnapshot| {
+        seen.store(s.done, Ordering::Relaxed);
+        if s.done > 0 {
+            handle.cancel();
+        }
+    });
+    assert!(matches!(
+        smooth_surfaces_with(&xyz, &cfg, &progress),
+        Err(MapError::Cancelled)
+    ));
+    assert_eq!(done.load(Ordering::Relaxed), SMOOTH_CHUNK as u64);
 }
 
 #[test]

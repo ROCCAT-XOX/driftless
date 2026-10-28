@@ -9,6 +9,7 @@ use driftless_export::mesh::{
 use driftless_export::testutil::synthetic_points;
 use driftless_export::{read_points, write_points, Layout, PointFormat, Points};
 use driftless_io::progress::Progress;
+use driftless_io::testdir::TestDir;
 use driftless_io::testscan::tmp;
 use driftless_steps::export::{
     existing_targets, export_targets, file_kind, run_export, ExportFormat, ExportKind,
@@ -49,9 +50,8 @@ fn write_cloud(path: &Path, points: &Points) {
 
 /// A map folder: `map.json`, `clean.las` (400 points without colour) and, if `color`,
 /// `color.las` (300 coloured points).
-fn map_dir(name: &str, color: bool) -> PathBuf {
-    let dir = tmp(name).join("karte");
-    fs::create_dir_all(&dir).unwrap();
+fn map_dir(name: &str, color: bool) -> TestDir {
+    let dir = tmp(name).inside("karte");
     fs::write(dir.join("map.json"), "{}").unwrap();
     write_cloud(
         &dir.join("clean.las"),
@@ -79,8 +79,11 @@ fn member(scan: &str, pose: &Isometry3<f64>, included: bool) -> ModelMember {
     let h = pose.to_homogeneous();
     ModelMember {
         scan: PathBuf::from("/scans").join(scan),
+        scan_rel: None,
         slam_dir: PathBuf::from("/scans").join(scan).join("driftless"),
+        slam_dir_rel: None,
         map_dir: PathBuf::from("/scans").join(scan).join("driftless"),
+        map_dir_rel: None,
         slam: SlamSettings::default(),
         transform: std::array::from_fn(|k| h[(k / 4, k % 4)]),
         placed_against: None,
@@ -91,7 +94,7 @@ fn member(scan: &str, pose: &Isometry3<f64>, included: bool) -> ModelMember {
         residual_median_mm: 0.0,
         residual_rms_mm: 0.0,
         agreement: 1.0,
-        wall_residual_mm: 0.0,
+        wall_residual_mm: None,
         pair_rms_mm: None,
         included,
         color_gain: [1.0; 3],
@@ -112,9 +115,8 @@ fn model_members() -> Vec<ModelMember> {
 
 /// A model folder: `modell.las` (600 points of scans 0–2 with every column) and
 /// `modell.json` with [`model_members`].
-fn model_dir(name: &str) -> PathBuf {
-    let dir = tmp(name).join("modell");
-    fs::create_dir_all(&dir).unwrap();
+fn model_dir(name: &str) -> TestDir {
+    let dir = tmp(name).inside("modell");
     let mut points = synthetic_points(600, 3, all_columns());
     points.scans.clear();
     write_cloud(&dir.join(MODEL_LAS), &points);
@@ -126,6 +128,7 @@ fn model_dir(name: &str) -> PathBuf {
         seconds_total: 0.0,
         peak_rss_bytes: 0,
         include_unsure: false,
+        warnings: Vec::new(),
     };
     fs::write(
         dir.join(MODEL_REPORT),
@@ -168,9 +171,8 @@ fn mesh(pages: usize) -> Mesh {
 }
 
 /// A surface folder: `oberflaeche.glb` with `pages` pages and `oberflaeche.json`.
-fn surface_dir(name: &str, pages: usize) -> PathBuf {
-    let dir = tmp(name).join("oberflaeche");
-    fs::create_dir_all(&dir).unwrap();
+fn surface_dir(name: &str, pages: usize) -> TestDir {
+    let dir = tmp(name).inside("oberflaeche");
     write_glb(&dir.join("oberflaeche.glb"), &mesh(pages), &Progress::new()).unwrap();
     fs::write(dir.join("oberflaeche.json"), "{}").unwrap();
     dir
@@ -187,9 +189,8 @@ fn poses() -> Vec<Pose> {
 }
 
 /// A run folder: `traj.tum` with [`poses`].
-fn run_dir(name: &str) -> PathBuf {
-    let dir = tmp(name).join("lauf");
-    fs::create_dir_all(&dir).unwrap();
+fn run_dir(name: &str) -> TestDir {
+    let dir = tmp(name).inside("lauf");
     write_tum(&dir.join("traj.tum"), &poses()).unwrap();
     dir
 }
@@ -262,7 +263,12 @@ fn map_exports_color_else_clean() {
     fs::remove_file(dir.join("clean.las")).unwrap();
     let out = dir.parent().unwrap().join("nichts.las");
     assert_eq!(
-        failed(ExportSource::Map(dir), &out, ExportFormat::Las, false),
+        failed(
+            ExportSource::Map(dir.to_path_buf()),
+            &out,
+            ExportFormat::Las,
+            false
+        ),
         "Karte ohne color.las oder clean.las"
     );
     assert!(!out.exists());
@@ -303,7 +309,7 @@ fn model_e57_has_named_scans_with_poses() {
     // modell.las directly (as the app passes it) is the same source.
     assert_eq!(
         ExportSource::detect(&dir.join(MODEL_LAS)).unwrap(),
-        ExportSource::Model(dir)
+        ExportSource::Model(dir.to_path_buf())
     );
 }
 
@@ -399,7 +405,10 @@ fn detect_sources() {
     }
 
     assert_eq!(ExportSource::Map(map.clone()).kind(), ExportKind::Points);
-    assert_eq!(ExportSource::Model(model).kind(), ExportKind::Points);
+    assert_eq!(
+        ExportSource::Model(model.to_path_buf()).kind(),
+        ExportKind::Points
+    );
     assert_eq!(ExportSource::PointFile(las).kind(), ExportKind::Points);
     assert_eq!(
         ExportSource::Surface(surface.clone()).kind(),
@@ -418,9 +427,9 @@ fn detect_sources() {
         ExportSource::Run(scan_run).default_name(),
         "Büro 2_laufbahn"
     );
-    assert_eq!(ExportSource::Map(map).default_name(), "karte");
+    assert_eq!(ExportSource::Map(map.to_path_buf()).default_name(), "karte");
     assert_eq!(
-        ExportSource::Surface(surface).default_name(),
+        ExportSource::Surface(surface.to_path_buf()).default_name(),
         "s_oberflaeche"
     );
     assert_eq!(
@@ -479,7 +488,11 @@ fn format_from_extension_and_override() {
     // `format` decides, not the extension of the target.
     let dir = map_dir("export-override", true);
     let out = dir.parent().unwrap().join("wolke.dat");
-    export(ExportSource::Map(dir), &out, ExportFormat::Laz);
+    export(
+        ExportSource::Map(dir.to_path_buf()),
+        &out,
+        ExportFormat::Laz,
+    );
     let bytes = fs::read(&out).unwrap();
     assert_eq!(&bytes[..4], b"LASF");
     // LAZ: the compressed point format has bit 7 set.
@@ -507,7 +520,11 @@ fn ply_extension_by_kind() {
     // A surface to .ply is a mesh with colours per corner.
     let dir = surface_dir("export-ply-kind", 2);
     let out = dir.parent().unwrap().join("netz.ply");
-    let report = export(ExportSource::Surface(dir), &out, ExportFormat::PlyMesh);
+    let report = export(
+        ExportSource::Surface(dir.to_path_buf()),
+        &out,
+        ExportFormat::PlyMesh,
+    );
     assert_eq!(report.count, 4);
     let text = String::from_utf8_lossy(&fs::read(&out).unwrap()[..300]).into_owned();
     assert!(text.contains("element face 4"), "{text}");
@@ -530,7 +547,7 @@ fn kind_mismatch_is_refused() {
     let surface = surface_dir("export-mismatch-s", 1);
     assert_eq!(
         failed(
-            ExportSource::Surface(surface),
+            ExportSource::Surface(surface.to_path_buf()),
             &out,
             ExportFormat::Las,
             false
@@ -540,7 +557,12 @@ fn kind_mismatch_is_refused() {
     );
     let run = run_dir("export-mismatch-r");
     assert_eq!(
-        failed(ExportSource::Run(run), &out, ExportFormat::Ply, false),
+        failed(
+            ExportSource::Run(run.to_path_buf()),
+            &out,
+            ExportFormat::Ply,
+            false
+        ),
         "PLY (binär) passt nicht zu Lauf: möglich sind TUM, CSV"
     );
     assert!(!out.exists());
@@ -559,7 +581,12 @@ fn existing_target_refused_without_overwrite() {
     );
     assert_eq!(existing_targets(&req), vec![out.clone()]);
     assert_eq!(
-        failed(ExportSource::Map(map), &out, ExportFormat::Las, false),
+        failed(
+            ExportSource::Map(map.to_path_buf()),
+            &out,
+            ExportFormat::Las,
+            false
+        ),
         format!("gibt es schon: {}", out.display())
     );
     assert_eq!(fs::read(&out).unwrap(), b"alt");
@@ -570,7 +597,12 @@ fn overwrite_replaces() {
     let map = map_dir("export-overwrite", true);
     let out = map.parent().unwrap().join("da.pcd");
     fs::write(&out, b"alt").unwrap();
-    let req = request(ExportSource::Map(map), &out, ExportFormat::Pcd, true);
+    let req = request(
+        ExportSource::Map(map.to_path_buf()),
+        &out,
+        ExportFormat::Pcd,
+        true,
+    );
     let report = run_export(&req, &Progress::new()).unwrap();
     assert_eq!(report.count, 300);
     assert_eq!(read_points(&out, &Progress::new()).unwrap().len(), 300);
@@ -616,14 +648,17 @@ fn target_is_source_refused() {
     assert_eq!(fs::read(&color).unwrap(), before);
     let model = model_dir("export-self-model");
     let out = model.join(MODEL_LAS);
-    assert!(
-        failed(ExportSource::Model(model), &out, ExportFormat::Laz, true)
-            .starts_with("Ziel ist die Quelle selbst")
-    );
+    assert!(failed(
+        ExportSource::Model(model.to_path_buf()),
+        &out,
+        ExportFormat::Laz,
+        true
+    )
+    .starts_with("Ziel ist die Quelle selbst"));
     let surface = surface_dir("export-self-surface", 1);
     let glb = surface.join("oberflaeche.glb");
     assert!(failed(
-        ExportSource::Surface(surface),
+        ExportSource::Surface(surface.to_path_buf()),
         &glb,
         ExportFormat::Glb,
         true
@@ -631,10 +666,13 @@ fn target_is_source_refused() {
     .starts_with("Ziel ist die Quelle selbst"));
     let run = run_dir("export-self-run");
     let tum = run.join("traj.tum");
-    assert!(
-        failed(ExportSource::Run(run), &tum, ExportFormat::Tum, true)
-            .starts_with("Ziel ist die Quelle selbst")
-    );
+    assert!(failed(
+        ExportSource::Run(run.to_path_buf()),
+        &tum,
+        ExportFormat::Tum,
+        true
+    )
+    .starts_with("Ziel ist die Quelle selbst"));
 }
 
 #[test]
@@ -657,7 +695,7 @@ fn obj_side_file_exists_refused() {
     assert_eq!(existing_targets(&req), vec![page.clone()]);
     assert_eq!(
         failed(
-            ExportSource::Surface(surface),
+            ExportSource::Surface(surface.to_path_buf()),
             &out,
             ExportFormat::Obj,
             false
@@ -682,7 +720,7 @@ fn obj_overwrite_removes_stale_pages() {
     fs::write(base.join("x_seite_notizen.txt"), b"fremd").unwrap();
     fs::write(base.join("x_seite_02.jpg.bak"), b"fremd").unwrap();
     let req = request(
-        ExportSource::Surface(surface),
+        ExportSource::Surface(surface.to_path_buf()),
         &out,
         ExportFormat::Obj,
         true,
@@ -708,6 +746,75 @@ fn obj_overwrite_removes_stale_pages() {
     );
 }
 
+/// A killed export leaves `<name>.tmp` next to its target; the next export to that target
+/// removes them (for an OBJ also those of its `.mtl` and pages), others stay.
+#[test]
+fn stale_tmp_files_of_the_target_are_removed() {
+    let surface = surface_dir("export-tmp", 2);
+    let base = surface.parent().unwrap().to_path_buf();
+    let own = [
+        "netz.obj.tmp",
+        "netz.mtl.tmp",
+        "netz_seite_00.jpg.tmp",
+        "netz_seite_07.png.tmp",
+    ];
+    let foreign = ["netzwerk.obj.tmp", "netz_seite_xy.jpg.tmp", "wolke.laz.tmp"];
+    for f in own.iter().chain(&foreign) {
+        fs::write(base.join(f), b"halb").unwrap();
+    }
+    export(
+        ExportSource::Surface(surface.to_path_buf()),
+        &base.join("netz.obj"),
+        ExportFormat::Obj,
+    );
+    for f in own {
+        assert!(!base.join(f).exists(), "{f} left");
+    }
+    for f in foreign {
+        assert!(base.join(f).exists(), "{f} removed");
+    }
+    let map = map_dir("export-tmp-points", true);
+    let out = map.parent().unwrap().join("wolke.laz");
+    fs::write(map.parent().unwrap().join("wolke.laz.tmp"), b"halb").unwrap();
+    export(
+        ExportSource::Map(map.to_path_buf()),
+        &out,
+        ExportFormat::Laz,
+    );
+    assert!(leftovers(out.parent().unwrap()).is_empty());
+}
+
+/// A target in a folder that is not there: refused in German before anything is read, not
+/// with the system's English message from the writer.
+#[test]
+fn missing_target_folder_is_refused_in_german() {
+    let map = map_dir("export-kein-ordner", true);
+    let base = map.parent().unwrap().to_path_buf();
+    let missing = base.join("gibt es nicht");
+    let m = failed(
+        ExportSource::Map(map.clone()),
+        &missing.join("karte.laz"),
+        ExportFormat::Laz,
+        false,
+    );
+    assert_eq!(
+        m,
+        format!(
+            "Zielordner {} gibt es nicht – einen vorhandenen Ordner wählen oder ihn erst anlegen",
+            missing.display()
+        )
+    );
+    assert!(!missing.exists());
+    fs::write(base.join("datei"), b"").unwrap();
+    let m = failed(
+        ExportSource::Map(map.to_path_buf()),
+        &base.join("datei").join("karte.laz"),
+        ExportFormat::Laz,
+        true,
+    );
+    assert!(m.contains("ist kein Ordner"), "{m}");
+}
+
 #[test]
 fn cancel_keeps_old_files() {
     let surface = surface_dir("export-cancel", 2);
@@ -715,7 +822,11 @@ fn cancel_keeps_old_files() {
     let out = base.join("alt.obj");
     // The old OBJ: of a surface with three pages.
     let old_surface = surface_dir("export-cancel-old", 3);
-    export(ExportSource::Surface(old_surface), &out, ExportFormat::Obj);
+    export(
+        ExportSource::Surface(old_surface.to_path_buf()),
+        &out,
+        ExportFormat::Obj,
+    );
     let before: Vec<(String, Vec<u8>)> = names(&base)
         .into_iter()
         .filter(|n| n.starts_with("alt"))
@@ -734,7 +845,7 @@ fn cancel_keeps_old_files() {
         }
     });
     let req = request(
-        ExportSource::Surface(surface),
+        ExportSource::Surface(surface.to_path_buf()),
         &out,
         ExportFormat::Obj,
         true,
@@ -762,7 +873,12 @@ fn cancel_keeps_old_files() {
             watcher.cancel();
         }
     });
-    let req = request(ExportSource::Map(map), &out, ExportFormat::Laz, true);
+    let req = request(
+        ExportSource::Map(map.to_path_buf()),
+        &out,
+        ExportFormat::Laz,
+        true,
+    );
     assert_eq!(run_export(&req, &progress), Err(StepError::Cancelled));
     assert_eq!(fs::read(&out).unwrap(), b"alt");
     assert!(leftovers(out.parent().unwrap()).is_empty());
@@ -780,16 +896,36 @@ fn run_exports_tum_and_csv() {
         fs::read(&tum).unwrap(),
         fs::read(run.join("traj.tum")).unwrap()
     );
-    let report = export(ExportSource::Run(run), &csv, ExportFormat::Csv);
+    let report = export(
+        ExportSource::Run(run.to_path_buf()),
+        &csv,
+        ExportFormat::Csv,
+    );
     assert_eq!(report.count, 5);
     assert_eq!(report.bytes, fs::metadata(&csv).unwrap().len());
     let csv_text = fs::read_to_string(&csv).unwrap();
     let tum_text = fs::read_to_string(&tum).unwrap();
     let csv_lines: Vec<&str> = csv_text.split('\n').collect();
     let tum_lines: Vec<&str> = tum_text.lines().collect();
-    assert_eq!(csv_lines[0], "zeit;x;y;z;qx;qy;qz;qw");
-    assert_eq!(csv_lines[1], tum_lines[1].replace(' ', ";"));
-    assert!(csv_lines[1].starts_with("1700000000.000000000;0.000000000;-0.333333333;1.5"));
+    // For German spreadsheets: `;` and a decimal comma; the stamp as in TUM, then the seconds
+    // since the first pose, then the TUM values.
+    assert_eq!(csv_lines[0], "stempel;zeit_s;x;y;z;qx;qy;qz;qw");
+    for (k, (csv, tum)) in csv_lines[1..6].iter().zip(&tum_lines[1..]).enumerate() {
+        let tum: Vec<&str> = tum.split(' ').collect();
+        let fields: Vec<&str> = csv.split(';').collect();
+        assert_eq!(fields.len(), 9, "{csv}");
+        assert!(!csv.contains('.'), "{csv}");
+        assert_eq!(fields[0], tum[0].replace('.', ","));
+        let t = |s: &str| s.parse::<f64>().unwrap();
+        let since = t(&fields[1].replace(',', "."))
+            - (t(tum[0]) - t(tum_lines[1].split(' ').next().unwrap()));
+        assert!(since.abs() < 5e-4, "{k}: {csv}");
+        assert_eq!(fields[1].split(',').nth(1).map(str::len), Some(3), "{csv}");
+        for (c, v) in fields[2..].iter().zip(&tum[1..]) {
+            assert_eq!(*c, v.replace('.', ","));
+        }
+    }
+    assert!(csv_lines[1].starts_with("1700000000,000000000;0,000;0,000000000;-0,333333333;1,5"));
     assert_eq!(csv_lines.len(), 7, "five poses, a newline at the end");
     assert_eq!(csv_lines[6], "");
     assert!(!csv_text.contains('\r'));
@@ -844,8 +980,7 @@ fn empty_source_every_format() {
 
 #[test]
 fn umlaut_paths_every_format() {
-    let dir = tmp("export-umlaut").join("Büro Scan");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tmp("export-umlaut").inside("Büro Scan");
     let src = point_file(&dir, 2_000);
     for f in POINT_FORMATS {
         let out = dir.join(format!("Prüfung ä.{}", f.extension()));

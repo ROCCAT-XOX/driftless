@@ -52,6 +52,11 @@ fn out_dir() -> PathBuf {
     dir
 }
 
+/// The residual on the walls as printed: „1.79 mm“, or „nicht messbar“.
+fn walls(mm: Option<f64>) -> String {
+    mm.map_or_else(|| "nicht messbar".into(), |w| format!("{w:.2} mm"))
+}
+
 /// Progress that prints every line as it comes.
 fn console() -> Progress {
     Progress::with_log(|line| match line {
@@ -71,6 +76,7 @@ fn black_room_three_scans() {
         smooth: true,
         include_unsure: false,
         pairs: Vec::new(),
+        ply: false,
     };
     let report = run_merge(&req, &console()).unwrap();
     println!("{}", serde_json::to_string_pretty(&report.members).unwrap());
@@ -84,8 +90,9 @@ fn black_room_three_scans() {
     for m in &report.members[1..] {
         let name = m.scan.display();
         println!(
-            "{name}: Wände {:.2} mm, Restfehler {:.2} mm",
-            m.wall_residual_mm, m.residual_median_mm
+            "{name}: Wände {}, Restfehler {:.2} mm",
+            walls(m.wall_residual_mm),
+            m.residual_median_mm
         );
         assert_eq!(m.verdict, "sicher", "{name}: {:?}", m.reason);
         assert!(m.overlap > 0.8, "{name}: overlap {:.3}", m.overlap);
@@ -154,7 +161,7 @@ fn corridor_cut_from_office() {
         .to_degrees();
     println!(
         "{} + {} Punkte, {:.1} s: {:?} {:?}, Überlappung {:.3}, Kanten {:.3}, Restfehler {:.2} mm, \
-         Wände {:.2} mm, Fehler {err:.4} m {rot:.3}°",
+         Wände {}, Fehler {err:.4} m {rot:.3}°",
         source.len(),
         target.len(),
         start.elapsed().as_secs_f64(),
@@ -163,7 +170,7 @@ fn corridor_cut_from_office() {
         a.quality.overlap,
         a.quality.agreement,
         a.quality.residual_median_mm,
-        a.quality.wall_residual_mm
+        walls(a.quality.wall_residual_mm)
     );
     if a.verdict == Verdict::Sure {
         assert!(err < 0.03, "sure with error {err:.4} m {rot:.3}°");
@@ -246,13 +253,13 @@ fn corridor_pairs_narrow_strip() {
         let err = (a.pose * c - truth * c).norm();
         println!(
             "Streifen {:.0} %, Punktpaare: {:?}, Überlappung {:.3}, Kanten {:.3}, Restfehler {:.2} \
-             mm, Wände {:.2} mm, Paare {:.1} mm, Fehler {err:.4} m, {:.1} s",
+             mm, Wände {}, Paare {:.1} mm, Fehler {err:.4} m, {:.1} s",
             100.0 * share,
             a.verdict,
             a.quality.overlap,
             a.quality.agreement,
             a.quality.residual_median_mm,
-            a.quality.wall_residual_mm,
+            walls(a.quality.wall_residual_mm),
             a.pair_rms_mm.unwrap_or(f64::NAN),
             start.elapsed().as_secs_f64()
         );

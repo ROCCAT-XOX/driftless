@@ -3,15 +3,13 @@ use driftless_io::bag::writer::{BagWriter, Compression};
 use driftless_io::bag::Time;
 use driftless_io::msg::encode::{encode_imu, encode_pointcloud2};
 use driftless_io::msg::{ImuSample, LidarPoint};
+use driftless_io::testdir::TestDir;
 use predicates::prelude::*;
 use std::fs;
 use std::path::PathBuf;
 
-fn tmp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("driftless-odom-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn tmp(name: &str) -> TestDir {
+    TestDir::new(format!("driftless-odom-{}-{name}", std::process::id()))
 }
 
 fn time(t: f64) -> Time {
@@ -306,8 +304,10 @@ fn odom_truncated_bag_warns_and_keeps_data() {
     fs::write(dir.join("LIDAR_0.bag"), bytes).unwrap();
     odom(&dir, &[])
         .success()
-        .stderr(predicate::str::contains("Warnung"))
-        .stderr(predicate::str::contains("truncated"));
+        .stderr(predicate::str::contains(
+            "Warnung: LIDAR_0.bag abgeschnitten (",
+        ))
+        .stderr(predicate::str::contains("neu vom Gerät kopieren"));
     let traj = driftless_traj::read_tum(&dir.join("out/traj.tum")).unwrap();
     assert!(!traj.is_empty() && traj.len() < 15, "{} poses", traj.len());
 }

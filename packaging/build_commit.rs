@@ -1,4 +1,5 @@
-// The common part of the `build.rs` of `driftless-app` and `driftless-cli`, taken in with
+// The common part of the `build.rs` of `driftless-app`, `driftless-cli` and `driftless-steps`
+// (the commit in `programm` of every step report), taken in with
 // `include!("../../packaging/build_commit.rs")`: sets `DRIFTLESS_COMMIT` for `env!`.
 //
 // The commit is the environment variable `DRIFTLESS_COMMIT` if set (CI, builds from a source

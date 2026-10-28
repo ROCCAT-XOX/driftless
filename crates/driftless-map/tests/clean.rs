@@ -1,5 +1,6 @@
 use driftless_io::msg::{ImuSample, LidarFrame, LidarPoint};
 use driftless_io::progress::Progress;
+use driftless_io::testdir::TestDir;
 use driftless_map::{
     build_dense, clean, clean_with, find_ghosts, find_outliers, write_removed_las, CleanConfig,
     CleanStats, Cloud, DenseConfig, MapError, RaySource, RemovalReason, SmoothConfig, SmoothStats,
@@ -350,15 +351,27 @@ fn clean_cancelled_returns_cancelled() {
     assert!(matches!(r, Err(MapError::Cancelled)), "{r:?}");
     assert_eq!(*phases.lock().unwrap(), ["Geister", "Durchblick"]);
 
-    // Not cancelled: every part in order, same result as `clean`.
-    let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Not cancelled: every part in order (the smoothing counts its points: the same phase
+    // again for each chunk), same result as `clean`.
+    let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let seen = phases.clone();
-    let p = Progress::new().with_observer(move |s| seen.lock().unwrap().push(s.phase.clone()));
+    let p = Progress::new().with_observer(move |s| {
+        let mut seen = seen.lock().unwrap();
+        if seen.last() != Some(&s.phase) {
+            seen.push(s.phase.clone());
+        }
+    });
     let with = clean_with(cloud.clone(), &rays, &cfg, &p).unwrap();
     assert_eq!(
         *phases.lock().unwrap(),
         ["Geister", "Durchblick", "Ausreißer", "Glätten"]
     );
+    assert_eq!(
+        p.snapshot().total,
+        Some(with.0.len() as u64),
+        "the kept points"
+    );
+    assert_eq!(p.snapshot().done, with.0.len() as u64);
     assert_eq!(with, clean(cloud, &rays, &cfg).unwrap());
 }
 
@@ -499,8 +512,7 @@ fn clean_rejects_bad_config() {
 fn removed_las_carries_reason() {
     let (cloud, rays) = moving_scan();
     let (_, removed, reasons, _) = clean(cloud, &rays, &CleanConfig::default()).unwrap();
-    let dir = std::env::temp_dir().join(format!("driftless-removed-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new(format!("driftless-removed-{}", std::process::id()));
     let path = dir.join("removed.las");
     write_removed_las(&path, &removed, &reasons).unwrap();
     let mut r = las::Reader::from_path(&path).unwrap();

@@ -170,8 +170,9 @@ pub fn holds_current(out: &Path) -> bool {
 }
 
 /// Switches the corrections of `out` back to state `nr`: entry i gets the switch it had in
-/// that state, entries added after it are switched off. Nothing is removed. Returns the
-/// number of entries that changed.
+/// that state, entries added after it are switched off, and the automatic loops switched off
+/// are those of the state (its reject entries). No manual loop is removed. Returns the number
+/// of entries that changed (each reject added or removed counts).
 pub fn restore_flags(out: &Path, nr: u32) -> Result<usize, StepError> {
     let entry = list(out).into_iter().find(|e| e.nr == nr).ok_or_else(|| {
         format!(
@@ -181,6 +182,9 @@ pub fn restore_flags(out: &Path, nr: u32) -> Result<usize, StepError> {
     })?;
     let then = Corrections::load(&entry.dir.join(CORRECTIONS_FILE))?;
     let path = out.join(CORRECTIONS_FILE);
+    // another window or `driftless correct` may change the file at the same time
+    let _lock = driftless_io::lock::FileLock::acquire(&path)
+        .map_err(|e| StepError::Failed(e.to_string()))?;
     let mut now = Corrections::load(&path)?;
     let mut changed = 0;
     for (i, l) in now.loops.iter_mut().enumerate() {
@@ -189,6 +193,12 @@ pub fn restore_flags(out: &Path, nr: u32) -> Result<usize, StepError> {
             l.enabled = enabled;
             changed += 1;
         }
+    }
+    if now.rejects != then.rejects {
+        let gone = now.rejects.iter().filter(|r| !then.rejects.contains(r));
+        let back = then.rejects.iter().filter(|r| !now.rejects.contains(r));
+        changed += gone.count() + back.count();
+        now.rejects = then.rejects.clone();
     }
     if changed > 0 {
         now.save(&path).map_err(failed)?;

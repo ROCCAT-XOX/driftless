@@ -62,17 +62,18 @@ fn map_all_writes_outputs() {
         .stdout(predicate::str::contains("Glanzansichten"))
         .stdout(predicate::str::contains(format!("Bilder {IMAGES} genutzt")))
         .stdout(predicate::str::contains("Laufzeit"));
+    // One cloud to look at, beside the stages and the removed points.
     for f in [
-        "dense.las",
         "dense.bin",
-        "clean.las",
         "removed.las",
         "clean.bin",
         "color.las",
-        "color.ply",
         "map.json",
     ] {
         assert!(out.join(f).is_file(), "{f} missing");
+    }
+    for f in ["dense.las", "clean.las", "color.ply"] {
+        assert!(!out.join(f).exists(), "{f} written without --alle-dateien");
     }
 
     let json = map_json(&out);
@@ -125,7 +126,6 @@ fn map_all_writes_outputs() {
         assert!(json["peak_rss_bytes"].as_u64().unwrap() > 1_000_000);
     }
 
-    assert_eq!(las_points(&out.join("dense.las")).len() as u64, dense);
     let removed = las_points(&out.join("removed.las")).len() as u64;
     assert_eq!(removed, ghosts + through + outliers);
     let points = las_points(&out.join("color.las"));
@@ -151,6 +151,52 @@ fn map_all_writes_outputs() {
         })
         .count();
     assert!(near * 10 >= wall.len() * 9, "{near} of {}", wall.len());
+}
+
+/// `--alle-dateien`: every step's cloud as LAS and `color.ply`, as before the first release.
+#[test]
+fn map_all_files_writes_every_cloud() {
+    let dir = tmp("map-alle-dateien");
+    scan_with_images(&dir);
+    let out = dir.join("out");
+    slam(&dir, &out);
+    map(&dir, &out, &["--alle-dateien"])
+        .success()
+        .stdout(predicate::str::contains("→ dense.las, dense.bin"))
+        .stdout(predicate::str::contains("→ color.las, color.ply"));
+    for f in [
+        "dense.las",
+        "dense.bin",
+        "clean.las",
+        "removed.las",
+        "clean.bin",
+        "color.las",
+        "color.ply",
+        "map.json",
+    ] {
+        assert!(out.join(f).is_file(), "{f} missing");
+    }
+    let json = map_json(&out);
+    let dense = json["steps"]["dense"]["stats"]["points"].as_u64().unwrap();
+    assert_eq!(las_points(&out.join("dense.las")).len() as u64, dense);
+    assert_eq!(
+        json["steps"]["color"]["files"],
+        serde_json::json!(["color.las", "color.ply"])
+    );
+    // The same map as without the switch: it is part of no id.
+    let plain = dir.join("ohne");
+    slam(&dir, &plain);
+    map(&dir, &plain, &[]).success();
+    for step in ["dense", "clean", "color"] {
+        assert_eq!(
+            map_json(&plain)["steps"][step]["input_id"],
+            json["steps"][step]["input_id"]
+        );
+    }
+    assert_eq!(
+        fs::read(plain.join("color.las")).unwrap(),
+        fs::read(out.join("color.las")).unwrap()
+    );
 }
 
 #[test]
@@ -201,17 +247,18 @@ fn map_skipped_color_marks_old_color_stale() {
     fs::remove_dir_all(dir.join("calibration")).unwrap();
     map(&dir, &out, &[])
         .success()
+        .stderr(predicate::str::contains("Warnung: keine Kalibrierung: "))
+        .stderr(predicate::str::contains("Karte nicht eingefärbt"))
         .stderr(predicate::str::contains(
-            "nicht eingefärbt, keine Kalibrierung",
-        ))
-        .stderr(predicate::str::contains(
-            "color.las, color.ply stammen aus einem früheren Lauf und passen nicht mehr zu \
-             clean.las",
+            "color.las stammt aus einem früheren Lauf und passt nicht mehr zu clean.bin – \
+             nicht verwenden; gelöscht wird nichts",
         ))
         .stderr(predicate::str::contains("fehlen").not());
     let json = map_json(&out);
     assert!(json["steps"]["color"]["skipped"].is_string());
-    assert_eq!(json["stale"], serde_json::json!(["color.las", "color.ply"]));
+    assert_eq!(json["stale"], serde_json::json!(["color.las"]));
+    // Without colour the cleaned cloud is the one to look at.
+    assert!(out.join("clean.las").is_file());
     assert_eq!(
         fs::read(out.join("color.las")).unwrap(),
         color,
@@ -276,13 +323,13 @@ fn map_step_color_reuses_clean() {
         ))
         .stdout(predicate::str::contains("Dicht:"))
         .stderr(predicate::str::contains(
-            "Warnung: color.las, color.ply stammen aus einem früheren Lauf und passen nicht \
-             mehr zu clean.las",
+            "Warnung: color.las stammt aus einem früheren Lauf und passt nicht mehr zu \
+             clean.bin",
         ));
     let json = map_json(&out);
     assert_eq!(json["steps"]["dense"]["reused"], false);
     assert!(json["steps"]["color"].is_null(), "colour no longer fits");
-    assert_eq!(json["stale"], serde_json::json!(["color.las", "color.ply"]));
+    assert_eq!(json["stale"], serde_json::json!(["color.las"]));
     // Nothing is deleted.
     assert_eq!(fs::read(out.join("color.las")).unwrap(), color);
 
@@ -291,17 +338,11 @@ fn map_step_color_reuses_clean() {
         .success()
         .stderr(predicate::str::contains(
             "clean.las, removed.las, clean.bin stammen aus einem früheren Lauf und passen \
-             nicht mehr zu dense.las",
+             nicht mehr zu dense.bin",
         ));
     assert_eq!(
         map_json(&out)["stale"],
-        serde_json::json!([
-            "clean.las",
-            "removed.las",
-            "clean.bin",
-            "color.las",
-            "color.ply"
-        ])
+        serde_json::json!(["clean.las", "removed.las", "clean.bin", "color.las"])
     );
 }
 
@@ -314,7 +355,13 @@ fn map_no_smooth_keeps_dense_coordinates() {
     map(
         &dir,
         &out,
-        &["--step", "clean", "--no-smooth", "--no-through"],
+        &[
+            "--step",
+            "clean",
+            "--no-smooth",
+            "--no-through",
+            "--alle-dateien",
+        ],
     )
     .success()
     .stdout(predicate::str::contains("geglättet").not());
@@ -362,7 +409,7 @@ fn m3_folder_is_rebuilt_not_misread() {
     scan_with_images(&dir);
     let out = dir.join("out");
     slam(&dir, &out);
-    map(&dir, &out, &[]).success();
+    map(&dir, &out, &["--alle-dateien"]).success();
     let clean = fs::read(out.join("clean.las")).unwrap();
 
     // Make the folder look like Meilenstein 3: the step files carry another input id and
@@ -386,16 +433,23 @@ fn m3_folder_is_rebuilt_not_misread() {
         ))
         .stdout(predicate::str::contains("Dicht:"))
         .stdout(predicate::str::contains("Bereinigt:"))
-        // The colour files are from the "old" run and no longer fit: warned, not deleted.
+        // The colour files and `dense.las` (not written now) are from the "old" run and no
+        // longer fit: warned, not deleted.
         .stderr(predicate::str::contains(
             "color.las, color.ply stammen aus einem früheren Lauf",
+        ))
+        .stderr(predicate::str::contains(
+            "dense.las stammt aus einem früheren Lauf",
         ));
     assert_eq!(fs::read(out.join("clean.las")).unwrap(), clean);
     let json = map_json(&out);
     assert_eq!(json["steps"]["dense"]["reused"], false);
     assert_eq!(json["steps"]["clean"]["reused"], false);
     assert!(json["steps"]["color"].is_null());
-    assert_eq!(json["stale"], serde_json::json!(["color.las", "color.ply"]));
+    assert_eq!(
+        json["stale"],
+        serde_json::json!(["dense.las", "color.las", "color.ply"])
+    );
 }
 
 #[test]
@@ -405,7 +459,7 @@ fn map_is_deterministic() {
     let (a, b) = (dir.join("a"), dir.join("b"));
     for out in [&a, &b] {
         slam(&dir, out);
-        map(&dir, out, &[]).success();
+        map(&dir, out, &["--alle-dateien"]).success();
     }
     for f in [
         "dense.las",
@@ -482,7 +536,7 @@ fn gpu_off_is_the_cpu_path() {
     scan_with_images(&dir);
     let out = dir.join("out");
     slam(&dir, &out);
-    map(&dir, &out, &["--gpu", "aus"])
+    map(&dir, &out, &["--gpu", "aus", "--alle-dateien"])
         .success()
         .stdout(predicate::str::contains("Grafikkarte").not());
     let reference = dir.join("reference");
@@ -570,7 +624,7 @@ fn auto_falls_back_when_gpu_budget_exceeded() {
     for out in [&cpu, &small] {
         slam(&dir, out);
     }
-    map(&dir, &cpu, &["--gpu", "aus"]).success();
+    map(&dir, &cpu, &["--gpu", "aus", "--alle-dateien"]).success();
     // A budget of 1 kB: `auto` says why and colours on the CPU, `an` fails in German.
     Command::cargo_bin("driftless")
         .unwrap()
@@ -579,6 +633,7 @@ fn auto_falls_back_when_gpu_budget_exceeded() {
         .arg(&dir)
         .arg("--slam")
         .arg(&small)
+        .arg("--alle-dateien")
         .assert()
         .success()
         .stdout(predicate::str::contains("Einfärben auf der CPU"));
@@ -635,4 +690,28 @@ fn map_json_says_why_auto_took_the_cpu() {
     assert_eq!(gpu["fallback"], "keine Grafikkarte gefunden", "{gpu}");
     map(&dir, &out, &["--step", "color", "--gpu", "aus"]).success();
     assert!(map_json(&out)["steps"]["color"]["gpu"]["fallback"].is_null());
+}
+
+/// The same `driftless map` again is „aktuell“: nothing computed, nothing written. The GPU
+/// switch does not matter (an equivalent map); `--neu` computes it anyway.
+#[test]
+fn map_twice_is_current() {
+    let dir = tmp("map-zweimal");
+    scan_with_images(&dir);
+    let out = dir.join("out");
+    slam(&dir, &out);
+    map(&dir, &out, &[]).success();
+    let json = fs::read(out.join("map.json")).unwrap();
+    for args in [&[][..], &["--gpu", "aus"]] {
+        map(&dir, &out, args)
+            .success()
+            .stdout(predicate::str::contains("Karte ist aktuell"))
+            .stdout(predicate::str::contains("Dicht:").not());
+    }
+    assert_eq!(fs::read(out.join("map.json")).unwrap(), json);
+    map(&dir, &out, &["--neu"])
+        .success()
+        .stdout(predicate::str::contains("Dicht:"))
+        .stdout(predicate::str::contains("Eingefärbt:"))
+        .stdout(predicate::str::contains("Karte ist aktuell").not());
 }

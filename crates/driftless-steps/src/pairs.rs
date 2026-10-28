@@ -26,6 +26,7 @@
 //! wrong type, cannot be read at all.
 
 use crate::StepError;
+use driftless_io::paths;
 use driftless_slam::align::pose_from_pairs;
 use driftless_traj::nalgebra::Vector3;
 use serde::{Deserialize, Serialize};
@@ -195,52 +196,29 @@ impl PointPairs {
     }
 }
 
-/// Absolute on Windows: `C:\…`, `C:/…` or `\\server\…` (also read on another system, where
-/// such a path is just not found instead of being taken as relative).
-fn windows_absolute(text: &str) -> bool {
-    let b = text.as_bytes();
-    let drive =
-        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\');
-    drive || text.starts_with("\\\\") || text.starts_with("//")
-}
-
 /// A path from a project file (`project.toml`, `punktpaare.toml`): absolute as written,
-/// relative (with `/` or `\`, `..` for the folder above) to `base`.
+/// relative (with `/` or `\`, `..` for the folder above) to `base`; `..` is taken off in the
+/// text, so it also works below a share ([`driftless_io::paths::stored_path`]).
 pub fn stored_path(base: &Path, text: &str) -> PathBuf {
-    let p = Path::new(text);
-    if p.is_absolute() || windows_absolute(text) {
-        return p.to_path_buf();
-    }
-    let mut out = base.to_path_buf();
-    for part in text
-        .split(['/', '\\'])
-        .filter(|s| !s.is_empty() && *s != ".")
-    {
-        out.push(part);
-    }
-    out
+    paths::stored_path(base, text)
 }
 
 /// `path` (absolute, resolved) as [`stored_path`] reads it back for a file in `dir`: below
 /// `dir` relative with `/`, below the folder above `dir` (the project, for
-/// `<projekt>/modelle/punktpaare.toml`) as `../…`, anywhere else absolute. Fails for a path
-/// that is no valid text.
+/// `<projekt>/modelle/punktpaare.toml`) as `../…`, anywhere else absolute. Compared as text
+/// ([`paths::relative_text`]), so a drive or share of Windows counts as well on any system.
+/// Fails for a path that is no valid text.
 pub fn stored_text(dir: &Path, path: &Path) -> Result<String, StepError> {
-    let joined = |rel: &Path, up: bool| {
-        let parts = rel
-            .components()
-            .map(|c| c.as_os_str().to_str())
-            .collect::<Option<Vec<_>>>()?;
-        let mut text = if up { "../".to_string() } else { String::new() };
-        text += &parts.join("/");
-        Some(text)
+    let text = path
+        .to_str()
+        .ok_or_else(|| format!("Pfad {} ist kein gültiger Text", path.display()))?;
+    let near = |rel: &String| {
+        let below = rel.strip_prefix("../").unwrap_or(rel);
+        !matches!(rel.as_str(), "." | "..") && below != ".." && !below.starts_with("../")
     };
-    let text = match path.strip_prefix(dir) {
-        Ok(rel) if !rel.as_os_str().is_empty() => joined(rel, false),
-        _ => match dir.parent().map(|up| path.strip_prefix(up)) {
-            Some(Ok(rel)) if !rel.as_os_str().is_empty() => joined(rel, true),
-            _ => path.to_str().map(str::to_string),
-        },
-    };
-    text.ok_or_else(|| format!("Pfad {} ist kein gültiger Text", path.display()).into())
+    let rel = dir
+        .to_str()
+        .and_then(|d| paths::relative_text(d, text))
+        .filter(near);
+    Ok(rel.unwrap_or_else(|| text.to_string()))
 }

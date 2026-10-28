@@ -11,6 +11,7 @@ use driftless_app::render::{
 };
 use driftless_app::synthetic::Rng;
 use driftless_io::progress::Progress;
+use driftless_io::testdir::TestDir;
 use driftless_steps::overlay::quality_color;
 use egui_wgpu::wgpu;
 
@@ -229,7 +230,8 @@ fn rgb_mode_without_colours_shows_intensity() {
 fn quality_mode_uses_ramp() {
     let Some(gpu) = gpu() else { return };
     let cam = camera([0.0; 3], 0.0);
-    for q in [0u8, 64, 128, 191, 255] {
+    // also the low qualities the logarithmic scale spreads out (0.01 is 2.55 × 1/255)
+    for q in [0u8, 1, 2, 3, 5, 8, 13, 20, 30, 40, 64, 128, 191, 255] {
         let mut points = cloud(vec![[2.0, 0.0, 0.0]], vec![BLUE]);
         points.quality = vec![q];
         let tree = tree(&points);
@@ -722,9 +724,7 @@ fn tree_of_one() -> Octree {
 #[test]
 fn point_m_from_map() {
     use driftless_app::cloud::{point_m_of_map, LoadedCloud, DEFAULT_POINT_M};
-    let dir = std::env::temp_dir().join(format!("driftless-app-point-m-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new(format!("driftless-app-point-m-{}", std::process::id()));
     assert_eq!(DEFAULT_POINT_M, 0.015);
     assert_eq!(point_m_of_map(&dir), 0.015, "without map.json");
     std::fs::write(dir.join("map.json"), "kein json").unwrap();

@@ -117,8 +117,12 @@ impl<'a> TopicPicker<'a> {
 pub fn bag_read_error(bag: &Path, e: BagError, progress: &Progress) -> Result<(), String> {
     let name = file_name(bag);
     match e {
-        BagError::Truncated { .. } => {
-            progress.warn(format!("{name}: {e}"));
+        BagError::Truncated { offset } => {
+            progress.warn(format!(
+                "{name} abgeschnitten (Aufnahme unterbrochen oder Kopie unvollständig): genutzt \
+                 bis Byte {offset}, der Rest fehlt – ist nur die Kopie unvollständig, die Datei \
+                 neu vom Gerät kopieren"
+            ));
             Ok(())
         }
         e => Err(format!("{name}: {e}")),
@@ -317,8 +321,9 @@ pub fn require_frames(stats: &OdomStats) -> Result<(), String> {
 pub fn warn_if_not_static(stats: &OdomStats, progress: &Progress) {
     if !stats.static_start {
         progress.warn(
-            "Gerät stand in der ersten Sekunde nicht still; Schwerkraft und Kreisel-Offset \
-             sind nur grob geschätzt",
+            "Gerät stand in der ersten Sekunde nicht still: Schwerkraft und Kreisel-Offset \
+             sind nur grob geschätzt, die Laufbahn kann leicht kippen – Start↔Ende prüfen; beim \
+             nächsten Scan das Gerät zu Beginn kurz ruhig halten",
         );
     }
 }

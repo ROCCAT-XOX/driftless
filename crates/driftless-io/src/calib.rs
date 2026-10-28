@@ -15,13 +15,13 @@ use std::path::Path;
 /// Errors produced while loading a calibration file.
 #[derive(Debug, thiserror::Error)]
 pub enum CalibError {
-    #[error("I/O error: {0}")]
+    #[error("Kalibrierung nicht lesbar: {0}")]
     Io(#[from] std::io::Error),
-    #[error("invalid calib.json: {0}")]
+    #[error("calib.json ist beschädigt: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("unknown camera model `{0}`")]
+    #[error("unbekanntes Kameramodell „{0}“")]
     UnknownModel(String),
-    #[error("malformed calibration: {0}")]
+    #[error("Kalibrierung ist beschädigt: {0}")]
     Malformed(String),
 }
 

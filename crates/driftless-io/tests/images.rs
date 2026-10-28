@@ -3,6 +3,7 @@ use driftless_io::bag::Time;
 use driftless_io::images::{decode_jpeg, for_each_image, ImageError};
 use driftless_io::msg::encode::encode_compressed_image;
 use driftless_io::msg::CompressedImage;
+use driftless_io::testdir::TestDir;
 use jpeg_encoder::{ColorType, Encoder};
 
 /// Solid-colour JPEG (quality 100, no chroma subsampling issues for flat colour).
@@ -82,8 +83,7 @@ fn image_stream_counts_bad_images() {
         });
         w.write_message(conn, Time { sec, nsec: 0 }, &msg);
     }
-    let dir = std::env::temp_dir().join(format!("driftless_images_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new(format!("driftless_images_{}", std::process::id()));
     let path = dir.join("t.bag");
     std::fs::write(&path, w.finish()).unwrap();
 
@@ -141,8 +141,7 @@ fn truncated_image_bag_keeps_images_before_the_cut() {
     let mut bytes = w.finish();
     let cut = bytes.len() * 7 / 10;
     bytes.truncate(cut);
-    let dir = std::env::temp_dir().join(format!("driftless_images_trunc_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new(format!("driftless_images_trunc_{}", std::process::id()));
     let path = dir.join("t.bag");
     std::fs::write(&path, bytes).unwrap();
 

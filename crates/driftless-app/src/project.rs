@@ -22,32 +22,58 @@
 //! path = "rohdaten/buero"        # relative to the project folder if inside it, else absolute
 //! name = "Büro, Erdgeschoss"
 //! extra_runs = ["/pfad/zu/cli-lauf"]  # run folders made by the CLI, added by hand
+//!
+//! [[scan]]
+//! id = "halle"
+//! path = "/Volumes/Daten/Rohdaten/halle"
+//! path_rel = "../Rohdaten/halle" # beside an absolute path: relative to the project folder
+//! name = "Halle"
+//! extra_runs = ["/Volumes/Daten/cli/lauf"]
+//! extra_runs_rel = ["../cli/lauf"]  # one per entry of `extra_runs`, "" where none
 //! ```
 //!
 //! Relative paths are written with `/` and read with `/` or `\`, so a project works on macOS
-//! and Windows alike. `lauf.toml` holds `scan` (stored the same way), `erstellt` (UTC) and the
-//! [`SlamSettings`] under `[slam]`; `erstellt` is the only value that differs between two equal
-//! runs (like `erstellt`/`sekunden` in `stand.toml` and the runtimes in `map.json`).
+//! and Windows alike. A path outside the project folder is written absolute and, where one can
+//! be computed (the same volume, drive or share), relative to the project folder as well
+//! (`path_rel`, `extra_runs_rel`); reading takes the relative one where that folder exists,
+//! else the absolute one. So a project moved or copied together with its raw data still finds
+//! them, and one moved alone finds them where they were. `extra_runs_rel` counts only with as
+//! many entries as `extra_runs`. `lauf.toml` holds `scan` (stored the same way, with
+//! `scan_rel`), `erstellt` (UTC) and the [`SlamSettings`] under `[slam]`; `erstellt` is the
+//! only value that differs between two equal runs (like `erstellt`/`sekunden` in `stand.toml`
+//! and the runtimes in `map.json`).
+//!
+//! The paths in `modell.json` are relative to the model folder as well
+//! ([`driftless_steps::merge`]). A model written before that has absolute paths only: if the
+//! project folder was renamed, moved or copied since, [`Project::models`] takes the folders
+//! that lay in the project folder then into the project folder now ([`merged_in`]).
 //!
 //! A scan folder that is gone (an unplugged drive) is reported by [`Project::scan_state`];
 //! the project still opens and its runs are still listed.
 //!
 //! Folders for results are only created by the jobs ([`run_slam_job`], [`run_map_job`]), never
 //! on the UI thread, and a job removes a folder it created when it is cancelled or fails. A
-//! full SLAM run always gets a new `slam-NNN` (so no earlier `traj.tum` is replaced), and a map
-//! is written only into a `karte-NNN` whose `map.json` fits the request, or into a new one. A
+//! full SLAM run always gets a new `slam-NNN` (so no earlier `traj.tum` is replaced); a reuse
+//! recomputes a run in its folder and, if it fails, leaves it as it was
+//! ([`driftless_steps::slam`]). A map is never computed into an existing `karte-NNN`: one whose
+//! map is current is taken as it is, any other map goes into a new one ([`map_dir_for`]). A
 //! surface is only computed if no `oberflaeche-NNN` of the map fits the request, and then into a
-//! new one ([`run_surface_job`]). Every merge gets a new `modell-NNN` ([`run_merge_job`]); a
-//! folder without `modell.json` is no model (the report is written last). `project.toml`
+//! new one ([`run_surface_job`]); a folder without `oberflaeche.json` is no surface, even with
+//! its glb (the report is written last). A job that writes into an existing folder (a reuse)
+//! marks it busy as a job's new folder is ([`StepDir`], [`mark_busy`]). A run or map folder
+//! without its report that holds finished results (maps, surfaces, the history of a run) is
+//! no leftover: it stays in the tree as „unvollständig“ ([`crate::leftovers::holds_results`]).
+//! Every merge gets a new `modell-NNN`
+//! ([`run_merge_job`]); a folder without `modell.json` is no model (the report is written
+//! last). `project.toml`
 //! does not list the models: [`Project::models`] reads the folder. Point pairs marked by hand
 //! are kept in `modelle/punktpaare.toml` ([`driftless_steps::pairs`], paths relative to that
 //! folder) and count in every merge of the project.
 
-use crate::surface::SURFACE_GLB;
 use crate::ui::text;
 use driftless_gpu::GpuPref;
 use driftless_io::atomic_write;
-use driftless_io::bag::BagReader;
+use driftless_io::paths::{relative_text, relative_to};
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_map::surface::SurfaceConfig;
@@ -55,15 +81,19 @@ use driftless_slam::align::AlignConfig;
 use driftless_steps::correct::utc_now;
 use driftless_steps::history::{self, HistoryEntry};
 use driftless_steps::map::{
-    clean_stage_id, fitting_stages, folder_fits, hex, map_input_for, run_map, MapInput, MapRequest,
-    MapSettings, MapStep, MapSwitches, CLEAN_BIN, DENSE_BIN, REPORT,
+    clean_stage_id, current_map, fitting_stages, folder_fits, hex, map_input_for,
+    recompute_map_from, take_current_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches,
+    CLEAN_BIN, DENSE_BIN, REPORT,
 };
-use driftless_steps::merge::{read_model, run_merge, MergeMember, MergeRequest, ModelReport};
+use driftless_steps::merge::{
+    read_model, run_merge, version_fits, MergeMember, MergeRequest, ModelReport,
+};
 use driftless_steps::pairs::{
     stored_path as from_stored, stored_text, PointPairEntry, PointPairs, POINT_PAIRS_FILE,
 };
 use driftless_steps::slam::{
-    cache_fits, run_slam, SlamOutcome, SlamRequest, SlamSettings, CACHE_FILE, CORRECTIONS_FILE,
+    cache_fits, run_fits_scan, run_slam, scan_times, SlamOutcome, SlamRequest, SlamSettings,
+    CACHE_FILE, CORRECTIONS_FILE,
 };
 use driftless_steps::surface::{
     model_surface_fits, run_model_surface, run_surface, surface_fits, ModelSurfaceRequest,
@@ -77,6 +107,8 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 pub const PROJECT_FILE: &str = "project.toml";
+/// The choices of the project's last session: `<projekt>/auswahl.toml` ([`Choices`]).
+pub const CHOICES_FILE: &str = "auswahl.toml";
 pub const RUN_FILE: &str = "lauf.toml";
 pub const SCANS_DIR: &str = "scans";
 /// The models of the project: `modelle/modell-NNN`.
@@ -85,16 +117,13 @@ pub const MODEL_PREFIX: &str = "modell-";
 /// One point per cell of this size (m) in a model, as `driftless merge` does by default.
 pub const MODEL_VOXEL: f64 = 0.01;
 const FORMAT: i64 = 1;
-const RUN_PREFIX: &str = "slam-";
-const MAP_PREFIX: &str = "karte-";
+pub(crate) const RUN_PREFIX: &str = "slam-";
+pub(crate) const MAP_PREFIX: &str = "karte-";
 /// Surfaces of a map: `oberflaeche-NNN` made here, other `oberflaeche…` folders by the CLI.
-const SURFACE_PREFIX: &str = "oberflaeche";
-const SURFACE_NUMBERED: &str = "oberflaeche-";
+pub(crate) const SURFACE_PREFIX: &str = "oberflaeche";
+pub(crate) const SURFACE_NUMBERED: &str = "oberflaeche-";
 /// The clouds of a map folder that can be shown, best first.
 const MAP_CLOUDS: [&str; 4] = ["color.las", "clean.las", "dense.las", "removed.las"];
-/// How far (s) a run's frames may lie outside the bag times of its scan: frame stamps come
-/// from the sensor, bag times from the recorder.
-const RUN_TIME_TOLERANCE: f64 = 5.0;
 
 /// Why a project could not be read or changed (German, for display).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,6 +167,10 @@ pub struct ScanEntry {
     pub name: String,
     /// Run folders made by the CLI and added by hand (absolute).
     pub extra_runs: Vec<PathBuf>,
+    /// The LiDAR bags of the scan when it was added (name, bytes): what tells it from another
+    /// scan when its folder is assigned anew ([`Project::relink_scan`]). Empty for a scan added
+    /// before this was kept.
+    pub bags: Vec<(String, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +189,10 @@ pub struct RunInfo {
     pub settings: SlamSettings,
     /// `slam.json` and `traj.tum` exist.
     pub has_result: bool,
+    /// Its report `slam.json` is missing (a recompute was cut off, or an older program's):
+    /// the tree keeps such a run only while it holds finished results, as „unvollständig – neu
+    /// rechnen“ ([`crate::leftovers::holds_results`]).
+    pub incomplete: bool,
     /// `submaps.bin` exists: the run can be recomputed.
     pub has_cache: bool,
     /// `traj.vorher.tum` exists.
@@ -177,8 +214,13 @@ pub struct MapInfo {
     pub settings: Option<MapSwitches>,
     /// The existing ones of `color.las`, `clean.las`, `dense.las`, `removed.las`, in this order.
     pub clouds: Vec<PathBuf>,
-    /// The surfaces of the map: its subfolders `oberflaeche…` with an `oberflaeche.glb`.
+    /// The surfaces of the map: its subfolders `oberflaeche…` with an `oberflaeche.json` (the
+    /// step writes it last; one without it is cut off, see [`crate::leftovers`]).
     pub surfaces: Vec<SurfaceInfo>,
+    /// Its report `map.json` is missing (computed in its folder by an older program or the
+    /// command line, and cut off): the tree keeps such a map only while it holds finished
+    /// surfaces, as „unvollständig – neu rechnen“ ([`crate::leftovers::holds_results`]).
+    pub incomplete: bool,
 }
 
 /// A surface folder of a map.
@@ -193,6 +235,9 @@ pub struct SurfaceInfo {
     /// What it was made with, from its `oberflaeche.json` ([`SurfaceSettings::from_report`]);
     /// `None` without a readable one.
     pub settings: Option<SurfaceSettings>,
+    /// The hints of its `oberflaeche.json` for the user (`hinweise`, German, e.g. why it stays
+    /// open in places); empty without them (also in a report of before the field).
+    pub hints: Vec<String>,
 }
 
 /// A model of the project: scans merged into one (`modelle/modell-NNN` with `modell.json`).
@@ -203,8 +248,16 @@ pub struct ModelInfo {
     pub label: String,
     /// Its `modell.json`: where each scan sits and how sure that is.
     pub report: ModelReport,
-    /// Its surfaces: subfolders `oberflaeche…` with an `oberflaeche.glb`.
+    /// Its surfaces: subfolders `oberflaeche…` with an `oberflaeche.json`, as for a map.
     pub surfaces: Vec<SurfaceInfo>,
+}
+
+impl ModelInfo {
+    /// Whether it was merged by another version of the merge than this program's
+    /// ([`driftless_steps::merge::version_fits`]): stale whatever its maps, merge anew.
+    pub fn other_version(&self) -> bool {
+        !version_fits(&self.report)
+    }
 }
 
 /// A scan chosen for a model, with the run and the map of it to merge.
@@ -283,6 +336,84 @@ impl SurfaceSettings {
     }
 }
 
+/// The lock of the file `file` while it is read, changed and written: another window of the
+/// program or the command line may change it at the same time.
+fn lock(file: &Path) -> Result<driftless_io::lock::FileLock, ProjectError> {
+    driftless_io::lock::FileLock::acquire(file).map_err(|e| ProjectError(e.to_string()))
+}
+
+/// Changes `project.toml` of the project in `dir` with `change`: under its lock, on the
+/// project as it is on disk now (so a change another window or program saved meanwhile is
+/// kept), then saved. Returns the project as written, whether the file differed from `known`
+/// (what the window showed) before the change, and what `change` returned.
+pub fn change_project<T>(
+    dir: &Path,
+    known: Option<&Project>,
+    change: impl FnOnce(&mut Project) -> Result<T, ProjectError>,
+) -> Result<(Project, bool, T), ProjectError> {
+    let _lock = lock(&dir.join(PROJECT_FILE))?;
+    let mut project = Project::open(dir)?;
+    let changed_meanwhile = known.is_some_and(|k| *k != project);
+    let out = change(&mut project)?;
+    project.save()?;
+    Ok((project, changed_meanwhile, out))
+}
+
+/// What was chosen in a project for the next map and surface, kept in its folder
+/// (`auswahl.toml`), so that the project opens with them again, also on another computer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Choices {
+    /// „Genauigkeit“: the voxel size of the next map (m).
+    pub genauigkeit: f64,
+    /// „Feinheit“: the voxel size of the next surface (m).
+    pub feinheit: f64,
+    /// „ohne Fotos (graue Fläche)“.
+    pub ohne_fotos: bool,
+}
+
+/// The comment at the top of `auswahl.toml`.
+const CHOICES_HEADER: &str =
+    "# Driftless: die zuletzt in diesem Projekt gewählte Genauigkeit und Feinheit.\n";
+
+impl Choices {
+    /// The choices in `settings` (map) and `surface`.
+    pub fn of(map: &MapSettings, surface: &SurfaceSettings) -> Choices {
+        Choices {
+            genauigkeit: map.switches.voxel,
+            feinheit: surface.config.voxel,
+            ohne_fotos: !surface.texture,
+        }
+    }
+
+    /// Sets them in `map` and `surface`; a value that is no valid size keeps the one there.
+    pub fn apply(&self, map: &mut MapSettings, surface: &mut SurfaceSettings) {
+        let valid = |v: f64| v.is_finite() && v > 0.0;
+        if valid(self.genauigkeit) {
+            map.switches.voxel = self.genauigkeit;
+        }
+        if valid(self.feinheit) {
+            surface.config.voxel = self.feinheit;
+        }
+        surface.texture = !self.ohne_fotos;
+    }
+
+    /// The choices of the project in `dir`; `None` without a readable `auswahl.toml`.
+    pub fn read(dir: &Path) -> Option<Choices> {
+        let text = fs::read_to_string(dir.join(CHOICES_FILE)).ok()?;
+        toml::from_str(&text).ok()
+    }
+
+    /// Writes them into the project in `dir`, under the lock of the file.
+    pub fn save(&self, dir: &Path) -> Result<(), ProjectError> {
+        let file = dir.join(CHOICES_FILE);
+        let _lock = lock(&file)?;
+        let body = toml::to_string(self)
+            .map_err(|e| ProjectError(text::about_path(&e.to_string(), &file)))?;
+        atomic_write(&file, format!("{CHOICES_HEADER}{body}").as_bytes())
+            .map_err(|e| ProjectError(text::io_error("auswahl.toml nicht schreibbar", &file, &e)))
+    }
+}
+
 /// What a map folder holds, for the step list: read from its `map.json`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MapStatus {
@@ -295,15 +426,36 @@ pub struct MapStatus {
 
 /// A folder a job writes into. One the job created ([`StepDir::is_new`]) is removed again
 /// when the guard is dropped without [`StepDir::keep`], i.e. when the job is cancelled or
-/// fails.
+/// fails; while the job runs it is marked busy ([`crate::leftovers::BUSY_FILE`]), so that no
+/// window offers it for „Aufräumen“ or „Löschen …“.
 #[must_use]
 #[derive(Debug)]
 pub struct StepDir {
     path: PathBuf,
     new: bool,
+    beat: Option<Beat>,
 }
 
 impl StepDir {
+    /// The folder `path` just created for a job: marked busy until kept or dropped.
+    fn made(path: PathBuf) -> StepDir {
+        StepDir {
+            beat: Beat::start(&path),
+            path,
+            new: true,
+        }
+    }
+
+    /// The existing folder `path`, which a job takes as it is (a current map: nothing is
+    /// written); never removed.
+    fn existing(path: PathBuf) -> StepDir {
+        StepDir {
+            path,
+            new: false,
+            beat: None,
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -315,6 +467,8 @@ impl StepDir {
 
     /// Keeps the folder; returns its path.
     pub fn keep(mut self) -> PathBuf {
+        // the mark goes with it
+        self.beat = None;
         self.new = false;
         std::mem::take(&mut self.path)
     }
@@ -322,9 +476,76 @@ impl StepDir {
 
 impl Drop for StepDir {
     fn drop(&mut self) {
+        self.beat = None;
         if self.new {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+}
+
+/// The mark of a folder a job writes into in place (a reuse of a run, „Diesen Stand
+/// wiederherstellen“): [`crate::leftovers::BUSY_FILE`] while the guard lives, so that another
+/// window neither offers the folder for „Aufräumen“ nor lets it be deleted.
+#[must_use]
+#[derive(Debug)]
+pub struct BusyMark {
+    _beat: Option<Beat>,
+}
+
+/// Marks the existing folder `dir` busy until the guard is dropped (nothing if the mark
+/// cannot be written: the job runs all the same).
+pub fn mark_busy(dir: &Path) -> BusyMark {
+    BusyMark {
+        _beat: Beat::start(dir),
+    }
+}
+
+/// The mark of a busy folder ([`crate::leftovers::BUSY_FILE`], naming the process): written at
+/// once, then touched every [`crate::leftovers::BUSY_BEAT`] by a thread of its own until this
+/// is dropped; then it is removed.
+#[derive(Debug)]
+struct Beat {
+    file: PathBuf,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Beat {
+    fn start(dir: &Path) -> Option<Beat> {
+        use crate::leftovers::{BUSY_BEAT, BUSY_FILE};
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        let file = dir.join(BUSY_FILE);
+        fs::write(&file, driftless_io::lock::holder_text()).ok()?;
+        let (stop, wait) = channel::<()>();
+        let touch = file.clone();
+        let thread = std::thread::Builder::new()
+            .name("in-arbeit".into())
+            .spawn(move || {
+                while let Err(RecvTimeoutError::Timeout) = wait.recv_timeout(BUSY_BEAT) {
+                    let touched = fs::File::options().write(true).open(&touch);
+                    let _ = touched.and_then(|f| f.set_modified(std::time::SystemTime::now()));
+                }
+            });
+        let Ok(thread) = thread else {
+            let _ = fs::remove_file(&file);
+            return None;
+        };
+        Some(Beat {
+            file,
+            stop: Some(stop),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for Beat {
+    fn drop(&mut self) {
+        // the thread ends when the sender goes
+        self.stop = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let _ = fs::remove_file(&self.file);
     }
 }
 
@@ -339,46 +560,68 @@ struct ProjectFile {
 #[derive(Serialize, Deserialize)]
 struct ScanFile {
     id: String,
+    /// Relative to the project folder if inside it, else absolute.
     path: String,
+    /// Beside an absolute [`Self::path`]: relative to the project folder, if one can be
+    /// computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path_rel: Option<String>,
     name: String,
     #[serde(default)]
     extra_runs: Vec<String>,
+    /// One per entry of [`Self::extra_runs`]: the relative path beside an absolute one, `""`
+    /// where there is none. Written only if one entry has one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    extra_runs_rel: Vec<String>,
+    /// [`ScanEntry::bags`] as „<name> <bytes>“.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    bags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct RunFile {
     scan: String,
+    /// As [`ScanFile::path_rel`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scan_rel: Option<String>,
     erstellt: String,
     #[serde(default)]
     slam: SlamSettings,
 }
 
-/// The absolute, resolved form of an existing path (without the `\\?\` that Windows adds to
-/// a plain drive path). Paths in a [`Project`] are always in this form.
-pub fn canonical(path: &Path) -> io::Result<PathBuf> {
-    let p = fs::canonicalize(path)?;
-    if cfg!(windows) {
-        if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
-            if rest.as_bytes().get(1) == Some(&b':') {
-                return Ok(PathBuf::from(rest));
-            }
-        }
-    }
-    Ok(p)
+/// The absolute, resolved form of an existing path, in its plain form on Windows: `C:\…`
+/// and `\\server\share\…`, without the `\\?\` that resolving adds (also for a share or a
+/// mapped drive). Paths in a [`Project`] are always in this form.
+pub use driftless_io::paths::canonical;
+
+/// `path` as written to a project file: relative to `base` with `/` if inside it; else
+/// absolute, and beside it relative to `base` where one can be computed (the same volume,
+/// drive or share, [`relative_to`]). Compared as text, so a share of Windows counts as well.
+fn to_stored(base: &Path, path: &Path) -> Result<(String, Option<String>), ProjectError> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| ProjectError(text::about_path("Pfad ist kein gültiger Text", path)))?;
+    let inside = base
+        .to_str()
+        .and_then(|b| relative_text(b, text))
+        .filter(|rel| rel != "." && rel != ".." && !rel.starts_with("../"));
+    Ok(match inside {
+        Some(rel) => (rel, None),
+        None => (
+            text.to_string(),
+            relative_to(base, path).filter(|rel| rel != "."),
+        ),
+    })
 }
 
-/// `path` as written to a project file: relative to `base` with `/` if inside it, else
-/// absolute.
-fn to_stored(base: &Path, path: &Path) -> Result<String, ProjectError> {
-    let text = match path.strip_prefix(base) {
-        Ok(rel) if !rel.as_os_str().is_empty() => rel
-            .components()
-            .map(|c| c.as_os_str().to_str())
-            .collect::<Option<Vec<_>>>()
-            .map(|parts| parts.join("/")),
-        _ => path.to_str().map(str::to_string),
-    };
-    text.ok_or_else(|| ProjectError(format!("Pfad {} ist kein gültiger Text", path.display())))
+/// A path of a project file as written by [`to_stored`]: the relative one beside it (if
+/// any, and not empty) where that folder exists, else the path itself; both relative to
+/// `base` if relative.
+fn from_stored_pair(base: &Path, path: &str, rel: Option<&str>) -> PathBuf {
+    rel.filter(|r| !r.is_empty())
+        .map(|r| from_stored(base, r))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| from_stored(base, path))
 }
 
 /// Windows device names, which name no folder whatever the extension.
@@ -438,10 +681,18 @@ fn check_run_scan(run: &Path, scan: &Path) -> Result<(), ProjectError> {
     let report: serde_json::Value = fs::read_to_string(&file)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
-        .ok_or_else(|| ProjectError(format!("{} nicht lesbar", file.display())))?;
-    let start = report["scan_start"]
-        .as_f64()
-        .ok_or_else(|| ProjectError(format!("{}: scan_start fehlt", file.display())))?;
+        .ok_or_else(|| {
+            ProjectError(text::about_path(
+                "Kein lesbarer SLAM-Bericht (slam.json fehlt oder ist beschädigt)",
+                &file,
+            ))
+        })?;
+    let start = report["scan_start"].as_f64().ok_or_else(|| {
+        ProjectError(text::about_path(
+            "slam.json ist beschädigt: „scan_start“ fehlt",
+            &file,
+        ))
+    })?;
     let end = start
         + report["submaps"]
             .as_array()
@@ -450,26 +701,68 @@ fn check_run_scan(run: &Path, scan: &Path) -> Result<(), ProjectError> {
             .unwrap_or(0.0);
     let project =
         discover_project(scan).map_err(|e| ProjectError(format!("Lauf nicht prüfbar: {e}")))?;
-    let mut range: Option<(f64, f64)> = None;
-    for bag in &project.lidar_bags {
-        let Some((a, b)) = BagReader::open(bag).ok().and_then(|mut r| r.time_range()) else {
-            return Ok(());
-        };
-        range = Some(range.map_or((a, b), |(lo, hi)| (lo.min(a), hi.max(b))));
-    }
-    let Some((lo, hi)) = range else {
+    let Some((lo, hi)) = scan_times(&project.lidar_bags) else {
         return Ok(());
     };
-    if start >= lo - RUN_TIME_TOLERANCE && end <= hi + RUN_TIME_TOLERANCE {
+    if run_fits_scan((start, end), (lo, hi)) {
         Ok(())
     } else {
         Err(ProjectError(format!(
-            "Lauf {} gehört nicht zum Scan {}: er umfasst {start:.1}–{end:.1} s, der Scan \
-             {lo:.1}–{hi:.1} s",
+            "Lauf gehört nicht zu diesem Scan: er umfasst {start:.1}–{end:.1} s, der Scan \
+             {lo:.1}–{hi:.1} s: {}\nLauf: {}\nScan: {}",
+            run.file_name().unwrap_or_default().to_string_lossy(),
             run.display(),
             scan.display()
         )))
     }
+}
+
+/// The LiDAR bags of a scan folder: name and bytes.
+fn bag_stamps(found: &driftless_io::project::Project) -> Vec<(String, u64)> {
+    found
+        .lidar_bags
+        .iter()
+        .map(|b| {
+            let name = b
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let bytes = fs::metadata(b).map_or(0, |m| m.len());
+            (name, bytes)
+        })
+        .collect()
+}
+
+/// Whether the scan folder `found` holds the scan `scan` with the runs `runs` ([`Project::
+/// relink_scan`]): the same bags by name and size as when it was added, and recorded at the
+/// times of its runs. `Ok(false)`: nothing to tell it by (added before the bags were kept, and
+/// no run yet).
+fn same_scan(
+    scan: &ScanEntry,
+    runs: &[RunInfo],
+    found: &driftless_io::project::Project,
+) -> Result<bool, ProjectError> {
+    let different = |why: String| ProjectError(text::about_path(&why, &found.root));
+    let mut checked = false;
+    if !scan.bags.is_empty() {
+        let now = bag_stamps(found);
+        if now != scan.bags {
+            return Err(different(text::other_scan_bags(&scan.bags, &now)));
+        }
+        checked = true;
+    }
+    // the recording times of a run (from the start of the scan to the end of its last submap)
+    let run = runs
+        .iter()
+        .find_map(|r| driftless_steps::slam::run_times(&r.dir));
+    if let (Some(run), Some(times)) = (run, scan_times(&found.lidar_bags)) {
+        if !run_fits_scan(run, times) {
+            return Err(different(text::other_scan_times(run, times)));
+        }
+        checked = true;
+    }
+    Ok(checked)
 }
 
 /// Two paths name the same folder (resolved where they exist).
@@ -479,7 +772,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 }
 
 /// Subfolders `<prefix><digits>` of `dir` as (number, digits, path), by number.
-fn numbered(dir: &Path, prefix: &str) -> Vec<(u64, String, PathBuf)> {
+pub(crate) fn numbered(dir: &Path, prefix: &str) -> Vec<(u64, String, PathBuf)> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -502,17 +795,18 @@ fn numbered(dir: &Path, prefix: &str) -> Vec<(u64, String, PathBuf)> {
 /// Creates the next free `<prefix>NNN` in `dir` after the numbers present.
 fn create_numbered(dir: &Path, prefix: &str) -> Result<StepDir, ProjectError> {
     fs::create_dir_all(dir)
-        .map_err(|e| ProjectError(format!("{} nicht anlegbar: {e}", dir.display())))?;
+        .map_err(|e| ProjectError(text::io_error("Ordner nicht anlegbar", dir, &e)))?;
     let mut n = numbered(dir, prefix).last().map_or(0, |m| m.0) + 1;
     loop {
         let path = dir.join(format!("{prefix}{n:03}"));
         match fs::create_dir(&path) {
-            Ok(()) => return Ok(StepDir { path, new: true }),
+            Ok(()) => return Ok(StepDir::made(path)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
             Err(e) => {
-                return Err(ProjectError(format!(
-                    "{} nicht anlegbar: {e}",
-                    path.display()
+                return Err(ProjectError(text::io_error(
+                    "Ordner nicht anlegbar",
+                    &path,
+                    &e,
                 )))
             }
         }
@@ -520,7 +814,10 @@ fn create_numbered(dir: &Path, prefix: &str) -> Result<StepDir, ProjectError> {
 }
 
 /// The surfaces in the map folder `dir`: `oberflaeche-NNN` by number, then other folders
-/// `oberflaeche…` (made with `driftless surface -o`) by name; only those with a glb.
+/// `oberflaeche…` (made with `driftless surface -o`) by name; only those with their report
+/// `oberflaeche.json`. The surface step writes it after the glb: a folder with the glb but
+/// without the report was cut off between the two and is no finished surface (it is offered
+/// for „Aufräumen“, [`crate::leftovers`]).
 fn surfaces_of(dir: &Path) -> Vec<SurfaceInfo> {
     let numbered = numbered(dir, SURFACE_NUMBERED);
     let mut others: Vec<PathBuf> = fs::read_dir(dir)
@@ -548,19 +845,31 @@ fn surfaces_of(dir: &Path) -> Vec<SurfaceInfo> {
             (name, p)
         }));
     labelled
-        .filter(|(_, p)| p.join(SURFACE_GLB).is_file())
+        .filter(|(_, p)| p.join(SURFACE_REPORT).is_file())
         .map(|(label, dir)| {
-            let settings = fs::read_to_string(dir.join(SURFACE_REPORT))
+            let report = fs::read_to_string(dir.join(SURFACE_REPORT))
                 .ok()
-                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                .and_then(|v| SurfaceSettings::from_report(&v));
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+            let settings = report.as_ref().and_then(SurfaceSettings::from_report);
             SurfaceInfo {
                 label,
                 stale: false,
                 settings,
+                hints: report.as_ref().map(surface_hints).unwrap_or_default(),
                 dir,
             }
         })
+        .collect()
+}
+
+/// The hints for the user in the surface report `report` (`hinweise`): its texts, nothing
+/// else; none without the field.
+fn surface_hints(report: &serde_json::Value) -> Vec<String> {
+    report["hinweise"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|h| h.as_str().map(String::from))
         .collect()
 }
 
@@ -579,6 +888,7 @@ fn map_info(dir: &Path, label: String) -> MapInfo {
             .filter(|p| p.is_file())
             .collect(),
         surfaces: surfaces_of(dir),
+        incomplete: !dir.join(REPORT).is_file(),
     }
 }
 
@@ -602,6 +912,7 @@ fn run_info(dir: &Path, label: String) -> RunInfo {
         label,
         settings,
         has_result: file("slam.json") && file("traj.tum"),
+        incomplete: !file("slam.json"),
         has_cache: file(CACHE_FILE),
         has_previous: file("traj.vorher.tum"),
         has_odometry: file("traj_odom.tum"),
@@ -638,34 +949,83 @@ pub fn run_label(dir: &Path) -> String {
     }
 }
 
+/// The project folder an old model (one without relative paths in `modell.json`) was merged
+/// in: the folder its runs `<projekt>/scans/<id>/slam-NNN` lay in then, if every such run
+/// says the same (runs elsewhere, added from the command line, say nothing).
+fn merged_in(report: &ModelReport) -> Option<PathBuf> {
+    let mut then: Option<&Path> = None;
+    for m in &report.members {
+        let run = &m.slam_dir;
+        let numbered_run = run
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix(RUN_PREFIX))
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+        let scans = run.parent().and_then(Path::parent);
+        let Some(project) = scans
+            .filter(|s| numbered_run && s.file_name().is_some_and(|n| n == SCANS_DIR))
+            .and_then(Path::parent)
+        else {
+            continue;
+        };
+        if then.is_some_and(|t| t != project) {
+            return None;
+        }
+        then = Some(project);
+    }
+    then.map(Path::to_path_buf)
+}
+
+/// An old model ([`merged_in`]) of a project renamed, moved or copied since: every folder of
+/// its scans that lay in the project folder then is taken in the project folder `now`, where
+/// it exists there (else it stays as written). A model with relative paths needs none of
+/// this ([`read_model`]).
+fn rebase_old_model(report: &mut ModelReport, now: &Path) {
+    let relative = report
+        .members
+        .iter()
+        .any(|m| m.scan_rel.is_some() || m.slam_dir_rel.is_some() || m.map_dir_rel.is_some());
+    let Some(then) = merged_in(report).filter(|then| !relative && then != now) else {
+        return;
+    };
+    for m in &mut report.members {
+        for p in [&mut m.scan, &mut m.slam_dir, &mut m.map_dir] {
+            let moved = p.strip_prefix(&then).ok().map(|rest| now.join(rest));
+            if let Some(found) = moved.filter(|f| f.is_dir()) {
+                *p = found;
+            }
+        }
+    }
+}
+
 impl Project {
     /// A new project in `dir` (created if missing; an existing folder must be empty apart
     /// from hidden files). `project.toml` is written right away.
     pub fn create(dir: &Path, name: &str) -> Result<Project, ProjectError> {
         if dir.join(PROJECT_FILE).exists() {
-            return Err(ProjectError(format!(
-                "Projekt existiert schon: {}",
-                dir.join(PROJECT_FILE).display()
+            return Err(ProjectError(text::about_path(
+                "Hier ist schon ein Projekt – „Projekt öffnen …“ nehmen",
+                dir,
             )));
         }
         if dir.exists() {
             let entries = fs::read_dir(dir)
-                .map_err(|e| ProjectError(format!("{} nicht lesbar: {e}", dir.display())))?;
+                .map_err(|e| ProjectError(text::io_error("Ordner nicht lesbar", dir, &e)))?;
             let busy = entries
                 .filter_map(Result::ok)
                 .any(|e| !e.file_name().to_string_lossy().starts_with('.'));
             if busy {
-                return Err(ProjectError(format!(
-                    "Ordner {} ist nicht leer; ein neues Projekt braucht einen leeren Ordner",
-                    dir.display()
+                return Err(ProjectError(text::about_path(
+                    "Ordner ist nicht leer – ein neues Projekt braucht einen leeren Ordner",
+                    dir,
                 )));
             }
         }
         fs::create_dir_all(dir)
-            .map_err(|e| ProjectError(format!("{} nicht anlegbar: {e}", dir.display())))?;
+            .map_err(|e| ProjectError(text::io_error("Ordner nicht anlegbar", dir, &e)))?;
         let project = Project {
             dir: canonical(dir)
-                .map_err(|e| ProjectError(format!("{} nicht lesbar: {e}", dir.display())))?,
+                .map_err(|e| ProjectError(text::io_error("Ordner nicht lesbar", dir, &e)))?,
             name: name.to_string(),
             scans: Vec::new(),
         };
@@ -676,37 +1036,66 @@ impl Project {
     /// Reads `dir/project.toml`.
     pub fn open(dir: &Path) -> Result<Project, ProjectError> {
         let file = dir.join(PROJECT_FILE);
-        let text = fs::read_to_string(&file).map_err(|e| {
+        let content = fs::read_to_string(&file).map_err(|e| {
             ProjectError(if e.kind() == io::ErrorKind::NotFound {
-                format!("Kein Projekt: {} fehlt", file.display())
+                text::about_path("Kein Projekt: project.toml fehlt", dir)
             } else {
-                format!("{} nicht lesbar: {e}", file.display())
+                text::io_error("project.toml nicht lesbar", &file, &e)
             })
         })?;
-        let bad = |e: &dyn fmt::Display| ProjectError(format!("{}: {e}", file.display()));
-        let table: toml::Table = toml::from_str(&text).map_err(|e| bad(&e))?;
+        let bad = |what: &str| ProjectError(text::about_path(what, &file));
+        let table: toml::Table = toml::from_str(&content)
+            .map_err(|e| ProjectError(text::damaged_toml(&file, &content, &e)))?;
         match table.get("format").and_then(toml::Value::as_integer) {
             Some(FORMAT) => {}
             Some(n) => {
                 return Err(bad(&format!(
-                    "Projektformat {n} wird von diesem Programm nicht unterstützt"
+                    "Projektformat {n} wird von diesem Programm nicht unterstützt (neueres \
+                     Driftless nötig)"
                 )))
             }
-            None => return Err(bad(&"`format` fehlt")),
+            None => return Err(bad("project.toml ist beschädigt: „format“ fehlt")),
         }
-        let pf: ProjectFile = table.try_into().map_err(|e| bad(&e))?;
-        let dir = canonical(dir).map_err(|e| bad(&e))?;
+        let pf: ProjectFile = table.try_into().map_err(|e: toml::de::Error| {
+            bad(&format!(
+                "project.toml ist beschädigt: {}",
+                e.message().lines().next().unwrap_or_default()
+            ))
+        })?;
+        let dir = canonical(dir)
+            .map_err(|e| ProjectError(text::io_error("Projektordner nicht lesbar", dir, &e)))?;
         let scans = pf
             .scans
             .into_iter()
-            .map(|s| ScanEntry {
-                path: from_stored(&dir, &s.path),
-                extra_runs: s.extra_runs.iter().map(|r| from_stored(&dir, r)).collect(),
-                id: s.id,
-                name: s.name,
+            .map(|s| {
+                // the relative paths of the runs count only one per run
+                let runs_rel =
+                    (s.extra_runs_rel.len() == s.extra_runs.len()).then_some(&s.extra_runs_rel);
+                ScanEntry {
+                    path: from_stored_pair(&dir, &s.path, s.path_rel.as_deref()),
+                    extra_runs: s
+                        .extra_runs
+                        .iter()
+                        .enumerate()
+                        .map(|(k, r)| {
+                            let rel = runs_rel.map(|v| v[k].as_str());
+                            from_stored_pair(&dir, r, rel)
+                        })
+                        .collect(),
+                    bags: s
+                        .bags
+                        .iter()
+                        .filter_map(|b| {
+                            let (name, bytes) = b.rsplit_once(' ')?;
+                            Some((name.to_string(), bytes.parse().ok()?))
+                        })
+                        .collect(),
+                    id: s.id,
+                    name: s.name,
+                }
             })
             .collect::<Vec<_>>();
-        check_ids(&scans).map_err(|e| bad(&e))?;
+        check_ids(&scans).map_err(|e| bad(&format!("project.toml ist beschädigt: {e}")))?;
         Ok(Project {
             dir,
             name: pf.name,
@@ -721,15 +1110,31 @@ impl Project {
             .scans
             .iter()
             .map(|s| {
+                let (path, path_rel) = to_stored(&self.dir, &s.path)?;
+                let runs = s
+                    .extra_runs
+                    .iter()
+                    .map(|r| to_stored(&self.dir, r))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let extra_runs_rel = if runs.iter().any(|(_, rel)| rel.is_some()) {
+                    runs.iter()
+                        .map(|(_, rel)| rel.clone().unwrap_or_default())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 Ok(ScanFile {
                     id: s.id.clone(),
-                    path: to_stored(&self.dir, &s.path)?,
+                    path,
+                    path_rel,
                     name: s.name.clone(),
-                    extra_runs: s
-                        .extra_runs
+                    extra_runs: runs.into_iter().map(|(text, _)| text).collect(),
+                    extra_runs_rel,
+                    bags: s
+                        .bags
                         .iter()
-                        .map(|r| to_stored(&self.dir, r))
-                        .collect::<Result<_, _>>()?,
+                        .map(|(name, bytes)| format!("{name} {bytes}"))
+                        .collect(),
                 })
             })
             .collect::<Result<_, ProjectError>>()?;
@@ -739,10 +1144,10 @@ impl Project {
             scans,
         };
         let file = self.dir.join(PROJECT_FILE);
-        let text =
-            toml::to_string(&pf).map_err(|e| ProjectError(format!("{}: {e}", file.display())))?;
-        atomic_write(&file, text.as_bytes())
-            .map_err(|e| ProjectError(format!("{} nicht schreibbar: {e}", file.display())))
+        let content = toml::to_string(&pf)
+            .map_err(|e| ProjectError(text::about_path(&e.to_string(), &file)))?;
+        atomic_write(&file, content.as_bytes())
+            .map_err(|e| ProjectError(text::io_error("project.toml nicht schreibbar", &file, &e)))
     }
 
     pub fn scan(&self, id: &str) -> Option<&ScanEntry> {
@@ -754,18 +1159,18 @@ impl Project {
     }
 
     /// Adds a scan folder (it must have LiDAR bags); returns its id: the folder name, with
-    /// `-2`, `-3`, … if taken (ignoring case). The same folder twice is refused. Call [`Project::save`]
-    /// afterwards.
+    /// `-2`, `-3`, … if taken (ignoring case) – by a scan of the project, or by the results of
+    /// another scan under `scans/<id>` (one taken out of the project, see
+    /// [`Project::results_of_another_scan`]). The same folder twice is refused. Call
+    /// [`Project::save`] afterwards.
     pub fn add_scan(&mut self, scan_dir: &Path) -> Result<String, ProjectError> {
-        let path = canonical(scan_dir).map_err(|_| {
-            ProjectError(format!("Scan-Ordner {} nicht gefunden", scan_dir.display()))
-        })?;
-        discover_project(&path).map_err(|e| ProjectError(e.to_string()))?;
+        let path = canonical(scan_dir)
+            .map_err(|_| ProjectError(text::about_path("Scan-Ordner nicht gefunden", scan_dir)))?;
+        let found = discover_project(&path).map_err(|e| ProjectError(e.to_string()))?;
         if let Some(s) = self.scans.iter().find(|s| same_dir(&s.path, &path)) {
-            return Err(ProjectError(format!(
-                "Scan {} ist schon im Projekt (als {})",
-                path.display(),
-                s.id
+            return Err(ProjectError(text::about_path(
+                &format!("Scan ist schon im Projekt (als „{}“)", s.name),
+                &path,
             )));
         }
         let base = path
@@ -778,6 +1183,7 @@ impl Project {
             self.scans
                 .iter()
                 .any(|s| s.id.to_lowercase() == id.to_lowercase())
+                || self.results_of_another_scan(id, &found)
         };
         while taken(&id) {
             n += 1;
@@ -788,8 +1194,116 @@ impl Project {
             path,
             name: base,
             extra_runs: Vec::new(),
+            bags: bag_stamps(&found),
         });
         Ok(id)
+    }
+
+    /// Whether `scans/<id>` holds the runs of another scan than the scan folder `found` (one
+    /// taken out of the project): none of its runs was recorded at the times of `found`'s LiDAR
+    /// bags ([`run_fits_scan`]), or one was recorded at others. Such an id is not given to
+    /// `found`, which would list those runs and maps as its own; a folder of the same scan,
+    /// taken out and added again, gives it its results back. A folder without runs holds
+    /// nothing to take over. Reads the bags' indexes and the runs' `slam.json`.
+    fn results_of_another_scan(&self, id: &str, found: &driftless_io::project::Project) -> bool {
+        let Ok(base) = self.runs_dir(id) else {
+            return false;
+        };
+        let runs = numbered(&base, RUN_PREFIX);
+        if runs.is_empty() {
+            return false;
+        }
+        let times = scan_times(&found.lidar_bags);
+        let mut fits = false;
+        for (_, _, run) in &runs {
+            match (driftless_steps::slam::run_times(run), times) {
+                (Some(run), Some(scan)) if run_fits_scan(run, scan) => fits = true,
+                // recorded at other times: another scan's
+                (Some(_), Some(_)) => return true,
+                // cannot be told (no report, bags without an index)
+                _ => {}
+            }
+        }
+        !fits
+    }
+
+    /// Gives the scan `id` the shown name `name` (trimmed, not empty); its folder and id stay.
+    /// Call [`Project::save`] afterwards.
+    pub fn rename_scan(&mut self, id: &str, name: &str) -> Result<(), ProjectError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ProjectError(text::SCAN_NAME_EMPTY.into()));
+        }
+        let scan = self
+            .scans
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or_else(|| Self::unknown(id))?;
+        scan.name = name.to_string();
+        Ok(())
+    }
+
+    /// Takes the scan `id` out of the project: only its entry; the raw data and the results
+    /// under `scans/<id>` stay (added again, the scan gets them back). Call [`Project::save`]
+    /// afterwards.
+    pub fn remove_scan(&mut self, id: &str) -> Result<ScanEntry, ProjectError> {
+        let k = self
+            .scans
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or_else(|| Self::unknown(id))?;
+        Ok(self.scans.remove(k))
+    }
+
+    /// Takes the run folder `run` made by the CLI out of the scan `id` (only the entry; the
+    /// folder stays). Call [`Project::save`] afterwards.
+    pub fn remove_run(&mut self, id: &str, run: &Path) -> Result<(), ProjectError> {
+        let scan = self
+            .scans
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or_else(|| Self::unknown(id))?;
+        let before = scan.extra_runs.len();
+        scan.extra_runs.retain(|r| !same_dir(r, run));
+        if scan.extra_runs.len() == before {
+            return Err(ProjectError(text::unknown_run(run)));
+        }
+        Ok(())
+    }
+
+    /// Points the scan `id` at the folder `dir` (its data moved: another drive, another
+    /// computer), if that holds the same scan: the same LiDAR bags by name and size as when it
+    /// was added, and recorded at the times of its runs ([`run_fits_scan`]). A different scan
+    /// is refused with the reason. Returns whether it could be checked (a scan without runs,
+    /// added before the bags were kept, cannot be). Reads the bags: call it off the UI thread.
+    /// Call [`Project::save`] afterwards.
+    pub fn relink_scan(&mut self, id: &str, dir: &Path) -> Result<bool, ProjectError> {
+        let path = canonical(dir)
+            .map_err(|_| ProjectError(text::about_path("Scan-Ordner nicht gefunden", dir)))?;
+        let found = discover_project(&path).map_err(|e| ProjectError(e.to_string()))?;
+        if let Some(other) = self
+            .scans
+            .iter()
+            .find(|s| s.id != id && same_dir(&s.path, &path))
+        {
+            return Err(ProjectError(text::about_path(
+                &format!("Ordner ist schon der Scan „{}“", other.name),
+                &path,
+            )));
+        }
+        let runs = self.runs(id);
+        let scan = self.scan(id).ok_or_else(|| Self::unknown(id))?;
+        let checked = same_scan(scan, &runs, &found)?;
+        let scan = self
+            .scans
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or_else(|| Self::unknown(id))?;
+        scan.path = path;
+        if scan.bags.is_empty() {
+            scan.bags = bag_stamps(&found);
+        }
+        Ok(checked)
     }
 
     /// Adds a run folder made by the CLI (`driftless slam -o`, with `slam.json`) to the scan
@@ -802,19 +1316,18 @@ impl Project {
             .iter_mut()
             .find(|s| s.id == scan_id)
             .ok_or_else(|| Self::unknown(scan_id))?;
-        let path = canonical(run_dir).map_err(|_| {
-            ProjectError(format!("Lauf-Ordner {} nicht gefunden", run_dir.display()))
-        })?;
+        let path = canonical(run_dir)
+            .map_err(|_| ProjectError(text::about_path("Lauf-Ordner nicht gefunden", run_dir)))?;
         if !path.join("slam.json").is_file() {
-            return Err(ProjectError(format!(
-                "{} ist kein SLAM-Lauf: slam.json fehlt",
-                path.display()
+            return Err(ProjectError(text::about_path(
+                "Kein SLAM-Lauf: slam.json fehlt",
+                &path,
             )));
         }
         if known.iter().any(|k| same_dir(k, &path)) {
-            return Err(ProjectError(format!(
-                "Lauf {} ist schon im Projekt",
-                path.display()
+            return Err(ProjectError(text::about_path(
+                "Lauf ist schon im Projekt",
+                &path,
             )));
         }
         check_run_scan(&path, &scan.path)?;
@@ -828,10 +1341,7 @@ impl Project {
             return ScanState::Missing(Self::unknown(scan_id).0);
         };
         if !scan.path.is_dir() {
-            return ScanState::Missing(format!(
-                "Scan-Ordner {} nicht gefunden",
-                scan.path.display()
-            ));
+            return ScanState::Missing(text::about_path("Scan-Ordner nicht gefunden", &scan.path));
         }
         match discover_project(&scan.path) {
             Ok(_) => ScanState::Ready,
@@ -894,13 +1404,17 @@ impl Project {
     }
 
     /// The models of the project: `modelle/modell-NNN` with a readable `modell.json`, by
-    /// number (a folder without one is a merge still running, stopped or broken). Reads each
-    /// report; call it when the tree is read, not every frame.
+    /// number (a folder without one is a merge still running, stopped or broken), with the
+    /// folders of their scans as found ([`read_model`]; an old model of a project renamed,
+    /// moved or copied since, see [`rebase_old_model`]). Reads each report; call it when the
+    /// tree is read, not every frame.
     pub fn models(&self) -> Vec<ModelInfo> {
         numbered(&self.dir.join(MODELS_DIR), MODEL_PREFIX)
             .into_iter()
             .filter_map(|(_, digits, dir)| {
-                let report = read_model(&dir).ok()?;
+                let mut report = read_model(&dir).ok()?;
+                rebase_old_model(&mut report, &self.dir);
+                self.current_scans(&mut report);
                 Some(ModelInfo {
                     label: text::model_label(&digits),
                     surfaces: surfaces_of(&dir),
@@ -909,6 +1423,45 @@ impl Project {
                 })
             })
             .collect()
+    }
+
+    /// Each scan of the model `report` whose run is one of the project's (`scans/<id>/slam-NNN`,
+    /// or a run added by hand) in the folder the project has for it now: `modell.json` keeps
+    /// the scan folder of the merge, which is out of date once the scan was assigned a new
+    /// folder („Ordner neu zuordnen …“). So the surface of the model takes the photos from where
+    /// the scan is, and whether its maps changed is told from there.
+    fn current_scans(&self, report: &mut ModelReport) {
+        for m in &mut report.members {
+            if let Some(scan) = self.scan_of_run(&m.slam_dir) {
+                m.scan = scan.path.clone();
+            }
+        }
+    }
+
+    /// The scan of the project whose run lies in `run`: `<projekt>/scans/<id>/slam-NNN` of the
+    /// scan `id`, or a run added to it by hand.
+    fn scan_of_run(&self, run: &Path) -> Option<&ScanEntry> {
+        let own = run
+            .strip_prefix(self.dir.join(SCANS_DIR))
+            .ok()
+            .and_then(|rest| {
+                let mut parts = rest.components();
+                let (Some(Component::Normal(id)), Some(Component::Normal(name)), None) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    return None;
+                };
+                let digits = name.to_str()?.strip_prefix(RUN_PREFIX)?;
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                self.scan(id.to_str()?)
+            });
+        own.or_else(|| {
+            self.scans
+                .iter()
+                .find(|s| s.extra_runs.iter().any(|r| same_dir(r, run)))
+        })
     }
 
     /// Creates the next `scans/<id>/slam-NNN` with its `lauf.toml`. For a job: the folder goes
@@ -920,16 +1473,18 @@ impl Project {
     ) -> Result<StepDir, ProjectError> {
         let scan = self.scan(scan_id).ok_or_else(|| Self::unknown(scan_id))?;
         let dir = create_numbered(&self.runs_dir(scan_id)?, RUN_PREFIX)?;
+        let (scan_text, scan_rel) = to_stored(&self.dir, &scan.path)?;
         let run = RunFile {
-            scan: to_stored(&self.dir, &scan.path)?,
+            scan: scan_text,
+            scan_rel,
             erstellt: utc_now(),
             slam: settings.clone(),
         };
         let file = dir.path().join(RUN_FILE);
-        let text =
-            toml::to_string(&run).map_err(|e| ProjectError(format!("{}: {e}", file.display())))?;
-        atomic_write(&file, text.as_bytes())
-            .map_err(|e| ProjectError(format!("{} nicht schreibbar: {e}", file.display())))?;
+        let content = toml::to_string(&run)
+            .map_err(|e| ProjectError(text::about_path(&e.to_string(), &file)))?;
+        atomic_write(&file, content.as_bytes())
+            .map_err(|e| ProjectError(text::io_error("lauf.toml nicht schreibbar", &file, &e)))?;
         Ok(dir)
     }
 }
@@ -940,31 +1495,59 @@ fn link_or_copy(from: &Path, to: &Path) -> io::Result<()> {
     fs::hard_link(from, to).or_else(|_| fs::copy(from, to).map(|_| ()))
 }
 
-/// The map folder for `input` in the run: the youngest `karte-NNN` that fits it
-/// ([`folder_fits`]), else a new `karte-NNN` after the last. Into a new folder the stages
-/// the step would take over (`dense.bin` for clean, `clean.bin` or else `dense.bin` for
-/// color) are linked from the youngest map folder (or else the run folder) that has one
-/// that fits.
-/// The map in the run folder itself is never written into. For a job: reads `traj.tum`,
-/// may copy large files.
+/// The map folder for `input` in the run: an existing `karte-NNN` only if its map of `input`
+/// is current already ([`current_map`]: computing it would write nothing), else a new
+/// `karte-NNN` after the last ([`new_map_dir`]). A map is never computed anew in its own
+/// folder: one that stopped half-way (cancelled, a full disk) would have lost its report, and
+/// with it the surfaces in it ([`crate::leftovers`]); the old map stays as it is. The map in
+/// the run folder itself is never written into. For a job: reads `traj.tum`, may copy large
+/// files.
 pub fn map_dir_for(
     run: &RunInfo,
     input: &MapInput,
     progress: &Progress,
 ) -> Result<StepDir, StepError> {
-    let maps = numbered(&run.dir, MAP_PREFIX);
-    if let Some((_, _, dir)) = maps.iter().rev().find(|(_, _, d)| folder_fits(input, d)) {
-        return Ok(StepDir {
-            path: dir.clone(),
-            new: false,
-        });
+    if let Some(dir) = current_map_dir(run, input) {
+        return Ok(StepDir::existing(dir));
     }
+    Ok(new_map_dir(run, input, progress)?.0)
+}
+
+/// The youngest `karte-NNN` of `run` whose whole map of `input` is current ([`current_map`];
+/// never for a single step, which always writes).
+fn current_map_dir(run: &RunInfo, input: &MapInput) -> Option<PathBuf> {
+    numbered(&run.dir, MAP_PREFIX)
+        .into_iter()
+        .rev()
+        .map(|(_, _, dir)| dir)
+        .find(|dir| {
+            let req = MapRequest {
+                input: input.clone(),
+                out_dir: dir.clone(),
+                all_files: false,
+            };
+            current_map(&req).is_some()
+        })
+}
+
+/// A new `karte-NNN` after the last of `run`, into which the stages the step of `input` would
+/// take over (`dense.bin` for clean, `clean.bin` or else `dense.bin` for color) are linked
+/// from the youngest map folder (or else the run folder) that has one that fits. Returns it
+/// with that folder, whose `map.json` gives the entries of the steps the stage stands for
+/// ([`recompute_map_from`]).
+fn new_map_dir(
+    run: &RunInfo,
+    input: &MapInput,
+    progress: &Progress,
+) -> Result<(StepDir, Option<PathBuf>), StepError> {
+    let maps = numbered(&run.dir, MAP_PREFIX);
     let target = create_numbered(&run.dir, MAP_PREFIX)?;
     let wanted: &[&str] = match input.map.step {
         MapStep::Dense | MapStep::All => &[],
         MapStep::Clean => &[DENSE_BIN],
         MapStep::Color => &[CLEAN_BIN, DENSE_BIN],
     };
+    let mut taken_from = None;
     if !wanted.is_empty() {
         // youngest first, up to the first that has a fitting stage; the run folder holds a
         // map made by the CLI
@@ -981,21 +1564,18 @@ pub fn map_dir_for(
             };
             progress.phase("Zwischenstände übernehmen", None);
             link_or_copy(&src.join(file), &target.path().join(file)).map_err(|e| {
-                format!(
-                    "{} nicht nach {} kopierbar: {e}",
-                    src.join(file).display(),
-                    target.path().display()
-                )
+                text::io_error("Zwischenstand nicht kopierbar", &src.join(file), &e)
             })?;
             let from = src.file_name().unwrap_or_default().to_string_lossy();
             progress.info(format!("{file} aus {from} übernommen"));
+            taken_from = Some(src);
             break;
         }
         if progress.is_cancelled() {
             return Err(StepError::Cancelled);
         }
     }
-    Ok(target)
+    Ok((target, taken_from))
 }
 
 /// The [`MapStatus`] of `map` of `run`, made from the scan folder `scan`. Reads `map.json`,
@@ -1076,32 +1656,41 @@ pub fn run_slam_job(
             })
         }
         SlamJob::Reuse(run) => {
-            let req = SlamRequest {
-                scan,
-                out: run.dir.clone(),
-                settings: run.settings.clone(),
-                reuse: true,
-                history: true,
-            };
-            reuse_refusal(&req)?;
-            let outcome = run_slam(&req, progress)?;
-            Ok(SlamDone {
-                run_dir: run.dir.clone(),
-                outcome,
-            })
+            // in place: another window must not offer or delete the folder meanwhile
+            let _busy = mark_busy(&run.dir);
+            reuse(scan, run, progress)
         }
     }
+}
+
+/// Recomputes `run` of the scan folder `scan` from its `submaps.bin`, in its folder, with
+/// history; a failure or a cancel leaves it as it was ([`run_slam`]).
+fn reuse(scan: PathBuf, run: &RunInfo, progress: &Progress) -> Result<SlamDone, StepError> {
+    let req = SlamRequest {
+        scan,
+        out: run.dir.clone(),
+        settings: run.settings.clone(),
+        reuse: true,
+        history: true,
+    };
+    reuse_refusal(&req)?;
+    let outcome = run_slam(&req, progress)?;
+    Ok(SlamDone {
+        run_dir: run.dir.clone(),
+        outcome,
+    })
 }
 
 /// Why a reuse of a run cannot be computed here: an added CLI run has no `lauf.toml`, its
 /// settings are only assumed, and its cache needs others.
 fn reuse_refusal(req: &SlamRequest) -> Result<(), StepError> {
     if settings_differ(req) {
-        return Err(format!(
-            "Lauf wurde mit anderen Einstellungen gerechnet als den Standardwerten (z. B. \
-             --lidar-to-imu, --lidar-topic oder --imu-topic) und lässt sich hier nicht neu \
-             rechnen; mit `driftless slam <scan> -o {} --reuse` und denselben Angaben neu rechnen",
-            req.out.display()
+        return Err(text::about_path(
+            "Nicht neu rechenbar: der Lauf wurde mit anderen SLAM-Einstellungen als den \
+             Standardwerten gerechnet (LiDAR-Lage oder Topics), die nicht bei ihm stehen; den \
+             Scan mit diesen Einstellungen neu rechnen (Scan wählen, „Erweitert“, \
+             SLAM-Einstellungen, „SLAM rechnen“)",
+            &req.out,
         )
         .into());
     }
@@ -1119,11 +1708,12 @@ fn map_refusal(run: &RunInfo, scan: &Path) -> Result<(), StepError> {
         history: false,
     };
     if settings_differ(&req) {
-        return Err(format!(
-            "Lauf wurde mit anderen Einstellungen gerechnet als den Standardwerten (z. B. \
-             --lidar-to-imu, --lidar-topic oder --imu-topic); die Karte lässt sich hier nicht \
-             rechnen; mit `driftless map <scan> --slam {}` und denselben Angaben rechnen",
-            run.dir.display()
+        return Err(text::about_path(
+            "Karte nicht rechenbar: der Lauf wurde mit anderen SLAM-Einstellungen als den \
+             Standardwerten gerechnet (LiDAR-Lage oder Topics), die nicht bei ihm stehen; den \
+             Scan mit diesen Einstellungen neu rechnen (Scan wählen, „Erweitert“, \
+             SLAM-Einstellungen, „SLAM rechnen“)",
+            &run.dir,
         )
         .into());
     }
@@ -1154,30 +1744,34 @@ pub fn restore_job(
         .path
         .clone();
     reuse_refusal(&SlamRequest {
-        scan,
+        scan: scan.clone(),
         out: run.dir.clone(),
         settings: run.settings.clone(),
         reuse: true,
         history: true,
     })?;
+    // in place: another window must not offer or delete the folder meanwhile
+    let _busy = mark_busy(&run.dir);
     let path = run.dir.join(CORRECTIONS_FILE);
     let before = match fs::read(&path) {
         Ok(bytes) => Some(bytes),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("{} nicht lesbar: {e}", path.display()).into()),
+        Err(e) => return Err(text::io_error("Korrekturen nicht lesbar", &path, &e).into()),
     };
     history::restore_flags(&run.dir, nr)?;
-    let done = run_slam_job(project, scan_id, &SlamJob::Reuse(run.clone()), progress);
+    let done = reuse(scan, run, progress);
     if done.is_err() {
+        let _lock = lock(&path)?;
         let back = match &before {
             Some(bytes) => atomic_write(&path, bytes),
             None if path.exists() => fs::remove_file(&path),
             None => Ok(()),
         };
         if let Err(e) = back {
-            return Err(format!(
-                "Neu rechnen fehlgeschlagen und {} nicht zurückgeschrieben: {e}",
-                path.display()
+            return Err(text::io_error(
+                "Neu rechnen fehlgeschlagen und Korrekturen nicht zurückgeschrieben",
+                &path,
+                &e,
             )
             .into());
         }
@@ -1185,9 +1779,12 @@ pub fn restore_job(
     done
 }
 
-/// Makes a map of `run` from the scan folder `scan` into the folder [`map_dir_for`] picks; a
-/// new folder is removed again if the map is cancelled or fails. Refused like a reuse for a
-/// run without `lauf.toml` whose cache needs other than the default settings.
+/// Makes a map of `run` from the scan folder `scan` into the folder [`map_dir_for`] picks: a
+/// map that is current already is taken as it is (nothing written), any other is computed
+/// into a new folder, which is removed again if the map is cancelled or fails. Its
+/// `map.json` takes the entries of the steps a single step builds on from the map their stage
+/// was linked from, so that it counts as current. Refused like a reuse for a run without
+/// `lauf.toml` whose cache needs other than the default settings.
 pub fn run_map_job(
     run: &RunInfo,
     scan: &Path,
@@ -1202,12 +1799,20 @@ pub fn run_map_job(
         slam: run.settings.clone(),
         map: settings.clone(),
     };
-    let dir = map_dir_for(run, &input, progress)?;
-    let req = MapRequest {
-        input,
-        out_dir: dir.path().to_path_buf(),
+    let request = |dir: &Path| MapRequest {
+        input: input.clone(),
+        out_dir: dir.to_path_buf(),
+        // one cloud to look at; the rest comes from „Exportieren …“
+        all_files: false,
     };
-    let report = run_map(&req, progress)?;
+    if let Some(dir) = current_map_dir(run, &input) {
+        if let Some(report) = take_current_map(&request(&dir), progress) {
+            return Ok(MapDone { dir, report });
+        }
+        // changed since it was picked (another window or program): never in place
+    }
+    let (dir, stages_from) = new_map_dir(run, &input, progress)?;
+    let report = recompute_map_from(&request(dir.path()), stages_from.as_deref(), progress)?;
     Ok(MapDone {
         dir: dir.keep(),
         report,
@@ -1246,12 +1851,14 @@ fn surface_request(
         config: settings.config.clone(),
         texture: settings.texture,
         gpu,
+        // the glb; an OBJ comes from „Exportieren …“
+        obj: false,
     })
 }
 
 /// The status of `surface` of `map` of `run`, made from the scan folder `scan`: its runtime
 /// (`seconds_total` of `oberflaeche.json`), and stale if it no longer fits the map
-/// ([`surface_fits`]: the map, the run, the images or the program changed since). A report
+/// ([`surface_fits`]: the map, the run, the images or the surface step changed since). A report
 /// whose settings cannot be read in full was written by an earlier version of the program and
 /// is stale too, and so is a folder without a report (the step writes it last: it was
 /// stopped before, or the folder was copied incompletely). Reads the lists of bags, the
@@ -1382,6 +1989,7 @@ pub fn run_merge_job(
         smooth: true,
         include_unsure,
         pairs,
+        ply: false,
     };
     run_merge(&req, progress)?;
     Ok(dir.keep())
@@ -1418,6 +2026,7 @@ pub fn set_point_pair_enabled(
     enabled: bool,
 ) -> Result<(), StepError> {
     let file = point_pairs_file(project);
+    let _lock = lock(&file)?;
     let mut pairs = PointPairs::load(&file)?;
     pairs.set_enabled(index, enabled)?;
     pairs.save(&file)
@@ -1462,6 +2071,9 @@ pub fn run_pairs_merge_job(
     let include_unsure = model.report.include_unsure;
     let file = point_pairs_file(project);
     let models = project.dir.join(MODELS_DIR);
+    fs::create_dir_all(&models)
+        .map_err(|e| ProjectError(text::io_error("Ordner nicht anlegbar", &models, &e)))?;
+    let lock = lock(&file)?;
     let mut pairs = PointPairs::load(&file)?;
     pairs.add(PointPairEntry {
         a: PathBuf::from(stored_text(&models, &entry.a)?),
@@ -1472,9 +2084,8 @@ pub fn run_pairs_merge_job(
     if progress.is_cancelled() {
         return Err(StepError::Cancelled);
     }
-    fs::create_dir_all(&models)
-        .map_err(|e| ProjectError(format!("{} nicht anlegbar: {e}", models.display())))?;
     pairs.save(&file)?;
+    drop(lock);
     progress.info(text::PAIRS_SAVED.to_string());
     run_merge_job(project, &picks, include_unsure, progress)
 }
@@ -1488,10 +2099,13 @@ fn model_surface_request(
 ) -> ModelSurfaceRequest {
     ModelSurfaceRequest {
         model_dir: model.dir.clone(),
+        // the scans' folders as the project found them
+        model: Some(model.report.clone()),
         out_dir: out_dir.to_path_buf(),
         config: settings.config.clone(),
         texture: settings.texture,
         gpu,
+        obj: false,
     }
 }
 
@@ -1506,10 +2120,12 @@ fn model_scan_missing(model: &ModelInfo) -> bool {
         .any(|m| discover_project(&m.scan).is_err())
 }
 
-/// The status of `model` itself: its runtime, and stale if the map of a scan in it was
-/// computed anew since the merge (the place of the scan in the model may not fit it any
-/// more: merge anew). Reads `traj.tum` and the bag lists of its scans: call it off the UI
-/// thread. A model whose scan cannot be read is never stale (that cannot be told).
+/// The status of `model` itself: its runtime, and stale if it was merged by another version
+/// of the merge ([`ModelInfo::other_version`]) or the map of a scan in it was computed anew
+/// since the merge (the place of the scan in the model may not fit it any more: merge anew).
+/// Reads `traj.tum` and the bag lists of its scans: call it off the UI thread. Whether a map
+/// changed cannot be told while a scan of the model cannot be read: then only the version
+/// counts.
 pub fn model_status(model: &ModelInfo) -> MapStatus {
     let changed = |m: &driftless_steps::merge::ModelMember| {
         let Some(id) = &m.clean_id else {
@@ -1518,13 +2134,14 @@ pub fn model_status(model: &ModelInfo) -> MapStatus {
         let input = map_input_for(&m.scan, &m.slam_dir, &m.map_dir, m.slam.clone());
         clean_stage_id(&input).map_or(true, |now| hex(&now) != *id)
     };
-    let stale = !model_scan_missing(model)
-        && model
-            .report
-            .members
-            .iter()
-            .filter(|m| m.included)
-            .any(changed);
+    let stale = model.other_version()
+        || (!model_scan_missing(model)
+            && model
+                .report
+                .members
+                .iter()
+                .filter(|m| m.included)
+                .any(changed));
     MapStatus {
         seconds: Some(model.report.seconds_total),
         stale,
@@ -1532,14 +2149,16 @@ pub fn model_status(model: &ModelInfo) -> MapStatus {
 }
 
 /// The status of `surface` of `model`, as [`surface_status`] for a map: stale if it no
-/// longer fits the model ([`model_surface_fits`]), without a readable report or with
-/// settings an earlier program wrote. Call it off the UI thread.
+/// longer fits the model ([`model_surface_fits`]), without a readable report, with settings
+/// an earlier program wrote, or of a model of another merge version. Call it off the UI
+/// thread.
 pub fn model_surface_status(model: &ModelInfo, surface: &SurfaceInfo) -> MapStatus {
     let report = fs::read_to_string(surface.dir.join(SURFACE_REPORT))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
     let seconds = report.as_ref().and_then(|v| v["seconds_total"].as_f64());
     let stale = report.is_none()
+        || model.other_version()
         || (!model_scan_missing(model)
             && surface.settings.as_ref().is_none_or(|settings| {
                 let req = model_surface_request(model, settings, GpuPref::default(), &surface.dir);
@@ -1594,8 +2213,11 @@ mod tests {
     #[test]
     fn stored_paths() {
         let base = Path::new("/p");
-        assert_eq!(to_stored(base, Path::new("/p/a/b")).unwrap(), "a/b");
-        assert_eq!(to_stored(base, Path::new("/q/a")).unwrap(), "/q/a");
+        let stored = |p: &str| to_stored(base, Path::new(p)).unwrap();
+        assert_eq!(stored("/p/a/b"), ("a/b".into(), None));
+        // outside: absolute, and relative beside it
+        assert_eq!(stored("/q/a"), ("/q/a".into(), Some("../q/a".into())));
+        assert_eq!(stored("/p"), ("/p".into(), None));
         assert_eq!(from_stored(base, "a/b"), Path::new("/p/a/b"));
         assert_eq!(from_stored(base, "a\\b"), Path::new("/p/a/b"));
         assert_eq!(from_stored(base, "./a//b/"), Path::new("/p/a/b"));

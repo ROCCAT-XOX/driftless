@@ -14,6 +14,7 @@ mod app;
 pub mod compare;
 pub mod correct;
 pub mod export;
+pub mod manage;
 pub mod rail;
 pub mod settings;
 pub mod status;
@@ -23,24 +24,26 @@ pub mod theme;
 pub mod tools;
 pub mod view3d;
 
-pub use app::{parse_args, Args, DriftlessApp, UI_KEY};
+pub use crate::leftovers::Leftover;
+pub use app::{
+    parse_args, Args, DialogFolder, DriftlessApp, LastFolders, FOCUS_DELAY, FOCUS_GAP, UI_KEY,
+};
 
 use crate::camera::CameraMode;
 use crate::jobs::JobStatus;
 use crate::project::{
     map_status, model_status, model_surface_status, point_pairs, state_gap, surface_status,
-    MapStatus, MergePick, ModelInfo, Project, RunInfo, ScanState, SurfaceSettings,
+    MapStatus, MergePick, ModelInfo, Project, ProjectError, RunInfo, ScanState, SurfaceSettings,
 };
 use crate::render::{ColorMode, PointSize, ShowMode};
 use driftless_gpu::GpuPref;
-use driftless_io::progress::LogLine;
 use driftless_steps::export::{ExportRequest, ExportSource};
 use driftless_steps::inspect;
 use driftless_steps::map::MapSettings;
 use driftless_steps::pairs::PointPairEntry;
 use driftless_steps::slam::SlamSettings;
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The steps of the work, in the order they are done; the rail switches between them.
 #[derive(
@@ -164,6 +167,15 @@ pub enum Action {
         nr: usize,
         enabled: bool,
     },
+    /// Switches the automatic loop between the submaps at times `a` and `b` (seconds since the
+    /// start of the scan) of the run on or off (`[[reject]]` of `corrections.toml`), then
+    /// recomputes the run from its submaps.
+    SetLoopUsed {
+        run: PathBuf,
+        a: f64,
+        b: f64,
+        used: bool,
+    },
     /// Switch the corrections of the run back as in state `nr`, then recompute it (a new
     /// state; the old ones stay).
     RestoreHistory {
@@ -205,6 +217,64 @@ pub enum Action {
     ConfirmExport(ExportRequest),
     /// Export as asked, as a step (also without a project).
     RunExport(ExportRequest),
+    /// ☰ „Protokoll-Ordner öffnen“: the folder of the log file in Finder or Explorer.
+    OpenLogFolder,
+    /// Asks before a change of the project ([`AppState::ask`]).
+    Ask(Ask),
+    /// „Löschen …“ of the folder `dir` of the tree: asks with its size and what depends on it.
+    AskDelete(PathBuf),
+    /// Closes the question without a change.
+    CloseAsk,
+    /// Gives the scan (id) the shown name.
+    RenameScan {
+        id: String,
+        name: String,
+    },
+    /// Takes the scan (id) out of the project: only its entry.
+    RemoveScan(String),
+    /// Takes the run folder made by the CLI out of the scan (id): only the entry.
+    RemoveRun {
+        scan: String,
+        run: PathBuf,
+    },
+    /// „Ordner neu zuordnen …“ of the scan (id): the folder dialog first.
+    PickRelinkScan(String),
+    /// Points the scan (id) at the folder `dir`, if it holds the same scan.
+    RelinkScan {
+        id: String,
+        dir: PathBuf,
+    },
+    /// Moves the folder `dir` of the tree to the trash.
+    Delete(PathBuf),
+    /// „Aus der Ansicht nehmen“: what the view shows from the folder `dir` (or from a model
+    /// that uses it) goes: the cloud, the surface, the run drawn, „Von Hand ausrichten“.
+    Unshow(PathBuf),
+    /// „Aufräumen“: what jobs cut off left behind ([`AppState::leftovers_shown`]) goes to the
+    /// trash.
+    CleanUp,
+}
+
+/// A question the window asks before a change of the project, in a small window over the view
+/// ([`manage`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ask {
+    /// „Umbenennen …“ of a scan: its id and the name being typed.
+    RenameScan { id: String, name: String },
+    /// „Aus Projekt entfernen“ of a scan.
+    RemoveScan { id: String },
+    /// „Löschen …“ of a folder of the tree.
+    Delete(DeleteQuestion),
+}
+
+/// What „Löschen …“ asks: the folder, its name and size, what lies in it, and the models
+/// that use it (a map, or a map of a run).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteQuestion {
+    pub dir: PathBuf,
+    pub label: String,
+    pub bytes: Option<u64>,
+    pub contains: Vec<String>,
+    pub used_by: Vec<String>,
 }
 
 /// What the queue of [`AppState::queue`] computes one after the other.
@@ -217,11 +287,43 @@ pub enum Queued {
     Surface(PathBuf),
 }
 
-/// A message for the status bar (German).
+/// A message for the status bar (German). Warnings and errors also go into the Protokoll, and
+/// every message into the log file (`crate::logfile`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiMessage {
     Info(String),
+    /// Something to look at that stops nothing (a project in iCloud Drive, little space).
+    Warning(String),
     Error(String),
+}
+
+impl UiMessage {
+    pub fn text(&self) -> &str {
+        match self {
+            UiMessage::Info(t) | UiMessage::Warning(t) | UiMessage::Error(t) => t,
+        }
+    }
+}
+
+/// How a line of the Protokoll is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogKind {
+    /// A message of a step.
+    Info,
+    /// A warning of a step, or of the window.
+    Warning,
+    /// An error of the window (a step that failed, a file that could not be read).
+    Error,
+}
+
+/// A line of the Protokoll: what a step said, or a warning or error of the status bar, with
+/// the local time it came („14:03:12“). The text is as shown: system errors in German
+/// ([`text::german`]), symbols the fonts lack replaced ([`text::shown`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogEntry {
+    pub time: String,
+    pub kind: LogKind,
+    pub text: String,
 }
 
 /// How the 3D view draws.
@@ -330,6 +432,101 @@ pub struct ScanNode {
     pub runs: Vec<RunInfo>,
 }
 
+/// The tree of a project as the field shows it: its scans with their runs, its models and the
+/// point pairs. Read from disk off the UI thread ([`read_tree`]), shown by
+/// [`AppState::set_tree`].
+#[derive(Debug, Clone, Default)]
+pub struct Tree {
+    pub scans: Vec<ScanNode>,
+    pub models: Vec<ModelInfo>,
+    pub point_pairs: Vec<PointPairEntry>,
+    /// Why `modelle/punktpaare.toml` cannot be read.
+    pub point_pairs_error: Option<String>,
+    /// What jobs cut off left behind ([`crate::leftovers`]).
+    pub leftovers: Vec<Leftover>,
+    /// The folders a running job marks busy, with who holds them
+    /// ([`crate::leftovers::busy_folders`]).
+    pub busy: Vec<(PathBuf, String)>,
+}
+
+/// Reads the tree of `project` from disk: every scan folder, run, map, surface and model, and
+/// what jobs cut off left behind. A run without its `slam.json` or a map without its `map.json`
+/// (one being computed, or a leftover) is not in the tree – unless it holds finished results
+/// (maps, surfaces, the history of a run): then it stays, marked incomplete
+/// ([`RunInfo::incomplete`], [`crate::project::MapInfo::incomplete`]; see
+/// [`crate::leftovers`]). Can take seconds on a network share or with files iCloud moved away:
+/// call it off the UI thread.
+pub fn read_tree(project: &Project) -> Tree {
+    use crate::leftovers::holds_results;
+    let complete = |s: &crate::project::ScanEntry, mut run: RunInfo| {
+        // a run made by the CLI and added by hand stays as it is
+        let added = s.extra_runs.contains(&run.dir);
+        if !added && run.incomplete && !holds_results(&run.dir) {
+            return None;
+        }
+        run.maps.retain(|m| !m.incomplete || holds_results(&m.dir));
+        Some(run)
+    };
+    let scans = project
+        .scans
+        .iter()
+        .map(|s| ScanNode {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            state: project.scan_state(&s.id),
+            no_color: project.color_missing(&s.id),
+            runs: project
+                .runs(&s.id)
+                .into_iter()
+                .filter_map(|r| complete(s, r))
+                .collect(),
+        })
+        .collect();
+    let ids: Vec<String> = project.scans.iter().map(|s| s.id.clone()).collect();
+    let (point_pairs, point_pairs_error) = match point_pairs(project) {
+        Ok(pairs) => (pairs, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    Tree {
+        scans,
+        models: project.models(),
+        point_pairs,
+        point_pairs_error,
+        leftovers: crate::leftovers::find(&project.dir, &ids),
+        busy: crate::leftovers::busy_folders(&project.dir),
+    }
+}
+
+/// What reading a project folder found: the project as its `project.toml` says now, its tree,
+/// the cloud storage it lies in (`cloud`, see [`crate::places::cloud_storage`]) and what was
+/// chosen in it last (`auswahl.toml`).
+#[derive(Debug, Clone)]
+pub struct ProjectRead {
+    pub project: Project,
+    pub tree: Tree,
+    pub cloud: Option<String>,
+    pub choices: Option<crate::project::Choices>,
+}
+
+/// How the window tells whether a folder lies in cloud storage (the system's way, or a test's).
+pub type CloudCheck = fn(&Path) -> Option<String>;
+
+/// Opens the project in `dir` and reads its tree ([`read_tree`]); `cloud` tells the cloud
+/// storage of its folder. Off the UI thread: `project.toml`, the tree and the cloud check may
+/// each wait for a slow disk.
+pub fn read_project(dir: &Path, cloud: CloudCheck) -> Result<ProjectRead, ProjectError> {
+    let project = Project::open(dir)?;
+    let tree = read_tree(&project);
+    let cloud = cloud(&project.dir);
+    let choices = crate::project::Choices::read(&project.dir);
+    Ok(ProjectRead {
+        project,
+        tree,
+        cloud,
+        choices,
+    })
+}
+
 /// The last check of a scan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InspectResult {
@@ -370,8 +567,9 @@ pub struct AppState {
     pub messages: Vec<UiMessage>,
     /// The running step, as of this frame.
     pub job: Option<JobStatus>,
-    /// Messages of the steps, oldest first.
-    pub log: Vec<LogLine>,
+    /// The Protokoll: messages of the steps, and the warnings and errors of the status bar,
+    /// oldest first.
+    pub log: Vec<LogEntry>,
     /// The step action that is running (set by [`actions::start_step`]).
     pub running: Option<Action>,
     /// The step of the work shown in the field next to the rail.
@@ -422,17 +620,47 @@ pub struct AppState {
     pub correct: correct::CorrectState,
     /// The comparison of two trajectories and of two maps.
     pub compare: compare::CompareState,
+    /// The folder of the project being opened: its `project.toml` and tree are read in the
+    /// background, the field says so meanwhile.
+    pub opening: Option<PathBuf>,
+    /// The tree is being read again (after a change, a step, the window coming to the front):
+    /// the tree shown is the one read before, and „Alle rechnen“ waits for the new one.
+    pub tree_pending: bool,
+    /// The disk use of the project and the free space of its drive, as last measured in the
+    /// background (after each read of the tree); `None` before the first measurement.
+    pub disk: Option<crate::disk::DiskUse>,
+    /// The question asked before a change of the project, while its window is open.
+    pub ask: Option<Ask>,
+    /// What jobs cut off left behind, as the last read of the tree found it.
+    pub leftovers: Vec<Leftover>,
+    /// The folders a running job marked busy when the tree was last read (this window's,
+    /// another window's or program's), with who holds them: „Löschen …“ waits for them.
+    pub busy: Vec<(PathBuf, String)>,
+    /// How long a leftover must lie untouched before it is offered; `None`:
+    /// [`crate::leftovers::QUIET`] (tests: zero).
+    pub leftover_quiet: Option<std::time::Duration>,
 }
 
 impl AppState {
-    /// Shows `project` from now on: nothing selected, tree read from disk.
+    /// Shows `project` from now on: nothing selected, its tree read from disk here (the window
+    /// reads it in the background and calls [`AppState::show_project`]).
     pub fn set_project(&mut self, project: Project) {
+        let tree = read_tree(&project);
+        self.show_project(project, tree);
+    }
+
+    /// Shows `project` with its `tree` from now on: nothing selected.
+    pub fn show_project(&mut self, project: Project, tree: Tree) {
+        // the disk use of another project is not this one's
+        if self.project.as_ref().map(|p| &p.dir) != Some(&project.dir) {
+            self.disk = None;
+        }
         self.project = Some(project);
         self.selection = Selection::None;
         self.inspect = None;
         self.merge = steps::merge::MergeState::default();
         tools::end_pairs(self);
-        self.refresh();
+        self.set_tree(tree);
     }
 
     /// Reads `modelle/punktpaare.toml` again ([`AppState::point_pairs`]).
@@ -460,22 +688,22 @@ impl AppState {
             })
     }
 
-    /// Reads the scans' state and runs again (after opening, adding, and after each step).
+    /// Reads the tree of the project again, here and now ([`read_tree`]; the window does it in
+    /// the background).
     pub fn refresh(&mut self) {
-        self.scans = self.project.as_ref().map_or_else(Vec::new, |p| {
-            p.scans
-                .iter()
-                .map(|s| ScanNode {
-                    id: s.id.clone(),
-                    name: s.name.clone(),
-                    state: p.scan_state(&s.id),
-                    no_color: p.color_missing(&s.id),
-                    runs: p.runs(&s.id),
-                })
-                .collect()
-        });
-        self.models = self.project.as_ref().map_or_else(Vec::new, Project::models);
-        self.refresh_pairs();
+        let tree = self.project.as_ref().map(read_tree).unwrap_or_default();
+        self.set_tree(tree);
+    }
+
+    /// Shows `tree` as the tree of the project; the statuses of what is still in it stay until
+    /// the background check replaces them.
+    pub fn set_tree(&mut self, tree: Tree) {
+        self.scans = tree.scans;
+        self.models = tree.models;
+        self.point_pairs = tree.point_pairs;
+        self.point_pairs_error = tree.point_pairs_error;
+        self.leftovers = tree.leftovers;
+        self.busy = tree.busy;
         // „Von Hand ausrichten“ of a model that is gone ends
         let gone = self
             .pairs
@@ -580,6 +808,268 @@ impl AppState {
         }
     }
 
+    /// The work of measuring the disk use of the project ([`crate::disk::measure`]) for the
+    /// current tree, to run off the UI thread; `free` tells the free space.
+    pub fn disk_job(
+        &self,
+        free: crate::disk::FreeSpace,
+    ) -> Option<impl FnOnce() -> crate::disk::DiskUse + Send + 'static> {
+        let project = self.project.as_ref()?;
+        let dir = project.dir.clone();
+        let tree = Tree {
+            scans: self.scans.clone(),
+            models: self.models.clone(),
+            ..Tree::default()
+        };
+        let folders = crate::disk::tree_folders(&tree);
+        let scans: Vec<PathBuf> = project.scans.iter().map(|s| s.path.clone()).collect();
+        Some(move || crate::disk::measure(&dir, &folders, &scans, free))
+    }
+
+    /// The leftovers „Daten“ offers for „Aufräumen“: those untouched for the quiet time.
+    pub fn leftovers_shown(&self) -> Vec<&Leftover> {
+        let quiet = self.leftover_quiet.unwrap_or(crate::leftovers::QUIET);
+        let now = std::time::SystemTime::now();
+        self.leftovers
+            .iter()
+            .filter(|l| crate::leftovers::settled(l, quiet, now))
+            .collect()
+    }
+
+    /// Why „Aufräumen“ waits: a step runs or waits in this window.
+    pub fn clean_up_blocked(&self) -> Option<&'static str> {
+        (self.running.is_some() || !self.queue.is_empty()).then_some(text::CLEAN_UP_WAIT)
+    }
+
+    /// The size of a folder of the tree, if measured.
+    pub fn folder_size(&self, dir: &Path) -> Option<u64> {
+        self.disk.as_ref()?.folders.get(dir).copied()
+    }
+
+    /// The name of a folder of the tree with its size where measured: a run, a map, a surface
+    /// or a model; `None` for another folder.
+    fn sized_label(&self, dir: &Path) -> Option<String> {
+        let label = self.tree_label(dir)?;
+        Some(match self.folder_size(dir) {
+            Some(bytes) => text::with_size(&label, bytes),
+            None => label,
+        })
+    }
+
+    /// The name of a folder of the tree: a run, a map, a surface or a model; `None` for
+    /// another folder.
+    fn tree_label(&self, dir: &Path) -> Option<String> {
+        let maps = self.all_maps();
+        self.scans
+            .iter()
+            .flat_map(|s| &s.runs)
+            .find(|r| r.dir == dir)
+            .map(|r| r.label.clone())
+            .or_else(|| {
+                self.all_maps()
+                    .find(|m| m.dir == dir)
+                    .map(|m| m.label.clone())
+            })
+            .or_else(|| self.model(dir).map(|m| m.label.clone()))
+            .or_else(|| {
+                maps.flat_map(|m| &m.surfaces)
+                    .chain(self.models.iter().flat_map(|m| &m.surfaces))
+                    .find(|s| s.dir == dir)
+                    .map(|s| s.label.clone())
+            })
+    }
+
+    /// The labels of the models that use the map in `dir`, or a map of the run in `dir`.
+    pub fn map_users(&self, dir: &Path) -> Vec<String> {
+        self.model_users(dir)
+            .into_iter()
+            .map(|m| m.label.clone())
+            .collect()
+    }
+
+    /// The folders of the models that use the map in `dir`, or a map of the run in `dir`.
+    pub fn model_users_dirs(&self, dir: &Path) -> Vec<PathBuf> {
+        self.model_users(dir)
+            .iter()
+            .map(|m| m.dir.clone())
+            .collect()
+    }
+
+    /// The models whose scans were merged from the map in `dir` or from a map of the run in
+    /// `dir`.
+    fn model_users(&self, dir: &Path) -> Vec<&ModelInfo> {
+        self.models
+            .iter()
+            .filter(|m| {
+                m.report
+                    .members
+                    .iter()
+                    .any(|s| s.map_dir.starts_with(dir) || s.slam_dir == dir)
+            })
+            .collect()
+    }
+
+    /// The question before „Löschen …“ of the folder `dir` of the tree: its name and size,
+    /// what lies in it (the maps of a run, the surfaces of a map or model) and the models that
+    /// use it; `None` for a folder that is not in the tree.
+    pub fn delete_question(&self, dir: &Path) -> Option<DeleteQuestion> {
+        let label = self.tree_label(dir)?;
+        let mut contains: Vec<String> = Vec::new();
+        for run in self
+            .scans
+            .iter()
+            .flat_map(|s| &s.runs)
+            .filter(|r| r.dir == dir)
+        {
+            for map in &run.maps {
+                contains.extend(self.sized_label(&map.dir));
+            }
+        }
+        let surfaces = self
+            .all_maps()
+            .filter(|m| m.dir.starts_with(dir))
+            .flat_map(|m| &m.surfaces)
+            .chain(
+                self.models
+                    .iter()
+                    .filter(|m| m.dir == dir)
+                    .flat_map(|m| &m.surfaces),
+            );
+        for surface in surfaces {
+            contains.extend(self.sized_label(&surface.dir));
+        }
+        Some(DeleteQuestion {
+            dir: dir.to_path_buf(),
+            label,
+            bytes: self.folder_size(dir),
+            contains,
+            used_by: self.map_users(dir),
+        })
+    }
+
+    /// Why the folder `dir` of the tree cannot go to the trash now ([`Self::delete_computing`],
+    /// else [`Self::delete_shown`]). `None` if it can.
+    pub fn delete_blocked(&self, dir: &Path) -> Option<String> {
+        self.delete_computing(dir)
+            .or_else(|| self.delete_shown(dir))
+    }
+
+    /// The folder `dir` and the models that use it: what a deletion of `dir` touches.
+    fn touched_by(&self, dir: &Path) -> Vec<PathBuf> {
+        std::iter::once(dir.to_path_buf())
+            .chain(self.model_users_dirs(dir))
+            .collect()
+    }
+
+    /// Whether the view shows something from the folder `dir` or from a model that uses it:
+    /// the cloud, the surface, the run drawn, „Von Hand ausrichten“; with the reason (the
+    /// window offers „Aus der Ansicht nehmen“, [`Action::Unshow`]).
+    pub fn delete_shown(&self, dir: &Path) -> Option<String> {
+        let touched = self.touched_by(dir);
+        let shown = [
+            self.cloud.as_ref().map(|c| c.path.as_path()),
+            self.surface.as_ref().map(|s| s.path.as_path()),
+            self.correct.run.as_deref(),
+            self.pairs.as_ref().map(|p| p.model.as_path()),
+        ];
+        let p = shown
+            .into_iter()
+            .flatten()
+            .find(|p| touched.iter().any(|t| p.starts_with(t)))?;
+        let name = p.file_name().map_or_else(
+            || p.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        Some(text::delete_shown(&name))
+    }
+
+    /// Whether a step works on the folder `dir` (or on a model that uses it, or on the folder
+    /// it lies in), or will (the queue); or a job – this window's, another window's or
+    /// program's – marked it or a folder in it busy when the tree was read ([`AppState::busy`];
+    /// the window looks again right before the folder goes). With the reason.
+    pub fn delete_computing(&self, dir: &Path) -> Option<String> {
+        let touched = self.touched_by(dir);
+        let hit = |p: &Path| dir.starts_with(p) || touched.iter().any(|t| p.starts_with(t));
+        let label = self.job.as_ref().map_or("", |j| j.label.as_str());
+        if let Some(step) = &self.running {
+            if self.step_folders(step).iter().any(|p| hit(p)) {
+                return Some(text::delete_computing(label));
+            }
+        }
+        let queued = self.queue.iter().any(|q| match q {
+            Queued::Surface(map) => hit(map),
+            // a queued scan computes into its runs
+            Queued::Scan(path) => self
+                .scan_at(path)
+                .is_some_and(|s| s.runs.iter().any(|r| hit(&r.dir))),
+        });
+        if queued {
+            return Some(text::delete_computing(text::COMPUTE_ALL));
+        }
+        self.busy
+            .iter()
+            .find(|(folder, _)| folder.starts_with(dir))
+            .map(|(_, holder)| text::delete_busy(holder))
+    }
+
+    /// The folders a step reads or writes (that must not go to the trash while it runs): the
+    /// run of a recompute or map, the map of a surface, the maps and model of a merge, the
+    /// source of an export.
+    fn step_folders(&self, step: &Action) -> Vec<PathBuf> {
+        let model_maps = |dir: &Path| -> Vec<PathBuf> {
+            self.model(dir).map_or_else(Vec::new, |m| {
+                std::iter::once(m.dir.clone())
+                    .chain(m.report.members.iter().map(|s| s.map_dir.clone()))
+                    .collect()
+            })
+        };
+        match step {
+            // a new run may reuse the folder of the newest
+            Action::RunSlam(id) => self
+                .scan_node(id)
+                .map_or_else(Vec::new, |s| s.runs.iter().map(|r| r.dir.clone()).collect()),
+            Action::Reuse(run) | Action::RunMap(run) | Action::RestoreHistory { run, .. } => {
+                vec![run.clone()]
+            }
+            Action::RunSurface(map) => vec![map.clone()],
+            Action::RunMerge { picks, .. } => picks.iter().map(|p| p.map.clone()).collect(),
+            Action::ApplyPairs { model, .. } | Action::RunModelSurface { model } => {
+                model_maps(model)
+            }
+            Action::RunExport(req) => {
+                use driftless_steps::export::ExportSource as S;
+                let (S::Map(p)
+                | S::Model(p)
+                | S::Surface(p)
+                | S::Run(p)
+                | S::PointFile(p)
+                | S::MeshFile(p)) = &req.source;
+                vec![p.clone()]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Why the scan `id` cannot be renamed, assigned anew or taken out now: a step of it runs
+    /// or waits in the queue.
+    pub fn scan_busy(&self, id: &str) -> Option<String> {
+        let running = self
+            .running
+            .as_ref()
+            .and_then(|a| self.scan_of(a))
+            .is_some_and(|s| s.id == id);
+        let path = self
+            .project
+            .as_ref()
+            .and_then(|p| p.scan(id))
+            .map(|e| &e.path);
+        let queued = self.queue.iter().any(|q| match q {
+            Queued::Scan(p) => Some(p) == path,
+            Queued::Surface(map) => self.map(map).is_some_and(|(s, _, _)| s.id == id),
+        });
+        (running || queued).then(|| text::SCAN_BUSY.to_string())
+    }
+
     /// The map of the selection: the selected map, or the map of a selected surface.
     pub fn selected_map(&self) -> Option<&crate::project::MapInfo> {
         let maps = self
@@ -680,10 +1170,13 @@ impl AppState {
     }
 
     /// How many maps [`Action::ComputeAllSurfaces`] leaves out because they wait for „Daten“:
-    /// the map no longer fits its run, has no `map.json` yet, or its scan cannot be read.
+    /// the map no longer fits its run, has no readable `map.json`, or its scan cannot be read.
+    /// A map kept without its report for its surfaces ([`crate::project::MapInfo::incomplete`])
+    /// waits for nothing: „Daten“ computes a new one.
     pub fn maps_waiting_for_data(&self) -> usize {
         use steps::bilder::SurfaceStatus;
         self.all_maps()
+            .filter(|m| !m.incomplete)
             .filter(|m| {
                 matches!(
                     steps::bilder::surface_status(self, m),

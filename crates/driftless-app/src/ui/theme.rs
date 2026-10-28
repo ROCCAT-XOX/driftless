@@ -90,6 +90,8 @@ pub mod icon {
     pub const FOLDED: &str = p::CARET_RIGHT;
     pub const UNFOLDED: &str = p::CARET_DOWN;
     pub const CLOSE: &str = p::X;
+    /// A hint for the user (of a surface): information, not a warning.
+    pub const HINT: &str = p::INFO;
 }
 
 /// Size of the heading of a step (the body text is 12.5).

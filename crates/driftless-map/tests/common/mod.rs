@@ -9,6 +9,7 @@ use driftless_io::calib::{CameraCalib, CameraModel};
 use driftless_io::camera::Camera;
 use driftless_io::msg::encode::encode_compressed_image;
 use driftless_io::msg::CompressedImage;
+use driftless_io::testdir::{SharedDir, TestDir};
 use driftless_map::{Cloud, ColorCamera, ColorConfig, ImageSource};
 pub use driftless_odom::testutil::{aabb, Aabb, Scene, Trajectory, Walk};
 use driftless_traj::nalgebra::{
@@ -16,7 +17,6 @@ use driftless_traj::nalgebra::{
 };
 use driftless_traj::Pose;
 use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
-use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// All scene times start here (bag and ROS stamps are unsigned).
@@ -156,10 +156,8 @@ pub fn jpeg(rgb: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("driftless-color-{}-{name}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+pub fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(format!("driftless-color-{}-{name}", std::process::id()))
 }
 
 /// An image to put in the bag.
@@ -178,7 +176,10 @@ pub fn shot(camera: usize, stamp: f64) -> Shot {
     }
 }
 
-/// Renders `shots` (camera pose at the true trajectory time stamp + offset) into one bag.
+/// Renders `shots` (camera pose at the true trajectory time stamp + offset) into one bag,
+/// `<name>/IMAGE_0.bag` in a folder shared by the tests of the test program (the images are
+/// read from it later, also from data sets kept in a `static`): removed when the program exits
+/// ([`SharedDir`]). `name` is one of its own per bag.
 pub fn write_bag(
     name: &str,
     painted: &Painted,
@@ -186,6 +187,10 @@ pub fn write_bag(
     cams: &[ColorCamera],
     shots: &[Shot],
 ) -> ImageSource {
+    static BAGS: OnceLock<SharedDir> = OnceLock::new();
+    let dir = BAGS.get_or_init(|| SharedDir::new("driftless-color-", "bilder"));
+    let dir = dir.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
     let offset = ColorConfig::default().time_offset;
     let mut w = BagWriter::new(Compression::None);
     let conns: Vec<u32> = cams
@@ -213,7 +218,7 @@ pub fn write_bag(
             &msg,
         );
     }
-    let path = temp_dir(name).join("IMAGE_0.bag");
+    let path = dir.join("IMAGE_0.bag");
     std::fs::write(&path, w.finish()).unwrap();
     ImageSource {
         bags: vec![path],

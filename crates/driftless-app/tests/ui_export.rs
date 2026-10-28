@@ -68,6 +68,7 @@ fn tree_state() -> AppState {
                 path: PathBuf::from("/daten/halle"),
                 name: "Halle".into(),
                 extra_runs: Vec::new(),
+                bags: Vec::new(),
             }],
         }),
         scans: vec![ScanNode {
@@ -94,9 +95,12 @@ fn tree_state() -> AppState {
                         label: "Oberfläche 001".into(),
                         stale: false,
                         settings: None,
+                        hints: Vec::new(),
                     }],
+                    incomplete: false,
                 }],
                 history: Vec::new(),
+                incomplete: false,
             }],
         }],
         models: vec![ModelInfo {
@@ -110,6 +114,7 @@ fn tree_state() -> AppState {
                 seconds_total: 1.0,
                 peak_rss_bytes: 0,
                 include_unsure: false,
+                warnings: Vec::new(),
             },
             surfaces: Vec::new(),
         }],
@@ -124,7 +129,7 @@ fn errors(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             UiMessage::Error(e) => Some(e.clone()),
-            UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect()
 }

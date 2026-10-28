@@ -15,12 +15,14 @@ pub use align::{
     Alignment, PairQuality, Verdict,
 };
 pub use cache::{cache_fits, load_cache, read_cache, save_cache, CacheContents, CacheError};
-pub use corrections::{Corrections, LoopEntry};
+pub use corrections::{Corrections, LoopEntry, RejectEntry};
 pub use loops::{
-    find_candidates, match_manual_loops, position_only_relative, verify, verify_manual,
-    LoopCandidate, LoopCheck, LoopConfig, LoopVerdict, ManualLoop, ManualLoopError, ManualMatch,
-    POSITION_ONLY,
+    find_candidates, match_manual_loops, match_rejected_loops, position_only_relative, verify,
+    verify_manual, LoopCandidate, LoopCheck, LoopConfig, LoopVerdict, ManualLoop, ManualLoopError,
+    ManualMatch, RejectedLoop, POSITION_ONLY,
 };
-pub use pipeline::{build_submaps, close_loops, run_slam, solve, SlamConfig, SlamResult};
+pub use pipeline::{
+    build_submaps, close_loops, run_slam, solve, solve_with, SlamConfig, SlamResult, VETOED,
+};
 pub use report::{scan_start, SlamReport};
 pub use submap::{Submap, SubmapBuilder, SubmapConfig, SubmapFrame};

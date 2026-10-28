@@ -17,7 +17,7 @@ jobs:
       matrix:
         os: [macos-14, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -27,6 +27,9 @@ jobs:
       - run: cargo test --workspace
       # Release-only code paths of the app (no console window on Windows).
       - run: cargo clippy --release -p driftless-app --bins -- -D warnings
+      # The debug viewer (`driftless view`, rerun) is not in the packages: keep it building.
+      - run: cargo clippy -p driftless-cli --all-targets --features debug-viewer -- -D warnings
+      - run: cargo test -p driftless-cli --features debug-viewer --bin driftless --test view
       # The Windows program for hand tests on other machines: the setup of package.yml
       # (artifact `driftless-windows` of every pull request).
       - uses: taiki-e/install-action@v2

@@ -1,8 +1,8 @@
 //! The status bar at the bottom, without a window: progress, runtime, „Abbrechen“, log.
 
 use driftless_app::jobs::JobStatus;
-use driftless_app::ui::{status, text, Action, AppState, UiMessage};
-use driftless_io::progress::{LogLine, ProgressSnapshot};
+use driftless_app::ui::{status, text, Action, AppState, LogEntry, LogKind, UiMessage};
+use driftless_io::progress::ProgressSnapshot;
 use eframe::egui::accesskit::Role;
 use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
@@ -99,19 +99,60 @@ fn idle_shows_ready_and_last_message() {
 }
 
 #[test]
-fn log_lists_lines_with_warnings() {
+fn log_lists_lines_with_warnings_and_errors() {
+    let entry = |kind, text: &str| LogEntry {
+        time: "14:03:12".into(),
+        kind,
+        text: text.into(),
+    };
     let state = AppState {
         log: vec![
-            LogLine::Info("Lese Bags".into()),
-            LogLine::Warning("IMU-Lücke bei 12 s".into()),
+            entry(LogKind::Info, "Lese Bags"),
+            entry(LogKind::Warning, "IMU-Lücke bei 12 s"),
+            entry(
+                LogKind::Error,
+                "Karte rechnen: keine Berechtigung: /Users/x/Halle 2026/scans/a/karte-001/color.las",
+            ),
         ],
         ..AppState::default()
     };
     let mut h = harness(state);
     h.run();
-    let header = format!("{} (2)", text::LOG);
+    let header = format!("{} (3)", text::LOG);
     h.get_by_label(&header).click();
     h.run();
     h.get_by_label("Lese Bags");
     h.get_by_label("IMU-Lücke bei 12 s");
+    // the reason stays in view: the path is cut to its file name (all of it on hover)
+    h.get_by_label("Karte rechnen: keine Berechtigung: color.las");
+    // each line with its time
+    assert_eq!(h.query_all_by_label("14:03:12").count(), 3);
+}
+
+/// A message whose path is long: the line shows the reason and the file name, a warning in
+/// its own colour (not checked here: only that it is shown).
+#[test]
+fn messages_show_the_reason_with_the_file_name() {
+    let state = AppState {
+        messages: vec![UiMessage::Error(
+            "Ordner ist nicht leer – ein neues Projekt braucht einen leeren Ordner: Projekte\n\
+             /Users/x/Documents/Firma/Kunden/Projekte"
+                .into(),
+        )],
+        ..AppState::default()
+    };
+    let mut h = harness(state);
+    h.run();
+    h.get_by_label(
+        "Ordner ist nicht leer – ein neues Projekt braucht einen leeren Ordner: Projekte",
+    );
+    let state = AppState {
+        messages: vec![UiMessage::Warning(
+            "Projekt liegt in iCloud Drive: /Users/x/Documents/Halle".into(),
+        )],
+        ..AppState::default()
+    };
+    let mut h = harness(state);
+    h.run();
+    h.get_by_label("Projekt liegt in iCloud Drive: Halle");
 }

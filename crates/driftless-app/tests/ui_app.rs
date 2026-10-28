@@ -3,8 +3,10 @@
 
 use driftless_app::jobs::JobOutput;
 use driftless_app::project::{canonical, Project};
-use driftless_app::ui::{parse_args, text, Action, Args, DriftlessApp, Selection, UiMessage};
-use driftless_io::progress::LogLine;
+use driftless_app::ui::{
+    parse_args, text, Action, Args, DriftlessApp, LogKind, Selection, UiMessage,
+};
+use driftless_io::testdir::TestDir;
 use driftless_io::testscan::{room_bag_secs, tmp};
 use driftless_steps::StepError;
 use egui_kittest::kittest::Queryable;
@@ -31,13 +33,18 @@ fn tick_until(app: &mut DriftlessApp, mut cond: impl FnMut(&DriftlessApp) -> boo
     }
 }
 
+/// Ticks until no step and no background work is left (the tree is read in the background).
+fn settle(app: &mut DriftlessApp) {
+    tick_until(app, |a| !a.wants_repaint_while_busy());
+}
+
 fn errors(app: &DriftlessApp) -> Vec<String> {
     app.state()
         .messages
         .iter()
         .filter_map(|m| match m {
             UiMessage::Error(e) => Some(e.clone()),
-            UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect()
 }
@@ -56,6 +63,11 @@ fn new_project_add_scan_shows_tree() {
     assert_eq!(errors(&app), Vec::<String>::new());
     app.apply(Action::AddScan(scan.clone()));
     assert_eq!(errors(&app), Vec::<String>::new());
+    // saved at once; the tree is read in the background
+    assert_eq!(app.state().project.as_ref().unwrap().scans.len(), 1);
+    assert!(app.state().tree_pending);
+    settle(&mut app);
+    assert!(!app.state().tree_pending);
     let s = app.state();
     assert_eq!(s.project.as_ref().unwrap().name, "Halle");
     assert_eq!(s.scans.len(), 1);
@@ -76,7 +88,11 @@ fn new_project_add_scan_shows_tree() {
 fn open_missing_project_reports_error() {
     let dir = tmp("ui-kein-projekt");
     let mut app = app();
-    app.apply(Action::OpenProject(dir));
+    app.apply(Action::OpenProject(dir.clone()));
+    // read in the background: the field says so meanwhile
+    assert_eq!(app.state().opening, Some(dir.to_path_buf()));
+    settle(&mut app);
+    assert_eq!(app.state().opening, None);
     assert!(app.state().project.is_none());
     let e = errors(&app);
     assert_eq!(e.len(), 1);
@@ -103,7 +119,12 @@ fn job_progress_log_and_result_reach_state() {
     app.tick();
     let job = app.state().job.clone().unwrap();
     assert_eq!((job.progress.done, job.progress.total), (3, Some(10)));
-    assert_eq!(app.state().log, vec![LogLine::Warning("Achtung".into())]);
+    let log = &app.state().log;
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert_eq!(
+        (log[0].kind, log[0].text.as_str()),
+        (LogKind::Warning, "Achtung")
+    );
     assert!(app.wants_repaint_while_busy());
     tx.send(()).unwrap();
     tick_until(&mut app, |a| a.state().job.is_none());
@@ -154,20 +175,21 @@ fn held_job(app: &mut DriftlessApp, label: &str) -> std::sync::mpsc::Sender<()> 
 }
 
 /// Two empty projects `A` and `B`, `A` open.
-fn two_projects(name: &str) -> (DriftlessApp, PathBuf, PathBuf) {
+fn two_projects(name: &str) -> (TestDir, DriftlessApp, PathBuf, PathBuf) {
     let dir = tmp(name);
     let (a, b) = (dir.join("a"), dir.join("b"));
     Project::create(&a, "A").unwrap();
     Project::create(&b, "B").unwrap();
     let mut app = app();
     app.apply(Action::OpenProject(a.clone()));
+    settle(&mut app);
     assert_eq!(app.state().project.as_ref().unwrap().name, "A");
-    (app, a, b)
+    (dir, app, a, b)
 }
 
 #[test]
 fn switching_project_cancels_job() {
-    let (mut app, _, b) = two_projects("ui-wechsel");
+    let (_dir, mut app, _, b) = two_projects("ui-wechsel");
     let release = held_job(&mut app, "läuft in A");
 
     app.apply(Action::OpenProject(b.clone()));
@@ -183,6 +205,8 @@ fn switching_project_cancels_job() {
 
     release.send(()).unwrap();
     tick_until(&mut app, |a| a.state().job.is_none());
+    // then B is read and opened
+    settle(&mut app);
     let p = app.state().project.as_ref().unwrap();
     assert_eq!(p.name, "B");
     assert_eq!(p.dir, canonical(&b).unwrap());
@@ -191,7 +215,7 @@ fn switching_project_cancels_job() {
 
 #[test]
 fn reopening_open_project_keeps_job() {
-    let (mut app, a, _) = two_projects("ui-wieder");
+    let (_dir, mut app, a, _) = two_projects("ui-wieder");
     let release = held_job(&mut app, "läuft in A");
     // the same folder, written differently
     app.apply(Action::OpenProject(a.join(".")));
@@ -206,7 +230,7 @@ fn reopening_open_project_keeps_job() {
 
 #[test]
 fn closing_while_busy_waits_for_cancel() {
-    let (mut app, _, _) = two_projects("ui-schliessen");
+    let (_dir, mut app, _, _) = two_projects("ui-schliessen");
     let release = held_job(&mut app, "läuft");
     assert!(!app.close_requested(), "close must be put off");
     app.tick();
@@ -227,7 +251,7 @@ fn window_close_is_cancelled_then_sent() {
     use eframe::egui::{ViewportCommand, ViewportEvent, ViewportId};
     use egui_kittest::Harness;
 
-    let (mut app, _, _) = two_projects("ui-fenster");
+    let (_dir, mut app, _, _) = two_projects("ui-fenster");
     let release = held_job(&mut app, "läuft");
     let mut h = Harness::builder()
         .with_size([1000.0, 700.0])
@@ -266,6 +290,7 @@ fn gone_last_project_is_reported_once() {
     let dir = tmp("ui-letztes");
     let mut app = app();
     app.restore_last(Some(dir.join("weg").to_str().unwrap()));
+    settle(&mut app);
     let e = errors(&app);
     assert_eq!(e.len(), 1);
     assert!(
@@ -285,6 +310,7 @@ fn gone_last_project_is_reported_once() {
     let p = dir.join("p");
     Project::create(&p, "P").unwrap();
     app.restore_last(Some(p.to_str().unwrap()));
+    settle(&mut app);
     let stored = app.last_to_store().unwrap();
     assert_eq!(PathBuf::from(stored), canonical(&p).unwrap());
 }
@@ -292,10 +318,17 @@ fn gone_last_project_is_reported_once() {
 #[test]
 fn messages_are_capped() {
     let mut app = app();
-    for _ in 0..250 {
-        app.apply(Action::Inspect("x".into()));
+    // 250 different messages („Scan nicht im Projekt: x7“)
+    for i in 0..250 {
+        app.apply(Action::ComputeMap(format!("x{i}")));
     }
     assert_eq!(app.state().messages.len(), 100);
+    // the same message again and again stands once
+    app.apply(Action::DismissMessages);
+    for _ in 0..5 {
+        app.apply(Action::Inspect("x".into()));
+    }
+    assert_eq!(app.state().messages.len(), 1);
 }
 
 #[test]
@@ -678,9 +711,9 @@ fn dropped_obj_loads_surface() {
     assert_eq!(errors(h.state()), Vec::<String>::new());
     let log = &h.state().state().log;
     assert!(
-        log.iter().any(
-            |l| matches!(l, LogLine::Warning(w) if w.contains("Textur fehlt") && w.contains("Netz_seite_01.jpg"))
-        ),
+        log.iter().any(|l| l.kind == LogKind::Warning
+            && l.text.contains("Textur fehlt")
+            && l.text.contains("Netz_seite_01.jpg")),
         "{log:?}"
     );
 }

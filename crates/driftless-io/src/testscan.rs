@@ -8,16 +8,25 @@ use crate::msg::encode::encode_compressed_image;
 use crate::msg::encode::{encode_imu, encode_pointcloud2};
 use crate::msg::CompressedImage;
 use crate::msg::{ImuSample, LidarPoint};
+use crate::testdir::{SharedDir, TestDir};
 use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Fresh, empty temporary folder for the test `name` (unique per process).
-pub fn tmp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("driftless-cli-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+/// Prefix of the folders of [`tmp`] and [`shared`] in the system's temporary folder.
+pub const TMP_PREFIX: &str = "driftless-cli-";
+
+/// Fresh, empty temporary folder for the test `name` (unique per process), removed when the
+/// test is done; kept if it fails ([`TestDir`]).
+pub fn tmp(name: &str) -> TestDir {
+    TestDir::new(format!("{TMP_PREFIX}{}-{name}", std::process::id()))
+}
+
+/// Fresh, empty temporary folder `name` shared by the tests of one test program (a scene
+/// built once, in a `static`); removed when the program exits, after a crash by a later one
+/// ([`SharedDir`]).
+pub fn shared(name: &str) -> SharedDir {
+    SharedDir::new(TMP_PREFIX, name)
 }
 
 /// ROS time of `t` seconds.

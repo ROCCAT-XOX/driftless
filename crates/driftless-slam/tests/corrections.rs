@@ -1,9 +1,10 @@
 //! `corrections.toml` and how `solve` checks and uses manual loops.
 
+use driftless_io::testdir::TestDir;
 use driftless_odom::FrameQuality;
 use driftless_slam::{
     close_loops, solve, Corrections, LoopCheck, LoopVerdict, ManualLoop, ManualLoopError,
-    SlamConfig, Submap, SubmapFrame, POSITION_ONLY,
+    RejectedLoop, SlamConfig, Submap, SubmapFrame, POSITION_ONLY,
 };
 use driftless_traj::nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 use std::f64::consts::FRAC_PI_2;
@@ -11,9 +12,7 @@ use std::fs;
 
 #[test]
 fn corrections_append_and_disable_keep_history() {
-    let dir = std::env::temp_dir().join(format!("driftless-corr-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new(format!("driftless-corr-{}", std::process::id()));
     let path = dir.join("corrections.toml");
 
     let mut c = Corrections::load(&path).unwrap();
@@ -55,11 +54,62 @@ fn corrections_append_and_disable_keep_history() {
     assert!(c.set_enabled(0, false).is_err());
 }
 
+/// An automatic loop switched off is a `[[reject]]` entry: by the start times of its two
+/// submaps; switched on again, the entry goes. Files written before rejects existed still read.
+#[test]
+fn rejects_are_written_and_removed_and_old_files_read() {
+    let dir = TestDir::new(format!("driftless-corr-reject-{}", std::process::id()));
+    let path = dir.join("corrections.toml");
+    // as written before the veto existed
+    fs::write(
+        &path,
+        "# Driftless-Korrekturen.\n\n[[loop]]\na = 1.0\nb = 2.0\nenabled = true\nnote = \"\"\n\
+         added = \"2026-10-20T10:00:00Z\"\n",
+    )
+    .unwrap();
+    let mut c = Corrections::load(&path).unwrap();
+    assert_eq!(c.loops.len(), 1);
+    assert!(c.rejects.is_empty());
+    assert!(c.rejected_loops().is_empty());
+
+    assert!(c.reject_loop(10.0, 40.5, "2026-10-28T09:00:00Z"));
+    // the same loop again (also the other way round): nothing new
+    assert!(!c.reject_loop(10.0, 40.5, "2026-10-28T09:01:00Z"));
+    assert!(!c.reject_loop(40.5, 10.0, "2026-10-28T09:01:00Z"));
+    c.save(&path).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("[[reject]]"), "{text}");
+    assert!(
+        text.contains("a = 10.0") && text.contains("b = 40.5"),
+        "{text}"
+    );
+    assert!(text.contains("[[loop]]"), "the manual loop stays: {text}");
+    let back = Corrections::load(&path).unwrap();
+    assert_eq!(back, c);
+    assert_eq!(
+        back.rejected_loops(),
+        vec![RejectedLoop {
+            a_t: 10.0,
+            b_t: 40.5
+        }]
+    );
+    // switched on again: the entry goes
+    let mut c = back;
+    assert!(c.allow_loop(40.5, 10.0));
+    assert!(!c.allow_loop(40.5, 10.0));
+    assert!(c.rejects.is_empty());
+    c.save(&path).unwrap();
+    assert!(!fs::read_to_string(&path).unwrap().contains("[[reject]]"));
+
+    // a mistyped key in a reject is an error, as in a loop
+    fs::write(&path, "[[reject]]\na = 1.0\nb = 2.0\nnotiz = \"x\"\n").unwrap();
+    let e = Corrections::load(&path).unwrap_err();
+    assert!(e.contains("nicht lesbar"), "{e}");
+}
+
 #[test]
 fn corrections_save_replaces_file_without_leftovers() {
-    let dir = std::env::temp_dir().join(format!("driftless-corr-save-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new(format!("driftless-corr-save-{}", std::process::id()));
     let path = dir.join("corrections.toml");
     let mut c = Corrections::default();
     c.add_loop(1.0, 2.0, "", "2026-10-20T10:00:00Z");
@@ -82,9 +132,7 @@ fn corrections_save_replaces_file_without_leftovers() {
 
 #[test]
 fn corrections_unknown_keys_are_errors() {
-    let dir = std::env::temp_dir().join(format!("driftless-corr-unknown-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new(format!("driftless-corr-unknown-{}", std::process::id()));
     let path = dir.join("corrections.toml");
     for text in [
         // mistyped key inside an entry

@@ -7,13 +7,18 @@
 
 pub mod camera;
 pub mod cloud;
+pub mod disk;
 pub mod icon;
 pub mod jobs;
+pub mod leftovers;
 pub mod lod;
+pub mod logfile;
 pub mod overlay;
 pub mod pick;
+pub mod places;
 pub mod project;
 pub mod render;
 pub mod surface;
 pub mod synthetic;
+pub mod trash;
 pub mod ui;

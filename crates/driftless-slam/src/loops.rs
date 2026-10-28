@@ -101,6 +101,15 @@ pub struct ManualLoop {
     pub b_t: f64,
 }
 
+/// An automatic loop the user switched off (`[[reject]]` in `corrections.toml`): the loop
+/// between the submaps holding the times `a_t` and `b_t` (seconds since the start of the scan)
+/// stays out of the pose graph.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RejectedLoop {
+    pub a_t: f64,
+    pub b_t: f64,
+}
+
 /// A [`ManualLoop`] matched to the submaps: the frame nearest in time to each of its two
 /// times, ordered so that `a < b`.
 #[derive(Debug, Clone, PartialEq)]
@@ -222,6 +231,29 @@ pub fn match_manual_loops(
             });
         }
         out.push(m);
+    }
+    Ok(out)
+}
+
+/// The pairs of submaps (`a < b`) of the rejected loops: the submap of the frame nearest in
+/// time to each time. Fails, as for a manual loop, on a time outside the scan and on two
+/// times in the same submap; the same pair twice is fine.
+pub fn match_rejected_loops(
+    submaps: &[Submap],
+    rejected: &[RejectedLoop],
+) -> Result<Vec<(usize, usize)>, ManualLoopError> {
+    let mut out = Vec::with_capacity(rejected.len());
+    for r in rejected {
+        let (sa, _) = locate(submaps, r.a_t)?;
+        let (sb, _) = locate(submaps, r.b_t)?;
+        if sa == sb {
+            return Err(ManualLoopError::SameSubmap {
+                a_t: r.a_t,
+                b_t: r.b_t,
+                submap: sa,
+            });
+        }
+        out.push((sa.min(sb), sa.max(sb)));
     }
     Ok(out)
 }

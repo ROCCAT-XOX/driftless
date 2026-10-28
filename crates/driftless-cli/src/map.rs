@@ -1,11 +1,16 @@
-//! `driftless map <scan> --slam <ziel> [--step dense|clean|color|all]`: the map of a SLAM run
-//! in three steps, each with its own files in the SLAM output folder: `dense.las`/`dense.bin`,
-//! `clean.las`/`removed.las`/`clean.bin`, `color.las`/`color.ply`, plus `map.json`. The run
-//! itself is [`driftless_steps::map::run_map`].
+//! `driftless map <scan> --slam <ziel> [--step dense|clean|color|all] [--alle-dateien] [--neu]`:
+//! the map of a SLAM run in three steps, each with its own files in the SLAM output folder:
+//! `dense.bin`, `removed.las`/`clean.bin`, `color.las`, plus `map.json`; the cloud of the last
+//! step as LAS (`color.las`, or `clean.las` without colour). `--alle-dateien` also writes
+//! `dense.las`, `clean.las` and `color.ply`. A whole map that is current already is not
+//! computed again unless `--neu`. The run itself is [`driftless_steps::map::run_map`]
+//! ([`driftless_steps::map::recompute_map`] with `--neu`).
 
 use driftless_gpu::GpuPref;
 use driftless_map::{ColorConfig, DenseConfig};
-use driftless_steps::map::{run_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches};
+use driftless_steps::map::{
+    recompute_map, run_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches,
+};
 use driftless_steps::scan::extrinsic_values;
 use driftless_steps::slam::SlamSettings;
 use std::path::PathBuf;
@@ -68,6 +73,15 @@ pub struct Args {
     /// Imu-Topic (Standard: das einzige in der Bag)
     #[arg(long)]
     imu_topic: Option<String>,
+    /// Jeden Schritt auch als LAS schreiben (dense.las, clean.las) und color.ply dazu; sonst
+    /// nur die Wolke des letzten Schritts (color.las, ohne Farbe clean.las) neben
+    /// removed.las und den Zwischenständen *.bin
+    #[arg(long)]
+    alle_dateien: bool,
+    /// Auch rechnen, wenn die Karte im Zielordner schon aktuell ist (gleiche Eingaben und
+    /// Einstellungen); ohne das meldet `--step all` dann nur „Karte ist aktuell“
+    #[arg(long)]
+    neu: bool,
 }
 
 impl From<Step> for MapStep {
@@ -114,8 +128,13 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             map,
         },
         out_dir: args.slam.clone(),
+        all_files: args.alle_dateien,
     };
-    run_map(&req, &crate::console())?;
+    if args.neu {
+        recompute_map(&req, &crate::console())?;
+    } else {
+        run_map(&req, &crate::console())?;
+    }
     Ok(())
 }
 

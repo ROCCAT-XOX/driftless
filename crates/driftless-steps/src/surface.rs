@@ -1,30 +1,45 @@
-//! The photo-like surface of a map: `oberflaeche.glb`, `oberflaeche.obj` (+ `.mtl` and the
-//! texture pages as JPEG) and `oberflaeche.json`, built from the `clean.bin` of the map
-//! folder (points with the frame they were measured in) and the camera images of the scan.
+//! The photo-like surface of a map: `oberflaeche.glb` (its texture pages inside) and
+//! `oberflaeche.json`, with [`SurfaceRequest::obj`] (`driftless surface --obj`) also
+//! `oberflaeche.obj` (+ `.mtl` and the texture pages as JPEG; else „Exportieren …“ makes an
+//! OBJ from the glb), built from the `clean.bin` of the map folder (points with the frame
+//! they were measured in) and the camera images of the scan.
 //!
 //! The input id is the clean step's id, the camera images and calibration, the surface
 //! settings and [`SURFACE_VERSION`]. A `clean.bin` of another input (or none) is refused:
 //! the surface would not fit the map. A scan without images or calibration gets a gray
-//! surface and a warning. A cancel before the files are written leaves the folder untouched;
-//! the JSON is written last, so a folder with a report holds a complete surface.
+//! surface and a warning. A cancel before the files are written leaves the folder untouched.
+//! A run removes the `.tmp` files a killed run of its files left at its start, and the
+//! report before it writes its first file; the report comes last again, with the size of
+//! every file it lists (`bytes`), so a folder with a report holds a complete surface and one
+//! with a file of another run next to the report does not fit ([`surface_fits`]).
+//!
+//! The report names under `hinweise` short German hints for the user in plain words (the app
+//! shows them with the surface): when the setting `max_fill_gap` leaves the surface open in
+//! many places, why and what helps ([`OPEN_HINT_SHARE`]).
 //!
 //! The surface of a merged model ([`run_model_surface`]) is made the same way from the
 //! `clean.bin` of every scan in the model, moved by its `T_i`, with the LiDAR positions and
 //! the camera images of every such scan (one texture source each). Its input id is the
 //! model's id, the clean id and images of every scan in it, the settings and
-//! [`SURFACE_VERSION`].
+//! [`SURFACE_VERSION`]. A model merged by another version of the merge is refused, like one
+//! whose maps were computed anew since ([`crate::merge::version_fits`]).
 
 use crate::error::{check_cancel, failed, StepError};
+use crate::export::is_page_of;
+use crate::leftovers::{remove_report, remove_stale_tmp};
 use crate::map::{
     clean_stage_id, color_input, dense_stage_id, fallback_reason, gpu_json, hex, map_input_for,
     peak_rss_bytes, read_traj, ColorInput, MapInput, CLEAN_BIN, DENSE_BIN,
 };
-use crate::merge::{member_transform, read_model, ModelMember};
+use crate::merge::{
+    member_transform, read_model, version_fits, ModelMember, ModelReport, MERGE_VERSION,
+};
+use crate::{PROGRAM, PROGRAM_KEY};
 use driftless_export::mesh;
 use driftless_gpu::{GpuChoice, GpuContext, GpuPref};
-use driftless_io::atomic_write;
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
+use driftless_io::{atomic_write, paths};
 use driftless_map::surface::{
     build_mesh, encode_pages, sensors_for_frames, texture_mesh, Accuracy, AccuracySplit,
     SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
@@ -39,10 +54,18 @@ use std::time::Instant;
 
 pub const SURFACE_REPORT: &str = "oberflaeche.json";
 /// Part of the input id: raised whenever the surface gives another result for the same
-/// settings, so an older folder counts as stale.
+/// settings, so an older folder counts as stale. Only then: the program version is no part
+/// of the id (see the rule at the step versions in [`crate::map`]).
 const SURFACE_VERSION: u32 = 13;
 /// File stem of the glb and the obj.
 const STEM: &str = "oberflaeche";
+/// Share of the faces the coarse grid offered that were dropped for lack of a point within
+/// `max_fill_gap` (`faces_unsupported` of all faces) from which the report carries a hint:
+/// the surface stays open there. Measured at the default 2 cm on the real scans of the
+/// release (`oberflaeche.json`): black room S1–S3 7–11 %, its model 9 %, office B 23–27 %
+/// (22.9 % holes from above, of which the setting makes 4.3 points:
+/// docs/ergebnisse/2026-10-25-qualitaetsrunde.md).
+const OPEN_HINT_SHARE: f64 = 0.15;
 const AXES: &str = "glb: Y oben; obj: Z oben";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -59,6 +82,9 @@ pub struct SurfaceRequest {
     /// Find the views per face on the GPU (`--gpu auto|an|aus`). Gives an equivalent
     /// result: not part of the input id; the report says what was used.
     pub gpu: GpuPref,
+    /// Also `oberflaeche.obj` with `.mtl` and the page JPEGs (`--obj`). The same surface:
+    /// not part of the input id.
+    pub obj: bool,
 }
 
 fn stale_map() -> StepError {
@@ -92,7 +118,10 @@ fn images_part(
     match images_of(&req.map.scan, &odom.lidar_to_imu, progress)? {
         Ok(c) => Ok((c.id.clone(), Some(c))),
         Err(why) => {
-            progress.warn(format!("Oberfläche ohne Textur, {why}"));
+            progress.warn(format!(
+                "{why} – Oberfläche ohne Textur, alle Flächen grau; fehlt das nur in der Kopie, \
+                 es vom Gerät dazukopieren und die Oberfläche neu rechnen"
+            ));
             Ok(("no images\n".into(), None))
         }
     }
@@ -111,8 +140,9 @@ fn plan(
     Ok((Plan { id, clean_id }, color))
 }
 
-/// Whether `out_dir` holds the surface of this request: its report has the current input id
-/// and `clean.bin` still fits the map.
+/// Whether `out_dir` holds the surface of this request: its report has the current input id,
+/// the files it lists are there with their sizes ([`files_intact`]) and `clean.bin` still
+/// fits the map.
 pub fn surface_fits(req: &SurfaceRequest) -> bool {
     let fits = || -> Option<bool> {
         let text = fs::read_to_string(req.out_dir.join(SURFACE_REPORT)).ok()?;
@@ -121,10 +151,61 @@ pub fn surface_fits(req: &SurfaceRequest) -> bool {
         let (plan, _) = plan(req, &Progress::new()).ok()?;
         Some(
             report["input_id"].as_str() == Some(hex(&plan.id).as_str())
+                && files_intact(&req.out_dir, &report)
                 && stage_fits(&req.map_dir.join(CLEAN_BIN), &plan.clean_id),
         )
     };
     fits().unwrap_or(false)
+}
+
+/// Whether the files the surface report `report` in `dir` lists are there, with the sizes
+/// it recorded under `bytes` (a report written before the sizes: only that they are there;
+/// one before the list: nothing to check). A file of another run next to the report – what
+/// a run of an older version left when it was killed between its files – does not fit.
+fn files_intact(dir: &Path, report: &Value) -> bool {
+    let Some(files) = report["files"].as_array() else {
+        return true;
+    };
+    files
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|f| *f != SURFACE_REPORT)
+        .all(|f| {
+            fs::metadata(dir.join(f)).is_ok_and(|m| {
+                m.is_file() && report["bytes"][f].as_u64().is_none_or(|b| b == m.len())
+            })
+        })
+}
+
+/// Whether a surface writes the file `name`: the glb, the OBJ with its `.mtl` and pages, the
+/// report.
+fn owns(name: &str) -> bool {
+    let fixed = [
+        format!("{STEM}.glb"),
+        format!("{STEM}.obj"),
+        format!("{STEM}.mtl"),
+        SURFACE_REPORT.to_string(),
+    ];
+    fixed.iter().any(|f| f == name) || is_page_of(name.as_ref(), STEM.as_ref())
+}
+
+/// Short German hints about the surface for the user, in plain words (the app shows them with
+/// the surface, the CLI prints them), in the report under `hinweise`: why a surface stays open
+/// in many places, when the cause is the setting `max_fill_gap` ([`OPEN_HINT_SHARE`]).
+fn hints(stats: &SurfaceStats, config: &SurfaceConfig) -> Vec<String> {
+    let dropped = stats.faces_unsupported as f64;
+    let share = dropped / (dropped + stats.faces_final as f64).max(1.0);
+    if share < OPEN_HINT_SHARE {
+        return Vec::new();
+    }
+    let gap_cm = format!("{:.1}", 100.0 * config.max_fill_gap).replace('.', ",");
+    vec![format!(
+        "Stellenweise offen: An {:.0} % der dünn gemessenen Stellen lag kein Messpunkt näher \
+         als {gap_cm} cm. Dort bleibt die Oberfläche offen, statt etwas zu erfinden. Das ist in \
+         großen Räumen üblich. Schließen lassen sich solche Stellen nur durch dichteres Scannen \
+         (näher heran, langsamer), nicht durch eine feinere Einstellung.",
+        100.0 * share
+    )]
 }
 
 fn settings_json(c: &SurfaceConfig, texture: bool) -> Value {
@@ -244,17 +325,22 @@ fn stats_json(s: &SurfaceStats) -> Value {
     })
 }
 
-/// Page JPEGs of an earlier run in `dir` that the files of this run (`keep`) do not include.
-/// Nothing is deleted: they are warned about and listed as stale in the report.
-fn stale_pages(dir: &Path, keep: &[String]) -> Vec<String> {
+/// The OBJ, its `.mtl` and page JPEGs of an earlier run in `dir` that the files of this run
+/// (`keep`) do not include. Nothing is deleted: they are warned about and listed as stale in
+/// the report.
+fn stale_files(dir: &Path, keep: &[String]) -> Vec<String> {
     let prefix = format!("{STEM}_seite_");
+    let (obj, mtl) = (format!("{STEM}.obj"), format!("{STEM}.mtl"));
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut stale: Vec<String> = entries
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with(&prefix) && n.ends_with(".jpg") && !keep.contains(n))
+        .filter(|n| {
+            let page = n.starts_with(&prefix) && n.ends_with(".jpg");
+            (page || *n == obj || *n == mtl) && !keep.contains(n)
+        })
         .collect();
     stale.sort();
     stale
@@ -307,6 +393,8 @@ struct Target<'a> {
     id: &'a str,
     /// One more entry of the report (key, value).
     extra: Option<(&'static str, Value)>,
+    /// Also the OBJ with its `.mtl` and pages.
+    obj: bool,
 }
 
 /// Mesh, texture, files and report of a surface: the part shared by [`run_surface`] and
@@ -362,25 +450,40 @@ fn make_surface(
     let out = target.out_dir;
     fs::create_dir_all(out).map_err(|e| format!("{} nicht anlegbar: {e}", out.display()))?;
     let report_path = out.join(SURFACE_REPORT);
+    remove_report(&report_path)?;
     let writing = Progress::new();
     mesh::write_glb(&out.join(format!("{STEM}.glb")), &surface, &writing)?;
-    mesh::write_obj(&out.join(format!("{STEM}.obj")), &surface, &writing)?;
+    let mut files = vec![format!("{STEM}.glb")];
+    if target.obj {
+        mesh::write_obj(&out.join(format!("{STEM}.obj")), &surface, &writing)?;
+        files.extend([format!("{STEM}.obj"), format!("{STEM}.mtl")]);
+        files.extend((0..pages).map(|p| format!("{STEM}_seite_{p:02}.jpg")));
+    }
     drop(surface);
-    let mut files = vec![
-        format!("{STEM}.glb"),
-        format!("{STEM}.obj"),
-        format!("{STEM}.mtl"),
-    ];
-    files.extend((0..pages).map(|p| format!("{STEM}_seite_{p:02}.jpg")));
     files.push(SURFACE_REPORT.to_string());
-    let stale = stale_pages(out, &files);
+    let stale = stale_files(out, &files);
     if !stale.is_empty() {
+        let (verb, belongs) = if stale.len() == 1 {
+            ("stammt", "gehört")
+        } else {
+            ("stammen", "gehören")
+        };
         progress.warn(format!(
-            "{} stammen aus einem früheren Lauf und gehören nicht mehr zur Oberfläche",
+            "{} {verb} aus einem früheren Lauf und {belongs} nicht mehr zur Oberfläche – nicht \
+             verwenden; gelöscht wird nichts, bei Bedarf von Hand löschen",
             stale.join(", ")
         ));
     }
 
+    // The size of every file written, so that one of another run is told apart.
+    let bytes: serde_json::Map<String, Value> = files
+        .iter()
+        .filter(|f| *f != SURFACE_REPORT)
+        .map(|f| {
+            let size = fs::metadata(out.join(f)).map_or(0, |m| m.len());
+            (f.clone(), json!(size))
+        })
+        .collect();
     let peak = peak_rss_bytes();
     let mut report = json!({
         "input_id": hex(target.id),
@@ -391,11 +494,14 @@ fn make_surface(
         "gpu": gpu_report,
         "axes": AXES,
         "files": files,
+        "bytes": bytes,
         "stale": stale,
+        "hinweise": hints(&stats, target.config),
     });
     if let Some((key, value)) = target.extra {
         report[key] = value;
     }
+    report[PROGRAM_KEY] = json!(PROGRAM);
     let text = serde_json::to_string_pretty(&report).map_err(failed)? + "\n";
     atomic_write(&report_path, text.as_bytes())
         .map_err(|e| format!("{} nicht schreibbar: {e}", report_path.display()))?;
@@ -413,6 +519,9 @@ fn make_surface(
         all.p95_mm,
         walls.median_mm
     ));
+    for hint in hints(&stats, target.config) {
+        progress.info(format!("Hinweis: {hint}"));
+    }
     let ram = peak.map_or_else(
         || "Spitzen-RAM unbekannt".to_string(),
         |b| format!("Spitzen-RAM {:.2} GB", b as f64 / 1e9),
@@ -439,6 +548,7 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
     let (plan, color) = plan(req, progress)?;
     let gpu = open_gpu(req.gpu, color.is_some(), progress)?;
     let (_, poses) = read_traj(&req.map.slam_dir)?;
+    remove_stale_tmp(&req.out_dir, owns, progress);
 
     let clean_path = req.map_dir.join(CLEAN_BIN);
     let (mut cloud, _) = load_stage(&clean_path, &plan.clean_id).map_err(|e| {
@@ -473,6 +583,7 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
         texture: req.texture,
         id: &plan.id,
         extra: None,
+        obj: req.obj,
     };
     make_surface(points, sources, gpu, target, start, progress)
 }
@@ -482,6 +593,10 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
 pub struct ModelSurfaceRequest {
     /// Folder of the model: `modell.json` of `driftless merge` is read from it.
     pub model_dir: PathBuf,
+    /// The model as read from [`Self::model_dir`], its folders as the caller found them (the
+    /// program takes a model older than the relative paths onto its project folder);
+    /// `None`: read here ([`read_model`]).
+    pub model: Option<ModelReport>,
     /// Where the surface files go.
     pub out_dir: PathBuf,
     pub config: SurfaceConfig,
@@ -489,6 +604,8 @@ pub struct ModelSurfaceRequest {
     pub texture: bool,
     /// As [`SurfaceRequest::gpu`].
     pub gpu: GpuPref,
+    /// As [`SurfaceRequest::obj`].
+    pub obj: bool,
 }
 
 /// A scan of the model whose points are in it.
@@ -523,8 +640,29 @@ fn stale_member(name: &str) -> StepError {
         .into()
 }
 
+/// A model merged by another version of the merge ([`version_fits`]).
+fn other_merge_version(dir: &Path, version: u32) -> StepError {
+    let which = if version < MERGE_VERSION {
+        "älteren"
+    } else {
+        "neueren"
+    };
+    format!(
+        "Modell {} stammt aus einer {which} Programmversion (Zusammenführen v{version}, dieses \
+         Programm v{MERGE_VERSION}) und ist veraltet: erst neu zusammenführen",
+        dir.display()
+    )
+    .into()
+}
+
 fn model_plan(req: &ModelSurfaceRequest, progress: &Progress) -> Result<ModelPlan, StepError> {
-    let model = read_model(&req.model_dir)?;
+    let model = match &req.model {
+        Some(m) => m.clone(),
+        None => read_model(&req.model_dir)?,
+    };
+    if !version_fits(&model) {
+        return Err(other_merge_version(&req.model_dir, model.version));
+    }
     let mut id = format!("model {}\nsurface v{SURFACE_VERSION}\n", model.input_id);
     let mut members = Vec::new();
     for (k, m) in model.members.iter().enumerate().filter(|(_, m)| m.included) {
@@ -543,7 +681,10 @@ fn model_plan(req: &ModelSurfaceRequest, progress: &Progress) -> Result<ModelPla
             match images_of(&m.scan, &lidar_to_imu, progress)? {
                 Ok(c) => (c.id.clone(), Some(c)),
                 Err(why) => {
-                    progress.warn(format!("{name} trägt nichts zur Textur bei, {why}"));
+                    progress.warn(format!(
+                        "{name}: {why} – trägt nichts zur Textur bei, die anderen Scans färben \
+                         das Modell"
+                    ));
                     ("no images\n".to_string(), None)
                 }
             }
@@ -567,7 +708,9 @@ fn model_plan(req: &ModelSurfaceRequest, progress: &Progress) -> Result<ModelPla
 }
 
 /// Whether `out_dir` holds the surface of this model request: its report has the current
-/// input id and the `clean.bin` of every scan in the model still fits its map.
+/// input id, the files it lists are there with their sizes ([`files_intact`]), the model is of
+/// this merge version ([`version_fits`]) and the `clean.bin` of every scan in the model still
+/// fits its map.
 pub fn model_surface_fits(req: &ModelSurfaceRequest) -> bool {
     let fits = || -> Option<bool> {
         let text = fs::read_to_string(req.out_dir.join(SURFACE_REPORT)).ok()?;
@@ -576,6 +719,7 @@ pub fn model_surface_fits(req: &ModelSurfaceRequest) -> bool {
         let plan = model_plan(req, &Progress::new()).ok()?;
         Some(
             report["input_id"].as_str() == Some(hex(&plan.id).as_str())
+                && files_intact(&req.out_dir, &report)
                 && plan
                     .members
                     .iter()
@@ -663,14 +807,23 @@ fn model_points(
     Ok((points, sources))
 }
 
+/// The model folder relative to the surface folder (`..` for one inside it), if one can be
+/// computed ([`paths::relative_to`]; both made absolute as given, the surface folder may not
+/// exist yet).
+fn model_dir_rel(req: &ModelSurfaceRequest) -> Option<String> {
+    let out = std::path::absolute(&req.out_dir).ok()?;
+    paths::relative_to(&out, &std::path::absolute(&req.model_dir).ok()?)
+}
+
 /// Runs the surface of the model in [`ModelSurfaceRequest::model_dir`] as
 /// `driftless surface --model` does: the points, LiDAR positions and camera images of every
 /// scan in the model (`included`), in the model frame. Without `dense.bin` the accuracy is
 /// measured against the merged points only. Returns the `oberflaeche.json` written to
 /// [`ModelSurfaceRequest::out_dir`]; it holds `model` (the folder and the scans in it).
 ///
-/// Fails if `modell.json` is missing or the map of a scan in it is missing or was computed
-/// anew after the merge. A cancel before the files are written leaves everything as it was.
+/// Fails if `modell.json` is missing, was written by another version of the merge
+/// ([`version_fits`]), or the map of a scan in it is missing or was computed anew after the
+/// merge. A cancel before the files are written leaves everything as it was.
 pub fn run_model_surface(
     req: &ModelSurfaceRequest,
     progress: &Progress,
@@ -682,6 +835,7 @@ pub fn run_model_surface(
     let names: Vec<String> = plan.members.iter().map(|m| m.name.clone()).collect();
     let with_images = plan.members.iter().any(|m| m.color.is_some());
     let gpu = open_gpu(req.gpu, with_images, progress)?;
+    remove_stale_tmp(&req.out_dir, owns, progress);
     let (points, sources) = model_points(plan, progress)?;
     let target = Target {
         out_dir: &req.out_dir,
@@ -692,9 +846,48 @@ pub fn run_model_surface(
             "model",
             json!({
                 "dir": req.model_dir.display().to_string(),
+                "dir_rel": model_dir_rel(req),
                 "members": names,
             }),
         )),
+        obj: req.obj,
     };
     make_surface(points, sources, gpu, target, start, progress)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(faces_final: usize, faces_unsupported: usize) -> SurfaceStats {
+        SurfaceStats {
+            faces_final,
+            faces_unsupported,
+            ..SurfaceStats::default()
+        }
+    }
+
+    /// The figures of the real scans at the default 2 cm: the office B (2.0 of 8.6 million
+    /// faces dropped, 23 %) gets the hint, the black room S1 (8 %) does not.
+    #[test]
+    fn open_surface_gets_a_hint() {
+        let cfg = SurfaceConfig::default();
+        assert!(hints(&stats(1_153_721, 98_911), &cfg).is_empty());
+        assert!(hints(&stats(0, 0), &cfg).is_empty());
+        let h = hints(&stats(6_640_042, 2_004_445), &cfg);
+        assert_eq!(
+            h,
+            [
+                "Stellenweise offen: An 23 % der dünn gemessenen Stellen lag kein Messpunkt näher \
+              als 1,5 cm. Dort bleibt die Oberfläche offen, statt etwas zu erfinden. Das ist in \
+              großen Räumen üblich. Schließen lassen sich solche Stellen nur durch dichteres \
+              Scannen (näher heran, langsamer), nicht durch eine feinere Einstellung."
+            ]
+        );
+        // no setting name, no decimal point
+        assert!(
+            !h[0].contains("max_fill_gap") && !h[0].contains("1.5"),
+            "{h:?}"
+        );
+    }
 }

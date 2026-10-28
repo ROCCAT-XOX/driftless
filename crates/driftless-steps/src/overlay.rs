@@ -21,18 +21,41 @@ pub fn is_rejected(l: &LoopReport) -> bool {
     !l.manual && !l.accepted
 }
 
-/// Colour of a submap quality: red (0) via yellow (0.5) to green (1).
+/// Submap quality (its worst frame, `slam.json`) at and below which the trajectory is red:
+/// barely held by the geometry, its place may have slipped (a featureless corridor, a door
+/// turned through, a frame without a match).
+pub const QUALITY_RED: f32 = 0.01;
+/// The quality drawn yellow: halfway between red and green on the logarithmic scale.
+pub const QUALITY_YELLOW: f32 = 0.05;
+/// The quality at and above which the trajectory is green: well held.
+///
+/// The scale is the display of the quality only (the pose graph weighs the odometry by the
+/// quality as before). It is set on the real runs of the analysis (28.10.): on the good office
+/// run (median 0.21, 93 % of its submaps below 0.5) the linear red-to-green ramp showed more
+/// than half of the trajectory red; with this scale at most a tenth of a good run is red and
+/// most of it green (`tests::real_runs_are_mostly_green`). The quality is a product of factors
+/// (overlap, constraint, residual) taken at the worst frame, so it spans decades: the scale is
+/// logarithmic.
+pub const QUALITY_GREEN: f32 = 0.25;
+
+/// Where a submap quality lies on the colour ramp: 0 (red) at [`QUALITY_RED`] and below, 1
+/// (green) at [`QUALITY_GREEN`] and above, logarithmic between them (yellow, 0.5, at
+/// [`QUALITY_YELLOW`]); 0 for a quality that is no number.
+pub fn quality_ramp(quality: f32) -> f32 {
+    if quality.is_nan() || quality <= QUALITY_RED {
+        return 0.0;
+    }
+    ((quality / QUALITY_RED).ln() / (QUALITY_GREEN / QUALITY_RED).ln()).clamp(0.0, 1.0)
+}
+
+/// Colour of a submap quality: red via yellow to green along [`quality_ramp`].
 pub fn quality_color(quality: f32) -> [u8; 3] {
-    let q = if quality.is_finite() {
-        quality.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+    let t = quality_ramp(quality);
     let ramp = |x: f32| (x * 255.0).round() as u8;
-    if q < 0.5 {
-        [255, ramp(q * 2.0), 0]
+    if t < 0.5 {
+        [255, ramp(t * 2.0), 0]
     } else {
-        [ramp(2.0 - q * 2.0), 255, 0]
+        [ramp(2.0 - t * 2.0), 255, 0]
     }
 }
 
@@ -180,12 +203,84 @@ mod tests {
     }
 
     #[test]
-    fn quality_color_endpoints() {
+    fn quality_color_points() {
+        // red at and below 0.01, yellow at 0.05, green at and above 0.25
         assert_eq!(quality_color(0.0), [255, 0, 0]);
-        assert_eq!(quality_color(0.5), [255, 255, 0]);
+        assert_eq!(quality_color(QUALITY_RED), [255, 0, 0]);
+        assert_eq!(quality_color(QUALITY_YELLOW), [255, 255, 0]);
+        assert_eq!(quality_color(QUALITY_GREEN), [0, 255, 0]);
         assert_eq!(quality_color(1.0), [0, 255, 0]);
         assert_eq!(quality_color(-3.0), [255, 0, 0]);
         assert_eq!(quality_color(f32::NAN), [255, 0, 0]);
+        // yellow halfway on the logarithmic scale
+        assert!((QUALITY_YELLOW - (QUALITY_RED * QUALITY_GREEN).sqrt()).abs() < 1e-6);
+        // never darker going up: red rises first, then green falls
+        let mut last = quality_ramp(0.0);
+        for k in 0..=1000 {
+            let r = quality_ramp(k as f32 / 1000.0);
+            assert!(r >= last && (0.0..=1.0).contains(&r), "{k}");
+            last = r;
+        }
+    }
+
+    /// The submap qualities (worst frame, as `slam.json` stores them, sorted) of the real runs
+    /// the analysis of 28.10. looked at, all good results: the office B (start↔end 2.16 →
+    /// 0.13 m), the RayStudio test scan (1.8 cm ATE against RayStudio) and the black room
+    /// S1–S3 (start↔end ≤ 2.5 cm). The ramp tells good from bad on them: at most a tenth of
+    /// the submaps of a good run is red, most are green. The old linear ramp showed the office
+    /// red to more than half.
+    #[test]
+    fn real_runs_are_mostly_green() {
+        const OFFICE: [f32; 59] = [
+            0.005, 0.005, 0.018, 0.019, 0.019, 0.025, 0.027, 0.028, 0.030, 0.031, 0.048, 0.050,
+            0.051, 0.051, 0.053, 0.055, 0.058, 0.065, 0.066, 0.081, 0.092, 0.105, 0.112, 0.129,
+            0.138, 0.153, 0.159, 0.171, 0.198, 0.206, 0.216, 0.228, 0.242, 0.254, 0.261, 0.267,
+            0.279, 0.310, 0.316, 0.317, 0.323, 0.324, 0.326, 0.345, 0.347, 0.356, 0.363, 0.374,
+            0.388, 0.395, 0.400, 0.417, 0.424, 0.468, 0.490, 0.575, 0.604, 0.608, 0.643,
+        ];
+        const TEST: [f32; 28] = [
+            0.008, 0.013, 0.030, 0.034, 0.058, 0.064, 0.067, 0.071, 0.083, 0.093, 0.119, 0.129,
+            0.152, 0.162, 0.162, 0.169, 0.275, 0.278, 0.291, 0.299, 0.306, 0.330, 0.331, 0.409,
+            0.432, 0.473, 0.685, 0.697,
+        ];
+        const S1: [f32; 35] = [
+            0.006, 0.026, 0.031, 0.091, 0.126, 0.154, 0.163, 0.173, 0.242, 0.274, 0.278, 0.341,
+            0.414, 0.419, 0.420, 0.421, 0.469, 0.470, 0.483, 0.538, 0.539, 0.544, 0.565, 0.605,
+            0.630, 0.652, 0.674, 0.746, 0.753, 0.820, 0.820, 0.886, 0.899, 0.900, 0.911,
+        ];
+        const S2: [f32; 26] = [
+            0.085, 0.095, 0.105, 0.130, 0.216, 0.288, 0.327, 0.383, 0.474, 0.612, 0.669, 0.813,
+            0.833, 0.834, 0.859, 0.867, 0.898, 0.898, 0.900, 0.901, 0.904, 0.907, 0.908, 0.908,
+            0.922, 0.949,
+        ];
+        const S3: [f32; 27] = [
+            0.016, 0.022, 0.044, 0.058, 0.062, 0.078, 0.088, 0.103, 0.116, 0.129, 0.134, 0.147,
+            0.300, 0.490, 0.501, 0.535, 0.560, 0.592, 0.630, 0.660, 0.680, 0.707, 0.827, 0.877,
+            0.880, 0.893, 0.919,
+        ];
+        // red: the first quarter of the ramp, green: the last quarter
+        let shares = |q: &[f32], ramp: &dyn Fn(f32) -> f32| {
+            let n = q.len() as f32;
+            let red = q.iter().filter(|&&x| ramp(x) < 0.25).count() as f32 / n;
+            let green = q.iter().filter(|&&x| ramp(x) >= 0.75).count() as f32 / n;
+            (red, green)
+        };
+        for (name, q) in [
+            ("Büro", &OFFICE[..]),
+            ("Test", &TEST[..]),
+            ("S1", &S1[..]),
+            ("S2", &S2[..]),
+            ("S3", &S3[..]),
+        ] {
+            let (red, green) = shares(q, &quality_ramp);
+            assert!(red <= 0.1, "{name}: {:.0} % rot", red * 100.0);
+            assert!(green >= 0.6, "{name}: {:.0} % grün", green * 100.0);
+        }
+        let (red, green) = shares(&OFFICE, &|q| q);
+        assert!(
+            red > 0.5 && green == 0.0,
+            "old ramp: {red} red, {green} green"
+        );
     }
 
     #[test]

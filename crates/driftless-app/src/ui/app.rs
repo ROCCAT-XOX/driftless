@@ -7,26 +7,28 @@ use super::export::{self, ExportDialog};
 use super::tools::{self, PairSession, ScreenLayout, Tool};
 use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
-    actions, rail, settings, status, steps, text, theme, Action, AppState, CloudSummary,
-    InspectResult, Queued, Selection, Step, SurfaceSummary, UiMessage, ViewSettings, ViewStats,
+    actions, rail, read_project, settings, status, steps, text, theme, Action, AppState,
+    CloudCheck, CloudSummary, InspectResult, LogEntry, LogKind, ProjectRead, Queued, Selection,
+    Step, SurfaceSummary, Tree, UiMessage, ViewSettings, ViewStats,
 };
 use crate::cloud::{load_cloud, load_pair_cloud, LoadedCloud};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
+use crate::logfile::{self, Level, LogFile};
 use crate::overlay::RunOverlay;
-use crate::project::{canonical, set_point_pair_enabled, Project};
+use crate::project::{canonical, change_project, set_point_pair_enabled, Choices, Project};
 use crate::render::ShowMode;
 use crate::surface::{load_mesh, surface_glb};
 use crate::synthetic::synthetic_cloud;
 use driftless_gpu::GpuPref;
-use driftless_io::progress::Progress;
+use driftless_io::progress::{LogLine, Progress};
 use driftless_steps::export::{file_kind, ExportKind, MESH_EXTENSIONS, POINT_EXTENSIONS};
 use driftless_steps::merge::MODEL_LAS;
 use driftless_steps::{correct, StepError};
 use eframe::egui;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Key of the last opened project in eframe's storage.
 const LAST_PROJECT_KEY: &str = "letztes_projekt";
@@ -36,6 +38,13 @@ pub const UI_KEY: &str = "ui-v2";
 /// While a step runs, the window draws this often, so progress and runtime move (the job
 /// runner only wakes the UI when a job ends, see `crate::jobs`).
 const REPAINT_WHILE_BUSY: Duration = Duration::from_millis(100);
+
+/// After the window got the focus back, the tree is read again this much later (switching back
+/// and forth reads it once).
+pub const FOCUS_DELAY: Duration = Duration::from_millis(300);
+/// The focus reads the tree again at most once in this time.
+pub const FOCUS_GAP: Duration = Duration::from_secs(2);
+
 /// Lines kept in the log; older ones are dropped.
 const LOG_LIMIT: usize = 10_000;
 /// Messages kept for the status bar (it shows the last); older ones are dropped.
@@ -118,6 +127,50 @@ struct StoredUi {
     point_m: Option<f32>,
     /// „Grafikkarte nutzen“ as its CLI word (`auto`, `an`, `aus`).
     gpu: String,
+    /// The folders the dialogs were last used in ([`LastFolders`]).
+    folders: LastFolders,
+}
+
+/// Which dialogs share their start folder ([`DriftlessApp::dialog_folder`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogFolder {
+    /// „Neues Projekt …“, „Projekt öffnen …“.
+    Projects,
+    /// „Scan hinzufügen …“, „Lauf hinzufügen …“.
+    Scans,
+    /// „Datei öffnen …“, the target of „Exportieren …“.
+    Files,
+}
+
+/// The folders the dialogs were last used in (the parent of a picked project or scan, the
+/// folder of a picked file), kept between starts.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LastFolders {
+    pub projects: Option<PathBuf>,
+    pub scans: Option<PathBuf>,
+    pub files: Option<PathBuf>,
+}
+
+impl LastFolders {
+    fn get(&self, kind: DialogFolder) -> Option<&Path> {
+        match kind {
+            DialogFolder::Projects => self.projects.as_deref(),
+            DialogFolder::Scans => self.scans.as_deref(),
+            DialogFolder::Files => self.files.as_deref(),
+        }
+    }
+
+    fn set(&mut self, kind: DialogFolder, dir: Option<&Path>) {
+        let slot = match kind {
+            DialogFolder::Projects => &mut self.projects,
+            DialogFolder::Scans => &mut self.scans,
+            DialogFolder::Files => &mut self.files,
+        };
+        if let Some(dir) = dir.filter(|d| !d.as_os_str().is_empty()) {
+            *slot = Some(dir.to_path_buf());
+        }
+    }
 }
 
 impl Default for StoredUi {
@@ -126,13 +179,15 @@ impl Default for StoredUi {
             Step::default(),
             &ViewSettings::default(),
             GpuPref::default(),
+            &LastFolders::default(),
         )
     }
 }
 
 impl StoredUi {
-    fn of(step: Step, v: &ViewSettings, gpu: GpuPref) -> Self {
+    fn of(step: Step, v: &ViewSettings, gpu: GpuPref, folders: &LastFolders) -> Self {
         StoredUi {
+            folders: folders.clone(),
             step,
             color_mode: v.color_mode,
             point_px: v.point_px,
@@ -227,7 +282,8 @@ enum HelperTask {
     HistoryGaps(u64),
     /// The overlay and the corrections of a run folder.
     LoadRun(PathBuf),
-    /// [`Action::AddLoop`] or [`Action::SetLoopEnabled`]: they read `submaps.bin`.
+    /// [`Action::AddLoop`], [`Action::SetLoopEnabled`] or [`Action::SetLoopUsed`]: they read
+    /// `submaps.bin`.
     Correct(Action),
     /// Two trajectories compared (reads both, well below a second).
     Compare(TrajRef, TrajRef),
@@ -235,6 +291,21 @@ enum HelperTask {
     CompareMaps(PathBuf, PathBuf),
     /// [`Action::SetPairEnabled`]: entry (from 0), on or off.
     SwitchPair(usize, bool),
+    /// Writes the choices into `auswahl.toml` of the project in the folder.
+    SaveChoices(PathBuf, Choices),
+    /// The disk use of the project for this tree version.
+    DiskUse(u64),
+    /// „Ordner neu zuordnen …“: points the scan (id) at the folder, if it holds the same scan
+    /// (reads its bags).
+    Relink { id: String, dir: PathBuf },
+    /// „Aufräumen“: these leftovers (path, bytes) to the trash.
+    CleanUp(Vec<(PathBuf, u64)>),
+    /// „Löschen …“: the folder to the trash, with its name and size for the message.
+    Trash {
+        dir: PathBuf,
+        label: String,
+        bytes: Option<u64>,
+    },
 }
 
 /// What a „compute all“ button puts into the queue.
@@ -254,6 +325,35 @@ struct QueueSettings {
     map: driftless_steps::map::MapSettings,
     surface: crate::project::SurfaceSettings,
     hand_loads: u64,
+}
+
+/// What a read of a project folder is for ([`DriftlessApp::read_folder`]).
+#[derive(Debug, Clone, PartialEq)]
+enum TreeTask {
+    /// Opening the project in this folder; `restore`: the project opened last (forgotten if
+    /// it cannot be read).
+    Open { dir: PathBuf, restore: bool },
+    /// Reading the open project again (its folder).
+    Refresh(PathBuf),
+}
+
+impl TreeTask {
+    fn dir(&self) -> &Path {
+        match self {
+            TreeTask::Open { dir, .. } | TreeTask::Refresh(dir) => dir,
+        }
+    }
+}
+
+/// The end of a step, kept until the tree read after it has arrived: then the result is
+/// selected and shown and the queue goes on ([`DriftlessApp::finish_step`]).
+#[derive(Debug)]
+struct StepEnd {
+    step: Option<Action>,
+    output: Option<JobOutput>,
+    /// It computed the head of the queue.
+    queued: bool,
+    seconds: f64,
 }
 
 pub struct DriftlessApp {
@@ -322,6 +422,42 @@ pub struct DriftlessApp {
     themed: bool,
     /// Where the panels and the floating bars were in the last frame.
     layout: ScreenLayout,
+    /// The log file of this start: every message of the status bar and every line of the
+    /// Protokoll goes into it as it comes ([`DriftlessApp::say`], [`DriftlessApp::protocol`]).
+    log_file: Option<Arc<LogFile>>,
+    /// Reads project folders (`project.toml` and the tree) off the UI thread.
+    tree_loader: JobRunner,
+    /// What the read that runs is for, and the read to start once it has ended (the newest
+    /// asked for; an open goes before a refresh).
+    tree_task: Option<TreeTask>,
+    tree_next: Option<TreeTask>,
+    /// The result of the read that runs is not wanted any more (an open cancelled).
+    tree_discard: bool,
+    /// A finished step waiting for the tree read after it.
+    step_end: Option<StepEnd>,
+    /// How a folder is told to be in cloud storage ([`crate::places::cloud_storage`]).
+    cloud_check: CloudCheck,
+    /// The project folders whose cloud storage was told in this session (once each).
+    cloud_told: BTreeSet<PathBuf>,
+    /// The folders the dialogs were last used in, and the projects folder they start in
+    /// before (`~/Driftless Projekte`; `None`: the system's choice).
+    folders: LastFolders,
+    projects_home: Option<PathBuf>,
+    /// The choices last written into (or read from) the project in the folder: they are
+    /// written again when they differ ([`DriftlessApp::keep_choices`]).
+    saved_choices: Option<(PathBuf, Choices)>,
+    /// The [`AppState::tree_version`] the disk use was last measured for.
+    disk_asked: u64,
+    /// How the free space of a drive is told ([`crate::disk::free_space`]).
+    free_space: crate::disk::FreeSpace,
+    /// Little free space was told (again only once there was enough in between).
+    low_space_told: bool,
+    /// How folders go to the trash ([`crate::trash::system_trash`]).
+    trash: crate::trash::Trash,
+    /// When the tree is read again after the window got the focus back ([`FOCUS_DELAY`]).
+    focus_read_at: Option<Instant>,
+    /// When the last such read started ([`FOCUS_GAP`]).
+    focus_read: Option<Instant>,
 }
 
 impl DriftlessApp {
@@ -334,7 +470,7 @@ impl DriftlessApp {
             helper_queue: VecDeque::new(),
             helper_running: None,
             loader: JobRunner::new(repaint.clone()),
-            surface_loader: JobRunner::new(repaint),
+            surface_loader: JobRunner::new(repaint.clone()),
             surface_loading: None,
             next_surface: None,
             surface_stamp: None,
@@ -359,22 +495,111 @@ impl DriftlessApp {
             forget_last: false,
             themed: false,
             layout: ScreenLayout::default(),
+            log_file: None,
+            tree_loader: JobRunner::new(repaint),
+            tree_task: None,
+            tree_next: None,
+            tree_discard: false,
+            step_end: None,
+            cloud_check: crate::places::cloud_storage,
+            cloud_told: BTreeSet::new(),
+            folders: LastFolders::default(),
+            projects_home: crate::places::projects_home(),
+            saved_choices: None,
+            disk_asked: 0,
+            free_space: crate::disk::free_space,
+            low_space_told: false,
+            trash: crate::trash::system_trash,
+            focus_read_at: None,
+            focus_read: None,
         }
     }
 
-    /// For eframe: opens the project of `args`, else the project opened last, and starts
-    /// generating the synthetic cloud if asked for.
-    pub fn from_creation_context(cc: &eframe::CreationContext<'_>, args: Args) -> Self {
+    /// With another trash (tests: not the system's).
+    pub fn with_trash(mut self, trash: crate::trash::Trash) -> Self {
+        self.trash = trash;
+        self
+    }
+
+    /// With another way to tell the free space of a drive (tests).
+    pub fn with_free_space(mut self, free: crate::disk::FreeSpace) -> Self {
+        self.free_space = free;
+        self
+    }
+
+    /// With another projects folder for the dialogs to start in (tests: not the home folder).
+    pub fn with_projects_home(mut self, dir: Option<PathBuf>) -> Self {
+        self.projects_home = dir;
+        self
+    }
+
+    /// The folder the dialogs of `kind` open in: the one they were last used in if it is still
+    /// there, else the projects folder (`~/Driftless Projekte`, made now if missing).
+    pub fn dialog_folder(&self, kind: DialogFolder) -> Option<PathBuf> {
+        crate::places::start_folder(self.folders.get(kind), self.projects_home.clone())
+    }
+
+    /// Remembers where a dialog of `kind` was used: the folder `dir`.
+    pub fn remember_folder(&mut self, kind: DialogFolder, dir: Option<&Path>) {
+        self.folders.set(kind, dir);
+    }
+
+    /// A folder dialog of `kind` with its title, opening in [`DriftlessApp::dialog_folder`].
+    fn dialog(&self, kind: DialogFolder, title: &str) -> rfd::FileDialog {
+        let dialog = rfd::FileDialog::new().set_title(title);
+        match self.dialog_folder(kind) {
+            Some(dir) => dialog.set_directory(dir),
+            None => dialog,
+        }
+    }
+
+    /// With another way to tell cloud storage (tests).
+    pub fn with_cloud_check(mut self, check: CloudCheck) -> Self {
+        self.cloud_check = check;
+        self
+    }
+
+    /// With the log file of this start: what the window says goes into it as well.
+    pub fn with_log_file(mut self, log: Arc<LogFile>) -> Self {
+        self.log_file = Some(log);
+        self
+    }
+
+    /// For eframe: writes the start line into the log file `log` (with the graphics adapter
+    /// eframe chose and the project to open), opens the project of `args`, else the project
+    /// opened last, and starts generating the synthetic cloud if asked for.
+    pub fn from_creation_context(
+        cc: &eframe::CreationContext<'_>,
+        args: Args,
+        log: Option<Arc<LogFile>>,
+    ) -> Self {
         let ctx = cc.egui_ctx.clone();
         super::theme::apply(&cc.egui_ctx);
         let mut app = DriftlessApp::new(Arc::new(move || ctx.request_repaint()));
+        app.log_file = log;
         app.themed = true;
         app.render_state = cc.wgpu_render_state.clone();
         app.restore_ui(&cc.egui_ctx, cc.storage);
+        let last = cc
+            .storage
+            .and_then(|s| s.get_string(LAST_PROJECT_KEY))
+            .filter(|s| !s.is_empty());
+        if let Some(file) = &app.log_file {
+            let gpu = cc.wgpu_render_state.as_ref().map(|rs| {
+                let info = rs.adapter.get_info();
+                let details = [
+                    format!("{:?}", info.backend),
+                    format!("{:?}", info.device_type),
+                    format!("{} {}", info.driver, info.driver_info),
+                ];
+                logfile::gpu_text(&info.name, &details)
+            });
+            let project = args.project.clone().or(last.clone().map(PathBuf::from));
+            file.write_start(gpu.as_deref(), project.as_deref());
+        }
         if let Some(dir) = args.project {
             app.apply(Action::OpenProject(dir));
         } else {
-            let last = cc.storage.and_then(|s| s.get_string(LAST_PROJECT_KEY));
             app.restore_last(last.as_deref());
         }
         if let Some(n) = args.synthetic {
@@ -448,13 +673,14 @@ impl DriftlessApp {
     }
 
     /// Follows the selection: the run of the selection, else of the cloud, is drawn and its
-    /// corrections are shown; reading them is queued for the helper.
+    /// corrections are shown; reading them is queued for the helper. A model and its surfaces
+    /// have no run of their own: none is drawn over them, not even that of the cloud before.
     fn sync_run(&mut self) {
-        let wanted = self
-            .state
-            .selected_run()
-            .map(|(_, r)| r.dir.clone())
-            .or_else(|| self.cloud_run.clone());
+        let wanted = match self.state.selected_run() {
+            Some((_, r)) => Some(r.dir.clone()),
+            None if self.state.selected_model().is_some() => None,
+            None => self.cloud_run.clone(),
+        };
         if self.state.correct.for_run(wanted.as_deref()) {
             if self.overlay.take().is_some() {
                 self.overlay_version += 1;
@@ -481,7 +707,20 @@ impl DriftlessApp {
         if self.state.correct.run.as_ref() != Some(&loaded.run) {
             return;
         }
+        // a run without its report: the tree says so („unvollständig – neu rechnen“)
+        let incomplete = self
+            .state
+            .run(&loaded.run)
+            .is_some_and(|(_, r)| r.incomplete);
         self.state.correct.corrections = Some(loaded.corrections);
+        let c = &mut self.state.correct;
+        (c.auto_loops, c.submap_starts) = match &loaded.overlay {
+            Ok(o) => (
+                super::correct::auto_loops(&o.report),
+                o.report.submaps.iter().map(|m| m.t_start).collect(),
+            ),
+            Err(_) => (Vec::new(), Vec::new()),
+        };
         match loaded.overlay {
             Ok(mut o) => {
                 o.set_origin(self.view_origin());
@@ -490,17 +729,24 @@ impl DriftlessApp {
             }
             Err(e) => {
                 self.overlay = None;
-                self.error(e);
+                if !incomplete {
+                    self.error(e);
+                }
             }
         }
         self.overlay_version += 1;
     }
 
-    /// A change of the corrections ended: its answer goes into the panel unchanged.
+    /// A change of the corrections ended: its answer goes into the panel (a refusal also into
+    /// the Protokoll and the log file). An automatic loop switched on or off recomputes the
+    /// run at once if no step runs (else „Jetzt neu rechnen“ waits).
     fn corrected(&mut self, action: &Action, result: Result<JobOutput, StepError>) {
         let c = &mut self.state.correct;
         c.busy = false;
-        let (Action::AddLoop { run, .. } | Action::SetLoopEnabled { run, .. }) = action else {
+        let (Action::AddLoop { run, .. }
+        | Action::SetLoopEnabled { run, .. }
+        | Action::SetLoopUsed { run, .. }) = action
+        else {
             return;
         };
         let shown = c.run.as_ref() == Some(run);
@@ -515,13 +761,35 @@ impl DriftlessApp {
                         c.clear_places();
                     }
                     c.corrections = Some(Ok(done.corrections));
-                    c.message = Some(UiMessage::Info(done.message));
+                    c.message = Some(UiMessage::Info(text::shown(&done.message).into_owned()));
+                }
+                let switched = matches!(action, Action::SetLoopUsed { .. });
+                if switched && done.changed && !self.jobs.is_busy() {
+                    self.apply(Action::Reuse(done.run));
                 }
             }
             Ok(_) => {}
-            Err(e) if shown => c.message = Some(UiMessage::Error(e.to_string())),
+            Err(e) if shown => {
+                let m = UiMessage::Error(text::shown(&text::german(&e.to_string())).into_owned());
+                self.note(&m);
+                self.state.correct.message = Some(m);
+            }
             Err(e) => self.error(e.to_string()),
         }
+    }
+
+    /// A warning or an error shown in a panel, not on the status bar: into the Protokoll and
+    /// the log file as well.
+    fn note(&mut self, m: &UiMessage) {
+        let (level, kind) = match m {
+            UiMessage::Info(_) => return,
+            UiMessage::Warning(_) => (Level::Warning, LogKind::Warning),
+            UiMessage::Error(_) => (Level::Error, LogKind::Error),
+        };
+        if let Some(file) = &self.log_file {
+            file.write(level, m.text());
+        }
+        self.protocol(kind, m.text());
     }
 
     /// Queues a change of the corrections (one at a time).
@@ -938,9 +1206,24 @@ impl DriftlessApp {
     }
 
     /// Loads the cloud or surface of `selection` if it is one, a cloud with the quality of
-    /// its run.
+    /// its run; for a map its best cloud, in „Bilder“ its newest fitting surface if it has one.
     fn load_selected(&mut self) {
         match self.state.selection.clone() {
+            Selection::Map(dir) => {
+                let surface = self
+                    .state
+                    .map(&dir)
+                    .filter(|_| self.state.step == Step::Bilder)
+                    .and_then(|(_, _, m)| m.surfaces.iter().rev().find(|s| !s.stale))
+                    .map(|s| s.dir.clone());
+                match surface {
+                    Some(surface) => {
+                        self.surface_by_hand = true;
+                        self.load_surface(&surface);
+                    }
+                    None => self.load_best_of_map(&dir),
+                }
+            }
             Selection::Cloud(path) if self.is_model_cloud(&path) => self.load_model_cloud(path),
             Selection::Cloud(path) => {
                 let run = self.state.selected_run().map(|(_, r)| r.dir.clone());
@@ -998,17 +1281,258 @@ impl DriftlessApp {
         }
     }
 
-    /// Opens the stored last project (an empty value is none). If it cannot be opened, the
-    /// message is shown once and the value is forgotten ([`DriftlessApp::last_to_store`]).
+    /// Opens the stored last project (an empty value is none), in the background. If it cannot
+    /// be opened, the message is shown once and the value is forgotten
+    /// ([`DriftlessApp::last_to_store`]).
     pub fn restore_last(&mut self, stored: Option<&str>) {
         let Some(last) = stored.filter(|s| !s.is_empty()) else {
             return;
         };
-        match Project::open(Path::new(last)) {
-            Ok(p) => self.set_project(p),
-            Err(e) => {
-                self.error(text::last_project_gone(&e.to_string()));
-                self.forget_last = true;
+        self.read_folder(TreeTask::Open {
+            dir: PathBuf::from(last),
+            restore: true,
+        });
+    }
+
+    /// Reads a project folder in the background for `task`; while a read runs, it is read once
+    /// that has ended (the newest task wins, an open goes before a refresh).
+    fn read_folder(&mut self, task: TreeTask) {
+        if self.tree_loader.is_busy() {
+            let open_waits = matches!(self.tree_next, Some(TreeTask::Open { .. }));
+            if !(open_waits && matches!(task, TreeTask::Refresh(_))) {
+                self.tree_next = Some(task);
+            }
+            // a read of another folder for an open is not wanted any more
+            self.tree_discard = matches!(self.tree_next, Some(TreeTask::Open { .. }));
+            self.sync_tree_state();
+            return;
+        }
+        let dir = task.dir().to_path_buf();
+        let cloud = self.cloud_check;
+        let started = self.tree_loader.start(text::READ_PROJECT_JOB, move |_| {
+            Ok(JobOutput::ProjectRead(Box::new(read_project(&dir, cloud)?)))
+        });
+        match started {
+            Ok(()) => {
+                self.tree_task = Some(task);
+                self.tree_discard = false;
+            }
+            Err(e) => self.error(e.to_string()),
+        }
+        self.sync_tree_state();
+    }
+
+    /// Reads the open project again in the background (after a change, a step, the window
+    /// coming to the front); its tree stays shown until the new one is there.
+    fn refresh_tree(&mut self) {
+        if let Some(dir) = self.state.project.as_ref().map(|p| p.dir.clone()) {
+            self.read_folder(TreeTask::Refresh(dir));
+        }
+    }
+
+    /// Whether a read of a project folder runs or waits.
+    fn tree_pending(&self) -> bool {
+        self.tree_loader.is_busy() || self.tree_next.is_some()
+    }
+
+    /// [`AppState::opening`] and [`AppState::tree_pending`] as the reads stand.
+    fn sync_tree_state(&mut self) {
+        let open = |t: &Option<TreeTask>| match t {
+            Some(TreeTask::Open { dir, .. }) => Some(dir.clone()),
+            _ => None,
+        };
+        let running = open(&self.tree_task).filter(|_| !self.tree_discard);
+        self.state.opening = open(&self.tree_next).or(running);
+        self.state.tree_pending = self.tree_pending();
+    }
+
+    /// Takes a project folder that has been read: an opened project is shown, a read of the
+    /// open one replaces its tree; then a waiting read starts, and once none is left the end
+    /// of a step that waited for it is carried out and the queue goes on.
+    fn tick_tree(&mut self) {
+        if let Some(f) = self.tree_loader.poll() {
+            let task = self.tree_task.take();
+            let discard = std::mem::take(&mut self.tree_discard);
+            match (task, f.result) {
+                (_, _) if discard => {}
+                (Some(TreeTask::Open { .. }), Ok(JobOutput::ProjectRead(read))) => {
+                    self.opened(*read)
+                }
+                (Some(TreeTask::Open { restore, .. }), Err(e)) => {
+                    let e = text::step_error(&e);
+                    if restore {
+                        self.error(text::last_project_gone(&e));
+                        self.forget_last = true;
+                    } else {
+                        self.error(e);
+                    }
+                }
+                // a read of the project shown (another one may have been opened since)
+                (Some(TreeTask::Refresh(dir)), result) if self.is_shown(&dir) => match result {
+                    Ok(JobOutput::ProjectRead(read)) => {
+                        let ProjectRead {
+                            project,
+                            tree,
+                            cloud,
+                            ..
+                        } = *read;
+                        self.state.project = Some(project);
+                        self.state.set_tree(tree);
+                        self.tell_cloud(&dir, cloud);
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.error(text::step_error(&e)),
+                },
+                _ => {}
+            }
+            if let Some(next) = self.tree_next.take() {
+                self.read_folder(next);
+            }
+        }
+        self.sync_tree_state();
+        if !self.tree_pending() {
+            if let Some(end) = self.step_end.take() {
+                self.finish_step(end);
+            }
+            self.advance_queue();
+        }
+    }
+
+    /// An opened project: shown from now on, nothing selected; a queue of the project before
+    /// stops, its measurements and surface go.
+    fn opened(&mut self, read: ProjectRead) {
+        self.stop_queue();
+        // the measurements belong to the project shown (they are not saved yet)
+        self.state.measurements.clear();
+        self.state.measure_a = None;
+        self.drop_surface();
+        let ProjectRead {
+            project,
+            tree,
+            cloud,
+            choices,
+        } = read;
+        let (name, dir) = (project.name.clone(), project.dir.clone());
+        self.state.show_project(project, tree);
+        // what was chosen in it last, else the defaults
+        let choices = choices.unwrap_or_else(|| {
+            Choices::of(
+                &driftless_steps::map::MapSettings::default(),
+                &crate::project::SurfaceSettings::default(),
+            )
+        });
+        choices.apply(
+            &mut self.state.map_settings,
+            &mut self.state.surface_settings,
+        );
+        self.saved_choices = Some((
+            dir.clone(),
+            Choices::of(&self.state.map_settings, &self.state.surface_settings),
+        ));
+        self.info(text::project_opened(&name));
+        self.tell_cloud(&dir, cloud);
+    }
+
+    /// Takes a measurement of the disk use; little free space ([`crate::disk::LOW_SPACE`]) is
+    /// warned about once, again only after there was enough in between.
+    fn disk_measured(&mut self, disk: crate::disk::DiskUse) {
+        let free = disk.free;
+        self.state.disk = Some(disk);
+        match free {
+            Some(free) if free < crate::disk::LOW_SPACE => {
+                if !std::mem::replace(&mut self.low_space_told, true) {
+                    self.warn(text::low_space(free));
+                }
+            }
+            Some(_) => self.low_space_told = false,
+            None => {}
+        }
+    }
+
+    /// What the step `step` will write at most ([`crate::disk::need`]), from the raw data of
+    /// its scans as last measured; `None` without a measurement or for a step that writes
+    /// little.
+    fn room_needed(&self, step: &Action) -> Option<u64> {
+        use crate::disk::{need, NeedKind};
+        let disk = self.state.disk.as_ref()?;
+        let project = self.state.project.as_ref()?;
+        let raw_of_scan = |path: &Path| disk.raw.get(path).copied().unwrap_or(0);
+        let raw_of_id = |id: &str| project.scan(id).map_or(0, |e| raw_of_scan(&e.path));
+        let map_voxel = self.state.map_settings.switches.voxel;
+        let surface_voxel = self.state.surface_settings.config.voxel;
+        let model_raw = |dir: &Path| {
+            self.state.model(dir).map_or(0, |m| {
+                m.report.members.iter().map(|m| raw_of_scan(&m.scan)).sum()
+            })
+        };
+        Some(match step {
+            Action::RunSlam(id) => need(NeedKind::Slam, raw_of_id(id), map_voxel),
+            Action::RunMap(run) => {
+                let (scan, _) = self.state.run(run)?;
+                need(NeedKind::Map, raw_of_id(&scan.id), map_voxel)
+            }
+            Action::RunSurface(map) => {
+                let (scan, _, _) = self.state.map(map)?;
+                need(NeedKind::Surface, raw_of_id(&scan.id), surface_voxel)
+            }
+            Action::RunMerge { picks, .. } => {
+                let raw = picks.iter().map(|p| raw_of_id(&p.scan_id)).sum();
+                need(NeedKind::Model, raw, map_voxel)
+            }
+            Action::ApplyPairs { model, .. } => need(NeedKind::Model, model_raw(model), map_voxel),
+            Action::RunModelSurface { model } => {
+                need(NeedKind::Surface, model_raw(model), surface_voxel)
+            }
+            _ => return None,
+        })
+    }
+
+    /// A step that started: if it will need more than is free on the drive of the project, a
+    /// warning (it still runs).
+    fn check_room(&mut self, step: &Action) {
+        let free = self.state.disk.as_ref().and_then(|d| d.free);
+        let (Some(free), Some(need)) = (free, self.room_needed(step)) else {
+            return;
+        };
+        if need > free {
+            let label = self
+                .state
+                .job
+                .as_ref()
+                .map_or_else(String::new, |j| j.label.clone());
+            self.warn(text::needs_room(&label, need, free));
+        }
+    }
+
+    /// Writes the precision, fineness and „ohne Fotos“ chosen into `auswahl.toml` of the
+    /// project once they differ from what it holds (in the background, the newest only).
+    fn keep_choices(&mut self) {
+        let Some(dir) = self.state.project.as_ref().map(|p| p.dir.clone()) else {
+            return;
+        };
+        if self.state.opening.is_some() {
+            return;
+        }
+        let now = Choices::of(&self.state.map_settings, &self.state.surface_settings);
+        if self
+            .saved_choices
+            .as_ref()
+            .is_some_and(|(d, c)| *d == dir && *c == now)
+        {
+            return;
+        }
+        self.saved_choices = Some((dir.clone(), now.clone()));
+        self.helper_queue
+            .retain(|t| !matches!(t, HelperTask::SaveChoices(..)));
+        self.helper_queue
+            .push_back(HelperTask::SaveChoices(dir, now));
+    }
+
+    /// Warns once per session and project folder that it lies in cloud storage.
+    fn tell_cloud(&mut self, dir: &Path, cloud: Option<String>) {
+        if let Some(cloud) = cloud {
+            if self.cloud_told.insert(dir.to_path_buf()) {
+                self.warn(text::project_in_cloud(&cloud, dir));
             }
         }
     }
@@ -1026,6 +1550,7 @@ impl DriftlessApp {
                 self.state.step = ui.step;
                 ui.apply_to(&mut self.state.view);
                 self.state.gpu = ui.gpu();
+                self.folders = ui.folders;
             }
             None => ctx.memory_mut(|m| {
                 m.data.clear();
@@ -1036,7 +1561,12 @@ impl DriftlessApp {
 
     /// The layout to store under [`UI_KEY`].
     pub fn ui_to_store(&self) -> String {
-        let ui = StoredUi::of(self.state.step, &self.state.view, self.state.gpu);
+        let ui = StoredUi::of(
+            self.state.step,
+            &self.state.view,
+            self.state.gpu,
+            &self.folders,
+        );
         serde_json::to_string(&ui).unwrap_or_default()
     }
 
@@ -1104,8 +1634,22 @@ impl DriftlessApp {
             || !self.helper_queue.is_empty()
             || self.is_loading()
             || self.surface_loader.is_busy()
+            || self.tree_pending()
+            || self.step_end.is_some()
             || self.status_asked != self.state.tree_version
             || self.gaps_asked != self.state.tree_version
+            || (self.state.project.is_some() && self.disk_asked != self.state.tree_version)
+            || self.focus_read_at.is_some()
+    }
+
+    /// The window got the focus back: the tree is read again [`FOCUS_DELAY`] later (a scan
+    /// folder may have come back, another window or program may have computed), at most once
+    /// per [`FOCUS_GAP`].
+    fn focus_back(&mut self) {
+        let recent = self.focus_read.is_some_and(|t| t.elapsed() < FOCUS_GAP);
+        if self.state.project.is_some() && self.focus_read_at.is_none() && !recent {
+            self.focus_read_at = Some(Instant::now() + FOCUS_DELAY);
+        }
     }
 
     /// Takes what the helper finished and starts its next task: queued ones first, then the
@@ -1141,6 +1685,33 @@ impl DriftlessApp {
                 (Some(HelperTask::SwitchPair(index, enabled)), result) => {
                     self.pair_switched(index, enabled, result.map(|_| ()));
                 }
+                (Some(HelperTask::SaveChoices(..)), Err(e)) => self.error(e.to_string()),
+                (Some(HelperTask::Relink { id, .. }), result) => self.relinked(&id, result),
+                (Some(HelperTask::CleanUp(_)), Ok(JobOutput::CleanedUp { moved, failed })) => {
+                    if !moved.is_empty() {
+                        self.info(text::cleaned_up(moved.len(), moved.iter().sum()));
+                    }
+                    for e in failed {
+                        self.error(e);
+                    }
+                    self.refresh_tree();
+                }
+                (Some(HelperTask::Trash { dir, label, bytes }), result) => match result {
+                    Ok(_) => {
+                        if self.selection_in(&dir) {
+                            self.state.selection = Selection::None;
+                        }
+                        self.info(text::deleted(&label, bytes));
+                        self.refresh_tree();
+                    }
+                    Err(e) => self.error(text::step_error(&e)),
+                },
+                (Some(HelperTask::DiskUse(v)), Ok(JobOutput::DiskUse(disk))) => {
+                    // a measure of an older tree still says the free space
+                    if v == self.state.tree_version || self.state.disk.is_none() {
+                        self.disk_measured(*disk);
+                    }
+                }
                 (Some(HelperTask::CompareMaps(a, b)), result) => {
                     let c = &mut self.state.compare;
                     if c.map_a.as_ref() == Some(&a) && c.map_b.as_ref() == Some(&b) {
@@ -1162,13 +1733,27 @@ impl DriftlessApp {
             .helper_queue
             .pop_front()
             .or_else(|| (self.status_asked != version).then_some(HelperTask::MapStatus(version)))
-            .or_else(|| (self.gaps_asked != version).then_some(HelperTask::HistoryGaps(version)));
+            .or_else(|| (self.gaps_asked != version).then_some(HelperTask::HistoryGaps(version)))
+            .or_else(|| {
+                let project = self.state.project.is_some() && self.state.opening.is_none();
+                (project && self.disk_asked != version).then_some(HelperTask::DiskUse(version))
+            });
         if let Some(task) = task {
             self.start_helper(task);
         }
     }
 
     fn start_helper(&mut self, task: HelperTask) {
+        // what is shown or computed now: a step may have started since the click
+        let blocked = match &task {
+            HelperTask::Trash { dir, .. } => self.state.delete_blocked(dir),
+            HelperTask::CleanUp(_) => self.state.clean_up_blocked().map(str::to_string),
+            _ => None,
+        };
+        if let Some(why) = blocked {
+            self.error(why);
+            return;
+        }
         let started = match &task {
             HelperTask::MapStatus(_) => {
                 let job = self.state.map_status_job();
@@ -1220,18 +1805,79 @@ impl DriftlessApp {
                     Ok(JobOutput::Done)
                 })
             }
+            HelperTask::DiskUse(_) => match self.state.disk_job(self.free_space) {
+                Some(job) => self.helper.start(text::DISK_JOB, move |_| {
+                    Ok(JobOutput::DiskUse(Box::new(job())))
+                }),
+                None => Ok(()),
+            },
+            HelperTask::Relink { id, dir } => {
+                let project = self.state.project.as_ref().map(|p| p.dir.clone());
+                let (id, dir) = (id.clone(), dir.clone());
+                self.helper.start(text::RELINK_JOB, move |_| {
+                    let project = project.ok_or(text::NO_PROJECT)?;
+                    let (project, _, checked) =
+                        change_project(&project, None, |p| p.relink_scan(&id, &dir))?;
+                    Ok(JobOutput::Relinked {
+                        project: Box::new(project),
+                        checked,
+                    })
+                })
+            }
+            HelperTask::CleanUp(leftovers) => {
+                let (leftovers, trash) = (leftovers.clone(), self.trash);
+                self.helper.start(text::CLEAN_UP_JOB, move |_| {
+                    let (mut moved, mut failed) = (Vec::new(), Vec::new());
+                    for (path, bytes) in leftovers {
+                        // a job that started in it, or finished results that came meanwhile,
+                        // keep a folder where it is
+                        if !crate::leftovers::may_clean_up(&path) {
+                            continue;
+                        }
+                        match trash(&path) {
+                            Ok(()) => moved.push(bytes),
+                            Err(e) => failed.push(e),
+                        }
+                    }
+                    Ok(JobOutput::CleanedUp { moved, failed })
+                })
+            }
+            HelperTask::Trash { dir, .. } => {
+                let (dir, trash) = (dir.clone(), self.trash);
+                self.helper.start(text::TRASH_JOB, move |_| {
+                    // a job of another window or program that started meanwhile keeps it
+                    if let Some(holder) = crate::leftovers::busy_below(&dir) {
+                        return Err(text::delete_busy(&holder).into());
+                    }
+                    trash(&dir)?;
+                    Ok(JobOutput::Done)
+                })
+            }
+            HelperTask::SaveChoices(dir, choices) => {
+                let (dir, choices) = (dir.clone(), choices.clone());
+                self.helper.start(text::CHOICES_JOB, move |_| {
+                    choices.save(&dir)?;
+                    Ok(JobOutput::Done)
+                })
+            }
         };
         match started {
             Ok(()) => {
                 match task {
                     HelperTask::MapStatus(v) => self.status_asked = v,
                     HelperTask::HistoryGaps(v) => self.gaps_asked = v,
+                    HelperTask::DiskUse(v) => self.disk_asked = v,
                     _ => {}
                 }
-                self.helper_running = Some(task);
+                // a measurement without a project started nothing
+                self.helper_running = self.helper.is_busy().then_some(task);
             }
             // the map statuses are asked again at the next frame
-            Err(_) if matches!(task, HelperTask::MapStatus(_) | HelperTask::HistoryGaps(_)) => {}
+            Err(_)
+                if matches!(
+                    task,
+                    HelperTask::MapStatus(_) | HelperTask::HistoryGaps(_) | HelperTask::DiskUse(_)
+                ) => {}
             Err(e) => match &task {
                 HelperTask::Correct(action) => {
                     self.corrected(action, Err(StepError::Failed(e.to_string())))
@@ -1240,6 +1886,12 @@ impl DriftlessApp {
                 HelperTask::CompareMaps(..) => self.state.compare.maps = Some(Err(e.to_string())),
                 &HelperTask::SwitchPair(index, enabled) => {
                     self.pair_switched(index, enabled, Err(StepError::Failed(e.to_string())))
+                }
+                // tried again with the next change
+                HelperTask::SaveChoices(..) => self.saved_choices = None,
+                HelperTask::Relink { id, .. } => {
+                    let id = id.clone();
+                    self.relinked(&id, Err(StepError::Failed(e.to_string())))
                 }
                 _ => self.error(e.to_string()),
             },
@@ -1259,18 +1911,33 @@ impl DriftlessApp {
 
     /// Once per frame: takes a finished step, the new log lines and the progress.
     pub fn tick(&mut self) {
+        // the lines of a step before its end, so that its summary comes before „fertig“
+        let lines = self.jobs.take_log();
+        self.take_lines(lines);
         if let Some(finished) = self.jobs.poll() {
+            let lines = self.jobs.take_log();
+            self.take_lines(lines);
             self.finished(finished);
         }
-        self.state.log.extend(self.jobs.take_log());
         self.state.job = self.jobs.status();
         self.tick_loader();
         self.tick_surface_loader();
         // what the readers say about a file they read anyway (a missing OBJ texture, …)
-        self.state.log.extend(self.loader.take_log());
-        self.state.log.extend(self.surface_loader.take_log());
-        let over = self.state.log.len().saturating_sub(LOG_LIMIT);
-        self.state.log.drain(..over);
+        let lines = self.loader.take_log();
+        self.take_lines(lines);
+        let lines = self.surface_loader.take_log();
+        self.take_lines(lines);
+        if self.focus_read_at.is_some_and(|at| Instant::now() >= at) {
+            self.focus_read_at = None;
+            self.focus_read = Some(Instant::now());
+            self.refresh_tree();
+        }
+        self.tick_tree();
+        self.keep_choices();
+        // the read of a project being opened, where no cloud or surface is being loaded
+        if self.state.loading.is_none() && self.state.opening.is_some() {
+            self.state.loading = self.tree_loader.status();
+        }
         self.sync_run();
         self.sync_compare();
         self.tick_helper();
@@ -1309,8 +1976,28 @@ impl DriftlessApp {
                 None
             }
         };
-        // the step may have added runs or maps
-        self.reload_project();
+        let end = StepEnd {
+            step,
+            output,
+            queued,
+            seconds: f.seconds,
+        };
+        // the step may have added runs or maps: its result is shown once the tree is read
+        // again (also after a check or an export: whatever changed on disk meanwhile shows)
+        self.step_end = Some(end);
+        self.refresh_tree();
+    }
+
+    /// The end of a step, once the tree after it is read: the queue counts it, its result is
+    /// selected and shown (a step of a queue only as its last), and a waiting switch of the
+    /// project follows.
+    fn finish_step(&mut self, end: StepEnd) {
+        let StepEnd {
+            step,
+            output,
+            queued,
+            seconds,
+        } = end;
         let hand_loads = self.queue_settings.as_ref().map(|q| q.hand_loads);
         if queued {
             self.queue_step_done(step.as_ref(), output.is_some());
@@ -1381,7 +2068,7 @@ impl DriftlessApp {
                 self.state.inspect = Some(InspectResult {
                     scan,
                     report: *report,
-                    seconds: f.seconds,
+                    seconds,
                 });
             }
             _ => {}
@@ -1418,10 +2105,13 @@ impl DriftlessApp {
         self.compute_all_waiting = None;
     }
 
-    /// Whether the map statuses of the current tree are still being checked.
+    /// Whether the map statuses of the current tree are still being checked (or the tree is
+    /// still being read).
     fn map_status_pending(&self) -> bool {
         self.status_asked != self.state.tree_version
             || matches!(self.helper_running, Some(HelperTask::MapStatus(_)))
+            || self.tree_pending()
+            || self.step_end.is_some()
     }
 
     /// [`Action::ComputeAllMaps`] (the new and stale scans) or [`Action::ComputeAllSurfaces`]
@@ -1481,7 +2171,12 @@ impl DriftlessApp {
     /// Starts the next step of the queue unless a step runs, with the settings the queue
     /// started with. A step that cannot start stops the queue with its reason.
     fn advance_queue(&mut self) {
-        if self.jobs.is_busy() || self.state.queue.is_empty() {
+        // the next step is told from the tree: wait for the read after a step or a change
+        if self.jobs.is_busy()
+            || self.state.queue.is_empty()
+            || self.tree_pending()
+            || self.step_end.is_some()
+        {
             return;
         }
         let started = match self.state.next_queued_step() {
@@ -1494,6 +2189,9 @@ impl DriftlessApp {
                     hand_loads: q.hand_loads,
                 });
                 let started = actions::start_step(&mut self.state, &mut self.jobs, &step);
+                if started.is_ok() {
+                    self.check_room(&step);
+                }
                 if let Some(own) = own {
                     self.state.slam_settings = own.slam;
                     self.state.map_settings = own.map;
@@ -1515,10 +2213,11 @@ impl DriftlessApp {
     pub fn apply(&mut self, action: Action) {
         match action {
             Action::PickNewProject => {
-                if let Some(dir) = rfd::FileDialog::new()
-                    .set_title(text::DIALOG_NEW_PROJECT)
+                if let Some(dir) = self
+                    .dialog(DialogFolder::Projects, text::DIALOG_NEW_PROJECT)
                     .pick_folder()
                 {
+                    self.remember_folder(DialogFolder::Projects, dir.parent());
                     let name = dir.file_name().map_or_else(
                         || text::DEFAULT_PROJECT_NAME.into(),
                         |n| n.to_string_lossy().into_owned(),
@@ -1527,18 +2226,19 @@ impl DriftlessApp {
                 }
             }
             Action::PickOpenProject => {
-                if let Some(dir) = rfd::FileDialog::new()
-                    .set_title(text::DIALOG_OPEN_PROJECT)
+                if let Some(dir) = self
+                    .dialog(DialogFolder::Projects, text::DIALOG_OPEN_PROJECT)
                     .pick_folder()
                 {
+                    self.remember_folder(DialogFolder::Projects, dir.parent());
                     self.apply(Action::OpenProject(dir));
                 }
             }
             Action::OpenProject(dir) if self.is_open(&dir) => {
                 // already shown: nothing to switch, nothing to cancel (a pending switch to
-                // another project is dropped, the user chose this one)
+                // another project is dropped, the user chose this one); read it again
                 self.pending = None;
-                self.state.refresh();
+                self.refresh_tree();
             }
             switch @ (Action::OpenProject(_) | Action::NewProject { .. })
                 if self.jobs.is_busy() =>
@@ -1549,20 +2249,38 @@ impl DriftlessApp {
                 self.pending = Some(switch);
                 self.info(text::SWITCH_AFTER_CANCEL.to_string());
             }
-            Action::OpenProject(dir) => match Project::open(&dir) {
-                Ok(p) => self.set_project(p),
-                Err(e) => self.error(e.to_string()),
-            },
+            // the end of a step of the old project is still to show: switch after it
+            switch @ (Action::OpenProject(_) | Action::NewProject { .. })
+                if self.step_end.is_some() =>
+            {
+                self.pending = Some(switch);
+            }
+            Action::OpenProject(dir) => self.read_folder(TreeTask::Open {
+                dir,
+                restore: false,
+            }),
             Action::NewProject { dir, name } => match Project::create(&dir, &name) {
-                Ok(p) => self.set_project(p),
+                Ok(p) => {
+                    // a new project has no tree yet; its folder is read once for the check of
+                    // cloud storage
+                    let read = ProjectRead {
+                        project: p,
+                        tree: Tree::default(),
+                        cloud: None,
+                        choices: None,
+                    };
+                    self.opened(read);
+                    self.refresh_tree();
+                }
                 Err(e) => self.error(e.to_string()),
             },
             Action::PickAddScan => {
                 if self.state.project.is_some() {
-                    if let Some(dir) = rfd::FileDialog::new()
-                        .set_title(text::DIALOG_ADD_SCAN)
+                    if let Some(dir) = self
+                        .dialog(DialogFolder::Scans, text::DIALOG_ADD_SCAN)
                         .pick_folder()
                     {
+                        self.remember_folder(DialogFolder::Scans, dir.parent());
                         self.apply(Action::AddScan(dir));
                     }
                 }
@@ -1573,10 +2291,11 @@ impl DriftlessApp {
             }),
             Action::PickAddRun(scan) => {
                 if self.state.project.is_some() {
-                    if let Some(dir) = rfd::FileDialog::new()
-                        .set_title(text::DIALOG_ADD_RUN)
+                    if let Some(dir) = self
+                        .dialog(DialogFolder::Scans, text::DIALOG_ADD_RUN)
                         .pick_folder()
                     {
+                        self.remember_folder(DialogFolder::Scans, dir.parent());
                         self.change_project(|p| {
                             p.add_run(&scan, &dir)?;
                             Ok(Selection::Scan(scan.clone()))
@@ -1606,13 +2325,14 @@ impl DriftlessApp {
                     .chain(&MESH_EXTENSIONS)
                     .copied()
                     .collect();
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title(text::DIALOG_OPEN_FILE)
+                if let Some(path) = self
+                    .dialog(DialogFolder::Files, text::DIALOG_OPEN_FILE)
                     .add_filter(text::FILTER_ALL, &all)
                     .add_filter(text::FILTER_CLOUD, &POINT_EXTENSIONS)
                     .add_filter(text::FILTER_MESH, &MESH_EXTENSIONS)
                     .pick_file()
                 {
+                    self.remember_folder(DialogFolder::Files, path.parent());
                     // picked again: a surface shown is read again
                     match open_file(&path, true) {
                         Ok(action) => self.apply(action),
@@ -1643,8 +2363,98 @@ impl DriftlessApp {
                 self.loader.cancel();
                 self.next_surface = None;
                 self.surface_loader.cancel();
+                // a project being opened is not opened (its read ends unseen)
+                if matches!(self.tree_next, Some(TreeTask::Open { .. })) {
+                    self.tree_next = None;
+                }
+                if matches!(self.tree_task, Some(TreeTask::Open { .. })) {
+                    self.tree_discard = true;
+                }
+                self.sync_tree_state();
             }
             Action::DismissMessages => self.state.messages.clear(),
+            Action::Ask(ask) => self.state.ask = Some(ask),
+            Action::AskDelete(dir) => {
+                self.state.ask = self.state.delete_question(&dir).map(super::Ask::Delete)
+            }
+            Action::CloseAsk => self.state.ask = None,
+            Action::RenameScan { id, name } => {
+                self.state.ask = None;
+                match self.state.scan_busy(&id) {
+                    Some(why) => self.error(why),
+                    None => {
+                        let keep = self.state.selection.clone();
+                        self.change_project(|p| {
+                            p.rename_scan(&id, &name)?;
+                            Ok(keep)
+                        });
+                    }
+                }
+            }
+            Action::RemoveScan(id) => {
+                self.state.ask = None;
+                match self.state.scan_busy(&id) {
+                    Some(why) => self.error(why),
+                    None => self.change_project(|p| {
+                        p.remove_scan(&id)?;
+                        Ok(Selection::None)
+                    }),
+                }
+            }
+            Action::RemoveRun { scan, run } => match self.state.scan_busy(&scan) {
+                Some(why) => self.error(why),
+                None => self.change_project(|p| {
+                    p.remove_run(&scan, &run)?;
+                    Ok(Selection::Scan(scan.clone()))
+                }),
+            },
+            Action::PickRelinkScan(id) => {
+                if let Some(dir) = self
+                    .dialog(DialogFolder::Scans, text::DIALOG_RELINK_SCAN)
+                    .pick_folder()
+                {
+                    self.remember_folder(DialogFolder::Scans, dir.parent());
+                    self.apply(Action::RelinkScan { id, dir });
+                }
+            }
+            Action::RelinkScan { id, dir } => match self.state.scan_busy(&id) {
+                Some(why) => self.error(why),
+                None => self.helper_queue.push_back(HelperTask::Relink { id, dir }),
+            },
+            Action::Unshow(dir) => self.unshow(&dir),
+            Action::CleanUp => match self.state.clean_up_blocked() {
+                Some(why) => self.error(why.to_string()),
+                None => {
+                    let leftovers = self
+                        .state
+                        .leftovers_shown()
+                        .iter()
+                        .map(|l| (l.path.clone(), l.bytes))
+                        .collect();
+                    self.helper_queue.push_back(HelperTask::CleanUp(leftovers));
+                }
+            },
+            Action::Delete(dir) => {
+                self.state.ask = None;
+                let Some(question) = self.state.delete_question(&dir) else {
+                    self.error(text::not_in_tree(&dir));
+                    return;
+                };
+                // what is shown or computed now (it may have changed since the question)
+                match self.state.delete_blocked(&dir) {
+                    Some(why) => self.error(why),
+                    None => self.helper_queue.push_back(HelperTask::Trash {
+                        dir,
+                        label: question.label,
+                        bytes: question.bytes,
+                    }),
+                }
+            }
+            Action::OpenLogFolder => {
+                if let Err(e) = super::about::open_log_folder() {
+                    self.error(e);
+                }
+            }
             Action::FrameAll => self.view.frame_all(),
             step @ (Action::Inspect(_)
             | Action::RunSlam(_)
@@ -1656,11 +2466,13 @@ impl DriftlessApp {
             | Action::ApplyPairs { .. }
             | Action::RunModelSurface { .. }) => {
                 match actions::start_step(&mut self.state, &mut self.jobs, &step) {
-                    // the merge runs: its field closes, the model shows when it is done
-                    Ok(()) if matches!(step, Action::RunMerge { .. }) => {
-                        self.state.merge.open = false
+                    Ok(()) => {
+                        // the merge runs: its field closes, the model shows when it is done
+                        if matches!(step, Action::RunMerge { .. }) {
+                            self.state.merge.open = false;
+                        }
+                        self.check_room(&step);
                     }
-                    Ok(()) => {}
                     Err(e) => self.error(e),
                 }
             }
@@ -1691,9 +2503,9 @@ impl DriftlessApp {
             Action::OpenMerge => self.state.open_merge(),
             Action::StartPairs { model, member } => self.start_pairs(&model, member),
             Action::SetPairEnabled { index, enabled } => self.switch_pair(index, enabled),
-            change @ (Action::AddLoop { .. } | Action::SetLoopEnabled { .. }) => {
-                self.change_corrections(change)
-            }
+            change @ (Action::AddLoop { .. }
+            | Action::SetLoopEnabled { .. }
+            | Action::SetLoopUsed { .. }) => self.change_corrections(change),
             Action::Compare { a, b } => self.start_compare(a, b),
             Action::CompareMaps { a, b } => self.start_compare_maps(a, b),
             Action::SetStep(step) => self.set_step(step),
@@ -1722,14 +2534,15 @@ impl DriftlessApp {
         };
         let format = dialog.format;
         let name = format!("{}.{}", dialog.source().default_name(), format.extension());
-        let Some(path) = rfd::FileDialog::new()
-            .set_title(text::EXPORT_TITLE)
+        let Some(path) = self
+            .dialog(DialogFolder::Files, text::EXPORT_TITLE)
             .set_file_name(name)
             .add_filter(format.label(), &[format.extension()])
             .save_file()
         else {
             return;
         };
+        self.remember_folder(DialogFolder::Files, path.parent());
         match export::target_picked(&mut self.state, path) {
             Ok(Some(action)) => self.apply(action),
             // asked in the window
@@ -1757,28 +2570,70 @@ impl DriftlessApp {
         };
     }
 
-    /// Reads the open project again from disk, keeping the selection.
-    fn reload_project(&mut self) {
-        let Some(dir) = self.state.project.as_ref().map(|p| p.dir.clone()) else {
-            return;
-        };
-        match Project::open(&dir) {
-            Ok(p) => {
-                self.state.project = Some(p);
-                self.state.refresh();
-            }
-            Err(e) => self.error(e.to_string()),
+    /// „Aus der Ansicht nehmen“: what the view shows from the folder `dir` or from a model that
+    /// uses it goes (the cloud, the surface, „Von Hand ausrichten“), and the selection if it
+    /// lies there; the run drawn follows ([`Self::sync_run`]).
+    fn unshow(&mut self, dir: &Path) {
+        let mut touched = vec![dir.to_path_buf()];
+        touched.extend(self.state.model_users_dirs(dir));
+        let hit = |p: &Path| touched.iter().any(|t| p.starts_with(t));
+        let drawn = self.state.selected_run().is_some_and(|(_, r)| hit(&r.dir));
+        if drawn || touched.iter().any(|t| self.selection_in(t)) {
+            self.state.selection = Selection::None;
+        }
+        if self.state.cloud.as_ref().is_some_and(|c| hit(&c.path)) {
+            self.cloud = None;
+            self.cloud_run = None;
+            self.state.cloud = None;
+            self.state.view.cut = None;
+            self.state.picked = None;
+            self.state.view_stats = None;
+            self.view.cloud_replaced();
+        }
+        if self.state.surface.as_ref().is_some_and(|s| hit(&s.path)) {
+            self.drop_surface();
+        }
+        if self.state.pairs.as_ref().is_some_and(|p| hit(&p.model)) {
+            tools::end_pairs(&mut self.state);
+        }
+        self.sync_run();
+    }
+
+    /// Whether the selection lies in the folder `dir`.
+    fn selection_in(&self, dir: &Path) -> bool {
+        match &self.state.selection {
+            Selection::Run(p)
+            | Selection::Map(p)
+            | Selection::Cloud(p)
+            | Selection::Surface(p)
+            | Selection::Model(p)
+            | Selection::History { run: p, .. } => p.starts_with(dir),
+            Selection::None | Selection::Scan(_) => false,
         }
     }
 
-    fn set_project(&mut self, project: Project) {
-        self.stop_queue();
-        // the measurements belong to the project shown (they are not saved yet)
-        self.state.measurements.clear();
-        self.state.measure_a = None;
-        self.info(text::project_opened(&project.name));
-        self.drop_surface();
-        self.state.set_project(project);
+    /// „Ordner neu zuordnen …“ of the scan `id` ended: the project as written and the tree
+    /// read again, or the reason it was refused.
+    fn relinked(&mut self, id: &str, result: Result<JobOutput, StepError>) {
+        match result {
+            Ok(JobOutput::Relinked { project, checked }) => {
+                let name = project
+                    .scan(id)
+                    .map_or_else(|| id.to_string(), |s| s.name.clone());
+                if self.is_shown(&project.dir) {
+                    self.state.project = Some(*project);
+                    self.refresh_tree();
+                }
+                self.info(text::relinked(&name, checked));
+            }
+            Ok(_) => {}
+            Err(e) => self.error(text::step_error(&e)),
+        }
+    }
+
+    /// Whether `dir` is the folder of the project shown (as stored, without resolving it).
+    fn is_shown(&self, dir: &Path) -> bool {
+        self.state.project.as_ref().is_some_and(|p| p.dir == dir)
     }
 
     fn is_open(&self, dir: &Path) -> bool {
@@ -1788,19 +2643,25 @@ impl DriftlessApp {
         }
     }
 
-    /// Changes a copy of the project and saves it; only a saved change is shown, so the
-    /// project on screen always matches `project.toml`.
+    /// Changes the project as `project.toml` is on disk now, under its lock, and saves it
+    /// ([`change_project`]): a change another window or program saved meanwhile is kept (and
+    /// said), a lock another holds refuses the change with its reason. Only a saved change is
+    /// shown, so the project on screen always matches `project.toml`. The tree is read again
+    /// in the background.
     fn change_project(
         &mut self,
         change: impl FnOnce(&mut Project) -> Result<Selection, crate::project::ProjectError>,
     ) {
-        let Some(mut project) = self.state.project.clone() else {
+        let Some(dir) = self.state.project.as_ref().map(|p| p.dir.clone()) else {
             return;
         };
-        match change(&mut project).and_then(|sel| project.save().map(|()| sel)) {
-            Ok(selection) => {
+        match change_project(&dir, self.state.project.as_ref(), change) {
+            Ok((project, changed_meanwhile, selection)) => {
+                if changed_meanwhile {
+                    self.info(text::PROJECT_CHANGED_ELSEWHERE.to_string());
+                }
                 self.state.project = Some(project);
-                self.state.refresh();
+                self.refresh_tree();
                 self.state.selection = selection;
             }
             Err(e) => self.error(e.to_string()),
@@ -1808,18 +2669,75 @@ impl DriftlessApp {
     }
 
     fn info(&mut self, text: String) {
-        self.message(UiMessage::Info(text));
+        self.say(UiMessage::Info(text));
+    }
+
+    fn warn(&mut self, text: String) {
+        self.say(UiMessage::Warning(text));
     }
 
     fn error(&mut self, text: String) {
-        self.message(UiMessage::Error(text));
+        self.say(UiMessage::Error(text));
     }
 
-    fn message(&mut self, m: UiMessage) {
+    /// Every message of the status bar comes here, in German ([`text::german`]): into the
+    /// log file, onto the status bar (the same as the last one only once), and a warning or an
+    /// error into the Protokoll as well.
+    fn say(&mut self, m: UiMessage) {
+        let (level, kind) = match &m {
+            UiMessage::Info(_) => (Level::Message, None),
+            UiMessage::Warning(_) => (Level::Warning, Some(LogKind::Warning)),
+            UiMessage::Error(_) => (Level::Error, Some(LogKind::Error)),
+        };
+        let german = text::german(m.text());
+        if let Some(file) = &self.log_file {
+            file.write(level, &german);
+        }
+        let shown = text::shown(&german).into_owned();
+        let m = match m {
+            UiMessage::Info(_) => UiMessage::Info(shown),
+            UiMessage::Warning(_) => UiMessage::Warning(shown),
+            UiMessage::Error(_) => UiMessage::Error(shown),
+        };
+        if self.state.messages.last() == Some(&m) {
+            return;
+        }
+        if let Some(kind) = kind {
+            self.protocol(kind, m.text());
+        }
         let messages = &mut self.state.messages;
         messages.push(m);
         let over = messages.len().saturating_sub(MESSAGE_LIMIT);
         messages.drain(..over);
+    }
+
+    /// A line of the Protokoll as shown, with the time; the oldest go beyond [`LOG_LIMIT`].
+    /// Not into the log file: that is the caller's ([`DriftlessApp::say`],
+    /// [`DriftlessApp::take_lines`]).
+    fn protocol(&mut self, kind: LogKind, shown: &str) {
+        let log = &mut self.state.log;
+        log.push(LogEntry {
+            time: chrono::Local::now().format("%H:%M:%S").to_string(),
+            kind,
+            text: shown.to_string(),
+        });
+        let over = log.len().saturating_sub(LOG_LIMIT);
+        log.drain(..over);
+    }
+
+    /// What the steps and the loaders said: in German into the log file and the Protokoll.
+    fn take_lines(&mut self, lines: Vec<LogLine>) {
+        for line in lines {
+            let (level, kind, said) = match line {
+                LogLine::Info(t) => (Level::Info, LogKind::Info, t),
+                LogLine::Warning(t) => (Level::Warning, LogKind::Warning, t),
+            };
+            let german = text::german(&said);
+            if let Some(file) = &self.log_file {
+                file.write(level, &german);
+            }
+            self.protocol(kind, &text::shown(&german));
+        }
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
@@ -1833,10 +2751,41 @@ impl DriftlessApp {
         }
     }
 
+    /// Whether the view draws something in the quality colours: the trajectory (not while a
+    /// comparison draws it in one colour), the anchors of the submaps, or the points in the
+    /// colour mode „Güte“ with a SLAM report.
+    fn quality_drawn(&self) -> bool {
+        let v = &self.state.view;
+        let run = self.overlay.as_ref().is_some_and(|o| {
+            let comparing = v.show_compare && !o.compare.is_empty();
+            !o.report.submaps.is_empty() && ((v.show_trajectory && !comparing) || v.show_submaps)
+        });
+        let points = self.cloud.as_ref().is_some_and(|c| {
+            let shown = effective_show(v.show, self.view.has_surface(), true);
+            c.points.quality_known
+                && shown != ShowMode::Surface
+                && super::view3d::effective_color_mode(
+                    v.color_mode,
+                    c.points.rgb.is_some(),
+                    !c.points.source.is_empty(),
+                ) == crate::render::ColorMode::Quality
+        });
+        run || points
+    }
+
     /// In „Bilder“ without a surface: a hint over the top of the view that the cloud stays
     /// until one is computed.
     fn no_surface_hint(&self, ctx: &egui::Context, view: egui::Rect) {
+        // without a map there is nothing to compute one from (the field says what to do)
+        let maps = self
+            .state
+            .scans
+            .iter()
+            .flat_map(|s| &s.runs)
+            .any(|r| !r.maps.is_empty())
+            || !self.state.models.is_empty();
         if self.state.step != Step::Bilder
+            || !maps
             || self.state.surface.is_some()
             || self.is_loading_surface()
         {
@@ -1882,6 +2831,14 @@ impl DriftlessApp {
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_requested() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
+        let focused = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::WindowFocused(true)))
+        });
+        if focused {
+            self.focus_back();
+        }
         self.tick();
         if self.take_close() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1921,6 +2878,7 @@ impl DriftlessApp {
         settings::show(&ctx, &mut self.state);
         super::about::show(&ctx, &mut self.state.about_open);
         actions.extend(export::show(&ctx, &mut self.state));
+        actions.extend(super::manage::show(&ctx, &mut self.state));
         self.view.set_tool(self.state.tool);
         self.view
             .set_picked(self.state.picked.as_ref().map(|p| p.index));
@@ -1952,7 +2910,11 @@ impl DriftlessApp {
                     ui.centered_and_justified(|ui| ui.weak(text::VIEW_NO_GPU));
                 }
                 (_, false) => {
-                    ui.centered_and_justified(|ui| ui.weak(text::VIEW_EMPTY));
+                    let hint = match self.state.project {
+                        Some(_) => text::VIEW_EMPTY,
+                        None => text::VIEW_NO_PROJECT,
+                    };
+                    ui.centered_and_justified(|ui| ui.weak(hint));
                 }
             });
         self.no_surface_hint(&ctx, central.response.rect);
@@ -1964,6 +2926,8 @@ impl DriftlessApp {
         }
         let view = central.response.rect;
         actions.extend(tools::floats(&ctx, view, &mut self.state, &mut self.layout));
+        let legend = self.quality_drawn();
+        tools::quality_legend(&ctx, view, legend, &mut self.layout);
         match event {
             Some(ViewEvent::PickedPose(i)) => self.pose_picked(i),
             Some(ViewEvent::TrajectoryHidden) => {
@@ -2074,6 +3038,15 @@ fn change_corrections(action: &Action) -> Result<Corrected, StepError> {
                 false,
             )
         }
+        Action::SetLoopUsed { run, a, b, used } => {
+            let changed = correct::set_loop_used(run, *a, *b, *used)?;
+            (
+                run,
+                correct::loop_used_message(*a, *b, *used, changed),
+                changed,
+                false,
+            )
+        }
         _ => return Err(text::NOT_A_STEP.into()),
     };
     Ok(Corrected {
@@ -2088,6 +3061,12 @@ fn change_corrections(action: &Action) -> Result<Corrected, StepError> {
 impl eframe::App for DriftlessApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.show(ui);
+    }
+
+    fn on_exit(&mut self) {
+        if let Some(file) = &self.log_file {
+            file.write(Level::Info, logfile::END_TEXT);
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

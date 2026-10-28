@@ -8,6 +8,7 @@ use driftless_app::project::{
     SurfaceSettings,
 };
 use driftless_app::ui::steps::bilder::{model_surface_status, surface_status, SurfaceStatus};
+use driftless_app::ui::theme::icon;
 use driftless_app::ui::{
     steps, text, Action, AppState, DriftlessApp, Queued, ScanNode, Selection, Step, UiMessage,
 };
@@ -15,7 +16,7 @@ use driftless_io::images::RgbImage;
 use driftless_io::testscan::{room_bag_secs, tmp};
 use driftless_map::surface::{encode_pages, write_glb, SurfaceConfig, TexturePage, TexturedMesh};
 use driftless_steps::map::{MapStep, MapSwitches};
-use driftless_steps::merge::ModelReport;
+use driftless_steps::merge::{ModelReport, MERGE_VERSION};
 use driftless_steps::slam::SlamSettings;
 use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
@@ -56,6 +57,7 @@ fn surface(dir: &str, label: &str) -> SurfaceInfo {
         label: label.into(),
         stale: false,
         settings: Some(SurfaceSettings::default()),
+        hints: Vec::new(),
     }
 }
 
@@ -66,6 +68,7 @@ fn map(dir: &str, surfaces: Vec<SurfaceInfo>) -> MapInfo {
         settings: Some(MapSwitches::default()),
         clouds: Vec::new(),
         surfaces,
+        incomplete: false,
     }
 }
 
@@ -81,6 +84,7 @@ fn run(dir: &str, maps: Vec<MapInfo>) -> RunInfo {
         cloud: None,
         maps,
         history: Vec::new(),
+        incomplete: false,
     }
 }
 
@@ -123,6 +127,7 @@ fn four_maps() -> AppState {
                     path: PathBuf::from(format!("/daten/{id}")),
                     name: format!("Scan {id}"),
                     extra_runs: Vec::new(),
+                    bags: Vec::new(),
                 })
                 .collect(),
         }),
@@ -294,7 +299,7 @@ fn errors(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             UiMessage::Error(e) => Some(e.clone()),
-            UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect()
 }
@@ -534,7 +539,7 @@ fn infos(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             UiMessage::Info(i) => Some(i.clone()),
-            UiMessage::Error(_) => None,
+            _ => None,
         })
         .collect()
 }
@@ -840,7 +845,7 @@ fn with_model(surfaces: Vec<SurfaceInfo>) -> AppState {
         })
     };
     let report: ModelReport = serde_json::from_value(serde_json::json!({
-        "version": 1,
+        "version": MERGE_VERSION,
         "input_id": "0",
         "members": [member("a"), member("b")],
         "points": 20,
@@ -896,6 +901,58 @@ fn surface_info(dir: &str) -> SurfaceInfo {
     surface(dir, "Oberfläche 001")
 }
 
+/// The hint of a surface that stays open in places, as the surface step writes it.
+const OPEN: &str = "Stellenweise offen: An 23 % der dünn gemessenen Stellen lag kein Messpunkt \
+                    näher als 1,5 cm. Dort bleibt die Oberfläche offen, statt etwas zu erfinden. \
+                    Das ist in großen Räumen üblich. Schließen lassen sich solche Stellen nur \
+                    durch dichteres Scannen (näher heran, langsamer), nicht durch eine feinere \
+                    Einstellung.";
+
+/// The hints of a surface for the user (`hinweise` of its report): short and muted below its
+/// entry with the whole hint on hover, and in full under „Diese Oberfläche“ once it is
+/// selected; for a surface of a map and of a model. A surface without hints shows none.
+#[test]
+fn surface_hints_are_shown() {
+    let short = format!("{} {}", icon::HINT, text::surface_hint_short(OPEN));
+    assert_eq!(
+        text::surface_hint_short(OPEN),
+        "Hinweis: Stellenweise offen"
+    );
+    let full = format!("{} {}: {OPEN}", icon::HINT, text::SURFACE_HINT);
+    let hinted = format!("{MAP_A}/oberflaeche-001");
+    let mut state = four_maps();
+    state.scans[0].runs[0].maps[0].surfaces[0].hints = vec![OPEN.into()];
+    let mut h = panel(state.clone());
+    h.ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.0);
+    // only below the surface with the hint (three surfaces are listed)
+    assert_eq!(h.get_all_by_label(&short).count(), 1);
+    assert!(h.query_by_label(OPEN).is_none());
+    h.get_by_label(&short).hover();
+    h.run();
+    h.get_by_label(OPEN);
+    // selected: in full below its state
+    state.selection = Selection::Surface(hinted.into());
+    let h = panel(state.clone());
+    h.get_by_label(text::THIS_SURFACE);
+    h.get_by_label(&full);
+    // another surface of the same map selected: not its hint
+    state.selection = Selection::Surface(format!("{MAP_A}/oberflaeche-002").into());
+    let h = panel(state);
+    h.get_by_label(text::THIS_SURFACE);
+    assert!(h.query_by_label(&full).is_none());
+
+    // a surface of a model
+    let model_surface = format!("{MODEL}/oberflaeche-001");
+    let mut hinted = surface_info(&model_surface);
+    hinted.hints = vec![OPEN.into()];
+    let mut state = with_model(vec![hinted]);
+    let h = panel(state.clone());
+    h.get_by_label(&short);
+    state.selection = Selection::Surface(model_surface.into());
+    let h = panel(state);
+    h.get_by_label(&full);
+}
+
 #[test]
 fn model_surface_states() {
     let surface = format!("{MODEL}/oberflaeche-001");
@@ -934,10 +991,17 @@ fn model_surface_states() {
         SurfaceStatus::ModelStale
     );
     state.selection = Selection::Model(MODEL.into());
-    let h = panel(state);
+    let h = panel(state.clone());
     assert!(h
         .get_by_label(text::STEP_SURFACE)
         .accesskit_node()
         .is_disabled());
     h.get_by_label(text::STATUS_MODEL_STALE);
+    h.get_by_label(text::STATUS_MODEL_STALE_HINT);
+    // merged by another version of the program: the same state, its own reason
+    state.models[0].report.version = MERGE_VERSION - 1;
+    let h = panel(state);
+    h.get_by_label(text::STATUS_MODEL_STALE);
+    h.get_by_label(text::STATUS_MODEL_STALE_VERSION_HINT);
+    assert!(h.query_by_label(text::STATUS_MODEL_STALE_HINT).is_none());
 }

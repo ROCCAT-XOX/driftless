@@ -1,17 +1,18 @@
+//! `driftless view` with the debug viewer (`--features debug-viewer`): the recordings it
+//! writes with `--dry-run`.
+#![cfg(feature = "debug-viewer")]
+
 use assert_cmd::Command;
 use driftless_io::bag::writer::{BagWriter, Compression};
 use driftless_io::bag::Time;
 use driftless_io::msg::encode::{encode_compressed_image, encode_imu, encode_pointcloud2};
 use driftless_io::msg::{CompressedImage, ImuSample, LidarPoint};
+use driftless_io::testdir::TestDir;
 use predicates::prelude::*;
 use std::fs;
-use std::path::PathBuf;
 
-fn tmp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("driftless-view-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn tmp(name: &str) -> TestDir {
+    TestDir::new(format!("driftless-view-{}-{name}", std::process::id()))
 }
 
 fn time(t: f64) -> Time {
@@ -22,7 +23,7 @@ fn time(t: f64) -> Time {
     }
 }
 
-fn synthetic_project(name: &str) -> PathBuf {
+fn synthetic_project(name: &str) -> TestDir {
     let dir = tmp(name);
     let mut w = BagWriter::new(Compression::None);
     let lc = w.add_connection("/vanjee_722z", "sensor_msgs/PointCloud2");
@@ -89,7 +90,7 @@ fn view_dry_run_writes_rrd() {
 }
 
 /// Hilti-style topic names; raw `sensor_msgs/Image` topic present (not shown, only warned).
-fn hilti_style_project(name: &str, with_lidar: bool) -> PathBuf {
+fn hilti_style_project(name: &str, with_lidar: bool) -> TestDir {
     let dir = tmp(name);
     let mut w = BagWriter::new(Compression::None);
     let lc = w.add_connection("/hesai/pandar", "sensor_msgs/PointCloud2");
@@ -188,7 +189,7 @@ fn view_bad_trajectory_fails_before_opening_output() {
 
 /// A `driftless slam` output folder: 3 submaps (poses every 0.5 s), one accepted, one
 /// rejected and one manual position-only loop.
-fn slam_output(name: &str) -> PathBuf {
+fn slam_output(name: &str) -> TestDir {
     use driftless_slam::report::{BeforeAfter, LoopReport, SlamReport, SubmapReport};
     let dir = tmp(name);
     let sm = |id: usize, t: f64, quality: f32, x: f64| SubmapReport {

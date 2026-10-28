@@ -12,7 +12,7 @@ use driftless_app::ui::{
 };
 use driftless_io::testscan::{room_bag_secs, tmp};
 use driftless_steps::map::MapSwitches;
-use driftless_steps::merge::{ModelMember, ModelReport, MODEL_LAS, MODEL_REPORT};
+use driftless_steps::merge::{ModelMember, ModelReport, MERGE_VERSION, MODEL_LAS, MODEL_REPORT};
 use driftless_steps::slam::SlamSettings;
 use eframe::egui::accesskit::Role;
 use egui_kittest::kittest::{NodeT, Queryable};
@@ -63,6 +63,7 @@ fn run(dir: &str, maps: Vec<MapInfo>) -> RunInfo {
         cloud: None,
         maps,
         history: Vec::new(),
+        incomplete: false,
     }
 }
 
@@ -73,6 +74,7 @@ fn map(dir: &str) -> MapInfo {
         settings: Some(MapSwitches::default()),
         clouds: Vec::new(),
         surfaces: Vec::new(),
+        incomplete: false,
     }
 }
 
@@ -104,6 +106,7 @@ fn three_scans() -> AppState {
                     path: PathBuf::from(format!("/daten/{id}")),
                     name: name.into(),
                     extra_runs: Vec::new(),
+                    bags: Vec::new(),
                 })
                 .collect(),
         }),
@@ -206,10 +209,10 @@ fn main_button_computes_all_or_the_selected_scan() {
         click(&mut h, text::COMPUTE_ALL),
         Some(Action::ComputeAllMaps)
     );
-    // the selected scan shows its runs and maps below it
+    // the selected scan shows its runs and maps below it; „Lauf hinzufügen …“ is in ☰ only
     h.get_by_label("SLAM 001");
     h.get_by_label("Karte 001");
-    h.get_by_label(text::ADD_RUN);
+    assert!(h.query_by_label(text::ADD_RUN).is_none());
 }
 
 #[test]
@@ -323,7 +326,7 @@ fn errors(app: &DriftlessApp) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             driftless_app::ui::UiMessage::Error(e) => Some(e.clone()),
-            driftless_app::ui::UiMessage::Info(_) => None,
+            _ => None,
         })
         .collect()
 }
@@ -823,8 +826,11 @@ fn member(scan: &str, verdict: &str, included: bool) -> ModelMember {
     let run = PathBuf::from(format!("/p/scans/{scan}/slam-001"));
     ModelMember {
         scan: PathBuf::from(format!("/daten/{scan}")),
+        scan_rel: None,
         slam_dir: run.clone(),
+        slam_dir_rel: None,
         map_dir: run.join("karte-001"),
+        map_dir_rel: None,
         slam: SlamSettings::default(),
         transform: [
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
@@ -847,7 +853,7 @@ fn member(scan: &str, verdict: &str, included: bool) -> ModelMember {
         residual_median_mm: 1.84,
         residual_rms_mm: 2.5,
         agreement: 0.95,
-        wall_residual_mm: 1.9,
+        wall_residual_mm: Some(1.9),
         pair_rms_mm: None,
         included,
         color_gain: [1.0; 3],
@@ -858,13 +864,14 @@ fn member(scan: &str, verdict: &str, included: bool) -> ModelMember {
 
 fn report(members: Vec<ModelMember>) -> ModelReport {
     ModelReport {
-        version: 1,
+        version: MERGE_VERSION,
         input_id: "0".into(),
         points: members.iter().map(|m| m.points).sum(),
         members,
         seconds_total: 12.0,
         peak_rss_bytes: 0,
         include_unsure: false,
+        warnings: Vec::new(),
     }
 }
 
@@ -887,6 +894,7 @@ fn with_model() -> AppState {
             label: "Oberfläche 001".into(),
             stale: false,
             settings: None,
+            hints: Vec::new(),
         }],
     }];
     state
@@ -942,8 +950,76 @@ fn model_node_shows_verdicts() {
         )]
         .into(),
     );
-    let h = panel(state);
+    let h = panel(state.clone());
     h.get_by_label(&text::model_stale("Modell 001"));
+    // a model of another version of the merge: the same mark with its own reason
+    state.models[0].report.version = MERGE_VERSION - 1;
+    let h = panel(state);
+    h.get_by_label(&text::model_stale_version("Modell 001"));
+    assert!(h.query_by_label(&text::model_stale("Modell 001")).is_none());
+}
+
+/// A surface of a model with a hint for the user: the hint short below its entry in the tree.
+#[test]
+fn surface_hint_in_the_tree() {
+    let hint = "Stellenweise offen: An 23 % der dünn gemessenen Stellen lag kein Messpunkt.";
+    let short = format!(
+        "{} {}",
+        driftless_app::ui::theme::icon::HINT,
+        text::surface_hint_short(hint)
+    );
+    let mut state = with_model();
+    let h = panel(state.clone());
+    h.get_by_label("Oberfläche 001");
+    assert!(h.query_by_label(&short).is_none());
+    state.models[0].surfaces[0].hints = vec![hint.into()];
+    let h = panel(state);
+    h.get_by_label("Oberfläche 001");
+    h.get_by_label(&short);
+}
+
+/// On hover over a scan of a model: the residual on the walls, or that they could not be
+/// measured (never „Wände 0,0 mm“) – once: not again when the reason says so.
+#[test]
+fn member_hover_names_the_walls() {
+    let mut state = with_model();
+    state.models[0].report.members[1].wall_residual_mm = None;
+    let mut h = panel(state);
+    h.ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.0);
+    h.get_by_label("2 · Scan 13:30").hover();
+    h.run();
+    h.get_by_label_contains(text::WALLS_UNMEASURABLE);
+    assert!(h.query_by_label_contains("Wände 0,0 mm").is_none());
+    h.get_by_label("3 · Scan 13:35").hover();
+    h.run();
+    h.get_by_label_contains(&text::member_walls(1.9));
+    assert!(h
+        .query_by_label_contains(text::WALLS_UNMEASURABLE)
+        .is_none());
+    assert_eq!(text::member_walls(1.9), "Wände 1,9 mm");
+
+    // unsure only because of the walls: the reason says it, the line below it does not again
+    let mut state = with_model();
+    let unsure = &mut state.models[0].report.members[2];
+    unsure.wall_residual_mm = None;
+    unsure.reason = Some(text::WALLS_UNMEASURABLE.into());
+    let mut h = panel(state);
+    h.ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.0);
+    h.get_by_label("3 · Scan 13:35").hover();
+    h.run();
+    // a label keeps its text as its value
+    let hover = h
+        .get_by_label_contains(text::VERDICT_HINT)
+        .accesskit_node()
+        .value()
+        .unwrap_or_default();
+    let reason = format!("{}: {}", text::VERDICT_UNSURE, text::WALLS_UNMEASURABLE);
+    assert!(hover.contains(&reason), "{hover}");
+    assert_eq!(
+        hover.matches(text::WALLS_UNMEASURABLE).count(),
+        1,
+        "{hover}"
+    );
 }
 
 #[test]
@@ -998,4 +1074,41 @@ fn selecting_model_loads_it_coloured_by_scan() {
     app.state_mut().view.color_mode = ColorMode::Intensity;
     settle(&mut app);
     assert_eq!(app.state().view.color_mode, ColorMode::Intensity);
+}
+
+/// „Zusammenführen …“ opens its field at the end of the list: the field scrolls into view, so
+/// that its start button is not hidden under the pinned main button (b-report #7).
+#[test]
+fn merge_start_is_in_view_when_the_field_opens() {
+    let mut state = mergeable();
+    // a field short enough that the list scrolls
+    let mut h = Harness::builder().with_size([320.0, 420.0]).build_ui_state(
+        |ui, (state, action): &mut (AppState, Option<Action>)| {
+            if let Some(a) = steps::show(ui, state) {
+                *action = Some(a);
+            }
+        },
+        (std::mem::take(&mut state), None),
+    );
+    h.run();
+    assert_eq!(click(&mut h, text::MERGE_OPEN), Some(Action::OpenMerge));
+    h.state_mut().0.open_merge();
+    h.run();
+    let bounds = |h: &H, label: &str| {
+        h.get_by_label(label)
+            .accesskit_node()
+            .bounding_box()
+            .expect("placed")
+    };
+    let start = bounds(&h, text::MERGE_START);
+    let pinned = bounds(&h, text::COMPUTE_ALL);
+    assert!(
+        start.y1 <= pinned.y0 && start.y0 >= 0.0,
+        "start {start:?} under the pinned bottom {pinned:?}"
+    );
+    assert!(h.state().0.merge.picks(&h.state().0).len() >= 2);
+    assert!(matches!(
+        click(&mut h, text::MERGE_START),
+        Some(Action::RunMerge { .. })
+    ));
 }

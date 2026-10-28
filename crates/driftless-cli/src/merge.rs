@@ -1,12 +1,13 @@
-//! `driftless merge <scan>... -o <ziel>`: several scans of one place merged into one model
-//! (`modell.las`, `modell.ply`, `modell.json`). The first scan is the reference; its frame is
-//! the model frame. The run itself is [`driftless_steps::merge::run_merge`].
+//! `driftless merge <scan>... -o <ziel> [--ply]`: several scans of one place merged into one
+//! model (`modell.las`, `modell.json`; with `--ply` also `modell.ply`). The first scan is the
+//! reference; its frame is the model frame. The run itself is
+//! [`driftless_steps::merge::run_merge`].
 //!
 //! `--punktpaare <datei>` takes point pairs marked by hand (a file like `punktpaare.toml`,
 //! [`driftless_steps::pairs`]); its map folders are relative to the folder of the file.
 
-use driftless_slam::align::AlignConfig;
-use driftless_steps::merge::{pair_members, run_merge, MergeMember, MergeRequest, ModelReport};
+use driftless_slam::align::{AlignConfig, WALLS_UNMEASURABLE};
+use driftless_steps::merge::{run_merge, MergeMember, MergeRequest, ModelReport};
 use driftless_steps::pairs::PointPairs;
 use driftless_steps::scan::extrinsic_values;
 use driftless_steps::slam::SlamSettings;
@@ -51,6 +52,9 @@ pub struct Args {
     /// Imu-Topic (Standard: das einzige in der Bag)
     #[arg(long)]
     imu_topic: Option<String>,
+    /// Auch modell.ply schreiben (die Punkte von modell.las mit der Eigenschaft scan)
+    #[arg(long)]
+    ply: bool,
 }
 
 /// `given` as one folder per scan, or `default` of each scan if none is given.
@@ -111,26 +115,8 @@ fn request(args: &Args) -> Result<MergeRequest, Box<dyn std::error::Error>> {
         smooth: !args.ohne_glaetten,
         include_unsure: args.auch_unsichere,
         pairs,
+        ply: args.ply,
     })
-}
-
-/// A warning for every switched-on entry of the point pairs that names no two scans of
-/// `req` (a mistyped folder would otherwise be ignored silently).
-fn unused_pairs(req: &MergeRequest) -> Vec<String> {
-    req.pairs
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.enabled && pair_members(req, e).is_none())
-        .map(|(k, e)| {
-            format!(
-                "Punktpaare Eintrag {}: {} und {} sind nicht zwei der gewählten Karten, nicht \
-                 genutzt",
-                k + 1,
-                e.a.display(),
-                e.b.display()
-            )
-        })
-        .collect()
 }
 
 fn folder_name(p: &Path) -> String {
@@ -141,7 +127,8 @@ fn folder_name(p: &Path) -> String {
 }
 
 /// One line per scan: name, verdict (with the fit of the point pairs that placed it), overlap,
-/// residual over all points and on the walls, and why it is unsure.
+/// residual over all points and on the walls („Wände nicht messbar“ without them, unless the
+/// reason says so already), and why it is unsure.
 fn lines(report: &ModelReport) -> Vec<String> {
     report
         .members
@@ -158,12 +145,21 @@ fn lines(report: &ModelReport) -> Vec<String> {
                 _ if m.method == "punktpaare" => " (Punktpaare)".to_string(),
                 _ => String::new(),
             };
+            // „Wände nicht messbar“ only once: the reason may say it already
+            let said = m
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains(WALLS_UNMEASURABLE));
+            let walls = match m.wall_residual_mm {
+                Some(w) => format!(", Wände {w:.1} mm"),
+                None if said => String::new(),
+                None => format!(", {WALLS_UNMEASURABLE}"),
+            };
             let mut line = format!(
-                "{name}: {}{by_hand}, Überlappung {:.0} %, Restfehler {:.1} mm, Wände {:.1} mm",
+                "{name}: {}{by_hand}, Überlappung {:.0} %, Restfehler {:.1} mm{walls}",
                 m.verdict,
                 100.0 * m.overlap,
                 m.residual_median_mm,
-                m.wall_residual_mm
             );
             if let Some(why) = &m.reason {
                 line += &format!(" – {why}");
@@ -182,11 +178,9 @@ fn lines(report: &ModelReport) -> Vec<String> {
 
 pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let req = request(args)?;
-    let console = crate::console();
-    for w in unused_pairs(&req) {
-        console.warn(w);
-    }
-    let report = run_merge(&req, &console)?;
+    // A switched-on point pair entry that names no two of the maps is warned about by the
+    // merge itself (and kept in `modell.json`).
+    let report = run_merge(&req, &crate::console())?;
     for line in lines(&report) {
         println!("{line}");
     }
@@ -197,6 +191,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use driftless_io::testdir::TestDir;
 
     #[derive(Parser)]
     struct Cli {
@@ -260,9 +255,7 @@ mod tests {
 
     #[test]
     fn point_pairs_relative_to_their_file() {
-        let dir =
-            std::env::temp_dir().join(format!("driftless-merge-paare-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new(format!("driftless-merge-paare-{}", std::process::id()));
         let file = dir.join("paare.toml");
         let pts = "[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]";
         let entry = |a: &str, b: &str, enabled: bool| {
@@ -293,10 +286,6 @@ mod tests {
         assert_eq!(r.pairs.len(), 3);
         assert_eq!(r.pairs[0].a, dir.join("a").join("driftless"));
         assert_eq!(r.pairs[0].b, r.members[1].map_dir);
-        // Only the second names a folder that is not a map of the merge.
-        let w = unused_pairs(&r);
-        assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("Eintrag 2"), "{w:?}");
 
         let e = parse(&["a", "b", "-o", "m", "--punktpaare", "fehlt.toml"]).unwrap_err();
         assert!(e.contains("fehlt.toml nicht gefunden"), "{e}");
@@ -304,6 +293,59 @@ mod tests {
         let e = parse(&["a", "b", "-o", "m", "--punktpaare", f]).unwrap_err();
         assert!(e.contains("nicht lesbar"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The line of a scan names the residual on the walls, or that they could not be measured
+    /// (never „Wände 0.0 mm“) – once: not again when the reason says so.
+    #[test]
+    fn lines_say_when_walls_are_not_measurable() {
+        let member = |name: &str, walls: Option<f64>, reason: Option<&str>| {
+            let mut m = serde_json::json!({
+                "scan": format!("/daten/{name}"), "slam_dir": "/l", "map_dir": "/l", "slam": {},
+                "transform": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                              0.0, 0.0, 1.0],
+                "placed_against": 0, "method": "merkmale", "verdict": "sicher",
+                "reason": reason, "overlap": 0.98, "residual_median_mm": 1.84,
+                "residual_rms_mm": 2.5, "agreement": 0.97, "included": true,
+                "color_gain": [1.0, 1.0, 1.0], "points": 10,
+            });
+            if let Some(w) = walls {
+                m["wall_residual_mm"] = w.into();
+            }
+            m
+        };
+        let mut reference = member("a", None, None);
+        reference["placed_against"] = serde_json::Value::Null;
+        let mut unsure = member("d", None, Some("Überlappung nur 40 %; Wände nicht messbar"));
+        unsure["verdict"] = "unsicher".into();
+        let report: ModelReport = serde_json::from_value(serde_json::json!({
+            "version": driftless_steps::merge::MERGE_VERSION, "input_id": "0",
+            "members": [
+                reference,
+                member("b", Some(1.84), None),
+                member("c", None, Some(WALLS_UNMEASURABLE)),
+                unsure,
+                member("e", None, None),
+            ],
+            "points": 30, "seconds_total": 1.0, "peak_rss_bytes": 0,
+        }))
+        .unwrap();
+        let lines = lines(&report);
+        assert_eq!(lines[0], "a: Bezug");
+        assert!(lines[1].ends_with(", Wände 1.8 mm"), "{}", lines[1]);
+        assert_eq!(
+            lines[2],
+            "c: sicher, Überlappung 98 %, Restfehler 1.8 mm – Wände nicht messbar"
+        );
+        assert_eq!(
+            lines[3],
+            "d: unsicher, Überlappung 98 %, Restfehler 1.8 mm – Überlappung nur 40 %; Wände \
+             nicht messbar"
+        );
+        assert_eq!(
+            lines[4],
+            "e: sicher, Überlappung 98 %, Restfehler 1.8 mm, Wände nicht messbar"
+        );
     }
 
     #[test]

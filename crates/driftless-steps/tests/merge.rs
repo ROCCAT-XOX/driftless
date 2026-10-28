@@ -4,13 +4,14 @@
 //! Point pairs marked by hand place C.
 
 use driftless_io::progress::{Progress, ProgressSnapshot};
-use driftless_io::testscan::{empty_room_bag, furnished_room_bag, tmp};
-use driftless_map::{load_stage, write_las, Cloud};
+use driftless_io::testdir::SharedDir;
+use driftless_io::testscan::{empty_room_bag, furnished_room_bag, shared, tmp};
+use driftless_map::{load_stage, write_las, Cloud, SMOOTH_CHUNK};
 use driftless_slam::align::AlignConfig;
 use driftless_steps::map::{clean_stage_id, map_input_for, run_map, MapRequest, CLEAN_BIN};
 use driftless_steps::merge::{
     member_transform, merge_input_id, read_model, run_merge, MergeMember, MergeRequest,
-    ModelReport, MODEL_LAS, MODEL_PLY, MODEL_REPORT,
+    ModelMember, ModelReport, MODEL_LAS, MODEL_PLY, MODEL_REPORT,
 };
 use driftless_steps::pairs::{PointPairEntry, PointPairs, POINT_PAIRS_FILE};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
@@ -19,7 +20,7 @@ use driftless_traj::nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Pose of scan B in the frame of scan A.
 fn truth_b() -> Isometry3<f64> {
@@ -46,6 +47,8 @@ fn room_color(p: &Point3<f64>, brightness: f64) -> [u8; 3] {
 }
 
 struct Scene {
+    /// Their folder, shared by the tests of this file.
+    _root: SharedDir,
     a: PathBuf,
     b: PathBuf,
     c: PathBuf,
@@ -67,6 +70,7 @@ fn prepare(scan: &Path) {
         &MapRequest {
             input,
             out_dir: out,
+            all_files: false,
         },
         &Progress::new(),
     )
@@ -101,7 +105,7 @@ fn write_color(scan: &Path, map_dir: &Path, pose: &Isometry3<f64>, brightness: f
 fn scene() -> &'static Scene {
     static SCENE: OnceLock<Scene> = OnceLock::new();
     SCENE.get_or_init(|| {
-        let root = tmp("steps-merge");
+        let root = shared("steps-merge");
         let (a, b, c) = (root.join("a"), root.join("b"), root.join("c"));
         for d in [&a, &b, &c] {
             fs::create_dir_all(d).unwrap();
@@ -113,7 +117,12 @@ fn scene() -> &'static Scene {
             prepare(d);
         }
         write_color(&a, &a.join("driftless"), &Isometry3::identity(), 1.0);
-        Scene { a, b, c }
+        Scene {
+            _root: root,
+            a,
+            b,
+            c,
+        }
     })
 }
 
@@ -136,6 +145,7 @@ fn request(members: Vec<MergeMember>, out: &Path) -> MergeRequest {
         smooth: true,
         include_unsure: false,
         pairs: Vec::new(),
+        ply: false,
     }
 }
 
@@ -182,8 +192,22 @@ fn describe(r: &ModelReport) -> String {
 fn merges_two_scans() {
     let s = scene();
     let out = out_dir("zwei");
+    // What a killed merge left: its `.tmp` files go at the start, others stay.
+    fs::create_dir_all(&out).unwrap();
+    for f in [
+        "modell.las.tmp",
+        "modell.ply.tmp",
+        "modell.json.tmp",
+        "notiz.tmp",
+    ] {
+        fs::write(out.join(f), b"halb").unwrap();
+    }
     let req = request(vec![member(&s.a), member(&s.b)], &out);
     let report = run_merge(&req, &Progress::new()).unwrap();
+    for f in ["modell.las.tmp", "modell.ply.tmp", "modell.json.tmp"] {
+        assert!(!out.join(f).exists(), "{f} left");
+    }
+    assert!(out.join("notiz.tmp").exists());
     let b = &report.members[1];
     assert_eq!(b.verdict, "sicher", "{}", describe(&report));
     assert_eq!(b.placed_against, Some(0));
@@ -197,27 +221,63 @@ fn merges_two_scans() {
     let points: u64 = report.members.iter().map(|m| m.points).sum();
     assert_eq!(points, report.points);
     assert_eq!(las_points(&out).len() as u64, report.points);
-    let ply = fs::read(out.join(MODEL_PLY)).unwrap();
-    let head = String::from_utf8_lossy(&ply[..400.min(ply.len())]).into_owned();
-    assert!(head.contains("property ushort scan"), "{head}");
+    assert!(!out.join(MODEL_PLY).exists(), "modell.ply only on request");
 
     let back = read_model(&out).unwrap();
     assert_eq!(back.input_id, report.input_id);
     assert_eq!(back.input_id, merge_input_id(&req).unwrap());
     assert_eq!(back.members.len(), 2);
+    // Every folder absolute and resolved (in its plain form on Windows), and relative to the
+    // model folder beside it.
+    let canon = |p: &Path| driftless_io::paths::canonical(p).unwrap();
+    for (m, scan) in back.members.iter().zip([&s.a, &s.b]) {
+        let name = scan.file_name().unwrap().to_str().unwrap();
+        assert_eq!(m.scan, canon(scan));
+        assert_eq!(m.map_dir, canon(&scan.join("driftless")));
+        assert_eq!(
+            m.scan_rel.as_deref(),
+            Some(format!("../../{name}").as_str())
+        );
+        let run = format!("../../{name}/driftless");
+        assert_eq!(m.slam_dir_rel.as_deref(), Some(run.as_str()));
+        assert_eq!(m.map_dir_rel.as_deref(), Some(run.as_str()));
+    }
     assert_eq!(back.members[1].transform, b.transform);
     assert_eq!(back.points, report.points);
     assert!(!out.join(format!("{MODEL_LAS}.tmp")).exists());
+    // The program that made it, beside the report (informational, part of no id).
+    let on_disk: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(out.join(MODEL_REPORT)).unwrap()).unwrap();
+    assert_eq!(
+        on_disk["programm"],
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "commit": driftless_steps::PROGRAM.commit,
+        })
+    );
+    let mut without = on_disk.clone();
+    without.as_object_mut().unwrap().remove("programm");
+    assert_eq!(
+        serde_json::from_value::<ModelReport>(without).unwrap(),
+        report,
+        "a model written before the field reads the same"
+    );
 
-    // The same request gives the same files.
+    // The same request gives the same files; `ply` adds `modell.ply` (the id stays).
     let again = out_dir("zwei-nochmal");
-    run_merge(&request(req.members.clone(), &again), &Progress::new()).unwrap();
-    for f in [MODEL_LAS, MODEL_PLY] {
-        assert!(
-            fs::read(out.join(f)).unwrap() == fs::read(again.join(f)).unwrap(),
-            "{f} differs between two runs"
-        );
-    }
+    let with_ply = MergeRequest {
+        ply: true,
+        ..request(req.members.clone(), &again)
+    };
+    let second = run_merge(&with_ply, &Progress::new()).unwrap();
+    assert_eq!(second.input_id, report.input_id);
+    assert!(
+        fs::read(out.join(MODEL_LAS)).unwrap() == fs::read(again.join(MODEL_LAS)).unwrap(),
+        "{MODEL_LAS} differs between two runs"
+    );
+    let ply = fs::read(again.join(MODEL_PLY)).unwrap();
+    let head = String::from_utf8_lossy(&ply[..400.min(ply.len())]).into_owned();
+    assert!(head.contains("property ushort scan"), "{head}");
 
     // A folder that already holds a model is not overwritten.
     let err = run_merge(&req, &Progress::new()).unwrap_err();
@@ -225,6 +285,87 @@ fn merges_two_scans() {
         matches!(&err, StepError::Failed(m) if m.contains("schon ein Modell")),
         "{err}"
     );
+}
+
+/// A member of a hand-written model with the folders `abs` and, relative to the model
+/// folder, `rel`.
+fn written_member(abs: &Path, rel: Option<&str>) -> ModelMember {
+    ModelMember {
+        scan: abs.to_path_buf(),
+        scan_rel: rel.map(String::from),
+        slam_dir: abs.to_path_buf(),
+        slam_dir_rel: rel.map(String::from),
+        map_dir: abs.to_path_buf(),
+        map_dir_rel: rel.map(String::from),
+        slam: SlamSettings::default(),
+        transform: std::array::from_fn(|k| if k % 5 == 0 { 1.0 } else { 0.0 }),
+        placed_against: None,
+        method: "bezug".into(),
+        verdict: "sicher".into(),
+        reason: None,
+        overlap: 1.0,
+        residual_median_mm: 0.0,
+        residual_rms_mm: 0.0,
+        agreement: 1.0,
+        wall_residual_mm: None,
+        pair_rms_mm: None,
+        included: true,
+        color_gain: [1.0; 3],
+        points: 1,
+        clean_id: None,
+    }
+}
+
+/// `read_model` takes a relative folder (below the model folder) where it exists, also when
+/// the absolute one exists too (a copy of a project), else the absolute one; a model written
+/// before the relative paths reads as written.
+#[test]
+fn read_model_takes_the_relative_folder_first() {
+    let scratch = tmp("modell-relativ");
+    let dir = driftless_io::paths::canonical(&scratch).unwrap();
+    let old = dir.join("alt").join("scans").join("a");
+    let new = dir.join("neu").join("scans").join("a");
+    let model = dir.join("neu").join("modelle").join("modell-001");
+    for d in [&old, &new, &model] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let write = |members: Vec<ModelMember>| {
+        let report = ModelReport {
+            version: 2,
+            input_id: "0".into(),
+            members,
+            points: 1,
+            seconds_total: 0.0,
+            peak_rss_bytes: 0,
+            include_unsure: false,
+            warnings: Vec::new(),
+        };
+        let text = serde_json::to_string_pretty(&report).unwrap();
+        fs::write(model.join(MODEL_REPORT), text).unwrap();
+    };
+    write(vec![written_member(&old, Some("../../scans/a"))]);
+    let m = read_model(&model).unwrap().members.remove(0);
+    assert_eq!((&m.scan, &m.slam_dir, &m.map_dir), (&new, &new, &new));
+    assert_eq!(
+        m.map_dir_rel.as_deref(),
+        Some("../../scans/a"),
+        "kept as read"
+    );
+    // The relative folder is gone: the absolute one.
+    fs::remove_dir_all(&new).unwrap();
+    assert_eq!(read_model(&model).unwrap().members[0].map_dir, old);
+    // Written before the relative paths: no keys at all, read as written.
+    write(vec![written_member(&old, None)]);
+    let text = fs::read_to_string(model.join(MODEL_REPORT)).unwrap();
+    let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    for key in ["scan_rel", "slam_dir_rel", "map_dir_rel"] {
+        json["members"][0].as_object_mut().unwrap().remove(key);
+    }
+    json.as_object_mut().unwrap().remove("warnings");
+    fs::write(model.join(MODEL_REPORT), json.to_string()).unwrap();
+    let back = read_model(&model).unwrap();
+    assert_eq!(back.members[0].map_dir, old);
+    assert!(back.members[0].map_dir_rel.is_none() && back.warnings.is_empty());
 }
 
 #[test]
@@ -326,6 +467,29 @@ fn cancel_leaves_no_report() {
     for f in [MODEL_REPORT, MODEL_LAS, MODEL_PLY] {
         assert!(!out.join(f).exists(), "{f} written");
     }
+
+    // Cancelled while smoothing, after its first chunk of points: it stops at the next one
+    // (before, the smoothing ran to its end), and nothing is written.
+    let p = Progress::new();
+    let handle = p.clone();
+    let seen = Arc::new(Mutex::new(ProgressSnapshot::default()));
+    let last = seen.clone();
+    let p = p.with_observer(move |s: &ProgressSnapshot| {
+        if s.phase == "Glätten" {
+            *last.lock().unwrap() = s.clone();
+            if s.done > 0 {
+                handle.cancel();
+            }
+        }
+    });
+    assert_eq!(run_merge(&req, &p).unwrap_err(), StepError::Cancelled);
+    for f in [MODEL_REPORT, MODEL_LAS, MODEL_PLY] {
+        assert!(!out.join(f).exists(), "{f} written");
+    }
+    let seen = seen.lock().unwrap().clone();
+    let total = seen.total.expect("the points of the model");
+    assert!(total > 2 * SMOOTH_CHUNK as u64, "{seen:?}");
+    assert_eq!(seen.done, SMOOTH_CHUNK as u64, "{seen:?}");
 }
 
 #[test]
@@ -467,12 +631,31 @@ fn disabled_pairs_are_ignored() {
     };
     let id = merge_input_id(&req).unwrap();
     assert_eq!(id, merge_input_id(&plain).unwrap());
-    let report = run_merge(&req, &Progress::new()).unwrap();
+    let p = Progress::new();
+    let report = run_merge(&req, &p).unwrap();
     let c = &report.members[2];
     assert_eq!(c.verdict, "unsicher", "{}", describe(&report));
     assert_ne!(c.method, "punktpaare");
     assert!(!c.included);
     assert_eq!(report.input_id, id);
+    // The switched-on entry that names no two of the maps is not skipped silently: a warning
+    // in the log and in `modell.json`; the switched-off one gives none.
+    let logged: Vec<String> = p
+        .take_log()
+        .into_iter()
+        .filter_map(|l| match l {
+            driftless_io::progress::LogLine::Warning(w) => Some(w),
+            driftless_io::progress::LogLine::Info(_) => None,
+        })
+        .collect();
+    let expected = format!(
+        "Punktpaare Eintrag 2: {} und {} sind nicht zwei der gewählten Karten, nicht genutzt",
+        s.c.join("driftless").display(),
+        s.a.join("anderswo").display()
+    );
+    assert_eq!(report.warnings, std::slice::from_ref(&expected));
+    assert!(logged.contains(&expected), "{logged:?}");
+    assert_eq!(read_model(&out).unwrap().warnings, report.warnings);
 
     // Switched on, the pairs count.
     let mut on = req.clone();
@@ -626,9 +809,83 @@ fn stored_text_round_trips_with_file_resolution() {
     let back = PointPairs::load(&file)
         .unwrap()
         .resolved(file.parent().unwrap());
+    // `..` is taken off in the text: no part `..` is left for the file system to resolve
+    // (below a verbatim Windows path it would be taken literally).
+    assert_eq!(back[0].a, inside);
+    assert!(back
+        .iter()
+        .flat_map(|e| [&e.a, &e.b])
+        .all(|p| !p.components().any(|c| c == std::path::Component::ParentDir)));
     let canon = |p: &Path| fs::canonicalize(p).unwrap();
     assert_eq!(canon(&back[0].a), inside);
     assert_eq!(canon(&back[0].b), outside);
     assert_eq!(canon(&back[1].a), below);
     assert_eq!(canon(&back[1].b), inside);
+}
+
+/// A project on a Windows share (`\\localhost\C$\…`): the map folders of `punktpaare.toml`,
+/// relative to `modelle/` with `..`, resolve below the share and match the members' folders
+/// as resolving gives them (in their plain form, without `\\?\UNC\`). Skipped where the
+/// share cannot be read (it needs an administrator, as on the CI runner).
+#[cfg(windows)]
+#[test]
+fn pairs_match_members_on_a_share() {
+    use driftless_io::paths::canonical;
+    use driftless_steps::merge::pair_members;
+    let scratch = tmp("punktpaare-freigabe");
+    let local = canonical(&scratch).unwrap();
+    let text = local.to_str().unwrap().to_string();
+    let Some(rest) = text
+        .get(3..)
+        .filter(|_| text[..3].eq_ignore_ascii_case("C:\\"))
+    else {
+        eprintln!("übersprungen: {text} liegt nicht auf C:");
+        return;
+    };
+    let share = PathBuf::from(format!(r"\\localhost\C$\{rest}"));
+    if fs::metadata(&share).is_err() {
+        eprintln!("übersprungen: {} nicht lesbar", share.display());
+        return;
+    }
+    let project = share.join("projekt");
+    let models = project.join("modelle");
+    let maps: Vec<PathBuf> = ["a", "b"]
+        .iter()
+        .map(|s| {
+            project
+                .join("scans")
+                .join(s)
+                .join("slam-001")
+                .join("karte-001")
+        })
+        .collect();
+    for d in maps.iter().chain([&models]) {
+        fs::create_dir_all(d).unwrap();
+    }
+    let members: Vec<MergeMember> = maps
+        .iter()
+        .map(|m| MergeMember {
+            map_dir: canonical(m).unwrap(),
+            ..member(m)
+        })
+        .collect();
+    for m in &members {
+        let shown = m.map_dir.to_string_lossy().into_owned();
+        assert!(!shown.starts_with(r"\\?\"), "{shown}");
+    }
+    let req = request(members, &models.join("modell-001"));
+    let (in_c, in_a) = pairs_c_in_a();
+    let mut pairs = PointPairs::default();
+    pairs
+        .add(pair_entry(
+            Path::new("../scans/a/slam-001/karte-001"),
+            Path::new("../scans/b/slam-001/karte-001"),
+            in_a,
+            in_c,
+        ))
+        .unwrap();
+    for base in [canonical(&models).unwrap(), models.clone()] {
+        let resolved = pairs.resolved(&base);
+        assert_eq!(pair_members(&req, &resolved[0]), Some((0, 1)), "{base:?}");
+    }
 }

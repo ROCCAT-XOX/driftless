@@ -1,7 +1,7 @@
 //! The layout of the window: the rail with ☰, the three steps and ⚙, the field of the active
 //! step, the settings window, the empty states and the stored layout.
 
-use driftless_app::project::{Project, ScanEntry, ScanState};
+use driftless_app::project::{MapInfo, Project, RunInfo, ScanEntry, ScanState};
 use driftless_app::render::{ColorMode, PointSize, ShowMode};
 use driftless_app::ui::{
     rail, steps, text, Action, AppState, DriftlessApp, ScanNode, Selection, Step, SurfaceSummary,
@@ -65,6 +65,7 @@ fn project_state() -> AppState {
                 path: PathBuf::from("/daten/buero"),
                 name: "buero".into(),
                 extra_runs: Vec::new(),
+                bags: Vec::new(),
             }],
         }),
         scans: vec![ScanNode {
@@ -77,6 +78,32 @@ fn project_state() -> AppState {
         selection: Selection::Scan("buero".into()),
         ..AppState::default()
     }
+}
+
+/// [`project_state`] with the map „Karte 001“ of the run „SLAM 001“ (not read from disk).
+fn with_map() -> AppState {
+    let mut state = project_state();
+    state.scans[0].runs.push(RunInfo {
+        dir: "/p/scans/buero/slam-001".into(),
+        label: "SLAM 001".into(),
+        settings: Default::default(),
+        has_result: true,
+        has_cache: false,
+        has_previous: false,
+        has_odometry: false,
+        cloud: None,
+        maps: vec![MapInfo {
+            dir: "/p/scans/buero/slam-001/karte-001".into(),
+            label: "Karte 001".into(),
+            settings: None,
+            clouds: Vec::new(),
+            surfaces: Vec::new(),
+            incomplete: false,
+        }],
+        history: Vec::new(),
+        incomplete: false,
+    });
+    state
 }
 
 #[test]
@@ -116,15 +143,25 @@ fn step_sets_show_mode() {
 
     // a surface still being loaded counts as one
     let mut app = self::app();
-    let glb = tmp("ui-layout-laedt").join("oberflaeche.glb");
+    let dir = tmp("ui-layout-laedt");
+    let glb = dir.join("oberflaeche.glb");
     app.apply(Action::LoadSurface(glb));
     assert!(app.is_loading_surface());
     assert!(app.state().surface.is_none());
     app.apply(Action::SetStep(Step::Bilder));
     assert_eq!(app.state().view.show, ShowMode::Surface);
 
-    // without a surface the cloud stays, with a hint
+    // without a surface the cloud stays, with a hint where there is a map to compute one from
     let mut h = window(self::app());
+    h.state_mut().apply(Action::SetStep(Step::Bilder));
+    h.run();
+    assert!(
+        h.query_by_label(text::NO_SURFACE_YET).is_none(),
+        "no map yet"
+    );
+    h.state_mut().state_mut().scans = with_map().scans;
+    h.state_mut().apply(Action::SetStep(Step::Daten));
+    h.run();
     h.state_mut().apply(Action::SetStep(Step::Bilder));
     h.run();
     assert_eq!(h.state().state().step, Step::Bilder);
@@ -479,7 +516,14 @@ fn projects_of_disk_show_in_daten() {
     let dir = tmp("ui-layout-leer");
     Project::create(&dir, "Leer").unwrap();
     let mut app = app();
-    app.apply(Action::OpenProject(dir));
+    app.apply(Action::OpenProject(dir.to_path_buf()));
+    // read in the background
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while app.wants_repaint_while_busy() {
+        assert!(std::time::Instant::now() < deadline, "project not read");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        app.tick();
+    }
     let h = window(app);
     h.get_by_label(&text::project_line("Leer", 0));
     h.get_by_label(text::EMPTY_NO_SCANS);

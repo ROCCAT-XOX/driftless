@@ -1,28 +1,37 @@
 //! The project model on synthetic scans: `project.toml`, run folders, map folders, CLI
 //! folders added as runs, missing scan folders, models merged from several scans.
 
+use driftless_app::leftovers;
 use driftless_app::project::{
-    map_dir_for, model_picks, model_status, model_surface_status, point_pairs, run_map_job,
-    run_merge_job, run_model_surface_job, run_pairs_merge_job, run_slam_job,
-    set_point_pair_enabled, MergePick, Project, ScanState, SlamJob, SurfaceSettings,
+    map_dir_for, map_status, model_picks, model_status, model_surface_status, point_pairs,
+    restore_job, run_map_job, run_merge_job, run_model_surface_job, run_pairs_merge_job,
+    run_slam_job, run_surface_job, set_point_pair_enabled, surface_status, MergePick, Project,
+    ScanState, SlamJob, SurfaceSettings,
 };
+use driftless_app::ui::read_tree;
 use driftless_gpu::GpuPref;
 use driftless_io::progress::{Progress, ProgressSnapshot};
-use driftless_io::testscan::{furnished_room_bag, room_bag_at, room_bag_secs, tmp};
+use driftless_io::testdir::SharedDir;
+use driftless_io::testscan::{
+    furnished_room_bag, room_bag_at, room_bag_secs, scan_with_images, shared, tmp,
+};
 use driftless_map::surface::SurfaceConfig;
 use driftless_steps::correct;
 use driftless_steps::history::HistoryKind;
 use driftless_steps::map::{
     map_input_for, run_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches,
 };
-use driftless_steps::merge::{member_transform, read_model, MODEL_LAS, MODEL_REPORT};
+use driftless_steps::merge::{
+    member_transform, read_model, MERGE_VERSION, MODEL_LAS, MODEL_REPORT,
+};
 use driftless_steps::pairs::{PointPairEntry, PointPairs, POINT_PAIRS_FILE};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::StepError;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 fn canon(p: &Path) -> PathBuf {
     driftless_app::project::canonical(p).unwrap()
@@ -151,7 +160,7 @@ fn create_refuses_existing_project() {
     Project::create(&dir.join("p"), "eins").unwrap();
     let err = Project::create(&dir.join("p"), "zwei").unwrap_err();
     assert!(
-        err.to_string().starts_with("Projekt existiert schon"),
+        err.to_string().starts_with("Hier ist schon ein Projekt"),
         "{err}"
     );
     assert_eq!(Project::open(&dir.join("p")).unwrap().name, "eins");
@@ -263,6 +272,7 @@ fn cli_folder_can_be_added_as_run() {
             map: MapSettings::default(),
         },
         out_dir: out.clone(),
+        all_files: false,
     };
     run_map(&req, &Progress::new()).unwrap();
 
@@ -291,13 +301,13 @@ fn cli_folder_can_be_added_as_run() {
     assert_eq!(map.label, "Karte (im Lauf-Ordner)");
     assert_eq!(map.dir, run.dir);
     assert_eq!(map.settings, Some(MapSwitches::default()));
-    // no camera images: no color.las
+    // no camera images: no color.las, the cleaned cloud to look at, and the removed points
     let clouds: Vec<String> = map
         .clouds
         .iter()
         .map(|c| c.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(clouds, ["clean.las", "dense.las", "removed.las"]);
+    assert_eq!(clouds, ["clean.las", "removed.las"]);
 }
 
 #[test]
@@ -395,8 +405,8 @@ fn missing_scan_folder_is_reported_not_fatal() {
     let p = Project::open(&p.dir).unwrap();
     match p.scan_state(&id) {
         ScanState::Missing(why) => {
-            assert!(why.starts_with("Scan-Ordner "), "{why}");
-            assert!(why.ends_with(" nicht gefunden"), "{why}");
+            // the reason first, then the folder
+            assert!(why.starts_with("Scan-Ordner nicht gefunden: "), "{why}");
             assert!(why.contains("rohdaten"), "{why}");
         }
         ScanState::Ready => panic!("scan folder is gone"),
@@ -428,31 +438,258 @@ fn map_dir_reused_when_settings_and_traj_fit() {
     let scan_dir = p.scans[0].path.clone();
     let done = run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
     assert_eq!(done.dir, run.dir.join("karte-001"));
-    let dense = fs::read(done.dir.join("dense.bin")).unwrap();
+    let k1 = files(&done.dir);
 
-    // same switches, another step: the same folder
+    // the same map again: current, nothing computed or written, the same folder
     let run = p.runs(&id).remove(0);
-    let done = run_map_job(&run, &scan_dir, &settings(MapStep::Clean), &Progress::new()).unwrap();
+    let done = run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
     assert_eq!(done.dir, run.dir.join("karte-001"));
-    assert_eq!(done.report["steps"]["dense"]["reused"], true);
-    assert_eq!(fs::read(done.dir.join("dense.bin")).unwrap(), dense);
-    let run = p.runs(&id).remove(0);
-    assert_eq!(run.maps.len(), 1);
-    assert_eq!(run.maps[0].label, "Karte 001");
-    assert_eq!(run.maps[0].settings, Some(MapSwitches::default()));
+    assert_eq!(files(&done.dir), k1);
 
-    // map_dir_for on its own: the fitting folder, nothing created
+    // map_dir_for on its own: the current folder, nothing created
     let input = MapInput {
         scan: scan_dir.clone(),
         slam_dir: run.dir.clone(),
         slam: run.settings.clone(),
-        map: settings(MapStep::Color),
+        map: settings(MapStep::All),
     };
     let target = map_dir_for(&run, &input, &Progress::new()).unwrap();
     assert!(!target.is_new());
     assert_eq!(target.path(), run.dir.join("karte-001"));
     drop(target);
     assert!(run.dir.join("karte-001/map.json").exists(), "kept on drop");
+
+    // same switches, another step: it writes, so never into the map's own folder – a new one,
+    // with the stage it takes over linked from the old one, which stays as it was
+    let done = run_map_job(&run, &scan_dir, &settings(MapStep::Clean), &Progress::new()).unwrap();
+    assert_eq!(done.dir, run.dir.join("karte-002"));
+    assert_eq!(done.report["steps"]["dense"]["reused"], true);
+    assert_eq!(
+        fs::read(done.dir.join("dense.bin")).unwrap(),
+        k1["dense.bin"]
+    );
+    assert_eq!(files(&run.dir.join("karte-001")), k1, "karte-001 untouched");
+    let run = p.runs(&id).remove(0);
+    let labels: Vec<&str> = run.maps.iter().map(|m| m.label.as_str()).collect();
+    assert_eq!(labels, ["Karte 001", "Karte 002"]);
+    assert_eq!(run.maps[0].settings, Some(MapSwitches::default()));
+}
+
+/// A map whose files no longer fit it all (here `dense.bin`, deleted to save space) is
+/// computed anew into a new folder, never into its own: cancelled in the clean step, the old
+/// map keeps its report and its surface and stays in the tree, and nothing is offered for
+/// „Aufräumen“ (the review's probe of I1). Computed to its end, the new map has a folder of
+/// its own as well.
+#[test]
+fn cancelled_map_recompute_keeps_the_map() {
+    let dir = tmp("app-map-recompute-cancel");
+    let (p, id) = project_with_run(&dir, 1.5);
+    let scan_dir = p.scans[0].path.clone();
+    let run = p.runs(&id).remove(0);
+    run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
+    let k1 = run.dir.join("karte-001");
+    let surface = k1.join("oberflaeche-001");
+    fs::create_dir_all(&surface).unwrap();
+    fs::write(surface.join("oberflaeche.glb"), b"glb").unwrap();
+    fs::write(surface.join("oberflaeche.json"), b"{}").unwrap();
+    fs::remove_file(k1.join("dense.bin")).unwrap();
+    let before = files(&k1);
+
+    let progress = Progress::new();
+    let handle = progress.clone();
+    let progress = progress.with_observer(move |s: &ProgressSnapshot| {
+        if s.phase == "Geister" {
+            handle.cancel();
+        }
+    });
+    let run = p.runs(&id).remove(0);
+    let err = run_map_job(&run, &scan_dir, &settings(MapStep::All), &progress).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    assert_eq!(files(&k1), before, "karte-001 untouched");
+    assert_eq!(files(&surface).len(), 2, "its surface too");
+    assert!(
+        !run.dir.join("karte-002").exists(),
+        "the new folder goes again"
+    );
+    let tree = read_tree(&p);
+    let run_node = &tree.scans[0].runs[0];
+    let maps: Vec<&Path> = run_node.maps.iter().map(|m| m.dir.as_path()).collect();
+    assert_eq!(maps, [k1.as_path()]);
+    assert!(!run_node.maps[0].incomplete);
+    assert_eq!(run_node.maps[0].surfaces.len(), 1);
+    assert_eq!(
+        leftovers::find(&p.dir, std::slice::from_ref(&id)),
+        Vec::new()
+    );
+
+    let done = run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
+    assert_eq!(done.dir, run.dir.join("karte-002"));
+    assert_eq!(files(&k1), before, "karte-001 untouched");
+}
+
+/// A single step under „Erweitert“ goes into a new folder with the stage it takes over linked,
+/// and its `map.json` carries the entries of the steps before it, with their numbers, from the
+/// map that stage came from: the map counts as current (not „veraltet“), so „Oberfläche
+/// rechnen“ is open for it and its surface fits; nothing in it is called stale. „Einfärben“
+/// alone with the same and with other colour switches, „Bereinigen“ alone (the review's probe
+/// of the fix of I1). The step after the one computed is not carried: its cloud is not there.
+#[test]
+fn single_map_steps_give_a_current_map() {
+    let dir = tmp("app-map-single-steps");
+    let raw = dir.join("rohdaten");
+    fs::create_dir_all(&raw).unwrap();
+    scan_with_images(&raw);
+    let mut p = Project::create(&dir.join("projekt"), "Test").unwrap();
+    let id = p.add_scan(&raw).unwrap();
+    p.save().unwrap();
+    let full = SlamJob::Full(SlamSettings::default());
+    run_slam_job(&p, &id, &full, &Progress::new()).unwrap();
+    let scan_dir = p.scans[0].path.clone();
+    let run = p.runs(&id).remove(0);
+    let whole = run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
+    let k1 = files(&whole.dir);
+    let other_colours = MapSettings {
+        step: MapStep::Color,
+        switches: MapSwitches {
+            highlights: true,
+            ..MapSwitches::default()
+        },
+    };
+    let colored: &[&str] = &["clean.bin", "color.las", "map.json"];
+    let cases: [(&str, MapSettings, &[&str], &[&str]); 3] = [
+        (
+            "karte-002",
+            settings(MapStep::Color),
+            colored,
+            &["dense", "clean"],
+        ),
+        ("karte-003", other_colours, colored, &["dense", "clean"]),
+        (
+            "karte-004",
+            settings(MapStep::Clean),
+            &[
+                "clean.bin",
+                "clean.las",
+                "dense.bin",
+                "map.json",
+                "removed.las",
+            ],
+            &["dense"],
+        ),
+    ];
+    for (folder, step, in_folder, carried) in cases {
+        let run = p.runs(&id).remove(0);
+        let done = run_map_job(&run, &scan_dir, &step, &Progress::new()).unwrap();
+        assert_eq!(done.dir, run.dir.join(folder));
+        assert_eq!(names(&done.dir), in_folder, "{folder}");
+        let steps = &done.report["steps"];
+        for s in carried {
+            assert_eq!(steps[s]["reused"], true, "{folder} {s}: {steps}");
+            assert_eq!(
+                steps[s]["stats"], whole.report["steps"][s]["stats"],
+                "{folder} {s}: the numbers of the map it was made from"
+            );
+        }
+        let computed = if step.step == MapStep::Clean {
+            assert!(steps.get("color").is_none(), "{folder}: {steps}");
+            "clean"
+        } else {
+            "color"
+        };
+        assert_eq!(steps[computed]["reused"], false, "{folder}: {steps}");
+        assert_eq!(done.report["stale"], serde_json::json!([]), "{folder}");
+        let run = p.runs(&id).remove(0);
+        let map = run.maps.iter().find(|m| m.dir == done.dir).unwrap();
+        assert!(
+            !map_status(&scan_dir, &run, map).stale,
+            "{folder} counts as stale: {steps}"
+        );
+    }
+    assert_eq!(files(&run.dir.join("karte-001")), k1, "karte-001 untouched");
+
+    // „Oberfläche rechnen“ on the coloured map of the single step: computed, and current
+    let run = p.runs(&id).remove(0);
+    let map = &run.maps[1];
+    let quick = SurfaceSettings {
+        config: SurfaceConfig {
+            voxel: 0.15,
+            min_weight: 1,
+            min_component_faces: 10,
+            page_size: 256,
+            simplify_error: 0.01,
+            ..SurfaceConfig::default()
+        },
+        texture: true,
+    };
+    let surface =
+        run_surface_job(&run, &scan_dir, map, &quick, GpuPref::Off, &Progress::new()).unwrap();
+    assert_eq!(surface.dir, map.dir.join("oberflaeche-001"));
+    let run = p.runs(&id).remove(0);
+    let map = &run.maps[1];
+    assert!(!surface_status(&scan_dir, &run, map, &map.surfaces[0]).stale);
+}
+
+/// A reuse of a run whose `map.las` cannot be written (as on a full disk) puts every file of
+/// the run back: it keeps its report, its trajectory and its history, stays in the tree with
+/// its map, and nothing is offered for „Aufräumen“ (the review's probe of I1).
+#[test]
+fn failed_reuse_keeps_the_run() {
+    let dir = tmp("app-reuse-fails");
+    let (p, id) = project_with_run(&dir, 1.5);
+    let scan_dir = p.scans[0].path.clone();
+    let run = p.runs(&id).remove(0);
+    run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
+    let run = p.runs(&id).remove(0);
+    let before = files(&run.dir);
+    let states = run.history.len();
+    // a folder in the way of the temporary file of the new map.las: its write fails
+    let blocked = run.dir.join("map.las.tmp");
+    fs::create_dir_all(blocked.join("x")).unwrap();
+    let err = run_slam_job(&p, &id, &SlamJob::Reuse(run.clone()), &Progress::new()).unwrap_err();
+    assert!(err.to_string().contains("wie vorher"), "{err}");
+    fs::remove_dir_all(&blocked).unwrap();
+    assert_eq!(files(&run.dir), before);
+    let tree = read_tree(&p);
+    let node = &tree.scans[0].runs[0];
+    assert!(node.has_result && !node.incomplete);
+    assert_eq!(node.maps.len(), 1);
+    assert_eq!(node.history.len(), states);
+    assert_eq!(leftovers::find(&p.dir, &[id]), Vec::new());
+}
+
+/// A reuse and „Diesen Stand wiederherstellen“ write into the run's own folder: while they
+/// run, the folder carries the busy mark, so another window neither offers it for „Aufräumen“
+/// nor deletes it; afterwards the mark is gone.
+#[test]
+fn jobs_in_the_run_folder_mark_it_busy() {
+    let dir = tmp("app-reuse-busy");
+    let (p, id) = project_with_run(&dir, 1.5);
+    let run = p.runs(&id).remove(0);
+    let mark = run.dir.join(leftovers::BUSY_FILE);
+    let watching = |seen: Arc<AtomicBool>| {
+        let mark = mark.clone();
+        Progress::new().with_observer(move |s: &ProgressSnapshot| {
+            if s.phase == "Schleifen schließen" && mark.is_file() {
+                seen.store(true, Ordering::SeqCst);
+            }
+        })
+    };
+    let seen = Arc::new(AtomicBool::new(false));
+    run_slam_job(
+        &p,
+        &id,
+        &SlamJob::Reuse(run.clone()),
+        &watching(seen.clone()),
+    )
+    .unwrap();
+    assert!(seen.load(Ordering::SeqCst), "marked while it ran");
+    assert!(!mark.exists(), "the mark goes afterwards");
+
+    let seen = Arc::new(AtomicBool::new(false));
+    let run = p.runs(&id).remove(0);
+    restore_job(&p, &id, &run, 1, &watching(seen.clone())).unwrap();
+    assert!(seen.load(Ordering::SeqCst), "marked while it ran");
+    assert!(!mark.exists(), "the mark goes afterwards");
 }
 
 #[test]
@@ -499,8 +736,10 @@ fn new_map_dir_on_changed_settings_copies_bins() {
     let target = map_dir_for(&run, &input, &Progress::new()).unwrap();
     assert!(target.is_new());
     assert_eq!(target.path(), run.dir.join("karte-003"));
-    assert!(
-        names(target.path()).is_empty(),
+    // only the mark of the job that writes into it
+    assert_eq!(
+        names(target.path()),
+        [driftless_app::leftovers::BUSY_FILE],
         "{:?}",
         names(target.path())
     );
@@ -585,6 +824,79 @@ fn relative_and_windows_style_paths() {
         canon(&moved).join("rohdaten").join("innen")
     );
     assert_eq!(r.scan_state(&a), ScanState::Ready);
+}
+
+/// A scan and a run outside the project: absolute, and relative to the project beside it
+/// (also in `lauf.toml`). The relative path is read first where it exists, else the absolute
+/// one; a list of relative run paths that does not match the runs is ignored.
+#[test]
+fn outside_paths_are_kept_relative_too() {
+    let dir = tmp("app-paths-outside");
+    let pdir = dir.join("projekte").join("p");
+    let mut p = Project::create(&pdir, "P").unwrap();
+    let outside = scan(&dir.join("rohdaten"), "aussen", 0.5);
+    let id = p.add_scan(&outside).unwrap();
+    let cli = dir.join("cli").join("lauf");
+    fake_run(&cli);
+    p.add_run(&id, &cli).unwrap();
+    p.save().unwrap();
+    let text = fs::read_to_string(pdir.join("project.toml")).unwrap();
+    let t: toml::Table = toml::from_str(&text).unwrap();
+    let s = &t["scan"][0];
+    assert_eq!(Path::new(s["path"].as_str().unwrap()), canon(&outside));
+    assert_eq!(s["path_rel"].as_str(), Some("../../rohdaten/aussen"));
+    assert_eq!(Path::new(s["extra_runs"][0].as_str().unwrap()), canon(&cli));
+    assert_eq!(s["extra_runs_rel"][0].as_str(), Some("../../cli/lauf"));
+    let run = p.new_run_dir(&id, &SlamSettings::default()).unwrap();
+    let lauf: toml::Table =
+        toml::from_str(&fs::read_to_string(run.path().join("lauf.toml")).unwrap()).unwrap();
+    assert_eq!(Path::new(lauf["scan"].as_str().unwrap()), canon(&outside));
+    assert_eq!(lauf["scan_rel"].as_str(), Some("../../rohdaten/aussen"));
+    drop(run);
+
+    // Everything moved together: only the relative paths lead to the folders.
+    let moved = tmp("app-paths-outside-moved");
+    fs::remove_dir_all(&moved).unwrap();
+    fs::rename(&dir, &moved).unwrap();
+    let q = Project::open(&moved.join("projekte").join("p")).unwrap();
+    assert_eq!(
+        q.scans[0].path,
+        canon(&moved.join("rohdaten").join("aussen"))
+    );
+    assert_eq!(
+        q.scans[0].extra_runs,
+        [canon(&moved.join("cli").join("lauf"))]
+    );
+    assert_eq!(q.scan_state(&id), ScanState::Ready);
+    // Saved again: the paths of the new place.
+    q.save().unwrap();
+    let r = Project::open(&moved.join("projekte").join("p")).unwrap();
+    assert_eq!(r.scans, q.scans);
+
+    // The project alone moved elsewhere: the relative paths lead nowhere, the absolute ones
+    // are taken.
+    let alone = moved.join("woanders").join("tiefer").join("p");
+    fs::create_dir_all(alone.parent().unwrap()).unwrap();
+    fs::rename(moved.join("projekte").join("p"), &alone).unwrap();
+    let r = Project::open(&alone).unwrap();
+    assert_eq!(r.scans[0].path, q.scans[0].path);
+    assert_eq!(r.scans[0].extra_runs, q.scans[0].extra_runs);
+
+    // A hand edit left another number of relative run paths than runs: they are not used,
+    // although the first would lead to a folder (another one).
+    let file = alone.join("project.toml");
+    let mut t: toml::Table = toml::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    let wrong = toml::Value::Array(vec!["../../../rohdaten/aussen".into(), "".into()]);
+    t["scan"].as_array_mut().unwrap()[0]
+        .as_table_mut()
+        .unwrap()
+        .insert("extra_runs_rel".into(), wrong);
+    fs::write(&file, toml::to_string(&t).unwrap()).unwrap();
+    assert!(alone.join("../../../rohdaten/aussen").is_dir());
+    assert_eq!(
+        Project::open(&alone).unwrap().scans[0].extra_runs,
+        q.scans[0].extra_runs
+    );
 }
 
 #[test]
@@ -695,10 +1007,12 @@ fn reuse_of_cli_run_with_other_settings_explains_why() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.starts_with("Lauf wurde mit anderen Einstellungen gerechnet"),
+        err.starts_with("Nicht neu rechenbar: der Lauf wurde mit anderen SLAM-Einstellungen"),
         "{err}"
     );
-    assert!(err.contains("--reuse"), "{err}");
+    // what to do in the window, no command line
+    assert!(err.contains("„SLAM rechnen“"), "{err}");
+    assert!(!err.contains("driftless "), "{err}");
     assert_eq!(files(&out), before);
     assert!(!out.join("verlauf").exists());
 }
@@ -732,10 +1046,10 @@ fn map_of_cli_run_with_other_settings_is_refused() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.starts_with("Lauf wurde mit anderen Einstellungen gerechnet"),
+        err.starts_with("Karte nicht rechenbar: der Lauf wurde mit anderen SLAM-Einstellungen"),
         "{err}"
     );
-    assert!(err.contains("Karte"), "{err}");
+    assert!(!err.contains("driftless "), "{err}");
     assert_eq!(files(&out), before);
     assert_eq!(names(&out), entries, "no map folder");
 
@@ -784,7 +1098,7 @@ fn add_run_checks_the_scan() {
     let id_a = p.add_scan(&a).unwrap();
     let id_b = p.add_scan(&b).unwrap();
     let err = p.add_run(&id_b, &lauf).unwrap_err().to_string();
-    assert!(err.contains("gehört nicht zum Scan"), "{err}");
+    assert!(err.starts_with("Lauf gehört nicht zu diesem Scan"), "{err}");
     assert!(p.scans[1].extra_runs.is_empty());
     p.add_run(&id_a, &lauf).unwrap();
 }
@@ -793,6 +1107,8 @@ fn add_run_checks_the_scan() {
 /// a run and a cleaned map in `<scan>/driftless` as the CLI makes them. Made once for the
 /// merge tests, which only read them.
 struct MergeScans {
+    /// Their folder, shared by the tests of this file.
+    _root: SharedDir,
     a: PathBuf,
     b: PathBuf,
 }
@@ -800,7 +1116,7 @@ struct MergeScans {
 fn merge_scans() -> &'static MergeScans {
     static SCANS: OnceLock<MergeScans> = OnceLock::new();
     SCANS.get_or_init(|| {
-        let root = tmp("app-merge-scans");
+        let root = shared("app-merge-scans");
         let (a, b) = (root.join("a"), root.join("b"));
         for d in [&a, &b] {
             fs::create_dir_all(d).unwrap();
@@ -815,6 +1131,7 @@ fn merge_scans() -> &'static MergeScans {
                 &MapRequest {
                     input,
                     out_dir: out,
+                    all_files: false,
                 },
                 &Progress::new(),
             )
@@ -823,6 +1140,7 @@ fn merge_scans() -> &'static MergeScans {
         MergeScans {
             a: canon(&a),
             b: canon(&b),
+            _root: root,
         }
     })
 }
@@ -857,6 +1175,61 @@ fn picks(p: &Project) -> Vec<MergePick> {
 
 fn models_dir(p: &Project) -> PathBuf {
     p.dir.join("modelle")
+}
+
+/// „Ordner neu zuordnen …“ reaches the models (M2 of the final review): `modell.json` keeps
+/// the scan folder of the merge, the project the one it has now. A model of a scan assigned a
+/// new folder takes it from the project: the report its surface request is made of names the new
+/// folder (the photos come from there), the scan is found in the project, and whether its map
+/// changed is told from there.
+#[test]
+fn relinked_scan_reaches_the_model() {
+    let dir = tmp("app-merge-relink");
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    for d in [&a, &b] {
+        fs::create_dir_all(d).unwrap();
+    }
+    furnished_room_bag(&a, true, [0.0; 3], 0.0);
+    furnished_room_bag(&b, true, [0.8, 0.5, 0.0], 30f64.to_radians());
+    let mut p = Project::create(&dir.join("projekt"), "Modell").unwrap();
+    let ids: Vec<String> = [&a, &b].iter().map(|s| p.add_scan(s).unwrap()).collect();
+    p.save().unwrap();
+    let mut picks = Vec::new();
+    for id in &ids {
+        let full = SlamJob::Full(SlamSettings::default());
+        let done = run_slam_job(&p, id, &full, &Progress::new()).unwrap();
+        let run = p.runs(id).remove(0);
+        let scan_dir = p.scan(id).unwrap().path.clone();
+        let map = run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
+        picks.push(MergePick {
+            scan_id: id.clone(),
+            run: done.run_dir,
+            map: map.dir,
+        });
+    }
+    run_merge_job(&p, &picks, false, &Progress::new()).unwrap();
+
+    // the raw data of `a` moves to another drive; the scan is assigned its new folder
+    let moved = dir.join("anderes-laufwerk").join("a");
+    fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    fs::rename(&a, &moved).unwrap();
+    assert!(p.relink_scan(&ids[0], &moved).unwrap());
+    p.save().unwrap();
+    let p = Project::open(&p.dir).unwrap();
+    let model = p.models().remove(0);
+    assert_eq!(model.report.members[0].scan, canon(&moved));
+    assert_eq!(model.report.members[1].scan, canon(&b));
+    assert_eq!(model_picks(&p, &model.report).unwrap().len(), 2);
+    assert!(!model_status(&model).stale);
+
+    // the scan's bags change in the new folder: the model is stale (from the old folder,
+    // which is gone, it could not be told at all)
+    let bag = moved.join("LIDAR_0.bag");
+    let mut bytes = fs::read(&bag).unwrap();
+    bytes.extend_from_slice(&[0; 16]);
+    fs::write(&bag, bytes).unwrap();
+    let model = p.models().remove(0);
+    assert!(model_status(&model).stale);
 }
 
 #[test]
@@ -941,6 +1314,74 @@ fn models_listed_with_verdicts() {
     assert!(m.report.members.iter().all(|x| x.included));
     assert_eq!(m.report.members[1].scan, merge_scans().b);
     assert!(!model_status(m).stale);
+}
+
+/// A model merged by an older version of the merge (`version` = [`MERGE_VERSION`] − 1) is
+/// stale, also while a scan of it cannot be read (its maps cannot be told then, its version
+/// can), and so are its surfaces.
+#[test]
+fn model_of_an_older_merge_is_stale() {
+    let dir = tmp("app-merge-version");
+    let p = merge_project(&dir);
+    let made = run_merge_job(&p, &picks(&p), false, &Progress::new()).unwrap();
+    let current = p.models().remove(0);
+    assert!(!current.other_version());
+    assert!(!model_status(&current).stale);
+    let file = made.join(MODEL_REPORT);
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    json["version"] = (MERGE_VERSION - 1).into();
+    fs::write(&file, json.to_string()).unwrap();
+    let old = p.models().remove(0);
+    assert_eq!(old.report.version, MERGE_VERSION - 1);
+    assert!(old.other_version());
+    assert!(model_status(&old).stale);
+    // a scan of it cannot be read: a changed map could not be told, the version still is
+    let mut unplugged = old.clone();
+    unplugged.report.members[1].scan = dir.join("abgesteckt");
+    assert!(model_status(&unplugged).stale);
+    let mut current_unplugged = current.clone();
+    current_unplugged.report.members[1].scan = dir.join("abgesteckt");
+    assert!(!model_status(&current_unplugged).stale);
+    // a surface with a readable report: stale with the model, not without it
+    let surface_dir = made.join("oberflaeche-001");
+    fs::create_dir_all(&surface_dir).unwrap();
+    fs::write(surface_dir.join("oberflaeche.json"), "{}").unwrap();
+    let surface = driftless_app::project::SurfaceInfo {
+        dir: surface_dir,
+        label: "Oberfläche 001".into(),
+        stale: false,
+        settings: None,
+        hints: Vec::new(),
+    };
+    assert!(model_surface_status(&unplugged, &surface).stale);
+    assert!(!model_surface_status(&current_unplugged, &surface).stale);
+}
+
+/// The hints for the user in a surface report (`hinweise`) are read with the surface; a report
+/// without them (written before the field) reads as no hints.
+#[test]
+fn surface_hints_are_read() {
+    let dir = tmp("app-surface-hints");
+    let p = merge_project(&dir);
+    let model = run_merge_job(&p, &picks(&p), false, &Progress::new()).unwrap();
+    let hint = "Stellenweise offen: An 23 % der dünn gemessenen Stellen lag kein Messpunkt.";
+    for (name, report) in [
+        ("oberflaeche-001", serde_json::json!({ "hinweise": [hint] })),
+        (
+            "oberflaeche-002",
+            serde_json::json!({ "seconds_total": 1.0 }),
+        ),
+        ("oberflaeche-003", serde_json::json!({ "hinweise": [] })),
+    ] {
+        let surface = model.join(name);
+        fs::create_dir_all(&surface).unwrap();
+        fs::write(surface.join("oberflaeche.glb"), b"glb").unwrap();
+        fs::write(surface.join("oberflaeche.json"), report.to_string()).unwrap();
+    }
+    let surfaces = &p.models()[0].surfaces;
+    let hints: Vec<&[String]> = surfaces.iter().map(|s| s.hints.as_slice()).collect();
+    assert_eq!(hints, [&[hint.to_string()][..], &[], &[]]);
 }
 
 #[test]
