@@ -12,7 +12,7 @@ use driftless_app::ui::{
 };
 use driftless_io::testscan::{room_bag_secs, tmp};
 use driftless_steps::map::MapSwitches;
-use driftless_steps::merge::{ModelMember, ModelReport, MODEL_LAS, MODEL_REPORT};
+use driftless_steps::merge::{ModelMember, ModelReport, MERGE_VERSION, MODEL_LAS, MODEL_REPORT};
 use driftless_steps::slam::SlamSettings;
 use eframe::egui::accesskit::Role;
 use egui_kittest::kittest::{NodeT, Queryable};
@@ -851,7 +851,7 @@ fn member(scan: &str, verdict: &str, included: bool) -> ModelMember {
         residual_median_mm: 1.84,
         residual_rms_mm: 2.5,
         agreement: 0.95,
-        wall_residual_mm: 1.9,
+        wall_residual_mm: Some(1.9),
         pair_rms_mm: None,
         included,
         color_gain: [1.0; 3],
@@ -862,7 +862,7 @@ fn member(scan: &str, verdict: &str, included: bool) -> ModelMember {
 
 fn report(members: Vec<ModelMember>) -> ModelReport {
     ModelReport {
-        version: 1,
+        version: MERGE_VERSION,
         input_id: "0".into(),
         points: members.iter().map(|m| m.points).sum(),
         members,
@@ -892,6 +892,7 @@ fn with_model() -> AppState {
             label: "Oberfläche 001".into(),
             stale: false,
             settings: None,
+            hints: Vec::new(),
         }],
     }];
     state
@@ -947,8 +948,53 @@ fn model_node_shows_verdicts() {
         )]
         .into(),
     );
-    let h = panel(state);
+    let h = panel(state.clone());
     h.get_by_label(&text::model_stale("Modell 001"));
+    // a model of another version of the merge: the same mark with its own reason
+    state.models[0].report.version = MERGE_VERSION - 1;
+    let h = panel(state);
+    h.get_by_label(&text::model_stale_version("Modell 001"));
+    assert!(h.query_by_label(&text::model_stale("Modell 001")).is_none());
+}
+
+/// A surface of a model with a hint for the user: the hint short below its entry in the tree.
+#[test]
+fn surface_hint_in_the_tree() {
+    let hint = "Stellenweise offen: An 23 % der dünn gemessenen Stellen lag kein Messpunkt.";
+    let short = format!(
+        "{} {}",
+        driftless_app::ui::theme::icon::HINT,
+        text::surface_hint_short(hint)
+    );
+    let mut state = with_model();
+    let h = panel(state.clone());
+    h.get_by_label("Oberfläche 001");
+    assert!(h.query_by_label(&short).is_none());
+    state.models[0].surfaces[0].hints = vec![hint.into()];
+    let h = panel(state);
+    h.get_by_label("Oberfläche 001");
+    h.get_by_label(&short);
+}
+
+/// On hover over a scan of a model: the residual on the walls, or that they could not be
+/// measured (never „Wände 0,0 mm“).
+#[test]
+fn member_hover_names_the_walls() {
+    let mut state = with_model();
+    state.models[0].report.members[1].wall_residual_mm = None;
+    let mut h = panel(state);
+    h.ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.0);
+    h.get_by_label("2 · Scan 13:30").hover();
+    h.run();
+    h.get_by_label_contains(text::WALLS_UNMEASURABLE);
+    assert!(h.query_by_label_contains("Wände 0,0 mm").is_none());
+    h.get_by_label("3 · Scan 13:35").hover();
+    h.run();
+    h.get_by_label_contains(&text::member_walls(1.9));
+    assert!(h
+        .query_by_label_contains(text::WALLS_UNMEASURABLE)
+        .is_none());
+    assert_eq!(text::member_walls(1.9), "Wände 1,9 mm");
 }
 
 #[test]

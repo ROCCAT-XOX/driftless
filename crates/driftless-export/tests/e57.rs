@@ -8,6 +8,7 @@ use driftless_export::{
     PHASE_WRITE,
 };
 use driftless_io::progress::{LogLine, Progress};
+use driftless_io::testdir::TestDir;
 use e57::{E57Reader, Record, RecordDataType, RecordName, RecordValue};
 use nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion};
 use std::path::{Path, PathBuf};
@@ -15,14 +16,11 @@ use std::path::{Path, PathBuf};
 mod common;
 use common::{double, edit_xml, foreign, integer};
 
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(format!(
         "driftless-export-e57-{}-{name}",
         std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    ))
 }
 
 /// Files in `dir` whose name ends in `.tmp`.
@@ -430,8 +428,7 @@ fn e57_deterministic() {
 
 #[test]
 fn e57_empty() {
-    let dir = temp_dir("empty").join("Büro Scan");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = temp_dir("empty").inside("Büro Scan");
     let path = dir.join("Prüfung ä.e57");
     write_e57(&path, &Points::default(), &Progress::new()).unwrap();
     let reader = E57Reader::from_file(&path).unwrap();

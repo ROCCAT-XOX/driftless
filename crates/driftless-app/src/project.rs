@@ -56,13 +56,14 @@
 //! full SLAM run always gets a new `slam-NNN` (so no earlier `traj.tum` is replaced), and a map
 //! is written only into a `karte-NNN` whose `map.json` fits the request, or into a new one. A
 //! surface is only computed if no `oberflaeche-NNN` of the map fits the request, and then into a
-//! new one ([`run_surface_job`]). Every merge gets a new `modell-NNN` ([`run_merge_job`]); a
-//! folder without `modell.json` is no model (the report is written last). `project.toml`
+//! new one ([`run_surface_job`]); a folder without `oberflaeche.json` is no surface, even with
+//! its glb (the report is written last). Every merge gets a new `modell-NNN`
+//! ([`run_merge_job`]); a folder without `modell.json` is no model (the report is written
+//! last). `project.toml`
 //! does not list the models: [`Project::models`] reads the folder. Point pairs marked by hand
 //! are kept in `modelle/punktpaare.toml` ([`driftless_steps::pairs`], paths relative to that
 //! folder) and count in every merge of the project.
 
-use crate::surface::SURFACE_GLB;
 use crate::ui::text;
 use driftless_gpu::GpuPref;
 use driftless_io::atomic_write;
@@ -77,7 +78,9 @@ use driftless_steps::map::{
     clean_stage_id, fitting_stages, folder_fits, hex, map_input_for, run_map, MapInput, MapRequest,
     MapSettings, MapStep, MapSwitches, CLEAN_BIN, DENSE_BIN, REPORT,
 };
-use driftless_steps::merge::{read_model, run_merge, MergeMember, MergeRequest, ModelReport};
+use driftless_steps::merge::{
+    read_model, run_merge, version_fits, MergeMember, MergeRequest, ModelReport,
+};
 use driftless_steps::pairs::{
     stored_path as from_stored, stored_text, PointPairEntry, PointPairs, POINT_PAIRS_FILE,
 };
@@ -200,7 +203,8 @@ pub struct MapInfo {
     pub settings: Option<MapSwitches>,
     /// The existing ones of `color.las`, `clean.las`, `dense.las`, `removed.las`, in this order.
     pub clouds: Vec<PathBuf>,
-    /// The surfaces of the map: its subfolders `oberflaeche…` with an `oberflaeche.glb`.
+    /// The surfaces of the map: its subfolders `oberflaeche…` with an `oberflaeche.json` (the
+    /// step writes it last; one without it is cut off, see [`crate::leftovers`]).
     pub surfaces: Vec<SurfaceInfo>,
 }
 
@@ -216,6 +220,9 @@ pub struct SurfaceInfo {
     /// What it was made with, from its `oberflaeche.json` ([`SurfaceSettings::from_report`]);
     /// `None` without a readable one.
     pub settings: Option<SurfaceSettings>,
+    /// The hints of its `oberflaeche.json` for the user (`hinweise`, German, e.g. why it stays
+    /// open in places); empty without them (also in a report of before the field).
+    pub hints: Vec<String>,
 }
 
 /// A model of the project: scans merged into one (`modelle/modell-NNN` with `modell.json`).
@@ -226,8 +233,16 @@ pub struct ModelInfo {
     pub label: String,
     /// Its `modell.json`: where each scan sits and how sure that is.
     pub report: ModelReport,
-    /// Its surfaces: subfolders `oberflaeche…` with an `oberflaeche.glb`.
+    /// Its surfaces: subfolders `oberflaeche…` with an `oberflaeche.json`, as for a map.
     pub surfaces: Vec<SurfaceInfo>,
+}
+
+impl ModelInfo {
+    /// Whether it was merged by another version of the merge than this program's
+    /// ([`driftless_steps::merge::version_fits`]): stale whatever its maps, merge anew.
+    pub fn other_version(&self) -> bool {
+        !version_fits(&self.report)
+    }
 }
 
 /// A scan chosen for a model, with the run and the map of it to merge.
@@ -751,7 +766,10 @@ fn create_numbered(dir: &Path, prefix: &str) -> Result<StepDir, ProjectError> {
 }
 
 /// The surfaces in the map folder `dir`: `oberflaeche-NNN` by number, then other folders
-/// `oberflaeche…` (made with `driftless surface -o`) by name; only those with a glb.
+/// `oberflaeche…` (made with `driftless surface -o`) by name; only those with their report
+/// `oberflaeche.json`. The surface step writes it after the glb: a folder with the glb but
+/// without the report was cut off between the two and is no finished surface (it is offered
+/// for „Aufräumen“, [`crate::leftovers`]).
 fn surfaces_of(dir: &Path) -> Vec<SurfaceInfo> {
     let numbered = numbered(dir, SURFACE_NUMBERED);
     let mut others: Vec<PathBuf> = fs::read_dir(dir)
@@ -779,19 +797,31 @@ fn surfaces_of(dir: &Path) -> Vec<SurfaceInfo> {
             (name, p)
         }));
     labelled
-        .filter(|(_, p)| p.join(SURFACE_GLB).is_file())
+        .filter(|(_, p)| p.join(SURFACE_REPORT).is_file())
         .map(|(label, dir)| {
-            let settings = fs::read_to_string(dir.join(SURFACE_REPORT))
+            let report = fs::read_to_string(dir.join(SURFACE_REPORT))
                 .ok()
-                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                .and_then(|v| SurfaceSettings::from_report(&v));
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+            let settings = report.as_ref().and_then(SurfaceSettings::from_report);
             SurfaceInfo {
                 label,
                 stale: false,
                 settings,
+                hints: report.as_ref().map(surface_hints).unwrap_or_default(),
                 dir,
             }
         })
+        .collect()
+}
+
+/// The hints for the user in the surface report `report` (`hinweise`): its texts, nothing
+/// else; none without the field.
+fn surface_hints(report: &serde_json::Value) -> Vec<String> {
+    report["hinweise"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|h| h.as_str().map(String::from))
         .collect()
 }
 
@@ -1922,10 +1952,12 @@ fn model_scan_missing(model: &ModelInfo) -> bool {
         .any(|m| discover_project(&m.scan).is_err())
 }
 
-/// The status of `model` itself: its runtime, and stale if the map of a scan in it was
-/// computed anew since the merge (the place of the scan in the model may not fit it any
-/// more: merge anew). Reads `traj.tum` and the bag lists of its scans: call it off the UI
-/// thread. A model whose scan cannot be read is never stale (that cannot be told).
+/// The status of `model` itself: its runtime, and stale if it was merged by another version
+/// of the merge ([`ModelInfo::other_version`]) or the map of a scan in it was computed anew
+/// since the merge (the place of the scan in the model may not fit it any more: merge anew).
+/// Reads `traj.tum` and the bag lists of its scans: call it off the UI thread. Whether a map
+/// changed cannot be told while a scan of the model cannot be read: then only the version
+/// counts.
 pub fn model_status(model: &ModelInfo) -> MapStatus {
     let changed = |m: &driftless_steps::merge::ModelMember| {
         let Some(id) = &m.clean_id else {
@@ -1934,13 +1966,14 @@ pub fn model_status(model: &ModelInfo) -> MapStatus {
         let input = map_input_for(&m.scan, &m.slam_dir, &m.map_dir, m.slam.clone());
         clean_stage_id(&input).map_or(true, |now| hex(&now) != *id)
     };
-    let stale = !model_scan_missing(model)
-        && model
-            .report
-            .members
-            .iter()
-            .filter(|m| m.included)
-            .any(changed);
+    let stale = model.other_version()
+        || (!model_scan_missing(model)
+            && model
+                .report
+                .members
+                .iter()
+                .filter(|m| m.included)
+                .any(changed));
     MapStatus {
         seconds: Some(model.report.seconds_total),
         stale,
@@ -1948,14 +1981,16 @@ pub fn model_status(model: &ModelInfo) -> MapStatus {
 }
 
 /// The status of `surface` of `model`, as [`surface_status`] for a map: stale if it no
-/// longer fits the model ([`model_surface_fits`]), without a readable report or with
-/// settings an earlier program wrote. Call it off the UI thread.
+/// longer fits the model ([`model_surface_fits`]), without a readable report, with settings
+/// an earlier program wrote, or of a model of another merge version. Call it off the UI
+/// thread.
 pub fn model_surface_status(model: &ModelInfo, surface: &SurfaceInfo) -> MapStatus {
     let report = fs::read_to_string(surface.dir.join(SURFACE_REPORT))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
     let seconds = report.as_ref().and_then(|v| v["seconds_total"].as_f64());
     let stale = report.is_none()
+        || model.other_version()
         || (!model_scan_missing(model)
             && surface.settings.as_ref().is_none_or(|settings| {
                 let req = model_surface_request(model, settings, GpuPref::default(), &surface.dir);

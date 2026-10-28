@@ -232,6 +232,7 @@ pub fn stored_path(base: &Path, text: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testdir::TestDir;
 
     #[test]
     fn plain_form_of_drives_and_shares() {
@@ -386,7 +387,7 @@ mod tests {
 
     #[test]
     fn canonical_is_absolute_and_plain() {
-        let dir = std::env::temp_dir().join(format!("driftless-io-paths-{}", std::process::id()));
+        let dir = TestDir::new(format!("driftless-io-paths-{}", std::process::id()));
         fs::create_dir_all(dir.join("a")).unwrap();
         let p = canonical(&dir.join("a").join("..").join("a")).unwrap();
         assert!(p.is_absolute());

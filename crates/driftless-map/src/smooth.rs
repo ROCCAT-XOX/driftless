@@ -13,8 +13,13 @@
 //! Every point is moved from the input coordinates, never from already moved ones, and
 //! neighbours at the same distance are ordered by their coordinates, so the result does not
 //! depend on the order the points run in; the step is a pure function per point.
+//!
+//! [`smooth_surfaces_with`] works through the points in chunks of [`SMOOTH_CHUNK`] (each in
+//! parallel), counts them on a [`Progress`] and stops at the next chunk once it is cancelled.
 
 use crate::clean::{block_moments, spread_axes, vec3, Moments};
+use crate::MapError;
+use driftless_io::progress::Progress;
 use driftless_odom::voxel_map::{voxel_key, FixedState, VoxelKey};
 use kiddo::{ImmutableKdTree, SquaredEuclidean};
 use nalgebra::Vector3;
@@ -31,6 +36,10 @@ const INLIER_SIGMAS: f64 = 3.0;
 /// Smallest inlier band of the local plane (m), so that a plane without noise keeps its
 /// points despite rounding.
 const MIN_BAND: f64 = 0.002;
+
+/// Points smoothed between two looks at the cancel flag of [`smooth_surfaces_with`] (a few
+/// hundredths of a second on six threads).
+pub const SMOOTH_CHUNK: usize = 16_384;
 
 /// Edge of the cells the wall thickness is measured in (m).
 const THICKNESS_CELL: f64 = 0.1;
@@ -184,46 +193,73 @@ fn project(rel: &[Vector3<f64>], inner: usize, cfg: &SmoothConfig) -> Option<Vec
 /// # Panics
 /// If `cfg` is invalid (see [`crate::clean`]) or there are 2^32 points or more.
 pub fn smooth_surfaces(xyz: &[[f32; 3]], cfg: &SmoothConfig) -> (Vec<[f32; 3]>, SmoothStats) {
+    smooth_surfaces_with(xyz, cfg, &Progress::new()).expect("never cancelled")
+}
+
+/// [`smooth_surfaces`] that can be stopped: it looks at `progress` before every
+/// [`SMOOTH_CHUNK`] points and before the wall thickness, counts the points smoothed on it
+/// ([`Progress::advance`]; the caller names the phase) and returns [`MapError::Cancelled`]
+/// once it is cancelled. The result is the same as [`smooth_surfaces`].
+///
+/// # Panics
+/// As [`smooth_surfaces`].
+pub fn smooth_surfaces_with(
+    xyz: &[[f32; 3]],
+    cfg: &SmoothConfig,
+    progress: &Progress,
+) -> Result<(Vec<[f32; 3]>, SmoothStats), MapError> {
     cfg.check().expect("valid SmoothConfig");
+    let cancelled = || {
+        if progress.is_cancelled() {
+            Err(MapError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
+    cancelled()?;
     if !cfg.enabled || xyz.len() < cfg.min_neighbours {
-        return (xyz.to_vec(), SmoothStats::default());
+        return Ok((xyz.to_vec(), SmoothStats::default()));
     }
     let tree: ImmutableKdTree<f32, 3> =
         ImmutableKdTree::new_from_slice(xyz).expect("fewer than 2^32 points");
     let r2 = (cfg.radius * cfg.radius) as f32;
     let half = (0.25 * cfg.radius * cfg.radius) as f32;
-    let shifts: Vec<Option<[f32; 3]>> = xyz
-        .par_iter()
-        .map(|p| {
-            let mut nn = tree.query(p).within::<SquaredEuclidean<f32>>(r2).execute();
-            // Ties in distance are broken by the coordinates, not by the order of the
-            // kd-tree, which depends on the input order.
-            nn.sort_by(|a, b| {
-                a.distance.total_cmp(&b.distance).then_with(|| {
-                    let bits = |i: u32| xyz[i as usize].map(f32::to_bits);
-                    bits(a.item).cmp(&bits(b.item))
-                })
-            });
-            let found = nn.len();
-            if found < cfg.min_neighbours {
-                return None;
-            }
-            let origin = vec3(p);
-            // Evenly spaced in distance rank, so that the neighbourhood spans the whole
-            // radius.
-            let take = found.min(cfg.max_neighbours);
-            let picked = (0..take).map(|i| &nn[i * found / take]);
-            let rel: Vec<Vector3<f64>> = picked
-                .clone()
-                .map(|x| vec3(&xyz[x.item as usize]) - origin)
-                .collect();
-            let inner = picked.take_while(|x| x.distance <= half).count();
-            let q = origin + project(&rel, inner, cfg)?;
-            let q = [q.x as f32, q.y as f32, q.z as f32];
-            (q != *p).then_some(q)
-        })
-        .collect();
+    let shift = |p: &[f32; 3]| -> Option<[f32; 3]> {
+        let mut nn = tree.query(p).within::<SquaredEuclidean<f32>>(r2).execute();
+        // Ties in distance are broken by the coordinates, not by the order of the
+        // kd-tree, which depends on the input order.
+        nn.sort_by(|a, b| {
+            a.distance.total_cmp(&b.distance).then_with(|| {
+                let bits = |i: u32| xyz[i as usize].map(f32::to_bits);
+                bits(a.item).cmp(&bits(b.item))
+            })
+        });
+        let found = nn.len();
+        if found < cfg.min_neighbours {
+            return None;
+        }
+        let origin = vec3(p);
+        // Evenly spaced in distance rank, so that the neighbourhood spans the whole
+        // radius.
+        let take = found.min(cfg.max_neighbours);
+        let picked = (0..take).map(|i| &nn[i * found / take]);
+        let rel: Vec<Vector3<f64>> = picked
+            .clone()
+            .map(|x| vec3(&xyz[x.item as usize]) - origin)
+            .collect();
+        let inner = picked.take_while(|x| x.distance <= half).count();
+        let q = origin + project(&rel, inner, cfg)?;
+        let q = [q.x as f32, q.y as f32, q.z as f32];
+        (q != *p).then_some(q)
+    };
+    let mut shifts: Vec<Option<[f32; 3]>> = Vec::with_capacity(xyz.len());
+    for chunk in xyz.chunks(SMOOTH_CHUNK) {
+        cancelled()?;
+        shifts.par_extend(chunk.par_iter().map(&shift));
+        progress.advance(chunk.len() as u64);
+    }
     drop(tree);
+    cancelled()?;
 
     let mut moved = 0;
     let mut total = 0.0;
@@ -247,7 +283,7 @@ pub fn smooth_surfaces(xyz: &[[f32; 3]], cfg: &SmoothConfig) -> (Vec<[f32; 3]>, 
         thickness_before,
         thickness_after,
     };
-    (out, stats)
+    Ok((out, stats))
 }
 
 /// Median wall thickness of `before` and of `after` (same points, moved) over the cells of

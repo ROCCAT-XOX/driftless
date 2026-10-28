@@ -1,5 +1,6 @@
 //! `corrections.toml` and how `solve` checks and uses manual loops.
 
+use driftless_io::testdir::TestDir;
 use driftless_odom::FrameQuality;
 use driftless_slam::{
     close_loops, solve, Corrections, LoopCheck, LoopVerdict, ManualLoop, ManualLoopError,
@@ -11,9 +12,7 @@ use std::fs;
 
 #[test]
 fn corrections_append_and_disable_keep_history() {
-    let dir = std::env::temp_dir().join(format!("driftless-corr-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new(format!("driftless-corr-{}", std::process::id()));
     let path = dir.join("corrections.toml");
 
     let mut c = Corrections::load(&path).unwrap();
@@ -59,9 +58,7 @@ fn corrections_append_and_disable_keep_history() {
 /// submaps; switched on again, the entry goes. Files written before rejects existed still read.
 #[test]
 fn rejects_are_written_and_removed_and_old_files_read() {
-    let dir = std::env::temp_dir().join(format!("driftless-corr-reject-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new(format!("driftless-corr-reject-{}", std::process::id()));
     let path = dir.join("corrections.toml");
     // as written before the veto existed
     fs::write(
@@ -112,9 +109,7 @@ fn rejects_are_written_and_removed_and_old_files_read() {
 
 #[test]
 fn corrections_save_replaces_file_without_leftovers() {
-    let dir = std::env::temp_dir().join(format!("driftless-corr-save-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new(format!("driftless-corr-save-{}", std::process::id()));
     let path = dir.join("corrections.toml");
     let mut c = Corrections::default();
     c.add_loop(1.0, 2.0, "", "2026-10-20T10:00:00Z");
@@ -137,9 +132,7 @@ fn corrections_save_replaces_file_without_leftovers() {
 
 #[test]
 fn corrections_unknown_keys_are_errors() {
-    let dir = std::env::temp_dir().join(format!("driftless-corr-unknown-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new(format!("driftless-corr-unknown-{}", std::process::id()));
     let path = dir.join("corrections.toml");
     for text in [
         // mistyped key inside an entry

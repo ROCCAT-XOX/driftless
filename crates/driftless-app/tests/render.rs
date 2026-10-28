@@ -11,6 +11,7 @@ use driftless_app::render::{
 };
 use driftless_app::synthetic::Rng;
 use driftless_io::progress::Progress;
+use driftless_io::testdir::TestDir;
 use driftless_steps::overlay::quality_color;
 use egui_wgpu::wgpu;
 
@@ -723,9 +724,7 @@ fn tree_of_one() -> Octree {
 #[test]
 fn point_m_from_map() {
     use driftless_app::cloud::{point_m_of_map, LoadedCloud, DEFAULT_POINT_M};
-    let dir = std::env::temp_dir().join(format!("driftless-app-point-m-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new(format!("driftless-app-point-m-{}", std::process::id()));
     assert_eq!(DEFAULT_POINT_M, 0.015);
     assert_eq!(point_m_of_map(&dir), 0.015, "without map.json");
     std::fs::write(dir.join("map.json"), "kein json").unwrap();

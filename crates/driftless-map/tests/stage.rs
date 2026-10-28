@@ -1,14 +1,11 @@
 //! `dense.bin` / `clean.bin`: the cloud (and rays) between the steps of `driftless map`.
 
+use driftless_io::testdir::TestDir;
 use driftless_map::{load_stage, save_stage, stage_fits, Cloud, RaySource, StageError};
 use std::fs;
-use std::path::PathBuf;
 
-fn tmp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("driftless-stage-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn tmp(name: &str) -> TestDir {
+    TestDir::new(format!("driftless-stage-{}-{name}", std::process::id()))
 }
 
 fn cloud() -> Cloud {

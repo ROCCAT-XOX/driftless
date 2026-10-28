@@ -4,8 +4,9 @@
 //! Point pairs marked by hand place C.
 
 use driftless_io::progress::{Progress, ProgressSnapshot};
-use driftless_io::testscan::{empty_room_bag, furnished_room_bag, tmp};
-use driftless_map::{load_stage, write_las, Cloud};
+use driftless_io::testdir::SharedDir;
+use driftless_io::testscan::{empty_room_bag, furnished_room_bag, shared, tmp};
+use driftless_map::{load_stage, write_las, Cloud, SMOOTH_CHUNK};
 use driftless_slam::align::AlignConfig;
 use driftless_steps::map::{clean_stage_id, map_input_for, run_map, MapRequest, CLEAN_BIN};
 use driftless_steps::merge::{
@@ -19,7 +20,7 @@ use driftless_traj::nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Pose of scan B in the frame of scan A.
 fn truth_b() -> Isometry3<f64> {
@@ -46,6 +47,8 @@ fn room_color(p: &Point3<f64>, brightness: f64) -> [u8; 3] {
 }
 
 struct Scene {
+    /// Their folder, shared by the tests of this file.
+    _root: SharedDir,
     a: PathBuf,
     b: PathBuf,
     c: PathBuf,
@@ -102,7 +105,7 @@ fn write_color(scan: &Path, map_dir: &Path, pose: &Isometry3<f64>, brightness: f
 fn scene() -> &'static Scene {
     static SCENE: OnceLock<Scene> = OnceLock::new();
     SCENE.get_or_init(|| {
-        let root = tmp("steps-merge");
+        let root = shared("steps-merge");
         let (a, b, c) = (root.join("a"), root.join("b"), root.join("c"));
         for d in [&a, &b, &c] {
             fs::create_dir_all(d).unwrap();
@@ -114,7 +117,12 @@ fn scene() -> &'static Scene {
             prepare(d);
         }
         write_color(&a, &a.join("driftless"), &Isometry3::identity(), 1.0);
-        Scene { a, b, c }
+        Scene {
+            _root: root,
+            a,
+            b,
+            c,
+        }
     })
 }
 
@@ -299,7 +307,7 @@ fn written_member(abs: &Path, rel: Option<&str>) -> ModelMember {
         residual_median_mm: 0.0,
         residual_rms_mm: 0.0,
         agreement: 1.0,
-        wall_residual_mm: 0.0,
+        wall_residual_mm: None,
         pair_rms_mm: None,
         included: true,
         color_gain: [1.0; 3],
@@ -313,7 +321,8 @@ fn written_member(abs: &Path, rel: Option<&str>) -> ModelMember {
 /// before the relative paths reads as written.
 #[test]
 fn read_model_takes_the_relative_folder_first() {
-    let dir = driftless_io::paths::canonical(&tmp("modell-relativ")).unwrap();
+    let scratch = tmp("modell-relativ");
+    let dir = driftless_io::paths::canonical(&scratch).unwrap();
     let old = dir.join("alt").join("scans").join("a");
     let new = dir.join("neu").join("scans").join("a");
     let model = dir.join("neu").join("modelle").join("modell-001");
@@ -458,6 +467,29 @@ fn cancel_leaves_no_report() {
     for f in [MODEL_REPORT, MODEL_LAS, MODEL_PLY] {
         assert!(!out.join(f).exists(), "{f} written");
     }
+
+    // Cancelled while smoothing, after its first chunk of points: it stops at the next one
+    // (before, the smoothing ran to its end), and nothing is written.
+    let p = Progress::new();
+    let handle = p.clone();
+    let seen = Arc::new(Mutex::new(ProgressSnapshot::default()));
+    let last = seen.clone();
+    let p = p.with_observer(move |s: &ProgressSnapshot| {
+        if s.phase == "Glätten" {
+            *last.lock().unwrap() = s.clone();
+            if s.done > 0 {
+                handle.cancel();
+            }
+        }
+    });
+    assert_eq!(run_merge(&req, &p).unwrap_err(), StepError::Cancelled);
+    for f in [MODEL_REPORT, MODEL_LAS, MODEL_PLY] {
+        assert!(!out.join(f).exists(), "{f} written");
+    }
+    let seen = seen.lock().unwrap().clone();
+    let total = seen.total.expect("the points of the model");
+    assert!(total > 2 * SMOOTH_CHUNK as u64, "{seen:?}");
+    assert_eq!(seen.done, SMOOTH_CHUNK as u64, "{seen:?}");
 }
 
 #[test]
@@ -800,7 +832,8 @@ fn stored_text_round_trips_with_file_resolution() {
 fn pairs_match_members_on_a_share() {
     use driftless_io::paths::canonical;
     use driftless_steps::merge::pair_members;
-    let local = canonical(&tmp("punktpaare-freigabe")).unwrap();
+    let scratch = tmp("punktpaare-freigabe");
+    let local = canonical(&scratch).unwrap();
     let text = local.to_str().unwrap().to_string();
     let Some(rest) = text
         .get(3..)

@@ -13,11 +13,11 @@ use driftless_app::render::{
 use driftless_app::surface::{load_mesh, LoadedSurface};
 use driftless_io::images::RgbImage;
 use driftless_io::progress::Progress;
+use driftless_io::testdir::TestDir;
 use driftless_map::surface::{encode_pages, write_glb, TexturePage, TexturedMesh};
 use egui_wgpu::wgpu;
 use image::RgbaImage;
 use std::fs;
-use std::path::PathBuf;
 
 const SIZE: u32 = 64;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -263,12 +263,8 @@ fn surface_and_points_share_depth() {
     assert!(near(c.centre(), BLUE, 2), "{:?}", c.centre());
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("driftless-app-mesh-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(format!("driftless-app-mesh-{}-{name}", std::process::id()))
 }
 
 /// A page of `n × n` texels in one colour.
@@ -373,7 +369,8 @@ fn load_error(name: &str, bytes: &[u8]) -> String {
 
 #[test]
 fn missing_glb_is_a_german_error() {
-    let path = temp_dir("fehlt").join("oberflaeche.glb");
+    let dir = temp_dir("fehlt");
+    let path = dir.join("oberflaeche.glb");
     let e = load_mesh(&path, &Progress::new()).unwrap_err().to_string();
     assert!(e.contains(&path.display().to_string()), "{e}");
     assert!(e.contains("nicht gefunden"), "{e}");
@@ -504,8 +501,7 @@ fn loads_obj_with_png_page() {
             },
         ],
     };
-    let dir = temp_dir("obj").join("Büro Scan");
-    fs::create_dir_all(&dir).unwrap();
+    let dir = temp_dir("obj").inside("Büro Scan");
     let path = dir.join("Prüfung ä.obj");
     write_obj(&path, &mesh, &Progress::new()).unwrap();
     let loaded = load_mesh(&path, &Progress::new()).unwrap();
@@ -699,7 +695,8 @@ fn load_mesh_refuses_oversized_textures() {
     let mesh = Mesh {
         pages: (0..5).map(|k| page(f64::from(k))).collect(),
     };
-    let path = temp_dir("textures-too-large").join("gross.glb");
+    let dir = temp_dir("textures-too-large");
+    let path = dir.join("gross.glb");
     write_glb(&path, &mesh, &Progress::new()).unwrap();
     let start = std::time::Instant::now();
     let err = load_mesh(&path, &Progress::new()).unwrap_err().to_string();

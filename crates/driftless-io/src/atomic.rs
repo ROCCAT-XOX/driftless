@@ -77,6 +77,7 @@ fn tmp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testdir::TestDir;
 
     #[test]
     fn writes_through_a_temporary_file() {
@@ -84,8 +85,7 @@ mod tests {
             tmp_path(Path::new("a/corrections.toml")),
             Path::new("a/corrections.toml.tmp")
         );
-        let dir = std::env::temp_dir().join(format!("driftless-io-atomic-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new(format!("driftless-io-atomic-{}", std::process::id()));
         let path = dir.join("stand.toml");
         atomic_write(&path, b"nr = 1\n").unwrap();
         atomic_write(&path, b"nr = 2\n").unwrap();
@@ -96,9 +96,7 @@ mod tests {
 
     #[test]
     fn temp_path_commit_and_drop() {
-        let dir =
-            std::env::temp_dir().join(format!("driftless-io-temp-path-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new(format!("driftless-io-temp-path-{}", std::process::id()));
         let path = dir.join("wolke.laz");
         let temp = TempPath::new(&path);
         assert_eq!(temp.path(), path);
@@ -127,8 +125,7 @@ mod tests {
 
     #[test]
     fn failed_write_leaves_no_temporary_file() {
-        let dir =
-            std::env::temp_dir().join(format!("driftless-io-atomic-fail-{}", std::process::id()));
+        let dir = TestDir::new(format!("driftless-io-atomic-fail-{}", std::process::id()));
         // The target is a non-empty folder: the rename fails.
         let path = dir.join("bericht.json");
         fs::create_dir_all(path.join("x")).unwrap();

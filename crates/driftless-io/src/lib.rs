@@ -14,6 +14,8 @@ pub mod project;
 pub mod testalloc;
 pub mod testdata;
 #[cfg(any(test, feature = "test-util"))]
+pub mod testdir;
+#[cfg(any(test, feature = "test-util"))]
 pub mod testscan;
 
 pub use atomic::{atomic_write, TempPath};

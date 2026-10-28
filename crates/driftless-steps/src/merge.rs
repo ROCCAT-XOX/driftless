@@ -30,9 +30,10 @@
 //! 3. **Thinning**: one point per [`MergeRequest::voxel`] cell of the model, a coloured one
 //!    before an uncoloured one, then the one of the smaller member number, then the earlier
 //!    one; then, with [`MergeRequest::smooth`], the surfaces of all scans are smoothed
-//!    together ([`smooth_surfaces`]).
+//!    together ([`driftless_map::smooth_surfaces`]).
 //!
-//! A cancel is honoured up to the writing. `modell.las` and `modell.ply` are written through
+//! A cancel is honoured up to the writing, in the smoothing at the next chunk of points
+//! ([`driftless_map::SMOOTH_CHUNK`]). `modell.las` and `modell.ply` are written through
 //! a temporary file each, `modell.json` last and atomically: a folder with a report holds a
 //! complete model. A folder that already holds a report is refused, nothing is overwritten;
 //! the `.tmp` files a killed merge left in it are removed at the start. Every step is
@@ -53,12 +54,13 @@ use crate::slam::SlamSettings;
 use driftless_io::progress::Progress;
 use driftless_io::{atomic_write, paths};
 use driftless_map::{
-    intensity_grays, load_stage, smooth_surfaces, stage_fits, write_las_sources, write_ply_sources,
-    Cloud, SmoothConfig,
+    intensity_grays, load_stage, smooth_surfaces_with, stage_fits, write_las_sources,
+    write_ply_sources, Cloud, SmoothConfig,
 };
 use driftless_odom::voxel_map::{voxel_key, FixedState, VoxelKey};
 use driftless_slam::align::{
     align_pair, align_with_pairs, AlignConfig, AlignMethod, Alignment, Verdict, MIN_AGREEMENT,
+    WALLS_UNMEASURABLE,
 };
 use driftless_traj::nalgebra::{
     Isometry3, Matrix3, Matrix4, Point3, Rotation3, Translation3, UnitQuaternion, Vector3,
@@ -113,7 +115,7 @@ pub struct MergeRequest {
     pub align: AlignConfig,
     /// One point per cell of this size (m) in the model.
     pub voxel: f64,
-    /// Smooth the surfaces of the merged points ([`smooth_surfaces`]).
+    /// Smooth the surfaces of the merged points ([`driftless_map::smooth_surfaces`]).
     pub smooth: bool,
     /// Take unsure members into the model as well.
     pub include_unsure: bool,
@@ -155,7 +157,9 @@ pub struct ModelMember {
     pub method: String,
     /// "sicher" | "unsicher" | "gescheitert".
     pub verdict: String,
-    /// Why it is unsure or failed (German).
+    /// Why it is unsure or failed (German). For a scan placed by point pairs whose walls could
+    /// not be measured it also says so ([`WALLS_UNMEASURABLE`], as information: the pairs
+    /// place it), even when it is sure.
     pub reason: Option<String>,
     pub overlap: f64,
     pub residual_median_mm: f64,
@@ -163,10 +167,12 @@ pub struct ModelMember {
     /// Edge agreement ([`driftless_slam::align::PairQuality::agreement`]).
     pub agreement: f64,
     /// Residual on the walls of the worst orientation
-    /// ([`driftless_slam::align::PairQuality::wall_residual_mm`]); 0 in a model written
-    /// before the field.
-    #[serde(default)]
-    pub wall_residual_mm: f64,
+    /// ([`driftless_slam::align::PairQuality::wall_residual_mm`]); `None` (not written) where
+    /// the walls could not be measured ([`WALLS_UNMEASURABLE`]), for the reference and in a
+    /// model written before the field. A model that wrote 0 for walls it could not measure
+    /// reads as `Some(0.0)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_residual_mm: Option<f64>,
     /// For a member placed by point pairs: their RMS distance at its pose
     /// ([`driftless_slam::align::Alignment::pair_rms_mm`]).
     #[serde(default)]
@@ -204,6 +210,15 @@ pub struct ModelReport {
     /// map. Empty in a model written before the field.
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+/// Whether `report` was merged by this program's merge ([`MERGE_VERSION`]). A model of
+/// another version is stale whatever its maps, like one whose maps were computed anew: the
+/// merge would place its scans or thin its points differently now. The app marks it
+/// „veraltet“, `driftless surface --model` refuses it ([`crate::surface::model_surface_fits`]
+/// does not take it either).
+pub fn version_fits(report: &ModelReport) -> bool {
+    report.version == MERGE_VERSION
 }
 
 /// `T_i` of a member: world of its scan → model.
@@ -900,8 +915,9 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
     drop(keep);
     check_cancel(progress)?;
     if req.smooth {
-        progress.phase("Glätten", None);
-        let (xyz, stats) = smooth_surfaces(&model.xyz, &SmoothConfig::default());
+        // counted by points; a cancel stops it at the next chunk of them
+        progress.phase("Glätten", Some(model.len() as u64));
+        let (xyz, stats) = smooth_surfaces_with(&model.xyz, &SmoothConfig::default(), progress)?;
         model.xyz = xyz;
         progress.info(format!(
             "Geglättet: {} Punkte um im Mittel {:.1} mm verschoben, Wanddicke {:.1} → {:.1} mm",
@@ -1002,6 +1018,16 @@ fn model_member(
                 ),
                 (Verdict::Unsure(r) | Verdict::Failed(r), _) => (a.verdict.word(), Some(r.clone())),
             };
+            // Point pairs place a scan without its walls (a door, a short corridor shows none):
+            // that they could not be measured is named, the verdict stays the pairs'.
+            let unmeasured = a.method == AlignMethod::PointPairs
+                && a.quality.wall_residual_mm.is_none()
+                && !matches!(a.verdict, Verdict::Failed(_));
+            let reason = match reason {
+                Some(r) if unmeasured => Some(format!("{r}; {WALLS_UNMEASURABLE}")),
+                None if unmeasured => Some(WALLS_UNMEASURABLE.to_string()),
+                r => r,
+            };
             (method_word(a.method), word, reason, Some(a))
         }
     };
@@ -1025,7 +1051,7 @@ fn model_member(
         residual_median_mm: q.map_or(0.0, |a| a.quality.residual_median_mm),
         residual_rms_mm: q.map_or(0.0, |a| a.quality.residual_rms_mm),
         agreement: q.map_or(1.0, |a| a.quality.agreement),
-        wall_residual_mm: q.map_or(0.0, |a| a.quality.wall_residual_mm),
+        wall_residual_mm: q.and_then(|a| a.quality.wall_residual_mm),
         pair_rms_mm: q.and_then(|a| a.pair_rms_mm),
         included: p.included,
         color_gain: gain,
@@ -1204,7 +1230,7 @@ mod tests {
             residual_median_mm: 1.0,
             residual_rms_mm: 2.0,
             agreement: 0.9,
-            wall_residual_mm: 1.0,
+            wall_residual_mm: Some(1.0),
             pair_rms_mm: None,
             included: true,
             color_gain: [1.0; 3],
@@ -1234,7 +1260,7 @@ mod tests {
             residual_rms_mm: 3.0,
             tilt_deg: 0.1,
             agreement: 0.98,
-            wall_residual_mm: 2.1,
+            wall_residual_mm: Some(2.1),
         };
         let mut p = Placement {
             pose: Isometry3::identity(),
@@ -1254,7 +1280,7 @@ mod tests {
         let alone = model_member(&m, out, &p, None, [1.0; 3], 5, "id");
         assert_eq!(alone.verdict, "sicher");
         assert!(alone.reason.is_none());
-        assert_eq!(alone.wall_residual_mm, 2.1);
+        assert_eq!(alone.wall_residual_mm, Some(2.1));
         p.unsure_anchor = Some(1);
         let inherited = model_member(&m, out, &p, Some("s1".into()), [1.0; 3], 5, "id");
         assert_eq!(inherited.verdict, "unsicher");
@@ -1267,6 +1293,114 @@ mod tests {
             inherited.reason
         );
         assert!(inherited.included);
+    }
+
+    /// Walls that cannot be measured: an automatic placement is unsure for it (the align
+    /// verdict), one by point pairs keeps the verdict of the pairs and names it as information.
+    #[test]
+    fn unmeasurable_walls_in_the_report() {
+        let m = MergeMember {
+            scan: "s2".into(),
+            slam_dir: "s2/d".into(),
+            map_dir: "s2/d".into(),
+            slam: SlamSettings::default(),
+        };
+        let quality = driftless_slam::align::PairQuality {
+            overlap: 0.05,
+            residual_median_mm: 2.0,
+            residual_rms_mm: 3.0,
+            tilt_deg: 0.1,
+            agreement: 0.7,
+            wall_residual_mm: None,
+        };
+        let placed = |method, verdict| Placement {
+            pose: Isometry3::identity(),
+            against: Some(0),
+            alignment: Some(Alignment {
+                pose: Isometry3::identity(),
+                method,
+                quality,
+                verdict,
+                runner_up: None,
+                pair_rms_mm: (method == AlignMethod::PointPairs).then_some(12.0),
+            }),
+            included: true,
+            unsure_anchor: None,
+        };
+        let out = Path::new("m");
+        let member = |p: &Placement| model_member(&m, out, p, None, [1.0; 3], 5, "id");
+        let by_hand = member(&placed(AlignMethod::PointPairs, Verdict::Sure));
+        assert_eq!(by_hand.verdict, "sicher");
+        assert_eq!(by_hand.reason.as_deref(), Some(WALLS_UNMEASURABLE));
+        assert_eq!(by_hand.wall_residual_mm, None);
+        let off = member(&placed(
+            AlignMethod::PointPairs,
+            Verdict::Unsure("Punktpaare liegen im Mittel 8.0 cm neben der Lage".into()),
+        ));
+        assert_eq!(off.verdict, "unsicher");
+        assert_eq!(
+            off.reason.as_deref(),
+            Some("Punktpaare liegen im Mittel 8.0 cm neben der Lage; Wände nicht messbar")
+        );
+        let auto = member(&placed(
+            AlignMethod::Features,
+            Verdict::Unsure(WALLS_UNMEASURABLE.into()),
+        ));
+        assert_eq!(auto.verdict, "unsicher");
+        assert_eq!(auto.reason.as_deref(), Some(WALLS_UNMEASURABLE));
+        let failed = member(&placed(
+            AlignMethod::PointPairs,
+            Verdict::Failed("mindestens drei Punktpaare nötig".into()),
+        ));
+        assert_eq!(
+            failed.reason.as_deref(),
+            Some("mindestens drei Punktpaare nötig")
+        );
+        // not written; the reference has none either
+        let text = serde_json::to_string(&by_hand).unwrap();
+        assert!(!text.contains("wall_residual_mm"), "{text}");
+        let reference = Placement {
+            against: None,
+            alignment: None,
+            ..placed(AlignMethod::Features, Verdict::Sure)
+        };
+        assert_eq!(member(&reference).wall_residual_mm, None);
+    }
+
+    /// `modell.json` of before: 0 reads as 0 (that program wrote 0 also for walls it could
+    /// not measure), a member without the field as not measured.
+    #[test]
+    fn old_wall_residuals_read() {
+        let mut json = serde_json::to_value(model_member(
+            &MergeMember {
+                scan: "s".into(),
+                slam_dir: "s/d".into(),
+                map_dir: "s/d".into(),
+                slam: SlamSettings::default(),
+            },
+            Path::new("m"),
+            &Placement {
+                pose: Isometry3::identity(),
+                against: None,
+                alignment: None,
+                included: true,
+                unsure_anchor: None,
+            },
+            None,
+            [1.0; 3],
+            1,
+            "id",
+        ))
+        .unwrap();
+        json["wall_residual_mm"] = 0.0.into();
+        let zero: ModelMember = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(zero.wall_residual_mm, Some(0.0));
+        json["wall_residual_mm"] = 1.54.into();
+        let measured: ModelMember = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(measured.wall_residual_mm, Some(1.54));
+        json.as_object_mut().unwrap().remove("wall_residual_mm");
+        let missing: ModelMember = serde_json::from_value(json).unwrap();
+        assert_eq!(missing.wall_residual_mm, None);
     }
 
     #[test]

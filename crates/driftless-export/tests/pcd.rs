@@ -5,16 +5,14 @@ use driftless_export::pcd::{read_pcd, write_pcd};
 use driftless_export::testutil::synthetic_points;
 use driftless_export::{read_points, ExportError, Layout, Points, PHASE_READ, PHASE_WRITE};
 use driftless_io::progress::Progress;
+use driftless_io::testdir::TestDir;
 use std::path::{Path, PathBuf};
 
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(format!(
         "driftless-export-pcd-{}-{name}",
         std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    ))
 }
 
 /// Files in `dir` whose name ends in `.tmp`.

@@ -3,15 +3,13 @@ use driftless_io::bag::writer::{BagWriter, Compression};
 use driftless_io::bag::Time;
 use driftless_io::msg::encode::{encode_imu, encode_pointcloud2};
 use driftless_io::msg::{ImuSample, LidarPoint};
+use driftless_io::testdir::TestDir;
 use predicates::prelude::*;
 use std::fs;
 use std::path::PathBuf;
 
-fn tmp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("driftless-odom-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn tmp(name: &str) -> TestDir {
+    TestDir::new(format!("driftless-odom-{}-{name}", std::process::id()))
 }
 
 fn time(t: f64) -> Time {

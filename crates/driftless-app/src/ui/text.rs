@@ -183,6 +183,23 @@ pub fn scan_not_in_project(scan: &std::path::Path) -> String {
     format!("Scan {} ist nicht mehr im Projekt", scan.display())
 }
 
+/// A model merged by another version of the merge than this program's (`version` in
+/// `modell.json`), as [`MODEL_STALE`] and [`STATUS_MODEL_STALE_HINT`] for a changed map.
+pub const MODEL_STALE_VERSION: &str = "veraltet – mit anderer Programmversion zusammengeführt";
+pub const STATUS_MODEL_STALE_VERSION_HINT: &str =
+    "Das Modell stammt aus einer anderen Programmversion – in „Daten“ neu zusammenführen";
+
+/// Such a model in the tree: „Modell 001 · veraltet – mit anderer Programmversion
+/// zusammengeführt“.
+pub fn model_stale_version(label: &str) -> String {
+    format!("{label} · {MODEL_STALE_VERSION}")
+}
+
+/// On hover over a scan of a model whose walls could not be measured, instead of
+/// [`member_walls`]: automatically placed it is „unsicher“ for that, by point pairs it is
+/// judged without them.
+pub const WALLS_UNMEASURABLE: &str = "Wände nicht messbar";
+
 // Point pairs by hand („Von Hand ausrichten“)
 /// Under an unsure or failed scan of a model.
 pub const PAIRS_START: &str = "Von Hand ausrichten";
@@ -297,6 +314,16 @@ pub const STATUS_SCAN_MISSING: &str = "Scan fehlt";
 pub const MAP_GONE: &str = "Karte nicht mehr im Projekt";
 /// Before the state of a surface of the selected map with the fineness chosen now.
 pub const WITH_THIS_FINENESS: &str = "Mit dieser Feinheit";
+/// Before a hint of a surface for the user (`hinweise` in its `oberflaeche.json`): a hint,
+/// not an error.
+pub const SURFACE_HINT: &str = "Hinweis";
+
+/// A hint of a surface short, below its entry: its title before the colon, „Hinweis:
+/// Stellenweise offen“ for „Stellenweise offen: An 23 % …“; without a colon the whole hint.
+pub fn surface_hint_short(hint: &str) -> String {
+    let title = hint.split_once(':').map_or(hint, |(title, _)| title);
+    format!("{SURFACE_HINT}: {title}")
+}
 
 // Panels
 pub const PANEL_STEPS: &str = "Schritte";

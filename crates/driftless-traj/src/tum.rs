@@ -71,6 +71,7 @@ pub fn write_tum(path: &Path, poses: &[Pose]) -> Result<(), TrajError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use driftless_io::testdir::TestDir;
     use std::fs;
 
     fn pose(t: f64) -> Pose {
@@ -85,8 +86,7 @@ mod tests {
     /// old trajectory, no `.tmp` is left, and a write that fails leaves none either.
     #[test]
     fn write_tum_replaces_the_file_as_a_whole() {
-        let dir = std::env::temp_dir().join(format!("driftless-traj-tum-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new(format!("driftless-traj-tum-{}", std::process::id()));
         let path = dir.join("traj.tum");
         write_tum(&path, &[pose(1.0)]).unwrap();
         let link = dir.join("traj.alt.tum");

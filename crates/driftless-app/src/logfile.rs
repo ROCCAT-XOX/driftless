@@ -395,14 +395,11 @@ fn panic_text(info: &PanicHookInfo<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use driftless_io::testdir::TestDir;
 
-    /// A fresh, empty folder for the test `name`.
-    fn tmp(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("driftless-logfile-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A fresh, empty folder for the test `name`, removed when it is done.
+    fn tmp(name: &str) -> TestDir {
+        TestDir::new(format!("driftless-logfile-{}-{name}", std::process::id()))
     }
 
     fn read(path: &Path) -> String {
@@ -446,11 +443,11 @@ mod tests {
 
     #[test]
     fn a_start_in_a_new_folder_makes_it() {
-        let dir = tmp("neu").join("Logs").join("Driftless");
+        let root = tmp("neu");
+        let dir = root.join("Logs").join("Driftless");
         let log = LogFile::start(&dir, "Driftless").unwrap();
         assert!(log.path().is_file());
         assert!(!numbered(&dir, 1).exists());
-        let _ = fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
     }
 
     #[test]

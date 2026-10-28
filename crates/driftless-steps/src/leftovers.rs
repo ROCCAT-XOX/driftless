@@ -71,11 +71,11 @@ pub(crate) fn remove_report(path: &Path) -> Result<(), StepError> {
 mod tests {
     use super::*;
     use driftless_io::progress::LogLine;
+    use driftless_io::testdir::TestDir;
 
     #[test]
     fn removes_only_own_tmp_files() {
-        let dir = std::env::temp_dir().join(format!("driftless-leftovers-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = TestDir::new(format!("driftless-leftovers-{}", std::process::id()));
         fs::create_dir_all(dir.join("ordner.las.tmp")).unwrap();
         for f in ["wolke.las.tmp", "wolke.las", "fremd.las.tmp", "wolke.tmp"] {
             fs::write(dir.join(f), b"halb").unwrap();

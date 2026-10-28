@@ -7,6 +7,7 @@
 
 use driftless_app::project::canonical;
 use driftless_app::ui::{steps, text, Action, DriftlessApp, Selection, UiMessage};
+use driftless_io::testdir::TestDir;
 use driftless_io::testscan::tmp;
 use driftless_odom::testutil::{room_scene, walk_bag, Circle};
 use driftless_slam::{Corrections, SlamReport, VETOED};
@@ -51,7 +52,7 @@ fn frames_until(h: &mut H, what: &str, cond: impl Fn(&DriftlessApp) -> bool) {
 /// A project with a scan of two laps and its SLAM run (computed in the window), the run
 /// selected and „Erweitert“ open; with `old` a `corrections.toml` as written before the veto
 /// existed (one manual loop, no rejects) is put into the run first.
-fn window_with_loops(name: &str, old: bool) -> (H, PathBuf) {
+fn window_with_loops(name: &str, old: bool) -> (TestDir, H, PathBuf) {
     let dir = tmp(name);
     let scan = dir.join("runde");
     let walk = Circle {
@@ -95,7 +96,7 @@ fn window_with_loops(name: &str, old: bool) -> (H, PathBuf) {
     frames_until(&mut h, "run not loaded", |app| {
         app.overlay().is_some() && app.state().correct.corrections.is_some()
     });
-    (h, run)
+    (dir, h, run)
 }
 
 fn report(run: &Path) -> SlamReport {
@@ -120,7 +121,7 @@ fn switch_on(h: &H, a: usize, b: usize) -> bool {
 
 #[test]
 fn switching_an_automatic_loop_off_and_on() {
-    let (mut h, run) = window_with_loops("veto-schalter", false);
+    let (_dir, mut h, run) = window_with_loops("veto-schalter", false);
     let loops = accepted(&run);
     assert!(!loops.is_empty(), "the walk closes automatic loops");
     // every automatic loop is listed with its switch, on
@@ -200,7 +201,7 @@ fn switching_an_automatic_loop_off_and_on() {
 /// listed as before, the automatic loops all on.
 #[test]
 fn old_corrections_without_rejects_still_read() {
-    let (h, run) = window_with_loops("veto-alte-datei", true);
+    let (_dir, h, run) = window_with_loops("veto-alte-datei", true);
     let c = &h.state().state().correct;
     let corrections = c.corrections.clone().unwrap().unwrap();
     assert_eq!(corrections.loops.len(), 1);

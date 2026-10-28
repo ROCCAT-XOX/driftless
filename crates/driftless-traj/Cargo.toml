@@ -15,3 +15,7 @@ workspace = true
 driftless-io = { path = "../driftless-io" }
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }
 thiserror = "2"
+
+[dev-dependencies]
+# `testdir`: temporary folders of the tests that clean up after themselves.
+driftless-io = { path = "../driftless-io", features = ["test-util"] }

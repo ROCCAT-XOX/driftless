@@ -8,14 +8,17 @@ use driftless_app::project::{
 };
 use driftless_gpu::GpuPref;
 use driftless_io::progress::{Progress, ProgressSnapshot};
-use driftless_io::testscan::{furnished_room_bag, room_bag_at, room_bag_secs, tmp};
+use driftless_io::testdir::SharedDir;
+use driftless_io::testscan::{furnished_room_bag, room_bag_at, room_bag_secs, shared, tmp};
 use driftless_map::surface::SurfaceConfig;
 use driftless_steps::correct;
 use driftless_steps::history::HistoryKind;
 use driftless_steps::map::{
     map_input_for, run_map, MapInput, MapRequest, MapSettings, MapStep, MapSwitches,
 };
-use driftless_steps::merge::{member_transform, read_model, MODEL_LAS, MODEL_REPORT};
+use driftless_steps::merge::{
+    member_transform, read_model, MERGE_VERSION, MODEL_LAS, MODEL_REPORT,
+};
 use driftless_steps::pairs::{PointPairEntry, PointPairs, POINT_PAIRS_FILE};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::StepError;
@@ -871,6 +874,8 @@ fn add_run_checks_the_scan() {
 /// a run and a cleaned map in `<scan>/driftless` as the CLI makes them. Made once for the
 /// merge tests, which only read them.
 struct MergeScans {
+    /// Their folder, shared by the tests of this file.
+    _root: SharedDir,
     a: PathBuf,
     b: PathBuf,
 }
@@ -878,7 +883,7 @@ struct MergeScans {
 fn merge_scans() -> &'static MergeScans {
     static SCANS: OnceLock<MergeScans> = OnceLock::new();
     SCANS.get_or_init(|| {
-        let root = tmp("app-merge-scans");
+        let root = shared("app-merge-scans");
         let (a, b) = (root.join("a"), root.join("b"));
         for d in [&a, &b] {
             fs::create_dir_all(d).unwrap();
@@ -902,6 +907,7 @@ fn merge_scans() -> &'static MergeScans {
         MergeScans {
             a: canon(&a),
             b: canon(&b),
+            _root: root,
         }
     })
 }
@@ -1020,6 +1026,74 @@ fn models_listed_with_verdicts() {
     assert!(m.report.members.iter().all(|x| x.included));
     assert_eq!(m.report.members[1].scan, merge_scans().b);
     assert!(!model_status(m).stale);
+}
+
+/// A model merged by an older version of the merge (`version` = [`MERGE_VERSION`] − 1) is
+/// stale, also while a scan of it cannot be read (its maps cannot be told then, its version
+/// can), and so are its surfaces.
+#[test]
+fn model_of_an_older_merge_is_stale() {
+    let dir = tmp("app-merge-version");
+    let p = merge_project(&dir);
+    let made = run_merge_job(&p, &picks(&p), false, &Progress::new()).unwrap();
+    let current = p.models().remove(0);
+    assert!(!current.other_version());
+    assert!(!model_status(&current).stale);
+    let file = made.join(MODEL_REPORT);
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    json["version"] = (MERGE_VERSION - 1).into();
+    fs::write(&file, json.to_string()).unwrap();
+    let old = p.models().remove(0);
+    assert_eq!(old.report.version, MERGE_VERSION - 1);
+    assert!(old.other_version());
+    assert!(model_status(&old).stale);
+    // a scan of it cannot be read: a changed map could not be told, the version still is
+    let mut unplugged = old.clone();
+    unplugged.report.members[1].scan = dir.join("abgesteckt");
+    assert!(model_status(&unplugged).stale);
+    let mut current_unplugged = current.clone();
+    current_unplugged.report.members[1].scan = dir.join("abgesteckt");
+    assert!(!model_status(&current_unplugged).stale);
+    // a surface with a readable report: stale with the model, not without it
+    let surface_dir = made.join("oberflaeche-001");
+    fs::create_dir_all(&surface_dir).unwrap();
+    fs::write(surface_dir.join("oberflaeche.json"), "{}").unwrap();
+    let surface = driftless_app::project::SurfaceInfo {
+        dir: surface_dir,
+        label: "Oberfläche 001".into(),
+        stale: false,
+        settings: None,
+        hints: Vec::new(),
+    };
+    assert!(model_surface_status(&unplugged, &surface).stale);
+    assert!(!model_surface_status(&current_unplugged, &surface).stale);
+}
+
+/// The hints for the user in a surface report (`hinweise`) are read with the surface; a report
+/// without them (written before the field) reads as no hints.
+#[test]
+fn surface_hints_are_read() {
+    let dir = tmp("app-surface-hints");
+    let p = merge_project(&dir);
+    let model = run_merge_job(&p, &picks(&p), false, &Progress::new()).unwrap();
+    let hint = "Stellenweise offen: An 23 % der dünn gemessenen Stellen lag kein Messpunkt.";
+    for (name, report) in [
+        ("oberflaeche-001", serde_json::json!({ "hinweise": [hint] })),
+        (
+            "oberflaeche-002",
+            serde_json::json!({ "seconds_total": 1.0 }),
+        ),
+        ("oberflaeche-003", serde_json::json!({ "hinweise": [] })),
+    ] {
+        let surface = model.join(name);
+        fs::create_dir_all(&surface).unwrap();
+        fs::write(surface.join("oberflaeche.glb"), b"glb").unwrap();
+        fs::write(surface.join("oberflaeche.json"), report.to_string()).unwrap();
+    }
+    let surfaces = &p.models()[0].surfaces;
+    let hints: Vec<&[String]> = surfaces.iter().map(|s| s.hints.as_slice()).collect();
+    assert_eq!(hints, [&[hint.to_string()][..], &[], &[]]);
 }
 
 #[test]

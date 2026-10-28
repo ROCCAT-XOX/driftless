@@ -1,5 +1,6 @@
 //! `submaps.bin`: round trip and every way a damaged or foreign file must fail.
 
+use driftless_io::testdir::TestDir;
 use driftless_odom::FrameQuality;
 use driftless_slam::{
     cache_fits, load_cache, read_cache, save_cache, CacheError, Submap, SubmapFrame,
@@ -8,11 +9,11 @@ use driftless_traj::nalgebra::{Isometry3, Translation3, UnitQuaternion};
 use std::fs;
 use std::path::PathBuf;
 
-fn tmp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("driftless-cache-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir.join("submaps.bin")
+/// A fresh test folder for `name` and the path of its `submaps.bin` (not yet written).
+fn tmp(name: &str) -> (TestDir, PathBuf) {
+    let dir = TestDir::new(format!("driftless-cache-{}-{name}", std::process::id()));
+    let path = dir.join("submaps.bin");
+    (dir, path)
 }
 
 fn iso(x: f64, yaw: f64) -> Isometry3<f64> {
@@ -55,7 +56,7 @@ fn submaps() -> (Vec<Submap>, Vec<Isometry3<f64>>) {
 
 #[test]
 fn cache_round_trip() {
-    let path = tmp("round-trip");
+    let (_dir, path) = tmp("round-trip");
     let (s, odom) = submaps();
     save_cache(&path, &s, &odom, "LIDAR_0.bag 1234 cfg").unwrap();
     let first = fs::read(&path).unwrap();
@@ -81,7 +82,7 @@ fn hint(e: &CacheError) {
 
 #[test]
 fn cache_rejects_other_input() {
-    let path = tmp("other");
+    let (_dir, path) = tmp("other");
     let (s, odom) = submaps();
     save_cache(&path, &s, &odom, "LIDAR_0.bag 1234 cfg").unwrap();
     let e = load_cache(&path, "LIDAR_0.bag 1235 cfg").unwrap_err();
@@ -92,7 +93,7 @@ fn cache_rejects_other_input() {
 
 #[test]
 fn cache_rejects_missing_and_wrong_version() {
-    let path = tmp("version");
+    let (_dir, path) = tmp("version");
     let e = load_cache(&path, "x").unwrap_err();
     assert!(matches!(e, CacheError::Missing(_)), "{e:?}");
     hint(&e);
@@ -117,7 +118,7 @@ fn cache_rejects_missing_and_wrong_version() {
 
 #[test]
 fn cache_rejects_truncated() {
-    let path = tmp("truncated");
+    let (_dir, path) = tmp("truncated");
     let (s, odom) = submaps();
     save_cache(&path, &s, &odom, "x").unwrap();
     let bytes = fs::read(&path).unwrap();
@@ -144,7 +145,7 @@ const POINT_COUNT: usize = FRAME_COUNT + 8 + 4 * (8 + 8 + 56 + 24 + 1);
 
 #[test]
 fn cache_rejects_huge_length_field() {
-    let path = tmp("huge");
+    let (_dir, path) = tmp("huge");
     let (s, odom) = submaps();
     save_cache(&path, &s, &odom, "x").unwrap();
     let bytes = fs::read(&path).unwrap();
@@ -166,7 +167,7 @@ fn cache_rejects_huge_length_field() {
 
 #[test]
 fn cache_rejects_unusable_submaps() {
-    let path = tmp("invalid");
+    let (_dir, path) = tmp("invalid");
     let (mut s, odom) = submaps();
     s[1].frames.clear();
     save_cache(&path, &s, &odom, "x").unwrap();
@@ -186,7 +187,7 @@ fn cache_rejects_unusable_submaps() {
 /// Finite but absurd coordinates (beyond 1000 km) are damage, not data.
 #[test]
 fn cache_rejects_huge_coordinates() {
-    let path = tmp("huge-coord");
+    let (_dir, path) = tmp("huge-coord");
     type Damage = fn(&mut Vec<Submap>, &mut Vec<Isometry3<f64>>);
     let damage: [Damage; 4] = [
         |s, _| s[0].anchor.translation.y = 1.0e7,
@@ -206,7 +207,7 @@ fn cache_rejects_huge_coordinates() {
 
 #[test]
 fn cache_fits_reads_only_the_header() {
-    let path = tmp("fits");
+    let (_dir, path) = tmp("fits");
     assert!(!cache_fits(&path, "id"));
     let (s, odom) = submaps();
     save_cache(&path, &s, &odom, "id").unwrap();

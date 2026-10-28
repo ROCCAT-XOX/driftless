@@ -13,23 +13,25 @@ use driftless_app::project::{
 use driftless_app::ui::{text, Action, DriftlessApp, UiMessage};
 use driftless_gpu::GpuPref;
 use driftless_io::progress::Progress;
-use driftless_io::testscan::{furnished_room_bag, tmp};
+use driftless_io::testdir::{SharedDir, TestDir};
+use driftless_io::testscan::{furnished_room_bag, shared, tmp};
 use driftless_map::surface::SurfaceConfig;
 use driftless_steps::map::{MapSettings, CLEAN_BIN};
 use driftless_steps::merge::MODEL_REPORT;
 use driftless_steps::slam::SlamSettings;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const PROJECT: &str = "Halle 2026";
 
-/// `<dir>/Rohdaten/{a,b}` and `<dir>/Halle 2026` with a run, a map and the model of both.
+/// `<dir>/Rohdaten/{a,b}` and `<dir>/Halle 2026` with a run, a map and the model of both, made
+/// once for all tests of this file.
 fn template() -> &'static Path {
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    static DIR: OnceLock<SharedDir> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = tmp("portabel-vorlage");
+        let dir = shared("portabel-vorlage");
         let raw = dir.join("Rohdaten");
         let (a, b) = (raw.join("a"), raw.join("b"));
         for d in [&a, &b] {
@@ -62,6 +64,7 @@ fn template() -> &'static Path {
         run_merge_job(&p, &picks, false, &Progress::new()).unwrap();
         dir
     })
+    .path()
 }
 
 /// Copies the folder `from` with everything in it to `to`.
@@ -79,7 +82,7 @@ fn copy_dir(from: &Path, to: &Path) {
 }
 
 /// A fresh copy of [`template`] as `<tmp>/<name>`.
-fn copy(name: &str) -> PathBuf {
+fn copy(name: &str) -> TestDir {
     let dir = tmp(name);
     copy_dir(template(), &dir);
     dir

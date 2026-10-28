@@ -1,6 +1,7 @@
 //! The surface in the project, without a window: the step „Oberfläche rechnen“ on a synthetic
 //! scan, its folder in the tree, the note on a stale surface and the key `O` of the view.
 
+use driftless_app::leftovers::LeftoverKind;
 use driftless_app::project::{canonical, run_surface_job, SurfaceSettings};
 use driftless_app::render::ShowMode;
 use driftless_app::ui::view3d::effective_show;
@@ -244,15 +245,36 @@ fn surface_of_an_older_program_is_stale() {
     assert!(surfaces(h.state().state(), &map)[0].2, "not marked stale");
 }
 
+/// A glb without its report: the step was cut off between the two (it writes the report last),
+/// or the folder copied in part. It is no surface of the map – neither current nor stale, so
+/// nothing shows or loads it as finished – but „unvollständig“, for „Aufräumen“.
 #[test]
-fn surface_without_report_is_stale() {
+fn surface_without_report_is_unfinished() {
     let dir = tmp("ui-oberflaeche-ohne-bericht");
     let (mut h, _, map) = project_with_map(&dir);
     run(&mut h, Action::RunSurface(map.clone()));
-    // a glb without its json: the step was killed between the two, or the folder copied
-    fs::remove_file(map.join("oberflaeche-001/oberflaeche.json")).unwrap();
+    let folder = map.join("oberflaeche-001");
+    let glb = folder.join("oberflaeche.glb");
+    fs::remove_file(folder.join("oberflaeche.json")).unwrap();
+    assert!(glb.is_file());
+    run(&mut h, Action::Unshow(map.clone()));
     run(&mut h, Action::OpenProject(dir.join("projekt")));
-    assert!(surfaces(h.state().state(), &map)[0].2, "not marked stale");
+    let state = h.state().state();
+    assert_eq!(surfaces(state, &map), Vec::new());
+    assert!(
+        state
+            .leftovers
+            .iter()
+            .any(|l| l.path == folder && l.kind == LeftoverKind::Surface),
+        "{:?}",
+        state.leftovers
+    );
+    // a click on the map in „Bilder“ shows its cloud, not that glb
+    run(&mut h, Action::SetStep(Step::Bilder));
+    run(&mut h, Action::Select(Selection::Map(map.clone())));
+    let state = h.state().state();
+    assert_eq!(state.surface.as_ref().map(|s| s.path.clone()), None);
+    assert!(state.cloud.is_some(), "the map's cloud");
 }
 
 #[test]

@@ -95,6 +95,7 @@ fn tree_state() -> AppState {
                         label: "Oberfläche 001".into(),
                         stale: false,
                         settings: None,
+                        hints: Vec::new(),
                     }],
                 }],
                 history: Vec::new(),
