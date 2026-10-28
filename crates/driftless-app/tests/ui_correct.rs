@@ -509,7 +509,11 @@ fn quality_legend_follows_what_is_drawn() {
     h.state_mut().state_mut().view.show_submaps = false;
     // the points in the colour mode „Güte“ (the synthetic cloud carries qualities)
     h.state_mut().load_synthetic(2_000);
-    frames_until(&mut h, |app| app.cloud().is_some());
+    // the run's own map.las is shown already: wait for the synthetic cloud itself
+    let synthetic = std::path::PathBuf::from(text::synthetic_name(2_000));
+    frames_until(&mut h, |app| {
+        app.cloud().is_some_and(|c| c.path == synthetic)
+    });
     h.state_mut().state_mut().view.color_mode = driftless_app::render::ColorMode::Rgb;
     assert!(!placed(&mut h));
     h.state_mut().state_mut().view.color_mode = driftless_app::render::ColorMode::Quality;
