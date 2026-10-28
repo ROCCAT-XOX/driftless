@@ -433,11 +433,20 @@ pub const ABOUT_CLI_MISSING: &str = "Kommandozeile: nicht im Paket (cargo run -p
 /// Opens the licence notices of the third-party parts (THIRD-PARTY-NOTICES.html).
 pub const ABOUT_NOTICES: &str = "Lizenzen Dritter …";
 pub const ABOUT_NOTICES_MISSING: &str = "Lizenzen Dritter: nicht im Paket (packaging/about.toml)";
+/// ☰: the folder of the log file (`crate::logfile`) in the file manager.
+pub const OPEN_LOG_FOLDER: &str = "Protokoll-Ordner öffnen";
+/// „Protokoll-Ordner öffnen“ when the system names no folder for it.
+pub const LOG_FOLDER_UNKNOWN: &str = "Kein Protokoll-Ordner: HOME bzw. LOCALAPPDATA fehlt";
 
 /// A file, folder or address the system could not open: „/Users/…/Logs/Driftless nicht geöffnet:
 /// …“.
 pub fn open_failed(what: &str, error: &str) -> String {
     format!("{what} nicht geöffnet: {error}")
+}
+
+/// On stderr, when the log file of a start cannot be begun.
+pub fn log_unavailable(dir: &str, error: &str) -> String {
+    format!("Protokolldatei in {dir} nicht anlegbar: {error}")
 }
 
 /// „Driftless 0.1.0“.

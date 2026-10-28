@@ -1,7 +1,7 @@
 //! The window „Über Driftless“ (☰ → „Über Driftless …“): version, the commit it was built
 //! from, licence, repository, where the command line `driftless` is, and the licence notices of
 //! the third-party parts. Also how the system opens a file, a folder or an address
-//! ([`open_with_system`]).
+//! ([`open_with_system`]), and „Protokoll-Ordner öffnen“ of ☰ ([`open_log_folder`]).
 
 use super::text;
 use super::theme::DARK;
@@ -108,6 +108,15 @@ pub fn open_with_system(target: &OsStr) -> std::io::Result<()> {
             let _ = child.wait();
         })?;
     Ok(())
+}
+
+/// „Protokoll-Ordner öffnen“ (☰): the folder of the log file ([`crate::logfile`]) in the file
+/// manager, made if missing. The error is a message for the status bar.
+pub fn open_log_folder() -> Result<(), String> {
+    let dir = crate::logfile::default_dir().ok_or_else(|| text::LOG_FOLDER_UNKNOWN.to_string())?;
+    std::fs::create_dir_all(&dir)
+        .and_then(|()| open_with_system(dir.as_os_str()))
+        .map_err(|e| text::open_failed(&dir.display().to_string(), &e.to_string()))
 }
 
 /// Shows the window while `open` ([`super::AppState::about_open`]); its × closes it.

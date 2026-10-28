@@ -3,7 +3,7 @@
 
 use driftless_app::ui::{about, rail, text, AppState};
 use eframe::egui::accesskit::Role;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
 use std::path::Path;
 
@@ -150,6 +150,24 @@ fn about_offers_the_notices_or_says_they_are_missing() {
     h.get_by_label(text::ABOUT_NOTICES_MISSING);
     assert!(h.query_by_label(text::ABOUT_NOTICES).is_none());
     assert!(text::ABOUT_NOTICES_MISSING.starts_with("Lizenzen Dritter: "));
+}
+
+#[test]
+fn menu_has_the_log_folder() {
+    let mut h = Harness::builder().with_size([320.0, 700.0]).build_ui_state(
+        |ui, state: &mut AppState| {
+            rail::show(ui, state);
+        },
+        AppState::default(),
+    );
+    h.run();
+    assert!(h.query_by_label(text::OPEN_LOG_FOLDER).is_none());
+    h.get_by_role_and_label(Role::Button, text::MENU_PROJECT)
+        .click();
+    h.run();
+    // not clicked: it would open the file manager
+    let entry = h.get_by_role_and_label(Role::Button, text::OPEN_LOG_FOLDER);
+    assert!(!entry.accesskit_node().is_disabled());
 }
 
 #[test]
