@@ -229,7 +229,8 @@ fn rgb_mode_without_colours_shows_intensity() {
 fn quality_mode_uses_ramp() {
     let Some(gpu) = gpu() else { return };
     let cam = camera([0.0; 3], 0.0);
-    for q in [0u8, 64, 128, 191, 255] {
+    // also the low qualities the logarithmic scale spreads out (0.01 is 2.55 × 1/255)
+    for q in [0u8, 1, 2, 3, 5, 8, 13, 20, 30, 40, 64, 128, 191, 255] {
         let mut points = cloud(vec![[2.0, 0.0, 0.0]], vec![BLUE]);
         points.quality = vec![q];
         let tree = tree(&points);

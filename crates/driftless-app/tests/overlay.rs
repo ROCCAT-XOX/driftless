@@ -14,7 +14,7 @@ use driftless_io::testscan::tmp;
 use driftless_slam::report::{BeforeAfter, LoopReport, SubmapReport};
 use driftless_slam::SlamReport;
 use driftless_steps::overlay::{
-    quality_color, LOOP_ACCEPTED, LOOP_MANUAL, LOOP_REJECTED, ODOMETRY_COLOR,
+    quality_color, LOOP_ACCEPTED, LOOP_MANUAL, LOOP_REJECTED, ODOMETRY_COLOR, QUALITY_YELLOW,
 };
 use driftless_traj::nalgebra::{UnitQuaternion, Vector3};
 use driftless_traj::{write_tum, Pose};
@@ -56,7 +56,7 @@ fn loop_report(a: usize, b: usize, manual: bool, accepted: bool) -> LoopReport {
     }
 }
 
-/// A run folder: 3 submaps of 3 s with quality 0, 0.5 and 1, one pose per second along x,
+/// A run folder: 3 submaps of 3 s with quality 0, 0.05 (yellow) and 1, one pose per second along x,
 /// and three loops (accepted, rejected, manual).
 fn run_dir(name: &str) -> PathBuf {
     let dir = tmp(name);
@@ -64,7 +64,7 @@ fn run_dir(name: &str) -> PathBuf {
         scan_start: SCAN_START,
         submaps: vec![
             submap(0, 0.0, 0.0, 0.0),
-            submap(1, 3.0, 0.5, 3.0),
+            submap(1, 3.0, QUALITY_YELLOW, 3.0),
             submap(2, 6.0, 1.0, 6.0),
         ],
         loops: vec![
@@ -133,7 +133,11 @@ fn strips_follow_submaps_and_quality() {
     let segs = segments(&lines);
     // poses 0..=3 red, 3..=6 yellow, 6..=8 green: 8 segments
     let colors: Vec<[u8; 3]> = segs.iter().map(|s| s.2).collect();
-    let (red, yellow, green) = (quality_color(0.0), quality_color(0.5), quality_color(1.0));
+    let (red, yellow, green) = (
+        quality_color(0.0),
+        quality_color(QUALITY_YELLOW),
+        quality_color(1.0),
+    );
     assert_eq!(
         colors,
         [red, red, red, yellow, yellow, yellow, green, green]
@@ -204,7 +208,7 @@ fn loops_colored_by_kind() {
         shown,
         [
             (anchor(0.0), quality_color(0.0), ANCHOR_SIZE),
-            (anchor(3.0), quality_color(0.5), ANCHOR_SIZE),
+            (anchor(3.0), quality_color(QUALITY_YELLOW), ANCHOR_SIZE),
             (anchor(6.0), quality_color(1.0), ANCHOR_SIZE),
         ]
     );

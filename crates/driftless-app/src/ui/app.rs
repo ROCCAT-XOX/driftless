@@ -1948,6 +1948,28 @@ impl DriftlessApp {
         }
     }
 
+    /// Whether the view draws something in the quality colours: the trajectory (not while a
+    /// comparison draws it in one colour), the anchors of the submaps, or the points in the
+    /// colour mode „Güte“ with a SLAM report.
+    fn quality_drawn(&self) -> bool {
+        let v = &self.state.view;
+        let run = self.overlay.as_ref().is_some_and(|o| {
+            let comparing = v.show_compare && !o.compare.is_empty();
+            !o.report.submaps.is_empty() && ((v.show_trajectory && !comparing) || v.show_submaps)
+        });
+        let points = self.cloud.as_ref().is_some_and(|c| {
+            let shown = effective_show(v.show, self.view.has_surface(), true);
+            c.points.quality_known
+                && shown != ShowMode::Surface
+                && super::view3d::effective_color_mode(
+                    v.color_mode,
+                    c.points.rgb.is_some(),
+                    !c.points.source.is_empty(),
+                ) == crate::render::ColorMode::Quality
+        });
+        run || points
+    }
+
     /// In „Bilder“ without a surface: a hint over the top of the view that the cloud stays
     /// until one is computed.
     fn no_surface_hint(&self, ctx: &egui::Context, view: egui::Rect) {
@@ -2079,6 +2101,8 @@ impl DriftlessApp {
         }
         let view = central.response.rect;
         actions.extend(tools::floats(&ctx, view, &mut self.state, &mut self.layout));
+        let legend = self.quality_drawn();
+        tools::quality_legend(&ctx, view, legend, &mut self.layout);
         match event {
             Some(ViewEvent::PickedPose(i)) => self.pose_picked(i),
             Some(ViewEvent::TrajectoryHidden) => {

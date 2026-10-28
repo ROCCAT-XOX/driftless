@@ -239,7 +239,10 @@ slim status bar:
   everything. With every tool the right or middle button (or Shift) pans and the wheel zooms; a click
   picks only with „Punkt wählen“ and „Messen“. Keys: `F` shows everything, `O` switches Fläche → Punkte →
   beides, Esc drops the first point of a measurement, W/A/S/D and Q/E fly in fly mode. The keys do
-  nothing while a text field has the keyboard.
+  nothing while a text field has the keyboard. While the trajectory, the submap anchors or the points
+  (colour mode Güte) are drawn in the quality colours, a legend at the bottom left says what they
+  mean: green „gut verortet“ (submap quality 0.25 and above), yellow „wenig Halt – prüfen“ (about
+  0.05), red „kaum Halt – Lage unsicher“ (0.01 and below), on a logarithmic scale set on real scans.
 - **⚙ (Einstellungen):** how the view draws, for the whole program: colour mode (Farbe, Intensität,
   Güte), points as „Meter“ (default: round spots in world size, 1.5 × the map's voxel, at least the
   minimum size in pixels and at most 24 px, so that they close into an image up close) or „Pixel“ (every

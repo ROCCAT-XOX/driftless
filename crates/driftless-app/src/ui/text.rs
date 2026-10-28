@@ -585,6 +585,15 @@ pub const NO_MEASUREMENTS: &str =
     "Noch keine Messungen. Unten in der Ansicht „Messen“ wählen und zwei Punkte anklicken.";
 pub const MEASUREMENTS_NOT_SAVED: &str = "Messungen werden noch nicht gespeichert (Baustein 5).";
 pub const CLEAR_MEASUREMENTS: &str = "Messungen löschen";
+/// The legend of the quality colours in the view.
+pub const QUALITY_LEGEND: &str = "Güte";
+pub const QUALITY_GOOD: &str = "gut verortet";
+pub const QUALITY_WEAK: &str = "wenig Halt – prüfen";
+pub const QUALITY_BAD: &str = "kaum Halt – Lage unsicher";
+pub const QUALITY_LEGEND_HINT: &str = "Wie fest die Umgebung jede Teilkarte der Laufbahn \
+     gehalten hat (ihr schwächster Moment). Gelb und Rot: wenig Wände oder Kanten im Blick, etwa \
+     in einem leeren Flur, in einer Tür oder bei einer schnellen Drehung – dort kann die Laufbahn \
+     verrutscht sein; die Karte an dieser Stelle prüfen.";
 pub const QUALITY_NONE_HINT: &str =
     "Ohne SLAM-Bericht oder ohne Punktzeiten: Güte unbekannt, grau gezeigt";
 

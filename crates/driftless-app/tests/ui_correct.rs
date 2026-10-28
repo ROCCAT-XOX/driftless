@@ -468,3 +468,50 @@ fn reuse_with_a_write_since_its_start_is_not_current() {
     // no reuse recorded (a full run): current
     assert!(c.computed_current(&run));
 }
+
+/// The legend of the quality colours: shown while the trajectory is drawn in them (not while
+/// a comparison draws it in one colour), or the anchors of the submaps, or the points in the
+/// colour mode „Güte“; its three rows say in German what green, yellow and red mean.
+#[test]
+fn quality_legend_follows_what_is_drawn() {
+    let (app, _run) = app_with_run(&tmp("ui-guete-legende"));
+    let mut h = harness(app);
+    // whether the window placed the legend in the last frame
+    let placed = |h: &mut H| {
+        h.step();
+        h.state().layout().legend.is_some()
+    };
+    // by default the comparison „Odometrie / aktuell“ draws the run in one colour
+    assert!(h.state().overlay().is_some_and(|o| !o.compare.is_empty()));
+    assert!(!placed(&mut h));
+    h.state_mut().state_mut().view.show_compare = false;
+    assert!(placed(&mut h));
+    // the rows, once the legend has faded in
+    frames_until(&mut h, |_| true);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while h.query_by_label(text::QUALITY_BAD).is_none() {
+        assert!(Instant::now() < deadline, "legend rows not shown");
+        h.step();
+    }
+    for row in [text::QUALITY_LEGEND, text::QUALITY_GOOD, text::QUALITY_WEAK] {
+        h.get_by_label(row);
+    }
+    // its place: in the view, at the left, above the bottom
+    let rect = h.state().layout().legend.expect("legend placed");
+    let view = h.state().layout().view;
+    assert!(view.contains_rect(rect), "{rect:?} in {view:?}");
+    assert!(rect.left() < view.center().x && rect.bottom() > view.center().y);
+    // without the trajectory: gone; the anchors of the submaps bring it back
+    h.state_mut().state_mut().view.show_trajectory = false;
+    assert!(!placed(&mut h));
+    h.state_mut().state_mut().view.show_submaps = true;
+    assert!(placed(&mut h));
+    h.state_mut().state_mut().view.show_submaps = false;
+    // the points in the colour mode „Güte“ (the synthetic cloud carries qualities)
+    h.state_mut().load_synthetic(2_000);
+    frames_until(&mut h, |app| app.cloud().is_some());
+    h.state_mut().state_mut().view.color_mode = driftless_app::render::ColorMode::Rgb;
+    assert!(!placed(&mut h));
+    h.state_mut().state_mut().view.color_mode = driftless_app::render::ColorMode::Quality;
+    assert!(placed(&mut h));
+}
