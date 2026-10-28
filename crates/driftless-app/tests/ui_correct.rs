@@ -164,7 +164,8 @@ fn places_fill_a_then_b_and_parse_typed_times() {
 
 #[test]
 fn pick_two_places_adds_loop() {
-    let (app, run) = app_with_run(&tmp("ui-korrektur-klick"));
+    let scratch = tmp("ui-korrektur-klick");
+    let (app, run) = app_with_run(&scratch);
     let mut h = harness(app);
     let overlay = h.state().overlay().expect("trajectory of the run").clone();
     assert_eq!(overlay.run, run);
@@ -214,7 +215,8 @@ fn pick_two_places_adds_loop() {
 
 #[test]
 fn invalid_loop_shows_error_and_writes_nothing() {
-    let (app, run) = app_with_run(&tmp("ui-korrektur-falsch"));
+    let scratch = tmp("ui-korrektur-falsch");
+    let (app, run) = app_with_run(&scratch);
     // one loop already there, written as the CLI writes it
     correct::add_loop_at(&run, 1.0, 11.0, "", ADDED).unwrap();
     let before = fs::read(run.join(CORRECTIONS_FILE)).unwrap();
@@ -261,7 +263,8 @@ fn invalid_loop_shows_error_and_writes_nothing() {
 
 #[test]
 fn toggle_entry_and_reuse() {
-    let (app, run) = app_with_run(&tmp("ui-korrektur-schalter"));
+    let scratch = tmp("ui-korrektur-schalter");
+    let (app, run) = app_with_run(&scratch);
     correct::add_loop_at(&run, 1.0, 11.0, "Treppe", ADDED).unwrap();
     let mut app = app;
     reselect(&mut app, &run);
@@ -304,7 +307,8 @@ fn toggle_entry_and_reuse() {
 
 #[test]
 fn cli_written_corrections_are_listed() {
-    let (app, run) = app_with_run(&tmp("ui-korrektur-cli"));
+    let scratch = tmp("ui-korrektur-cli");
+    let (app, run) = app_with_run(&scratch);
     correct::add_loop_at(&run, 1.0, 11.0, "Treppe", ADDED).unwrap();
     correct::set_enabled(&run, 1, false).unwrap();
     correct::add_loop_at(&run, 2.25, 10.75, "Flur Süd", "2026-10-21T12:30:00Z").unwrap();
@@ -348,7 +352,8 @@ fn cli_written_corrections_are_listed() {
 /// its start and its state is recorded with those.
 #[test]
 fn corrections_locked_while_a_step_of_the_run_runs() {
-    let (app, run) = app_with_run(&tmp("ui-korrektur-gesperrt"));
+    let scratch = tmp("ui-korrektur-gesperrt");
+    let (app, run) = app_with_run(&scratch);
     correct::add_loop_at(&run, 1.0, 11.0, "", ADDED).unwrap();
     let mut app = app;
     reselect(&mut app, &run);
@@ -399,7 +404,8 @@ fn corrections_locked_while_a_step_of_the_run_runs() {
 /// it); a change written after a reuse started keeps the hint, it was not applied.
 #[test]
 fn recompute_waits_for_writes_and_later_writes_keep_the_hint() {
-    let (app, run) = app_with_run(&tmp("ui-korrektur-wettlauf"));
+    let scratch = tmp("ui-korrektur-wettlauf");
+    let (app, run) = app_with_run(&scratch);
     correct::add_loop_at(&run, 1.0, 11.0, "", ADDED).unwrap();
     let mut app = app;
     reselect(&mut app, &run);
@@ -474,7 +480,8 @@ fn reuse_with_a_write_since_its_start_is_not_current() {
 /// colour mode „Güte“; its three rows say in German what green, yellow and red mean.
 #[test]
 fn quality_legend_follows_what_is_drawn() {
-    let (app, _run) = app_with_run(&tmp("ui-guete-legende"));
+    let scratch = tmp("ui-guete-legende");
+    let (app, _run) = app_with_run(&scratch);
     let mut h = harness(app);
     // whether the window placed the legend in the last frame
     let placed = |h: &mut H| {

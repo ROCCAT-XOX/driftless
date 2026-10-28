@@ -3,16 +3,14 @@ use driftless_io::bag::writer::{BagWriter, Compression};
 use driftless_io::bag::Time;
 use driftless_io::msg::encode::{encode_compressed_image, encode_imu, encode_pointcloud2};
 use driftless_io::msg::{CompressedImage, ImuSample, LidarPoint};
+use driftless_io::testdir::TestDir;
 use predicates::prelude::*;
 use serde_json::Value;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-fn tmp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("driftless-inspect-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn tmp(name: &str) -> TestDir {
+    TestDir::new(format!("driftless-inspect-{}-{name}", std::process::id()))
 }
 
 fn time(t: f64) -> Time {
@@ -79,7 +77,7 @@ fn image_bag(secs: f64) -> Vec<u8> {
 
 const CALIB: &str = r#"{"device":{"SN":"SN123","model":"JMK6"},"camera_info":{},"out_put":{}}"#;
 
-fn project(name: &str, lidar: Vec<u8>, image: Option<Vec<u8>>, calib: bool) -> PathBuf {
+fn project(name: &str, lidar: Vec<u8>, image: Option<Vec<u8>>, calib: bool) -> TestDir {
     let dir = tmp(name);
     fs::write(dir.join("LIDAR_0.bag"), lidar).unwrap();
     if let Some(i) = image {

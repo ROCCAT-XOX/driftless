@@ -185,6 +185,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use driftless_io::testdir::TestDir;
 
     #[derive(Parser)]
     struct Cli {
@@ -248,9 +249,7 @@ mod tests {
 
     #[test]
     fn point_pairs_relative_to_their_file() {
-        let dir =
-            std::env::temp_dir().join(format!("driftless-merge-paare-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new(format!("driftless-merge-paare-{}", std::process::id()));
         let file = dir.join("paare.toml");
         let pts = "[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]";
         let entry = |a: &str, b: &str, enabled: bool| {

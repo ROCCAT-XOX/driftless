@@ -1,5 +1,6 @@
 use driftless_io::msg::{ImuSample, LidarFrame, LidarPoint};
 use driftless_io::progress::Progress;
+use driftless_io::testdir::TestDir;
 use driftless_map::{
     build_dense, clean, clean_with, find_ghosts, find_outliers, write_removed_las, CleanConfig,
     CleanStats, Cloud, DenseConfig, MapError, RaySource, RemovalReason, SmoothConfig, SmoothStats,
@@ -499,8 +500,7 @@ fn clean_rejects_bad_config() {
 fn removed_las_carries_reason() {
     let (cloud, rays) = moving_scan();
     let (_, removed, reasons, _) = clean(cloud, &rays, &CleanConfig::default()).unwrap();
-    let dir = std::env::temp_dir().join(format!("driftless-removed-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new(format!("driftless-removed-{}", std::process::id()));
     let path = dir.join("removed.las");
     write_removed_las(&path, &removed, &reasons).unwrap();
     let mut r = las::Reader::from_path(&path).unwrap();

@@ -4,6 +4,7 @@ use driftless_io::calib::{
 };
 use driftless_io::camera::Camera;
 use driftless_io::project::{discover_project, ProjectError};
+use driftless_io::testdir::TestDir;
 use nalgebra::Point3;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,11 +14,8 @@ fn fixture() -> PathBuf {
 }
 
 /// Fresh empty directory under the system temp dir.
-fn tmp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("driftless-project-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+fn tmp(name: &str) -> TestDir {
+    TestDir::new(format!("driftless-project-{}-{name}", std::process::id()))
 }
 
 fn touch(root: &Path, rel: &str) {

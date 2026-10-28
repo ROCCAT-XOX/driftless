@@ -11,6 +11,7 @@ use driftless_app::ui::{
     steps, text, Action, AppState, CloudSummary, DriftlessApp, ScanNode, Selection, Step,
     SurfaceSummary,
 };
+use driftless_io::testdir::TestDir;
 use driftless_io::testscan::tmp;
 use driftless_map::{write_las, Cloud};
 use driftless_steps::merge::{ModelMember, ModelReport, MODEL_LAS, MODEL_REPORT};
@@ -122,7 +123,7 @@ fn measurement_distance() {
 /// A floor plate of 4 × 2 m with a point every 25 cm, as `color.las` in a folder of the
 /// running test (tests run in parallel, and each LAS goes through its own `.tmp`): a click
 /// hits exactly one point. Returns the LAS path.
-fn plate() -> PathBuf {
+fn plate() -> (TestDir, PathBuf) {
     let mut xyz = Vec::new();
     for i in 0..=16 {
         for j in 0..=8 {
@@ -142,9 +143,10 @@ fn plate() -> PathBuf {
         .name()
         .unwrap_or("?")
         .replace(':', "_");
-    let path = tmp(&format!("ui-tools-platte-{test}")).join("color.las");
+    let dir = tmp(&format!("ui-tools-platte-{test}"));
+    let path = dir.join("color.las");
     write_las(&path, &cloud).unwrap();
-    path
+    (dir, path)
 }
 
 /// Says that the running test was skipped, and why. Written past the test harness's capture
@@ -156,8 +158,9 @@ fn skipped(why: &str) {
     let _ = writeln!(std::io::stderr(), "ÜBERSPRUNGEN {name}: {why}");
 }
 
-/// The app with the plate loaded and drawn by a GPU, or `None` without an adapter.
-fn plate_window() -> Option<Harness<'static, DriftlessApp>> {
+/// The app with the plate loaded and drawn by a GPU (with the folder of the plate), or `None`
+/// without an adapter.
+fn plate_window() -> Option<(TestDir, Harness<'static, DriftlessApp>)> {
     use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
     if headless_device().is_none() {
         skipped("kein GPU-Adapter");
@@ -168,10 +171,8 @@ fn plate_window() -> Option<Harness<'static, DriftlessApp>> {
         egui_wgpu::RendererOptions::PREDICTABLE,
     );
     let mut app = app().with_render_state(rs.clone());
-    app.apply(Action::LoadCloud {
-        path: plate(),
-        run: None,
-    });
+    let (dir, path) = plate();
+    app.apply(Action::LoadCloud { path, run: None });
     let mut h = Harness::builder()
         .with_size([1400.0, 900.0])
         .with_pixels_per_point(1.0)
@@ -186,7 +187,7 @@ fn plate_window() -> Option<Harness<'static, DriftlessApp>> {
     for _ in 0..3 {
         h.step();
     }
-    Some(h)
+    Some((dir, h))
 }
 
 /// Where the absolute point `p` lies on the screen (points).
@@ -221,7 +222,7 @@ const B: [f64; 3] = [500_002.5, 401.0, 10.0];
 
 #[test]
 fn measure_two_points_gives_distance() {
-    let Some(mut h) = plate_window() else {
+    let Some((_dir, mut h)) = plate_window() else {
         return;
     };
     click_button(&mut h, text::TOOL_MEASURE);
@@ -253,7 +254,7 @@ fn measure_two_points_gives_distance() {
 
 #[test]
 fn escape_cancels_measure() {
-    let Some(mut h) = plate_window() else {
+    let Some((_dir, mut h)) = plate_window() else {
         return;
     };
     click_button(&mut h, text::TOOL_MEASURE);
@@ -495,7 +496,7 @@ fn drag(h: &mut Harness<'_, DriftlessApp>, from: egui::Pos2, by: egui::Vec2) {
 
 #[test]
 fn left_drag_orbits_or_pans_by_tool() {
-    let Some(mut h) = plate_window() else {
+    let Some((_dir, mut h)) = plate_window() else {
         return;
     };
     let middle = h.state().layout().view.center();
@@ -944,7 +945,7 @@ fn pair_points_mapped_back_to_member_frames() {
 /// A project on disk with [`pair_model`] (its maps inside the project, `modell.las` with
 /// points of a and b, a `clean.las` for c) and `punktpaare.toml` with two entries between a
 /// and b, the second switched off; opened in the program.
-fn pair_project(name: &str) -> (DriftlessApp, PathBuf) {
+fn pair_project(name: &str) -> (TestDir, DriftlessApp, PathBuf) {
     let dir = tmp(name);
     let mut app = app();
     app.apply(Action::NewProject {
@@ -999,7 +1000,7 @@ fn pair_project(name: &str) -> (DriftlessApp, PathBuf) {
     }
     pairs.save(&models.join(POINT_PAIRS_FILE)).unwrap();
     app.apply(Action::OpenProject(project.clone()));
-    (app, project)
+    (dir, app, project)
 }
 
 /// Ticks the program until its work has ended.
@@ -1017,7 +1018,7 @@ fn settle(app: &mut DriftlessApp) {
 
 #[test]
 fn pair_toggle_saves() {
-    let (mut app, project) = pair_project("app-pair-toggle");
+    let (_dir, mut app, project) = pair_project("app-pair-toggle");
     settle(&mut app);
     let state = app.state();
     assert_eq!(state.point_pairs.len(), 2, "{:?}", state.point_pairs_error);
@@ -1081,7 +1082,7 @@ fn pair_toggle_saves() {
 
 #[test]
 fn start_pairs_shows_model_and_scan() {
-    let (mut app, _) = pair_project("app-pair-start");
+    let (_dir, mut app, _) = pair_project("app-pair-start");
     settle(&mut app);
     let model = app.state().models[0].dir.clone();
     app.state_mut().view.color_mode = driftless_app::render::ColorMode::Rgb;

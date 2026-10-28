@@ -16,11 +16,11 @@
 use driftless_app::render::headless_device;
 use driftless_app::ui::tools::Measurement;
 use driftless_app::ui::{Action, DriftlessApp, Step};
+use driftless_io::testdir::TestDir;
 use eframe::egui;
 use egui_kittest::kittest::{By, Queryable};
 use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
 use egui_kittest::{Harness, SnapshotOptions};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,12 +40,9 @@ fn skipped(why: &str) {
 }
 
 /// A fixed work folder for `name` (the same on every run, so that nothing shown depends on
-/// the process), emptied.
-fn work(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("driftless-snapshots").join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// the process), emptied; removed when the test is done.
+fn work(name: &str) -> TestDir {
+    TestDir::new(format!("driftless-snapshots-{name}"))
 }
 
 /// Ticks the app until its background work has ended.
@@ -60,8 +57,8 @@ fn settle(app: &mut DriftlessApp) {
 
 /// The app with a GPU and the project „Schwarzer Raum“: two small synthetic scans
 /// „Scan 13:35“ with a computed map and „Scan 13:30“ without, and the synthetic cloud in
-/// the view. `None` without a GPU adapter.
-fn scene(name: &str) -> Option<Harness<'static, DriftlessApp>> {
+/// the view, with its work folder. `None` without a GPU adapter.
+fn scene(name: &str) -> Option<(TestDir, Harness<'static, DriftlessApp>)> {
     if headless_device().is_none() {
         skipped("kein GPU-Adapter");
         return None;
@@ -114,7 +111,7 @@ fn scene(name: &str) -> Option<Harness<'static, DriftlessApp>> {
     // no message of the load in the status bar: it holds its durations
     h.state_mut().state_mut().messages.clear();
     h.event(egui::Event::PointerGone);
-    Some(h)
+    Some((dir, h))
 }
 
 /// What the 3D view must show before it is painted over.
@@ -217,7 +214,7 @@ fn check(h: &mut Harness<'_, DriftlessApp>, name: &str, probe: Probe) {
 
 #[test]
 fn snapshot_daten() {
-    let Some(mut h) = scene("daten") else {
+    let Some((_dir, mut h)) = scene("daten") else {
         return;
     };
     check(&mut h, "snapshot_daten", Probe::Cloud);
@@ -225,7 +222,7 @@ fn snapshot_daten() {
 
 #[test]
 fn snapshot_bilder() {
-    let Some(mut h) = scene("bilder") else {
+    let Some((_dir, mut h)) = scene("bilder") else {
         return;
     };
     h.state_mut().apply(Action::SetStep(Step::Bilder));
@@ -234,7 +231,7 @@ fn snapshot_bilder() {
 
 #[test]
 fn snapshot_planung() {
-    let Some(mut h) = scene("planung") else {
+    let Some((_dir, mut h)) = scene("planung") else {
         return;
     };
     h.state_mut().apply(Action::SetStep(Step::Planung));

@@ -1,6 +1,7 @@
 //! Manual corrections through the library, in the file format of `driftless correct`.
 
 use driftless_io::progress::Progress;
+use driftless_io::testdir::TestDir;
 use driftless_io::testscan::{room_bag, tmp};
 use driftless_slam::Corrections;
 use driftless_steps::correct;
@@ -68,8 +69,9 @@ fn add_loop_rejects_same_submap() {
 }
 
 /// A run of two laps round the synthetic room (`testutil::Circle`), which closes automatic
-/// loops: the run folder, and the start times of the submaps of each accepted automatic loop.
-fn run_with_automatic_loops(name: &str) -> (std::path::PathBuf, Vec<(f64, f64)>) {
+/// loops: its test folder, the run folder in it, and the start times of the submaps of each
+/// accepted automatic loop.
+fn run_with_automatic_loops(name: &str) -> (TestDir, std::path::PathBuf, Vec<(f64, f64)>) {
     use driftless_odom::testutil::{room_scene, walk_bag, Circle};
     let dir = tmp(name);
     let walk = Circle {
@@ -94,7 +96,7 @@ fn run_with_automatic_loops(name: &str) -> (std::path::PathBuf, Vec<(f64, f64)>)
         .filter(|l| l.accepted)
         .map(|l| (report.submaps[l.a].t_start, report.submaps[l.b].t_start))
         .collect();
-    (out, loops)
+    (dir, out, loops)
 }
 
 fn read_report(out: &std::path::Path) -> driftless_slam::SlamReport {
@@ -124,7 +126,7 @@ fn reuse(out: &std::path::Path) {
 /// name the same loop.
 #[test]
 fn loop_switch_writes_and_removes_the_reject() {
-    let (out, loops) = run_with_automatic_loops("steps-correct-verwerfen");
+    let (_dir, out, loops) = run_with_automatic_loops("steps-correct-verwerfen");
     assert!(!loops.is_empty(), "no automatic loop");
     let (a, b) = loops[0];
     let added = "2026-10-28T09:00:00Z";
@@ -179,7 +181,7 @@ fn loop_switch_writes_and_removes_the_reject() {
 /// again: the rejects are restored as in that state.
 #[test]
 fn restore_brings_back_the_rejects_of_the_state() {
-    let (out, loops) = run_with_automatic_loops("steps-correct-verwerfen-stand");
+    let (_dir, out, loops) = run_with_automatic_loops("steps-correct-verwerfen-stand");
     let (a, b) = loops[0];
     // state 1: the full run, nothing switched off
     correct::set_loop_used(&out, a, b, false).unwrap();

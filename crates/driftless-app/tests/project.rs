@@ -8,7 +8,8 @@ use driftless_app::project::{
 };
 use driftless_gpu::GpuPref;
 use driftless_io::progress::{Progress, ProgressSnapshot};
-use driftless_io::testscan::{furnished_room_bag, room_bag_at, room_bag_secs, tmp};
+use driftless_io::testdir::SharedDir;
+use driftless_io::testscan::{furnished_room_bag, room_bag_at, room_bag_secs, shared, tmp};
 use driftless_map::surface::SurfaceConfig;
 use driftless_steps::correct;
 use driftless_steps::history::HistoryKind;
@@ -873,6 +874,8 @@ fn add_run_checks_the_scan() {
 /// a run and a cleaned map in `<scan>/driftless` as the CLI makes them. Made once for the
 /// merge tests, which only read them.
 struct MergeScans {
+    /// Their folder, shared by the tests of this file.
+    _root: SharedDir,
     a: PathBuf,
     b: PathBuf,
 }
@@ -880,7 +883,7 @@ struct MergeScans {
 fn merge_scans() -> &'static MergeScans {
     static SCANS: OnceLock<MergeScans> = OnceLock::new();
     SCANS.get_or_init(|| {
-        let root = tmp("app-merge-scans");
+        let root = shared("app-merge-scans");
         let (a, b) = (root.join("a"), root.join("b"));
         for d in [&a, &b] {
             fs::create_dir_all(d).unwrap();
@@ -904,6 +907,7 @@ fn merge_scans() -> &'static MergeScans {
         MergeScans {
             a: canon(&a),
             b: canon(&b),
+            _root: root,
         }
     })
 }

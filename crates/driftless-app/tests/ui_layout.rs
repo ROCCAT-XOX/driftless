@@ -141,7 +141,8 @@ fn step_sets_show_mode() {
 
     // a surface still being loaded counts as one
     let mut app = self::app();
-    let glb = tmp("ui-layout-laedt").join("oberflaeche.glb");
+    let dir = tmp("ui-layout-laedt");
+    let glb = dir.join("oberflaeche.glb");
     app.apply(Action::LoadSurface(glb));
     assert!(app.is_loading_surface());
     assert!(app.state().surface.is_none());
@@ -513,7 +514,7 @@ fn projects_of_disk_show_in_daten() {
     let dir = tmp("ui-layout-leer");
     Project::create(&dir, "Leer").unwrap();
     let mut app = app();
-    app.apply(Action::OpenProject(dir));
+    app.apply(Action::OpenProject(dir.to_path_buf()));
     // read in the background
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while app.wants_repaint_while_busy() {

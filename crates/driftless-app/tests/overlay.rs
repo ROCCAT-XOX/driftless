@@ -10,6 +10,7 @@ use driftless_app::overlay::{
 use driftless_app::pick::pick_pose;
 use driftless_app::render::LineVertex;
 use driftless_app::ui::ViewSettings;
+use driftless_io::testdir::TestDir;
 use driftless_io::testscan::tmp;
 use driftless_slam::report::{BeforeAfter, LoopReport, SubmapReport};
 use driftless_slam::SlamReport;
@@ -19,7 +20,7 @@ use driftless_steps::overlay::{
 use driftless_traj::nalgebra::{UnitQuaternion, Vector3};
 use driftless_traj::{write_tum, Pose};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const SCAN_START: f64 = 1_700_000_000.5;
 /// A large offset like UTM coordinates.
@@ -58,7 +59,7 @@ fn loop_report(a: usize, b: usize, manual: bool, accepted: bool) -> LoopReport {
 
 /// A run folder: 3 submaps of 3 s with quality 0, 0.05 (yellow) and 1, one pose per second along x,
 /// and three loops (accepted, rejected, manual).
-fn run_dir(name: &str) -> PathBuf {
+fn run_dir(name: &str) -> TestDir {
     let dir = tmp(name);
     let report = SlamReport {
         scan_start: SCAN_START,

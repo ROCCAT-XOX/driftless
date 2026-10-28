@@ -551,8 +551,7 @@ fn rename_refuses_an_empty_name() {
 #[test]
 #[ignore = "puts a folder into the real trash"]
 fn system_trash_takes_a_folder() {
-    let probe = tmp("echter-papierkorb").join("driftless-papierkorb-probe");
-    fs::create_dir_all(&probe).unwrap();
+    let probe = tmp("echter-papierkorb").inside("driftless-papierkorb-probe");
     fs::write(probe.join("probe.txt"), "Driftless").unwrap();
     driftless_app::trash::system_trash(&probe).unwrap();
     assert!(!probe.exists());

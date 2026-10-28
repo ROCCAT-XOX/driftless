@@ -1,15 +1,13 @@
 use driftless_io::msg::{ImuSample, LidarFrame, LidarPoint};
+use driftless_io::testdir::TestDir;
 use driftless_map::{build_dense, write_las, write_ply, Cloud, DenseConfig, MapError, RaySource};
 use driftless_odom::testutil::{imu_samples, lidar_frames, room_scene, Aabb, Trajectory, Walk};
 use driftless_odom::{run_odometry, OdomConfig};
 use driftless_traj::nalgebra::{Isometry3, Point3, Translation3, Vector3};
 use driftless_traj::Pose;
-use std::path::PathBuf;
 
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("driftless-map-{}-{name}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(name: &str) -> TestDir {
+    TestDir::new(format!("driftless-map-{}-{name}", std::process::id()))
 }
 
 struct RoomScan {

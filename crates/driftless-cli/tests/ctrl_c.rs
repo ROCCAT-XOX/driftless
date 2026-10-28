@@ -25,7 +25,7 @@ fn run(args: &[&std::ffi::OsStr]) {
 }
 
 /// A scan with SLAM and a map in `<dir>/out`.
-fn mapped(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+fn mapped(name: &str) -> (driftless_io::testdir::TestDir, std::path::PathBuf) {
     let dir = tmp(name);
     room_bag(&dir, true);
     let out = dir.join("out");

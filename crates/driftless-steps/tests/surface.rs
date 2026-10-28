@@ -2,8 +2,9 @@
 //! `run_model_surface` on models of two scans of the furnished room.
 
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
+use driftless_io::testdir::{SharedDir, TestDir};
 use driftless_io::testscan::{
-    furnished_room_bag, furnished_scan_with_images, room_bag, scan_with_images, tmp,
+    furnished_room_bag, furnished_scan_with_images, room_bag, scan_with_images, shared, tmp,
 };
 use driftless_map::surface::SurfaceConfig;
 use driftless_slam::align::AlignConfig;
@@ -56,7 +57,7 @@ fn small_config() -> SurfaceConfig {
 }
 
 /// Scan, SLAM and clean map in one folder; returns (scan, folder).
-fn prepared(name: &str, images: bool) -> (PathBuf, PathBuf) {
+fn prepared(name: &str, images: bool) -> (TestDir, PathBuf) {
     let dir = tmp(name);
     if images {
         scan_with_images(&dir);
@@ -499,6 +500,8 @@ fn old_pages_are_listed_as_stale_not_deleted() {
 // without images.
 
 struct ModelScene {
+    /// Their folder, shared by the tests of this file.
+    _root: SharedDir,
     a: PathBuf,
     /// Model of A (reference) and B.
     both: PathBuf,
@@ -558,7 +561,7 @@ fn merged(scans: &[&Path], out: &Path) -> PathBuf {
 fn model_scene() -> &'static ModelScene {
     static SCENE: OnceLock<ModelScene> = OnceLock::new();
     SCENE.get_or_init(|| {
-        let root = tmp("steps-model-surface");
+        let root = shared("steps-model-surface");
         let (a, b, c) = (
             root.join("raum-a"),
             root.join("raum-b"),
@@ -578,6 +581,7 @@ fn model_scene() -> &'static ModelScene {
         let images_of_a = merged(&[&a, &c], &root.join("modell-002"));
         let one_imageless = merged(&[&c, &a], &root.join("modell-003"));
         ModelScene {
+            _root: root,
             a,
             both,
             images_of_a,
