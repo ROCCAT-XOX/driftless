@@ -227,8 +227,9 @@ Each pull request builds both installers as CI artifacts (`driftless-macos`, `dr
 kept 14 days; `.github/workflows/package.yml`). A tag `v<version>` makes a **draft** release with
 both files and `THIRD-PARTY-NOTICES.html` (`.github/workflows/release.yml`). Its text is
 `packaging/release-notes.md` followed by the section of that version in [CHANGELOG.md](CHANGELOG.md)
-(`packaging/release-body.sh`; the job stops if the section is missing). Publishing the draft is a manual
-step; then the files are on the repository's Releases page (first start: see [Install](#install)).
+(`packaging/release-body.sh`; its first job runs it once before the installers are built, so a missing
+section stops the release within seconds). Publishing the draft is a manual step; then the files are on
+the repository's Releases page (first start: see [Install](#install)).
 
 - **macOS (Apple Silicon, macOS 14 or newer):** `Driftless-<version>-macos-arm64.dmg` holds `Driftless.app`
   with both programs and the licence notices (`Contents/Resources/THIRD-PARTY-NOTICES.html`), signed ad

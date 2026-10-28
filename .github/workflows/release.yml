@@ -13,7 +13,8 @@ permissions:
   contents: read
 
 jobs:
-  # First, so that a wrong tag fails in seconds and not after both builds.
+  # First, so that a wrong tag or a missing CHANGELOG section fails in seconds and not after
+  # both builds.
   version:
     name: Tag = Version
     runs-on: ubuntu-latest
@@ -34,6 +35,13 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      # The text of the draft once here as well: a missing or empty section of this version in
+      # CHANGELOG.md (or a placeholder left in release-notes.md) stops the release before both
+      # installers are built, not after.
+      - name: CHANGELOG-Abschnitt
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: bash packaging/release-body.sh "$VERSION" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$RUNNER_TEMP/release-notes.md"
 
   package:
     needs: version
