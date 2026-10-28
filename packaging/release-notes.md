@@ -49,9 +49,10 @@ Die Kommandozeile `driftless` ist in beiden Paketen dabei, aber nicht im Suchpfa
 
 ### Projekte nicht in iCloud Drive oder OneDrive
 
-Projekte und Scans auf ein lokales Laufwerk legen, z. B. `~/Driftless` oder `C:\Driftless`, nicht in
-iCloud Drive, OneDrive oder einen anderen Ordner, der abgeglichen wird: Die Ergebnisse sind mehrere GB
-groß, und Dateien, die nur in der Cloud liegen, bremsen oder stören das Rechnen.
+Projekte und Scans auf ein lokales Laufwerk legen, z. B. in den Ordner „Driftless Projekte“ im
+Benutzerordner, den Driftless vorschlägt, nicht in iCloud Drive, OneDrive oder einen anderen Ordner,
+der abgeglichen wird: Die Ergebnisse sind mehrere GB groß, und Dateien, die nur in der Cloud liegen,
+bremsen oder stören das Rechnen.
 
 ### Wenn etwas nicht geht
 
