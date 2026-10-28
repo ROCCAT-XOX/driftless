@@ -1,7 +1,10 @@
 //! Manual corrections of a SLAM run in `<lauf>/corrections.toml`. Manual loops are only
 //! appended or switched off and on, never removed; an automatic loop switched off is a reject
-//! entry, removed when it is switched on again ([`set_loop_used`]). A reuse of the run applies
-//! them in seconds.
+//! entry, removed when it is switched on again ([`set_loop_used`]; `driftless correct … enable`
+//! with its number, [`switch_entry`]). A reuse of the run applies them in seconds.
+//!
+//! `driftless correct … list` numbers the manual loops from 1 in file order, then the automatic
+//! loops switched off ([`render_list`]); `enable` and `disable` take those numbers.
 
 use crate::error::{failed, StepError};
 use crate::slam::{CACHE_FILE, CORRECTIONS_FILE};
@@ -91,17 +94,27 @@ pub fn add_loop_at(
     Ok(nr)
 }
 
-/// Switches entry `nr` (from 1) on or off and saves the file; returns whether it changed.
-/// Switching an entry back on is checked like a new loop against the active ones.
+/// Switches the manual loop `nr` (from 1) on or off and saves the file; returns whether it
+/// changed. Switching an entry back on is checked like a new loop against the active ones.
 pub fn set_enabled(run: &Path, nr: usize, enabled: bool) -> Result<bool, StepError> {
     let _lock = lock(run)?;
     let mut c = load(run)?;
+    switch_loop(run, &mut c, nr, enabled)
+}
+
+/// [`set_enabled`] on `c`, the corrections of `run` (under its lock).
+fn switch_loop(
+    run: &Path,
+    c: &mut Corrections,
+    nr: usize,
+    enabled: bool,
+) -> Result<bool, StepError> {
     if let Some(l) = c
         .loops
         .get(nr.wrapping_sub(1))
         .filter(|l| enabled && !l.enabled)
     {
-        check_new_loop(run, &c, l.a, l.b)
+        check_new_loop(run, c, l.a, l.b)
             .map_err(|e| format!("Eintrag {nr} nicht eingeschaltet: {e}"))?;
     }
     let changed = c.set_enabled(nr, enabled)?;
@@ -109,6 +122,76 @@ pub fn set_enabled(run: &Path, nr: usize, enabled: bool) -> Result<bool, StepErr
         c.save(&run.join(CORRECTIONS_FILE))?;
     }
     Ok(changed)
+}
+
+/// `driftless correct … enable|disable <nr>`: entry `nr` as [`render_list`] numbers it, on or
+/// off; saves the file. A manual loop as [`set_enabled`] switches it. An automatic loop switched
+/// off (numbered after the manual loops) counts again once enabled: its reject entry goes, so
+/// the next reuse may use the loop; disabled, it is off already. Returns whether the file
+/// changed and what to say.
+pub fn switch_entry(run: &Path, nr: usize, enabled: bool) -> Result<(bool, String), StepError> {
+    let _lock = lock(run)?;
+    let mut c = load(run)?;
+    let loops = c.loops.len();
+    let all = loops + c.rejects.len();
+    if nr == 0 || nr > all {
+        return Err(match all {
+            0 => format!("kein Eintrag {nr}: es gibt noch keine Korrekturen"),
+            n => format!("kein Eintrag {nr} (vorhanden: 1 bis {n})"),
+        }
+        .into());
+    }
+    if nr <= loops {
+        let changed = switch_loop(run, &mut c, nr, enabled)?;
+        return Ok((changed, switched_message(nr, enabled, changed)));
+    }
+    let reject = c.rejects[nr - loops - 1].clone();
+    if enabled {
+        c.rejects.remove(nr - loops - 1);
+        c.save(&run.join(CORRECTIONS_FILE))?;
+    }
+    Ok((
+        enabled,
+        reject_switched_message(nr, reject.a, reject.b, enabled),
+    ))
+}
+
+/// What `driftless correct … enable|disable` answers for the automatic loop switched off that
+/// `list` numbers `nr` (its submaps at `a` and `b`): enabled, its entry went and it counts again;
+/// disabled, nothing changed.
+pub fn reject_switched_message(nr: usize, a: f64, b: f64, enabled: bool) -> String {
+    if enabled {
+        format!("Eintrag {nr} entfernt: die automatische Schleife {a:.1} s ↔ {b:.1} s zählt wieder")
+    } else {
+        format!(
+            "Eintrag {nr} (automatische Schleife {a:.1} s ↔ {b:.1} s) ist schon abgeschaltet; \
+             nichts geändert"
+        )
+    }
+}
+
+/// The entry of `corrections.toml` of `run` that the run cannot apply to the submaps of its
+/// `submaps.bin` (it failed with [`StepError::BadCorrection`]): its number as [`render_list`]
+/// shows it, and whether it is an automatic loop switched off (then `enable` removes it, else
+/// `disable` switches it off). Checked as the run checks them: the manual loops switched on, in
+/// file order, then the switched-off automatic loops. `None` without a readable cache or if
+/// every entry fits. Reads the whole cache.
+pub fn bad_entry(run: &Path) -> Option<(usize, bool)> {
+    let c = load(run).ok()?;
+    let submaps = cached_submaps(run).ok()??;
+    let mut active = Vec::new();
+    for (i, l) in c.loops.iter().enumerate().filter(|(_, l)| l.enabled) {
+        active.push(ManualLoop { a_t: l.a, b_t: l.b });
+        if match_manual_loops(&submaps, &active).is_err() {
+            return Some((i + 1, false));
+        }
+    }
+    c.rejects.iter().enumerate().find_map(|(k, r)| {
+        let reject = RejectedLoop { a_t: r.a, b_t: r.b };
+        match_rejected_loops(&submaps, &[reject])
+            .is_err()
+            .then_some((c.loops.len() + k + 1, true))
+    })
 }
 
 /// The submaps of `submaps.bin` of the run, if it has one.
@@ -214,7 +297,8 @@ pub fn switched_message(nr: usize, enabled: bool, changed: bool) -> String {
 }
 
 /// The corrections as `driftless correct <lauf> list` prints them (`path`: their file): the
-/// manual loops by number, then the automatic loops switched off.
+/// manual loops by number, then the automatic loops switched off, numbered on after them (for
+/// `enable`, which removes such an entry).
 pub fn render_list(c: &Corrections, path: &Path) -> String {
     if c.loops.is_empty() && c.rejects.is_empty() {
         return format!("keine Korrekturen in {}\n", path.display());
@@ -234,10 +318,15 @@ pub fn render_list(c: &Corrections, path: &Path) -> String {
             l.note
         );
     }
-    for r in &c.rejects {
+    for (k, r) in c.rejects.iter().enumerate() {
         s += &format!(
             "{:<3} {:<12} {:<12} {:>6.1} {:>10.1}  {:<21}\n",
-            "–", "abgeschaltet", "automatisch", r.a, r.b, r.added
+            c.loops.len() + k + 1,
+            "abgeschaltet",
+            "automatisch",
+            r.a,
+            r.b,
+            r.added
         );
     }
     s

@@ -68,6 +68,101 @@ fn add_loop_rejects_same_submap() {
     assert!(err.to_string().contains("kein Eintrag 1"), "{err}");
 }
 
+/// `driftless correct … list` numbers the automatic loops switched off after the manual loops;
+/// `enable` on such a number removes its entry (the loop counts again), `disable` leaves it as
+/// it is; a manual loop is switched as before (M6 of the final review).
+#[test]
+fn switched_off_automatic_loops_are_numbered_and_enabled_again() {
+    let run = tmp("steps-correct-nummern");
+    fs::write(
+        run.join(CORRECTIONS_FILE),
+        "[[loop]]\na = 1.0\nb = 20.0\nenabled = true\n\n\
+         [[reject]]\na = 30.0\nb = 200.0\nadded = \"2026-10-28T09:00:00Z\"\n\n\
+         [[reject]]\na = 40.0\nb = 300.0\nadded = \"2026-10-28T09:01:00Z\"\n",
+    )
+    .unwrap();
+    let list = correct::render_list(&correct::load(&run).unwrap(), &run.join(CORRECTIONS_FILE));
+    let lines: Vec<&str> = list.lines().collect();
+    assert_eq!(lines.len(), 4, "{list}");
+    assert!(lines[1].starts_with("1   aktiv"), "{list}");
+    assert!(
+        lines[2].starts_with("2   abgeschaltet automatisch"),
+        "{list}"
+    );
+    assert!(
+        lines[2].contains("30.0") && lines[2].contains("200.0"),
+        "{list}"
+    );
+    assert!(
+        lines[3].starts_with("3   abgeschaltet automatisch"),
+        "{list}"
+    );
+
+    // disabled already: nothing changes
+    let before = fs::read(run.join(CORRECTIONS_FILE)).unwrap();
+    let (changed, message) = correct::switch_entry(&run, 2, false).unwrap();
+    assert!(!changed);
+    assert_eq!(
+        message,
+        "Eintrag 2 (automatische Schleife 30.0 s ↔ 200.0 s) ist schon abgeschaltet; nichts \
+         geändert"
+    );
+    assert_eq!(fs::read(run.join(CORRECTIONS_FILE)).unwrap(), before);
+    // enabled: its entry goes, the other stays
+    let (changed, message) = correct::switch_entry(&run, 2, true).unwrap();
+    assert!(changed);
+    assert_eq!(
+        message,
+        "Eintrag 2 entfernt: die automatische Schleife 30.0 s ↔ 200.0 s zählt wieder"
+    );
+    let c = correct::load(&run).unwrap();
+    assert_eq!(c.loops.len(), 1);
+    assert_eq!(c.rejects.len(), 1);
+    assert_eq!((c.rejects[0].a, c.rejects[0].b), (40.0, 300.0));
+    // a number of neither kind
+    let err = correct::switch_entry(&run, 3, true).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("kein Eintrag 3 (vorhanden: 1 bis 2)"),
+        "{err}"
+    );
+    // a manual loop as before
+    let (changed, message) = correct::switch_entry(&run, 1, false).unwrap();
+    assert!(changed);
+    assert_eq!(message, correct::switched_message(1, false, true));
+    assert!(!correct::load(&run).unwrap().loops[0].enabled);
+}
+
+/// The entry a run cannot apply to its submaps, by its number in the list: a manual loop
+/// (switched off with `disable`) or an automatic loop switched off (removed with `enable`).
+#[test]
+fn bad_entry_names_the_number_and_the_kind() {
+    // 1.5 s: a single submap
+    let dir = tmp("steps-correct-falsch");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    let req = SlamRequest {
+        scan: dir.clone(),
+        out: out.clone(),
+        settings: SlamSettings::default(),
+        reuse: false,
+        history: false,
+    };
+    run_slam(&req, &Progress::new()).unwrap();
+    assert_eq!(correct::bad_entry(&out), None);
+    // both times of the switched-off loop in the one submap
+    let reject = "[[reject]]\na = 0.2\nb = 1.0\n";
+    fs::write(out.join(CORRECTIONS_FILE), reject).unwrap();
+    assert_eq!(correct::bad_entry(&out), Some((1, true)));
+    // a manual loop out of the scan comes first; switched off, it is no longer checked
+    let manual = "[[loop]]\na = 0.5\nb = 30.0\nenabled = true\n\n";
+    fs::write(out.join(CORRECTIONS_FILE), format!("{manual}{reject}")).unwrap();
+    assert_eq!(correct::bad_entry(&out), Some((1, false)));
+    let off = manual.replace("enabled = true", "enabled = false");
+    fs::write(out.join(CORRECTIONS_FILE), format!("{off}{reject}")).unwrap();
+    assert_eq!(correct::bad_entry(&out), Some((2, true)));
+}
+
 /// A run of two laps round the synthetic room (`testutil::Circle`), which closes automatic
 /// loops: its test folder, the run folder in it, and the start times of the submaps of each
 /// accepted automatic loop.

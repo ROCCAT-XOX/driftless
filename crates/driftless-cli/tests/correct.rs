@@ -211,10 +211,55 @@ fn full_run_with_bad_correction_hints_disable_and_reuse() {
     slam(&dir, &out, false)
         .failure()
         .stderr(predicate::str::contains("außerhalb des Scans"))
-        .stderr(predicate::str::contains("disable <nr>"))
+        .stderr(predicate::str::contains(format!(
+            "Eintrag 1 mit `driftless correct {} disable 1` abschalten",
+            out.display()
+        )))
         .stderr(predicate::str::contains("--reuse"));
     assert!(out.join("submaps.bin").exists());
     correct(&out, &["disable", "1"]).success();
+    slam(&dir, &out, true).success();
+}
+
+/// An automatic loop switched off in the desktop program (`[[reject]]`) is numbered by `list`
+/// after the manual loops; `enable` with its number removes the entry, so the loop counts
+/// again, `disable` leaves it. If the entry breaks a run (here both times in one submap), the
+/// message names that command, not `disable` (M6 of the final review).
+#[test]
+fn switched_off_automatic_loop_is_listed_and_enabled_again() {
+    let dir = tmp("correct-reject");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    slam(&dir, &out, false).success();
+    // the scan is 1.5 s long: one submap
+    fs::write(
+        out.join("corrections.toml"),
+        "[[reject]]\na = 0.2\nb = 1.0\nadded = \"2026-10-28T09:00:00Z\"\n",
+    )
+    .unwrap();
+    slam(&dir, &out, true)
+        .failure()
+        .stderr(predicate::str::contains("derselben Teilkarte"))
+        .stderr(predicate::str::contains(format!(
+            "Eintrag 1 ist eine abgeschaltete automatische Schleife: mit `driftless correct {} \
+             enable 1` entfernen",
+            out.display()
+        )))
+        .stderr(predicate::str::contains("disable").not());
+    correct(&out, &["list"])
+        .success()
+        .stdout(predicate::str::contains("1   abgeschaltet automatisch"));
+    correct(&out, &["disable", "1"])
+        .success()
+        .stdout(predicate::str::contains("ist schon abgeschaltet"))
+        .stdout(predicate::str::contains("--reuse").not());
+    correct(&out, &["enable", "1"])
+        .success()
+        .stdout(predicate::str::contains("Eintrag 1 entfernt"))
+        .stdout(predicate::str::contains("--reuse"));
+    correct(&out, &["list"])
+        .success()
+        .stdout(predicate::str::contains("keine Korrekturen"));
     slam(&dir, &out, true).success();
 }
 
