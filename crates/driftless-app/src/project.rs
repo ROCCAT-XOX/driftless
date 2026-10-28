@@ -1159,8 +1159,10 @@ impl Project {
     }
 
     /// Adds a scan folder (it must have LiDAR bags); returns its id: the folder name, with
-    /// `-2`, `-3`, … if taken (ignoring case). The same folder twice is refused. Call [`Project::save`]
-    /// afterwards.
+    /// `-2`, `-3`, … if taken (ignoring case) – by a scan of the project, or by the results of
+    /// another scan under `scans/<id>` (one taken out of the project, see
+    /// [`Project::results_of_another_scan`]). The same folder twice is refused. Call
+    /// [`Project::save`] afterwards.
     pub fn add_scan(&mut self, scan_dir: &Path) -> Result<String, ProjectError> {
         let path = canonical(scan_dir)
             .map_err(|_| ProjectError(text::about_path("Scan-Ordner nicht gefunden", scan_dir)))?;
@@ -1181,6 +1183,7 @@ impl Project {
             self.scans
                 .iter()
                 .any(|s| s.id.to_lowercase() == id.to_lowercase())
+                || self.results_of_another_scan(id, &found)
         };
         while taken(&id) {
             n += 1;
@@ -1194,6 +1197,34 @@ impl Project {
             bags: bag_stamps(&found),
         });
         Ok(id)
+    }
+
+    /// Whether `scans/<id>` holds the runs of another scan than the scan folder `found` (one
+    /// taken out of the project): none of its runs was recorded at the times of `found`'s LiDAR
+    /// bags ([`run_fits_scan`]), or one was recorded at others. Such an id is not given to
+    /// `found`, which would list those runs and maps as its own; a folder of the same scan,
+    /// taken out and added again, gives it its results back. A folder without runs holds
+    /// nothing to take over. Reads the bags' indexes and the runs' `slam.json`.
+    fn results_of_another_scan(&self, id: &str, found: &driftless_io::project::Project) -> bool {
+        let Ok(base) = self.runs_dir(id) else {
+            return false;
+        };
+        let runs = numbered(&base, RUN_PREFIX);
+        if runs.is_empty() {
+            return false;
+        }
+        let times = scan_times(&found.lidar_bags);
+        let mut fits = false;
+        for (_, _, run) in &runs {
+            match (driftless_steps::slam::run_times(run), times) {
+                (Some(run), Some(scan)) if run_fits_scan(run, scan) => fits = true,
+                // recorded at other times: another scan's
+                (Some(_), Some(_)) => return true,
+                // cannot be told (no report, bags without an index)
+                _ => {}
+            }
+        }
+        !fits
     }
 
     /// Gives the scan `id` the shown name `name` (trimmed, not empty); its folder and id stay.
@@ -1383,6 +1414,7 @@ impl Project {
             .filter_map(|(_, digits, dir)| {
                 let mut report = read_model(&dir).ok()?;
                 rebase_old_model(&mut report, &self.dir);
+                self.current_scans(&mut report);
                 Some(ModelInfo {
                     label: text::model_label(&digits),
                     surfaces: surfaces_of(&dir),
@@ -1391,6 +1423,45 @@ impl Project {
                 })
             })
             .collect()
+    }
+
+    /// Each scan of the model `report` whose run is one of the project's (`scans/<id>/slam-NNN`,
+    /// or a run added by hand) in the folder the project has for it now: `modell.json` keeps
+    /// the scan folder of the merge, which is out of date once the scan was assigned a new
+    /// folder („Ordner neu zuordnen …“). So the surface of the model takes the photos from where
+    /// the scan is, and whether its maps changed is told from there.
+    fn current_scans(&self, report: &mut ModelReport) {
+        for m in &mut report.members {
+            if let Some(scan) = self.scan_of_run(&m.slam_dir) {
+                m.scan = scan.path.clone();
+            }
+        }
+    }
+
+    /// The scan of the project whose run lies in `run`: `<projekt>/scans/<id>/slam-NNN` of the
+    /// scan `id`, or a run added to it by hand.
+    fn scan_of_run(&self, run: &Path) -> Option<&ScanEntry> {
+        let own = run
+            .strip_prefix(self.dir.join(SCANS_DIR))
+            .ok()
+            .and_then(|rest| {
+                let mut parts = rest.components();
+                let (Some(Component::Normal(id)), Some(Component::Normal(name)), None) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    return None;
+                };
+                let digits = name.to_str()?.strip_prefix(RUN_PREFIX)?;
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                self.scan(id.to_str()?)
+            });
+        own.or_else(|| {
+            self.scans
+                .iter()
+                .find(|s| s.extra_runs.iter().any(|r| same_dir(r, run)))
+        })
     }
 
     /// Creates the next `scans/<id>/slam-NNN` with its `lauf.toml`. For a job: the folder goes

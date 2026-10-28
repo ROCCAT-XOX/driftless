@@ -262,6 +262,39 @@ fn relink_a_missing_scan_only_to_the_same_scan() {
     assert_eq!(h.state().state().scans[0].runs.len(), 1, "its run stays");
 }
 
+/// A scan taken out of the project leaves its results under `scans/<id>`: another scan folder
+/// of the same name added later (`Tag2/EG` after `Tag1/EG`) gets an id of its own instead of
+/// taking them over as its own runs and maps (M1 of the final review); the scan itself, added
+/// again, gets them back under its id.
+#[test]
+fn a_removed_scans_id_goes_to_no_other_scan() {
+    let dir = tmp("verwalten-kennung");
+    let project = dir.join("projekt");
+    Project::create(&project, "Haus").unwrap();
+    let day1 = scan(&dir.join("tag1"), "EG", 1000.0, 1.5);
+    let day2 = scan(&dir.join("tag2"), "EG", 5000.0, 1.5);
+    let mut h = harness(app());
+    run(&mut h, Action::OpenProject(project.clone()));
+    run(&mut h, Action::AddScan(day1.clone()));
+    run(&mut h, Action::RunSlam("EG".into()));
+    run(&mut h, Action::RemoveScan("EG".into()));
+    assert!(h.state().state().scans.is_empty());
+    let results = canonical(&project).unwrap().join("scans/EG/slam-001");
+    assert!(results.join("slam.json").is_file(), "the results stay");
+
+    // another folder named EG, recorded at another time: an id of its own, no runs
+    run(&mut h, Action::AddScan(day2));
+    assert_eq!(Project::open(&project).unwrap().scans[0].id, "EG-2");
+    assert!(h.state().state().scans[0].runs.is_empty());
+    // the scan of the results, added again: its id and its run
+    run(&mut h, Action::AddScan(day1));
+    let on_disk = Project::open(&project).unwrap();
+    assert_eq!(on_disk.scans[1].id, "EG");
+    assert_eq!(h.state().state().scans[1].runs.len(), 1);
+    assert_eq!(h.state().state().scans[1].runs[0].dir, results);
+    assert_eq!(errors(h.state()), Vec::<String>::new());
+}
+
 /// A scan added before the bags were kept (no `bags` in `project.toml`) is told by the times
 /// of its run; without a run it cannot be told, and is taken with a note.
 #[test]

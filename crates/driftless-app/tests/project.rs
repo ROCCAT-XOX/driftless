@@ -1072,6 +1072,61 @@ fn models_dir(p: &Project) -> PathBuf {
     p.dir.join("modelle")
 }
 
+/// „Ordner neu zuordnen …“ reaches the models (M2 of the final review): `modell.json` keeps
+/// the scan folder of the merge, the project the one it has now. A model of a scan assigned a
+/// new folder takes it from the project: the report its surface request is made of names the new
+/// folder (the photos come from there), the scan is found in the project, and whether its map
+/// changed is told from there.
+#[test]
+fn relinked_scan_reaches_the_model() {
+    let dir = tmp("app-merge-relink");
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    for d in [&a, &b] {
+        fs::create_dir_all(d).unwrap();
+    }
+    furnished_room_bag(&a, true, [0.0; 3], 0.0);
+    furnished_room_bag(&b, true, [0.8, 0.5, 0.0], 30f64.to_radians());
+    let mut p = Project::create(&dir.join("projekt"), "Modell").unwrap();
+    let ids: Vec<String> = [&a, &b].iter().map(|s| p.add_scan(s).unwrap()).collect();
+    p.save().unwrap();
+    let mut picks = Vec::new();
+    for id in &ids {
+        let full = SlamJob::Full(SlamSettings::default());
+        let done = run_slam_job(&p, id, &full, &Progress::new()).unwrap();
+        let run = p.runs(id).remove(0);
+        let scan_dir = p.scan(id).unwrap().path.clone();
+        let map = run_map_job(&run, &scan_dir, &settings(MapStep::All), &Progress::new()).unwrap();
+        picks.push(MergePick {
+            scan_id: id.clone(),
+            run: done.run_dir,
+            map: map.dir,
+        });
+    }
+    run_merge_job(&p, &picks, false, &Progress::new()).unwrap();
+
+    // the raw data of `a` moves to another drive; the scan is assigned its new folder
+    let moved = dir.join("anderes-laufwerk").join("a");
+    fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    fs::rename(&a, &moved).unwrap();
+    assert!(p.relink_scan(&ids[0], &moved).unwrap());
+    p.save().unwrap();
+    let p = Project::open(&p.dir).unwrap();
+    let model = p.models().remove(0);
+    assert_eq!(model.report.members[0].scan, canon(&moved));
+    assert_eq!(model.report.members[1].scan, canon(&b));
+    assert_eq!(model_picks(&p, &model.report).unwrap().len(), 2);
+    assert!(!model_status(&model).stale);
+
+    // the scan's bags change in the new folder: the model is stale (from the old folder,
+    // which is gone, it could not be told at all)
+    let bag = moved.join("LIDAR_0.bag");
+    let mut bytes = fs::read(&bag).unwrap();
+    bytes.extend_from_slice(&[0; 16]);
+    fs::write(&bag, bytes).unwrap();
+    let model = p.models().remove(0);
+    assert!(model_status(&model).stale);
+}
+
 #[test]
 fn merge_job_creates_model_dir() {
     let dir = tmp("app-merge-job");
