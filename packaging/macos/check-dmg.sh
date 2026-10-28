@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Checks a disk image of build-dmg.sh: mounts it read-only, then the files of the bundle,
-# Info.plist, the oldest macOS of both programs, the signature, `--version` of both programs and
-# the size. Exit ≠ 0 on any fault.
+# Checks a disk image of build-dmg.sh: mounts it read-only, then the files of the bundle, the
+# licence notices, Info.plist, the oldest macOS of both programs, the signature, `--version` of
+# both programs and the size. Exit ≠ 0 on any fault.
 #
 #   packaging/macos/check-dmg.sh target/package/Driftless-<version>-macos-arm64.dmg
 set -euo pipefail
@@ -51,13 +51,23 @@ ok "Driftless.app und Verweis auf /Applications"
 # Exactly these files in the bundle (the signature may hold several files).
 files="$(cd "$app" && find . -type f -o -type l | sed 's|^\./||' | LC_ALL=C sort)"
 expected="$(printf '%s\n' Contents/Info.plist Contents/MacOS/driftless Contents/MacOS/driftless-app \
-    Contents/Resources/driftless.icns | LC_ALL=C sort)"
+    Contents/Resources/THIRD-PARTY-NOTICES.html Contents/Resources/driftless.icns | LC_ALL=C sort)"
 rest="$(printf '%s\n' "$files" | grep -v '^Contents/_CodeSignature/' || true)"
 [ "$rest" = "$expected" ] || fail "unerwartete Dateien im Bündel:
 $files"
 printf '%s\n' "$files" | grep -q '^Contents/_CodeSignature/CodeResources$' \
     || fail "Contents/_CodeSignature/CodeResources fehlt"
 ok "Dateiliste des Bündels"
+
+# The licence notices, with the texts of the embedded fonts: they are missing if the
+# clarification of epaint_default_fonts in packaging/about.toml no longer fits.
+notices="$app/Contents/Resources/THIRD-PARTY-NOTICES.html"
+[ -s "$notices" ] || fail "THIRD-PARTY-NOTICES.html ist leer"
+for text in "BITSTREAM VERA LICENSE" "SIL OPEN FONT LICENSE Version 1.1" \
+    "UBUNTU FONT LICENCE Version 1.0" "Copyright (c) 2020 Phosphor Icons"; do
+    grep -qF "$text" "$notices" || fail "THIRD-PARTY-NOTICES.html enthält nicht: $text"
+done
+ok "Lizenzen Dritter: THIRD-PARTY-NOTICES.html ($(du -h "$notices" | cut -f1))"
 
 plutil -lint "$app/Contents/Info.plist" >/dev/null || fail "Info.plist ungültig"
 plist() { /usr/libexec/PlistBuddy -c "Print :$1" "$app/Contents/Info.plist"; }

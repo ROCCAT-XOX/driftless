@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Builds target/package/Driftless.app and target/package/Driftless-<version>-macos-arm64.dmg.
+# Builds target/package/Driftless.app and target/package/Driftless-<version>-macos-arm64.dmg,
+# and the licence notices target/package/THIRD-PARTY-NOTICES.html (in the bundle too), for which
+# cargo-about is needed (cargo install cargo-about --locked --features cli).
 #
 #   packaging/macos/build-dmg.sh [--ohne-bauen]
 #
@@ -47,6 +49,12 @@ if [ "$MACOSX_DEPLOYMENT_TARGET" != "$floor" ]; then
     exit 1
 fi
 
+# Before the build, so that a missing cargo-about does not wait for it.
+if ! command -v cargo-about >/dev/null; then
+    echo "cargo-about fehlt (für die Lizenzen Dritter): cargo install cargo-about --locked --features cli" >&2
+    exit 1
+fi
+
 if [ "$build" = 1 ]; then
     cargo build --release --locked -p driftless-app -p driftless-cli
 fi
@@ -61,13 +69,24 @@ package="target/package"
 app="$package/Driftless.app"
 dmg="$package/Driftless-$version-macos-arm64.dmg"
 staging="$package/dmg"
-rm -rf "$app" "$staging" "$dmg"
+# The licence notices of the third-party parts (packaging/about.toml): in the bundle, and for the
+# release next to the image.
+notices="$package/THIRD-PARTY-NOTICES.html"
+rm -rf "$app" "$staging" "$dmg" "$notices"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+
+cargo about generate --workspace --locked --fail -c packaging/about.toml -o "$notices" \
+    packaging/about.hbs
+if [ ! -s "$notices" ]; then
+    echo "$notices fehlt oder ist leer." >&2
+    exit 1
+fi
 
 sed "s/@VERSION@/$version/g" packaging/macos/Info.plist.in > "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist" >/dev/null
 cp target/release/driftless-app target/release/driftless "$app/Contents/MacOS/"
 cp assets/icon/driftless.icns "$app/Contents/Resources/driftless.icns"
+cp "$notices" "$app/Contents/Resources/THIRD-PARTY-NOTICES.html"
 
 # Ad-hoc signature: the command line first, then the bundle with its main program.
 codesign --force --sign - "$app/Contents/MacOS/driftless"

@@ -104,13 +104,25 @@ Ok "stille Installation nach $dir"
 
 # 2. The files, both programs and the Start menu entry.
 $expected = 'driftless-app.exe', 'driftless.exe', 'driftless.ico', 'LICENSE-APACHE',
-    'LICENSE-MIT', 'unins000.exe'
+    'LICENSE-MIT', 'THIRD-PARTY-NOTICES.html', 'unins000.exe'
 foreach ($name in $expected) {
     if (-not (Test-Path -LiteralPath (Join-Path $dir $name) -PathType Leaf)) {
         Fail "$name fehlt in $dir"
     }
 }
 Ok "Dateien: $($expected -join ', ')"
+
+# The licence notices, with the texts of the embedded fonts: they are missing if the
+# clarification of epaint_default_fonts in packaging\about.toml no longer fits.
+$notices = Join-Path $dir 'THIRD-PARTY-NOTICES.html'
+$noticesSize = (Get-Item -LiteralPath $notices).Length
+if ($noticesSize -eq 0) { Fail "$notices ist leer" }
+$noticesText = [IO.File]::ReadAllText($notices)
+foreach ($text in 'BITSTREAM VERA LICENSE', 'SIL OPEN FONT LICENSE Version 1.1',
+    'UBUNTU FONT LICENCE Version 1.0', 'Copyright (c) 2020 Phosphor Icons') {
+    if (-not $noticesText.Contains($text)) { Fail "THIRD-PARTY-NOTICES.html enthält nicht: $text" }
+}
+Ok "Lizenzen Dritter: THIRD-PARTY-NOTICES.html ($([math]::Round($noticesSize / 1KB)) KB)"
 
 $cli = Join-Path $dir 'driftless.exe'
 $app = Join-Path $dir 'driftless-app.exe'

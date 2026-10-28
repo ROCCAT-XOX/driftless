@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<!--
+  Template of THIRD-PARTY-NOTICES.html for cargo-about (configuration: packaging/about.toml).
+  The workspace's own crates (no `source`) are left out of the lists. The fonts of egui and the
+  icon font come with their copyright lines from the fonts themselves (name table); their
+  licence texts follow below with the crates epaint_default_fonts and egui-phosphor, except the
+  one of Phosphor, which that crate does not ship.
+-->
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Driftless – Lizenzen Dritter</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; line-height: 1.45; margin: 0; padding: 0 16px; }
+  main { max-width: 880px; margin: 0 auto; padding: 24px 0 48px; }
+  h2 { margin-top: 2em; padding-bottom: 0.2em; border-bottom: 1px solid rgba(128, 128, 128, 0.4); }
+  h3 { margin: 1.6em 0 0.3em; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; vertical-align: top; padding: 4px 8px; border-bottom: 1px solid rgba(128, 128, 128, 0.3); }
+  ul.crates { margin: 0.3em 0; padding-left: 1.2em; }
+  .who { opacity: 0.7; }
+  pre { white-space: pre-wrap; font-size: 0.85em; margin: 0.6em 0; padding: 8px 12px; max-height: 24em; overflow: auto;
+        border-left: 3px solid rgba(128, 128, 128, 0.5); }
+</style>
+</head>
+<body>
+<main>
+<h1>Driftless – Lizenzen Dritter</h1>
+<p>Driftless enthält Programmteile anderer Autoren: Rust-Bibliotheken und Schriften. Sie stehen unter
+den Lizenzen, deren Texte hier folgen; unter jeder Überschrift steht, welche Bibliotheken diesen Text
+verwenden.</p>
+<p>Driftless selbst steht nach Wahl unter der Apache-Lizenz 2.0 oder der MIT-Lizenz (Apache-2.0 OR MIT),
+ebenso das Programmsymbol, das zu Driftless gehört.</p>
+
+<h2 id="schriften">Schriften und Symbole</h2>
+<p>Diese Schriften sind in das Programm eingebettet:</p>
+<table>
+<tr><th>Schrift</th><th>Rechte</th><th>Lizenz</th></tr>
+<tr><td>Hack (aus epaint_default_fonts)</td>
+    <td>Copyright (c) 2018 Source Foundry Authors; Bitstream Vera Sans Mono: Copyright (c) 2003 by Bitstream, Inc.</td>
+    <td>MIT und Bitstream-Vera-Lizenz (Text unter MIT, epaint_default_fonts)</td></tr>
+<tr><td>Noto Emoji (aus epaint_default_fonts)</td>
+    <td>Copyright 2013 Google Inc.</td>
+    <td>SIL Open Font License 1.1</td></tr>
+<tr><td>Ubuntu Light (aus epaint_default_fonts)</td>
+    <td>Copyright 2011 Canonical Ltd.</td>
+    <td>Ubuntu Font Licence 1.0</td></tr>
+<tr><td>emoji-icon-font (aus epaint_default_fonts)</td>
+    <td>Copyright (c) 2014 John Slegers</td>
+    <td>MIT</td></tr>
+<tr><td>Phosphor Icons, die Symbole der Oberfläche (aus egui-phosphor)</td>
+    <td>Copyright (c) 2020 Phosphor Icons</td>
+    <td>MIT, Text hier:</td></tr>
+</table>
+<pre>MIT License
+
+Copyright (c) 2020 Phosphor Icons
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.</pre>
+
+<h2 id="uebersicht">Lizenzen</h2>
+<ul>
+{{#each overview}}
+<li><a href="#{{id}}">{{name}}</a></li>
+{{/each}}
+</ul>
+
+<h2 id="texte">Lizenztexte</h2>
+{{#each licenses}}
+<section>
+<h3{{#if first_of_kind}} id="{{id}}"{{/if}}>{{name}}</h3>
+<ul class="crates">
+{{#each used_by}}
+{{#if crate.source}}
+<li><a href="https://crates.io/crates/{{crate.name}}/{{crate.version}}">{{crate.name}} {{crate.version}}</a>{{#if crate.authors}} <span class="who">({{#each crate.authors}}{{#unless @first}}, {{/unless}}{{this}}{{/each}})</span>{{/if}}</li>
+{{/if}}
+{{/each}}
+</ul>
+<pre>{{text}}</pre>
+</section>
+{{/each}}
+</main>
+</body>
+</html>

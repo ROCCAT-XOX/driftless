@@ -1,4 +1,6 @@
-﻿# Builds target\package\Driftless-<version>-setup.exe (Windows x64, Inno Setup 6).
+﻿# Builds target\package\Driftless-<version>-setup.exe (Windows x64, Inno Setup 6), and the
+# licence notices target\package\THIRD-PARTY-NOTICES.html (installed next to the programs), for
+# which cargo-about is needed (cargo install cargo-about --locked --features cli).
 #
 #   packaging\windows\build-setup.ps1 [-OhneBauen]
 #
@@ -30,6 +32,11 @@ try {
         Write-Error 'Keine Version in [workspace.package] von Cargo.toml gefunden.'
     }
 
+    # Before the build, so that a missing cargo-about does not wait for it.
+    if (-not (Get-Command 'cargo-about' -ErrorAction SilentlyContinue)) {
+        Write-Error 'cargo-about fehlt (für die Lizenzen Dritter): cargo install cargo-about --locked --features cli'
+    }
+
     if (-not $OhneBauen) {
         & cargo build --release --locked -p driftless-app -p driftless-cli
         if ($LASTEXITCODE -ne 0) { Write-Error "cargo build ist fehlgeschlagen (Exit $LASTEXITCODE)." }
@@ -38,6 +45,20 @@ try {
         if (-not (Test-Path -LiteralPath (Join-Path $root "target\release\$bin"))) {
             Write-Error "target\release\$bin fehlt (ohne -OhneBauen bauen)."
         }
+    }
+
+    $package = Join-Path $root 'target\package'
+    New-Item -ItemType Directory -Force -Path $package | Out-Null
+    # The licence notices of the third-party parts (packaging\about.toml), for the setup (the
+    # name is fixed in driftless.iss) and for the release next to it. cargo-about writes the
+    # file itself (-o): its output redirected by PowerShell would change the encoding.
+    $notices = Join-Path $package 'THIRD-PARTY-NOTICES.html'
+    if (Test-Path -LiteralPath $notices) { Remove-Item -LiteralPath $notices -Force }
+    & cargo about generate --workspace --locked --fail -c (Join-Path $root 'packaging\about.toml') `
+        -o $notices (Join-Path $root 'packaging\about.hbs')
+    if ($LASTEXITCODE -ne 0) { Write-Error "cargo about ist fehlgeschlagen (Exit $LASTEXITCODE)." }
+    if (-not (Test-Path -LiteralPath $notices) -or (Get-Item -LiteralPath $notices).Length -eq 0) {
+        Write-Error "$notices fehlt oder ist leer."
     }
 
     # ISCC.exe: on the PATH, else the usual places of Inno Setup 6.
@@ -54,9 +75,7 @@ try {
         Write-Error 'ISCC.exe (Inno Setup 6) nicht gefunden: installieren, z. B. "choco install innosetup".'
     }
 
-    $package = Join-Path $root 'target\package'
     $setup = Join-Path $package "Driftless-$version-setup.exe"
-    New-Item -ItemType Directory -Force -Path $package | Out-Null
     if (Test-Path -LiteralPath $setup) { Remove-Item -LiteralPath $setup -Force }
 
     & $iscc "/DAppVersion=$version" (Join-Path $root 'packaging\windows\driftless.iss')

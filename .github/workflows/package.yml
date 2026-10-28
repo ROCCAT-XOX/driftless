@@ -1,7 +1,8 @@
 name: Package
 
-# The installers of both platforms, checked and kept as artifacts of every pull request
-# (14 days); release.yml calls this workflow for a tag `v*`.
+# The installers of both platforms and the licence notices of the third-party parts, checked
+# and kept as artifacts of every pull request (14 days); release.yml calls this workflow for a
+# tag `v*`.
 on:
   pull_request:
   workflow_call:
@@ -28,6 +29,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # For THIRD-PARTY-NOTICES.html (packaging/about.toml); the same version in both jobs.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
       - run: packaging/macos/build-dmg.sh
       - run: packaging/macos/check-dmg.sh target/package/Driftless-*-macos-arm64.dmg
       - uses: actions/upload-artifact@v7
@@ -38,6 +43,14 @@ jobs:
           retention-days: 14
           # The disk image is compressed already.
           compression-level: 0
+      # As in the bundle and the setup (both generated from the same Cargo.lock): for the
+      # release next to the installers.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: driftless-notices
+          path: target/package/THIRD-PARTY-NOTICES.html
+          if-no-files-found: error
+          retention-days: 14
 
   windows:
     name: windows
@@ -49,6 +62,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # For THIRD-PARTY-NOTICES.html (packaging/about.toml); the same version in both jobs.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
       # Inno Setup 6 comes with the runner image; install it only if an image lacks it.
       - name: Inno Setup
         run: |
