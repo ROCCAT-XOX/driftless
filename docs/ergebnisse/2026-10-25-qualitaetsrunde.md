@@ -66,6 +66,10 @@ Punkte im Umkreis von 2 cm, Median / 95 %:
 SLAM und Karte ändern sich durch A und B nicht. Der Versatz zwischen Durchgängen (Ziel Z3) bleibt
 Thema von Schritt C.
 
+Die weiteren Schritte: [C und D](2026-10-26-qualitaet-c-d.md) (Durchgänge und Büro-Laufbahn, ohne
+Änderung), [E](2026-10-26-qualitaet-e.md) (Glätten), [F](2026-10-26-qualitaet-f.md) (Texturkarten und
+Nähte).
+
 ## Entscheidung
 
 Zweistufige Oberfläche mit Filter ist die Vorgabe für alle Feinheiten. Die Hinweise zu 1 cm im Programm
