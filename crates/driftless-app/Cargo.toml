@@ -52,7 +52,8 @@ rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
-# „Löschen …“ and „Aufräumen“ move folders to the system's trash, never delete them for good.
+# „Löschen …“ and „Aufräumen“ move folders and files to the system's trash; nothing is deleted for
+# good without the user's yes (Windows asks first for a folder too large for its recycle bin).
 trash = "5.2"
 
 # The free space of a drive (`statvfs`, `disk`).

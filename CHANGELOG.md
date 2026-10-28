@@ -152,7 +152,7 @@ Die erste Version für echte Aufträge. Wie man sie installiert und benutzt, ste
 - **Mac ohne echte Scans:** Mit dieser Version wurden echte Scans noch nicht auf einem Mac gerechnet, nur
   auf einem Linux-Rechner mit RTX 5080.
 - **1 cm braucht viel Speicher:** Eine Oberfläche mit 1 cm braucht bei großen Aufnahmen bis 9 GB
-  Arbeitsspeicher (Büro: 8,2 GB, 21 Minuten).
+  Arbeitsspeicher (Büro: 7,7 GB, 20 Minuten).
 - **Verfehlte Qualitätsziele:**
   - Bei 1 cm bleiben in großen und in dunklen Räumen Stellen der Oberfläche offen: von oben gesehen im
     Büro 31 % (Ziel höchstens 30 %), in einem dunklen Raum 9,7 % (Ziel höchstens 6 %). 2 cm schließt

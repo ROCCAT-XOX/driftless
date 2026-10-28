@@ -310,7 +310,7 @@ slim status bar:
   a job still writes is marked `.in-arbeit` (touched every 10 s) and left alone, as is anything written
   to in the last two minutes. The tree is read again when the window gets the focus back (a scan drive
   attached again, results of another window). The precision Schnell · Genau · Maximal sets only the voxel
-  size of the map (0.02 / 0.01 / 0.005 m; Maximal needs over 4 GB of memory on large scans, another voxel
+  size of the map (0.02 / 0.01 / 0.005 m; Maximal needs almost 4 GB of RAM on large scans, another voxel
   shows „Eigene“). „Alle rechnen“ queues every new or stale scan and computes them one after the other;
   with a scan selected, „Rechnen“ computes only that one. A map is never computed anew in its own folder:
   one that is current is taken as it is („Karte ist aktuell“), any other map – also a single step under
