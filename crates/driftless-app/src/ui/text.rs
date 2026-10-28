@@ -836,9 +836,10 @@ pub fn remove_scan_question(
 }
 
 /// The question before „Löschen …“: „Karte 001 löschen? Der Ordner (640 MB) wandert in den
-/// Papierkorb.“ (without a size while it is not measured).
+/// Papierkorb.“ (without a size while it is not measured); on Windows with
+/// [`DELETE_TOO_BIG_WINDOWS`].
 pub fn delete_question(label: &str, bytes: Option<u64>) -> String {
-    match bytes {
+    let question = match bytes {
         Some(bytes) => format!(
             "„{label}“ löschen? Der Ordner ({}) wandert in den Papierkorb und lässt sich von dort \
              zurückholen.",
@@ -848,8 +849,19 @@ pub fn delete_question(label: &str, bytes: Option<u64>) -> String {
             "„{label}“ löschen? Der Ordner wandert in den Papierkorb und lässt sich von dort \
              zurückholen."
         ),
+    };
+    if cfg!(windows) {
+        format!("{question} {DELETE_TOO_BIG_WINDOWS}")
+    } else {
+        question
     }
 }
+
+/// What Windows does with a folder its recycle bin cannot take (larger than the bin may get,
+/// or a drive whose bin is switched off): it asks whether to delete it for good
+/// (`FOF_WANTNUKEWARNING` of the `trash` crate); „Nein“ keeps it.
+pub const DELETE_TOO_BIG_WINDOWS: &str = "Ist er zu groß für den Papierkorb, fragt Windows, ob \
+     er endgültig gelöscht werden soll – dann „Nein“ wählen: es wird nichts gelöscht.";
 
 /// What lies in a folder to delete: „Darin: Karte 001, Oberfläche 001“.
 pub fn delete_contains(list: &[String]) -> String {
@@ -881,6 +893,15 @@ pub fn delete_shown(what: &str) -> String {
 /// Why a folder cannot go to the trash now: a step works on it, or it waits in the queue.
 pub fn delete_computing(label: &str) -> String {
     format!("Wird gerade gerechnet ({label}) – nach dem Schritt oder „Abbrechen“")
+}
+
+/// Why a folder cannot go to the trash now: a job of another window or program writes into it
+/// or into a folder in it (its mark names `holder`).
+pub fn delete_busy(holder: &str) -> String {
+    format!(
+        "Wird gerade in einem anderen Fenster oder Programm gerechnet ({holder}) – erst danach \
+         löschen"
+    )
 }
 
 /// A folder the trash cannot take (a network share, a removable drive on Windows).

@@ -15,7 +15,8 @@ correctable by hand. Runs natively on **macOS (Apple Silicon)** and **Windows**.
 > (correctable by hand: mark loops, switch off wrong automatic ones), a cleaned and coloured point cloud
 > and a photo-like textured surface, merge several scans of one place into a model, and export to open
 > formats (LAS/LAZ, E57, PLY, PCD, glb, OBJ, TUM, CSV). Projects can be renamed, moved, copied and
-> cleaned up; nothing is deleted for good. Installers for macOS and Windows: see [Install](#install).
+> cleaned up; nothing is deleted for good without asking (Windows asks before it deletes a folder too
+> large for its Recycle Bin). Installers for macOS and Windows: see [Install](#install).
 > Results on real scans (German): [export and installers](docs/ergebnisse/2026-10-27-baustein-3.md),
 > [merging scans](docs/ergebnisse/2026-10-27-baustein-1.md),
 > [quality round C and D](docs/ergebnisse/2026-10-26-qualitaet-c-d.md),
@@ -286,10 +287,13 @@ slim status bar:
   taken: the same LiDAR bags by name and size, recorded at the times of its runs) and „Aus Projekt
   entfernen“ (only the entry: the raw data and the results under `scans/<id>` stay). A right click on a
   run, map, surface or model: „Löschen …“ asks with the size, what lies in the folder and which models
-  use it, and moves the folder to the system's trash – never deleted for good; on Windows a network or
-  removable drive, which has no trash, is refused. It is locked while a step works on it; while the
-  view shows it, the question offers „Aus der Ansicht nehmen“ first. A run made with the command line
-  and added by hand is only taken out of the project. What a job cut off by a crash, a force quit or
+  use it, and moves the folder to the system's trash – never deleted for good without asking: on
+  Windows a folder too large for the Recycle Bin makes Windows ask whether to delete it permanently
+  (choose „Nein“, then nothing is deleted; the same for „Aufräumen“), and a network or removable drive,
+  which has no trash, is refused. It is locked while a step works on it, also one of another window or
+  program (its `.in-arbeit` in the folder or below it, looked at again right before the folder goes);
+  while the view shows it, the question offers „Aus der Ansicht nehmen“ first. A run made with the
+  command line and added by hand is only taken out of the project. What a job cut off by a crash, a force quit or
   a power cut left behind – a run, map, surface or model folder without its report, a stale
   `<name>.tmp` – is listed as „unvollständig“ (not as a run or map that waits) and „Aufräumen“ moves it
   to the trash; a folder a job still writes is marked `.in-arbeit` (touched every 10 s) and left

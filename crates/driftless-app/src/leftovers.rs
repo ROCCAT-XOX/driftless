@@ -244,17 +244,41 @@ fn busy(dir: &Path) -> bool {
 /// names it („Prozess 1234 · Benutzer anna · Rechner Werkstatt-PC“), else „unbekannt“. Walks
 /// the folder: call it off the UI thread.
 pub fn busy_below(dir: &Path) -> Option<String> {
+    let mut found = Vec::new();
+    collect_busy(dir, true, &mut found);
+    found.pop().map(|(_, holder)| holder)
+}
+
+/// The folders below `scans/` and `modelle/` of the project in `dir` that a running job marks
+/// busy (this window's, another window's or program's), with who holds them ([`busy_below`]):
+/// „Löschen …“ waits for them. Walks those folders: call it off the UI thread.
+pub fn busy_folders(dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut found = Vec::new();
+    for top in [dir.join(SCANS_DIR), dir.join(MODELS_DIR)] {
+        collect_busy(&top, false, &mut found);
+    }
+    found
+}
+
+/// The busy folders in and below `dir` into `found` (only the first if `first`).
+fn collect_busy(dir: &Path, first: bool, found: &mut Vec<(PathBuf, String)>) {
     if busy(dir) {
         let holder = fs::read_to_string(dir.join(BUSY_FILE)).unwrap_or_default();
-        let holder = holder.trim();
-        return Some(if holder.is_empty() {
-            "unbekannt".to_string()
-        } else {
-            holder.to_string()
-        });
+        let holder = match holder.trim() {
+            "" => "unbekannt".to_string(),
+            h => h.to_string(),
+        };
+        found.push((dir.to_path_buf(), holder));
+        if first {
+            return;
+        }
     }
-    let entries = fs::read_dir(dir).into_iter().flatten().flatten();
-    entries
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .find_map(|e| busy_below(&e.path()))
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if first && !found.is_empty() {
+            return;
+        }
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            collect_busy(&e.path(), first, found);
+        }
+    }
 }

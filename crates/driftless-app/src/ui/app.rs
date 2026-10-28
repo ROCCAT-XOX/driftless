@@ -1844,6 +1844,10 @@ impl DriftlessApp {
             HelperTask::Trash { dir, .. } => {
                 let (dir, trash) = (dir.clone(), self.trash);
                 self.helper.start(text::TRASH_JOB, move |_| {
+                    // a job of another window or program that started meanwhile keeps it
+                    if let Some(holder) = crate::leftovers::busy_below(&dir) {
+                        return Err(text::delete_busy(&holder).into());
+                    }
                     trash(&dir)?;
                     Ok(JobOutput::Done)
                 })

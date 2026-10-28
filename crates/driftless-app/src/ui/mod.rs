@@ -444,6 +444,9 @@ pub struct Tree {
     pub point_pairs_error: Option<String>,
     /// What jobs cut off left behind ([`crate::leftovers`]).
     pub leftovers: Vec<Leftover>,
+    /// The folders a running job marks busy, with who holds them
+    /// ([`crate::leftovers::busy_folders`]).
+    pub busy: Vec<(PathBuf, String)>,
 }
 
 /// Reads the tree of `project` from disk: every scan folder, run, map, surface and model, and
@@ -490,6 +493,7 @@ pub fn read_tree(project: &Project) -> Tree {
         point_pairs,
         point_pairs_error,
         leftovers: crate::leftovers::find(&project.dir, &ids),
+        busy: crate::leftovers::busy_folders(&project.dir),
     }
 }
 
@@ -629,6 +633,9 @@ pub struct AppState {
     pub ask: Option<Ask>,
     /// What jobs cut off left behind, as the last read of the tree found it.
     pub leftovers: Vec<Leftover>,
+    /// The folders a running job marked busy when the tree was last read (this window's,
+    /// another window's or program's), with who holds them: „Löschen …“ waits for them.
+    pub busy: Vec<(PathBuf, String)>,
     /// How long a leftover must lie untouched before it is offered; `None`:
     /// [`crate::leftovers::QUIET`] (tests: zero).
     pub leftover_quiet: Option<std::time::Duration>,
@@ -696,6 +703,7 @@ impl AppState {
         self.point_pairs = tree.point_pairs;
         self.point_pairs_error = tree.point_pairs_error;
         self.leftovers = tree.leftovers;
+        self.busy = tree.busy;
         // „Von Hand ausrichten“ of a model that is gone ends
         let gone = self
             .pairs
@@ -976,7 +984,9 @@ impl AppState {
     }
 
     /// Whether a step works on the folder `dir` (or on a model that uses it, or on the folder
-    /// it lies in), or will (the queue); with the reason.
+    /// it lies in), or will (the queue); or a job – this window's, another window's or
+    /// program's – marked it or a folder in it busy when the tree was read ([`AppState::busy`];
+    /// the window looks again right before the folder goes). With the reason.
     pub fn delete_computing(&self, dir: &Path) -> Option<String> {
         let touched = self.touched_by(dir);
         let hit = |p: &Path| dir.starts_with(p) || touched.iter().any(|t| p.starts_with(t));
@@ -993,7 +1003,13 @@ impl AppState {
                 .scan_at(path)
                 .is_some_and(|s| s.runs.iter().any(|r| hit(&r.dir))),
         });
-        queued.then(|| text::delete_computing(text::COMPUTE_ALL))
+        if queued {
+            return Some(text::delete_computing(text::COMPUTE_ALL));
+        }
+        self.busy
+            .iter()
+            .find(|(folder, _)| folder.starts_with(dir))
+            .map(|(_, holder)| text::delete_busy(holder))
     }
 
     /// The folders a step reads or writes (that must not go to the trash while it runs): the

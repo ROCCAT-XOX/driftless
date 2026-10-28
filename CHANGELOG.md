@@ -76,7 +76,9 @@ Die erste Version für echte Aufträge. Wie man sie installiert und benutzt, ste
 - Projekte mit den Schritten „Daten“, „Bilder“ und „Planung“; eine 3D-Ansicht, auf dem Mac flüssig bis
   etwa 50 Mio. Punkte; die Werkzeuge „Drehen“, „Verschieben“, „Punkt wählen“, „Messen“ und „Schnitt“.
 - Projekte verwalten: Scans „Umbenennen …“, „Ordner neu zuordnen …“ und „Aus Projekt entfernen“; Läufe,
-  Karten, Oberflächen und Modelle mit „Löschen …“ in den Papierkorb, nie endgültig.
+  Karten, Oberflächen und Modelle mit „Löschen …“ in den Papierkorb, nie ungefragt endgültig: Ist ein
+  Ordner unter Windows zu groß für den Papierkorb, fragt Windows, ob er endgültig gelöscht werden soll –
+  dann „Nein“ wählen. Was gerade rechnet, auch in einem anderen Fenster, lässt „Löschen …“ in Ruhe.
 - Die Größe jedes Ergebnisses und der freie Platz; eine Warnung unter 10 GB frei.
 - Eine Warnung bei Projekten in iCloud Drive, OneDrive und anderen Cloud-Ordnern; die Dialoge beginnen im
   Ordner „Driftless Projekte“.

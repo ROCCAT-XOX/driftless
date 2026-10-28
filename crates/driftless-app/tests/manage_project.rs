@@ -6,6 +6,7 @@
 //! folder to the trash, never deleting it for good. The trash of these tests is a folder of
 //! their own.
 
+use driftless_app::leftovers::{BUSY_FILE, BUSY_STALE};
 use driftless_app::project::{canonical, ModelInfo, Project};
 use driftless_app::trash::Trash;
 use driftless_app::ui::{text, Action, CloudSummary, DriftlessApp, Queued, Selection, UiMessage};
@@ -17,7 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 type H = Harness<'static, DriftlessApp>;
 
@@ -427,6 +428,48 @@ fn a_refused_trash_deletes_nothing() {
         e[0].starts_with("Kein Papierkorb für diesen Ordner (Netzlaufwerk)"),
         "{e:?}"
     );
+}
+
+/// Another window (or program) computes in a folder of the project – its fresh busy mark in
+/// the surface folder of the map (M3 of the final review): „Löschen …“ of the map, and of the
+/// run it lies in, is refused with the reason. A mark made after the tree was read is found
+/// right before the folder would go; once the tree is read again, the menu entry is locked.
+/// When the mark is no longer touched (that job was cut off), the folder can go.
+#[test]
+fn delete_waits_for_another_window() {
+    let dir = tmp("verwalten-anderes-fenster");
+    let (mut h, run_dir, map) = project_with_surface(&dir, test_trash);
+    run(&mut h, Action::Unshow(map.clone()));
+    let mark = map.join("oberflaeche-001").join(BUSY_FILE);
+    let holder = "Prozess 999999 · Benutzer kollege · Rechner Werkstatt";
+    fs::write(&mark, holder).unwrap();
+    // the window does not know the mark yet: the folder stays all the same
+    assert_eq!(h.state().state().delete_blocked(&map), None);
+    run(&mut h, Action::Delete(map.clone()));
+    assert!(map.join("map.json").is_file());
+    assert_eq!(errors(h.state()), [text::delete_busy(holder)]);
+    // read again (the focus back in the window): locked in the menu, with the reason
+    h.state_mut().state_mut().messages.clear();
+    run(&mut h, Action::OpenProject(dir.join("projekt")));
+    let busy = Some(text::delete_busy(holder));
+    assert_eq!(h.state().state().delete_blocked(&map), busy);
+    assert_eq!(h.state().state().delete_blocked(&run_dir), busy);
+    run(&mut h, Action::Select(Selection::Scan("halle".into())));
+    let label = entry(&h, &map, "Karte 001");
+    assert!(!menu_enabled(&mut h, &label, text::DELETE));
+    // its job was cut off: the mark is no longer touched, and the folder can go
+    fs::File::options()
+        .write(true)
+        .open(&mark)
+        .unwrap()
+        .set_modified(SystemTime::now() - BUSY_STALE * 2)
+        .unwrap();
+    run(&mut h, Action::OpenProject(dir.join("projekt")));
+    assert_eq!(h.state().state().delete_blocked(&map), None);
+    run(&mut h, Action::Delete(map.clone()));
+    assert!(!map.exists());
+    assert!(in_trash(&dir, "karte-001", "map.json"));
+    assert_eq!(errors(h.state()), Vec::<String>::new());
 }
 
 /// A model of the map `map` of the run `run`, as the tree reads it (only what the questions

@@ -1,7 +1,12 @@
 //! The system's trash for „Löschen …“ and „Aufräumen“: a folder or file goes there and can be
-//! taken back; nothing is ever deleted for good. Where the system has no trash (on Windows a
-//! network share or a removable drive, where deleting would be for good), nothing is deleted
-//! and the window says why.
+//! taken back; nothing is deleted for good without the user's yes. Where the system has no
+//! trash (on Windows a network share or a removable drive, where deleting would be for good),
+//! nothing is deleted and the window says why. On Windows a folder larger than the recycle bin
+//! may get (or on a drive whose bin is switched off) cannot be recycled: the `trash` crate
+//! (5.2.9) deletes through `IFileOperation` with `FOF_NO_UI | FOF_ALLOWUNDO |
+//! FOF_WANTNUKEWARNING`, and with `FOF_WANTNUKEWARNING` Windows asks before it destroys an item
+//! instead of recycling it, despite `FOF_NO_UI` ([`crate::ui::text::DELETE_TOO_BIG_WINDOWS`]).
+//! „Nein“ aborts it: nothing is deleted, the crate reports the abort and the window says so.
 
 use crate::ui::text;
 use std::path::Path;

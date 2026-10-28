@@ -284,11 +284,14 @@ Projekts und sind nicht mitgewandert, zeigt die Kachel des Scans „fehlt“: da
 
 **Löschen.** Rechtsklick auf einen Lauf, eine Karte, eine Oberfläche oder ein Modell → „Löschen …“. Die
 Frage nennt die Größe, was darin liegt und welche Modelle davon abhängen. „In den Papierkorb“ legt den
-Ordner in den Papierkorb des Systems; von dort lässt er sich zurückholen. Endgültig löscht Driftless
-nie. Unter Windows haben Netzlaufwerke und USB-Sticks keinen Papierkorb: Dort lehnt Driftless ab.
-Während ein Schritt daran rechnet, ist „Löschen …“ gesperrt. Zeigt die Ansicht den Ordner gerade, erst
-„Aus der Ansicht nehmen“. Einen Lauf, der mit der Kommandozeile gerechnet und mit „Lauf hinzufügen …“
-geholt wurde, nimmt nur „Aus Projekt entfernen“ heraus; sein Ordner gehört dem Nutzer.
+Ordner in den Papierkorb des Systems; von dort lässt er sich zurückholen. Ungefragt endgültig löscht
+Driftless nie. Unter Windows haben Netzlaufwerke und USB-Sticks keinen Papierkorb: Dort lehnt Driftless
+ab. Ist ein Ordner zu groß für den Papierkorb von Windows, fragt Windows, ob er endgültig gelöscht
+werden soll: dann „Nein“ wählen, es wird nichts gelöscht. Das gilt auch für „Aufräumen“. Während ein
+Schritt daran rechnet, auch in einem anderen Fenster, ist „Löschen …“ gesperrt. Zeigt die Ansicht den
+Ordner gerade, erst „Aus der Ansicht nehmen“. Einen Lauf, der mit der Kommandozeile gerechnet und mit
+„Lauf hinzufügen …“ geholt wurde, nimmt nur „Aus Projekt entfernen“ heraus; sein Ordner gehört dem
+Nutzer.
 
 **Größe und freier Platz.** Unter dem Projektnamen stehen die Größe des Projekts und der freie Platz
 auf dem Laufwerk; jeder Lauf, jede Karte, Oberfläche und jedes Modell zeigt seine Größe.
