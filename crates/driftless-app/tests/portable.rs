@@ -1,6 +1,7 @@
 //! Projects that are renamed, moved or copied: the model still fits, its surface and „Von
 //! Hand ausrichten“ still find the maps, a copy works on its own maps; a model written before
-//! the relative paths is taken onto the project folder it lies in now.
+//! the relative paths is taken onto the project folder it lies in now. And the view draws no
+//! run over the model.
 //!
 //! The project has two synthetic scans of one furnished room outside its folder
 //! (`<dir>/Rohdaten/a`, `b`), a run and a map of each in the project, and a model of both.
@@ -10,7 +11,7 @@ use driftless_app::project::{
     canonical, model_status, run_map_job, run_merge_job, run_model_surface_job, run_slam_job,
     MergePick, ModelInfo, Project, SlamJob, SurfaceSettings,
 };
-use driftless_app::ui::{text, Action, DriftlessApp, UiMessage};
+use driftless_app::ui::{text, Action, DriftlessApp, Selection, UiMessage};
 use driftless_gpu::GpuPref;
 use driftless_io::progress::Progress;
 use driftless_io::testdir::{SharedDir, TestDir};
@@ -166,6 +167,48 @@ fn settle(app: &mut DriftlessApp) {
         assert!(Instant::now() < deadline, "work did not end");
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// A model and its surface have no run of their own: the view draws none over them, not even
+/// that of the scan cloud shown before; that one comes back with its cloud.
+#[test]
+fn a_model_draws_no_run() {
+    let dir = copy("portabel-modell-ohne-lauf");
+    let project = dir.join(PROJECT);
+    let (_, model) = the_model(&project);
+    surface_of(&model);
+    let mut app = DriftlessApp::new(Arc::new(|| {}));
+    app.apply(Action::OpenProject(project));
+    settle(&mut app);
+    let run = app.state().scans[0].runs[0].clone();
+    let cloud = run.maps[0].clouds[0].clone();
+    let drawn = |app: &DriftlessApp| app.overlay().map(|o| o.run.clone());
+    app.apply(Action::Select(Selection::Cloud(cloud.clone())));
+    settle(&mut app);
+    assert_eq!(drawn(&app), Some(run.dir.clone()));
+    let model = app.state().models[0].clone();
+    for selection in [
+        Selection::Surface(model.surfaces[0].dir.clone()),
+        Selection::Model(model.dir.clone()),
+    ] {
+        app.apply(Action::Select(selection.clone()));
+        settle(&mut app);
+        assert_eq!(drawn(&app), None, "{selection:?}");
+        assert_eq!(app.state().correct.run, None, "{selection:?}");
+    }
+    app.apply(Action::Select(Selection::Cloud(cloud)));
+    settle(&mut app);
+    assert_eq!(drawn(&app), Some(run.dir));
+    let errors: Vec<&String> = app
+        .state()
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            UiMessage::Error(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
 }
 
 /// The renamed project: its model still fits, its surface and „Von Hand ausrichten“ find the

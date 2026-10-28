@@ -673,13 +673,14 @@ impl DriftlessApp {
     }
 
     /// Follows the selection: the run of the selection, else of the cloud, is drawn and its
-    /// corrections are shown; reading them is queued for the helper.
+    /// corrections are shown; reading them is queued for the helper. A model and its surfaces
+    /// have no run of their own: none is drawn over them, not even that of the cloud before.
     fn sync_run(&mut self) {
-        let wanted = self
-            .state
-            .selected_run()
-            .map(|(_, r)| r.dir.clone())
-            .or_else(|| self.cloud_run.clone());
+        let wanted = match self.state.selected_run() {
+            Some((_, r)) => Some(r.dir.clone()),
+            None if self.state.selected_model().is_some() => None,
+            None => self.cloud_run.clone(),
+        };
         if self.state.correct.for_run(wanted.as_deref()) {
             if self.overlay.take().is_some() {
                 self.overlay_version += 1;
