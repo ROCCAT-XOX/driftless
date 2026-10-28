@@ -1323,6 +1323,8 @@ pub fn run_map_job(
     let req = MapRequest {
         input,
         out_dir: dir.path().to_path_buf(),
+        // one cloud to look at; the rest comes from „Exportieren …“
+        all_files: false,
     };
     let report = run_map(&req, progress)?;
     Ok(MapDone {
@@ -1363,6 +1365,8 @@ fn surface_request(
         config: settings.config.clone(),
         texture: settings.texture,
         gpu,
+        // the glb; an OBJ comes from „Exportieren …“
+        obj: false,
     })
 }
 
@@ -1499,6 +1503,7 @@ pub fn run_merge_job(
         smooth: true,
         include_unsure,
         pairs,
+        ply: false,
     };
     run_merge(&req, progress)?;
     Ok(dir.keep())
@@ -1611,6 +1616,7 @@ fn model_surface_request(
         config: settings.config.clone(),
         texture: settings.texture,
         gpu,
+        obj: false,
     }
 }
 

@@ -40,14 +40,13 @@ fn surface_writes_files_and_refuses_a_missing_map() {
         .stdout(predicate::str::contains("Oberfläche:"))
         .stdout(predicate::str::contains("Laufzeit"));
     let dest = out.join("oberflaeche");
-    for f in [
-        "oberflaeche.glb",
-        "oberflaeche.obj",
-        "oberflaeche.mtl",
-        "oberflaeche.json",
-    ] {
+    for f in ["oberflaeche.glb", "oberflaeche.json"] {
         assert!(dest.join(f).is_file(), "{f} missing");
     }
+    assert!(
+        !dest.join("oberflaeche.obj").exists(),
+        "the OBJ only with --obj"
+    );
     let json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dest.join("oberflaeche.json")).unwrap()).unwrap();
     assert_eq!(json["settings"]["voxel"], 0.15);
@@ -70,6 +69,25 @@ fn surface_writes_files_and_refuses_a_missing_map() {
     .success()
     .stderr(predicate::str::contains("Warnung").not());
     assert!(other.join("oberflaeche.glb").is_file());
+
+    // `--obj`: the OBJ with its `.mtl` and pages beside the glb
+    let with_obj = dir.join("mit-obj");
+    run(
+        "surface",
+        &dir,
+        &out,
+        &["--voxel", "0.15", "--obj", "-o", with_obj.to_str().unwrap()],
+    )
+    .success();
+    for f in [
+        "oberflaeche.glb",
+        "oberflaeche.obj",
+        "oberflaeche.mtl",
+        "oberflaeche_seite_00.jpg",
+        "oberflaeche.json",
+    ] {
+        assert!(with_obj.join(f).is_file(), "{f} missing");
+    }
 }
 
 fn report(dir: &Path) -> serde_json::Value {
@@ -162,12 +180,14 @@ fn surface_falls_back_when_gpu_budget_exceeded() {
             "0.15",
             "--gpu",
             "aus",
+            "--obj",
             "-o",
             cpu.to_str().unwrap(),
         ],
     )
     .success();
-    // A budget of 1 kB: `auto` says why and looks on the CPU, with the same files.
+    // A budget of 1 kB: `auto` says why and looks on the CPU, with the same files (the OBJ
+    // and its pages too).
     let budget = |extra: &[&str]| {
         Command::cargo_bin("driftless")
             .unwrap()
@@ -176,7 +196,7 @@ fn surface_falls_back_when_gpu_budget_exceeded() {
             .arg(&dir)
             .arg("--slam")
             .arg(&out)
-            .args(["--voxel", "0.15", "-o", small.to_str().unwrap()])
+            .args(["--voxel", "0.15", "--obj", "-o", small.to_str().unwrap()])
             .args(extra)
             .assert()
     };

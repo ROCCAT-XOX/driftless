@@ -71,6 +71,7 @@ fn black_room_three_scans() {
         smooth: true,
         include_unsure: false,
         pairs: Vec::new(),
+        ply: false,
     };
     let report = run_merge(&req, &console()).unwrap();
     println!("{}", serde_json::to_string_pretty(&report.members).unwrap());

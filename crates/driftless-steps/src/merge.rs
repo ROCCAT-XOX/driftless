@@ -1,6 +1,7 @@
 //! Merging several scans into one model: `modell.las` (the scan of each point in
-//! `point_source_id`), `modell.ply` (the same with a property `scan`) and `modell.json`
-//! (where every scan sits in the model and how sure that is).
+//! `point_source_id`) and `modell.json` (where every scan sits in the model and how sure that
+//! is); with [`MergeRequest::ply`] (`driftless merge --ply`) also `modell.ply` (the points
+//! of `modell.las` with a property `scan`).
 //!
 //! The model frame is the world frame of the first member (the reference). Each member's map
 //! is its `clean.bin` (refused if missing or of another input), coloured from `color.las` of
@@ -105,7 +106,7 @@ pub struct MergeMember {
 pub struct MergeRequest {
     /// The scans; the first is the reference (its frame is the model frame).
     pub members: Vec<MergeMember>,
-    /// Where `modell.las`, `modell.ply` and `modell.json` go.
+    /// Where `modell.las`, `modell.json` and, with [`Self::ply`], `modell.ply` go.
     pub out_dir: PathBuf,
     pub align: AlignConfig,
     /// One point per cell of this size (m) in the model.
@@ -118,6 +119,8 @@ pub struct MergeRequest {
     /// ([`crate::pairs::PointPairs::resolved`]). An entry counts if it is switched on and
     /// names the map folders ([`MergeMember::map_dir`]) of two members; others are ignored.
     pub pairs: Vec<PointPairEntry>,
+    /// Also `modell.ply` (`--ply`): the same points. Not part of the input id.
+    pub ply: bool,
 }
 
 /// Where a member sits in the model and how sure that is.
@@ -928,7 +931,9 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
     progress.phase("Schreiben", None);
     fs::create_dir_all(out).map_err(|e| format!("{} nicht anlegbar: {e}", out.display()))?;
     write_whole(out, MODEL_LAS, |p| write_las_sources(p, &model, &sources))?;
-    write_whole(out, MODEL_PLY, |p| write_ply_sources(p, &model, &sources))?;
+    if req.ply {
+        write_whole(out, MODEL_PLY, |p| write_ply_sources(p, &model, &sources))?;
+    }
     let points = model.len() as u64;
     drop((model, sources));
 
@@ -1085,6 +1090,7 @@ mod tests {
             voxel: 0.01,
             smooth: false,
             include_unsure: false,
+            ply: false,
             pairs: vec![
                 entry("s2", "s0", 0.0, 3),
                 entry("s1", "s1", 10.0, 3),
@@ -1158,6 +1164,7 @@ mod tests {
         let map = MapRequest {
             input,
             out_dir: out.clone(),
+            all_files: false,
         };
         run_map(&map, &Progress::new()).unwrap();
         let member = MergeMember {
@@ -1174,6 +1181,7 @@ mod tests {
             smooth: true,
             include_unsure: false,
             pairs: Vec::new(),
+            ply: false,
         };
         let (text, clean_ids) = input_text(&req).unwrap();
         assert!(!text.contains(env!("CARGO_PKG_VERSION")), "{text}");

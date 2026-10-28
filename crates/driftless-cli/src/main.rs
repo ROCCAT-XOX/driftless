@@ -62,14 +62,15 @@ enum Command {
     /// Prüft die Kamera-Kalibrierung per Test-Projektion: Richtung der LiDAR↔Kamera-Matrix
     /// und Zeitversatz der Bilder (calib_check.json, Überlagerungsbilder)
     CalibCheck(calib_check::Args),
-    /// Karte eines SLAM-Laufs: dichte Wolke (dense.las), bereinigt (clean.las, removed.las),
-    /// eingefärbt (color.las, color.ply) und map.json; jeder Schritt einzeln startbar
+    /// Karte eines SLAM-Laufs: dichte Wolke, bereinigt (removed.las), eingefärbt (color.las,
+    /// ohne Farbe clean.las) und map.json; jeder Schritt einzeln startbar, --alle-dateien
+    /// schreibt jeden als LAS und color.ply dazu
     Map(map::Args),
-    /// Fotoähnliche Oberfläche einer Karte oder eines Modells (--model): oberflaeche.glb,
-    /// oberflaeche.obj (mit .mtl und Texturseiten) und oberflaeche.json
+    /// Fotoähnliche Oberfläche einer Karte oder eines Modells (--model): oberflaeche.glb und
+    /// oberflaeche.json, mit --obj auch oberflaeche.obj (mit .mtl und Texturseiten)
     Surface(surface::Args),
-    /// Führt mehrere Scans eines Orts zu einem Modell zusammen: modell.las, modell.ply und
-    /// modell.json (Lage und Güte je Scan)
+    /// Führt mehrere Scans eines Orts zu einem Modell zusammen: modell.las und modell.json
+    /// (Lage und Güte je Scan), mit --ply auch modell.ply
     Merge(merge::Args),
     /// Exportiert Karte, Modell, Oberfläche, Laufbahn oder eine Punktwolken-Datei (LAS, LAZ,
     /// E57, PLY, PCD, glb, OBJ, TUM, CSV)

@@ -68,6 +68,7 @@ fn prepared(name: &str, images: bool) -> (PathBuf, PathBuf) {
     let req = MapRequest {
         input: map_input(&dir, &out),
         out_dir: out.clone(),
+        all_files: false,
     };
     run_map(&req, &Progress::new()).unwrap();
     (dir, out)
@@ -81,6 +82,7 @@ fn request(scan: &Path, map_dir: &Path, out_dir: &Path) -> SurfaceRequest {
         config: small_config(),
         texture: true,
         gpu: driftless_gpu::GpuPref::default(),
+        obj: false,
     }
 }
 
@@ -109,7 +111,10 @@ fn names(dir: &Path) -> Vec<String> {
 fn surface_end_to_end() {
     let (dir, out) = prepared("steps-surface-e2e", true);
     let dest = out.join("oberflaeche");
-    let req = request(&dir, &out, &dest);
+    let req = SurfaceRequest {
+        obj: true,
+        ..request(&dir, &out, &dest)
+    };
     assert!(!surface_fits(&req));
     let report = run_surface(&req, &Progress::new()).unwrap();
     for f in [
@@ -156,6 +161,44 @@ fn surface_end_to_end() {
         serde_json::from_str(&fs::read_to_string(dest.join(SURFACE_REPORT)).unwrap()).unwrap();
     assert_eq!(on_disk, report);
     assert!(surface_fits(&req));
+}
+
+/// Without `obj` a surface is its glb and its report; an OBJ of an earlier run is listed as
+/// stale, not deleted. The OBJ is part of no id.
+#[test]
+fn surface_writes_only_the_glb_by_default() {
+    let (dir, out) = prepared("steps-surface-glb", true);
+    let dest = out.join("oberflaeche");
+    let req = request(&dir, &out, &dest);
+    let report = run_surface(&req, &Progress::new()).unwrap();
+    assert_eq!(names(&dest), ["oberflaeche.glb", SURFACE_REPORT]);
+    assert_eq!(
+        report["files"],
+        serde_json::json!(["oberflaeche.glb", SURFACE_REPORT])
+    );
+    let with_obj = SurfaceRequest {
+        obj: true,
+        ..req.clone()
+    };
+    assert!(surface_fits(&with_obj), "the OBJ changes no id");
+    run_surface(&with_obj, &Progress::new()).unwrap();
+    assert!(dest.join("oberflaeche.obj").is_file() && dest.join("oberflaeche.mtl").is_file());
+    let p = Progress::new();
+    let again = run_surface(&req, &p).unwrap();
+    let stale: Vec<&str> = again["stale"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        stale.contains(&"oberflaeche.obj")
+            && stale.contains(&"oberflaeche.mtl")
+            && stale.contains(&"oberflaeche_seite_00.jpg"),
+        "{stale:?}"
+    );
+    assert!(dest.join("oberflaeche.obj").is_file(), "not deleted");
+    assert!(warnings(&p).iter().any(|w| w.contains("früheren Lauf")));
 }
 
 #[test]
@@ -349,6 +392,7 @@ fn prepare_member(scan: &Path) {
         &MapRequest {
             input,
             out_dir: out,
+            all_files: false,
         },
         &Progress::new(),
     )
@@ -374,6 +418,7 @@ fn merged(scans: &[&Path], out: &Path) -> PathBuf {
         smooth: true,
         include_unsure: false,
         pairs: Vec::new(),
+        ply: false,
     };
     let report = run_merge(&req, &Progress::new()).unwrap();
     assert!(
@@ -423,6 +468,7 @@ fn model_request(model: &Path, out: &Path) -> ModelSurfaceRequest {
         config: small_config(),
         texture: true,
         gpu: driftless_gpu::GpuPref::default(),
+        obj: false,
     }
 }
 
@@ -454,9 +500,13 @@ fn model_surface_textures_both_scans() {
     let p = Progress::new();
     let report = run_model_surface(&model_request(&s.both, &dest), &p).unwrap();
     assert!(warnings(&p).is_empty(), "{:?}", warnings(&p));
-    for f in ["oberflaeche.glb", "oberflaeche.obj", SURFACE_REPORT] {
+    for f in ["oberflaeche.glb", SURFACE_REPORT] {
         assert!(dest.join(f).is_file(), "{f} missing");
     }
+    assert!(
+        !dest.join("oberflaeche.obj").exists(),
+        "the OBJ only on request"
+    );
     assert_eq!(
         report["model"]["members"],
         serde_json::json!(["raum-a", "raum-b"])

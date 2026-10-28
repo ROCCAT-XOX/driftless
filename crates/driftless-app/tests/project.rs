@@ -263,6 +263,7 @@ fn cli_folder_can_be_added_as_run() {
             map: MapSettings::default(),
         },
         out_dir: out.clone(),
+        all_files: false,
     };
     run_map(&req, &Progress::new()).unwrap();
 
@@ -291,13 +292,13 @@ fn cli_folder_can_be_added_as_run() {
     assert_eq!(map.label, "Karte (im Lauf-Ordner)");
     assert_eq!(map.dir, run.dir);
     assert_eq!(map.settings, Some(MapSwitches::default()));
-    // no camera images: no color.las
+    // no camera images: no color.las, the cleaned cloud to look at, and the removed points
     let clouds: Vec<String> = map
         .clouds
         .iter()
         .map(|c| c.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(clouds, ["clean.las", "dense.las", "removed.las"]);
+    assert_eq!(clouds, ["clean.las", "removed.las"]);
 }
 
 #[test]
@@ -888,6 +889,7 @@ fn merge_scans() -> &'static MergeScans {
                 &MapRequest {
                     input,
                     out_dir: out,
+                    all_files: false,
                 },
                 &Progress::new(),
             )

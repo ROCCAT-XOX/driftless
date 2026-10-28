@@ -1,6 +1,8 @@
-//! The photo-like surface of a map: `oberflaeche.glb`, `oberflaeche.obj` (+ `.mtl` and the
-//! texture pages as JPEG) and `oberflaeche.json`, built from the `clean.bin` of the map
-//! folder (points with the frame they were measured in) and the camera images of the scan.
+//! The photo-like surface of a map: `oberflaeche.glb` (its texture pages inside) and
+//! `oberflaeche.json`, with [`SurfaceRequest::obj`] (`driftless surface --obj`) also
+//! `oberflaeche.obj` (+ `.mtl` and the texture pages as JPEG; else „Exportieren …“ makes an
+//! OBJ from the glb), built from the `clean.bin` of the map folder (points with the frame
+//! they were measured in) and the camera images of the scan.
 //!
 //! The input id is the clean step's id, the camera images and calibration, the surface
 //! settings and [`SURFACE_VERSION`]. A `clean.bin` of another input (or none) is refused:
@@ -60,6 +62,9 @@ pub struct SurfaceRequest {
     /// Find the views per face on the GPU (`--gpu auto|an|aus`). Gives an equivalent
     /// result: not part of the input id; the report says what was used.
     pub gpu: GpuPref,
+    /// Also `oberflaeche.obj` with `.mtl` and the page JPEGs (`--obj`). The same surface:
+    /// not part of the input id.
+    pub obj: bool,
 }
 
 fn stale_map() -> StepError {
@@ -245,17 +250,22 @@ fn stats_json(s: &SurfaceStats) -> Value {
     })
 }
 
-/// Page JPEGs of an earlier run in `dir` that the files of this run (`keep`) do not include.
-/// Nothing is deleted: they are warned about and listed as stale in the report.
-fn stale_pages(dir: &Path, keep: &[String]) -> Vec<String> {
+/// The OBJ, its `.mtl` and page JPEGs of an earlier run in `dir` that the files of this run
+/// (`keep`) do not include. Nothing is deleted: they are warned about and listed as stale in
+/// the report.
+fn stale_files(dir: &Path, keep: &[String]) -> Vec<String> {
     let prefix = format!("{STEM}_seite_");
+    let (obj, mtl) = (format!("{STEM}.obj"), format!("{STEM}.mtl"));
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut stale: Vec<String> = entries
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with(&prefix) && n.ends_with(".jpg") && !keep.contains(n))
+        .filter(|n| {
+            let page = n.starts_with(&prefix) && n.ends_with(".jpg");
+            (page || *n == obj || *n == mtl) && !keep.contains(n)
+        })
         .collect();
     stale.sort();
     stale
@@ -308,6 +318,8 @@ struct Target<'a> {
     id: &'a str,
     /// One more entry of the report (key, value).
     extra: Option<(&'static str, Value)>,
+    /// Also the OBJ with its `.mtl` and pages.
+    obj: bool,
 }
 
 /// Mesh, texture, files and report of a surface: the part shared by [`run_surface`] and
@@ -365,19 +377,23 @@ fn make_surface(
     let report_path = out.join(SURFACE_REPORT);
     let writing = Progress::new();
     mesh::write_glb(&out.join(format!("{STEM}.glb")), &surface, &writing)?;
-    mesh::write_obj(&out.join(format!("{STEM}.obj")), &surface, &writing)?;
+    let mut files = vec![format!("{STEM}.glb")];
+    if target.obj {
+        mesh::write_obj(&out.join(format!("{STEM}.obj")), &surface, &writing)?;
+        files.extend([format!("{STEM}.obj"), format!("{STEM}.mtl")]);
+        files.extend((0..pages).map(|p| format!("{STEM}_seite_{p:02}.jpg")));
+    }
     drop(surface);
-    let mut files = vec![
-        format!("{STEM}.glb"),
-        format!("{STEM}.obj"),
-        format!("{STEM}.mtl"),
-    ];
-    files.extend((0..pages).map(|p| format!("{STEM}_seite_{p:02}.jpg")));
     files.push(SURFACE_REPORT.to_string());
-    let stale = stale_pages(out, &files);
+    let stale = stale_files(out, &files);
     if !stale.is_empty() {
+        let (verb, belongs) = if stale.len() == 1 {
+            ("stammt", "gehört")
+        } else {
+            ("stammen", "gehören")
+        };
         progress.warn(format!(
-            "{} stammen aus einem früheren Lauf und gehören nicht mehr zur Oberfläche",
+            "{} {verb} aus einem früheren Lauf und {belongs} nicht mehr zur Oberfläche",
             stale.join(", ")
         ));
     }
@@ -474,6 +490,7 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
         texture: req.texture,
         id: &plan.id,
         extra: None,
+        obj: req.obj,
     };
     make_surface(points, sources, gpu, target, start, progress)
 }
@@ -494,6 +511,8 @@ pub struct ModelSurfaceRequest {
     pub texture: bool,
     /// As [`SurfaceRequest::gpu`].
     pub gpu: GpuPref,
+    /// As [`SurfaceRequest::obj`].
+    pub obj: bool,
 }
 
 /// A scan of the model whose points are in it.
@@ -712,6 +731,7 @@ pub fn run_model_surface(
                 "members": names,
             }),
         )),
+        obj: req.obj,
     };
     make_surface(points, sources, gpu, target, start, progress)
 }

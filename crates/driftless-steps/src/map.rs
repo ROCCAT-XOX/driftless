@@ -1,13 +1,18 @@
 //! The map of a SLAM run in three steps, each with its own files in the output folder:
 //!
-//! - **dense**: dense cloud from the corrected `traj.tum` → `dense.las`, `dense.bin`
-//! - **clean**: ghosts, points seen through windows and outliers removed → `clean.las`,
-//!   `removed.las`, `clean.bin`
-//! - **color**: coloured from the camera images → `color.las`, `color.ply`
+//! - **dense**: dense cloud from the corrected `traj.tum` → `dense.bin` (`dense.las`)
+//! - **clean**: ghosts, points seen through windows and outliers removed → `removed.las`,
+//!   `clean.bin` (`clean.las`)
+//! - **color**: coloured from the camera images → `color.las` (`color.ply`)
 //!
 //! plus `map.json` (settings, statistics and runtimes of the steps, peak memory, and under
 //! `stale` the files of earlier runs that no longer fit; they get a warning, nothing is ever
 //! deleted).
+//!
+//! Of the clouds to look at, a run writes one: the LAS of its last step, so `color.las`, or
+//! `clean.las` where the scan cannot be coloured (and `dense.las` for the dense step alone).
+//! [`MapRequest::all_files`] (`driftless map --alle-dateien`) writes the files in brackets
+//! above as well: the LAS of every step and `color.ply`.
 //!
 //! The requested step always runs; the step before it is taken from its `*.bin` in the folder
 //! if that was written for the same input and settings (input id as in `submaps.bin`), and
@@ -260,6 +265,10 @@ pub struct MapRequest {
     pub input: MapInput,
     /// Where the results go (and where earlier ones are reused from).
     pub out_dir: PathBuf,
+    /// Every step writes its cloud as LAS (`dense.las`, `clean.las`), and colouring
+    /// `color.ply` as well (`driftless map --alle-dateien`); else only the last step's LAS
+    /// (see the module documentation). Part of no id: the files hold the same points.
+    pub all_files: bool,
 }
 
 /// Names and sizes of `bags`, one per line.
@@ -676,6 +685,8 @@ struct MapRun<'a> {
     /// `map.json` of an earlier run (`Null` if there is none).
     previous: Value,
     steps: BTreeMap<&'static str, Value>,
+    /// [`MapRequest::all_files`].
+    all_files: bool,
 }
 
 fn seconds(start: Instant) -> f64 {
@@ -695,7 +706,9 @@ impl MapRun<'_> {
         Ok(())
     }
 
-    /// Entry of a step that ran now.
+    /// Entry of a step that ran now and wrote `files`. The files an earlier run wrote for the
+    /// same input that are still there stay listed: every step gives the same files for the
+    /// same input. In the order of [`STEP_FILES`].
     fn record(
         &mut self,
         step: &'static str,
@@ -704,6 +717,22 @@ impl MapRun<'_> {
         stats: Value,
         files: &[&str],
     ) {
+        let before = self.previous_entry(step, id).unwrap_or(Value::Null);
+        let written_before = |f: &str| {
+            before["files"]
+                .as_array()
+                .is_some_and(|l| l.iter().any(|v| v == f))
+                && self.path(f).is_file()
+        };
+        let of_step = STEP_FILES
+            .iter()
+            .find(|(s, _, _)| *s == step)
+            .map_or(&[][..], |(_, f, _)| *f);
+        let listed: Vec<&str> = of_step
+            .iter()
+            .copied()
+            .filter(|f| files.contains(f) || written_before(f))
+            .collect();
         self.steps.insert(
             step,
             json!({
@@ -711,7 +740,7 @@ impl MapRun<'_> {
                 "reused": false,
                 "seconds": seconds(start),
                 "peak_rss_bytes_after": peak_rss_bytes(),
-                "files": files,
+                "files": listed,
                 "stats": stats,
             }),
         );
@@ -767,7 +796,9 @@ impl MapRun<'_> {
         }
     }
 
-    fn run_dense(&mut self) -> Result<(Cloud, RaySource), StepError> {
+    /// The dense step; its `dense.las` if it is the `last` step of the run (or with
+    /// [`MapRequest::all_files`]).
+    fn run_dense(&mut self, last: bool) -> Result<(Cloud, RaySource), StepError> {
         let start = Instant::now();
         let bags = &self.project.lidar_bags;
         let slam = &self.input.slam;
@@ -782,29 +813,32 @@ impl MapRun<'_> {
         drop(imu);
         warn_if_not_static(&stats.odom, self.progress);
         self.ready_to_write()?;
+        let las = last || self.all_files;
         let write = || -> Result<(), BoxError> {
-            write_las(&self.path("dense.las"), &cloud)?;
+            if las {
+                write_las(&self.path("dense.las"), &cloud)?;
+            }
             save_stage(&self.path(DENSE_BIN), &self.ids.dense, &cloud, Some(&rays))
                 .map_err(|e| format!("{DENSE_BIN} nicht schreibbar: {e}"))?;
             Ok(())
         };
         write()?;
+        let files: &[&str] = if las {
+            &["dense.las", DENSE_BIN]
+        } else {
+            &[DENSE_BIN]
+        };
         self.progress.info(format!(
-            "Dicht: {} Punkte aus {} Frames ({} im Messbereich, {} Strahlen), {:.1} s → dense.las",
+            "Dicht: {} Punkte aus {} Frames ({} im Messbereich, {} Strahlen), {:.1} s → {}",
             stats.points,
             stats.frames,
             stats.points_in_range,
             stats.rays,
-            start.elapsed().as_secs_f64()
+            start.elapsed().as_secs_f64(),
+            files.join(", ")
         ));
         let id = self.ids.dense.clone();
-        self.record(
-            "dense",
-            &id,
-            start,
-            dense_json(&stats),
-            &["dense.las", DENSE_BIN],
-        );
+        self.record("dense", &id, start, dense_json(&stats), files);
         Ok((cloud, rays))
     }
 
@@ -815,17 +849,22 @@ impl MapRun<'_> {
             self.record_reused("dense", &id);
             return Ok((cloud, rays));
         }
-        self.run_dense()
+        self.run_dense(false)
     }
 
-    fn run_clean(&mut self, cloud: Cloud, rays: RaySource) -> Result<Cloud, StepError> {
+    /// The clean step; its `clean.las` if it is the `last` step of the run (or with
+    /// [`MapRequest::all_files`]).
+    fn run_clean(&mut self, cloud: Cloud, rays: RaySource, last: bool) -> Result<Cloud, StepError> {
         let start = Instant::now();
         let (kept, removed, reasons, stats) =
             clean_with(cloud, &rays, &self.clean_cfg, self.progress)?;
         drop(rays);
         self.ready_to_write()?;
+        let las = last || self.all_files;
         let write = || -> Result<(), BoxError> {
-            write_las(&self.path("clean.las"), &kept)?;
+            if las {
+                write_las(&self.path("clean.las"), &kept)?;
+            }
             write_removed_las(&self.path("removed.las"), &removed, &reasons)?;
             Ok(())
         };
@@ -846,23 +885,23 @@ impl MapRun<'_> {
         } else {
             String::new()
         };
+        let files: &[&str] = if las {
+            &["clean.las", "removed.las", CLEAN_BIN]
+        } else {
+            &["removed.las", CLEAN_BIN]
+        };
         self.progress.info(format!(
             "Bereinigt: {} Punkte behalten, entfernt {} Geister, {} Durchblick und {} \
-             Ausreißer{smooth}, {:.1} s → clean.las, removed.las",
+             Ausreißer{smooth}, {:.1} s → {}",
             stats.kept,
             stats.ghosts,
             stats.through,
             stats.outliers,
-            start.elapsed().as_secs_f64()
+            start.elapsed().as_secs_f64(),
+            files.join(", ")
         ));
         let id = self.ids.clean.clone();
-        self.record(
-            "clean",
-            &id,
-            start,
-            clean_json(&stats),
-            &["clean.las", "removed.las", CLEAN_BIN],
-        );
+        self.record("clean", &id, start, clean_json(&stats), files);
         Ok(kept)
     }
 
@@ -875,7 +914,7 @@ impl MapRun<'_> {
             return Ok(cloud);
         }
         let (cloud, rays) = self.dense_input()?;
-        self.run_clean(cloud, rays)
+        self.run_clean(cloud, rays, false)
     }
 
     /// Colours `cloud` on `device` (opened by [`run_map`] before any work, so `--gpu an`
@@ -924,14 +963,21 @@ impl MapRun<'_> {
         }
         let write = || -> Result<(), BoxError> {
             write_las(&self.path("color.las"), &cloud)?;
-            write_ply(&self.path("color.ply"), &cloud)?;
+            if self.all_files {
+                write_ply(&self.path("color.ply"), &cloud)?;
+            }
             Ok(())
         };
         write()?;
+        let files: &[&str] = if self.all_files {
+            &["color.las", "color.ply"]
+        } else {
+            &["color.las"]
+        };
         let share = 100.0 * stats.points_colored as f64 / cloud.len().max(1) as f64;
         self.progress.info(format!(
             "Eingefärbt: {share:.1} % der {} Punkte; Bilder {} genutzt, {} unscharf, {} außerhalb \
-             der Laufbahn, {} kaputt; Belichtung {:.2}–{:.2}, {:.1} s → color.las, color.ply",
+             der Laufbahn, {} kaputt; Belichtung {:.2}–{:.2}, {:.1} s → {}",
             cloud.len(),
             stats.images_used,
             stats.images_blurry,
@@ -939,7 +985,8 @@ impl MapRun<'_> {
             stats.images_bad,
             stats.gain_min,
             stats.gain_max,
-            start.elapsed().as_secs_f64()
+            start.elapsed().as_secs_f64(),
+            files.join(", ")
         ));
         self.progress.info(format!(
             "Farbqualität: {} Glanzansichten verworfen ({} Punkte), {} Randansichten ausgelassen; \
@@ -956,13 +1003,7 @@ impl MapRun<'_> {
         ));
         let id = self.ids.color.clone().expect("colour input exists");
         let names: Vec<&str> = input.cams.iter().map(|c| c.camera.name.as_str()).collect();
-        self.record(
-            "color",
-            &id,
-            start,
-            color_json(&stats, &names),
-            &["color.las", "color.ply"],
-        );
+        self.record("color", &id, start, color_json(&stats, &names), files);
         if let Some(e) = self.steps.get_mut("color") {
             e["gpu"] = gpu_report;
         }
@@ -970,20 +1011,19 @@ impl MapRun<'_> {
     }
 }
 
-/// Output files of each step, and the file of the step before it that they are made from.
+/// Every output file of each step (also those written only with [`MapRequest::all_files`]),
+/// and the file of the step before it that they are made from (one that is always written).
 const STEP_FILES: [(&str, &[&str], &str); 3] = [
     ("dense", &["dense.las", DENSE_BIN], "traj.tum"),
-    (
-        "clean",
-        &["clean.las", "removed.las", CLEAN_BIN],
-        "dense.las",
-    ),
-    ("color", &["color.las", "color.ply"], "clean.las"),
+    ("clean", &["clean.las", "removed.las", CLEAN_BIN], DENSE_BIN),
+    ("color", &["color.las", "color.ply"], CLEAN_BIN),
 ];
 
-/// Output files in `out` of steps that have no current entry in `steps` (not run and no
-/// longer fitting, or skipped): they are from an earlier run. Nothing is deleted; each group
-/// gets a warning. Returns their names, in step order.
+/// Output files in `out` that the current entry of their step in `steps` does not list (its
+/// `files`): the step has none (not run and no longer fitting, or skipped), or did not write
+/// them for its input (`dense.las` of an earlier `--alle-dateien` run, say). They are from an
+/// earlier run. Nothing is deleted; each group gets a warning. Returns their names, in step
+/// order.
 fn warn_stale(
     out: &Path,
     steps: &BTreeMap<&'static str, Value>,
@@ -991,14 +1031,18 @@ fn warn_stale(
 ) -> Vec<String> {
     let mut stale = Vec::new();
     for (step, files, source) in STEP_FILES {
-        let current = steps.get(step).is_some_and(|e| e.get("skipped").is_none());
-        if current {
-            continue;
-        }
+        let current = steps.get(step).filter(|e| e.get("skipped").is_none());
+        let listed = |f: &str| {
+            current.is_some_and(|e| {
+                e["files"]
+                    .as_array()
+                    .is_some_and(|l| l.iter().any(|v| v == f))
+            })
+        };
         let found: Vec<&str> = files
             .iter()
             .copied()
-            .filter(|f| out.join(f).exists())
+            .filter(|f| out.join(f).exists() && !listed(f))
             .collect();
         if found.is_empty() {
             continue;
@@ -1177,15 +1221,16 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
         },
         previous,
         steps: BTreeMap::new(),
+        all_files: req.all_files,
     };
 
     match step {
         MapStep::Dense => {
-            run.run_dense()?;
+            run.run_dense(true)?;
         }
         MapStep::Clean => {
             let (cloud, rays) = run.dense_input()?;
-            run.run_clean(cloud, rays)?;
+            run.run_clean(cloud, rays, true)?;
         }
         MapStep::Color => {
             let cloud = run.clean_input()?;
@@ -1196,8 +1241,9 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
             )?;
         }
         MapStep::All => {
-            let (cloud, rays) = run.run_dense()?;
-            let cloud = run.run_clean(cloud, rays)?;
+            let (cloud, rays) = run.run_dense(false)?;
+            // Without colour the cleaned cloud is the one to look at.
+            let cloud = run.run_clean(cloud, rays, color.is_err())?;
             match color {
                 Ok(input) => {
                     run.run_color(cloud, input, device.expect("opened with the colour input"))?

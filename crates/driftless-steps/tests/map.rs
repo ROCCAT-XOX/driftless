@@ -39,6 +39,7 @@ fn request(scan: &Path, slam_dir: &Path, out_dir: &Path, step: MapStep) -> MapRe
     MapRequest {
         input: input(scan, slam_dir, step),
         out_dir: out_dir.to_path_buf(),
+        all_files: false,
     }
 }
 
@@ -108,6 +109,7 @@ fn map_out_dir_separate_from_slam_dir() {
     let p = Progress::new();
     let report = run_map(&request(&dir, &slam_dir, &map_dir, MapStep::All), &p).unwrap();
     assert_eq!(files(&slam_dir), slam_files, "SLAM folder untouched");
+    // No images: the cleaned cloud is the one to look at; no `dense.las`.
     let names: Vec<String> = files(&map_dir).into_keys().collect();
     assert_eq!(
         names,
@@ -115,10 +117,17 @@ fn map_out_dir_separate_from_slam_dir() {
             "clean.bin",
             "clean.las",
             "dense.bin",
-            "dense.las",
             "map.json",
             "removed.las"
         ]
+    );
+    assert_eq!(
+        report["steps"]["dense"]["files"],
+        serde_json::json!(["dense.bin"])
+    );
+    assert_eq!(
+        report["steps"]["clean"]["files"],
+        serde_json::json!(["clean.las", "removed.las", "clean.bin"])
     );
     let json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(map_dir.join("map.json")).unwrap()).unwrap();
@@ -134,6 +143,96 @@ fn map_out_dir_separate_from_slam_dir() {
         l,
         driftless_io::progress::LogLine::Warning(w) if w.starts_with("nicht eingefärbt, ")
     )));
+}
+
+/// With `all_files` every step writes its cloud as LAS, as before the first release.
+#[test]
+fn all_files_writes_every_cloud() {
+    let dir = tmp("steps-map-all-files");
+    room_bag(&dir, true);
+    let slam_dir = dir.join("slam");
+    slam(&dir, &slam_dir, false);
+    let map_dir = dir.join("karte");
+    let req = MapRequest {
+        all_files: true,
+        ..request(&dir, &slam_dir, &map_dir, MapStep::All)
+    };
+    let report = run_map(&req, &Progress::new()).unwrap();
+    let names: Vec<String> = files(&map_dir).into_keys().collect();
+    assert_eq!(
+        names,
+        [
+            "clean.bin",
+            "clean.las",
+            "dense.bin",
+            "dense.las",
+            "map.json",
+            "removed.las"
+        ]
+    );
+    assert_eq!(
+        report["steps"]["dense"]["files"],
+        serde_json::json!(["dense.las", "dense.bin"])
+    );
+    // The same stages as without: the switch is part of no id.
+    let plain = dir.join("karte-ohne");
+    let again = run_map(
+        &request(&dir, &slam_dir, &plain, MapStep::All),
+        &Progress::new(),
+    )
+    .unwrap();
+    for step in ["dense", "clean"] {
+        assert_eq!(
+            again["steps"][step]["input_id"],
+            report["steps"][step]["input_id"]
+        );
+    }
+    for f in ["dense.bin", "clean.bin", "clean.las", "removed.las"] {
+        assert_eq!(
+            fs::read(map_dir.join(f)).unwrap(),
+            fs::read(plain.join(f)).unwrap()
+        );
+    }
+}
+
+/// A cloud an earlier run wrote is listed as current only while it fits: the same input keeps
+/// it, another trajectory makes it stale (warned, not deleted), also when its step ran again
+/// without writing it.
+#[test]
+fn clouds_of_an_earlier_run_fit_only_the_same_input() {
+    let dir = tmp("steps-map-earlier-clouds");
+    room_bag(&dir, true);
+    let slam_dir = dir.join("slam");
+    slam(&dir, &slam_dir, false);
+    let all = MapRequest {
+        all_files: true,
+        ..request(&dir, &slam_dir, &slam_dir, MapStep::All)
+    };
+    run_map(&all, &Progress::new()).unwrap();
+    // The same input without the switch: `dense.las` still fits.
+    let plain = request(&dir, &slam_dir, &slam_dir, MapStep::All);
+    let report = run_map(&plain, &Progress::new()).unwrap();
+    assert_eq!(report["stale"], serde_json::json!([]));
+    assert_eq!(
+        report["steps"]["dense"]["files"],
+        serde_json::json!(["dense.las", "dense.bin"])
+    );
+    // Another trajectory: the dense step runs anew without writing `dense.las`.
+    let traj = fs::read_to_string(slam_dir.join("traj.tum")).unwrap();
+    fs::write(slam_dir.join("traj.tum"), format!("{traj}# geändert\n")).unwrap();
+    let p = Progress::new();
+    let report = run_map(&plain, &p).unwrap();
+    assert_eq!(report["stale"], serde_json::json!(["dense.las"]));
+    assert_eq!(
+        report["steps"]["dense"]["files"],
+        serde_json::json!(["dense.bin"])
+    );
+    assert!(p.take_log().iter().any(|l| matches!(
+        l,
+        driftless_io::progress::LogLine::Warning(w)
+            if w.starts_with("dense.las stammt aus einem früheren Lauf")
+    )));
+    assert!(slam_dir.join("dense.las").is_file(), "not deleted");
 }
 
 #[test]

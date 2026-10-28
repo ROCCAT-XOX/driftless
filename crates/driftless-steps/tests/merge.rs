@@ -67,6 +67,7 @@ fn prepare(scan: &Path) {
         &MapRequest {
             input,
             out_dir: out,
+            all_files: false,
         },
         &Progress::new(),
     )
@@ -136,6 +137,7 @@ fn request(members: Vec<MergeMember>, out: &Path) -> MergeRequest {
         smooth: true,
         include_unsure: false,
         pairs: Vec::new(),
+        ply: false,
     }
 }
 
@@ -197,9 +199,7 @@ fn merges_two_scans() {
     let points: u64 = report.members.iter().map(|m| m.points).sum();
     assert_eq!(points, report.points);
     assert_eq!(las_points(&out).len() as u64, report.points);
-    let ply = fs::read(out.join(MODEL_PLY)).unwrap();
-    let head = String::from_utf8_lossy(&ply[..400.min(ply.len())]).into_owned();
-    assert!(head.contains("property ushort scan"), "{head}");
+    assert!(!out.join(MODEL_PLY).exists(), "modell.ply only on request");
 
     let back = read_model(&out).unwrap();
     assert_eq!(back.input_id, report.input_id);
@@ -224,15 +224,21 @@ fn merges_two_scans() {
     assert_eq!(back.points, report.points);
     assert!(!out.join(format!("{MODEL_LAS}.tmp")).exists());
 
-    // The same request gives the same files.
+    // The same request gives the same files; `ply` adds `modell.ply` (the id stays).
     let again = out_dir("zwei-nochmal");
-    run_merge(&request(req.members.clone(), &again), &Progress::new()).unwrap();
-    for f in [MODEL_LAS, MODEL_PLY] {
-        assert!(
-            fs::read(out.join(f)).unwrap() == fs::read(again.join(f)).unwrap(),
-            "{f} differs between two runs"
-        );
-    }
+    let with_ply = MergeRequest {
+        ply: true,
+        ..request(req.members.clone(), &again)
+    };
+    let second = run_merge(&with_ply, &Progress::new()).unwrap();
+    assert_eq!(second.input_id, report.input_id);
+    assert!(
+        fs::read(out.join(MODEL_LAS)).unwrap() == fs::read(again.join(MODEL_LAS)).unwrap(),
+        "{MODEL_LAS} differs between two runs"
+    );
+    let ply = fs::read(again.join(MODEL_PLY)).unwrap();
+    let head = String::from_utf8_lossy(&ply[..400.min(ply.len())]).into_owned();
+    assert!(head.contains("property ushort scan"), "{head}");
 
     // A folder that already holds a model is not overwritten.
     let err = run_merge(&req, &Progress::new()).unwrap_err();

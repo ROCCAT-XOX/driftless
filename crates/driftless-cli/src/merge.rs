@@ -1,6 +1,7 @@
-//! `driftless merge <scan>... -o <ziel>`: several scans of one place merged into one model
-//! (`modell.las`, `modell.ply`, `modell.json`). The first scan is the reference; its frame is
-//! the model frame. The run itself is [`driftless_steps::merge::run_merge`].
+//! `driftless merge <scan>... -o <ziel> [--ply]`: several scans of one place merged into one
+//! model (`modell.las`, `modell.json`; with `--ply` also `modell.ply`). The first scan is the
+//! reference; its frame is the model frame. The run itself is
+//! [`driftless_steps::merge::run_merge`].
 //!
 //! `--punktpaare <datei>` takes point pairs marked by hand (a file like `punktpaare.toml`,
 //! [`driftless_steps::pairs`]); its map folders are relative to the folder of the file.
@@ -51,6 +52,9 @@ pub struct Args {
     /// Imu-Topic (Standard: das einzige in der Bag)
     #[arg(long)]
     imu_topic: Option<String>,
+    /// Auch modell.ply schreiben (die Punkte von modell.las mit der Eigenschaft scan)
+    #[arg(long)]
+    ply: bool,
 }
 
 /// `given` as one folder per scan, or `default` of each scan if none is given.
@@ -111,6 +115,7 @@ fn request(args: &Args) -> Result<MergeRequest, Box<dyn std::error::Error>> {
         smooth: !args.ohne_glaetten,
         include_unsure: args.auch_unsichere,
         pairs,
+        ply: args.ply,
     })
 }
 
