@@ -4,10 +4,10 @@
 //! the scans the models („Modell 001“): per scan of a model its number, name and how surely it
 //! was placed (✓ sicher, ⚠ unsicher, ✗ gescheitert, the reason on hover) with overlap and
 //! residual („Punktpaare“ before them if placed by hand, the fit of the pairs and the wall
-//! residual on hover), under an unsure or failed one „Von Hand ausrichten“
-//! ([`Action::StartPairs`]); then the point pairs of the model („Punktpaare“, each with its
-//! switch, as the loops of a run; one the merge cannot use marked „nicht nutzbar“, why on
-//! hover), `modell.las` and the surfaces of the model. Names too long for the field end in „…“;
+//! residual – or „Wände nicht messbar“ – on hover), under an unsure or failed one „Von Hand
+//! ausrichten“ ([`Action::StartPairs`]); then the point pairs of the model („Punktpaare“, each
+//! with its switch, as the loops of a run; one the merge cannot use marked „nicht nutzbar“, why
+//! on hover), `modell.las` and the surfaces of the model. Names too long for the field end in „…“;
 //! the full name and the folder show on hover. A run, a map, a model and a surface have
 //! „Exportieren …“ in their context menu (right click, [`Action::OpenExport`]).
 
@@ -229,11 +229,10 @@ fn member_rows(ui: &mut Ui, state: &AppState, k: usize, m: &ModelMember) {
         hover += &format!("\n{}", text::member_pairs_fit(rms));
     }
     if !reference {
-        hover += &format!(
-            "\n{}\n{}",
-            text::member_walls(m.wall_residual_mm),
-            text::VERDICT_HINT
-        );
+        let walls = m
+            .wall_residual_mm
+            .map_or_else(|| text::WALLS_UNMEASURABLE.to_string(), text::member_walls);
+        hover += &format!("\n{walls}\n{}", text::VERDICT_HINT);
     }
     let [r, g, b] = SCAN_COLORS[k % SCAN_COLORS.len()];
     let row = ui

@@ -195,6 +195,11 @@ pub fn model_stale_version(label: &str) -> String {
     format!("{label} · {MODEL_STALE_VERSION}")
 }
 
+/// On hover over a scan of a model whose walls could not be measured, instead of
+/// [`member_walls`]: automatically placed it is „unsicher“ for that, by point pairs it is
+/// judged without them.
+pub const WALLS_UNMEASURABLE: &str = "Wände nicht messbar";
+
 // Point pairs by hand („Von Hand ausrichten“)
 /// Under an unsure or failed scan of a model.
 pub const PAIRS_START: &str = "Von Hand ausrichten";

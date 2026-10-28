@@ -23,8 +23,9 @@
 //!    is, once refined), and those join the candidates: a room that looks the same turned
 //!    is caught even if no feature match proposed the turned pose. Too little overlap or
 //!    agreement, a large residual (over all overlapping points, or on the walls of one
-//!    orientation, [`PairQuality::wall_residual_mm`]) or tilt, or a different candidate
-//!    almost as good make the result "unsicher". Almost no overlap ([`FAILED_OVERLAP`]) or
+//!    orientation, [`PairQuality::wall_residual_mm`]), walls that cannot be measured, or tilt,
+//!    or a different candidate almost as good make the result "unsicher". Almost no overlap
+//!    ([`FAILED_OVERLAP`]) or
 //!    edges that almost all disagree ([`FAILED_AGREEMENT`]) make it "gescheitert": such a
 //!    pose is no place of the scan at all.
 //!
@@ -180,9 +181,10 @@ pub struct PairQuality {
     /// [`WALL_BIN_DEG`], a wall seen from either side in the same bin); the largest median
     /// residual of a group of at least [`MIN_WALL_POINTS`] points and [`MIN_WALL_SHARE`] of
     /// all wall points. A pose slid along one wall moves the walls across it, which the
-    /// median over all points (mostly floor and ceiling) hardly shows. 0 if no group is
-    /// that large.
-    pub wall_residual_mm: f64,
+    /// median over all points (mostly floor and ceiling) hardly shows. `None` if no group is
+    /// that large: the walls cannot be measured ([`WALLS_UNMEASURABLE`]), so an automatic
+    /// alignment is not sure.
+    pub wall_residual_mm: Option<f64>,
 }
 
 impl PairQuality {
@@ -192,9 +194,15 @@ impl PairQuality {
         residual_rms_mm: 0.0,
         tilt_deg: 0.0,
         agreement: 0.0,
-        wall_residual_mm: 0.0,
+        wall_residual_mm: None,
     };
 }
+
+/// The reason (German) when no wall group is large enough for
+/// [`PairQuality::wall_residual_mm`]: an automatic alignment is then „unsicher“ (a pose slid
+/// along a wall would not show), one from point pairs is judged without the walls and names
+/// it as information.
+pub const WALLS_UNMEASURABLE: &str = "Wände nicht messbar";
 
 /// Result of [`align_pair`] or [`align_with_pairs`].
 #[derive(Debug, Clone, PartialEq)]
@@ -690,7 +698,7 @@ fn quality(p: &Pair, pose: &Isometry3<f64>, cfg: &AlignConfig) -> PairQuality {
     let wall_residual_mm = wall_groups(&hits)
         .iter()
         .map(|w| w.median_mm)
-        .fold(0.0, f64::max);
+        .reduce(f64::max);
     let overlap = hits.len() as f64 / p.src_quality.len() as f64;
     let mut r: Vec<f64> = hits.into_iter().map(|h| h.0).collect();
     let rms = (r.iter().map(|x| x * x).sum::<f64>() / r.len() as f64).sqrt();
@@ -1043,14 +1051,14 @@ fn plausible(q: &PairQuality, cfg: &AlignConfig) -> bool {
 }
 
 /// The reasons (German) why a pose with quality `q` does not fit closely enough: residual over
-/// all points and on the walls, tilt.
+/// all points and on the walls (where they can be measured), tilt.
 fn fit_reasons(q: &PairQuality, cfg: &AlignConfig) -> Vec<String> {
     let mut why = Vec::new();
     if q.residual_median_mm > cfg.max_residual_mm {
         why.push(format!("Restfehler {:.1} mm", q.residual_median_mm));
     }
-    if q.wall_residual_mm > cfg.max_wall_residual_mm {
-        why.push(format!("Wände {:.1} mm versetzt", q.wall_residual_mm));
+    if let Some(walls) = q.wall_residual_mm.filter(|w| *w > cfg.max_wall_residual_mm) {
+        why.push(format!("Wände {walls:.1} mm versetzt"));
     }
     if q.tilt_deg > cfg.max_tilt_deg {
         why.push(format!("Neigung {:.1}°", q.tilt_deg));
@@ -1067,9 +1075,10 @@ fn unsure_if(why: Vec<String>) -> Verdict {
 }
 
 /// Verdict of the best candidate: failed below [`FAILED_OVERLAP`] or [`FAILED_AGREEMENT`];
-/// else unsure for every threshold it misses (reasons joined by "; "), and for a runner-up
-/// (`runner_up`: its quality) that is as plausible and has at least `ambiguity` of its
-/// overlap.
+/// else unsure for every threshold it misses (reasons joined by "; "), for walls that cannot
+/// be measured ([`WALLS_UNMEASURABLE`]: the 3 mm wall limit cannot pass unchecked), and for a
+/// runner-up (`runner_up`: its quality) that is as plausible and has at least `ambiguity` of
+/// its overlap.
 fn judge(q: &PairQuality, runner_up: Option<&PairQuality>, cfg: &AlignConfig) -> Verdict {
     if q.overlap < FAILED_OVERLAP || q.agreement < FAILED_AGREEMENT {
         return Verdict::Failed(format!(
@@ -1086,6 +1095,9 @@ fn judge(q: &PairQuality, runner_up: Option<&PairQuality>, cfg: &AlignConfig) ->
         why.push(format!("Kanten passen nur zu {:.0} %", 100.0 * q.agreement));
     }
     why.extend(fit_reasons(q, cfg));
+    if q.wall_residual_mm.is_none() {
+        why.push(WALLS_UNMEASURABLE.to_string());
+    }
     if let Some(r) = runner_up {
         if plausible(r, cfg) == plausible(q, cfg) && r.overlap >= cfg.ambiguity * q.overlap {
             why.push(format!(
@@ -1106,9 +1118,10 @@ pub fn verdict(q: &PairQuality, cfg: &AlignConfig) -> Verdict {
 
 /// Verdict of [`align_with_pairs`]: unsure if the pairs lie more than
 /// [`AlignConfig::max_pair_rms_mm`] (RMS, `pair_rms_mm`) from the refined pose, or for a
-/// residual or tilt over its limit ([`fit_reasons`]). Overlap, agreement and ambiguity do not
-/// count: the user chose the place, and at a door or a short corridor the right pose
-/// overlaps too little for them.
+/// residual or tilt over its limit ([`fit_reasons`]). Overlap, agreement, ambiguity and walls
+/// that cannot be measured do not count: the user chose the place, and at a door or a short
+/// corridor the right pose overlaps too little for them and may show no wall. The merge
+/// names unmeasurable walls of such a placement as information.
 fn judge_pairs(q: &PairQuality, pair_rms_mm: f64, cfg: &AlignConfig) -> Verdict {
     let mut why = Vec::new();
     if pair_rms_mm.is_nan() || pair_rms_mm > cfg.max_pair_rms_mm {
@@ -1400,7 +1413,7 @@ mod tests {
             residual_rms_mm: 3.0,
             tilt_deg: 0.2,
             agreement: 0.98,
-            wall_residual_mm: 2.0,
+            wall_residual_mm: Some(2.0),
         }
     }
 
@@ -1413,7 +1426,7 @@ mod tests {
             residual_median_mm: 7.0,
             tilt_deg: 4.0,
             agreement: 0.5,
-            wall_residual_mm: 3.5,
+            wall_residual_mm: Some(3.5),
             ..good()
         };
         let Verdict::Unsure(why) = judge(&bad, None, &cfg) else {
@@ -1466,12 +1479,93 @@ mod tests {
             Verdict::Unsure(_)
         ));
         let walls = PairQuality {
-            wall_residual_mm: 9.0,
+            wall_residual_mm: Some(9.0),
             ..narrow
         };
         assert!(
             matches!(judge_pairs(&walls, 5.0, &cfg), Verdict::Unsure(w) if w.contains("Wände"))
         );
+    }
+
+    /// Without a wall group large enough the 3 mm wall limit cannot be checked: an automatic
+    /// result is unsure for that alone, one from point pairs is judged as before (a door or a
+    /// short corridor may show no wall).
+    #[test]
+    fn unmeasurable_walls_are_unsure_only_without_pairs() {
+        let cfg = AlignConfig::default();
+        let no_walls = PairQuality {
+            wall_residual_mm: None,
+            ..good()
+        };
+        assert_eq!(
+            judge(&no_walls, None, &cfg),
+            Verdict::Unsure(WALLS_UNMEASURABLE.into())
+        );
+        assert_eq!(WALLS_UNMEASURABLE, "Wände nicht messbar");
+        // with other reasons: all of them
+        let tilted = PairQuality {
+            tilt_deg: 4.0,
+            ..no_walls
+        };
+        let Verdict::Unsure(why) = judge(&tilted, None, &cfg) else {
+            panic!("not unsure");
+        };
+        assert!(
+            why.contains("Neigung") && why.contains(WALLS_UNMEASURABLE),
+            "{why}"
+        );
+        // failed stays failed
+        let none = PairQuality {
+            agreement: 0.1,
+            ..no_walls
+        };
+        assert!(matches!(judge(&none, None, &cfg), Verdict::Failed(_)));
+        // point pairs: the verdict of the pairs and the other limits, as with walls
+        let narrow = PairQuality {
+            overlap: 0.04,
+            agreement: 0.6,
+            ..no_walls
+        };
+        assert_eq!(judge_pairs(&narrow, 12.0, &cfg), Verdict::Sure);
+        assert_eq!(
+            judge_pairs(&narrow, 80.0, &cfg),
+            judge_pairs(
+                &PairQuality {
+                    wall_residual_mm: Some(2.0),
+                    ..narrow
+                },
+                80.0,
+                &cfg
+            )
+        );
+    }
+
+    /// Floor and ceiling only: no wall group, so no wall residual; with walls one.
+    #[test]
+    fn wall_residual_needs_walls() {
+        let cfg = AlignConfig::default();
+        let mut slabs = Vec::new();
+        for i in 0..150 {
+            for j in 0..150 {
+                let (x, y) = (i as f64 * 0.02, j as f64 * 0.02);
+                slabs.push(Vector3::new(x, y, 0.0));
+                slabs.push(Vector3::new(x, y, 2.5));
+            }
+        }
+        let at_rest = Isometry3::identity();
+        let q = pair_quality(&slabs, &slabs, &at_rest, &cfg);
+        assert!(q.overlap > 0.9, "{q:?}");
+        assert_eq!(q.wall_residual_mm, None);
+        let mut room = slabs.clone();
+        for i in 0..150 {
+            for k in 0..125 {
+                let (s, z) = (i as f64 * 0.02, k as f64 * 0.02);
+                room.push(Vector3::new(0.0, s, z));
+                room.push(Vector3::new(s, 0.0, z));
+            }
+        }
+        let q = pair_quality(&room, &room, &at_rest, &cfg);
+        assert!(q.wall_residual_mm.is_some_and(|w| w < 1.0), "{q:?}");
     }
 
     #[test]

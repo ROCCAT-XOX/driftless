@@ -94,7 +94,7 @@ fn member(scan: &str, pose: &Isometry3<f64>, included: bool) -> ModelMember {
         residual_median_mm: 0.0,
         residual_rms_mm: 0.0,
         agreement: 1.0,
-        wall_residual_mm: 0.0,
+        wall_residual_mm: None,
         pair_rms_mm: None,
         included,
         color_gain: [1.0; 3],

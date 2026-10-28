@@ -851,7 +851,7 @@ fn member(scan: &str, verdict: &str, included: bool) -> ModelMember {
         residual_median_mm: 1.84,
         residual_rms_mm: 2.5,
         agreement: 0.95,
-        wall_residual_mm: 1.9,
+        wall_residual_mm: Some(1.9),
         pair_rms_mm: None,
         included,
         color_gain: [1.0; 3],
@@ -954,6 +954,27 @@ fn model_node_shows_verdicts() {
     let h = panel(state);
     h.get_by_label(&text::model_stale_version("Modell 001"));
     assert!(h.query_by_label(&text::model_stale("Modell 001")).is_none());
+}
+
+/// On hover over a scan of a model: the residual on the walls, or that they could not be
+/// measured (never „Wände 0,0 mm“).
+#[test]
+fn member_hover_names_the_walls() {
+    let mut state = with_model();
+    state.models[0].report.members[1].wall_residual_mm = None;
+    let mut h = panel(state);
+    h.ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.0);
+    h.get_by_label("2 · Scan 13:30").hover();
+    h.run();
+    h.get_by_label_contains(text::WALLS_UNMEASURABLE);
+    assert!(h.query_by_label_contains("Wände 0,0 mm").is_none());
+    h.get_by_label("3 · Scan 13:35").hover();
+    h.run();
+    h.get_by_label_contains(&text::member_walls(1.9));
+    assert!(h
+        .query_by_label_contains(text::WALLS_UNMEASURABLE)
+        .is_none());
+    assert_eq!(text::member_walls(1.9), "Wände 1,9 mm");
 }
 
 #[test]
