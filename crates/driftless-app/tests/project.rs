@@ -500,8 +500,10 @@ fn new_map_dir_on_changed_settings_copies_bins() {
     let target = map_dir_for(&run, &input, &Progress::new()).unwrap();
     assert!(target.is_new());
     assert_eq!(target.path(), run.dir.join("karte-003"));
-    assert!(
-        names(target.path()).is_empty(),
+    // only the mark of the job that writes into it
+    assert_eq!(
+        names(target.path()),
+        [driftless_app::leftovers::BUSY_FILE],
         "{:?}",
         names(target.path())
     );

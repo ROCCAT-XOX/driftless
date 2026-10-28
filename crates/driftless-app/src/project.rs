@@ -107,11 +107,11 @@ pub const MODEL_PREFIX: &str = "modell-";
 /// One point per cell of this size (m) in a model, as `driftless merge` does by default.
 pub const MODEL_VOXEL: f64 = 0.01;
 const FORMAT: i64 = 1;
-const RUN_PREFIX: &str = "slam-";
-const MAP_PREFIX: &str = "karte-";
+pub(crate) const RUN_PREFIX: &str = "slam-";
+pub(crate) const MAP_PREFIX: &str = "karte-";
 /// Surfaces of a map: `oberflaeche-NNN` made here, other `oberflaeche…` folders by the CLI.
 const SURFACE_PREFIX: &str = "oberflaeche";
-const SURFACE_NUMBERED: &str = "oberflaeche-";
+pub(crate) const SURFACE_NUMBERED: &str = "oberflaeche-";
 /// The clouds of a map folder that can be shown, best first.
 const MAP_CLOUDS: [&str; 4] = ["color.las", "clean.las", "dense.las", "removed.las"];
 
@@ -396,15 +396,26 @@ pub struct MapStatus {
 
 /// A folder a job writes into. One the job created ([`StepDir::is_new`]) is removed again
 /// when the guard is dropped without [`StepDir::keep`], i.e. when the job is cancelled or
-/// fails.
+/// fails; while the job runs it is marked busy ([`crate::leftovers::BUSY_FILE`]), so that no
+/// window offers it for „Aufräumen“.
 #[must_use]
 #[derive(Debug)]
 pub struct StepDir {
     path: PathBuf,
     new: bool,
+    beat: Option<Beat>,
 }
 
 impl StepDir {
+    /// The folder `path` just created for a job: marked busy until kept or dropped.
+    fn made(path: PathBuf) -> StepDir {
+        StepDir {
+            beat: Beat::start(&path),
+            path,
+            new: true,
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -416,6 +427,9 @@ impl StepDir {
 
     /// Keeps the folder; returns its path.
     pub fn keep(mut self) -> PathBuf {
+        if self.beat.take().is_some() {
+            let _ = fs::remove_file(self.path.join(crate::leftovers::BUSY_FILE));
+        }
         self.new = false;
         std::mem::take(&mut self.path)
     }
@@ -423,8 +437,51 @@ impl StepDir {
 
 impl Drop for StepDir {
     fn drop(&mut self) {
+        self.beat = None;
         if self.new {
             let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// The mark of a busy folder ([`crate::leftovers::BUSY_FILE`], naming the process): written at
+/// once, then touched every [`crate::leftovers::BUSY_BEAT`] by a thread of its own until this
+/// is dropped.
+#[derive(Debug)]
+struct Beat {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Beat {
+    fn start(dir: &Path) -> Option<Beat> {
+        use crate::leftovers::{BUSY_BEAT, BUSY_FILE};
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        let file = dir.join(BUSY_FILE);
+        fs::write(&file, driftless_io::lock::holder_text()).ok()?;
+        let (stop, wait) = channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("in-arbeit".into())
+            .spawn(move || {
+                while let Err(RecvTimeoutError::Timeout) = wait.recv_timeout(BUSY_BEAT) {
+                    let touched = fs::File::options().write(true).open(&file);
+                    let _ = touched.and_then(|f| f.set_modified(std::time::SystemTime::now()));
+                }
+            })
+            .ok()?;
+        Some(Beat {
+            stop: Some(stop),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for Beat {
+    fn drop(&mut self) {
+        // the thread ends when the sender goes
+        self.stop = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -652,7 +709,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 }
 
 /// Subfolders `<prefix><digits>` of `dir` as (number, digits, path), by number.
-fn numbered(dir: &Path, prefix: &str) -> Vec<(u64, String, PathBuf)> {
+pub(crate) fn numbered(dir: &Path, prefix: &str) -> Vec<(u64, String, PathBuf)> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -680,7 +737,7 @@ fn create_numbered(dir: &Path, prefix: &str) -> Result<StepDir, ProjectError> {
     loop {
         let path = dir.join(format!("{prefix}{n:03}"));
         match fs::create_dir(&path) {
-            Ok(()) => return Ok(StepDir { path, new: true }),
+            Ok(()) => return Ok(StepDir::made(path)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
             Err(e) => {
                 return Err(ProjectError(text::io_error(
@@ -1304,6 +1361,7 @@ pub fn map_dir_for(
         return Ok(StepDir {
             path: dir.clone(),
             new: false,
+            beat: None,
         });
     }
     let target = create_numbered(&run.dir, MAP_PREFIX)?;

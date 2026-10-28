@@ -10,6 +10,7 @@ pub mod cloud;
 pub mod disk;
 pub mod icon;
 pub mod jobs;
+pub mod leftovers;
 pub mod lod;
 pub mod logfile;
 pub mod overlay;

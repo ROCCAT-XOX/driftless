@@ -24,7 +24,10 @@ pub mod theme;
 pub mod tools;
 pub mod view3d;
 
-pub use app::{parse_args, Args, DialogFolder, DriftlessApp, LastFolders, UI_KEY};
+pub use crate::leftovers::Leftover;
+pub use app::{
+    parse_args, Args, DialogFolder, DriftlessApp, LastFolders, FOCUS_DELAY, FOCUS_GAP, UI_KEY,
+};
 
 use crate::camera::CameraMode;
 use crate::jobs::JobStatus;
@@ -246,6 +249,9 @@ pub enum Action {
     /// „Aus der Ansicht nehmen“: what the view shows from the folder `dir` (or from a model
     /// that uses it) goes: the cloud, the surface, the run drawn, „Von Hand ausrichten“.
     Unshow(PathBuf),
+    /// „Aufräumen“: what jobs cut off left behind ([`AppState::leftovers_shown`]) goes to the
+    /// trash.
+    CleanUp,
 }
 
 /// A question the window asks before a change of the project, in a small window over the view
@@ -436,11 +442,25 @@ pub struct Tree {
     pub point_pairs: Vec<PointPairEntry>,
     /// Why `modelle/punktpaare.toml` cannot be read.
     pub point_pairs_error: Option<String>,
+    /// What jobs cut off left behind ([`crate::leftovers`]).
+    pub leftovers: Vec<Leftover>,
 }
 
-/// Reads the tree of `project` from disk: every scan folder, run, map, surface and model. Can
-/// take seconds on a network share or with files iCloud moved away: call it off the UI thread.
+/// Reads the tree of `project` from disk: every scan folder, run, map, surface and model, and
+/// what jobs cut off left behind. A run without its `slam.json` or a map without its `map.json`
+/// (one being computed, or a leftover) is not in the tree. Can take seconds on a network share
+/// or with files iCloud moved away: call it off the UI thread.
 pub fn read_tree(project: &Project) -> Tree {
+    let complete = |s: &crate::project::ScanEntry, mut run: RunInfo| {
+        // a run made by the CLI and added by hand stays as it is
+        let added = s.extra_runs.contains(&run.dir);
+        if !added && !run.dir.join("slam.json").is_file() {
+            return None;
+        }
+        run.maps
+            .retain(|m| m.dir.join(driftless_steps::map::REPORT).is_file());
+        Some(run)
+    };
     let scans = project
         .scans
         .iter()
@@ -449,9 +469,14 @@ pub fn read_tree(project: &Project) -> Tree {
             name: s.name.clone(),
             state: project.scan_state(&s.id),
             no_color: project.color_missing(&s.id),
-            runs: project.runs(&s.id),
+            runs: project
+                .runs(&s.id)
+                .into_iter()
+                .filter_map(|r| complete(s, r))
+                .collect(),
         })
         .collect();
+    let ids: Vec<String> = project.scans.iter().map(|s| s.id.clone()).collect();
     let (point_pairs, point_pairs_error) = match point_pairs(project) {
         Ok(pairs) => (pairs, None),
         Err(e) => (Vec::new(), Some(e)),
@@ -461,6 +486,7 @@ pub fn read_tree(project: &Project) -> Tree {
         models: project.models(),
         point_pairs,
         point_pairs_error,
+        leftovers: crate::leftovers::find(&project.dir, &ids),
     }
 }
 
@@ -598,6 +624,11 @@ pub struct AppState {
     pub disk: Option<crate::disk::DiskUse>,
     /// The question asked before a change of the project, while its window is open.
     pub ask: Option<Ask>,
+    /// What jobs cut off left behind, as the last read of the tree found it.
+    pub leftovers: Vec<Leftover>,
+    /// How long a leftover must lie untouched before it is offered; `None`:
+    /// [`crate::leftovers::QUIET`] (tests: zero).
+    pub leftover_quiet: Option<std::time::Duration>,
 }
 
 impl AppState {
@@ -661,6 +692,7 @@ impl AppState {
         self.models = tree.models;
         self.point_pairs = tree.point_pairs;
         self.point_pairs_error = tree.point_pairs_error;
+        self.leftovers = tree.leftovers;
         // „Von Hand ausrichten“ of a model that is gone ends
         let gone = self
             .pairs
@@ -781,6 +813,21 @@ impl AppState {
         let folders = crate::disk::tree_folders(&tree);
         let scans: Vec<PathBuf> = project.scans.iter().map(|s| s.path.clone()).collect();
         Some(move || crate::disk::measure(&dir, &folders, &scans, free))
+    }
+
+    /// The leftovers „Daten“ offers for „Aufräumen“: those untouched for the quiet time.
+    pub fn leftovers_shown(&self) -> Vec<&Leftover> {
+        let quiet = self.leftover_quiet.unwrap_or(crate::leftovers::QUIET);
+        let now = std::time::SystemTime::now();
+        self.leftovers
+            .iter()
+            .filter(|l| crate::leftovers::settled(l, quiet, now))
+            .collect()
+    }
+
+    /// Why „Aufräumen“ waits: a step runs or waits in this window.
+    pub fn clean_up_blocked(&self) -> Option<&'static str> {
+        (self.running.is_some() || !self.queue.is_empty()).then_some(text::CLEAN_UP_WAIT)
     }
 
     /// The size of a folder of the tree, if measured.

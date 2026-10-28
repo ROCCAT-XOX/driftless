@@ -904,6 +904,45 @@ pub fn other_scan_times(run: (f64, f64), scan: (f64, f64)) -> String {
     )
 }
 
+// After an interruption: what jobs cut off left behind
+/// Beside each leftover in „Daten“.
+pub const INCOMPLETE: &str = "unvollständig";
+/// The start of the line above the leftovers.
+pub const INCOMPLETE_TITLE: &str = "Unvollständig";
+pub const CLEAN_UP: &str = "Aufräumen";
+pub const CLEAN_UP_HINT: &str = "Legt diese Reste abgebrochener Schritte in den Papierkorb";
+pub const CLEAN_UP_WAIT: &str = "Erst nach dem Schritt, der gerade läuft oder wartet";
+pub const CLEAN_UP_JOB: &str = "Aufräumen";
+/// At most this many leftovers are listed by name; the rest is counted.
+pub const INCOMPLETE_LISTED: usize = 5;
+
+/// The line above the leftovers: „Unvollständig – Reste abgebrochener Schritte (3 · 2,4 GB)“.
+pub fn incomplete_title(count: usize, bytes: u64) -> String {
+    format!(
+        "{INCOMPLETE_TITLE} – Reste abgebrochener Schritte (Absturz, Stromausfall): {count} · {}",
+        size(bytes)
+    )
+}
+
+/// One leftover: „SLAM 002 · unvollständig · 12 KB“.
+pub fn incomplete_entry(label: &str, bytes: u64) -> String {
+    format!("{label} · {INCOMPLETE} · {}", size(bytes))
+}
+
+/// Below the leftovers listed: „und 4 weitere“.
+pub fn incomplete_more(count: usize) -> String {
+    format!("und {count} weitere")
+}
+
+/// After „Aufräumen“.
+pub fn cleaned_up(count: usize, bytes: u64) -> String {
+    format!(
+        "{count} {} in den Papierkorb gelegt ({})",
+        if count == 1 { "Rest" } else { "Reste" },
+        size(bytes)
+    )
+}
+
 /// The label of the read of a project folder (status bar while a project is opened).
 pub const READ_PROJECT_JOB: &str = "Projekt lesen";
 /// In the field while a project is being opened.

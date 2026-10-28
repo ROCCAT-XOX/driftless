@@ -28,7 +28,7 @@ use eframe::egui;
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Key of the last opened project in eframe's storage.
 const LAST_PROJECT_KEY: &str = "letztes_projekt";
@@ -38,6 +38,13 @@ pub const UI_KEY: &str = "ui-v2";
 /// While a step runs, the window draws this often, so progress and runtime move (the job
 /// runner only wakes the UI when a job ends, see `crate::jobs`).
 const REPAINT_WHILE_BUSY: Duration = Duration::from_millis(100);
+
+/// After the window got the focus back, the tree is read again this much later (switching back
+/// and forth reads it once).
+pub const FOCUS_DELAY: Duration = Duration::from_millis(300);
+/// The focus reads the tree again at most once in this time.
+pub const FOCUS_GAP: Duration = Duration::from_secs(2);
+
 /// Lines kept in the log; older ones are dropped.
 const LOG_LIMIT: usize = 10_000;
 /// Messages kept for the status bar (it shows the last); older ones are dropped.
@@ -291,6 +298,8 @@ enum HelperTask {
     /// „Ordner neu zuordnen …“: points the scan (id) at the folder, if it holds the same scan
     /// (reads its bags).
     Relink { id: String, dir: PathBuf },
+    /// „Aufräumen“: these leftovers (path, bytes) to the trash.
+    CleanUp(Vec<(PathBuf, u64)>),
     /// „Löschen …“: the folder to the trash, with its name and size for the message.
     Trash {
         dir: PathBuf,
@@ -445,6 +454,10 @@ pub struct DriftlessApp {
     low_space_told: bool,
     /// How folders go to the trash ([`crate::trash::system_trash`]).
     trash: crate::trash::Trash,
+    /// When the tree is read again after the window got the focus back ([`FOCUS_DELAY`]).
+    focus_read_at: Option<Instant>,
+    /// When the last such read started ([`FOCUS_GAP`]).
+    focus_read: Option<Instant>,
 }
 
 impl DriftlessApp {
@@ -497,6 +510,8 @@ impl DriftlessApp {
             free_space: crate::disk::free_space,
             low_space_told: false,
             trash: crate::trash::system_trash,
+            focus_read_at: None,
+            focus_read: None,
         }
     }
 
@@ -1601,6 +1616,17 @@ impl DriftlessApp {
             || self.status_asked != self.state.tree_version
             || self.gaps_asked != self.state.tree_version
             || (self.state.project.is_some() && self.disk_asked != self.state.tree_version)
+            || self.focus_read_at.is_some()
+    }
+
+    /// The window got the focus back: the tree is read again [`FOCUS_DELAY`] later (a scan
+    /// folder may have come back, another window or program may have computed), at most once
+    /// per [`FOCUS_GAP`].
+    fn focus_back(&mut self) {
+        let recent = self.focus_read.is_some_and(|t| t.elapsed() < FOCUS_GAP);
+        if self.state.project.is_some() && self.focus_read_at.is_none() && !recent {
+            self.focus_read_at = Some(Instant::now() + FOCUS_DELAY);
+        }
     }
 
     /// Takes what the helper finished and starts its next task: queued ones first, then the
@@ -1638,6 +1664,15 @@ impl DriftlessApp {
                 }
                 (Some(HelperTask::SaveChoices(..)), Err(e)) => self.error(e.to_string()),
                 (Some(HelperTask::Relink { id, .. }), result) => self.relinked(&id, result),
+                (Some(HelperTask::CleanUp(_)), Ok(JobOutput::CleanedUp { moved, failed })) => {
+                    if !moved.is_empty() {
+                        self.info(text::cleaned_up(moved.len(), moved.iter().sum()));
+                    }
+                    for e in failed {
+                        self.error(e);
+                    }
+                    self.refresh_tree();
+                }
                 (Some(HelperTask::Trash { dir, label, bytes }), result) => match result {
                     Ok(_) => {
                         if self.selection_in(&dir) {
@@ -1756,6 +1791,19 @@ impl DriftlessApp {
                     })
                 })
             }
+            HelperTask::CleanUp(leftovers) => {
+                let (leftovers, trash) = (leftovers.clone(), self.trash);
+                self.helper.start(text::CLEAN_UP_JOB, move |_| {
+                    let (mut moved, mut failed) = (Vec::new(), Vec::new());
+                    for (path, bytes) in leftovers {
+                        match trash(&path) {
+                            Ok(()) => moved.push(bytes),
+                            Err(e) => failed.push(e),
+                        }
+                    }
+                    Ok(JobOutput::CleanedUp { moved, failed })
+                })
+            }
             HelperTask::Trash { dir, .. } => {
                 let (dir, trash) = (dir.clone(), self.trash);
                 self.helper.start(text::TRASH_JOB, move |_| {
@@ -1837,6 +1885,11 @@ impl DriftlessApp {
         self.take_lines(lines);
         let lines = self.surface_loader.take_log();
         self.take_lines(lines);
+        if self.focus_read_at.is_some_and(|at| Instant::now() >= at) {
+            self.focus_read_at = None;
+            self.focus_read = Some(Instant::now());
+            self.refresh_tree();
+        }
         self.tick_tree();
         self.keep_choices();
         // the read of a project being opened, where no cloud or surface is being loaded
@@ -2327,6 +2380,18 @@ impl DriftlessApp {
                 None => self.helper_queue.push_back(HelperTask::Relink { id, dir }),
             },
             Action::Unshow(dir) => self.unshow(&dir),
+            Action::CleanUp => match self.state.clean_up_blocked() {
+                Some(why) => self.error(why.to_string()),
+                None => {
+                    let leftovers = self
+                        .state
+                        .leftovers_shown()
+                        .iter()
+                        .map(|l| (l.path.clone(), l.bytes))
+                        .collect();
+                    self.helper_queue.push_back(HelperTask::CleanUp(leftovers));
+                }
+            },
             Action::Delete(dir) => {
                 self.state.ask = None;
                 let Some(question) = self.state.delete_question(&dir) else {
@@ -2714,6 +2779,14 @@ impl DriftlessApp {
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_requested() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        let focused = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::WindowFocused(true)))
+        });
+        if focused {
+            self.focus_back();
         }
         self.tick();
         if self.take_close() {

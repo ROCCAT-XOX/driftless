@@ -163,6 +163,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     ui.weak(text::project_line(&project.name, state.scans.len()))
         .on_hover_text(project.dir.display().to_string());
     disk_lines(ui, state);
+    leftover_lines(ui, state, &mut action);
     if state.scans.is_empty() {
         hint(ui, text::EMPTY_NO_SCANS);
         if main_button(ui, text::ADD_SCAN, None, text::COMPUTE_HINT) {
@@ -226,6 +227,43 @@ fn disk_lines(ui: &mut Ui, state: &AppState) {
             RichText::new(format!("{} {}", icon::UNSURE, text::low_space(free))).color(DARK.warn);
         ui.add(egui::Label::new(warn).wrap());
     }
+}
+
+/// What jobs cut off left behind, as „unvollständig“ with their sizes (the path on hover), and
+/// „Aufräumen“ that moves them to the trash; it waits while a step runs or waits.
+fn leftover_lines(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
+    let shown = state.leftovers_shown();
+    if shown.is_empty() {
+        return;
+    }
+    let bytes = shown.iter().map(|l| l.bytes).sum();
+    let title = format!(
+        "{} {}",
+        icon::UNSURE,
+        text::incomplete_title(shown.len(), bytes)
+    );
+    ui.add_space(4.0);
+    ui.add(egui::Label::new(RichText::new(title).color(DARK.warn)).wrap());
+    for leftover in shown.iter().take(text::INCOMPLETE_LISTED) {
+        ui.add(egui::Label::new(text::incomplete_entry(&leftover.label, leftover.bytes)).wrap())
+            .on_hover_text(leftover.path.display().to_string());
+    }
+    if shown.len() > text::INCOMPLETE_LISTED {
+        let rest = &shown[text::INCOMPLETE_LISTED..];
+        let paths: Vec<String> = rest.iter().map(|l| l.path.display().to_string()).collect();
+        ui.weak(text::incomplete_more(rest.len()))
+            .on_hover_text(paths.join("\n"));
+    }
+    let blocked = state.clean_up_blocked();
+    let r = ui.add_enabled(blocked.is_none(), egui::Button::new(text::CLEAN_UP));
+    if r.clicked() {
+        *action = Some(Action::CleanUp);
+    }
+    match blocked {
+        Some(why) => r.on_disabled_hover_text(why),
+        None => r.on_hover_text(text::CLEAN_UP_HINT),
+    };
+    ui.add_space(4.0);
 }
 
 /// The card of a scan: its name and status; a click selects it (again: deselects). While it

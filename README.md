@@ -218,7 +218,13 @@ slim status bar:
   use it, and moves the folder to the system's trash – never deleted for good; on Windows a network or
   removable drive, which has no trash, is refused. It is locked while a step works on it; while the
   view shows it, the question offers „Aus der Ansicht nehmen“ first. A run made with the command line
-  and added by hand is only taken out of the project. The precision Schnell · Genau · Maximal sets only the voxel size of the map (0.02 /
+  and added by hand is only taken out of the project. What a job cut off by a crash, a force quit or
+  a power cut left behind – a run, map, surface or model folder without its report, a stale
+  `<name>.tmp` – is listed as „unvollständig“ (not as a run or map that waits) and „Aufräumen“ moves it
+  to the trash; a folder a job still writes is marked `.in-arbeit` (touched every 10 s) and left
+  alone, as is anything written to in the last two minutes. The tree is read again when the window
+  gets the focus back (a scan drive attached again, results of another window). The precision
+  Schnell · Genau · Maximal sets only the voxel size of the map (0.02 /
   0.01 / 0.005 m; Maximal needs over 4 GB of memory on large scans, another voxel shows „Eigene“). „Alle
   rechnen“ queues every new or stale scan and computes them one after the other; with a scan selected,
   „Rechnen“ computes only that one. The runs and maps of a scan unfold below its card. „▸ Erweitert“

@@ -68,7 +68,7 @@ fn lock_path(file: &Path) -> PathBuf {
 
 /// Who holds a lock taken now: „Prozess 1234 · Benutzer anna · Rechner Werkstatt-PC“ (user and
 /// computer as far as the environment names them).
-fn holder_text() -> String {
+pub fn holder_text() -> String {
     let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
     let mut text = format!("Prozess {}", std::process::id());
     if let Some(user) = var("USER").or_else(|| var("USERNAME")) {
