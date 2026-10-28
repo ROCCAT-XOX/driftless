@@ -126,6 +126,7 @@ fn model_dir(name: &str) -> PathBuf {
         seconds_total: 0.0,
         peak_rss_bytes: 0,
         include_unsure: false,
+        warnings: Vec::new(),
     };
     fs::write(
         dir.join(MODEL_REPORT),

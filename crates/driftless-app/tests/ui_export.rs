@@ -110,6 +110,7 @@ fn tree_state() -> AppState {
                 seconds_total: 1.0,
                 peak_rss_bytes: 0,
                 include_unsure: false,
+                warnings: Vec::new(),
             },
             surfaces: Vec::new(),
         }],

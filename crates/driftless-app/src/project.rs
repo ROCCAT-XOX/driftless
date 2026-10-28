@@ -48,6 +48,7 @@ use crate::ui::text;
 use driftless_gpu::GpuPref;
 use driftless_io::atomic_write;
 use driftless_io::bag::BagReader;
+use driftless_io::paths::relative_text;
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_map::surface::SurfaceConfig;
@@ -353,32 +354,22 @@ struct RunFile {
     slam: SlamSettings,
 }
 
-/// The absolute, resolved form of an existing path (without the `\\?\` that Windows adds to
-/// a plain drive path). Paths in a [`Project`] are always in this form.
-pub fn canonical(path: &Path) -> io::Result<PathBuf> {
-    let p = fs::canonicalize(path)?;
-    if cfg!(windows) {
-        if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
-            if rest.as_bytes().get(1) == Some(&b':') {
-                return Ok(PathBuf::from(rest));
-            }
-        }
-    }
-    Ok(p)
-}
+/// The absolute, resolved form of an existing path, in its plain form on Windows: `C:\…`
+/// and `\\server\share\…`, without the `\\?\` that resolving adds (also for a share or a
+/// mapped drive). Paths in a [`Project`] are always in this form.
+pub use driftless_io::paths::canonical;
 
 /// `path` as written to a project file: relative to `base` with `/` if inside it, else
-/// absolute.
+/// absolute. Compared as text, so a share of Windows counts as well.
 fn to_stored(base: &Path, path: &Path) -> Result<String, ProjectError> {
-    let text = match path.strip_prefix(base) {
-        Ok(rel) if !rel.as_os_str().is_empty() => rel
-            .components()
-            .map(|c| c.as_os_str().to_str())
-            .collect::<Option<Vec<_>>>()
-            .map(|parts| parts.join("/")),
-        _ => path.to_str().map(str::to_string),
-    };
-    text.ok_or_else(|| ProjectError(format!("Pfad {} ist kein gültiger Text", path.display())))
+    let text = path
+        .to_str()
+        .ok_or_else(|| ProjectError(format!("Pfad {} ist kein gültiger Text", path.display())))?;
+    let inside = base
+        .to_str()
+        .and_then(|b| relative_text(b, text))
+        .filter(|rel| rel != "." && rel != ".." && !rel.starts_with("../"));
+    Ok(inside.unwrap_or_else(|| text.to_string()))
 }
 
 /// Windows device names, which name no folder whatever the extension.

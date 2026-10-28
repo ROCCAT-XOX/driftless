@@ -467,12 +467,31 @@ fn disabled_pairs_are_ignored() {
     };
     let id = merge_input_id(&req).unwrap();
     assert_eq!(id, merge_input_id(&plain).unwrap());
-    let report = run_merge(&req, &Progress::new()).unwrap();
+    let p = Progress::new();
+    let report = run_merge(&req, &p).unwrap();
     let c = &report.members[2];
     assert_eq!(c.verdict, "unsicher", "{}", describe(&report));
     assert_ne!(c.method, "punktpaare");
     assert!(!c.included);
     assert_eq!(report.input_id, id);
+    // The switched-on entry that names no two of the maps is not skipped silently: a warning
+    // in the log and in `modell.json`; the switched-off one gives none.
+    let logged: Vec<String> = p
+        .take_log()
+        .into_iter()
+        .filter_map(|l| match l {
+            driftless_io::progress::LogLine::Warning(w) => Some(w),
+            driftless_io::progress::LogLine::Info(_) => None,
+        })
+        .collect();
+    let expected = format!(
+        "Punktpaare Eintrag 2: {} und {} sind nicht zwei der gewählten Karten, nicht genutzt",
+        s.c.join("driftless").display(),
+        s.a.join("anderswo").display()
+    );
+    assert_eq!(report.warnings, std::slice::from_ref(&expected));
+    assert!(logged.contains(&expected), "{logged:?}");
+    assert_eq!(read_model(&out).unwrap().warnings, report.warnings);
 
     // Switched on, the pairs count.
     let mut on = req.clone();
@@ -626,9 +645,82 @@ fn stored_text_round_trips_with_file_resolution() {
     let back = PointPairs::load(&file)
         .unwrap()
         .resolved(file.parent().unwrap());
+    // `..` is taken off in the text: no part `..` is left for the file system to resolve
+    // (below a verbatim Windows path it would be taken literally).
+    assert_eq!(back[0].a, inside);
+    assert!(back
+        .iter()
+        .flat_map(|e| [&e.a, &e.b])
+        .all(|p| !p.components().any(|c| c == std::path::Component::ParentDir)));
     let canon = |p: &Path| fs::canonicalize(p).unwrap();
     assert_eq!(canon(&back[0].a), inside);
     assert_eq!(canon(&back[0].b), outside);
     assert_eq!(canon(&back[1].a), below);
     assert_eq!(canon(&back[1].b), inside);
+}
+
+/// A project on a Windows share (`\\localhost\C$\…`): the map folders of `punktpaare.toml`,
+/// relative to `modelle/` with `..`, resolve below the share and match the members' folders
+/// as resolving gives them (in their plain form, without `\\?\UNC\`). Skipped where the
+/// share cannot be read (it needs an administrator, as on the CI runner).
+#[cfg(windows)]
+#[test]
+fn pairs_match_members_on_a_share() {
+    use driftless_io::paths::canonical;
+    use driftless_steps::merge::pair_members;
+    let local = canonical(&tmp("punktpaare-freigabe")).unwrap();
+    let text = local.to_str().unwrap().to_string();
+    let Some(rest) = text
+        .get(3..)
+        .filter(|_| text[..3].eq_ignore_ascii_case("C:\\"))
+    else {
+        eprintln!("übersprungen: {text} liegt nicht auf C:");
+        return;
+    };
+    let share = PathBuf::from(format!(r"\\localhost\C$\{rest}"));
+    if fs::metadata(&share).is_err() {
+        eprintln!("übersprungen: {} nicht lesbar", share.display());
+        return;
+    }
+    let project = share.join("projekt");
+    let models = project.join("modelle");
+    let maps: Vec<PathBuf> = ["a", "b"]
+        .iter()
+        .map(|s| {
+            project
+                .join("scans")
+                .join(s)
+                .join("slam-001")
+                .join("karte-001")
+        })
+        .collect();
+    for d in maps.iter().chain([&models]) {
+        fs::create_dir_all(d).unwrap();
+    }
+    let members: Vec<MergeMember> = maps
+        .iter()
+        .map(|m| MergeMember {
+            map_dir: canonical(m).unwrap(),
+            ..member(m)
+        })
+        .collect();
+    for m in &members {
+        let shown = m.map_dir.to_string_lossy().into_owned();
+        assert!(!shown.starts_with(r"\\?\"), "{shown}");
+    }
+    let req = request(members, &models.join("modell-001"));
+    let (in_c, in_a) = pairs_c_in_a();
+    let mut pairs = PointPairs::default();
+    pairs
+        .add(pair_entry(
+            Path::new("../scans/a/slam-001/karte-001"),
+            Path::new("../scans/b/slam-001/karte-001"),
+            in_a,
+            in_c,
+        ))
+        .unwrap();
+    for base in [canonical(&models).unwrap(), models.clone()] {
+        let resolved = pairs.resolved(&base);
+        assert_eq!(pair_members(&req, &resolved[0]), Some((0, 1)), "{base:?}");
+    }
 }

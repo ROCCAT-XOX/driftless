@@ -6,7 +6,7 @@
 //! [`driftless_steps::pairs`]); its map folders are relative to the folder of the file.
 
 use driftless_slam::align::AlignConfig;
-use driftless_steps::merge::{pair_members, run_merge, MergeMember, MergeRequest, ModelReport};
+use driftless_steps::merge::{run_merge, MergeMember, MergeRequest, ModelReport};
 use driftless_steps::pairs::PointPairs;
 use driftless_steps::scan::extrinsic_values;
 use driftless_steps::slam::SlamSettings;
@@ -114,25 +114,6 @@ fn request(args: &Args) -> Result<MergeRequest, Box<dyn std::error::Error>> {
     })
 }
 
-/// A warning for every switched-on entry of the point pairs that names no two scans of
-/// `req` (a mistyped folder would otherwise be ignored silently).
-fn unused_pairs(req: &MergeRequest) -> Vec<String> {
-    req.pairs
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.enabled && pair_members(req, e).is_none())
-        .map(|(k, e)| {
-            format!(
-                "Punktpaare Eintrag {}: {} und {} sind nicht zwei der gewählten Karten, nicht \
-                 genutzt",
-                k + 1,
-                e.a.display(),
-                e.b.display()
-            )
-        })
-        .collect()
-}
-
 fn folder_name(p: &Path) -> String {
     p.file_name().map_or_else(
         || p.display().to_string(),
@@ -182,11 +163,9 @@ fn lines(report: &ModelReport) -> Vec<String> {
 
 pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let req = request(args)?;
-    let console = crate::console();
-    for w in unused_pairs(&req) {
-        console.warn(w);
-    }
-    let report = run_merge(&req, &console)?;
+    // A switched-on point pair entry that names no two of the maps is warned about by the
+    // merge itself (and kept in `modell.json`).
+    let report = run_merge(&req, &crate::console())?;
     for line in lines(&report) {
         println!("{line}");
     }
@@ -293,10 +272,6 @@ mod tests {
         assert_eq!(r.pairs.len(), 3);
         assert_eq!(r.pairs[0].a, dir.join("a").join("driftless"));
         assert_eq!(r.pairs[0].b, r.members[1].map_dir);
-        // Only the second names a folder that is not a map of the merge.
-        let w = unused_pairs(&r);
-        assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("Eintrag 2"), "{w:?}");
 
         let e = parse(&["a", "b", "-o", "m", "--punktpaare", "fehlt.toml"]).unwrap_err();
         assert!(e.contains("fehlt.toml nicht gefunden"), "{e}");

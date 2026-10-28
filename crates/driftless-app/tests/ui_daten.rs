@@ -865,6 +865,7 @@ fn report(members: Vec<ModelMember>) -> ModelReport {
         seconds_total: 12.0,
         peak_rss_bytes: 0,
         include_unsure: false,
+        warnings: Vec::new(),
     }
 }
 

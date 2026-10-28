@@ -16,6 +16,7 @@ use crate::merge::{member_transform, read_model, MODEL_LAS, MODEL_REPORT};
 use driftless_export::mesh::{self, obj_files, Mesh};
 use driftless_export::traj::{write_traj, TrajFormat};
 use driftless_export::{read_points, write_points, PointFormat, Points, ScanInfo, PHASE_WRITE};
+use driftless_io::paths;
 use driftless_io::progress::Progress;
 use serde::Serialize;
 use std::ffi::OsString;
@@ -410,11 +411,11 @@ pub fn check_export(req: &ExportRequest) -> Result<(), StepError> {
         .source
         .files()
         .iter()
-        .filter_map(|f| fs::canonicalize(f).ok())
+        .filter_map(|f| paths::canonical(f).ok())
         .collect();
     for target in export_targets(req) {
         // A target that does not exist cannot be a file of the source.
-        if let Ok(t) = fs::canonicalize(&target) {
+        if let Ok(t) = paths::canonical(&target) {
             if sources.contains(&t) {
                 return Err(format!("Ziel ist die Quelle selbst: {}", target.display()).into());
             }

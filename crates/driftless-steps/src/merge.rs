@@ -40,8 +40,8 @@ use crate::error::{check_cancel, failed, StepError};
 use crate::map::{clean_stage_id, hex, map_input_for, peak_rss_bytes, CLEAN_BIN, REPORT};
 use crate::pairs::PointPairEntry;
 use crate::slam::SlamSettings;
-use driftless_io::atomic_write;
 use driftless_io::progress::Progress;
+use driftless_io::{atomic_write, paths};
 use driftless_map::{
     intensity_grays, load_stage, smooth_surfaces, stage_fits, write_las_sources, write_ply_sources,
     Cloud, MapError, SmoothConfig,
@@ -172,6 +172,11 @@ pub struct ModelReport {
     /// field.
     #[serde(default)]
     pub include_unsure: bool,
+    /// What the merge warned about (German, as in the log): a switched-on point pair entry
+    /// that names no two of the scans or cannot be used, a `color.las` that does not fit its
+    /// map. Empty in a model written before the field.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// `T_i` of a member: world of its scan → model.
@@ -229,13 +234,22 @@ type HandPairs = Vec<(Vector3<f64>, Vector3<f64>)>;
 
 /// The point pairs that count ([`MergeRequest::pairs`]) by members (smaller, larger number),
 /// those of several entries one after another in their order, and a warning (German) for
-/// every switched-on entry of two members that cannot be used ([`PointPairEntry::check`]):
-/// it is left out, as if switched off.
+/// every switched-on entry that is left out, as if switched off: one whose map folders are
+/// not those of two members ([`pair_members`]: another scan, another map of it, or a path
+/// that does not resolve to the member's folder), and one of two members that cannot be used
+/// ([`PointPairEntry::check`]).
 fn hand_pairs(req: &MergeRequest) -> (BTreeMap<(usize, usize), HandPairs>, Vec<String>) {
     let mut out: BTreeMap<(usize, usize), HandPairs> = BTreeMap::new();
     let mut warnings = Vec::new();
-    for e in req.pairs.iter().filter(|e| e.enabled) {
+    for (k, e) in req.pairs.iter().enumerate().filter(|(_, e)| e.enabled) {
         let Some((i, j)) = pair_members(req, e) else {
+            warnings.push(format!(
+                "Punktpaare Eintrag {}: {} und {} sind nicht zwei der gewählten Karten, nicht \
+                 genutzt",
+                k + 1,
+                e.a.display(),
+                e.b.display()
+            ));
             continue;
         };
         if let Err(m) = e.check() {
@@ -302,9 +316,10 @@ pub fn merge_input_id(req: &MergeRequest) -> Result<String, StepError> {
     Ok(hex(&input_text(req)?.0))
 }
 
-/// The path as the file system resolves it, else as given.
+/// The path as the file system resolves it, in its plain form ([`paths::canonical`]), else
+/// as given.
 fn canonical(p: &Path) -> PathBuf {
-    fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    paths::canonical(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Checks the request; returns the clean id of every member and the input id.
@@ -348,22 +363,25 @@ fn stale_map(m: &MergeMember) -> StepError {
 
 /// Takes the colours of `color.las` in `map_dir` into `cloud` (its `clean.bin`) if it holds
 /// the same points in the same order. Returns whether it did; a file that does not fit
-/// gives a warning.
+/// gives a warning, also kept in `warnings`.
 fn attach_color(
     cloud: &mut Cloud,
     member: &MergeMember,
     progress: &Progress,
+    warnings: &mut Vec<String>,
 ) -> Result<bool, StepError> {
     let path = member.map_dir.join("color.las");
     if !path.is_file() {
         return Ok(false);
     }
-    let unfit = |why: String| {
-        progress.warn(format!(
+    let mut unfit = |why: String| {
+        let w = format!(
             "{}: {} passt nicht zur Karte ({why}), Scan bleibt ungefärbt",
             name(member),
             path.display()
-        ));
+        );
+        progress.warn(w.clone());
+        warnings.push(w);
         Ok(false)
     };
     let err = |e: las::Error| StepError::Failed(format!("{}: {e}", path.display()));
@@ -458,10 +476,12 @@ fn better(a: &Alignment, b: &Alignment) -> bool {
         .is_gt()
 }
 
-/// Step 1 of the module documentation on the thinned points `pts` of the members.
+/// Step 1 of the module documentation on the thinned points `pts` of the members, with the
+/// point pairs that count ([`hand_pairs`]).
 fn chain(
     req: &MergeRequest,
     pts: &[Vec<Vector3<f64>>],
+    by_hand: &BTreeMap<(usize, usize), HandPairs>,
     progress: &Progress,
 ) -> Result<Vec<Placement>, StepError> {
     let n = pts.len();
@@ -474,10 +494,6 @@ fn chain(
         unsure_anchor: None,
     });
     let mut cache: BTreeMap<(usize, usize), Alignment> = BTreeMap::new();
-    let (by_hand, warnings) = hand_pairs(req);
-    for w in warnings {
-        progress.warn(w);
-    }
     // Every pair is aligned at most once, each open member against each anchor: n (n − 1) / 2
     // when every member is in the model, fewer otherwise (the rest is counted at the end).
     let total = (n * (n - 1) / 2) as u64;
@@ -497,7 +513,7 @@ fn chain(
                 if let Entry::Vacant(slot) = cache.entry((i, j)) {
                     check_cancel(progress)?;
                     let start = Instant::now();
-                    let a = match pairs_between(&by_hand, i, j) {
+                    let a = match pairs_between(by_hand, i, j) {
                         Some(pairs) => {
                             align_with_pairs(&pts[i], &pts[j], &pairs, &req.align, progress)
                         }
@@ -779,6 +795,10 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
         .into());
     }
     let n = req.members.len();
+    let (by_hand, mut warnings) = hand_pairs(req);
+    for w in &warnings {
+        progress.warn(w.clone());
+    }
 
     progress.phase("Karten laden", Some(n as u64));
     let mut clouds = Vec::with_capacity(n);
@@ -789,7 +809,7 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
             progress.info(format!("{}: {e}", m.map_dir.join(CLEAN_BIN).display()));
             stale_map(m)
         })?;
-        let colored = attach_color(&mut cloud, m, progress)?;
+        let colored = attach_color(&mut cloud, m, progress, &mut warnings)?;
         progress.info(format!(
             "{}: {} Punkte{}",
             name(m),
@@ -805,7 +825,7 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
         progress.advance(1);
     }
 
-    let placed = chain(req, &pts, progress)?;
+    let placed = chain(req, &pts, &by_hand, progress)?;
     drop(pts);
     check_cancel(progress)?;
 
@@ -880,6 +900,7 @@ pub fn run_merge(req: &MergeRequest, progress: &Progress) -> Result<ModelReport,
         seconds_total: (start.elapsed().as_secs_f64() * 1000.0).round() / 1000.0,
         peak_rss_bytes: peak.unwrap_or(0),
         include_unsure: req.include_unsure,
+        warnings,
     };
     let text = serde_json::to_string_pretty(&report).map_err(failed)? + "\n";
     atomic_write(&report_path, text.as_bytes())
@@ -1010,12 +1031,26 @@ mod tests {
                 entry("s0", "s9", 20.0, 3),
                 off,
                 entry("s0", "s2", 30.0, 4),
-                // Not about two members: not checked.
+                // Not about two members: not checked, but warned about.
                 entry("s9", "s0", 40.0, 2),
             ],
         };
         let (by_hand, warnings) = hand_pairs(&req);
-        assert!(warnings.is_empty(), "{warnings:?}");
+        // Switched on, but no two members: one member twice, a folder that is no member's.
+        // The switched-off entry is left out without a word.
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        for (w, (nr, a, b)) in
+            warnings
+                .iter()
+                .zip([(2, "s1", "s1"), (3, "s0", "s9"), (6, "s9", "s0")])
+        {
+            assert!(
+                w.starts_with(&format!(
+                    "Punktpaare Eintrag {nr}: {a}/karte und {b}/karte "
+                )) && w.ends_with("sind nicht zwei der gewählten Karten, nicht genutzt"),
+                "{w}"
+            );
+        }
         assert_eq!(by_hand.keys().copied().collect::<Vec<_>>(), vec![(0, 2)]);
         let x = |v: f64| Vector3::new(v, 0.0, 0.0);
         let y = |v: f64| Vector3::new(0.0, v, 0.0);
@@ -1034,9 +1069,9 @@ mod tests {
         bad.pairs.push(entry("s1", "s2", 60.0, 2));
         let (by_hand, warnings) = hand_pairs(&bad);
         assert_eq!(by_hand.keys().copied().collect::<Vec<_>>(), vec![(0, 2)]);
-        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings.len(), 4);
         assert!(
-            warnings[0].contains("mindestens drei") && warnings[0].contains("s1/karte"),
+            warnings[3].contains("mindestens drei") && warnings[3].contains("s1/karte"),
             "{warnings:?}"
         );
     }

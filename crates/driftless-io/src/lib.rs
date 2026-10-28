@@ -6,6 +6,7 @@ pub mod calib;
 pub mod camera;
 pub mod images;
 pub mod msg;
+pub mod paths;
 pub mod progress;
 pub mod project;
 #[cfg(any(test, feature = "test-util"))]
