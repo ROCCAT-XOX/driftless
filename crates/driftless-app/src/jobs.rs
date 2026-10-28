@@ -67,6 +67,8 @@ pub enum JobOutput {
     Corrected(Box<Corrected>),
     /// A project folder read: `project.toml` and the tree (tree reader).
     ProjectRead(Box<crate::ui::ProjectRead>),
+    /// The disk use of the project (helper runner).
+    DiskUse(Box<crate::disk::DiskUse>),
     /// Two trajectories compared (helper runner).
     Compare(Box<Comparison>),
     /// Two `map.json` side by side (helper runner).

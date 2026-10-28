@@ -782,6 +782,59 @@ pub fn project_line(name: &str, scans: usize) -> String {
     format!("Projekt „{name}“ · {scans}")
 }
 
+/// A size in bytes, decimal units, a decimal only below 10: „3 KB“, „3,4 MB“, „640 MB“,
+/// „1,2 GB“, „85 GB“.
+pub fn size(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b < 1e6 {
+        format!("{} KB", (b / 1e3).ceil() as u64)
+    } else if b < 1e7 {
+        format!("{} MB", decimal(b / 1e6, 1))
+    } else if b < 1e9 {
+        format!("{} MB", (b / 1e6).round() as u64)
+    } else if b < 1e10 {
+        format!("{} GB", decimal(b / 1e9, 1))
+    } else {
+        format!("{} GB", (b / 1e9).round() as u64)
+    }
+}
+
+/// An entry of the tree with the size of its folder: „Karte 001 · 640 MB“.
+pub fn with_size(label: &str, bytes: u64) -> String {
+    format!("{label} · {}", size(bytes))
+}
+
+/// Under the project line: „12,4 GB im Projekt · 85 GB frei“ (without the free space if the
+/// system does not say it).
+pub fn disk_line(total: u64, free: Option<u64>) -> String {
+    match free {
+        Some(free) => format!("{} im Projekt · {} frei", size(total), size(free)),
+        None => format!("{} im Projekt", size(total)),
+    }
+}
+
+/// Little free space on the drive of the project.
+pub fn low_space(free: u64) -> String {
+    format!(
+        "Nur noch {} frei auf dem Laufwerk des Projekts – Karten und Oberflächen brauchen \
+         schnell mehrere GB; Platz schaffen (alte Ergebnisse löschen) oder das Projekt auf ein \
+         größeres Laufwerk legen",
+        size(free)
+    )
+}
+
+/// A step that will need more than is free.
+pub fn needs_room(label: &str, need: u64, free: u64) -> String {
+    format!(
+        "{label} braucht etwa {}, frei sind nur {} – der Schritt läuft, bricht aber ab, wenn \
+         der Datenträger voll wird",
+        size(need),
+        size(free)
+    )
+}
+/// Label of the background measurement of the disk use (not shown in the status bar).
+pub const DISK_JOB: &str = "Platz messen";
+
 /// A precision that is no level: „Eigene (0,013 m)“.
 pub fn precision_custom(voxel: f64) -> String {
     format!("{PRECISION_CUSTOM} ({})", voxel_metres(voxel))

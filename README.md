@@ -206,7 +206,10 @@ slim status bar:
   iCloud Drive (also `~/Documents` and `~/Desktop` with „Schreibtisch & Dokumente“), OneDrive or
   another cloud storage opens with a warning: large results get uploaded and moved off the disk, and
   load slowly again.
-- **1 Daten:** a card per scan with its state (neu, wartet, rechnet, fertig ✓, veraltet) and „+ Scan
+- **1 Daten:** under the project line the size of the project and the free space of its drive (below
+  10 GB a warning, also in the Protokoll; a step that will need more than is free is warned about when it
+  starts); every run, map, surface and model in the tree shows the size of its folder (measured in the
+  background). A card per scan with its state (neu, wartet, rechnet, fertig ✓, veraltet) and „+ Scan
   hinzufügen“; the precision Schnell · Genau · Maximal sets only the voxel size of the map (0.02 /
   0.01 / 0.005 m; Maximal needs over 4 GB of memory on large scans, another voxel shows „Eigene“). „Alle
   rechnen“ queues every new or stale scan and computes them one after the other; with a scan selected,

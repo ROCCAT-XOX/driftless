@@ -32,9 +32,10 @@ const DOT: f32 = 8.0;
 /// A run of a scan with its cloud, maps and history, below the scan's card in „Daten“.
 pub(super) fn run_node(ui: &mut Ui, state: &AppState, run: &RunInfo, action: &mut Option<Action>) {
     let selected = state.selection == Selection::Run(run.dir.clone());
+    let label = sized(state, &run.label, &run.dir);
     let header = |ui: &mut Ui| {
-        let hover = format!("{}\n{}", run.label, run.dir.display());
-        entry(ui, selected, run.label.clone(), &hover)
+        let hover = format!("{label}\n{}", run.dir.display());
+        entry(ui, selected, label.clone(), &hover)
     };
     let header = if run.cloud.is_none() && run.maps.is_empty() && run.history.is_empty() {
         leaf(ui, header)
@@ -82,9 +83,10 @@ fn history_node(ui: &mut Ui, state: &AppState, run: &RunInfo, action: &mut Optio
 
 fn map_node(ui: &mut Ui, state: &AppState, map: &MapInfo, action: &mut Option<Action>) {
     let selected = state.selection == Selection::Map(map.dir.clone());
+    let label = sized(state, &map.label, &map.dir);
     let header = |ui: &mut Ui| {
-        let hover = format!("{}\n{}", map.label, map.dir.display());
-        entry(ui, selected, map.label.clone(), &hover)
+        let hover = format!("{label}\n{}", map.dir.display());
+        entry(ui, selected, label.clone(), &hover)
     };
     let header = if map.clouds.is_empty() && map.surfaces.is_empty() {
         leaf(ui, header)
@@ -113,9 +115,10 @@ pub(super) fn model_node(
 ) {
     let selected = state.selection == Selection::Model(model.dir.clone());
     let stale = state.map_status.get(&model.dir).is_some_and(|s| s.stale);
+    let label = sized(state, &model.label, &model.dir);
     let header = |ui: &mut Ui| {
         if stale {
-            let name = text::model_stale(&model.label);
+            let name = text::model_stale(&label);
             let hover = format!(
                 "{name}\n{}\n{}",
                 text::STATUS_MODEL_STALE_HINT,
@@ -124,8 +127,8 @@ pub(super) fn model_node(
             let warn = ui.visuals().warn_fg_color;
             entry(ui, selected, RichText::new(name).color(warn), &hover)
         } else {
-            let hover = format!("{}\n{}", model.label, model.dir.display());
-            entry(ui, selected, model.label.clone(), &hover)
+            let hover = format!("{label}\n{}", model.dir.display());
+            entry(ui, selected, label.clone(), &hover)
         }
     };
     let header = branch(ui, Id::new(("model", &model.dir)), header, |ui| {
@@ -311,15 +314,16 @@ pub(super) fn surface_leaf(
     action: &mut Option<Action>,
 ) {
     let selected = state.selection == Selection::Surface(surface.dir.clone());
+    let label = sized(state, &surface.label, &surface.dir);
     let r = leaf(ui, |ui| {
         if surface.stale {
-            let name = text::surface_stale(&surface.label);
+            let name = text::surface_stale(&label);
             let hover = format!("{name}\n{}", surface.dir.display());
             let warn = ui.visuals().warn_fg_color;
             entry(ui, selected, RichText::new(name).color(warn), &hover)
         } else {
-            let hover = format!("{}\n{}", surface.label, surface.dir.display());
-            entry(ui, selected, surface.label.clone(), &hover)
+            let hover = format!("{label}\n{}", surface.dir.display());
+            entry(ui, selected, label.clone(), &hover)
         }
     });
     export_menu(&r, || ExportSource::Surface(surface.dir.clone()), action);
@@ -339,6 +343,14 @@ fn export_menu(
             *action = Some(Action::OpenExport(source()));
         }
     });
+}
+
+/// The name of an entry with the size of its folder, once measured („Karte 001 · 640 MB“).
+fn sized(state: &AppState, label: &str, dir: &Path) -> String {
+    match state.folder_size(dir) {
+        Some(bytes) => text::with_size(label, bytes),
+        None => label.to_string(),
+    }
 }
 
 /// A selectable name, cut with „…“ where the panel ends, the full text on hover.

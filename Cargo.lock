@@ -1649,6 +1649,7 @@ dependencies = [
  "egui_kittest",
  "image",
  "las",
+ "libc",
  "log",
  "mimalloc",
  "nalgebra",

@@ -286,6 +286,8 @@ enum HelperTask {
     SwitchPair(usize, bool),
     /// Writes the choices into `auswahl.toml` of the project in the folder.
     SaveChoices(PathBuf, Choices),
+    /// The disk use of the project for this tree version.
+    DiskUse(u64),
 }
 
 /// What a „compute all“ button puts into the queue.
@@ -426,6 +428,12 @@ pub struct DriftlessApp {
     /// The choices last written into (or read from) the project in the folder: they are
     /// written again when they differ ([`DriftlessApp::keep_choices`]).
     saved_choices: Option<(PathBuf, Choices)>,
+    /// The [`AppState::tree_version`] the disk use was last measured for.
+    disk_asked: u64,
+    /// How the free space of a drive is told ([`crate::disk::free_space`]).
+    free_space: crate::disk::FreeSpace,
+    /// Little free space was told (again only once there was enough in between).
+    low_space_told: bool,
 }
 
 impl DriftlessApp {
@@ -474,7 +482,16 @@ impl DriftlessApp {
             folders: LastFolders::default(),
             projects_home: crate::places::projects_home(),
             saved_choices: None,
+            disk_asked: 0,
+            free_space: crate::disk::free_space,
+            low_space_told: false,
         }
+    }
+
+    /// With another way to tell the free space of a drive (tests).
+    pub fn with_free_space(mut self, free: crate::disk::FreeSpace) -> Self {
+        self.free_space = free;
+        self
     }
 
     /// With another projects folder for the dialogs to start in (tests: not the home folder).
@@ -1360,6 +1377,77 @@ impl DriftlessApp {
         self.tell_cloud(&dir, cloud);
     }
 
+    /// Takes a measurement of the disk use; little free space ([`crate::disk::LOW_SPACE`]) is
+    /// warned about once, again only after there was enough in between.
+    fn disk_measured(&mut self, disk: crate::disk::DiskUse) {
+        let free = disk.free;
+        self.state.disk = Some(disk);
+        match free {
+            Some(free) if free < crate::disk::LOW_SPACE => {
+                if !std::mem::replace(&mut self.low_space_told, true) {
+                    self.warn(text::low_space(free));
+                }
+            }
+            Some(_) => self.low_space_told = false,
+            None => {}
+        }
+    }
+
+    /// What the step `step` will write at most ([`crate::disk::need`]), from the raw data of
+    /// its scans as last measured; `None` without a measurement or for a step that writes
+    /// little.
+    fn room_needed(&self, step: &Action) -> Option<u64> {
+        use crate::disk::{need, NeedKind};
+        let disk = self.state.disk.as_ref()?;
+        let project = self.state.project.as_ref()?;
+        let raw_of_scan = |path: &Path| disk.raw.get(path).copied().unwrap_or(0);
+        let raw_of_id = |id: &str| project.scan(id).map_or(0, |e| raw_of_scan(&e.path));
+        let map_voxel = self.state.map_settings.switches.voxel;
+        let surface_voxel = self.state.surface_settings.config.voxel;
+        let model_raw = |dir: &Path| {
+            self.state.model(dir).map_or(0, |m| {
+                m.report.members.iter().map(|m| raw_of_scan(&m.scan)).sum()
+            })
+        };
+        Some(match step {
+            Action::RunSlam(id) => need(NeedKind::Slam, raw_of_id(id), map_voxel),
+            Action::RunMap(run) => {
+                let (scan, _) = self.state.run(run)?;
+                need(NeedKind::Map, raw_of_id(&scan.id), map_voxel)
+            }
+            Action::RunSurface(map) => {
+                let (scan, _, _) = self.state.map(map)?;
+                need(NeedKind::Surface, raw_of_id(&scan.id), surface_voxel)
+            }
+            Action::RunMerge { picks, .. } => {
+                let raw = picks.iter().map(|p| raw_of_id(&p.scan_id)).sum();
+                need(NeedKind::Model, raw, map_voxel)
+            }
+            Action::ApplyPairs { model, .. } => need(NeedKind::Model, model_raw(model), map_voxel),
+            Action::RunModelSurface { model } => {
+                need(NeedKind::Surface, model_raw(model), surface_voxel)
+            }
+            _ => return None,
+        })
+    }
+
+    /// A step that started: if it will need more than is free on the drive of the project, a
+    /// warning (it still runs).
+    fn check_room(&mut self, step: &Action) {
+        let free = self.state.disk.as_ref().and_then(|d| d.free);
+        let (Some(free), Some(need)) = (free, self.room_needed(step)) else {
+            return;
+        };
+        if need > free {
+            let label = self
+                .state
+                .job
+                .as_ref()
+                .map_or_else(String::new, |j| j.label.clone());
+            self.warn(text::needs_room(&label, need, free));
+        }
+    }
+
     /// Writes the precision, fineness and „ohne Fotos“ chosen into `auswahl.toml` of the
     /// project once they differ from what it holds (in the background, the newest only).
     fn keep_choices(&mut self) {
@@ -1494,6 +1582,7 @@ impl DriftlessApp {
             || self.step_end.is_some()
             || self.status_asked != self.state.tree_version
             || self.gaps_asked != self.state.tree_version
+            || (self.state.project.is_some() && self.disk_asked != self.state.tree_version)
     }
 
     /// Takes what the helper finished and starts its next task: queued ones first, then the
@@ -1530,6 +1619,12 @@ impl DriftlessApp {
                     self.pair_switched(index, enabled, result.map(|_| ()));
                 }
                 (Some(HelperTask::SaveChoices(..)), Err(e)) => self.error(e.to_string()),
+                (Some(HelperTask::DiskUse(v)), Ok(JobOutput::DiskUse(disk))) => {
+                    // a measure of an older tree still says the free space
+                    if v == self.state.tree_version || self.state.disk.is_none() {
+                        self.disk_measured(*disk);
+                    }
+                }
                 (Some(HelperTask::CompareMaps(a, b)), result) => {
                     let c = &mut self.state.compare;
                     if c.map_a.as_ref() == Some(&a) && c.map_b.as_ref() == Some(&b) {
@@ -1551,7 +1646,11 @@ impl DriftlessApp {
             .helper_queue
             .pop_front()
             .or_else(|| (self.status_asked != version).then_some(HelperTask::MapStatus(version)))
-            .or_else(|| (self.gaps_asked != version).then_some(HelperTask::HistoryGaps(version)));
+            .or_else(|| (self.gaps_asked != version).then_some(HelperTask::HistoryGaps(version)))
+            .or_else(|| {
+                let project = self.state.project.is_some() && self.state.opening.is_none();
+                (project && self.disk_asked != version).then_some(HelperTask::DiskUse(version))
+            });
         if let Some(task) = task {
             self.start_helper(task);
         }
@@ -1609,6 +1708,12 @@ impl DriftlessApp {
                     Ok(JobOutput::Done)
                 })
             }
+            HelperTask::DiskUse(_) => match self.state.disk_job(self.free_space) {
+                Some(job) => self.helper.start(text::DISK_JOB, move |_| {
+                    Ok(JobOutput::DiskUse(Box::new(job())))
+                }),
+                None => Ok(()),
+            },
             HelperTask::SaveChoices(dir, choices) => {
                 let (dir, choices) = (dir.clone(), choices.clone());
                 self.helper.start(text::CHOICES_JOB, move |_| {
@@ -1622,12 +1727,18 @@ impl DriftlessApp {
                 match task {
                     HelperTask::MapStatus(v) => self.status_asked = v,
                     HelperTask::HistoryGaps(v) => self.gaps_asked = v,
+                    HelperTask::DiskUse(v) => self.disk_asked = v,
                     _ => {}
                 }
-                self.helper_running = Some(task);
+                // a measurement without a project started nothing
+                self.helper_running = self.helper.is_busy().then_some(task);
             }
             // the map statuses are asked again at the next frame
-            Err(_) if matches!(task, HelperTask::MapStatus(_) | HelperTask::HistoryGaps(_)) => {}
+            Err(_)
+                if matches!(
+                    task,
+                    HelperTask::MapStatus(_) | HelperTask::HistoryGaps(_) | HelperTask::DiskUse(_)
+                ) => {}
             Err(e) => match &task {
                 HelperTask::Correct(action) => {
                     self.corrected(action, Err(StepError::Failed(e.to_string())))
@@ -1930,6 +2041,9 @@ impl DriftlessApp {
                     hand_loads: q.hand_loads,
                 });
                 let started = actions::start_step(&mut self.state, &mut self.jobs, &step);
+                if started.is_ok() {
+                    self.check_room(&step);
+                }
                 if let Some(own) = own {
                     self.state.slam_settings = own.slam;
                     self.state.map_settings = own.map;
@@ -2127,11 +2241,13 @@ impl DriftlessApp {
             | Action::ApplyPairs { .. }
             | Action::RunModelSurface { .. }) => {
                 match actions::start_step(&mut self.state, &mut self.jobs, &step) {
-                    // the merge runs: its field closes, the model shows when it is done
-                    Ok(()) if matches!(step, Action::RunMerge { .. }) => {
-                        self.state.merge.open = false
+                    Ok(()) => {
+                        // the merge runs: its field closes, the model shows when it is done
+                        if matches!(step, Action::RunMerge { .. }) {
+                            self.state.merge.open = false;
+                        }
+                        self.check_room(&step);
                     }
-                    Ok(()) => {}
                     Err(e) => self.error(e),
                 }
             }

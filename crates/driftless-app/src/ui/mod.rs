@@ -539,6 +539,9 @@ pub struct AppState {
     /// The tree is being read again (after a change, a step, the window coming to the front):
     /// the tree shown is the one read before, and „Alle rechnen“ waits for the new one.
     pub tree_pending: bool,
+    /// The disk use of the project and the free space of its drive, as last measured in the
+    /// background (after each read of the tree); `None` before the first measurement.
+    pub disk: Option<crate::disk::DiskUse>,
 }
 
 impl AppState {
@@ -551,6 +554,10 @@ impl AppState {
 
     /// Shows `project` with its `tree` from now on: nothing selected.
     pub fn show_project(&mut self, project: Project, tree: Tree) {
+        // the disk use of another project is not this one's
+        if self.project.as_ref().map(|p| &p.dir) != Some(&project.dir) {
+            self.disk = None;
+        }
         self.project = Some(project);
         self.selection = Selection::None;
         self.inspect = None;
@@ -700,6 +707,29 @@ impl AppState {
                 .filter_map(|d| state_gap(&d).map(|g| (d, g)))
                 .collect()
         }
+    }
+
+    /// The work of measuring the disk use of the project ([`crate::disk::measure`]) for the
+    /// current tree, to run off the UI thread; `free` tells the free space.
+    pub fn disk_job(
+        &self,
+        free: crate::disk::FreeSpace,
+    ) -> Option<impl FnOnce() -> crate::disk::DiskUse + Send + 'static> {
+        let project = self.project.as_ref()?;
+        let dir = project.dir.clone();
+        let tree = Tree {
+            scans: self.scans.clone(),
+            models: self.models.clone(),
+            ..Tree::default()
+        };
+        let folders = crate::disk::tree_folders(&tree);
+        let scans: Vec<PathBuf> = project.scans.iter().map(|s| s.path.clone()).collect();
+        Some(move || crate::disk::measure(&dir, &folders, &scans, free))
+    }
+
+    /// The size of a folder of the tree, if measured.
+    pub fn folder_size(&self, dir: &Path) -> Option<u64> {
+        self.disk.as_ref()?.folders.get(dir).copied()
     }
 
     /// The map of the selection: the selected map, or the map of a selected surface.

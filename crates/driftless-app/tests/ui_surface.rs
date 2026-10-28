@@ -100,6 +100,13 @@ fn project_with_map(dir: &Path) -> (H, PathBuf, PathBuf) {
 }
 
 /// The surfaces of the map `map` in the tree: (folder, label, stale).
+/// The entry of the surface in `dir` as the tree shows it: its label with the size of its
+/// folder, as measured in the background.
+fn entry(state: &AppState, dir: &Path, label: &str) -> String {
+    let bytes = state.folder_size(dir).expect("measured");
+    text::with_size(label, bytes)
+}
+
 fn surfaces(state: &AppState, map: &Path) -> Vec<(PathBuf, String, bool)> {
     state
         .scans
@@ -136,7 +143,7 @@ fn surface_button_runs_step() {
     let shown = state.surface.as_ref().expect("surface loaded");
     assert_eq!(shown.path, surface.join("oberflaeche.glb"));
     assert!(shown.triangles > 0);
-    h.get_by_label("Oberfläche 001");
+    h.get_by_label(&entry(state, &surface, "Oberfläche 001"));
     h.get_by_label(text::THIS_SURFACE);
 
     // the same settings again: no second folder, the surface fits
@@ -158,9 +165,8 @@ fn stale_surface_marked() {
     h.state_mut()
         .apply(Action::Select(Selection::Map(map.clone())));
     h.step();
-    assert!(h
-        .query_by_label(&text::surface_stale("Oberfläche 001"))
-        .is_none());
+    let label = entry(h.state().state(), &surface, "Oberfläche 001");
+    assert!(h.query_by_label(&text::surface_stale(&label)).is_none());
 
     // the run is computed anew; on the static synthetic scan its trajectory may come out
     // the same, so it is changed as well: the map, and with it the surface, no longer fit
@@ -171,9 +177,10 @@ fn stale_surface_marked() {
     run(&mut h, Action::OpenProject(dir.join("projekt")));
     assert_eq!(
         surfaces(h.state().state(), &map),
-        [(surface, "Oberfläche 001".to_string(), true)]
+        [(surface.clone(), "Oberfläche 001".to_string(), true)]
     );
-    h.get_by_label(&text::surface_stale("Oberfläche 001"));
+    let label = entry(h.state().state(), &surface, "Oberfläche 001");
+    h.get_by_label(&text::surface_stale(&label));
 }
 
 fn summaries(state: &mut AppState) {
@@ -261,7 +268,12 @@ fn tree_marks_stale_after_a_step() {
     fs::write(run_dir.join("traj.tum"), traj).unwrap();
     run(&mut h, Action::Inspect("halle".into()));
     assert!(surfaces(h.state().state(), &map)[0].2, "not marked stale");
-    h.get_by_label(&text::surface_stale("Oberfläche 001"));
+    let label = entry(
+        h.state().state(),
+        &map.join("oberflaeche-001"),
+        "Oberfläche 001",
+    );
+    h.get_by_label(&text::surface_stale(&label));
 }
 
 #[test]

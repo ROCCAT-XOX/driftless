@@ -162,6 +162,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     };
     ui.weak(text::project_line(&project.name, state.scans.len()))
         .on_hover_text(project.dir.display().to_string());
+    disk_lines(ui, state);
     if state.scans.is_empty() {
         hint(ui, text::EMPTY_NO_SCANS);
         if main_button(ui, text::ADD_SCAN, None, text::COMPUTE_HINT) {
@@ -211,6 +212,20 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
         |ui, (state, action)| compute_buttons(ui, state, action),
     );
     action
+}
+
+/// The disk use of the project and the free space of its drive, once measured; below
+/// [`crate::disk::LOW_SPACE`] a warning what to do.
+fn disk_lines(ui: &mut Ui, state: &AppState) {
+    let Some(disk) = &state.disk else {
+        return;
+    };
+    ui.weak(text::disk_line(disk.total, disk.free));
+    if let Some(free) = disk.free.filter(|&f| f < crate::disk::LOW_SPACE) {
+        let warn =
+            RichText::new(format!("{} {}", icon::UNSURE, text::low_space(free))).color(DARK.warn);
+        ui.add(egui::Label::new(warn).wrap());
+    }
 }
 
 /// The card of a scan: its name and status; a click selects it (again: deselects). While it

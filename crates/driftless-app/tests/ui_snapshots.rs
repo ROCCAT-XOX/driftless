@@ -71,7 +71,10 @@ fn scene(name: &str) -> Option<Harness<'static, DriftlessApp>> {
         default_wgpu_setup(),
         egui_wgpu::RendererOptions::PREDICTABLE,
     );
-    let mut app = DriftlessApp::new(Arc::new(|| {})).with_render_state(rs.clone());
+    // a fixed free space: the picture must not depend on the disk of the computer
+    let mut app = DriftlessApp::new(Arc::new(|| {}))
+        .with_render_state(rs.clone())
+        .with_free_space(|_| Some(85_000_000_000));
     app.apply(Action::NewProject {
         dir: dir.join("projekt"),
         name: "Schwarzer Raum".into(),

@@ -7,6 +7,7 @@
 
 pub mod camera;
 pub mod cloud;
+pub mod disk;
 pub mod icon;
 pub mod jobs;
 pub mod lod;
