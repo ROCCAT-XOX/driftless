@@ -184,8 +184,22 @@ fn describe(r: &ModelReport) -> String {
 fn merges_two_scans() {
     let s = scene();
     let out = out_dir("zwei");
+    // What a killed merge left: its `.tmp` files go at the start, others stay.
+    fs::create_dir_all(&out).unwrap();
+    for f in [
+        "modell.las.tmp",
+        "modell.ply.tmp",
+        "modell.json.tmp",
+        "notiz.tmp",
+    ] {
+        fs::write(out.join(f), b"halb").unwrap();
+    }
     let req = request(vec![member(&s.a), member(&s.b)], &out);
     let report = run_merge(&req, &Progress::new()).unwrap();
+    for f in ["modell.las.tmp", "modell.ply.tmp", "modell.json.tmp"] {
+        assert!(!out.join(f).exists(), "{f} left");
+    }
+    assert!(out.join("notiz.tmp").exists());
     let b = &report.members[1];
     assert_eq!(b.verdict, "sicher", "{}", describe(&report));
     assert_eq!(b.placed_against, Some(0));

@@ -712,6 +712,40 @@ fn obj_overwrite_removes_stale_pages() {
     );
 }
 
+/// A killed export leaves `<name>.tmp` next to its target; the next export to that target
+/// removes them (for an OBJ also those of its `.mtl` and pages), others stay.
+#[test]
+fn stale_tmp_files_of_the_target_are_removed() {
+    let surface = surface_dir("export-tmp", 2);
+    let base = surface.parent().unwrap().to_path_buf();
+    let own = [
+        "netz.obj.tmp",
+        "netz.mtl.tmp",
+        "netz_seite_00.jpg.tmp",
+        "netz_seite_07.png.tmp",
+    ];
+    let foreign = ["netzwerk.obj.tmp", "netz_seite_xy.jpg.tmp", "wolke.laz.tmp"];
+    for f in own.iter().chain(&foreign) {
+        fs::write(base.join(f), b"halb").unwrap();
+    }
+    export(
+        ExportSource::Surface(surface),
+        &base.join("netz.obj"),
+        ExportFormat::Obj,
+    );
+    for f in own {
+        assert!(!base.join(f).exists(), "{f} left");
+    }
+    for f in foreign {
+        assert!(base.join(f).exists(), "{f} removed");
+    }
+    let map = map_dir("export-tmp-points", true);
+    let out = map.parent().unwrap().join("wolke.laz");
+    fs::write(map.parent().unwrap().join("wolke.laz.tmp"), b"halb").unwrap();
+    export(ExportSource::Map(map), &out, ExportFormat::Laz);
+    assert!(leftovers(out.parent().unwrap()).is_empty());
+}
+
 #[test]
 fn cancel_keeps_old_files() {
     let surface = surface_dir("export-cancel", 2);

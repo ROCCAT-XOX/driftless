@@ -365,6 +365,104 @@ fn surface_fits_after_run() {
     assert!(!surface_fits(&req), "other trajectory");
 }
 
+/// A killed run leaves `<name>.tmp` files; the next surface into the folder removes those of
+/// its own files at its start, and only those.
+#[test]
+fn stale_tmp_files_of_the_surface_are_removed() {
+    let (dir, out) = prepared("steps-surface-tmp", false);
+    let dest = out.join("oberflaeche");
+    fs::create_dir_all(&dest).unwrap();
+    let own = [
+        "oberflaeche.glb.tmp",
+        "oberflaeche.obj.tmp",
+        "oberflaeche.mtl.tmp",
+        "oberflaeche_seite_00.jpg.tmp",
+        "oberflaeche_seite_12.png.tmp",
+        SURFACE_REPORT_TMP,
+    ];
+    let foreign = [
+        "oberflaeche_seite_xy.jpg.tmp",
+        "modell.las.tmp",
+        "notiz.tmp",
+    ];
+    for f in own.iter().chain(&foreign) {
+        fs::write(dest.join(f), b"halb").unwrap();
+    }
+    run_surface(&request(&dir, &out, &dest), &Progress::new()).unwrap();
+    for f in own {
+        assert!(!dest.join(f).exists(), "{f} left");
+    }
+    for f in foreign {
+        assert!(dest.join(f).exists(), "{f} removed");
+    }
+}
+
+const SURFACE_REPORT_TMP: &str = "oberflaeche.json.tmp";
+
+/// What a kill of an earlier version could leave: the glb of a new run (other settings) next
+/// to the OBJ and the report of the old one. The report names the sizes of its files, so the
+/// folder does not fit the old request (nor the new one).
+#[test]
+fn new_glb_next_to_an_old_report_does_not_fit() {
+    let (dir, out) = prepared("steps-surface-mixed", true);
+    let dest = out.join("oberflaeche");
+    let old = SurfaceRequest {
+        obj: true,
+        ..request(&dir, &out, &dest)
+    };
+    let report = run_surface(&old, &Progress::new()).unwrap();
+    assert!(surface_fits(&old));
+    let glb = fs::read(dest.join("oberflaeche.glb")).unwrap();
+    assert_eq!(report["bytes"]["oberflaeche.glb"], glb.len() as u64);
+    assert!(report["bytes"]["oberflaeche.obj"].as_u64().unwrap() > 0);
+    let new = SurfaceRequest {
+        config: SurfaceConfig {
+            voxel: 0.3,
+            ..small_config()
+        },
+        obj: false,
+        ..request(&dir, &out, &out.join("neu"))
+    };
+    run_surface(&new, &Progress::new()).unwrap();
+    fs::copy(
+        out.join("neu").join("oberflaeche.glb"),
+        dest.join("oberflaeche.glb"),
+    )
+    .unwrap();
+    assert!(!surface_fits(&old), "new glb, old OBJ and report");
+    assert!(!surface_fits(&SurfaceRequest {
+        out_dir: dest.clone(),
+        ..new.clone()
+    }));
+    fs::write(dest.join("oberflaeche.glb"), &glb).unwrap();
+    assert!(surface_fits(&old));
+    fs::remove_file(dest.join("oberflaeche_seite_00.jpg")).unwrap();
+    assert!(!surface_fits(&old), "a page of the report is missing");
+}
+
+/// `oberflaeche.json` goes before the first file of a surface is written and comes back
+/// last: a surface that stops in between (here: the OBJ cannot be replaced, after the new
+/// glb was written) leaves no report and does not fit.
+#[test]
+fn report_goes_before_the_first_write() {
+    let (dir, out) = prepared("steps-surface-report-first", false);
+    let dest = out.join("oberflaeche");
+    let req = request(&dir, &out, &dest);
+    run_surface(&req, &Progress::new()).unwrap();
+    assert!(surface_fits(&req));
+    fs::create_dir_all(dest.join("oberflaeche.obj").join("x")).unwrap();
+    let with_obj = SurfaceRequest {
+        obj: true,
+        ..req.clone()
+    };
+    let err = run_surface(&with_obj, &Progress::new()).unwrap_err();
+    assert!(err.to_string().contains("oberflaeche.obj"), "{err}");
+    assert!(!dest.join(SURFACE_REPORT).exists(), "the old report stayed");
+    assert!(dest.join("oberflaeche.glb").is_file());
+    assert!(!surface_fits(&req) && !surface_fits(&with_obj));
+    assert!(!names(&dest).iter().any(|n| n.ends_with(".tmp")));
+}
+
 #[test]
 fn old_pages_are_listed_as_stale_not_deleted() {
     let (dir, out) = prepared("steps-surface-stale-pages", false);
@@ -589,6 +687,13 @@ fn model_surface_fits_after_run() {
     let mut gray = model_request(&s.both, &dest);
     gray.texture = false;
     assert!(!model_surface_fits(&gray), "without texture");
+    // A glb other than the one of the report (a kill between the files of two runs).
+    let glb = dest.join("oberflaeche.glb");
+    let bytes = fs::read(&glb).unwrap();
+    fs::write(&glb, &bytes[..bytes.len() / 2]).unwrap();
+    assert!(!model_surface_fits(&req), "glb of another run");
+    fs::write(&glb, &bytes).unwrap();
+    assert!(model_surface_fits(&req));
 }
 
 /// A copy of `modell.json` of the model of A and B in a new folder, changed by `edit`.

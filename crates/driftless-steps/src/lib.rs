@@ -9,6 +9,7 @@ mod error;
 pub mod export;
 pub mod history;
 pub mod inspect;
+mod leftovers;
 pub mod map;
 pub mod merge;
 pub mod overlay;

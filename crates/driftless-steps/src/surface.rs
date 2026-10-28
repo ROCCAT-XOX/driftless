@@ -7,8 +7,11 @@
 //! The input id is the clean step's id, the camera images and calibration, the surface
 //! settings and [`SURFACE_VERSION`]. A `clean.bin` of another input (or none) is refused:
 //! the surface would not fit the map. A scan without images or calibration gets a gray
-//! surface and a warning. A cancel before the files are written leaves the folder untouched;
-//! the JSON is written last, so a folder with a report holds a complete surface.
+//! surface and a warning. A cancel before the files are written leaves the folder untouched.
+//! A run removes the `.tmp` files a killed run of its files left at its start, and the
+//! report before it writes its first file; the report comes last again, with the size of
+//! every file it lists (`bytes`), so a folder with a report holds a complete surface and one
+//! with a file of another run next to the report does not fit ([`surface_fits`]).
 //!
 //! The surface of a merged model ([`run_model_surface`]) is made the same way from the
 //! `clean.bin` of every scan in the model, moved by its `T_i`, with the LiDAR positions and
@@ -17,6 +20,8 @@
 //! [`SURFACE_VERSION`].
 
 use crate::error::{check_cancel, failed, StepError};
+use crate::export::is_page_of;
+use crate::leftovers::{remove_report, remove_stale_tmp};
 use crate::map::{
     clean_stage_id, color_input, dense_stage_id, fallback_reason, gpu_json, hex, map_input_for,
     peak_rss_bytes, read_traj, ColorInput, MapInput, CLEAN_BIN, DENSE_BIN,
@@ -118,8 +123,9 @@ fn plan(
     Ok((Plan { id, clean_id }, color))
 }
 
-/// Whether `out_dir` holds the surface of this request: its report has the current input id
-/// and `clean.bin` still fits the map.
+/// Whether `out_dir` holds the surface of this request: its report has the current input id,
+/// the files it lists are there with their sizes ([`files_intact`]) and `clean.bin` still
+/// fits the map.
 pub fn surface_fits(req: &SurfaceRequest) -> bool {
     let fits = || -> Option<bool> {
         let text = fs::read_to_string(req.out_dir.join(SURFACE_REPORT)).ok()?;
@@ -128,10 +134,42 @@ pub fn surface_fits(req: &SurfaceRequest) -> bool {
         let (plan, _) = plan(req, &Progress::new()).ok()?;
         Some(
             report["input_id"].as_str() == Some(hex(&plan.id).as_str())
+                && files_intact(&req.out_dir, &report)
                 && stage_fits(&req.map_dir.join(CLEAN_BIN), &plan.clean_id),
         )
     };
     fits().unwrap_or(false)
+}
+
+/// Whether the files the surface report `report` in `dir` lists are there, with the sizes
+/// it recorded under `bytes` (a report written before the sizes: only that they are there;
+/// one before the list: nothing to check). A file of another run next to the report – what
+/// a run of an older version left when it was killed between its files – does not fit.
+fn files_intact(dir: &Path, report: &Value) -> bool {
+    let Some(files) = report["files"].as_array() else {
+        return true;
+    };
+    files
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|f| *f != SURFACE_REPORT)
+        .all(|f| {
+            fs::metadata(dir.join(f)).is_ok_and(|m| {
+                m.is_file() && report["bytes"][f].as_u64().is_none_or(|b| b == m.len())
+            })
+        })
+}
+
+/// Whether a surface writes the file `name`: the glb, the OBJ with its `.mtl` and pages, the
+/// report.
+fn owns(name: &str) -> bool {
+    let fixed = [
+        format!("{STEM}.glb"),
+        format!("{STEM}.obj"),
+        format!("{STEM}.mtl"),
+        SURFACE_REPORT.to_string(),
+    ];
+    fixed.iter().any(|f| f == name) || is_page_of(name.as_ref(), STEM.as_ref())
 }
 
 fn settings_json(c: &SurfaceConfig, texture: bool) -> Value {
@@ -376,6 +414,7 @@ fn make_surface(
     let out = target.out_dir;
     fs::create_dir_all(out).map_err(|e| format!("{} nicht anlegbar: {e}", out.display()))?;
     let report_path = out.join(SURFACE_REPORT);
+    remove_report(&report_path)?;
     let writing = Progress::new();
     mesh::write_glb(&out.join(format!("{STEM}.glb")), &surface, &writing)?;
     let mut files = vec![format!("{STEM}.glb")];
@@ -399,6 +438,15 @@ fn make_surface(
         ));
     }
 
+    // The size of every file written, so that one of another run is told apart.
+    let bytes: serde_json::Map<String, Value> = files
+        .iter()
+        .filter(|f| *f != SURFACE_REPORT)
+        .map(|f| {
+            let size = fs::metadata(out.join(f)).map_or(0, |m| m.len());
+            (f.clone(), json!(size))
+        })
+        .collect();
     let peak = peak_rss_bytes();
     let mut report = json!({
         "input_id": hex(target.id),
@@ -409,6 +457,7 @@ fn make_surface(
         "gpu": gpu_report,
         "axes": AXES,
         "files": files,
+        "bytes": bytes,
         "stale": stale,
     });
     if let Some((key, value)) = target.extra {
@@ -458,6 +507,7 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
     let (plan, color) = plan(req, progress)?;
     let gpu = open_gpu(req.gpu, color.is_some(), progress)?;
     let (_, poses) = read_traj(&req.map.slam_dir)?;
+    remove_stale_tmp(&req.out_dir, owns, progress);
 
     let clean_path = req.map_dir.join(CLEAN_BIN);
     let (mut cloud, _) = load_stage(&clean_path, &plan.clean_id).map_err(|e| {
@@ -596,7 +646,8 @@ fn model_plan(req: &ModelSurfaceRequest, progress: &Progress) -> Result<ModelPla
 }
 
 /// Whether `out_dir` holds the surface of this model request: its report has the current
-/// input id and the `clean.bin` of every scan in the model still fits its map.
+/// input id, the files it lists are there with their sizes ([`files_intact`]) and the
+/// `clean.bin` of every scan in the model still fits its map.
 pub fn model_surface_fits(req: &ModelSurfaceRequest) -> bool {
     let fits = || -> Option<bool> {
         let text = fs::read_to_string(req.out_dir.join(SURFACE_REPORT)).ok()?;
@@ -605,6 +656,7 @@ pub fn model_surface_fits(req: &ModelSurfaceRequest) -> bool {
         let plan = model_plan(req, &Progress::new()).ok()?;
         Some(
             report["input_id"].as_str() == Some(hex(&plan.id).as_str())
+                && files_intact(&req.out_dir, &report)
                 && plan
                     .members
                     .iter()
@@ -719,6 +771,7 @@ pub fn run_model_surface(
     let names: Vec<String> = plan.members.iter().map(|m| m.name.clone()).collect();
     let with_images = plan.members.iter().any(|m| m.color.is_some());
     let gpu = open_gpu(req.gpu, with_images, progress)?;
+    remove_stale_tmp(&req.out_dir, owns, progress);
     let (points, sources) = model_points(plan, progress)?;
     let target = Target {
         out_dir: &req.out_dir,

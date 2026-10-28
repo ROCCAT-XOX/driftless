@@ -8,10 +8,12 @@
 //! ([`export_targets`]: for OBJ also the `.mtl` and every page `<stem>_seite_NN.jpg|png`
 //! there) may exist.
 //! Every file is written through `<name>.tmp` and renamed at the end; a cancel or an error
-//! leaves the old files as they were. An OBJ written over an older one removes the older
-//! one's pages that it does not write itself.
+//! leaves the old files as they were, and the `.tmp` files a killed export to the same
+//! target left are removed first. An OBJ written over an older one removes the older one's
+//! pages that it does not write itself.
 
 use crate::error::{check_cancel, failed, StepError};
+use crate::leftovers::remove_stale_tmp;
 use crate::merge::{member_transform, read_model, MODEL_LAS, MODEL_REPORT};
 use driftless_export::mesh::{self, obj_files, Mesh};
 use driftless_export::traj::{write_traj, TrajFormat};
@@ -335,7 +337,7 @@ pub struct ExportReport {
 
 /// Whether `name` is a page of the OBJ with file stem `stem`: `<stem>_seite_<digits>.jpg`
 /// or `.png` (any other file with that start is not ours and stays).
-fn is_page_of(name: &std::ffi::OsStr, stem: &std::ffi::OsStr) -> bool {
+pub(crate) fn is_page_of(name: &std::ffi::OsStr, stem: &std::ffi::OsStr) -> bool {
     let mut prefix: OsString = stem.to_os_string();
     prefix.push("_seite_");
     let Some(rest) = name
@@ -384,6 +386,29 @@ pub fn export_targets(req: &ExportRequest) -> Vec<PathBuf> {
         files.extend(existing_pages(&req.out));
     }
     files
+}
+
+/// The folder of the target `out` (`.` for a bare file name).
+fn target_dir(out: &Path) -> &Path {
+    match out.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+/// Whether the export `req` writes the file `name` next to its target: the target; for OBJ
+/// also its `.mtl` and pages.
+fn owns(req: &ExportRequest, name: &str) -> bool {
+    let name = std::ffi::OsStr::new(name);
+    if req.out.file_name() == Some(name) {
+        return true;
+    }
+    req.format == ExportFormat::Obj
+        && (req.out.with_extension("mtl").file_name() == Some(name)
+            || req
+                .out
+                .file_stem()
+                .is_some_and(|stem| is_page_of(name, stem)))
 }
 
 /// The [`export_targets`] that exist (asked about before replacing them).
@@ -503,6 +528,7 @@ pub fn run_export(req: &ExportRequest, progress: &Progress) -> Result<ExportRepo
         }
     }
 
+    remove_stale_tmp(target_dir(&req.out), |name| owns(req, name), progress);
     let data = read_source(&req.source, progress)?;
     // Last chance to stop before a file is touched.
     progress.phase(PHASE_WRITE, None);

@@ -331,6 +331,88 @@ fn stage_ids_hold_no_program_version() {
     assert!(clean.contains("clean v3 "), "{clean}");
 }
 
+/// A killed run leaves `<name>.tmp` files; the next map removes those of its own files at
+/// its start, and only those: in the SLAM folder (where the CLI writes the map) a `.tmp` of
+/// the SLAM run or of a surface stays.
+#[test]
+fn stale_tmp_files_of_the_map_are_removed() {
+    let dir = tmp("steps-map-tmp");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    slam(&dir, &out, false);
+    let own = [
+        "dense.las.tmp",
+        "dense.bin.tmp",
+        "clean.las.tmp",
+        "removed.las.tmp",
+        "clean.bin.tmp",
+        "color.las.tmp",
+        "color.ply.tmp",
+        "map.json.tmp",
+    ];
+    let foreign = ["traj.tum.tmp", "map.las.tmp", "slam.json.tmp", "notiz.tmp"];
+    for f in own.iter().chain(&foreign) {
+        fs::write(out.join(f), b"halb").unwrap();
+    }
+    run_map(&request(&dir, &out, &out, MapStep::All), &Progress::new()).unwrap();
+    for f in own {
+        assert!(!out.join(f).exists(), "{f} left");
+    }
+    for f in foreign {
+        assert!(out.join(f).exists(), "{f} removed");
+    }
+}
+
+/// `map.json` goes before the first file of a map is written and comes back last: a map
+/// that stops in between (here: `removed.las` cannot be replaced, after `dense.bin` was
+/// written) leaves no report and does not fit, also not the input of the old report.
+#[test]
+fn report_goes_before_the_first_write() {
+    let dir = tmp("steps-map-report-first");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    slam(&dir, &out, false);
+    let all = input(&dir, &out, MapStep::All);
+    run_map(&request(&dir, &out, &out, MapStep::All), &Progress::new()).unwrap();
+    assert!(folder_fits(&all, &out));
+    fs::remove_file(out.join("removed.las")).unwrap();
+    fs::create_dir_all(out.join("removed.las").join("x")).unwrap();
+    let mut coarse = request(&dir, &out, &out, MapStep::All);
+    coarse.input.map.switches.voxel *= 2.0;
+    let err = run_map(&coarse, &Progress::new()).unwrap_err();
+    assert!(err.to_string().contains("removed.las"), "{err}");
+    assert!(!out.join("map.json").exists(), "the old report stayed");
+    assert!(!folder_fits(&all, &out));
+    assert!(!folder_fits(&coarse.input, &out));
+    assert!(!files(&out).keys().any(|f| f.ends_with(".tmp")));
+}
+
+/// A stage of another run next to the report of an earlier one (what a run of an older
+/// version left when it was killed between its files) does not fit; a stage that is missing
+/// is no reason (`dense.bin` may be deleted to save space).
+#[test]
+fn stage_of_another_run_next_to_an_old_report_does_not_fit() {
+    let dir = tmp("steps-map-mixed");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    slam(&dir, &out, false);
+    let all = input(&dir, &out, MapStep::All);
+    run_map(&request(&dir, &out, &out, MapStep::All), &Progress::new()).unwrap();
+    let mut coarse = request(&dir, &out, &dir.join("grob"), MapStep::All);
+    coarse.input.map.switches.voxel *= 2.0;
+    run_map(&coarse, &Progress::new()).unwrap();
+    let keep = fs::read(out.join(DENSE_BIN)).unwrap();
+    fs::copy(dir.join("grob").join(DENSE_BIN), out.join(DENSE_BIN)).unwrap();
+    assert!(!folder_fits(&all, &out), "dense.bin of another run");
+    fs::write(out.join(DENSE_BIN), &keep).unwrap();
+    assert!(folder_fits(&all, &out));
+    fs::copy(dir.join("grob").join(CLEAN_BIN), out.join(CLEAN_BIN)).unwrap();
+    assert!(!folder_fits(&all, &out), "clean.bin of another run");
+    fs::remove_file(out.join(CLEAN_BIN)).unwrap();
+    fs::remove_file(out.join(DENSE_BIN)).unwrap();
+    assert!(folder_fits(&all, &out), "missing stages are no reason");
+}
+
 /// `programm` in `map.json` only says which build made the map: a map of another build, or
 /// one written before the field, still fits.
 #[test]

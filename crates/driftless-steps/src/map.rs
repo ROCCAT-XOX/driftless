@@ -9,6 +9,10 @@
 //! `stale` the files of earlier runs that no longer fit; they get a warning, nothing is ever
 //! deleted).
 //!
+//! A run removes the `.tmp` files a killed run of its files left at its start, and
+//! `map.json` before it writes its first file; `map.json` comes last again, so a folder with
+//! a `map.json` holds what it describes.
+//!
 //! Of the clouds to look at, a run writes one: the LAS of its last step, so `color.las`, or
 //! `clean.las` where the scan cannot be coloured (and `dense.las` for the dense step alone).
 //! [`MapRequest::all_files`] (`driftless map --alle-dateien`) writes the files in brackets
@@ -24,10 +28,12 @@
 //! uses the SLAM folder for both).
 
 use crate::error::{check_cancel, failed, StepError};
+use crate::leftovers::{remove_report, remove_stale_tmp};
 use crate::scan::{image_topics, read_imu, warn_if_not_static, with_lidar_frames, IMAGE_TYPE};
 use crate::slam::SlamSettings;
 use crate::{PROGRAM, PROGRAM_KEY};
 use driftless_gpu::{CpuFallback, GpuChoice, GpuContext, GpuPref};
+use driftless_io::atomic_write;
 use driftless_io::calib::load_calibration;
 use driftless_io::camera::Camera;
 use driftless_io::progress::Progress;
@@ -688,6 +694,8 @@ struct MapRun<'a> {
     steps: BTreeMap<&'static str, Value>,
     /// [`MapRequest::all_files`].
     all_files: bool,
+    /// `map.json` of an earlier run is gone (before the first file is written).
+    report_removed: bool,
 }
 
 fn seconds(start: Instant) -> f64 {
@@ -699,11 +707,16 @@ impl MapRun<'_> {
         self.out.join(file)
     }
 
-    /// Last check before a step writes its files; creates the output folder.
-    fn ready_to_write(&self) -> Result<(), StepError> {
+    /// Last check before a step writes its files; creates the output folder and, before the
+    /// first file of the run, removes `map.json` (written again last).
+    fn ready_to_write(&mut self) -> Result<(), StepError> {
         check_cancel(self.progress)?;
         fs::create_dir_all(&self.out)
             .map_err(|e| format!("{} nicht anlegbar: {e}", self.out.display()))?;
+        if !self.report_removed {
+            remove_report(&self.path(REPORT))?;
+            self.report_removed = true;
+        }
         Ok(())
     }
 
@@ -1020,6 +1033,11 @@ const STEP_FILES: [(&str, &[&str], &str); 3] = [
     ("color", &["color.las", "color.ply"], CLEAN_BIN),
 ];
 
+/// Whether a map writes the file `name` (one of [`STEP_FILES`] or `map.json`).
+fn owns(name: &str) -> bool {
+    name == REPORT || STEP_FILES.iter().any(|(_, files, _)| files.contains(&name))
+}
+
 /// Output files in `out` that the current entry of their step in `steps` does not list (its
 /// `files`): the step has none (not run and no longer fitting, or skipped), or did not write
 /// them for its input (`dense.las` of an earlier `--alle-dateien` run, say). They are from an
@@ -1079,7 +1097,9 @@ pub(crate) fn read_traj(slam_dir: &Path) -> Result<(Vec<u8>, Vec<Pose>), String>
 
 /// Whether `dir` holds a map of `input`: its `map.json` has the same switches (the step does
 /// not matter) and a dense entry for the current LiDAR bags, odometry settings and
-/// trajectory.
+/// trajectory, and the stages it claims as current (`dense.bin`, `clean.bin`) are those, if
+/// they are there: one of another run next to the report – what a run of an older version
+/// left when it was killed between its files – does not fit. Reads only their headers.
 pub fn folder_fits(input: &MapInput, dir: &Path) -> bool {
     let fits = || -> Option<bool> {
         let text = fs::read_to_string(dir.join(REPORT)).ok()?;
@@ -1090,9 +1110,29 @@ pub fn folder_fits(input: &MapInput, dir: &Path) -> bool {
         let odom = input.slam.config().ok()?.odom;
         let project = discover_project(&input.scan).ok()?;
         let traj_bytes = fs::read(input.slam_dir.join("traj.tum")).ok()?;
-        let dense_cfg = input.map.switches.dense_config();
-        let id = dense_id(&project, &input.slam, &odom, &traj_bytes, &dense_cfg).ok()?;
-        Some(report["steps"]["dense"]["input_id"].as_str() == Some(hex(&id).as_str()))
+        let switches = &input.map.switches;
+        let dense = dense_id(
+            &project,
+            &input.slam,
+            &odom,
+            &traj_bytes,
+            &switches.dense_config(),
+        )
+        .ok()?;
+        let clean = clean_id(&dense, &switches.clean_config());
+        let claims = |step: &str, id: &str| {
+            report["steps"][step]["input_id"].as_str() == Some(hex(id).as_str())
+        };
+        // A stage that is not there is no reason: `dense.bin` may go to save space.
+        let stage_agrees = |file: &str, id: &str| {
+            let path = dir.join(file);
+            !path.exists() || stage_fits(&path, id)
+        };
+        Some(
+            claims("dense", &dense)
+                && stage_agrees(DENSE_BIN, &dense)
+                && (!claims("clean", &clean) || stage_agrees(CLEAN_BIN, &clean)),
+        )
     };
     fits().unwrap_or(false)
 }
@@ -1190,6 +1230,7 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
     };
 
     let (traj_bytes, poses) = read_traj(&input.slam_dir)?;
+    remove_stale_tmp(&req.out_dir, owns, progress);
     let dense_cfg = switches.dense_config();
     let clean_cfg = switches.clean_config();
     let color_cfg = switches.color_config();
@@ -1223,6 +1264,7 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
         previous,
         steps: BTreeMap::new(),
         all_files: req.all_files,
+        report_removed: false,
     };
 
     match step {
@@ -1286,7 +1328,7 @@ pub fn run_map(req: &MapRequest, progress: &Progress) -> Result<Value, StepError
     report[PROGRAM_KEY] = json!(PROGRAM);
     let report_path = run.path(REPORT);
     let text = serde_json::to_string_pretty(&report).map_err(failed)? + "\n";
-    fs::write(&report_path, text)
+    atomic_write(&report_path, text.as_bytes())
         .map_err(|e| format!("{} nicht schreibbar: {e}", report_path.display()))?;
     let ram = peak.map_or_else(
         || "Spitzen-RAM unbekannt".to_string(),

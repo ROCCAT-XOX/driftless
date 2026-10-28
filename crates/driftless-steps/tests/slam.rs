@@ -285,3 +285,81 @@ fn full_run_refuses_the_folder_of_another_scan() {
     fs::write(unknown.join("slam.json"), "kaputt").unwrap();
     run_slam(&request(&b, &unknown, false), &Progress::new()).unwrap();
 }
+
+/// A killed run leaves `<name>.tmp` files; the next run removes those of its own files at its
+/// start, and only those: a `.tmp` of the map or of `driftless correct` in the same folder
+/// stays.
+#[test]
+fn stale_tmp_files_of_the_run_are_removed() {
+    let dir = tmp("steps-slam-tmp");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let own = [
+        "submaps.bin.tmp",
+        "traj.tum.tmp",
+        "traj_odom.tum.tmp",
+        "map.las.tmp",
+        "slam.json.tmp",
+    ];
+    let foreign = ["dense.bin.tmp", "corrections.toml.tmp", "notiz.tmp"];
+    for f in own.iter().chain(&foreign) {
+        fs::write(out.join(f), b"halb").unwrap();
+    }
+    let p = Progress::new();
+    run_slam(&request(&dir, &out, false), &p).unwrap();
+    for f in own {
+        assert!(!out.join(f).exists(), "{f} left");
+    }
+    for f in foreign {
+        assert!(out.join(f).exists(), "{f} removed");
+    }
+    assert!(p.take_log().iter().any(|l| matches!(
+        l,
+        LogLine::Info(i) if i.starts_with("Reste eines abgebrochenen Laufs entfernt: ")
+            && i.contains("traj.tum.tmp")
+    )));
+
+    // A reuse writes the same files.
+    fs::write(out.join("traj.tum.tmp"), b"halb").unwrap();
+    run_slam(&request(&dir, &out, true), &Progress::new()).unwrap();
+    assert!(!out.join("traj.tum.tmp").exists());
+}
+
+/// `slam.json` goes before the first file of a run is written and comes back last: a run
+/// that stops in between (here: `map.las` cannot be replaced) leaves no report, so the
+/// folder never passes for a finished run of the files in it.
+#[test]
+fn report_goes_before_the_first_write() {
+    let dir = tmp("steps-slam-report-first");
+    room_bag(&dir, true);
+    let out = dir.join("out");
+    run_slam(&request(&dir, &out, false), &Progress::new()).unwrap();
+    assert!(driftless_steps::slam::run_times(&out).is_some());
+    // A folder in the way of map.las: the run fails after traj.tum is written.
+    fs::remove_file(out.join("map.las")).unwrap();
+    fs::create_dir_all(out.join("map.las").join("x")).unwrap();
+    let err = run_slam(&request(&dir, &out, false), &Progress::new()).unwrap_err();
+    assert!(err.to_string().contains("map.las"), "{err}");
+    assert!(!out.join("slam.json").exists(), "the old report stayed");
+    assert!(driftless_steps::slam::run_times(&out).is_none());
+    assert!(out.join("traj.tum").is_file());
+    assert!(!files(&out).keys().any(|f| f.ends_with(".tmp")));
+
+    // The same for a reuse, which renames traj.tum first.
+    fs::remove_dir_all(out.join("map.las")).unwrap();
+    run_slam(&request(&dir, &out, false), &Progress::new()).unwrap();
+    fs::remove_file(out.join("map.las")).unwrap();
+    fs::create_dir_all(out.join("map.las").join("x")).unwrap();
+    run_slam(&request(&dir, &out, true), &Progress::new()).unwrap_err();
+    assert!(!out.join("slam.json").exists());
+    assert!(out.join("traj.vorher.tum").is_file());
+
+    // A cancel before anything is written keeps the report.
+    fs::remove_dir_all(out.join("map.las")).unwrap();
+    run_slam(&request(&dir, &out, false), &Progress::new()).unwrap();
+    let before = files(&out);
+    let err = run_slam(&request(&dir, &out, false), &cancel_at("LiDAR lesen", 5)).unwrap_err();
+    assert_eq!(err, StepError::Cancelled);
+    assert_eq!(files(&out), before);
+}
