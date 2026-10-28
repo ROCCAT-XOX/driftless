@@ -163,7 +163,7 @@ fn export_run_folder_that_is_also_the_map() {
     .stdout(predicate::str::starts_with("1 Lagen → "));
     assert_eq!(
         std::fs::read_to_string(&out).unwrap(),
-        "zeit;x;y;z;qx;qy;qz;qw\n1.000000000;0.000000000;0.000000000;0.000000000;0.000000000;\
-         0.000000000;0.000000000;1.000000000\n"
+        "stempel;zeit_s;x;y;z;qx;qy;qz;qw\n1,000000000;0,000;0,000000000;0,000000000;\
+         0,000000000;0,000000000;0,000000000;0,000000000;1,000000000\n"
     );
 }

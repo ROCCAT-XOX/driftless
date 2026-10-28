@@ -1814,6 +1814,7 @@ dependencies = [
 name = "driftless-traj"
 version = "0.1.0"
 dependencies = [
+ "driftless-io",
  "nalgebra",
  "thiserror 2.0.21",
 ]

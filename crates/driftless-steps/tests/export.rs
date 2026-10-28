@@ -791,9 +791,25 @@ fn run_exports_tum_and_csv() {
     let tum_text = fs::read_to_string(&tum).unwrap();
     let csv_lines: Vec<&str> = csv_text.split('\n').collect();
     let tum_lines: Vec<&str> = tum_text.lines().collect();
-    assert_eq!(csv_lines[0], "zeit;x;y;z;qx;qy;qz;qw");
-    assert_eq!(csv_lines[1], tum_lines[1].replace(' ', ";"));
-    assert!(csv_lines[1].starts_with("1700000000.000000000;0.000000000;-0.333333333;1.5"));
+    // For German spreadsheets: `;` and a decimal comma; the stamp as in TUM, then the seconds
+    // since the first pose, then the TUM values.
+    assert_eq!(csv_lines[0], "stempel;zeit_s;x;y;z;qx;qy;qz;qw");
+    for (k, (csv, tum)) in csv_lines[1..6].iter().zip(&tum_lines[1..]).enumerate() {
+        let tum: Vec<&str> = tum.split(' ').collect();
+        let fields: Vec<&str> = csv.split(';').collect();
+        assert_eq!(fields.len(), 9, "{csv}");
+        assert!(!csv.contains('.'), "{csv}");
+        assert_eq!(fields[0], tum[0].replace('.', ","));
+        let t = |s: &str| s.parse::<f64>().unwrap();
+        let since = t(&fields[1].replace(',', "."))
+            - (t(tum[0]) - t(tum_lines[1].split(' ').next().unwrap()));
+        assert!(since.abs() < 5e-4, "{k}: {csv}");
+        assert_eq!(fields[1].split(',').nth(1).map(str::len), Some(3), "{csv}");
+        for (c, v) in fields[2..].iter().zip(&tum[1..]) {
+            assert_eq!(*c, v.replace('.', ","));
+        }
+    }
+    assert!(csv_lines[1].starts_with("1700000000,000000000;0,000;0,000000000;-0,333333333;1,5"));
     assert_eq!(csv_lines.len(), 7, "five poses, a newline at the end");
     assert_eq!(csv_lines[6], "");
     assert!(!csv_text.contains('\r'));

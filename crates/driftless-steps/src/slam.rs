@@ -5,12 +5,17 @@
 //!
 //! A reuse skips the odometry: it loads `submaps.bin`, solves the pose graph again and keeps
 //! the previous `traj.tum` as `traj.vorher.tum`.
+//!
+//! A full run into a folder that holds the run of another scan is refused: its frames (from
+//! `slam.json`) lie outside the times of this scan's LiDAR bags ([`run_fits_scan`]). Its
+//! corrections would be applied to this scan and its results replaced.
 
 use crate::error::{check_cancel, failed, StepError};
 use crate::history::{self, HistoryKind};
 use crate::scan::{
     parse_extrinsic, read_imu, require_frames, warn_if_not_static, with_lidar_frames, write_las,
 };
+use driftless_io::bag::BagReader;
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_odom::OdomConfig;
@@ -28,6 +33,61 @@ use std::time::Instant;
 
 pub const CACHE_FILE: &str = "submaps.bin";
 pub const CORRECTIONS_FILE: &str = "corrections.toml";
+/// How far (s) a run's frames may lie outside the bag times of its scan: frame stamps come
+/// from the sensor, bag times from the recorder.
+pub const RUN_TIME_TOLERANCE: f64 = 5.0;
+
+/// The times of the run in `dir` from its `slam.json` (s, the clock of the bags): the start
+/// of the scan and the end of the last submap; `None` without a readable `slam.json` with
+/// `scan_start`.
+pub fn run_times(dir: &Path) -> Option<(f64, f64)> {
+    let text = fs::read_to_string(dir.join("slam.json")).ok()?;
+    let report: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let start = report["scan_start"].as_f64()?;
+    let end = report["submaps"]
+        .as_array()
+        .and_then(|m| m.last())
+        .and_then(|m| m["t_end"].as_f64())
+        .unwrap_or(0.0);
+    Some((start, start + end))
+}
+
+/// The time range of the LiDAR bags of a scan (s, the clock of the bags), from their
+/// indexes; `None` if a bag has none (cut off while recording) or cannot be opened.
+pub fn scan_times(bags: &[PathBuf]) -> Option<(f64, f64)> {
+    let mut range: Option<(f64, f64)> = None;
+    for bag in bags {
+        let (a, b) = BagReader::open(bag).ok()?.time_range()?;
+        range = Some(range.map_or((a, b), |(lo, hi)| (lo.min(a), hi.max(b))));
+    }
+    range
+}
+
+/// Whether a run of the times `run` ([`run_times`]) can be of a scan of the times `scan`
+/// ([`scan_times`]): within them, give or take [`RUN_TIME_TOLERANCE`].
+pub fn run_fits_scan(run: (f64, f64), scan: (f64, f64)) -> bool {
+    run.0 >= scan.0 - RUN_TIME_TOLERANCE && run.1 <= scan.1 + RUN_TIME_TOLERANCE
+}
+
+/// Why a full run of the scan `req.scan` (its LiDAR bags `bags`) cannot go into `req.out`:
+/// the folder holds the run of another scan. `None` if it holds none, or if that cannot be
+/// told (no readable `slam.json`, bags without an index).
+fn foreign_run(req: &SlamRequest, bags: &[PathBuf]) -> Option<String> {
+    let run = run_times(&req.out)?;
+    let scan = scan_times(bags)?;
+    (!run_fits_scan(run, scan)).then(|| {
+        format!(
+            "{} enthält den Lauf eines anderen Scans ({:.1}–{:.1} s, dieser Scan {:.1}–{:.1} \
+             s) und wird nicht überschrieben; einen eigenen Zielordner wählen, z. B. {}",
+            req.out.display(),
+            run.0,
+            run.1,
+            scan.0,
+            scan.1,
+            req.scan.join("driftless").display()
+        )
+    })
+}
 
 /// Settings of the odometry that a run depends on (the same for `slam` and `map`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -117,11 +177,19 @@ pub fn cache_fits(req: &SlamRequest) -> bool {
 /// renamed to `traj.vorher.tum` (reuse). A cancelled run leaves the output folder as it was
 /// (a full run into a new folder leaves it empty). From the replaced `submaps.bin` or the
 /// rename on the run is not interruptible and finishes, also when cancelled meanwhile.
+///
+/// A full run into a folder with the run of another scan is refused before anything is read
+/// (see the module documentation).
 pub fn run_slam(req: &SlamRequest, progress: &Progress) -> Result<SlamOutcome, StepError> {
     let start = Instant::now();
     let out = &req.out;
     let cfg = req.settings.config()?;
     let project = discover_project(&req.scan).map_err(failed)?;
+    if !req.reuse {
+        if let Some(why) = foreign_run(req, &project.lidar_bags) {
+            return Err(why.into());
+        }
+    }
     let input = input_id(&project.lidar_bags, &req.settings, &cfg)?;
     let cache = out.join(CACHE_FILE);
     let corrections = Corrections::load(&out.join(CORRECTIONS_FILE))?;

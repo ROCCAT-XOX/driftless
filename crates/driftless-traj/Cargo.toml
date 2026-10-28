@@ -11,5 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+# `atomic_write`: a trajectory is written through `<name>.tmp`.
+driftless-io = { path = "../driftless-io" }
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }
 thiserror = "2"

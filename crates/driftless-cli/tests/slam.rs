@@ -1,7 +1,7 @@
 mod common;
 
 use assert_cmd::Command;
-use common::{room_bag, tmp};
+use common::{room_bag, room_bag_at, tmp};
 use predicates::prelude::*;
 use std::fs;
 use std::path::Path;
@@ -90,4 +90,28 @@ fn slam_rejects_missing_imu() {
         .failure()
         .stderr(predicate::str::contains("keine IMU-Messungen"));
     assert!(!dir.join("out/traj.tum").exists());
+}
+
+/// `-o` of another scan's run (README: one folder per scan): refused in German, nothing
+/// replaced, its corrections not applied.
+#[test]
+fn slam_refuses_the_folder_of_another_scan() {
+    let dir = tmp("slam-fremd");
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    room_bag(&a, true);
+    room_bag_at(&b, true, 5000.0, 1.5);
+    let out = dir.join("out");
+    slam(&a, &out).success();
+    let traj = fs::read(out.join("traj.tum")).unwrap();
+    slam(&b, &out)
+        .failure()
+        .stderr(predicate::str::contains("Fehler: "))
+        .stderr(predicate::str::contains(
+            "enthält den Lauf eines anderen Scans",
+        ))
+        .stderr(predicate::str::contains("eigenen Zielordner"));
+    assert_eq!(fs::read(out.join("traj.tum")).unwrap(), traj);
+    slam(&b, &b.join("driftless")).success();
 }

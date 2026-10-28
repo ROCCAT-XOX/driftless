@@ -46,6 +46,8 @@ pub fn read_tum(path: &Path) -> Result<Vec<Pose>, TrajError> {
     Ok(out)
 }
 
+/// Writes `poses` to `path` through `<name>.tmp` next to it, renamed at the end: an
+/// interruption leaves the old file whole, never half a trajectory.
 pub fn write_tum(path: &Path, poses: &[Pose]) -> Result<(), TrajError> {
     let mut s = String::from("# timestamp tx ty tz qx qy qz qw\n");
     for p in poses {
@@ -56,8 +58,55 @@ pub fn write_tum(path: &Path, poses: &[Pose]) -> Result<(), TrajError> {
             p.t, p.p.x, p.p.y, p.p.z, q.i, q.j, q.k, q.w
         );
     }
-    std::fs::write(path, s).map_err(|source| TrajError::Io {
+    driftless_io::atomic_write(path, s.as_bytes()).map_err(|source| TrajError::Io {
         path: path.display().to_string(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn pose(t: f64) -> Pose {
+        Pose {
+            t,
+            p: Vector3::new(t, 0.0, 0.0),
+            q: UnitQuaternion::identity(),
+        }
+    }
+
+    /// The file is replaced as a whole: a second name of the old file (a hard link) keeps the
+    /// old trajectory, no `.tmp` is left, and a write that fails leaves none either.
+    #[test]
+    fn write_tum_replaces_the_file_as_a_whole() {
+        let dir = std::env::temp_dir().join(format!("driftless-traj-tum-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("traj.tum");
+        write_tum(&path, &[pose(1.0)]).unwrap();
+        let link = dir.join("traj.alt.tum");
+        let _ = fs::remove_file(&link);
+        fs::hard_link(&path, &link).unwrap();
+        let before = fs::read(&link).unwrap();
+        write_tum(&path, &[pose(2.0), pose(3.0)]).unwrap();
+        assert_eq!(
+            fs::read(&link).unwrap(),
+            before,
+            "written into the old file"
+        );
+        let back = read_tum(&path).unwrap();
+        assert_eq!(back.iter().map(|p| p.t).collect::<Vec<_>>(), [2.0, 3.0]);
+        assert!(!dir.join("traj.tum.tmp").exists());
+
+        // The target is a folder with something in it: the rename fails.
+        let blocked = dir.join("ordner.tum");
+        fs::create_dir_all(blocked.join("x")).unwrap();
+        assert!(matches!(
+            write_tum(&blocked, &[pose(1.0)]),
+            Err(TrajError::Io { .. })
+        ));
+        assert!(!dir.join("ordner.tum.tmp").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

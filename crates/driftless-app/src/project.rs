@@ -66,7 +66,6 @@ use crate::surface::SURFACE_GLB;
 use crate::ui::text;
 use driftless_gpu::GpuPref;
 use driftless_io::atomic_write;
-use driftless_io::bag::BagReader;
 use driftless_io::paths::{relative_text, relative_to};
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
@@ -83,7 +82,8 @@ use driftless_steps::pairs::{
     stored_path as from_stored, stored_text, PointPairEntry, PointPairs, POINT_PAIRS_FILE,
 };
 use driftless_steps::slam::{
-    cache_fits, run_slam, SlamOutcome, SlamRequest, SlamSettings, CACHE_FILE, CORRECTIONS_FILE,
+    cache_fits, run_fits_scan, run_slam, scan_times, SlamOutcome, SlamRequest, SlamSettings,
+    CACHE_FILE, CORRECTIONS_FILE,
 };
 use driftless_steps::surface::{
     model_surface_fits, run_model_surface, run_surface, surface_fits, ModelSurfaceRequest,
@@ -112,9 +112,6 @@ const SURFACE_PREFIX: &str = "oberflaeche";
 const SURFACE_NUMBERED: &str = "oberflaeche-";
 /// The clouds of a map folder that can be shown, best first.
 const MAP_CLOUDS: [&str; 4] = ["color.las", "clean.las", "dense.las", "removed.las"];
-/// How far (s) a run's frames may lie outside the bag times of its scan: frame stamps come
-/// from the sensor, bag times from the recorder.
-const RUN_TIME_TOLERANCE: f64 = 5.0;
 
 /// Why a project could not be read or changed (German, for display).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -489,17 +486,10 @@ fn check_run_scan(run: &Path, scan: &Path) -> Result<(), ProjectError> {
             .unwrap_or(0.0);
     let project =
         discover_project(scan).map_err(|e| ProjectError(format!("Lauf nicht prüfbar: {e}")))?;
-    let mut range: Option<(f64, f64)> = None;
-    for bag in &project.lidar_bags {
-        let Some((a, b)) = BagReader::open(bag).ok().and_then(|mut r| r.time_range()) else {
-            return Ok(());
-        };
-        range = Some(range.map_or((a, b), |(lo, hi)| (lo.min(a), hi.max(b))));
-    }
-    let Some((lo, hi)) = range else {
+    let Some((lo, hi)) = scan_times(&project.lidar_bags) else {
         return Ok(());
     };
-    if start >= lo - RUN_TIME_TOLERANCE && end <= hi + RUN_TIME_TOLERANCE {
+    if run_fits_scan((start, end), (lo, hi)) {
         Ok(())
     } else {
         Err(ProjectError(format!(

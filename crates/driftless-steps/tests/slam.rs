@@ -1,7 +1,7 @@
 //! `run_slam` on synthetic scans: outputs, progress and cancelling.
 
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
-use driftless_io::testscan::{room_bag, room_bag_secs, tmp};
+use driftless_io::testscan::{room_bag, room_bag_at, room_bag_secs, tmp};
 use driftless_steps::slam::{cache_fits, run_slam, SlamRequest, SlamSettings};
 use driftless_steps::StepError;
 use std::collections::BTreeMap;
@@ -232,4 +232,40 @@ fn bad_correction_fails_after_the_cache() {
     assert!(!m.contains("driftless"), "{m}");
     assert_eq!(err.to_string(), *m);
     assert!(out.join("submaps.bin").exists());
+}
+
+/// A full run into a folder that holds the run of another scan (recorded at another time) is
+/// refused before anything is read or written: its corrections would be applied to this scan
+/// and its results replaced. The same scan again, an empty folder and a folder of a run that
+/// cannot be told are fine.
+#[test]
+fn full_run_refuses_the_folder_of_another_scan() {
+    let dir = tmp("steps-slam-fremd");
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    for d in [&a, &b] {
+        fs::create_dir_all(d).unwrap();
+    }
+    room_bag(&a, true);
+    room_bag_at(&b, true, 5000.0, 1.5);
+    let out = dir.join("out");
+    run_slam(&request(&a, &out, false), &Progress::new()).unwrap();
+    let before = files(&out);
+    let err = run_slam(&request(&b, &out, false), &Progress::new()).unwrap_err();
+    let StepError::Failed(m) = &err else {
+        panic!("expected a refusal, got {err:?}");
+    };
+    assert!(
+        m.contains("Lauf eines anderen Scans") && m.contains("eigenen Zielordner"),
+        "{m}"
+    );
+    assert!(m.contains(&out.display().to_string()), "{m}");
+    assert_eq!(files(&out), before, "nothing written");
+    // The scan of the folder again, and the other scan into a folder of its own.
+    run_slam(&request(&a, &out, false), &Progress::new()).unwrap();
+    run_slam(&request(&b, &dir.join("out-b"), false), &Progress::new()).unwrap();
+    // A `slam.json` that cannot be read tells nothing: the run goes ahead.
+    let unknown = dir.join("unbekannt");
+    fs::create_dir_all(&unknown).unwrap();
+    fs::write(unknown.join("slam.json"), "kaputt").unwrap();
+    run_slam(&request(&b, &unknown, false), &Progress::new()).unwrap();
 }
