@@ -220,7 +220,7 @@ fn export_glim_truncated_bag_warns_and_keeps_data() {
     export(&dir, &[])
         .success()
         .stderr(predicate::str::contains("Warnung"))
-        .stderr(predicate::str::contains("truncated"));
+        .stderr(predicate::str::contains("abgeschnitten"));
     let lidar = fs::read(dir.join("out/lidar.bin")).unwrap();
     assert!(lidar.len() > 8);
 }
