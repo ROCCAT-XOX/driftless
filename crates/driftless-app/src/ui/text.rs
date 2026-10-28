@@ -284,7 +284,7 @@ pub const SURFACE_RECOMPUTE_HINT: &str = "Karte wählen und „Oberfläche rechn
 pub const SURFACE_FINENESS: &str = "Feinheit";
 /// Under the switch at 1 cm.
 pub const SURFACE_FINE_HINT: &str =
-    "braucht bei großen Aufnahmen bis 8 GB Arbeitsspeicher und rund 20 Minuten";
+    "braucht bei großen Aufnahmen bis 9 GB Arbeitsspeicher und rund 20 Minuten";
 /// The status of a map whose own map no longer fits its run: its surface waits for „Daten“.
 pub const STATUS_MAP_STALE: &str = "Karte veraltet";
 pub const STATUS_MAP_STALE_HINT: &str =
@@ -368,7 +368,7 @@ pub const SURFACE_VOXEL_CHOICES: [(f64, &str); 3] =
     [(0.01, "1 cm"), (0.015, "1,5 cm"), (0.02, "2 cm")];
 pub const SURFACE_VOXEL_HINT: &str =
     "Kleiner ist feiner, braucht mehr Speicher und Zeit; 1 cm braucht bei großen Aufnahmen bis \
-     8 GB Arbeitsspeicher und rund 20 Minuten";
+     9 GB Arbeitsspeicher und rund 20 Minuten";
 pub const SURFACE_NO_PHOTOS: &str = "ohne Fotos (graue Fläche)";
 
 // The 3D view and its settings (window ⚙)
