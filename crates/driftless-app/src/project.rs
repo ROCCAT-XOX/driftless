@@ -218,6 +218,9 @@ pub struct SurfaceInfo {
     /// What it was made with, from its `oberflaeche.json` ([`SurfaceSettings::from_report`]);
     /// `None` without a readable one.
     pub settings: Option<SurfaceSettings>,
+    /// The hints of its `oberflaeche.json` for the user (`hinweise`, German, e.g. why it stays
+    /// open in places); empty without them (also in a report of before the field).
+    pub hints: Vec<String>,
 }
 
 /// A model of the project: scans merged into one (`modelle/modell-NNN` with `modell.json`).
@@ -791,17 +794,29 @@ fn surfaces_of(dir: &Path) -> Vec<SurfaceInfo> {
     labelled
         .filter(|(_, p)| p.join(SURFACE_GLB).is_file())
         .map(|(label, dir)| {
-            let settings = fs::read_to_string(dir.join(SURFACE_REPORT))
+            let report = fs::read_to_string(dir.join(SURFACE_REPORT))
                 .ok()
-                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                .and_then(|v| SurfaceSettings::from_report(&v));
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+            let settings = report.as_ref().and_then(SurfaceSettings::from_report);
             SurfaceInfo {
                 label,
                 stale: false,
                 settings,
+                hints: report.as_ref().map(surface_hints).unwrap_or_default(),
                 dir,
             }
         })
+        .collect()
+}
+
+/// The hints for the user in the surface report `report` (`hinweise`): its texts, nothing
+/// else; none without the field.
+fn surface_hints(report: &serde_json::Value) -> Vec<String> {
+    report["hinweise"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|h| h.as_str().map(String::from))
         .collect()
 }
 

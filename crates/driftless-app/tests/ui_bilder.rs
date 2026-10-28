@@ -8,6 +8,7 @@ use driftless_app::project::{
     SurfaceSettings,
 };
 use driftless_app::ui::steps::bilder::{model_surface_status, surface_status, SurfaceStatus};
+use driftless_app::ui::theme::icon;
 use driftless_app::ui::{
     steps, text, Action, AppState, DriftlessApp, Queued, ScanNode, Selection, Step, UiMessage,
 };
@@ -56,6 +57,7 @@ fn surface(dir: &str, label: &str) -> SurfaceInfo {
         label: label.into(),
         stale: false,
         settings: Some(SurfaceSettings::default()),
+        hints: Vec::new(),
     }
 }
 
@@ -895,6 +897,58 @@ fn model_card_computes_its_surface() {
 
 fn surface_info(dir: &str) -> SurfaceInfo {
     surface(dir, "Oberfläche 001")
+}
+
+/// The hint of a surface that stays open in places, as the surface step writes it.
+const OPEN: &str = "Stellenweise offen: An 23 % der dünn gemessenen Stellen lag kein Messpunkt \
+                    näher als 1,5 cm. Dort bleibt die Oberfläche offen, statt etwas zu erfinden. \
+                    Das ist in großen Räumen üblich. Schließen lassen sich solche Stellen nur \
+                    durch dichteres Scannen (näher heran, langsamer), nicht durch eine feinere \
+                    Einstellung.";
+
+/// The hints of a surface for the user (`hinweise` of its report): short and muted below its
+/// entry with the whole hint on hover, and in full under „Diese Oberfläche“ once it is
+/// selected; for a surface of a map and of a model. A surface without hints shows none.
+#[test]
+fn surface_hints_are_shown() {
+    let short = format!("{} {}", icon::HINT, text::surface_hint_short(OPEN));
+    assert_eq!(
+        text::surface_hint_short(OPEN),
+        "Hinweis: Stellenweise offen"
+    );
+    let full = format!("{} {}: {OPEN}", icon::HINT, text::SURFACE_HINT);
+    let hinted = format!("{MAP_A}/oberflaeche-001");
+    let mut state = four_maps();
+    state.scans[0].runs[0].maps[0].surfaces[0].hints = vec![OPEN.into()];
+    let mut h = panel(state.clone());
+    h.ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.0);
+    // only below the surface with the hint (three surfaces are listed)
+    assert_eq!(h.get_all_by_label(&short).count(), 1);
+    assert!(h.query_by_label(OPEN).is_none());
+    h.get_by_label(&short).hover();
+    h.run();
+    h.get_by_label(OPEN);
+    // selected: in full below its state
+    state.selection = Selection::Surface(hinted.into());
+    let h = panel(state.clone());
+    h.get_by_label(text::THIS_SURFACE);
+    h.get_by_label(&full);
+    // another surface of the same map selected: not its hint
+    state.selection = Selection::Surface(format!("{MAP_A}/oberflaeche-002").into());
+    let h = panel(state);
+    h.get_by_label(text::THIS_SURFACE);
+    assert!(h.query_by_label(&full).is_none());
+
+    // a surface of a model
+    let model_surface = format!("{MODEL}/oberflaeche-001");
+    let mut hinted = surface_info(&model_surface);
+    hinted.hints = vec![OPEN.into()];
+    let mut state = with_model(vec![hinted]);
+    let h = panel(state.clone());
+    h.get_by_label(&short);
+    state.selection = Selection::Surface(model_surface.into());
+    let h = panel(state);
+    h.get_by_label(&full);
 }
 
 #[test]

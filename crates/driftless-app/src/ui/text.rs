@@ -314,6 +314,16 @@ pub const STATUS_SCAN_MISSING: &str = "Scan fehlt";
 pub const MAP_GONE: &str = "Karte nicht mehr im Projekt";
 /// Before the state of a surface of the selected map with the fineness chosen now.
 pub const WITH_THIS_FINENESS: &str = "Mit dieser Feinheit";
+/// Before a hint of a surface for the user (`hinweise` in its `oberflaeche.json`): a hint,
+/// not an error.
+pub const SURFACE_HINT: &str = "Hinweis";
+
+/// A hint of a surface short, below its entry: its title before the colon, „Hinweis:
+/// Stellenweise offen“ for „Stellenweise offen: An 23 % …“; without a colon the whole hint.
+pub fn surface_hint_short(hint: &str) -> String {
+    let title = hint.split_once(':').map_or(hint, |(title, _)| title);
+    format!("{SURFACE_HINT}: {title}")
+}
 
 // Panels
 pub const PANEL_STEPS: &str = "Schritte";

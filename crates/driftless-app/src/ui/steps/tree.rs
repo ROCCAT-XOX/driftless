@@ -1,5 +1,6 @@
 //! What „Daten“ shows below the card of a scan: its runs („SLAM 001“ …) → maps → clouds and
-//! surfaces („Oberfläche 001“, a stale one with „veraltet – Karte oder Lauf neu gerechnet“), and
+//! surfaces („Oberfläche 001“, a stale one with „veraltet – Karte oder Lauf neu gerechnet“; a
+//! hint of its report small below it, „Hinweis: Stellenweise offen“, in full on hover), and
 //! per run its history („Verlauf“: each state with number, kind, time and start↔end gap). Below
 //! the scans the models („Modell 001“): per scan of a model its number, name and how surely it
 //! was placed (✓ sicher, ⚠ unsicher, ✗ gescheitert, the reason on hover) with overlap and
@@ -357,17 +358,31 @@ pub(super) fn surface_leaf(
 ) {
     let selected = state.selection == Selection::Surface(surface.dir.clone());
     let label = sized(state, &surface.label, &surface.dir);
+    // its hints for the user in full on hover, below the folder
+    let hover = |name: &str| {
+        let mut hover = format!("{name}\n{}", surface.dir.display());
+        for hint in &surface.hints {
+            hover += &format!("\n\n{hint}");
+        }
+        hover
+    };
     let r = leaf(ui, |ui| {
         if surface.stale {
             let name = text::surface_stale(&label);
-            let hover = format!("{name}\n{}", surface.dir.display());
             let warn = ui.visuals().warn_fg_color;
-            entry(ui, selected, RichText::new(name).color(warn), &hover)
+            entry(
+                ui,
+                selected,
+                RichText::new(&name).color(warn),
+                &hover(&name),
+            )
         } else {
-            let hover = format!("{label}\n{}", surface.dir.display());
-            entry(ui, selected, label.clone(), &hover)
+            entry(ui, selected, label.clone(), &hover(&label))
         }
     });
+    for hint in &surface.hints {
+        hint_line(ui, hint);
+    }
     let manage = Manage::Delete(surface.dir.clone());
     entry_menu(
         &r,
@@ -379,6 +394,17 @@ pub(super) fn surface_leaf(
     if r.clicked() {
         *action = Some(Action::Select(Selection::Surface(surface.dir.clone())));
     }
+}
+
+/// A hint of a surface for the user below its entry: small and muted (a hint, not an error),
+/// only its title ([`text::surface_hint_short`]), the whole hint on hover.
+fn hint_line(ui: &mut Ui, hint: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(ui.spacing().indent + ui.spacing().button_padding.x);
+        let line = format!("{} {}", icon::HINT, text::surface_hint_short(hint));
+        let line = RichText::new(line).small().color(DARK.text_dim);
+        ui.add(egui::Label::new(line).wrap()).on_hover_text(hint);
+    });
 }
 
 /// What the context menu of an entry offers besides „Exportieren …“.

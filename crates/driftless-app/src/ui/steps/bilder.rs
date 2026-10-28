@@ -1,10 +1,12 @@
 //! Step 2 „Bilder“, in the form of „Daten“: the heading with the number of maps and
 //! surfaces, a card per map with its status (neu, wartet, rechnet, fertig ✓, veraltet, Karte
-//! veraltet, Karte noch nicht fertig, Scan fehlt) and its surfaces below it („Oberfläche 001“, a stale one marked; a click shows
-//! it), the fineness of the next surface as a three-way switch (1 / 1,5 / 2 cm), the progress
-//! of the running job, and at the bottom the main button: „Alle Oberflächen rechnen“ queues
-//! every map without a current surface ([`Action::ComputeAllSurfaces`]), „Oberfläche
-//! rechnen“ only the selected map. „ohne Fotos“ lies under „▸ Erweitert“.
+//! veraltet, Karte noch nicht fertig, Scan fehlt) and its surfaces below it („Oberfläche 001“,
+//! a stale one marked, a hint of its report small below it; a click shows it, and its hints in
+//! full under „Diese Oberfläche“), the fineness of the next surface as a three-way switch
+//! (1 / 1,5 / 2 cm), the progress of the running job, and at the bottom the main button:
+//! „Alle Oberflächen rechnen“ queues every map without a current surface
+//! ([`Action::ComputeAllSurfaces`]), „Oberfläche rechnen“ only the selected map. „ohne Fotos“
+//! lies under „▸ Erweitert“.
 //!
 //! Below the maps a card per model („Modell 001 · 3 Scans“) with its surfaces; selected, the
 //! main button computes the surface of the model from the images of all its scans
@@ -275,7 +277,7 @@ fn fineness_switch(ui: &mut Ui, settings: &mut SurfaceSettings) {
 }
 
 /// For a selected map: the state of its surface with the settings chosen now; for a
-/// selected surface also its own state.
+/// selected surface also its own state and its hints for the user (`hinweise`).
 fn selection_state(ui: &mut Ui, state: &AppState) {
     let surfaces = match (state.selected_map(), state.selected_model()) {
         (Some(map), _) => &map.surfaces,
@@ -294,6 +296,11 @@ fn selection_state(ui: &mut Ui, state: &AppState) {
                 ui.label(text::THIS_SURFACE);
                 state_label(ui, own_surface_state(state, surface));
             });
+            // its hints for the user in full, muted: a hint, not an error
+            for hint in &surface.hints {
+                let line = format!("{} {}: {hint}", icon::HINT, text::SURFACE_HINT);
+                ui.add(egui::Label::new(RichText::new(line).color(DARK.text_dim)).wrap());
+            }
         }
     }
 }

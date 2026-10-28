@@ -1060,9 +1060,36 @@ fn model_of_an_older_merge_is_stale() {
         label: "Oberfläche 001".into(),
         stale: false,
         settings: None,
+        hints: Vec::new(),
     };
     assert!(model_surface_status(&unplugged, &surface).stale);
     assert!(!model_surface_status(&current_unplugged, &surface).stale);
+}
+
+/// The hints for the user in a surface report (`hinweise`) are read with the surface; a report
+/// without them (written before the field) reads as no hints.
+#[test]
+fn surface_hints_are_read() {
+    let dir = tmp("app-surface-hints");
+    let p = merge_project(&dir);
+    let model = run_merge_job(&p, &picks(&p), false, &Progress::new()).unwrap();
+    let hint = "Stellenweise offen: An 23 % der dünn gemessenen Stellen lag kein Messpunkt.";
+    for (name, report) in [
+        ("oberflaeche-001", serde_json::json!({ "hinweise": [hint] })),
+        (
+            "oberflaeche-002",
+            serde_json::json!({ "seconds_total": 1.0 }),
+        ),
+        ("oberflaeche-003", serde_json::json!({ "hinweise": [] })),
+    ] {
+        let surface = model.join(name);
+        fs::create_dir_all(&surface).unwrap();
+        fs::write(surface.join("oberflaeche.glb"), b"glb").unwrap();
+        fs::write(surface.join("oberflaeche.json"), report.to_string()).unwrap();
+    }
+    let surfaces = &p.models()[0].surfaces;
+    let hints: Vec<&[String]> = surfaces.iter().map(|s| s.hints.as_slice()).collect();
+    assert_eq!(hints, [&[hint.to_string()][..], &[], &[]]);
 }
 
 #[test]

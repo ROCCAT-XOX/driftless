@@ -892,6 +892,7 @@ fn with_model() -> AppState {
             label: "Oberfläche 001".into(),
             stale: false,
             settings: None,
+            hints: Vec::new(),
         }],
     }];
     state
@@ -954,6 +955,25 @@ fn model_node_shows_verdicts() {
     let h = panel(state);
     h.get_by_label(&text::model_stale_version("Modell 001"));
     assert!(h.query_by_label(&text::model_stale("Modell 001")).is_none());
+}
+
+/// A surface of a model with a hint for the user: the hint short below its entry in the tree.
+#[test]
+fn surface_hint_in_the_tree() {
+    let hint = "Stellenweise offen: An 23 % der dünn gemessenen Stellen lag kein Messpunkt.";
+    let short = format!(
+        "{} {}",
+        driftless_app::ui::theme::icon::HINT,
+        text::surface_hint_short(hint)
+    );
+    let mut state = with_model();
+    let h = panel(state.clone());
+    h.get_by_label("Oberfläche 001");
+    assert!(h.query_by_label(&short).is_none());
+    state.models[0].surfaces[0].hints = vec![hint.into()];
+    let h = panel(state);
+    h.get_by_label("Oberfläche 001");
+    h.get_by_label(&short);
 }
 
 /// On hover over a scan of a model: the residual on the walls, or that they could not be

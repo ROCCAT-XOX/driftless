@@ -13,9 +13,9 @@
 //! every file it lists (`bytes`), so a folder with a report holds a complete surface and one
 //! with a file of another run next to the report does not fit ([`surface_fits`]).
 //!
-//! The report names under `hinweise` short German hints for the user (the app can show
-//! them): when the setting `max_fill_gap` leaves the surface open in many places, why and
-//! what helps ([`OPEN_HINT_SHARE`]).
+//! The report names under `hinweise` short German hints for the user in plain words (the app
+//! shows them with the surface): when the setting `max_fill_gap` leaves the surface open in
+//! many places, why and what helps ([`OPEN_HINT_SHARE`]).
 //!
 //! The surface of a merged model ([`run_model_surface`]) is made the same way from the
 //! `clean.bin` of every scan in the model, moved by its `T_i`, with the LiDAR positions and
@@ -189,22 +189,22 @@ fn owns(name: &str) -> bool {
     fixed.iter().any(|f| f == name) || is_page_of(name.as_ref(), STEM.as_ref())
 }
 
-/// Short German hints about the surface for the user (the app can show them), in the report
-/// under `hinweise`: why a surface stays open in many places, when the cause is the setting
-/// `max_fill_gap` ([`OPEN_HINT_SHARE`]).
+/// Short German hints about the surface for the user, in plain words (the app shows them with
+/// the surface, the CLI prints them), in the report under `hinweise`: why a surface stays open
+/// in many places, when the cause is the setting `max_fill_gap` ([`OPEN_HINT_SHARE`]).
 fn hints(stats: &SurfaceStats, config: &SurfaceConfig) -> Vec<String> {
     let dropped = stats.faces_unsupported as f64;
     let share = dropped / (dropped + stats.faces_final as f64).max(1.0);
     if share < OPEN_HINT_SHARE {
         return Vec::new();
     }
+    let gap_cm = format!("{:.1}", 100.0 * config.max_fill_gap).replace('.', ",");
     vec![format!(
-        "Stellenweise offen: an {:.0} % der dünn gemessenen Flächen lag kein Messpunkt näher \
-         als {:.1} cm (Einstellung max_fill_gap), dort bleibt die Oberfläche offen statt \
-         erfunden – in großen Räumen üblich; schließen lässt sie sich nur durch dichteres \
-         Scannen dieser Stellen (näher, langsamer), nicht durch eine feinere Feinheit",
-        100.0 * share,
-        100.0 * config.max_fill_gap
+        "Stellenweise offen: An {:.0} % der dünn gemessenen Stellen lag kein Messpunkt näher \
+         als {gap_cm} cm. Dort bleibt die Oberfläche offen, statt etwas zu erfinden. Das ist in \
+         großen Räumen üblich. Schließen lassen sich solche Stellen nur durch dichteres Scannen \
+         (näher heran, langsamer), nicht durch eine feinere Einstellung.",
+        100.0 * share
     )]
 }
 
@@ -875,14 +875,19 @@ mod tests {
         assert!(hints(&stats(1_153_721, 98_911), &cfg).is_empty());
         assert!(hints(&stats(0, 0), &cfg).is_empty());
         let h = hints(&stats(6_640_042, 2_004_445), &cfg);
-        assert_eq!(h.len(), 1, "{h:?}");
+        assert_eq!(
+            h,
+            [
+                "Stellenweise offen: An 23 % der dünn gemessenen Stellen lag kein Messpunkt näher \
+              als 1,5 cm. Dort bleibt die Oberfläche offen, statt etwas zu erfinden. Das ist in \
+              großen Räumen üblich. Schließen lassen sich solche Stellen nur durch dichteres \
+              Scannen (näher heran, langsamer), nicht durch eine feinere Einstellung."
+            ]
+        );
+        // no setting name, no decimal point
         assert!(
-            h[0].starts_with(
-                "Stellenweise offen: an 23 % der dünn gemessenen Flächen lag kein \
-                 Messpunkt näher als 1.5 cm (Einstellung max_fill_gap)"
-            ),
+            !h[0].contains("max_fill_gap") && !h[0].contains("1.5"),
             "{h:?}"
         );
-        assert!(h[0].contains("nicht durch eine feinere Feinheit"), "{h:?}");
     }
 }
