@@ -58,4 +58,4 @@ groß, und Dateien, die nur in der Cloud liegen, bremsen oder stören das Rechne
 ☰ → „Protokoll-Ordner öffnen“ zeigt das Protokoll (`driftless.log`), „Über Driftless“ nennt Version
 und Commit. Beides bitte einer Fehlermeldung beilegen.
 
-Was neu ist, steht im [CHANGELOG](@REPO@/blob/main/CHANGELOG.md).
+Was neu ist, steht unten und im [CHANGELOG](@REPO@/blob/main/CHANGELOG.md).
