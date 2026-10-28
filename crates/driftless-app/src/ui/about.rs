@@ -1,7 +1,8 @@
 //! The window „Über Driftless“ (☰ → „Über Driftless …“): version, the commit it was built
-//! from, licence, repository, where the command line `driftless` is, and the licence notices of
-//! the third-party parts. Also how the system opens a file, a folder or an address
-//! ([`open_with_system`]), and „Protokoll-Ordner öffnen“ of ☰ ([`open_log_folder`]).
+//! from, licence, repository, the German guide („Anleitung“), where the command line
+//! `driftless` is, and the licence notices of the third-party parts. Also how the system opens a
+//! file, a folder or an address ([`open_with_system`]), and „Protokoll-Ordner öffnen“ of ☰
+//! ([`open_log_folder`]).
 
 use super::text;
 use super::theme::DARK;
@@ -23,6 +24,8 @@ pub const CLI_NAME: &str = if cfg!(windows) {
 /// The licence notices of the third-party parts, as the package scripts write them
 /// (packaging/about.toml).
 pub const NOTICES_NAME: &str = "THIRD-PARTY-NOTICES.html";
+/// The German guide for colleagues (`docs/anleitung.md`) on the main branch of the repository.
+pub const GUIDE_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/blob/main/docs/anleitung.md");
 
 /// Width of the window (points).
 const WIDTH: f32 = 340.0;
@@ -146,6 +149,13 @@ pub fn show_with(ctx: &Context, open: &mut bool, notices: Option<&Path>, cli: Op
                     repository.to_string(),
                     open_with_system(repository.as_ref()),
                 ));
+            }
+            if ui
+                .link(text::ABOUT_GUIDE)
+                .on_hover_text(GUIDE_URL)
+                .clicked()
+            {
+                opened = Some((GUIDE_URL.to_string(), open_with_system(GUIDE_URL.as_ref())));
             }
             ui.separator();
             ui.label(cli_line(cli));

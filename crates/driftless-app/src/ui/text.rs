@@ -443,6 +443,8 @@ pub const ABOUT_CLI_MISSING: &str = "Kommandozeile: nicht im Paket (cargo run -p
 /// Opens the licence notices of the third-party parts (THIRD-PARTY-NOTICES.html).
 pub const ABOUT_NOTICES: &str = "Lizenzen Dritter …";
 pub const ABOUT_NOTICES_MISSING: &str = "Lizenzen Dritter: nicht im Paket (packaging/about.toml)";
+/// Opens the German guide for colleagues (docs/anleitung.md on GitHub) in the browser.
+pub const ABOUT_GUIDE: &str = "Anleitung";
 /// ☰: the folder of the log file (`crate::logfile`) in the file manager.
 pub const OPEN_LOG_FOLDER: &str = "Protokoll-Ordner öffnen";
 /// „Protokoll-Ordner öffnen“ when the system names no folder for it.

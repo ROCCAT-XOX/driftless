@@ -1,5 +1,5 @@
-//! The window „Über Driftless“: version, commit, licence, repository and where the command
-//! line is; ☰ opens it.
+//! The window „Über Driftless“: version, commit, licence, repository, the guide and where the
+//! command line is; ☰ opens it.
 
 use driftless_app::ui::{about, rail, text, AppState};
 use eframe::egui::accesskit::Role;
@@ -26,6 +26,21 @@ fn about_shows_version_commit_license() {
     h.get_by_label(&about::cli_line(about::cli_path().as_deref()));
     assert!(!about::COMMIT.is_empty());
     assert_eq!(about::VERSION, env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn about_links_the_guide() {
+    let h = window(true);
+    // a link like the repository's (egui names it as a label); not clicked: it would open the
+    // browser
+    h.get_by_label(text::ABOUT_GUIDE);
+    assert_eq!(
+        about::GUIDE_URL,
+        "https://github.com/ROCCAT-XOX/driftless/blob/main/docs/anleitung.md"
+    );
+    // the address points at the guide in this repository
+    let guide = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/anleitung.md");
+    assert!(guide.is_file(), "{} fehlt", guide.display());
 }
 
 #[test]
