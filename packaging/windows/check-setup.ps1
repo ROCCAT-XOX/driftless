@@ -1,6 +1,7 @@
 ﻿# Checks a setup of build-setup.ps1: size, silent install for the current user, the installed
-# files, `--version` of both programs, the Start menu entry, silent uninstall. Exit != 0 on any
-# fault. Leaves nothing installed behind when it passes.
+# files, that both programs bring their C runtime with them, `--version` of both programs, the
+# Start menu entry, silent uninstall. Exit != 0 on any fault. Leaves nothing installed behind
+# when it passes.
 #
 #   packaging\windows\check-setup.ps1 target\package\Driftless-<version>-setup.exe
 #
@@ -12,6 +13,8 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# Get-PeImports
+. (Join-Path $PSScriptRoot 'pe-imports.ps1')
 
 if (-not $Setup -or -not (Test-Path -LiteralPath $Setup -PathType Leaf)) {
     [Console]::Error.WriteLine('Aufruf: check-setup.ps1 <Driftless-…-setup.exe>')
@@ -111,6 +114,16 @@ Ok "Dateien: $($expected -join ', ')"
 
 $cli = Join-Path $dir 'driftless.exe'
 $app = Join-Path $dir 'driftless-app.exe'
+# The C runtime is linked in (.cargo/config.toml): the Visual C++ runtime is not part of Windows,
+# and this runner has it installed, so only the import tables can show the need for it.
+foreach ($exe in $cli, $app) {
+    $runtime = @(Get-PeImports $exe | Where-Object { $_ -match '^(vcruntime|msvcp|api-ms-win-crt-)' })
+    if ($runtime.Count -gt 0) {
+        Fail "$(Split-Path -Leaf $exe) braucht die Visual-C++-Laufzeit ($($runtime -join ', ')): target-feature=+crt-static in .cargo/config.toml?"
+    }
+}
+Ok 'C-Laufzeit eingebunden: kein VCRUNTIME*, MSVCP* oder api-ms-win-crt-* in driftless.exe und driftless-app.exe'
+
 $cliVersion = Get-ProgramOutput $cli @('--version')
 if ($cliVersion -notmatch "^driftless $([regex]::Escape($version)) \(") {
     Fail "driftless.exe --version: `"$cliVersion`", erwartet `"driftless $version (…)`""
