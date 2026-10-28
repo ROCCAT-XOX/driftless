@@ -1,8 +1,9 @@
 name: Release
 
 # A tag `v<version>` builds and checks both installers (package.yml) and puts them, with the
-# licence notices of the third-party parts, into a release DRAFT. Publishing the draft stays a
-# manual step on GitHub.
+# licence notices of the third-party parts, into a release DRAFT whose text is the install steps
+# of packaging/release-notes.md followed by GitHub's list of changes. Publishing the draft stays
+# a manual step on GitHub.
 on:
   push:
     tags: ['v*']
@@ -78,6 +79,15 @@ jobs:
           test -f "$dmg"
           test -f "$setup"
           test -s "$notices"
+          # The install steps (packaging/release-notes.md) first, GitHub's list of changes after.
+          notes="$RUNNER_TEMP/release-notes.md"
+          sed -e "s|@VERSION@|$VERSION|g" -e "s|@REPO@|$GITHUB_SERVER_URL/$GITHUB_REPOSITORY|g" \
+            packaging/release-notes.md > "$notes"
+          if grep -n '@[A-Z][A-Z_]*@' "$notes"; then
+            echo "::error::packaging/release-notes.md: Platzhalter nicht ersetzt."
+            exit 1
+          fi
           # Always a draft: publishing stays by hand.
           gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
-            --title "Driftless $VERSION" --generate-notes "$dmg" "$setup" "$notices"
+            --title "Driftless $VERSION" --notes-file "$notes" --generate-notes \
+            "$dmg" "$setup" "$notices"
