@@ -189,6 +189,33 @@ fn finite(p: &[f64; 3]) -> bool {
     p.iter().all(|c| c.is_finite())
 }
 
+/// Whether the `patches` can be applied to the surface welded as `s` ([`apply_patches`],
+/// [`page_edits`]): each is consistent in itself (see [`SurfacePatch`]), names only vertices
+/// and faces of `s`, and every corner of a page it adds is a copy of one vertex of `s` (corner
+/// `k` of a triangle is one of its face's corner `k`). Patches computed for this surface always
+/// are; a file of another surface, or a crafted one, need not be, also with a valid checksum
+/// ([`read_patches`] checks each patch in itself only): its patches are not this surface's.
+pub fn patches_fit(s: &WeldedSurface, patches: &[SurfacePatch]) -> bool {
+    let (vertices, faces) = (s.positions().len(), s.face_count());
+    patches.iter().all(|p| {
+        p.check().is_ok()
+            && p.moved.last().is_none_or(|&(v, _)| (v as usize) < vertices)
+            && p.removed_faces.last().is_none_or(|&f| (f as usize) < faces)
+            && p.pages.iter().all(|page| {
+                // the faces of a page are among the removed ones (checked): faces of `s`
+                let mut vertex = vec![NONE; page.positions.len()];
+                page.indices.iter().zip(&page.faces).all(|(tri, &f)| {
+                    tri.iter().zip(&s.faces()[f as usize]).all(|(&c, &v)| {
+                        let slot = &mut vertex[c as usize];
+                        let one = *slot == NONE || *slot == v;
+                        *slot = v;
+                        one
+                    })
+                })
+            })
+    })
+}
+
 /// Panics unless every patch is consistent in itself.
 fn check_all(patches: &[SurfacePatch]) {
     for (i, patch) in patches.iter().enumerate() {
@@ -204,9 +231,9 @@ fn check_all(patches: &[SurfacePatch]) {
 /// the patches count).
 ///
 /// # Panics
-/// If `s` is not the welded surface of `mesh`, a patch is not consistent in itself (see
-/// [`SurfacePatch`]) or names a vertex or face `s` does not have, or a corner of an added
-/// page is a copy of two vertices.
+/// If `s` is not the welded surface of `mesh`, or the patches do not fit it ([`patches_fit`]:
+/// a patch is not consistent in itself, names a vertex or face `s` does not have, or a corner
+/// of an added page is a copy of two vertices).
 pub fn apply_patches(mesh: &Mesh, s: &WeldedSurface, patches: &[SurfacePatch]) -> Mesh {
     let (edits, added) = page_edits(s, mesh, patches);
     let mut edits = edits.into_iter().peekable();
@@ -1230,6 +1257,55 @@ mod tests {
         let mut patch = retexture(&s, &near(&s, [0.3, 0.2, 0.0], 0.12), jpeg([1, 2, 3]));
         patch.removed_faces.remove(0);
         apply_patches(&mesh, &s, &[patch]);
+    }
+
+    /// [`patches_fit`] holds for patches of the surface and not where applying them would
+    /// panic: a vertex or face it does not have, a patch not consistent in itself, a corner of
+    /// an added page that is a copy of two vertices (a crafted file with a valid checksum).
+    #[test]
+    fn patches_fit_the_surface_they_are_of() {
+        let (mesh, s) = surface();
+        let faces = near(&s, [0.3, 0.2, 0.0], 0.12);
+        let v = vertex(&s, 7, 3);
+        let good = vec![
+            SurfacePatch {
+                moved: vec![(v, f32_exact([0.351, 0.15, 0.02]))],
+                ..SurfacePatch::default()
+            },
+            retexture(&s, &faces, jpeg([1, 2, 3])),
+        ];
+        assert!(patches_fit(&s, &good));
+        assert!(patches_fit(&s, &[]));
+        let unfit = |what: &str, change: &dyn Fn(&mut Vec<SurfacePatch>)| {
+            let mut patches = good.clone();
+            change(&mut patches);
+            assert!(!patches_fit(&s, &patches), "{what}");
+            let mesh = mesh.clone();
+            let s = s.clone();
+            let applied = std::panic::catch_unwind(move || apply_patches(&mesh, &s, &patches));
+            assert!(applied.is_err(), "{what}: applying it would panic");
+        };
+        let n = s.positions().len() as u32;
+        unfit("a vertex of another surface", &|p| p[0].moved[0].0 = n);
+        let faces_n = s.face_count() as u32;
+        unfit("a face of another surface", &|p| {
+            p.push(SurfacePatch {
+                removed_faces: vec![faces_n],
+                ..SurfacePatch::default()
+            })
+        });
+        unfit("not consistent in itself", &|p| {
+            p[1].removed_faces.remove(0);
+        });
+        // corner 0 of a triangle made a copy of the vertex of another triangle's corner 0
+        unfit("a corner of two vertices", &|p| {
+            let page = &mut p[1].pages[0];
+            let first = s.faces()[page.faces[0] as usize][0];
+            let t = (1..page.faces.len())
+                .find(|&t| s.faces()[page.faces[t] as usize][0] != first)
+                .unwrap();
+            page.indices[t][0] = page.indices[0][0];
+        });
     }
 
     /// A patch that touches only page 1 leaves the data of page 0 in the glb as it was, byte

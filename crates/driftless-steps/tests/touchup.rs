@@ -9,7 +9,8 @@ use driftless_io::progress::{Progress, ProgressSnapshot};
 use driftless_io::testdir::{SharedDir, TestDir};
 use driftless_io::testscan::{scan_with_images, shared, tmp};
 use driftless_map::surface::edit::{
-    dab_normal, read_patches, FaceBvh, SurfacePatch, WeldedSurface, PATCHES_FILE,
+    dab_normal, read_patches, write_patches, FaceBvh, SurfacePatch, VariantFrom, WeldedSurface,
+    PATCHES_FILE,
 };
 use driftless_map::surface::SurfaceConfig;
 use driftless_steps::export::{run_export, ExportFormat, ExportKind, ExportRequest, ExportSource};
@@ -441,12 +442,15 @@ fn smooth_then_export_contains_it() {
     };
     let variant_of = outcome.variant_of.expect("images baked");
     assert!(variant_of.0 == 1 && variant_of.1 >= 1, "{done:?}");
+    let image = outcome.image.clone().expect("the image taken");
+    assert_eq!(image.from, VariantFrom::Best, "{done:?}");
     assert_eq!(
         *outcome,
         StepOutcome {
             mark: nr,
             seq,
             variant_of: Some(variant_of),
+            image: Some(image),
             refused: None,
             without_raw_data: false,
         }
@@ -1012,6 +1016,53 @@ fn prepared_surface_is_used() {
         "{phases:?}"
     );
     assert_eq!(fs::read(scene.cache().join(PATCHES_FILE)).unwrap(), want);
+}
+
+/// A cache whose patches have a valid checksum and name only vertices and faces of the surface,
+/// but hold a page whose corner is a copy of two vertices (a crafted file, or one of another
+/// surface): the touched-up surface is not made of it – no panic, it is not current –, and with
+/// the surface at hand the touch-up computes it anew.
+#[test]
+fn crafted_cache_is_stale() {
+    let scene = Scene::new("nacharbeit-gefaelscht");
+    scene.mark(
+        &front_wall(&scene.surface),
+        Some(StepInput::Retexture { variant: 0 }),
+    );
+    scene.touch_up();
+    let want = fs::read(scene.cache().join(PATCHES_FILE)).unwrap();
+    let mesh = scene.glb();
+    let s = WeldedSurface::from_mesh(&mesh);
+    let mut patches = read_patches(&scene.cache()).unwrap();
+    let page = &mut patches[0].pages[0];
+    let first = s.faces()[page.faces[0] as usize][0];
+    let other = (1..page.faces.len())
+        .find(|&t| s.faces()[page.faces[t] as usize][0] != first)
+        .expect("a triangle of another corner");
+    page.indices[other][0] = page.indices[0][0];
+    write_patches(&scene.cache(), &patches).unwrap();
+    assert_eq!(
+        fs::metadata(scene.cache().join(PATCHES_FILE))
+            .unwrap()
+            .len(),
+        want.len() as u64
+    );
+    assert!(touchup_fits(&scene.surface, &scene.marks()), "the key fits");
+    assert_eq!(edited_mesh(&scene.surface, &Progress::new()).unwrap(), None);
+    assert_eq!(edited_pages(&scene.surface, &s, &mesh).unwrap(), None);
+    let glb = scene.surface.join("oberflaeche.glb");
+    let req = TouchupRequest {
+        prepared: TouchupPrepared {
+            surface: Some(PreparedSurface::read(&glb, &Progress::new()).unwrap()),
+            indices: None,
+        },
+        ..scene.request(scene.sources())
+    };
+    run_touchup(&req, &Progress::new()).unwrap();
+    assert_eq!(fs::read(scene.cache().join(PATCHES_FILE)).unwrap(), want);
+    assert!(edited_mesh(&scene.surface, &Progress::new())
+        .unwrap()
+        .is_some());
 }
 
 /// Moves every position of the trajectory `traj` by `dx` m along x, as a corrected trajectory

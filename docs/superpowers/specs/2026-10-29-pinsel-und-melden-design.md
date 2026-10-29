@@ -144,8 +144,15 @@ Erfolg heißt:
   trotzdem.
 - Die Grafikkarte zeichnet die Ansicht, die Markierung und Vorher/Nachher. Die Nacharbeit selbst rechnet
   der Prozessor: Sie betrifft nur eine Stelle, ist damit klein, und so fällt sie auf jedem Rechner Byte
-  für Byte gleich aus (die Grafikkarte rechnet nur bis auf Rundung gleich).
+  für Byte gleich aus (die Grafikkarte rechnet nur bis auf Rundung gleich; Grenze siehe Nachtrag im
+  nächsten Punkt).
 - Gleiche Stellen und Schritte ergeben dasselbe Ergebnis, Byte für Byte wie der Rest der Kette.
+  Nachtrag nach dem Gesamt-Review (29.10.): gleiche Bytes auf demselben System (Betriebssystem
+  und Prozessor). Über Systeme hinweg können neu eingespielte Seiten in seltenen Texeln
+  abweichen, wie die Seiten der Oberfläche selbst: Kamerastellung, Projektion und
+  Helligkeitsangleich gehen durch `sin`, `atan2`, `exp` und `ln`, deren letztes Bit jede
+  Mathematik-Bibliothek anders runden kann. Flächen und Punktlagen (Auswahl, Glätten) sind
+  überall gleich. Ein mit dem Projekt verschobener Zwischenspeicher gilt weiter.
 - Schwere Läufe mit echten Daten laufen auf VM 101 (6 Threads, `nice 10`).
 - Scandaten, Meldungen und Kundennamen kommen nie ins Repository.
 

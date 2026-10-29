@@ -15,8 +15,14 @@
 //! Everything here runs on the CPU and is deterministic: the same surface, dabs and steps give
 //! the same faces and positions, byte for byte, on every machine and with any number of
 //! threads (rayon only for ordered maps and work that does not depend on the order, sorts only
-//! on unique keys, no hash map order). The app (picking and highlighting while painting) and
-//! the touch-up step use the same code, so they see the same faces.
+//! on unique keys, no hash map order; selecting and smoothing use only `+ − × ÷` and `√`). The
+//! pages baked anew ([`retexture_region`]) are the same bytes on the same platform (system and
+//! processor); across platforms they may differ in rare texels, as the pages of the surface
+//! step may: the camera poses, the projections and the brightness matching go through `sin`,
+//! `atan2`, `exp`, `ln` and the like, whose last bit each platform's maths library rounds its
+//! own way (the hashes the tests pin are recorded on Apple silicon). The app (picking and
+//! highlighting while painting) and the touch-up step use the same code, so they see the same
+//! faces.
 
 mod bvh;
 mod patch;
@@ -27,10 +33,10 @@ mod weld;
 
 pub use bvh::{FaceBvh, RayHit, LEAF_FACES};
 pub use patch::{
-    apply_patches, page_edits, read_patches, write_patches, PageEdit, PatchPage, SurfacePatch,
-    PATCHES_FILE,
+    apply_patches, page_edits, patches_fit, read_patches, write_patches, PageEdit, PatchPage,
+    SurfacePatch, PATCHES_FILE,
 };
-pub use retexture::{retexture_region, RetextureDone};
+pub use retexture::{retexture_region, RetextureDone, VariantFrom, VariantImage};
 pub use select::{dab_faces, dab_normal, select_faces, SelectDab, MAX_HOLE_AREA, MIN_NORMAL_DOT};
 pub use smooth::{smooth_region, Smoothing};
 pub use weld::WeldedSurface;
@@ -40,8 +46,10 @@ use std::path::PathBuf;
 
 /// Version of the touch-up computation. A change that alters what a step gives (the faces a
 /// dab selects, how they are smoothed or re-textured) raises it, so cached touch-ups are
-/// computed anew.
-pub const EDIT_VERSION: u32 = 1;
+/// computed anew. 2: „Bilder neu einspielen“ leaves out views that show something in front of
+/// the Stelle (photo consistency), compares each face with at most 64 around it, and takes the
+/// variants in another order (the best image of another scan, camera, or time and place first).
+pub const EDIT_VERSION: u32 = 2;
 
 /// Why a touch-up step left the surface as it was. The texts are for the app: German, plain.
 #[derive(Debug, thiserror::Error)]

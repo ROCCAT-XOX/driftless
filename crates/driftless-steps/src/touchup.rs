@@ -56,8 +56,10 @@
 //! `.tmp` once a run is through.
 //!
 //! Everything runs on the CPU and is deterministic: the same surface, Stellen and steps give
-//! the same patches, byte for byte, on every machine – also when they are taken from what was
-//! kept aside, which a full run would compute the same.
+//! the same patches, byte for byte, on every machine of a platform – also when they are taken
+//! from what was kept aside, which a full run would compute the same. Across platforms the
+//! pages baked anew may differ in rare texels (see `driftless_map::surface::edit`); a cache
+//! moved with the project is taken as it is.
 
 use crate::error::{check_cancel, failed, StepError};
 use crate::export::SURFACE_GLB;
@@ -71,9 +73,9 @@ use driftless_io::images::{index_images, ImageError, ImageIndex, ImageIndices};
 use driftless_io::lock::FileLock;
 use driftless_io::progress::Progress;
 use driftless_map::surface::edit::{
-    apply_patches, page_edits, read_patches, retexture_region, select_faces, smooth_region,
-    write_patches, EditError, FaceBvh, PageEdit, RetextureDone, SelectDab, Smoothing, SurfacePatch,
-    WeldedSurface, EDIT_VERSION, PATCHES_FILE,
+    apply_patches, page_edits, patches_fit, read_patches, retexture_region, select_faces,
+    smooth_region, write_patches, EditError, FaceBvh, PageEdit, RetextureDone, SelectDab,
+    Smoothing, SurfacePatch, VariantFrom, VariantImage, WeldedSurface, EDIT_VERSION, PATCHES_FILE,
 };
 use driftless_map::surface::{SurfaceConfig, TextureSource};
 use driftless_map::MapError;
@@ -238,6 +240,9 @@ pub struct StepOutcome {
     pub seq: u64,
     /// The images it baked: the variant, counted from 1, of how many („Variante 2 von 5“).
     pub variant_of: Option<(u32, u32)>,
+    /// The image that variant took and how it stands to the variants before it („andere
+    /// Kamera“).
+    pub image: Option<VariantImage>,
     /// Why it changed nothing (German), if it was refused.
     pub refused: Option<String>,
     /// It needed the camera images, but they were not at hand
@@ -276,12 +281,70 @@ struct StepRecord {
     /// The images it baked: the variant, counted from 1, of how many („Variante 2 von 5“).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     variant_of: Option<(u32, u32)>,
+    /// The image that variant took ([`StepOutcome::image`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<ImageRecord>,
     /// Hints for the program (German).
     #[serde(rename = "hinweise", default)]
     hints: Vec<String>,
     /// Why it changed nothing (German), if it was refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refused: Option<String>,
+}
+
+/// [`VariantImage`] as [`TOUCHUP_REPORT`] keeps it ([`StepRecord::image`]).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+struct ImageRecord {
+    source: u32,
+    camera: String,
+    frame: u32,
+    stamp_ns: u64,
+    from: FromRecord,
+}
+
+/// [`VariantFrom`] as [`TOUCHUP_REPORT`] keeps it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FromRecord {
+    Best,
+    OtherScan,
+    OtherCamera,
+    OtherPlace,
+    Like(u32),
+}
+
+impl ImageRecord {
+    fn of(image: &VariantImage) -> ImageRecord {
+        ImageRecord {
+            source: image.source,
+            camera: image.camera.clone(),
+            frame: image.frame,
+            stamp_ns: image.stamp_ns,
+            from: match image.from {
+                VariantFrom::Best => FromRecord::Best,
+                VariantFrom::OtherScan => FromRecord::OtherScan,
+                VariantFrom::OtherCamera => FromRecord::OtherCamera,
+                VariantFrom::OtherPlace => FromRecord::OtherPlace,
+                VariantFrom::Like(n) => FromRecord::Like(n),
+            },
+        }
+    }
+
+    fn to_image(&self) -> VariantImage {
+        VariantImage {
+            source: self.source,
+            camera: self.camera.clone(),
+            frame: self.frame,
+            stamp_ns: self.stamp_ns,
+            from: match self.from {
+                FromRecord::Best => VariantFrom::Best,
+                FromRecord::OtherScan => VariantFrom::OtherScan,
+                FromRecord::OtherCamera => VariantFrom::OtherCamera,
+                FromRecord::OtherPlace => VariantFrom::OtherPlace,
+                FromRecord::Like(n) => VariantFrom::Like(n),
+            },
+        }
+    }
 }
 
 impl Report {
@@ -315,6 +378,7 @@ impl Report {
                     mark: s.mark,
                     seq: s.seq,
                     variant_of: s.variant_of,
+                    image: s.image.as_ref().map(ImageRecord::to_image),
                     refused: s.refused.clone(),
                     without_raw_data: s.without_raw_data,
                 })
@@ -519,6 +583,7 @@ struct Replay<'a> {
 struct Outcome {
     without_raw_data: bool,
     variant_of: Option<(u32, u32)>,
+    image: Option<VariantImage>,
     hints: Vec<String>,
     refused: Option<String>,
 }
@@ -571,6 +636,7 @@ impl Replay<'_> {
                                 patch.removed_faces = done.patch.removed_faces;
                                 patch.pages = done.patch.pages;
                                 out.variant_of = Some(done.variant_of);
+                                out.image = Some(done.image);
                             }
                             Baked::Unavailable(hint) => {
                                 out.without_raw_data = true;
@@ -589,6 +655,7 @@ impl Replay<'_> {
             EditStep::Retexture { variant, .. } => match self.bake(&faces, variant, progress)? {
                 Baked::Done(done) => {
                     out.variant_of = Some(done.variant_of);
+                    out.image = Some(done.image);
                     done.patch
                 }
                 Baked::Unavailable(hint) => {
@@ -674,16 +741,6 @@ impl Replay<'_> {
         self.indices = Some(indices.clone());
         Ok(indices)
     }
-}
-
-/// Whether every vertex and face the patches name is one of `s`: they were made for its glb.
-fn patches_fit(s: &WeldedSurface, patches: &[SurfacePatch]) -> bool {
-    let (vertices, faces) = (s.positions().len(), s.face_count());
-    // Both sorted (a patch read is checked); the faces of the pages are among the removed.
-    patches.iter().all(|p| {
-        p.moved.last().is_none_or(|&(v, _)| (v as usize) < vertices)
-            && p.removed_faces.last().is_none_or(|&f| (f as usize) < faces)
-    })
 }
 
 /// A step of a cache with its patch.
@@ -813,6 +870,16 @@ pub fn run_touchup(req: &TouchupRequest, progress: &Progress) -> Result<TouchupD
         Some(old) if kept > 0 || goes_aside => with_patches(&cache, old),
         _ => Vec::new(),
     };
+    // Patches that do not fit the surface at hand (the program's, of this glb as it is now) are
+    // computed anew: a file of another surface, or a crafted one with a valid checksum. Without
+    // it the key is trusted; the touched-up surface checks them again when it is made.
+    let glb = dir.join(SURFACE_GLB);
+    let at_hand = req.prepared.surface.as_ref().filter(|p| p.fits(&glb));
+    let fits_here =
+        |p: &SurfacePatch| at_hand.is_none_or(|h| patches_fit(&h.welded, std::slice::from_ref(p)));
+    if !cached.iter().all(|(_, p)| fits_here(p)) {
+        cached.clear();
+    }
     let kept = kept.min(cached.len());
     if let Some(old) = old.filter(|_| n > 0 && kept == n && cached.len() == n) {
         return Ok(old.done());
@@ -831,7 +898,9 @@ pub fn run_touchup(req: &TouchupRequest, progress: &Progress) -> Result<TouchupD
     let rest = &events[steps.len()..];
     let all_aside = !rest.is_empty()
         && steps.iter().all(|s| !s.without_raw_data)
-        && rest.iter().all(|e| aside.contains_key(e.key.as_str()));
+        && rest
+            .iter()
+            .all(|e| aside.get(e.key.as_str()).is_some_and(|k| fits_here(&k.1)));
     if all_aside {
         // nothing to compute: the surface need not be read
         for event in rest {
@@ -849,7 +918,6 @@ pub fn run_touchup(req: &TouchupRequest, progress: &Progress) -> Result<TouchupD
         })?;
         // The surface as read from its glb: the one the program has at hand, if it is of
         // this glb as it is now.
-        let glb = dir.join(SURFACE_GLB);
         let (mesh, mut s, tree) = match &req.prepared.surface {
             Some(p) if p.fits(&glb) => (
                 Arc::clone(&p.mesh),
@@ -908,6 +976,7 @@ pub fn run_touchup(req: &TouchupRequest, progress: &Progress) -> Result<TouchupD
                 key: event.key.clone(),
                 without_raw_data: out.without_raw_data,
                 variant_of: out.variant_of,
+                image: out.image.as_ref().map(ImageRecord::of),
                 hints: out.hints,
                 refused: out.refused,
             });
@@ -1292,6 +1361,7 @@ mod tests {
             key: key.into(),
             without_raw_data: false,
             variant_of: None,
+            image: None,
             hints: Vec::new(),
             refused: None,
         }

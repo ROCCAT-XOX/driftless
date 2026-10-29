@@ -68,7 +68,16 @@
 //!    finer than [`SurfaceConfig::min_texel`] and `sqrt(area / SHARPNESS_TEXELS)`; colours
 //!    divided by the image's gain), relative to the median of them and at most 1, times its
 //!    quality orders the images: those covering [`FULL_COVERAGE`] first, then by quality ×
-//!    sharpness, then by source and stream order. Variant `k` takes the `k`-th (`k mod n`) for
+//!    sharpness, then by source and stream order. **Variants**: images of one camera of a scan
+//!    taken within [`VOTE_GAP`] of each other, or from nearly one place (closer together than
+//!    [`VARIANT_PLACE`] of the distance to the Stelle), show it much alike (in the dark room the
+//!    two best images of a wall Stelle were frames 588 and 590 of one camera, of ten near ones
+//!    taken within 2.7 s). So every image goes to
+//!    the group of the first better image it is so alike to, else into a group of its own, and
+//!    the variants take first the best image of every group, by rank, then in turn the next
+//!    image of every group ([`variant_order`]): one after the other they show the Stelle from
+//!    another scan, camera, or time and place, as long as there is one ([`VariantFrom`]).
+//!    Variant `k` takes the `k`-th of them (`k mod n`) for
 //!    every face it sees, but where the photo consistency (below) leaves its views out in a
 //!    group of at least [`ISLAND_FACES`] faces, and along the edge of such a group
 //!    ([`Prepared::taken_from`]). The other faces take the next best by [`ICM_ROUNDS`] rounds
@@ -100,7 +109,8 @@
 //! against the image's own colours of the faces around it: per view the face's colour in the
 //! image at 1/[`SHARPNESS_DOWNSCALE`], as the surface step looks (the mean at [`FACE_SAMPLES`],
 //! divided by the gain), over the median of its colours of the faces of the Stelle within
-//! [`CONSISTENCY_RADIUS`]; more than [`CONSISTENCY_RATIO`] off the median of the votes in a
+//! [`CONSISTENCY_RADIUS`] (on a fine Stelle of about [`CONSISTENCY_FACES`] of them spread over
+//! that, [`faces_around`]); more than [`CONSISTENCY_RATIO`] off the median of the votes in a
 //! channel is something else. Measured on the wall Stellen of 1 m² of the black room and the
 //! Büro (24 images each), the tolerances keep apart what is not a thing in front:
 //! - the gains match the images to the old texture only around the Stelle, without the edge
@@ -131,8 +141,11 @@
 //!
 //! Everything runs on the CPU and is deterministic: per image an ordered map, sums and sorts
 //! in a fixed order with a tie rule, the depth buffer a minimum on the bits of an `f32`; hash
-//! maps only to look up.
+//! maps only to look up. The same input gives the same bytes on the same platform; on another
+//! one rare texels may differ (`sin`, `atan2`, `exp`, `ln` round there otherwise, see
+//! [`super`]).
 
+use super::bvh::point_triangle_dist2;
 use super::{dot, sub, EditError, FaceBvh, PatchPage, SurfacePatch, WeldedSurface};
 use crate::color::{
     angular_rate, linear_table, luminance, sample_linear, ColorCamera, ColorConfig,
@@ -151,7 +164,7 @@ use crate::surface::level::{
 };
 use crate::surface::views::{
     all_cameras, consistent, stretch_of, vote_median, voters, windowed_views, CornerFaces, Faces,
-    Shot, TextureSource, UsedImage, ViewTable, MAX_VIEWS_PER_FACE, SMOOTH_COS_MIN,
+    Shot, TextureSource, UsedImage, ViewTable, MAX_VIEWS_PER_FACE, SMOOTH_COS_MIN, VOTE_GAP,
 };
 use crate::surface::{encode_pages, Mesh, PageJpegs, SurfaceConfig, TexturedMesh};
 use crate::visibility::MAX_SPLAT;
@@ -208,6 +221,12 @@ pub(crate) const PAGES_AT_ONCE: usize = 4;
 /// how it shows the faces within this distance around it (m): the median of those colours.
 pub(crate) const CONSISTENCY_RADIUS: f64 = 0.2;
 
+/// … of at most about this many of those faces, spread over them ([`faces_around`]): so the
+/// cost does not grow with the square of the fineness (1 m² on 1 cm squares, 2,245 faces within
+/// the radius, 22 images: 6.8 s on one thread before, 0.37 s with it), and the median of so many
+/// is as good as of all.
+pub(crate) const CONSISTENCY_FACES: usize = 64;
+
 /// A view of a face whose colour, against its own surroundings ([`CONSISTENCY_RADIUS`]), lies
 /// more than this factor (linear light, in any channel) from the median of the votes of the
 /// face's views shows something else there ([`judge_views`]): the limit between exposure and
@@ -219,6 +238,12 @@ pub(crate) const CONSISTENCY_RATIO: f64 = MAX_SEAM_RATIO;
 /// the median at a face within this distance (m): the images of a Stelle lie a few centimetres
 /// apart on it (black room 3–4 cm, Büro up to 8 cm), and their edges would differ everywhere.
 pub(crate) const CONSISTENCY_SHIFT: f64 = 0.05;
+
+/// Two images of one camera of a scan show a Stelle much alike – one group of the variants
+/// ([`variant_order`]) – if they were taken within [`VOTE_GAP`] of each other or from places
+/// closer together than this share of the distance to the Stelle's centre (0.1: about 6° seen
+/// from the Stelle, or 10 % nearer).
+pub(crate) const VARIANT_PLACE: f64 = 0.1;
 
 // Every view of a face is judged in one array of the photo consistency.
 const _: () = assert!(DECODED_VIEWS <= MAX_VIEWS_PER_FACE);
@@ -237,7 +262,7 @@ const FACE_SAMPLES: [[f64; 3]; 4] = [
 /// ever keep more.
 const SLACK: f64 = 1e-6;
 
-/// Phase of [`region_views`]: the headers of the images, one step each.
+/// Phase of [`region_views`]: one step per candidate given a depth buffer.
 const PHASE_FIND: &str = "Bilder der Stelle suchen";
 /// Phase of [`decode_views`]: one step per image decoded.
 const PHASE_DECODE: &str = "Bilder der Stelle lesen";
@@ -321,9 +346,9 @@ pub(crate) struct SightStats {
 /// the Stelle, typically a ring around it), as the surface step would see them; the images and
 /// their views of the Stelle are the same with any `around`. The images are listed from
 /// `indices` (per source the index of its images); none is read or decoded. `cfg` is the
-/// surface's (as its report has it). Progress: phase „Bilder der Stelle suchen“; a cancel is
-/// checked at every image and every round and returns [`EditError::Cancelled`]. Same input,
-/// same views.
+/// surface's (as its report has it). Progress: phase „Bilder der Stelle suchen“, a step per
+/// candidate given a depth buffer; a cancel is checked at every image and every candidate and
+/// returns [`EditError::Cancelled`]. Same input, same views.
 ///
 /// Fails if `cfg` is invalid or two cameras of one source share a name.
 ///
@@ -449,9 +474,13 @@ pub(crate) fn region_views(
     let mut size = sight.batch;
     while !round.is_empty() {
         stats.rounds += 1;
-        let found: Vec<(SeenFaces, usize)> = round
+        // A cancel is taken at every candidate: on a large Stelle a depth buffer takes a while.
+        let found: Vec<Option<(SeenFaces, usize)>> = round
             .par_iter()
             .map(|&c| {
+                if progress.is_cancelled() {
+                    return None;
+                }
                 let cand = &candidates[c];
                 let cam = &sources[cand.source as usize].cams[cand.camera as usize].camera;
                 let splat = in_front(s, bvh, reach, &cand.world_from_cam, cam, ccfg);
@@ -480,10 +509,15 @@ pub(crate) fn region_views(
                     .into_iter()
                     .map(|(f, v)| (near[f as usize], v.rank_score()))
                     .partition(|(f, _)| region.binary_search(f).is_ok());
-                ((stelle, ring.into_iter().map(|(f, _)| f).collect()), cells)
+                progress.advance(1);
+                Some(((stelle, ring.into_iter().map(|(f, _)| f).collect()), cells))
             })
             .collect();
-        for (&c, (faces, cells)) in round.iter().zip(found) {
+        if progress.is_cancelled() {
+            return Err(EditError::Cancelled);
+        }
+        for (&c, found) in round.iter().zip(found) {
+            let (faces, cells) = found.expect("not cancelled");
             for (f, score) in &faces.0 {
                 let i = region.binary_search(f).expect("a face of the Stelle");
                 best[i] = best[i].max(*score);
@@ -491,9 +525,6 @@ pub(crate) fn region_views(
             stats.buffered += 1;
             stats.cells += cells;
             seen[c] = Some(faces);
-        }
-        if progress.is_cancelled() {
-            return Err(EditError::Cancelled);
         }
         let ranked = ranked_views(&candidates, &seen, &region, &best, &weights, total);
         let rest: Vec<usize> = order
@@ -1114,12 +1145,52 @@ pub struct RetextureDone {
     /// The variant taken, counted from 1, and how many there are: `(k + 1, n)` („Variante 2
     /// von 5“).
     pub variant_of: (u32, u32),
+    /// The image the variant takes for the Stelle, and how it stands to the images of the
+    /// variants before it.
+    pub image: VariantImage,
+}
+
+/// The image a variant of [`retexture_region`] takes for the Stelle: every face it sees, but
+/// where the photo consistency leaves its view out (see the module docs, step 6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VariantImage {
+    /// Its source: index into the sources given to [`retexture_region`].
+    pub source: u32,
+    /// The name of its camera, as its topic gives it („left“).
+    pub camera: String,
+    /// Its place in the source's image stream ([`ImageHeader::index`]).
+    pub frame: u32,
+    /// Its stamp (ns, [`ImageHeader::stamp_ns`]).
+    pub stamp_ns: u64,
+    /// How it stands to the images of the variants before it.
+    pub from: VariantFrom,
+}
+
+/// How the image of a variant stands to the images of the variants before it (see the module
+/// docs, step 6, „Variants“).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VariantFrom {
+    /// The first variant: the best image.
+    Best,
+    /// The best image of another group than the variants before, of another scan than the
+    /// variant just before.
+    OtherScan,
+    /// … of the same scan, another camera than the variant just before.
+    OtherCamera,
+    /// … of the same scan and camera as the variant just before, taken at another time and from
+    /// another place.
+    OtherPlace,
+    /// Once the best image of every group was a variant: an image of the group of variant `n`
+    /// (counted from 1), taken by its camera within a second of it or from nearly its place, so
+    /// it shows the Stelle much as that one.
+    Like(u32),
 }
 
 /// Bakes the Stelle `faces` (welded ids, any order) anew from the camera images of `sources`
 /// onto pages of its own (see the module docs), as variant `variant`: of the `n` images that
-/// can take it, best first, the `variant mod n`-th takes every face it sees; each further
-/// variant tries the next one. `s` is the welded surface as the earlier steps left it (their
+/// can take it, in the order of the variants (the best image of every group of alike ones
+/// first), the `variant mod n`-th takes every face it sees ([`RetextureDone::image`]); each
+/// further variant tries the next one. `s` is the welded surface as the earlier steps left it (their
 /// moves applied, [`WeldedSurface::apply_moves`]) and `bvh` the tree of its faces,
 /// `current` the surface with their patches applied ([`super::apply_patches`]): its texture
 /// around the Stelle is what the new images are matched to. `indices` hold, per source, where
@@ -1205,9 +1276,17 @@ fn retexture(
     let prep = prepare(
         s, bvh, current, faces, sources, indices, cfg, sight, judging, progress,
     )?;
-    let n = prep.ranked.len();
+    let n = prep.variants.len();
     let k = variant as usize % n;
-    let main = prep.ranked[k];
+    let Variant { image: main, from } = prep.variants[k];
+    let chosen = &prep.images[main].view;
+    let image = VariantImage {
+        source: chosen.source,
+        camera: camera_of(sources, chosen).camera.name.clone(),
+        frame: chosen.frame,
+        stamp_ns: chosen.stamp,
+        from,
+    };
     let (mut labels, taken) = prep.labels(main, sources, cfg);
     if progress.is_cancelled() {
         return Err(EditError::Cancelled);
@@ -1328,11 +1407,12 @@ fn retexture(
             pages,
         },
         variant_of: (k as u32 + 1, n as u32),
+        image,
     })
 }
 
-/// The images the variants of [`retexture_region`] take for the Stelle `faces`, in order:
-/// (source, frame).
+/// The images the variants of [`retexture_region`] take for the Stelle `faces`, in order: the
+/// view of each and how it stands to the variants before it.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn variants(
@@ -1344,7 +1424,7 @@ fn variants(
     indices: &[Arc<ImageIndex>],
     cfg: &SurfaceConfig,
     progress: &Progress,
-) -> Result<Vec<(u32, u32)>, EditError> {
+) -> Result<Vec<(RegionView, VariantFrom)>, EditError> {
     let prep = prepare(
         s,
         bvh,
@@ -1358,10 +1438,72 @@ fn variants(
         progress,
     )?;
     Ok(prep
-        .ranked
+        .variants
         .iter()
-        .map(|&i| (prep.images[i].view.source, prep.images[i].view.frame))
+        .map(|v| (prep.images[v.image].view.clone(), v.from))
         .collect())
+}
+
+/// A variant of a Stelle: its image (an index into the decoded images) and how it stands to the
+/// variants before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Variant {
+    image: usize,
+    from: VariantFrom,
+}
+
+/// The variants of a Stelle whose centre is `centre` (see the module docs, step 6): the decoded
+/// `images` in groups, each image in the group of the first group's best image (in the order of
+/// `ranked`, best first) it shows the Stelle much like – the same camera of the same scan, taken
+/// within [`VOTE_GAP`] of it or from a place nearer to its place than [`VARIANT_PLACE`] of its
+/// distance to `centre` –, else in a group of its own. First the best image of every group, by
+/// rank; then in turn the next image of every group that has one, by group. Each with how it
+/// stands to the ones before it.
+fn variant_order(images: &[Decoded], ranked: &[usize], centre: [f64; 3]) -> Vec<Variant> {
+    let place = |c: usize| {
+        let t = images[c].view.world_from_cam.translation.vector;
+        [t.x, t.y, t.z]
+    };
+    let alike = |best: usize, c: usize| {
+        let (a, b) = (&images[best].view, &images[c].view);
+        let (pa, pb) = (place(best), place(c));
+        a.source == b.source
+            && a.camera == b.camera
+            && ((a.stamp.abs_diff(b.stamp) as f64) * 1e-9 < VOTE_GAP
+                || norm(sub(pa, pb)) < VARIANT_PLACE * norm(sub(pa, centre)))
+    };
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for &c in ranked {
+        match groups.iter_mut().find(|g| alike(g[0], c)) {
+            Some(g) => g.push(c),
+            None => groups.push(vec![c]),
+        }
+    }
+    let rounds = groups.iter().map(Vec::len).max().unwrap_or(0);
+    let mut out: Vec<Variant> = Vec::with_capacity(ranked.len());
+    for r in 0..rounds {
+        for (g, group) in groups.iter().enumerate() {
+            let Some(&image) = group.get(r) else {
+                continue;
+            };
+            let from = match out.last() {
+                _ if r > 0 => VariantFrom::Like(g as u32 + 1),
+                None => VariantFrom::Best,
+                Some(before) => {
+                    let (a, b) = (&images[before.image].view, &images[image].view);
+                    if a.source != b.source {
+                        VariantFrom::OtherScan
+                    } else if a.camera != b.camera {
+                        VariantFrom::OtherCamera
+                    } else {
+                        VariantFrom::OtherPlace
+                    }
+                }
+            };
+            out.push(Variant { image, from });
+        }
+    }
+    out
 }
 
 /// A decoded image of a Stelle.
@@ -1391,8 +1533,8 @@ struct Prepared<'a> {
     /// Per image its gain against the old texture, and whether it is its own (not a fallback).
     gains: Vec<[f32; 3]>,
     own_gain: Vec<bool>,
-    /// The images best first: the variants.
-    ranked: Vec<usize>,
+    /// The variants, in order ([`variant_order`]).
+    variants: Vec<Variant>,
     /// The photo consistency of the views ([`judge_views`]).
     judged: Judged,
     /// Where the faces of the Stelle and of the ring sit in the current surface.
@@ -1486,6 +1628,7 @@ fn prepare<'a>(
 
     let mesh = local_mesh(s, &region);
     let ranked = rank(s, &region, &mesh, &images, &gains, sources, cfg);
+    let variants = variant_order(&images, &ranked, Shape::new(s, &region).centre);
     let judged = match judging {
         Judging::Consistent => judge_views(s, bvh, &region, &images, &gains, sources, &lin),
         #[cfg(test)]
@@ -1502,7 +1645,7 @@ fn prepare<'a>(
         images,
         gains,
         own_gain: own.iter().map(Option::is_some).collect(),
-        ranked,
+        variants,
         judged,
         old,
         ring_old,
@@ -2153,7 +2296,8 @@ fn rank(
 /// (sorted; its faces in the tree `bvh` of `s`) the decoded `images` (indices, sorted) whose
 /// view of it shows something else than the others' views. A view gives the face its colour in
 /// its image at 1/[`SHARPNESS_DOWNSCALE`] ([`quarter_colours`]) against the median of its
-/// colours of the faces of the Stelle within [`CONSISTENCY_RADIUS`]: per channel
+/// colours of the faces of the Stelle within [`CONSISTENCY_RADIUS`] ([`faces_around`]: at most
+/// [`CONSISTENCY_FACES`] of them): per channel
 /// `ln((colour + MIN_SEAM_LUMINANCE) / (median + MIN_SEAM_LUMINANCE))`. The views of a face vote
 /// as in the surface step, one per camera and stretch of capture time, and a view further than
 /// `ln` [`CONSISTENCY_RATIO`] from the median of the votes in a channel, where the votes within
@@ -2170,16 +2314,7 @@ fn judge_views(
     lin: &[f32; 256],
 ) -> Judged {
     let n = region.len();
-    // The faces of the Stelle around each (indices into `region`, sorted; itself among them).
-    let around: Vec<Vec<u32>> = region
-        .par_iter()
-        .map(|&f| {
-            bvh.faces_within(s, s.face_centroid(f), CONSISTENCY_RADIUS)
-                .into_iter()
-                .filter_map(|g| region.binary_search(&g).ok().map(|i| i as u32))
-                .collect()
-        })
-        .collect();
+    let around = faces_around(s, bvh, region);
     // Per image the colour of every face it sees, …
     let colours: Vec<Vec<Option<[f64; 3]>>> = images
         .par_iter()
@@ -2256,6 +2391,9 @@ fn judge_views(
             let Some(kept) = consistent(&values, &voter[..views.len()], tolerance) else {
                 return Vec::new();
             };
+            if kept[..views.len()].iter().all(|&ok| ok) {
+                return Vec::new();
+            }
             let shifted: Vec<usize> = bvh
                 .faces_within(s, s.face_centroid(region[i]), CONSISTENCY_SHIFT)
                 .into_iter()
@@ -2282,6 +2420,74 @@ fn judge_views(
     }
 }
 
+/// The faces of the Stelle `region` (sorted; its faces in the tree `bvh` of `s`) around each of
+/// its faces that [`judge_views`] compares it with (indices into `region`, sorted): those whose
+/// closest point lies within [`CONSISTENCY_RADIUS`] of its centroid. On a fine Stelle, where a
+/// plane of its mean face area holds more than [`CONSISTENCY_FACES`] faces within that radius,
+/// only every `q`-th face of the Stelle counts (by index; `q` the number of those faces over
+/// [`CONSISTENCY_FACES`], rounded down), but every face around a face where that leaves fewer
+/// than a quarter of [`CONSISTENCY_FACES`] (smaller faces there than on average). Of them at
+/// most [`CONSISTENCY_FACES`], evenly by index ([`evenly`]). So the faces tested do not grow
+/// with the square of the fineness (on 1 cm squares about 2,500 lie within the radius of a
+/// face, of which every 39th counts); a Stelle without more than [`CONSISTENCY_FACES`] faces
+/// within the radius anywhere has all of them.
+fn faces_around(s: &WeldedSurface, bvh: &FaceBvh, region: &[u32]) -> Vec<Vec<u32>> {
+    let r2 = CONSISTENCY_RADIUS * CONSISTENCY_RADIUS;
+    let area: f64 = region.iter().map(|&f| 0.5 * norm(s.face_cross(f))).sum();
+    let on_plane = std::f64::consts::PI * r2 * region.len() as f64 / area;
+    let q = if on_plane.is_finite() {
+        ((on_plane / CONSISTENCY_FACES as f64) as usize).max(1)
+    } else {
+        1
+    };
+    // Every face of the surface: its index in the Stelle, or none.
+    let mut at = vec![u32::MAX; s.face_count()];
+    for (i, &f) in region.iter().enumerate() {
+        at[f as usize] = i as u32;
+    }
+    region
+        .par_iter()
+        .map(|&f| {
+            let c = s.face_centroid(f);
+            let within = |q: usize| {
+                let mut found: Vec<u32> = Vec::new();
+                bvh.faces_where(
+                    |lo, hi| {
+                        let gap = |k: usize| (lo[k] - c[k]).max(c[k] - hi[k]).max(0.0);
+                        (0..3).map(|k| gap(k) * gap(k)).sum::<f64>() <= r2
+                    },
+                    |g| {
+                        let i = at[g as usize];
+                        if i != u32::MAX
+                            && (i as usize).is_multiple_of(q)
+                            && point_triangle_dist2(c, s.face_corners(g)) <= r2
+                        {
+                            found.push(i);
+                        }
+                        false
+                    },
+                );
+                found.sort_unstable();
+                found
+            };
+            let mut found = within(q);
+            if q > 1 && found.len() < CONSISTENCY_FACES / 4 {
+                found = within(1);
+            }
+            evenly(found, CONSISTENCY_FACES)
+        })
+        .collect()
+}
+
+/// At most `k` of `v` (sorted), taken evenly: all of them if they are no more, else those at
+/// `⌊j · len / k⌋` for `j` in `0..k` (still sorted).
+fn evenly(v: Vec<u32>, k: usize) -> Vec<u32> {
+    if v.len() <= k {
+        return v;
+    }
+    (0..k).map(|j| v[j * v.len() / k]).collect()
+}
+
 /// The views of one face of a Stelle as [`judge_views`] judges them.
 struct FaceVotes {
     /// The images that see it with their values, best first (equal: the earlier image), as
@@ -2301,7 +2507,8 @@ struct Judged {
     /// Per image the colour of every face of the Stelle it sees ([`quarter_colours`]); empty
     /// where nothing was judged.
     colours: Vec<Vec<Option<[f64; 3]>>>,
-    /// Per face of the Stelle the faces within [`CONSISTENCY_RADIUS`] (indices, sorted).
+    /// Per face of the Stelle the faces within [`CONSISTENCY_RADIUS`] it is compared with
+    /// ([`faces_around`]; indices, sorted).
     around: Vec<Vec<u32>>,
 }
 
@@ -2763,7 +2970,11 @@ mod tests {
         }
         assert!(of_source(&found, 0).is_empty(), "looks away");
         assert!(of_source(&found, 2).is_empty(), "behind a wall");
-        let front = of_source(&found, 1);
+        // Five images from one place, taken by frame: equally good here (so in stream order),
+        // on a platform whose `sin`/`atan2` round otherwise they may differ in the last bit and
+        // come in another order (see `nearer_views_rank_first`).
+        let mut front = of_source(&found, 1);
+        front.sort_by_key(|v| v.frame);
         assert_eq!(front.len(), IMAGES);
         let camera = sources[1].poses[0].p
             + sources[1].poses[0].q * sources[1].cams[0].cam_in_body.translation.vector;
@@ -2831,31 +3042,60 @@ mod tests {
     #[test]
     fn nearer_views_rank_first() {
         // The Stelle straight on from 5 m and from 2 m: the nearer images see every face in
-        // more pixels, score higher on each and come first.
+        // more pixels, score higher on each and come first, the best of them the best image of
+        // (nearly) every face. Which of the nearer images comes first, and whether it is the
+        // best of every face to the last bit, is left open: poses and projections go through
+        // `sin`, `atan2` and the like, which round differently on another platform (Windows:
+        // quality 0.987), and then the images of one place differ at a face or two. So also
+        // with the nearer place creeping by 2 mm a second over its images: none of them is then
+        // the best image of every face.
         let s = &room().surface;
         let spot = wall_spot(s, 0.6);
-        let sources = [
-            looking_back([1.0, 1.0, 0.25]),
-            looking_back([-2.0, 1.0, 0.25]),
-        ];
-        let found = views(s, &spot, &sources);
-        assert_eq!(found.len(), 2 * IMAGES);
-        assert!(found[..IMAGES].iter().all(|v| v.source == 1), "{found:?}");
-        let (near, far) = (&found[0], &found[IMAGES]);
-        assert_eq!(near.quality, 1.0);
-        assert!(far.quality < 0.6, "{}", far.quality);
-        let mut compared = 0;
-        for &(f, score) in &near.faces {
-            if let Some(&(_, other)) = far.faces.iter().find(|x| x.0 == f) {
-                assert!(score > 2.0 * other, "face {f}: {score} vs {other}");
-                compared += 1;
+        let creeping = {
+            let mut src = looking_back([-2.0, 1.0, 0.25]);
+            for p in &mut src.poses {
+                p.p.y += 0.002 * (p.t - 999.5);
+            }
+            src
+        };
+        for (name, nearer) in [
+            ("still", looking_back([-2.0, 1.0, 0.25])),
+            ("creeping", creeping),
+        ] {
+            let sources = [looking_back([1.0, 1.0, 0.25]), nearer];
+            let found = views(s, &spot, &sources);
+            assert_eq!(found.len(), 2 * IMAGES, "{name}");
+            let (near, far) = found.split_at(IMAGES);
+            assert!(near.iter().all(|v| v.source == 1), "{name}: {found:?}");
+            assert!(far.iter().all(|v| v.source == 0), "{name}: {found:?}");
+            println!(
+                "{name}: nearer {:?}, farther {:?}",
+                near.iter().map(|v| v.quality).collect::<Vec<_>>(),
+                far.iter().map(|v| v.quality).collect::<Vec<_>>()
+            );
+            assert!(near[0].quality > 0.95, "{name}: {}", near[0].quality);
+            for v in near {
+                assert!(v.coverage >= FULL_COVERAGE, "{name}: {}", v.coverage);
+                assert!(v.quality > 0.9 && v.quality <= 1.0, "{name}: {}", v.quality);
+            }
+            // Every nearer image sees every face both see in more than twice the pixels.
+            for (a, b) in near.iter().flat_map(|a| far.iter().map(move |b| (a, b))) {
+                assert!(b.quality < 0.6, "{name}: {}", b.quality);
+                let mut compared = 0;
+                for &(f, score) in &a.faces {
+                    if let Ok(i) = b.faces.binary_search_by_key(&f, |x| x.0) {
+                        let other = b.faces[i].1;
+                        assert!(score > 2.0 * other, "{name}, face {f}: {score} vs {other}");
+                        compared += 1;
+                    }
+                }
+                assert!(
+                    compared >= spot.len() * 9 / 10,
+                    "{name}: {compared} of {}",
+                    spot.len()
+                );
             }
         }
-        assert!(
-            compared >= spot.len() * 9 / 10,
-            "{compared} of {}",
-            spot.len()
-        );
     }
 
     /// The scan's image at full size, as the bag holds it (all its images are the same).
@@ -3095,6 +3335,63 @@ mod tests {
             assert!(smaller > 0);
         }
         assert!(partly > 0, "some image sees a Stelle in part");
+    }
+
+    /// A cancel is taken at every candidate of a round, not only after it: the depth buffer of
+    /// a candidate takes a while on a large Stelle, and a round holds up to every candidate.
+    /// Each depth buffer counts as a step of the phase „Bilder der Stelle suchen“.
+    #[test]
+    fn cancel_within_a_round() {
+        let room = room();
+        let s = &room.surface;
+        let spot = front_spot(s, 0.8);
+        let sources = crowd();
+        let indices = index_of(sources);
+        let bvh = FaceBvh::build(s);
+        let cfg = testscan_config();
+        let around = ring_around(s, &spot);
+        let run = |progress: &Progress| {
+            region_views(
+                s,
+                &bvh,
+                &spot,
+                &around,
+                sources,
+                &indices,
+                &cfg,
+                Sight::ALL,
+                progress,
+            )
+        };
+        // One round of every candidate.
+        let progress = Progress::new();
+        let (_, stats) = run(&progress).unwrap();
+        assert_eq!((stats.buffered, stats.rounds), (100, 1), "{stats:?}");
+        let snap = progress.snapshot();
+        assert_eq!((snap.phase.as_str(), snap.done), (PHASE_FIND, 100));
+        // Cancelled after the first depth buffer: the other candidates get none, but for those
+        // already under way.
+        let progress = Progress::new();
+        let cancel = progress.clone();
+        let progress = progress.with_observer(move |snap| {
+            if snap.phase == PHASE_FIND && snap.done >= 1 {
+                cancel.cancel();
+            }
+        });
+        let r = run(&progress);
+        assert!(matches!(r, Err(EditError::Cancelled)), "{r:?}");
+        let built = progress.snapshot().done;
+        println!(
+            "cancelled after {built} of 100 depth buffers ({} threads)",
+            rayon::current_num_threads()
+        );
+        // At most one under way per thread, a few more where a thread waiting within one takes
+        // up another (the depth buffer runs in parallel itself).
+        let threads = rayon::current_num_threads();
+        assert!(
+            built < 100 && built as usize <= 2 * threads,
+            "{built} of 100"
+        );
     }
 
     #[test]
@@ -3388,6 +3685,7 @@ mod tests {
             &Progress::new(),
         )
         .unwrap();
+        let ranked: Vec<(u32, u32)> = ranked.iter().map(|(v, _)| (v.source, v.frame)).collect();
         let n = ranked.len();
         println!("{n} variants: {ranked:?}");
         assert_eq!(n, 3 * IMAGES);
@@ -3395,10 +3693,16 @@ mod tests {
         distinct.sort_unstable();
         distinct.dedup();
         assert_eq!(distinct.len(), n, "every image once");
-        // The images that see the whole Stelle first: from 3.5 m nearer the camera sees only
-        // a part of it.
-        assert!(ranked[..2 * IMAGES].iter().all(|r| r.0 != 2), "{ranked:?}");
-        assert!(ranked[2 * IMAGES..].iter().all(|r| r.0 == 2), "{ranked:?}");
+        // One image of every place first, those that see the whole Stelle before the one that
+        // sees only a part of it (3.5 m nearer); then the other images of each place in turn.
+        let places: Vec<u32> = ranked.iter().map(|r| r.0).collect();
+        let first = &places[..3];
+        assert!(
+            first[..2].contains(&0) && first[..2].contains(&1),
+            "{ranked:?}"
+        );
+        assert_eq!(first[2], 2, "{ranked:?}");
+        assert!(places.chunks(3).all(|c| c == first), "{ranked:?}");
         let n = n as u32;
         let patch = |k: u32| {
             let done = retextured(&spot, &sources, k);
@@ -3406,14 +3710,193 @@ mod tests {
             done.patch
         };
         let first = patch(0);
-        // Another place, another texture; after the last variant the first again.
-        let second = patch(IMAGES as u32);
-        let third = patch(2 * IMAGES as u32);
+        // Another place, another texture; the same place again (its images are alike), the
+        // same; after the last variant the first again.
+        let second = patch(1);
+        let third = patch(2);
         assert_ne!(second, first);
         assert_ne!(third, first);
         assert_ne!(third, second);
+        assert_eq!(patch(3), first);
         assert_eq!(patch(n), first);
-        assert_eq!(patch(n + IMAGES as u32), second);
+        assert_eq!(patch(n + 1), second);
+    }
+
+    /// Consecutive variants take images that show the Stelle otherwise: first the best image of
+    /// every group – the images of one camera of one scan taken within [`VOTE_GAP`] of its best
+    /// one or from nearly its place ([`VARIANT_PLACE`]) –, in the order of their rank; then, in
+    /// turn, the next image of every group, each said to be like its group's best one. Each
+    /// says how it stands to the variant before it, [`retexture_region`] gives the image it
+    /// took, and the best images of the groups give other patches one after the other.
+    #[test]
+    fn variants_differ_visibly() {
+        let room = room();
+        let (pages, tw, tw_src) = textured_walk();
+        type Case<'a> = (
+            &'a str,
+            &'a WeldedSurface,
+            &'a PageMesh,
+            Vec<u32>,
+            Vec<TextureSource>,
+            SurfaceConfig,
+        );
+        let walk = |c: [f64; 3], r: f64, n: [f64; 3]| spot_at(tw, c, r, n);
+        let cases: Vec<Case> = vec![
+            (
+                "three places",
+                &room.surface,
+                &room.mesh,
+                front_spot(&room.surface, 0.8),
+                vec![room.scan.clone(), nearer(2.0), nearer(3.5)],
+                testscan_config(),
+            ),
+            (
+                "walk, +y wall",
+                tw,
+                pages,
+                walk([1.0, 5.0, 0.3], 0.565, [0.0, -1.0, 0.0]),
+                vec![tw_src.clone()],
+                walk_config(),
+            ),
+            (
+                "walk, behind the pillar",
+                tw,
+                pages,
+                walk([-3.5, -4.0, 0.0], 1.0, [0.0, 1.0, 0.0]),
+                vec![tw_src.clone()],
+                walk_config(),
+            ),
+            (
+                "walk, floor",
+                tw,
+                pages,
+                walk([0.5, 1.5, -1.2], 0.6, [0.0, 0.0, 1.0]),
+                vec![tw_src.clone()],
+                walk_config(),
+            ),
+        ];
+        for (name, s, mesh, spot, sources, cfg) in cases {
+            let bvh = FaceBvh::build(s);
+            let indices = index_of(&sources);
+            let plan = variants(
+                s,
+                &bvh,
+                mesh,
+                &spot,
+                &sources,
+                &indices,
+                &cfg,
+                &Progress::new(),
+            )
+            .unwrap();
+            let centre = Shape::new(s, &spot).centre;
+            let at = |v: &RegionView| {
+                let t = v.world_from_cam.translation.vector;
+                [t.x, t.y, t.z]
+            };
+            // One camera of one scan, within VOTE_GAP or from nearly the place of `a`.
+            let alike = |a: &RegionView, b: &RegionView| {
+                a.source == b.source
+                    && a.camera == b.camera
+                    && ((a.stamp.abs_diff(b.stamp) as f64) * 1e-9 < VOTE_GAP
+                        || norm(sub(at(a), at(b))) < VARIANT_PLACE * norm(sub(at(a), centre)))
+            };
+            println!(
+                "{name}: {:?}",
+                plan.iter()
+                    .map(|(v, f)| (v.source, v.camera, v.frame, *f))
+                    .collect::<Vec<_>>()
+            );
+            let n = plan.len();
+            let mut ids: Vec<(u32, u32)> = plan.iter().map(|(v, _)| (v.source, v.frame)).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), n, "{name}: every image once");
+            assert_eq!(plan[0].1, VariantFrom::Best, "{name}");
+            // The best image of every group first, none like one before it; then the others.
+            let leaders = plan
+                .iter()
+                .take_while(|(_, f)| !matches!(f, VariantFrom::Like(_)))
+                .count();
+            assert!(leaders >= 2, "{name}: {leaders} groups");
+            let mut group = vec![0usize; n];
+            for (k, (v, from)) in plan.iter().enumerate() {
+                if k < leaders {
+                    for (u, _) in &plan[..k] {
+                        assert!(!alike(u, v), "{name}: variant {} like one before", k + 1);
+                    }
+                    group[k] = k;
+                    if k > 0 {
+                        let u = &plan[k - 1].0;
+                        let want = if u.source != v.source {
+                            VariantFrom::OtherScan
+                        } else if u.camera != v.camera {
+                            VariantFrom::OtherCamera
+                        } else {
+                            VariantFrom::OtherPlace
+                        };
+                        assert_eq!(*from, want, "{name}: variant {}", k + 1);
+                    }
+                } else {
+                    let VariantFrom::Like(j) = *from else {
+                        panic!("{name}: variant {} is {from:?}", k + 1);
+                    };
+                    let j = j as usize - 1;
+                    assert!(j < leaders, "{name}: variant {}", k + 1);
+                    assert!(alike(&plan[j].0, v), "{name}: variant {}", k + 1);
+                    assert!(plan[..j].iter().all(|(u, _)| !alike(u, v)), "{name}");
+                    group[k] = j;
+                }
+            }
+            // In turn: round r holds the r-th image of every group that has one, by group.
+            let mut size = vec![0usize; leaders];
+            for &g in &group {
+                size[g] += 1;
+            }
+            let size = &size;
+            let turns: Vec<usize> = (0..n)
+                .flat_map(|r| (0..leaders).filter(move |&g| size[g] > r))
+                .collect();
+            assert_eq!(group, turns, "{name}");
+            // Each variant takes its image; the best images of the groups give other patches.
+            let mut before: Option<u64> = None;
+            for k in (0..leaders.min(4)).chain([leaders, n - 1]) {
+                let done = retexture_region(
+                    s,
+                    &bvh,
+                    mesh,
+                    &spot,
+                    &sources,
+                    &indices,
+                    k as u32,
+                    &cfg,
+                    &Progress::new(),
+                )
+                .unwrap();
+                let (v, from) = &plan[k];
+                assert_eq!(done.variant_of, (k as u32 + 1, n as u32), "{name}");
+                assert_eq!(
+                    done.image,
+                    VariantImage {
+                        source: v.source,
+                        camera: sources[v.source as usize].cams[v.camera as usize]
+                            .camera
+                            .name
+                            .clone(),
+                        frame: v.frame,
+                        stamp_ns: v.stamp,
+                        from: *from,
+                    },
+                    "{name}: variant {}",
+                    k + 1
+                );
+                if k < leaders.min(4) {
+                    let hash = patch_hash(&done.patch);
+                    assert_ne!(Some(hash), before, "{name}: variant {}", k + 1);
+                    before = Some(hash);
+                }
+            }
+        }
     }
 
     #[test]
@@ -3643,6 +4126,7 @@ mod tests {
             &Progress::new(),
         )
         .unwrap();
+        let ranked: Vec<(u32, u32)> = ranked.iter().map(|(v, _)| (v.source, v.frame)).collect();
         assert_eq!(ranked.len(), ROD_PLACES.len(), "{ranked:?}");
         assert_eq!(ranked[0], (0, 0), "the head-on image first: {ranked:?}");
         let done = retexture_here(s, pages, &spot, sources, 0, &cfg, &Progress::new()).unwrap();
@@ -3805,7 +4289,9 @@ mod tests {
     /// The patches of „Bilder neu“ on the synthetic scenes, recorded (Apple silicon, as
     /// [`crate::surface::tests::full_surface_unchanged`]) before the images were found through
     /// an index of the bags and the visibility was computed only for the best candidates and
-    /// over the cut-out of the image: the same images, the same patches, byte for byte.
+    /// over the cut-out of the image: the same images, the same patches, byte for byte. Recorded
+    /// again where the variants take other images in their new order ([`variant_order`],
+    /// `EDIT_VERSION` 2); the first variant of every Stelle is the same.
     #[test]
     fn retexture_unchanged() {
         let room = room();
@@ -3910,19 +4396,21 @@ mod tests {
                     0xd31cfad808618677,
                     (1, 15),
                 ),
+                // The variants in turn by place (EDIT_VERSION 2): variant 4 the scan's second
+                // image (as „front, scan“), 5 the second of 3.5 m nearer, 10 the scan's fourth.
                 (
                     "front, three places, variant 4",
-                    0xd31cfad808618677,
+                    0xad94db987087cb22,
                     (5, 15),
                 ),
                 (
                     "front, three places, variant 5",
-                    0xad94db987087cb22,
+                    0xc9827c5ba3b54492,
                     (6, 15),
                 ),
                 (
                     "front, three places, variant 10",
-                    0xc9827c5ba3b54492,
+                    0xad94db987087cb22,
                     (11, 15),
                 ),
                 (
@@ -3930,24 +4418,28 @@ mod tests {
                     0xc9827c5ba3b54492,
                     (15, 15),
                 ),
-                ("front, two sources, variant 3", 0xd31cfad808618677, (4, 10)),
+                // The second image of the brighter scan, no longer the fourth of 2 m nearer.
+                ("front, two sources, variant 3", 0x01688fe0107ff7c9, (4, 10)),
                 ("side, darker", 0xe9d513978068f927, (1, 5)),
                 ("walk, +y wall, variant 0", 0xe9188df5a88c99e5, (1, 11)),
-                ("walk, +y wall, variant 1", 0xd761518c9f1aaeae, (2, 11)),
+                // The best image 1.5 s earlier (frame 10), not the one after frame 16.
+                ("walk, +y wall, variant 1", 0x881cef4826e73abc, (2, 11)),
                 ("walk, +y wall, variant 7", 0x8d19242da74739e6, (8, 11)),
                 (
                     "walk, behind the pillar, variant 0",
                     0xdbe31d78ed7db39c,
                     (1, 11),
                 ),
+                // Variant 1 the best image 2 s later (frame 15, variant 7 before), variant 7 the
+                // image of frame 21.
                 (
                     "walk, behind the pillar, variant 1",
-                    0x27c92c6de0d7443d,
+                    0xc4db214a0b83abfc,
                     (2, 11),
                 ),
                 (
                     "walk, behind the pillar, variant 7",
-                    0xc4db214a0b83abfc,
+                    0x4640cd3d19f6f655,
                     (8, 11),
                 ),
                 ("walk, floor", 0x67b8828b5c08eca0, (1, 11)),
@@ -4444,6 +4936,168 @@ mod tests {
             phases.join(", ")
         );
     }
+    /// The +y wall of the painted room (y = 5, facing −y) around (1, 5, 0.3) as a grid of squares
+    /// of `step` (m), 2.4 × 2.4 m, the vertices as the glb holds them (`f32`), in charts of 64
+    /// faces on 8 pages, welded; and the Stelle of about 1 m² in its middle (the faces within
+    /// 0.565 m of (1, 5, 0.3)).
+    fn wall_grid(step: f64) -> (WeldedSurface, Vec<u32>) {
+        use crate::surface::testutil::grid;
+        let n = (2.4 / step).round() as usize;
+        let (positions, indices) = grid([n, n], |i, j| {
+            [-0.2 + step * i as f64, 5.0, -0.9 + step * j as f64].map(|c| f64::from(c as f32))
+        });
+        let s = WeldedSurface::from_mesh(&paged(&positions, &indices, 64, 8));
+        let spot = spot_at(&s, [1.0, 5.0, 0.3], 0.565, [0.0, -1.0, 0.0]);
+        (s, spot)
+    }
+
+    /// The photo consistency compares each face with at most [`CONSISTENCY_FACES`] faces of the
+    /// Stelle within [`CONSISTENCY_RADIUS`] ([`faces_around`]): on 8 cm squares (about 40 within
+    /// the radius) with all of them; on 2 cm squares (about 590) with every 9th face of the
+    /// Stelle, about 64 and spread over them, and at the rim of the Stelle with at least a
+    /// quarter of [`CONSISTENCY_FACES`]. On the 5 cm squares of the rod's wall the rod is still
+    /// found and not baked (`thin_occluder_not_baked`).
+    #[test]
+    fn consistency_compares_a_few_faces_around() {
+        let (_, _, src) = textured_walk();
+        let sources = std::slice::from_ref(src);
+        let indices = index_of(sources);
+        for (step, all) in [(0.08, true), (0.02, false)] {
+            let (s, spot) = wall_grid(step);
+            let bvh = FaceBvh::build(&s);
+            let around = faces_around(&s, &bvh, &spot);
+            assert_eq!(around.len(), spot.len());
+            let mut inside = 0;
+            for (i, &f) in spot.iter().enumerate() {
+                let within: Vec<u32> = bvh
+                    .faces_within(&s, s.face_centroid(f), CONSISTENCY_RADIUS)
+                    .into_iter()
+                    .filter_map(|g| spot.binary_search(&g).ok().map(|j| j as u32))
+                    .collect();
+                let a = &around[i];
+                assert!(a.windows(2).all(|w| w[0] < w[1]), "face {f}");
+                assert!(a.iter().all(|j| within.binary_search(j).is_ok()));
+                assert!(a.len() <= CONSISTENCY_FACES, "{step} m: face {f}");
+                assert!(
+                    a.len() >= within.len().min(CONSISTENCY_FACES / 4),
+                    "{step} m: face {f}: {} of {}",
+                    a.len(),
+                    within.len()
+                );
+                if all {
+                    assert!(within.len() <= CONSISTENCY_FACES, "{}", within.len());
+                    assert_eq!(*a, within, "{step} m: face {f}");
+                } else if within.len() >= 8 * CONSISTENCY_FACES {
+                    // inside the Stelle: about CONSISTENCY_FACES, spread over them by index
+                    inside += 1;
+                    assert!(
+                        a.len() >= CONSISTENCY_FACES * 3 / 4,
+                        "face {f}: {}",
+                        a.len()
+                    );
+                    for quarter in within.chunks(within.len().div_ceil(4)) {
+                        let taken = a.iter().filter(|j| quarter.contains(j)).count();
+                        assert!(taken >= CONSISTENCY_FACES / 8, "{step} m: face {f}");
+                    }
+                }
+            }
+            if !all {
+                assert!(inside * 2 > spot.len(), "{inside} of {}", spot.len());
+            }
+            // What the photo consistency compares.
+            let (views, _) = region_views(
+                &s,
+                &bvh,
+                &spot,
+                &[],
+                sources,
+                &indices,
+                &walk_config(),
+                Sight::BEST,
+                &Progress::new(),
+            )
+            .unwrap();
+            let images: Vec<Decoded> = decode_views(&views, sources, &indices, 4, &Progress::new())
+                .unwrap()
+                .into_iter()
+                .map(|(i, rgb)| Decoded {
+                    view: views[i].clone(),
+                    rgb,
+                })
+                .collect();
+            let gains = vec![[1.0f32; 3]; images.len()];
+            let judged = judge_views(&s, &bvh, &spot, &images, &gains, sources, &linear_table());
+            assert!(judged.around == around, "{step} m");
+        }
+    }
+
+    /// The photo consistency of a Stelle of 1 m² on uniform grids of 4, 2 and 1 cm ([`wall_grid`])
+    /// with the decoded images of the walk that see it (both cameras; the left one sees it), and
+    /// on 1 cm with twice as many: faces, faces of the Stelle within [`CONSISTENCY_RADIUS`] of a
+    /// face and of them compared ([`faces_around`], mean), time of [`judge_views`].
+    /// `cargo test -p driftless-map --release --lib retexture::tests::timing_judge_views -- --ignored --nocapture`
+    #[test]
+    #[ignore = "Messung"]
+    fn timing_judge_views() {
+        let (_, _, src) = textured_walk();
+        // The walk once (11 images see the Stelle), and twice (22).
+        let once = vec![src.clone()];
+        let twice = vec![src.clone(), src.clone()];
+        let cfg = walk_config();
+        let lin = linear_table();
+        for (step, sources) in [(0.04, &once), (0.02, &once), (0.01, &once), (0.01, &twice)] {
+            let indices = index_of(sources);
+            let (s, spot) = wall_grid(step);
+            let bvh = FaceBvh::build(&s);
+            let (views, _) = region_views(
+                &s,
+                &bvh,
+                &spot,
+                &[],
+                sources,
+                &indices,
+                &cfg,
+                Sight::BEST,
+                &Progress::new(),
+            )
+            .unwrap();
+            let images: Vec<Decoded> =
+                decode_views(&views, sources, &indices, DECODED_VIEWS, &Progress::new())
+                    .unwrap()
+                    .into_iter()
+                    .map(|(i, rgb)| Decoded {
+                        view: views[i].clone(),
+                        rgb,
+                    })
+                    .collect();
+            let gains = vec![[1.0f32; 3]; images.len()];
+            let within: usize = spot
+                .iter()
+                .map(|&f| {
+                    bvh.faces_within(&s, s.face_centroid(f), CONSISTENCY_RADIUS)
+                        .iter()
+                        .filter(|g| spot.binary_search(g).is_ok())
+                        .count()
+                })
+                .sum();
+            let clock = Instant::now();
+            let judged = judge_views(&s, &bvh, &spot, &images, &gains, sources, &lin);
+            let took = clock.elapsed();
+            let compared: usize = judged.around.iter().map(Vec::len).sum();
+            let out: usize = judged.out.iter().map(Vec::len).sum();
+            println!(
+                "{:.0} cm: {} faces, Stelle {} faces, {} images; within {CONSISTENCY_RADIUS} m: \
+                 {:.0} faces (mean), compared {:.0}; judge_views {took:?}; {out} views left out",
+                step * 100.0,
+                s.face_count(),
+                spot.len(),
+                images.len(),
+                within as f64 / spot.len() as f64,
+                compared as f64 / spot.len() as f64,
+            );
+        }
+    }
+
     /// Time to find the ring of a Stelle of 1 m² and its old texture's triangles on a surface of
     /// Büro size (1818² squares of 3.5 cm: 6.6 M triangles in charts of 18 faces dealt to 28
     /// pages, so the Stelle's charts lie on every page).
