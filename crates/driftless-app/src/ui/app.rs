@@ -5,6 +5,7 @@ use super::brush::{self, Brush, MarkChange};
 use super::compare::{compare_maps, compare_refs, default_refs, TrajRef};
 use super::correct::{Corrected, RunLoaded};
 use super::export::{self, ExportDialog};
+use super::feedback::{FeedbackDialog, ReportList};
 use super::tools::{self, PairSession, ScreenLayout, Tool};
 use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
@@ -12,7 +13,9 @@ use super::{
     CloudCheck, CloudSummary, InspectResult, LogEntry, LogKind, ProjectRead, Queued, Selection,
     Step, SurfaceSummary, Tree, UiMessage, ViewSettings, ViewStats,
 };
+use crate::camera::CameraState;
 use crate::cloud::{load_cloud, load_pair_cloud, LoadedCloud};
+use crate::feedback::{DoubleShift, Feedback, FeedbackCamera, FeedbackKind, FeedbackProject};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
 use crate::logfile::{self, Level, LogFile};
 use crate::overlay::RunOverlay;
@@ -63,6 +66,10 @@ const HINT_TOP: f32 = 64.0;
 
 /// Seed of the synthetic cloud of `--synthetic`.
 const SYNTHETIC_SEED: u64 = 1;
+
+/// „Melden“ opens without the picture of the window if it has not come this long (s) after it
+/// was asked for (a window not drawn, a system without it).
+const SHOT_WAIT: f64 = 2.0;
 
 /// The arguments of `driftless-app [--version] [--synthetic N] [projekt-ordner]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -314,6 +321,67 @@ enum HelperTask {
     /// A change of the Stellen of the map or model in the folder, in its `stellen.toml`
     /// ([`Marks::change`]); made on [`AppState::marks`] already.
     Marks { owner: PathBuf, change: MarkChange },
+    /// „Melden“: the report written as a folder of its own ([`crate::feedback::write`]).
+    Feedback(Box<FeedbackJob>),
+    /// The reports in the folder, for the list (☰ → „Meldungen …“).
+    ReadReports(PathBuf),
+}
+
+/// A report of „Melden“ to write ([`HelperTask::Feedback`]).
+#[derive(Debug, Clone, PartialEq)]
+struct FeedbackJob {
+    /// The folder of the reports.
+    dir: PathBuf,
+    report: Feedback,
+    /// The picture of the window and the Stellen, if attached.
+    image: Option<Arc<egui::ColorImage>>,
+    marks: Option<Marks>,
+    /// The log file whose last lines go along; without one (or an empty one) `log`, the last
+    /// lines of the Protokoll of the window.
+    log_file: Option<PathBuf>,
+    log: Vec<String>,
+}
+
+/// „Melden“ asked for, while the picture of the window is awaited: the Stelle it is about, and
+/// the time of the frame that asked for the picture.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FeedbackAsk {
+    mark: Option<u32>,
+    asked: Option<f64>,
+}
+
+/// What the picture of the window for „Melden“ is asked for with: its reply is told apart by it.
+struct FeedbackShot;
+
+/// Whether `data` came with the picture asked for by „Melden“.
+fn is_feedback_shot(data: &egui::UserData) -> bool {
+    data.data
+        .as_ref()
+        .is_some_and(|d| (**d).is::<FeedbackShot>())
+}
+
+/// „Zur Ansicht“ of a report, until its camera is set ([`DriftlessApp::advance_report_view`]).
+#[derive(Debug, Clone, PartialEq)]
+struct ReportView {
+    /// The project of the report, to be shown first; `None`: the one shown stays.
+    project: Option<PathBuf>,
+    step: Option<Step>,
+    selection: Option<Selection>,
+    camera: Option<CameraState>,
+    /// The project is shown and the step and selection are set: what they load is awaited.
+    selected: bool,
+}
+
+/// The graphics adapter of `rs` as the log file names it: „Apple M4 Pro (Metal, IntegratedGpu,
+/// …)“.
+fn graphics_of(rs: &egui_wgpu::RenderState) -> String {
+    let info = rs.adapter.get_info();
+    let details = [
+        format!("{:?}", info.backend),
+        format!("{:?}", info.device_type),
+        format!("{} {}", info.driver, info.driver_info),
+    ];
+    logfile::gpu_text(&info.name, &details)
 }
 
 /// What a „compute all“ button puts into the queue.
@@ -473,6 +541,18 @@ pub struct DriftlessApp {
     /// before it, so they are not taken from it.
     marks_saved: u64,
     tree_marks_at: u64,
+    /// ⇧⇧ anywhere in the window opens „Melden“.
+    double_shift: DoubleShift,
+    /// „Melden“ asked for while the picture of the window is awaited.
+    feedback_ask: Option<FeedbackAsk>,
+    /// Where the reports go ([`crate::feedback::default_dir`]; tests: a folder of their own).
+    feedback_dir: Option<PathBuf>,
+    /// The dialogs of the reports being written, in order: one opens again if writing it fails.
+    feedback_saving: VecDeque<FeedbackDialog>,
+    /// The graphics adapter the window draws with, as the log file names it.
+    graphics: Option<String>,
+    /// „Zur Ansicht“ of a report, until its camera is set.
+    report_view: Option<ReportView>,
 }
 
 impl DriftlessApp {
@@ -533,6 +613,12 @@ impl DriftlessApp {
             brush: Brush::default(),
             marks_saved: 0,
             tree_marks_at: 0,
+            double_shift: DoubleShift::default(),
+            feedback_ask: None,
+            feedback_dir: crate::feedback::default_dir(),
+            feedback_saving: VecDeque::new(),
+            graphics: None,
+            report_view: None,
         }
     }
 
@@ -551,6 +637,13 @@ impl DriftlessApp {
     /// With another projects folder for the dialogs to start in (tests: not the home folder).
     pub fn with_projects_home(mut self, dir: Option<PathBuf>) -> Self {
         self.projects_home = dir;
+        self
+    }
+
+    /// With another folder for the reports of „Melden“ (tests: never the app's own); `None`:
+    /// „Melden“ cannot save.
+    pub fn with_feedback_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.feedback_dir = dir;
         self
     }
 
@@ -605,18 +698,11 @@ impl DriftlessApp {
             .storage
             .and_then(|s| s.get_string(LAST_PROJECT_KEY))
             .filter(|s| !s.is_empty());
+        // kept: a report of „Melden“ names it too
+        app.graphics = cc.wgpu_render_state.as_ref().map(graphics_of);
         if let Some(file) = &app.log_file {
-            let gpu = cc.wgpu_render_state.as_ref().map(|rs| {
-                let info = rs.adapter.get_info();
-                let details = [
-                    format!("{:?}", info.backend),
-                    format!("{:?}", info.device_type),
-                    format!("{} {}", info.driver, info.driver_info),
-                ];
-                logfile::gpu_text(&info.name, &details)
-            });
             let project = args.project.clone().or(last.clone().map(PathBuf::from));
-            file.write_start(gpu.as_deref(), project.as_deref());
+            file.write_start(app.graphics.as_deref(), project.as_deref());
         }
         if let Some(dir) = args.project {
             app.apply(Action::OpenProject(dir));
@@ -631,6 +717,7 @@ impl DriftlessApp {
 
     /// With the GPU of a window (or of a test renderer): the 3D view draws with it.
     pub fn with_render_state(mut self, render_state: egui_wgpu::RenderState) -> Self {
+        self.graphics = Some(graphics_of(&render_state));
         self.render_state = Some(render_state);
         self
     }
@@ -1655,8 +1742,9 @@ impl DriftlessApp {
     /// the step is cancelled and [`DriftlessApp::take_close`] says when to close, so the
     /// window never waits for it inside the event loop.
     pub fn close_requested(&mut self) -> bool {
-        // a stroke or ↶ not yet in `stellen.toml` is saved first
-        if !self.jobs.is_busy() && !self.marks_pending() {
+        // a stroke or ↶ not yet in `stellen.toml`, a report not yet in its folder, are saved
+        // first
+        if !self.jobs.is_busy() && !self.marks_pending() && !self.feedback_pending() {
             return true;
         }
         if !self.closing {
@@ -1671,9 +1759,11 @@ impl DriftlessApp {
         false
     }
 
-    /// True once, after a put-off close, when the step has ended and the Stellen are saved.
+    /// True once, after a put-off close, when the step has ended and the Stellen and the reports
+    /// are saved.
     pub fn take_close(&mut self) -> bool {
-        if self.closing && !self.jobs.is_busy() && !self.marks_pending() {
+        let saving = self.marks_pending() || self.feedback_pending();
+        if self.closing && !self.jobs.is_busy() && !saving {
             self.closing = false;
             return true;
         }
@@ -1714,6 +1804,7 @@ impl DriftlessApp {
             || (self.state.project.is_some() && self.disk_asked != self.state.tree_version)
             || self.focus_read_at.is_some()
             || !self.state.touchup.waiting.is_empty()
+            || self.report_view.is_some()
     }
 
     /// The window got the focus back: the tree is read again [`FOCUS_DELAY`] later (a scan
@@ -1799,6 +1890,8 @@ impl DriftlessApp {
                 (Some(HelperTask::Marks { owner, .. }), result) => {
                     self.marks_written(owner, result)
                 }
+                (Some(HelperTask::Feedback(_)), result) => self.feedback_written(result),
+                (Some(HelperTask::ReadReports(_)), result) => self.reports_read(result),
                 _ => {}
             }
         }
@@ -1944,6 +2037,29 @@ impl DriftlessApp {
                     Ok(JobOutput::Marks(Box::new(marks)))
                 })
             }
+            HelperTask::Feedback(job) => {
+                let job = (**job).clone();
+                self.helper.start(text::FEEDBACK_JOB, move |_| {
+                    use crate::feedback::{last_lines, write, LOG_LINES};
+                    // the log file of this start, else what the window keeps of the Protokoll
+                    let lines = job
+                        .log_file
+                        .as_deref()
+                        .and_then(|path| last_lines(path, LOG_LINES).ok())
+                        .filter(|lines| !lines.is_empty())
+                        .unwrap_or(job.log);
+                    let image = job.image.as_deref();
+                    let folder = write(&job.dir, &job.report, image, job.marks.as_ref(), &lines)
+                        .map_err(|e| StepError::Failed(e.to_string()))?;
+                    Ok(JobOutput::FeedbackSaved(folder))
+                })
+            }
+            HelperTask::ReadReports(dir) => {
+                let dir = dir.clone();
+                self.helper.start(text::REPORTS_JOB, move |_| {
+                    Ok(JobOutput::Reports(crate::feedback::read_all(&dir)))
+                })
+            }
         };
         match started {
             Ok(()) => {
@@ -1980,6 +2096,12 @@ impl DriftlessApp {
                 HelperTask::Marks { owner, .. } => {
                     let owner = owner.clone();
                     self.marks_written(owner, Err(StepError::Failed(e.to_string())))
+                }
+                HelperTask::Feedback(_) => {
+                    self.feedback_written(Err(StepError::Failed(e.to_string())))
+                }
+                HelperTask::ReadReports(_) => {
+                    self.reports_read(Err(StepError::Failed(e.to_string())))
                 }
                 _ => self.error(e.to_string()),
             },
@@ -2279,6 +2401,321 @@ impl DriftlessApp {
         }
     }
 
+    /// „Melden“ (⇧⇧, „Melden …“ in the bar of the brush), about Stelle `mark` if given. With a
+    /// GPU the picture of the window is asked for first, and the dialog opens in the frame it
+    /// comes in ([`Self::feedback_picture`]); without one at once, without a picture. One at a
+    /// time.
+    fn ask_feedback(&mut self, mark: Option<u32>) {
+        if self.state.feedback_dialog.is_some() || self.feedback_ask.is_some() {
+            return;
+        }
+        if self.render_state.is_none() {
+            self.open_feedback(mark, None);
+            return;
+        }
+        self.feedback_ask = Some(FeedbackAsk { mark, asked: None });
+    }
+
+    /// While „Melden“ waits for the picture of the window: asks for it once; opens the dialog in
+    /// the frame it comes in – painted after the frame that asked, so the dialog is not in it –
+    /// or without it after [`SHOT_WAIT`].
+    fn feedback_picture(&mut self, ctx: &egui::Context) {
+        let Some(ask) = self.feedback_ask else {
+            return;
+        };
+        let (time, image) = ctx.input(|i| {
+            let image = i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot {
+                    user_data, image, ..
+                } if is_feedback_shot(user_data) => Some(image.clone()),
+                _ => None,
+            });
+            (i.time, image)
+        });
+        let late = ask.asked.is_some_and(|at| time - at > SHOT_WAIT);
+        if image.is_some() || late {
+            self.feedback_ask = None;
+            self.open_feedback(ask.mark, image);
+            return;
+        }
+        if ask.asked.is_none() {
+            let shot = egui::UserData::new(FeedbackShot);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(shot));
+            self.feedback_ask = Some(FeedbackAsk {
+                asked: Some(time),
+                ..ask
+            });
+        }
+        // the next frames paint the picture and bring it
+        ctx.request_repaint();
+    }
+
+    /// Opens „Melden“ with the picture of the window, the Stellen of the surface shown (ticked if
+    /// there are any), the Stelle `mark` named if it is one of them, and what comes along by
+    /// itself ([`Self::feedback_context`]).
+    fn open_feedback(&mut self, mark: Option<u32>, image: Option<Arc<egui::ColorImage>>) {
+        let marks = brush::shown_marks(&self.state)
+            .and_then(|(_, marks)| marks)
+            .cloned();
+        let named = mark.and_then(|nr| {
+            let m = marks.as_ref()?.marks.iter().find(|m| m.nr == nr)?;
+            Some((nr, m.label()))
+        });
+        let context = self.feedback_context();
+        self.state.feedback_dialog = Some(FeedbackDialog::new(context, image, marks, named));
+    }
+
+    /// What comes along with a report without the user: version, system, graphics adapter, the
+    /// project, the step, the selection and the camera of the view.
+    fn feedback_context(&self) -> Feedback {
+        let mut f = Feedback::new(FeedbackKind::default());
+        f.version = super::about::version_line();
+        f.system = logfile::os_text();
+        f.graphics = self.graphics.clone().unwrap_or_default();
+        f.step = Some(super::feedback::step_word(self.state.step).to_string());
+        f.project = self
+            .state
+            .project
+            .as_ref()
+            .map(|p| FeedbackProject::new(&p.name, &p.dir));
+        f.selection = super::feedback::selection_record(&self.state);
+        f.camera = self.camera_state().map(FeedbackCamera::new);
+        f
+    }
+
+    /// The camera of the view in absolute coordinates, if the view draws something: in the frame
+    /// it last drew in.
+    fn camera_state(&self) -> Option<CameraState> {
+        let shown = self.cloud.is_some() || self.overlay.is_some() || self.view.has_surface();
+        let drawn = shown && self.render_state.is_some();
+        let origin = self.view.view_origin().filter(|_| drawn)?;
+        Some(self.view.camera().state(origin))
+    }
+
+    /// „Melden“ in the dialog: the report is written in the background as a folder of its own,
+    /// with the last lines of the log file (else of the Protokoll); the dialog closes. Without a
+    /// folder for the reports it stays, and says so.
+    fn send_feedback(&mut self) {
+        let Some(dialog) = self.state.feedback_dialog.take() else {
+            return;
+        };
+        let dir = self.feedback_dir.clone().filter(|_| dialog.can_send());
+        let Some(dir) = dir else {
+            if dialog.can_send() {
+                self.error(text::FEEDBACK_NO_FOLDER.into());
+            }
+            self.state.feedback_dialog = Some(dialog);
+            return;
+        };
+        let created = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        let job = FeedbackJob {
+            dir,
+            report: dialog.report(created),
+            image: dialog.image_to_attach(),
+            marks: dialog.marks_to_attach(),
+            log_file: self.log_file.as_ref().map(|f| f.path().to_path_buf()),
+            log: self.protocol_lines(crate::feedback::LOG_LINES),
+        };
+        self.feedback_saving.push_back(dialog);
+        self.helper_queue
+            .push_back(HelperTask::Feedback(Box::new(job)));
+    }
+
+    /// The last `n` lines of the Protokoll of the window, as the log file writes them.
+    fn protocol_lines(&self, n: usize) -> Vec<String> {
+        let log = &self.state.log;
+        log[log.len().saturating_sub(n)..]
+            .iter()
+            .map(|e| {
+                let level = match e.kind {
+                    LogKind::Info => Level::Info,
+                    LogKind::Warning => Level::Warning,
+                    LogKind::Error => Level::Error,
+                };
+                logfile::format_line(&e.time, level, &e.text)
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// A report was written (or not): „Meldung gespeichert“, and an open list reads it anew; if
+    /// it failed, why, and the dialog opens again with what was typed.
+    fn feedback_written(&mut self, result: Result<JobOutput, StepError>) {
+        let dialog = self.feedback_saving.pop_front();
+        match result {
+            Ok(output) => {
+                if let (JobOutput::FeedbackSaved(folder), Some(file)) = (&output, &self.log_file) {
+                    file.write(Level::Info, &folder.display().to_string());
+                }
+                self.info(text::FEEDBACK_SAVED.to_string());
+                if self.state.feedback_list.is_some() {
+                    self.open_reports();
+                }
+            }
+            Err(e) => {
+                self.error(text::feedback_not_saved(&text::step_error(&e)));
+                if self.state.feedback_dialog.is_none() {
+                    self.state.feedback_dialog = dialog;
+                }
+            }
+        }
+    }
+
+    /// Whether a report is still to be written.
+    fn feedback_pending(&self) -> bool {
+        let feedback = |t: &HelperTask| matches!(t, HelperTask::Feedback(_));
+        self.helper_running.as_ref().is_some_and(feedback) || self.helper_queue.iter().any(feedback)
+    }
+
+    /// ☰ → „Meldungen …“: the window with the reports, read anew from their folder.
+    fn open_reports(&mut self) {
+        let Some(dir) = self.feedback_dir.clone() else {
+            self.state.feedback_list = Some(ReportList {
+                problem: Some(text::FEEDBACK_NO_FOLDER.into()),
+                ..ReportList::default()
+            });
+            return;
+        };
+        let reading = ReportList {
+            reading: true,
+            ..ReportList::default()
+        };
+        // the reports read before stay shown until the new ones are there
+        let list = self.state.feedback_list.get_or_insert(reading);
+        list.reading = true;
+        list.problem = None;
+        self.helper_queue
+            .retain(|t| !matches!(t, HelperTask::ReadReports(_)));
+        self.helper_queue.push_back(HelperTask::ReadReports(dir));
+    }
+
+    /// The reports were read: into the list, if it is still open.
+    fn reports_read(&mut self, result: Result<JobOutput, StepError>) {
+        let Some(list) = &mut self.state.feedback_list else {
+            return;
+        };
+        list.reading = false;
+        match result {
+            Ok(JobOutput::Reports(reports)) => list.reports = reports,
+            Ok(_) => {}
+            Err(e) => list.problem = Some(text::step_error(&e)),
+        }
+    }
+
+    /// „Zur Ansicht“ of the report in `folder` (of the list): its project is opened if another
+    /// one is shown, then [`Self::advance_report_view`] sets its step, selection and camera.
+    fn report_view(&mut self, folder: &Path) {
+        let report = self
+            .state
+            .feedback_list
+            .as_ref()
+            .and_then(|l| l.reports.iter().find(|(p, _)| p == folder))
+            .map(|(_, f)| f.clone());
+        let Some(report) = report else {
+            self.error(text::REPORT_GONE.into());
+            return;
+        };
+        self.state.feedback_list = None;
+        let project = report.project.map(|p| p.dir);
+        if let Some(dir) = &project {
+            if !self.is_open(dir) {
+                self.apply(Action::OpenProject(dir.clone()));
+            }
+        }
+        let selection = report
+            .selection
+            .as_ref()
+            .and_then(super::feedback::selection_of);
+        self.report_view = Some(ReportView {
+            project,
+            step: report.step.as_deref().and_then(super::feedback::step_of),
+            selection,
+            camera: report.camera.map(|c| c.state),
+            selected: false,
+        });
+    }
+
+    /// „Zur Ansicht“ goes on as far as it can: once the project of the report is shown (its tree
+    /// read; a switch that waits for a step to stop waits too) its step and selection are set –
+    /// not before, the project shown resets the selection –; once what they load is loaded and
+    /// the run of the selection is read, the camera is set, by the view once it has all of it on
+    /// the GPU ([`View3d::restore_camera`]). Gives up if the project did not open (that said why).
+    fn advance_report_view(&mut self) {
+        let Some(view) = &self.report_view else {
+            return;
+        };
+        if !view.selected {
+            let opening = self.pending.is_some()
+                || self.state.opening.is_some()
+                || self.tree_pending()
+                || self.step_end.is_some();
+            if opening {
+                return;
+            }
+            if let Some(dir) = view.project.clone() {
+                if !self.is_open(&dir) {
+                    self.report_view = None;
+                    return;
+                }
+            }
+            let Some(view) = self.report_view.as_mut() else {
+                return;
+            };
+            view.selected = true;
+            let (step, selection) = (view.step.take(), view.selection.take());
+            if let Some(step) = step {
+                self.set_step(step);
+            }
+            match selection {
+                Some(s) if super::feedback::selection_known(&self.state, &s) => {
+                    self.apply(Action::Select(s))
+                }
+                Some(_) => self.info(text::REPORT_SELECTION_GONE.into()),
+                None => {}
+            }
+            // the run of the selection is asked for in the next tick
+            return;
+        }
+        if self.is_loading() || self.is_loading_surface() || self.run_loading() {
+            return;
+        }
+        if let Some(camera) = self.report_view.take().and_then(|v| v.camera) {
+            self.state.view.camera_mode = camera.mode;
+            self.restore_camera(camera);
+        }
+    }
+
+    /// Whether the run drawn is being read.
+    fn run_loading(&self) -> bool {
+        let run = |t: &HelperTask| matches!(t, HelperTask::LoadRun(_));
+        self.helper_running.as_ref().is_some_and(run) || self.helper_queue.iter().any(run)
+    }
+
+    /// Sets the camera of the view as `camera` says: by the view, once what it shows is up on
+    /// the GPU and framed; without a GPU (or with nothing to draw) at once, in the frame the view
+    /// would draw in.
+    fn restore_camera(&mut self, camera: CameraState) {
+        let shown = self.cloud.is_some() || self.overlay.is_some() || self.view.has_surface();
+        if self.render_state.is_some() && shown {
+            self.view.restore_camera(camera);
+            return;
+        }
+        let origin = self
+            .view
+            .view_origin()
+            .or_else(|| self.view_origin())
+            .or_else(|| self.overlay.as_ref().map(|o| o.origin))
+            .unwrap_or([0.0; 3]);
+        self.view.camera_mut().restore(&camera, origin);
+    }
+
+    /// Whether „Zur Ansicht“ of a report is still under way: its project, selection or camera
+    /// not set yet.
+    pub fn report_view_pending(&self) -> bool {
+        self.report_view.is_some() || self.view.camera_pending()
+    }
+
     /// Once per frame: takes a finished step, the new log lines and the progress.
     pub fn tick(&mut self) {
         // the lines of a step before its end, so that its summary comes before „fertig“
@@ -2318,6 +2755,8 @@ impl DriftlessApp {
                 self.compute_all(batch);
             }
         }
+        // last: what the selection of a report loads starts here, its run is read next tick
+        self.advance_report_view();
     }
 
     fn finished(&mut self, f: JobFinished) {
@@ -2963,8 +3402,18 @@ impl DriftlessApp {
                 self.state.touchup.after = after;
                 self.view.show_edit(after);
             }
-            // the window „Melden“ comes with its own step of the plan (Task 11)
-            Action::OpenFeedback { .. } => {}
+            Action::OpenFeedback { mark } => self.ask_feedback(mark),
+            Action::SendFeedback => self.send_feedback(),
+            Action::OpenReports => self.open_reports(),
+            Action::OpenReportFolder(dir) => {
+                if let Err(e) = super::about::open_with_system(dir.as_os_str()) {
+                    self.error(text::open_failed(
+                        &dir.display().to_string(),
+                        &e.to_string(),
+                    ));
+                }
+            }
+            Action::ReportView(dir) => self.report_view(&dir),
             Action::Touchup { surface, step } => self.want_touchup(surface, step),
         }
     }
@@ -3290,11 +3739,22 @@ impl DriftlessApp {
             ctx.request_repaint_after(REPAINT_WHILE_BUSY);
         }
         self.update_title(&ctx);
-        show_mode_key(&ctx, &mut self.state);
-        tools::keys(&ctx, &mut self.state);
+        // while „Melden“ is open the keys of the view and the brush wait (Esc closes it)
+        let reporting = self.state.feedback_dialog.is_some();
+        if !reporting {
+            show_mode_key(&ctx, &mut self.state);
+            tools::keys(&ctx, &mut self.state);
+        }
+        // ⇧⇧ anywhere: „Melden“
+        if ctx.input(|i| self.double_shift.feed(&i.events, i.time)) {
+            self.ask_feedback(None);
+        }
+        self.feedback_picture(&ctx);
 
         let mut actions: Vec<Action> = Vec::new();
-        actions.extend(brush::keys(&ctx, &mut self.state));
+        if !reporting {
+            actions.extend(brush::keys(&ctx, &mut self.state));
+        }
         // without a surface of the project to paint on the brush goes back to „Drehen“
         if self.state.tool == Tool::Brush && brush::blocked(&self.state).is_some() {
             tools::select(&mut self.state, Tool::Orbit);
@@ -3333,6 +3793,8 @@ impl DriftlessApp {
         super::about::show(&ctx, &mut self.state.about_open);
         actions.extend(export::show(&ctx, &mut self.state));
         actions.extend(super::manage::show(&ctx, &mut self.state));
+        actions.extend(super::feedback::show_list(&ctx, &mut self.state));
+        actions.extend(super::feedback::show_dialog(&ctx, &mut self.state));
         self.view.set_tool(self.state.tool);
         self.view
             .set_picked(self.state.picked.as_ref().map(|p| p.index));

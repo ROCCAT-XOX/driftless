@@ -419,11 +419,12 @@ pub fn remember_text_focus(ctx: &Context) {
 }
 
 /// Whether the keys of the view (Esc, `O`, `F`, flying) are free: no text field has the
-/// keyboard, now or at the end of the last pass. A button or slider with the keyboard (after
-/// Tab, say) does not hold them.
+/// keyboard, now or at the end of the last pass, and no modal dialog („Melden“) lies over the
+/// window. A button or slider with the keyboard (after Tab, say) does not hold them.
 pub fn keys_free(ctx: &Context) -> bool {
     let before = ctx.data(|d| d.get_temp::<bool>(text_focus_id()));
-    !before.unwrap_or(false) && !ctx.text_edit_focused()
+    let modal = ctx.memory(|m| m.top_modal_layer().is_some());
+    !before.unwrap_or(false) && !ctx.text_edit_focused() && !modal
 }
 
 /// The floating bars over the view `view`, while a cloud or a surface is loaded. Their

@@ -91,6 +91,10 @@ pub enum JobOutput {
     Marks(Box<driftless_steps::marks::Marks>),
     /// The step „Nacharbeit“: the touch-up of a surface, with what the view should show.
     Touchup(Box<crate::surface::TouchupOutput>),
+    /// A report of „Melden“ written: its folder (helper runner).
+    FeedbackSaved(PathBuf),
+    /// The reports of this computer, the newest first (helper runner).
+    Reports(Vec<(PathBuf, crate::feedback::Feedback)>),
     /// Nothing to hand back; the job's effect is on disk.
     Done,
 }

@@ -782,6 +782,133 @@ pub fn feedback_button_hint() -> String {
     )
 }
 
+// „Melden“ (⇧⇧, `crate::feedback`) and ☰ → „Meldungen …“
+/// The dialog.
+pub const FEEDBACK_TITLE: &str = "Melden";
+/// What is reported: the two choices, also the words of the list.
+pub const FEEDBACK_BUG: &str = "Fehler";
+pub const FEEDBACK_WISH: &str = "Wunsch";
+/// The text field while it is empty.
+pub const FEEDBACK_HINT: &str = "Was ist passiert, oder was wünschst du dir?";
+pub const FEEDBACK_ATTACH_IMAGE: &str = "Bild des Fensters anhängen";
+/// Why the picture cannot be attached.
+pub const FEEDBACK_NO_IMAGE: &str = "Kein Bild des Fensters (ohne Grafikkarte)";
+/// Why the Stellen cannot be attached.
+pub const FEEDBACK_NO_MARKS: &str = "Auf der gezeigten Oberfläche ist keine Stelle markiert";
+/// Under the choices: what comes along without the user.
+pub const FEEDBACK_CONTEXT: &str =
+    "Ansicht, Auswahl, Version und die letzten Meldungen der App kommen von selbst dazu";
+/// Saves the report.
+pub const FEEDBACK_SEND: &str = "Melden";
+/// Why „Melden“ waits.
+pub const FEEDBACK_NEEDS_TEXT: &str = "Erst ein paar Worte schreiben";
+/// After a report was saved.
+pub const FEEDBACK_SAVED: &str = "Meldung gespeichert";
+/// „Melden“ when the system names no folder for the reports.
+pub const FEEDBACK_NO_FOLDER: &str = "Kein Ordner für Meldungen: HOME bzw. LOCALAPPDATA fehlt";
+/// The work of the helper that writes a report, and the one that reads the list.
+pub const FEEDBACK_JOB: &str = "Meldung speichern";
+pub const REPORTS_JOB: &str = "Meldungen lesen";
+/// What could not be written of a report.
+pub const FEEDBACK_FOLDER_FAILED: &str = "Ordner der Meldung nicht anlegbar";
+pub const FEEDBACK_FILE_FAILED: &str = "Datei der Meldung nicht schreibbar";
+
+/// „Markierte Stellen anhängen (2)“: the Stellen of the surface shown.
+pub fn feedback_attach_marks(n: usize) -> String {
+    format!("Markierte Stellen anhängen ({n})")
+}
+
+/// The Stelle a report is about: „Zu Stelle 1 · Wand“.
+pub fn feedback_about_mark(label: &str) -> String {
+    format!("Zu {label}")
+}
+
+/// A report that could not be saved (the dialog opens again with it).
+pub fn feedback_not_saved(why: &str) -> String {
+    format!("Meldung nicht gespeichert: {why}")
+}
+
+/// The picture of the window that could not be packed.
+pub fn feedback_picture_failed(e: &dyn std::fmt::Display) -> String {
+    format!("Bild des Fensters nicht speicherbar: {e}")
+}
+
+/// `meldung.toml` that could not be made.
+pub fn feedback_unwritable(e: &dyn std::fmt::Display) -> String {
+    format!("meldung.toml nicht schreibbar: {e}")
+}
+
+/// ☰: the window with the reports of this computer.
+pub const REPORTS: &str = "Meldungen …";
+pub const REPORTS_TITLE: &str = "Meldungen auf diesem Rechner";
+pub const REPORTS_READING: &str = "Meldungen werden gelesen …";
+pub const REPORTS_FOOTER: &str = "Gespeichert im Ordner der App auf diesem Rechner, nichts wird \
+     hochgeladen. Claude liest die offenen Meldungen in der nächsten Sitzung und trägt hier ein, \
+     was daraus wurde.";
+/// Of a report in the list: its folder in the file manager, and back to its view.
+pub const REPORT_OPEN_FOLDER: &str = "Ordner öffnen";
+pub const REPORT_TO_VIEW: &str = "Zur Ansicht";
+pub const REPORT_TO_VIEW_HINT: &str =
+    "Öffnet das Projekt und stellt Auswahl und Ansicht wieder her, wie sie beim Melden waren";
+/// Why „Zur Ansicht“ is off.
+pub const REPORT_NO_VIEW: &str = "Die Meldung nennt kein Projekt und keine Ansicht";
+/// „Zur Ansicht“ of a report whose selection is no longer in the project.
+pub const REPORT_SELECTION_GONE: &str = "Die Auswahl der Meldung gibt es im Projekt nicht mehr";
+/// „Zur Ansicht“ of a report the list no longer holds.
+pub const REPORT_GONE: &str = "Die Meldung gibt es nicht mehr";
+
+/// The tooltip of „Meldungen …“ in ☰.
+pub fn reports_hint() -> String {
+    format!(
+        "Die Fehler und Wünsche, die auf diesem Rechner gemeldet wurden; {} öffnet „Melden“ \
+         überall in der App",
+        double_shift()
+    )
+}
+
+/// The list without a report.
+pub fn reports_none() -> String {
+    format!(
+        "Noch keine Meldungen. {} (zweimal kurz Shift) öffnet „Melden“ überall in der App.",
+        double_shift()
+    )
+}
+
+/// Between the facts of a report in the list (kind, time, project, Stelle).
+pub const REPORT_DOT: &str = "·";
+
+/// The parts of a name as the window joins them: „Oberfläche 001 · Karte 001 · Halle“.
+pub fn joined_name(parts: &[&str]) -> String {
+    parts.join(" · ")
+}
+
+/// The project of a report in the list: „Projekt „Abnahme““.
+pub fn report_project(name: &str) -> String {
+    format!("Projekt „{name}“")
+}
+
+/// The Stelle of a report in the list: „Stelle 1“.
+pub fn report_mark(nr: u32) -> String {
+    format!("Stelle {nr}")
+}
+
+/// When a report was made, in local time: „29.10. 10:14“, of another year „29.10.2025 10:14“;
+/// what cannot be read as it is.
+pub fn report_time(created: &str) -> String {
+    use chrono::Datelike;
+    match chrono::DateTime::parse_from_rfc3339(created) {
+        Ok(t) => {
+            let t = t.with_timezone(&chrono::Local);
+            if t.year() == chrono::Local::now().year() {
+                t.format("%d.%m. %H:%M").to_string()
+            } else {
+                t.format("%d.%m.%Y %H:%M").to_string()
+            }
+        }
+        Err(_) => created.to_string(),
+    }
+}
+
 /// „Vorher“ / „Nachher“ in the bar of the brush: the surface as computed or touched up.
 pub const EDIT_BEFORE: &str = "Vorher";
 pub const EDIT_BEFORE_HINT: &str = "Die Oberfläche, wie sie gerechnet wurde";

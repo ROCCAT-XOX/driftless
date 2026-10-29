@@ -31,10 +31,14 @@
 //! Over the surface the view marks the Stellen ([`View3d::set_marks`]) and draws its touched-up
 //! state („Nachher“, [`View3d::set_edit`], [`View3d::show_edit`]). Both belong to the surface
 //! last given: they wait until it is on the GPU, and a new surface drops them.
+//!
+//! A camera kept in absolute coordinates (a report of „Melden“) is set once what was given is
+//! on the GPU and has framed itself ([`View3d::restore_camera`]), in the frame the view then
+//! draws in ([`View3d::view_origin`]).
 
 use super::tools::Tool;
 use super::{text, ViewSettings};
-use crate::camera::{fly_motion, Camera, CameraMode, FlyKeys, ZOOM_FACTOR};
+use crate::camera::{fly_motion, Camera, CameraMode, CameraState, FlyKeys, ZOOM_FACTOR};
 use crate::cloud::{LoadedCloud, DEFAULT_POINT_M};
 use crate::lod::{select_nodes, Octree, PointVertex};
 use crate::overlay::RunOverlay;
@@ -384,6 +388,11 @@ pub struct View3d {
     painting: Option<bool>,
     /// What the pointer did for the brush in the last frame.
     brush_input: BrushInput,
+    /// The origin the camera's frame was drawn in, in the last frame drawn: the cloud's, else
+    /// the surface's, else the run's.
+    origin: Option<[f64; 3]>,
+    /// A camera to set once what was given is up on the GPU ([`View3d::restore_camera`]).
+    pending_camera: Option<CameraState>,
 }
 
 impl View3d {
@@ -492,6 +501,24 @@ impl View3d {
 
     pub fn camera(&self) -> &Camera {
         &self.camera
+    }
+
+    /// The origin the camera is relative to: that of the last frame drawn (the cloud's, else
+    /// the surface's, else the run's); `None` before the first one.
+    pub fn view_origin(&self) -> Option<[f64; 3]> {
+        self.origin
+    }
+
+    /// Sets the camera as `state` says (absolute, [`Camera::restore`]) once the cloud and the
+    /// surface given are up on the GPU and have framed themselves, in the frame the view then
+    /// draws in. A camera asked for before replaces this one.
+    pub fn restore_camera(&mut self, state: CameraState) {
+        self.pending_camera = Some(state);
+    }
+
+    /// Whether a camera of [`View3d::restore_camera`] still waits.
+    pub fn camera_pending(&self) -> bool {
+        self.pending_camera.is_some()
     }
 
     /// For tools and measurements that move the camera themselves.
@@ -659,6 +686,14 @@ impl View3d {
                 self.camera.frame_bounds(min, max, aspect);
             }
             self.frame_all = false;
+        }
+        self.origin = view_origin;
+        // a camera asked for once the surface is up too (it framed itself above)
+        if self.pending_surface.is_none() {
+            if let (Some(state), Some(origin)) = (&self.pending_camera, view_origin) {
+                self.camera.restore(state, origin);
+                self.pending_camera = None;
+            }
         }
         self.camera.set_mode(settings.camera_mode);
 

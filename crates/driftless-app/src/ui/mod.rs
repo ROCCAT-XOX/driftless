@@ -6,8 +6,8 @@
 //! field of the active step ([`steps`]), the 3D view ([`view3d`]) in the rest with its floating
 //! bars ([`tools`]: info, the switch Punkte · Fläche · beides, the tools, the cut and the bar of
 //! the brush, [`brush`]), the status bar ([`status`]) at the bottom, the settings window ⚙
-//! ([`settings`]), the window „Exportieren“ ([`export`]) and the window „Über Driftless“
-//! ([`about`]).
+//! ([`settings`]), the window „Exportieren“ ([`export`]), the window „Über Driftless“
+//! ([`about`]), and „Melden“ (⇧⇧) with the list of the reports ([`feedback`]).
 
 pub mod about;
 pub mod actions;
@@ -16,6 +16,7 @@ pub mod brush;
 pub mod compare;
 pub mod correct;
 pub mod export;
+pub mod feedback;
 pub mod manage;
 pub mod rail;
 pub mod settings;
@@ -287,10 +288,22 @@ pub enum Action {
     },
     /// „Vorher“ (`false`) or „Nachher“ (`true`): the surface shown as computed, or touched up.
     ShowEdit(bool),
-    /// „Melden …“ (⇧⇧): the window „Melden“, about Stelle `mark` of the surface shown if given.
+    /// „Melden …“ (⇧⇧): the window „Melden“, about Stelle `mark` of the surface shown if given,
+    /// with „Markierte Stellen anhängen (n)“ ticked where there are Stellen. With a GPU it opens
+    /// once the picture of the window has come, so the picture shows the window without it.
     OpenFeedback {
         mark: Option<u32>,
     },
+    /// „Melden“ in the dialog: the report is written as a folder in the background
+    /// ([`crate::feedback::write`]), the dialog closes; „Meldung gespeichert“ says when it is.
+    SendFeedback,
+    /// ☰ → „Meldungen …“: the window with the reports of this computer, read anew.
+    OpenReports,
+    /// „Ordner öffnen“ of a report: its folder in Finder or Explorer.
+    OpenReportFolder(PathBuf),
+    /// „Zur Ansicht“ of the report in the folder: its project is opened, then its step and
+    /// selection are set, and once what they load is shown the camera is set as it was.
+    ReportView(PathBuf),
     /// The touch-up of the surface in the folder `surface` as a step, with its progress and
     /// „Abbrechen“ ([`crate::surface::run_touchup_job`]): the steps of the Stellen of its map or
     /// model replayed and kept in `nacharbeit/`; the view gets the touched-up state. `step`:
@@ -708,6 +721,10 @@ pub struct AppState {
     pub brush: brush::BrushState,
     /// The touch-up of the Stellen: „Vorher“ / „Nachher“, what the view holds, what waits.
     pub touchup: brush::TouchupState,
+    /// The dialog „Melden“, while it is open.
+    pub feedback_dialog: Option<feedback::FeedbackDialog>,
+    /// The window „Meldungen auf diesem Rechner“, while it is open.
+    pub feedback_list: Option<feedback::ReportList>,
 }
 
 impl AppState {

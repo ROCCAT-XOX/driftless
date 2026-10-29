@@ -72,6 +72,36 @@ impl Default for Camera {
     }
 }
 
+/// The camera in absolute coordinates – metres in the frame of the data, not relative to the
+/// origin a view draws in –, for keeping it beside the program (a report of „Melden“,
+/// `crate::feedback`): [`Camera::state`] writes it, [`Camera::restore`] sets a camera from it in
+/// the frame of any origin. Angles in degrees; the keys are German, like the files of a project.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CameraState {
+    /// Orbiting [`CameraState::target`] or flying from [`CameraState::eye`].
+    #[serde(rename = "modus")]
+    pub mode: CameraMode,
+    #[serde(rename = "ziel")]
+    pub target: [f64; 3],
+    #[serde(rename = "auge")]
+    pub eye: [f64; 3],
+    /// About z, 0 = +x, counter-clockwise.
+    #[serde(rename = "gier_grad")]
+    pub yaw_deg: f64,
+    /// Above the horizontal.
+    #[serde(rename = "neigung_grad")]
+    pub pitch_deg: f64,
+    /// From the eye to the target.
+    #[serde(rename = "abstand_m")]
+    pub distance_m: f64,
+    /// The vertical field of view.
+    #[serde(rename = "bildwinkel_grad")]
+    pub fov_y_deg: f64,
+}
+
+/// The narrowest and widest field of view [`Camera::restore`] takes (degrees).
+const FOV_RANGE_DEG: [f64; 2] = [1.0, 170.0];
+
 /// A ray in world coordinates; `dir` has length 1.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Ray {
@@ -329,6 +359,55 @@ impl Camera {
         self.target = centre;
         self.distance = (radius / half.sin() * FRAME_MARGIN).max(MIN_DISTANCE);
         self.eye = self.target - self.dir() * self.distance;
+    }
+
+    /// The camera in absolute coordinates, for a view that draws in the frame of `origin`
+    /// (its target and eye are relative to it).
+    pub fn state(&self, origin: [f64; 3]) -> CameraState {
+        let abs = |v: Vector3<f32>| [0, 1, 2].map(|k| origin[k] + f64::from(v[k]));
+        CameraState {
+            mode: self.mode,
+            target: abs(self.target),
+            eye: abs(self.eye_position()),
+            yaw_deg: f64::from(self.yaw).to_degrees(),
+            pitch_deg: f64::from(self.pitch).to_degrees(),
+            distance_m: f64::from(self.distance),
+            fov_y_deg: f64::from(self.fov_y).to_degrees(),
+        }
+    }
+
+    /// Sets the camera as `state` says, for a view that draws in the frame of `origin`: mode,
+    /// target and eye (moved into that frame in f64), direction, distance and field of view;
+    /// the pitch held within ±[`PITCH_LIMIT_DEG`], the distance at least [`MIN_DISTANCE`]. A
+    /// state with a value that is not finite (a file edited by hand) leaves the camera as it is.
+    pub fn restore(&mut self, state: &CameraState, origin: [f64; 3]) {
+        let values = [
+            state.yaw_deg,
+            state.pitch_deg,
+            state.distance_m,
+            state.fov_y_deg,
+        ];
+        let finite = state
+            .target
+            .iter()
+            .chain(&state.eye)
+            .chain(&values)
+            .chain(&origin)
+            .all(|v| v.is_finite());
+        if !finite {
+            return;
+        }
+        let rel = |p: [f64; 3]| Vector3::from([0, 1, 2].map(|k| (p[k] - origin[k]) as f32));
+        self.mode = state.mode;
+        self.target = rel(state.target);
+        self.eye = rel(state.eye);
+        self.yaw = (state.yaw_deg.to_radians() as f32).rem_euclid(std::f32::consts::TAU);
+        self.pitch = clamp_pitch(state.pitch_deg.to_radians() as f32);
+        self.distance = (state.distance_m as f32).max(MIN_DISTANCE);
+        let fov = state.fov_y_deg.clamp(FOV_RANGE_DEG[0], FOV_RANGE_DEG[1]);
+        self.fov_y = fov.to_radians() as f32;
+        // target and eye agree as the mode needs it (they do already for a state it wrote)
+        self.sync();
     }
 
     /// The ray from the eye through a pixel of the view; for a degenerate viewport (see
