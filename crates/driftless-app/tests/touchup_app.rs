@@ -27,6 +27,7 @@ use driftless_steps::export::{ExportFormat, ExportRequest, ExportSource};
 use driftless_steps::map::{MapSettings, MapSwitches};
 use driftless_steps::marks::{DabInput, EditStep, Marks, SmoothLevel, MARKS_FILE};
 use driftless_steps::slam::SlamSettings;
+use driftless_steps::surface::texture_sources;
 use driftless_steps::touchup::{edited_mesh, touchup_fits, touchup_without_raw_data, TOUCHUP_DIR};
 use eframe::egui::accesskit::Toggled;
 use egui_kittest::kittest::{NodeT, Queryable};
@@ -817,6 +818,65 @@ fn undo_step_recomputes() {
     assert!(touchup_fits(&scene.surface, &marks));
     assert_eq!(scene.patches(), strong);
     assert!(scene.app.view().has_edit());
+}
+
+/// The touch-up of the surface shown takes it as the loader read it: with its glb unreadable
+/// (its size and time kept) smoothing and „Bilder neu“ give the same patches as on a readable
+/// one, and the view gets the touched-up state. The window keeps the index of the scan's
+/// images from the first step that baked them.
+#[test]
+fn touchup_takes_the_loaded_surface() {
+    let mut want = Scene::new("nacharbeit-app-vorbereitet-soll");
+    let nr = want.paint(front_wall(&want.surface));
+    want.run(Action::Smooth {
+        mark: nr,
+        level: SmoothLevel::Strong,
+    });
+    want.run(Action::Retexture { mark: nr });
+    no_errors(&want.app);
+    let bytes = want.patches();
+
+    let mut scene = Scene::new("nacharbeit-app-vorbereitet");
+    let sources = texture_sources(&scene.surface).unwrap().unwrap();
+    let images = &sources[0].images;
+    let nr = scene.paint(front_wall(&scene.surface));
+    assert!(!scene
+        .app
+        .image_indices()
+        .holds(&images.bags, &images.topics));
+    let glb = scene.surface.join("oberflaeche.glb");
+    let meta = fs::metadata(&glb).unwrap();
+    fs::write(&glb, vec![0u8; meta.len() as usize]).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&glb)
+        .unwrap()
+        .set_modified(meta.modified().unwrap())
+        .unwrap();
+    scene.run(Action::Smooth {
+        mark: nr,
+        level: SmoothLevel::Strong,
+    });
+    no_errors(&scene.app);
+    assert!(scene.app.view().has_edit());
+    assert!(scene
+        .app
+        .image_indices()
+        .holds(&images.bags, &images.topics));
+    scene.run(Action::Retexture { mark: nr });
+    no_errors(&scene.app);
+    assert_eq!(scene.patches(), bytes);
+    let log: Vec<&str> = scene
+        .app
+        .state()
+        .log
+        .iter()
+        .map(|l| l.text.as_str())
+        .collect();
+    assert!(
+        log.iter().any(|l| l.starts_with("Bilder der Stelle: ")),
+        "{log:?}"
+    );
 }
 
 #[test]

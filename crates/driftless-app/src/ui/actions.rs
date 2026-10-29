@@ -15,6 +15,7 @@ use crate::surface::{run_touchup_job, TouchupJob, TouchupView, SURFACE_GLB};
 use driftless_steps::export::run_export;
 use driftless_steps::inspect;
 use driftless_steps::map::MapStep;
+use driftless_steps::touchup::TouchupPrepared;
 
 /// Starts the job of a step action (`Inspect`, `RunSlam`, `Reuse`, `RestoreHistory`,
 /// `RunMap`, `RunSurface`, `RunMerge`, `ApplyPairs`, `RunModelSurface`, `RunExport`,
@@ -184,32 +185,59 @@ pub fn start_step(
                 Ok(JobOutput::SurfaceStep(Box::new(done)))
             })
         }
-        Action::Touchup { surface, step } => {
-            if !state.all_surfaces().any(|s| s.dir == *surface) {
-                return Err(text::not_in_tree(surface));
-            }
-            // the surface shown gets its touched-up state for the view as well
-            let view = state
-                .surface
-                .as_ref()
-                .filter(|s| s.path == surface.join(SURFACE_GLB))
-                .map(|s| TouchupView {
-                    load: state.touchup.load,
-                    origin: s.origin,
-                    shown: state.touchup.shown,
-                });
-            let job = TouchupJob {
-                surface: surface.clone(),
-                step: *step,
-                view,
-            };
-            runner.start(text::STEP_TOUCHUP, move |p| {
-                Ok(JobOutput::Touchup(Box::new(run_touchup_job(&job, p)?)))
-            })
+        Action::Touchup { .. } => {
+            return start_touchup(state, runner, action, TouchupPrepared::default());
         }
         _ => return Err(text::NOT_A_STEP.into()),
     };
     started.map_err(|e| e.to_string())?;
+    state.running = Some(action.clone());
+    state.job = runner.status();
+    Ok(())
+}
+
+/// Starts the touch-up of a surface ([`Action::Touchup`]) as [`start_step`] does, with what the
+/// window has at hand for it (`prepared`: the surface shown as its loader read it, the indices of
+/// the camera images it keeps). Refused as there.
+pub fn start_touchup(
+    state: &mut AppState,
+    runner: &mut JobRunner,
+    action: &Action,
+    prepared: TouchupPrepared,
+) -> Result<(), String> {
+    if let Some(job) = runner.status() {
+        return Err(text::busy(&job.label));
+    }
+    let Action::Touchup { surface, step } = action else {
+        return Err(text::NOT_A_STEP.into());
+    };
+    if state.project.is_none() {
+        return Err(text::NO_PROJECT.into());
+    }
+    if !state.all_surfaces().any(|s| s.dir == *surface) {
+        return Err(text::not_in_tree(surface));
+    }
+    // the surface shown gets its touched-up state for the view as well
+    let view = state
+        .surface
+        .as_ref()
+        .filter(|s| s.path == surface.join(SURFACE_GLB))
+        .map(|s| TouchupView {
+            load: state.touchup.load,
+            origin: s.origin,
+            shown: state.touchup.shown,
+        });
+    let job = TouchupJob {
+        surface: surface.clone(),
+        step: *step,
+        view,
+        prepared,
+    };
+    runner
+        .start(text::STEP_TOUCHUP, move |p| {
+            Ok(JobOutput::Touchup(Box::new(run_touchup_job(&job, p)?)))
+        })
+        .map_err(|e| e.to_string())?;
     state.running = Some(action.clone());
     state.job = runner.status();
     Ok(())

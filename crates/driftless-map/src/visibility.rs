@@ -120,12 +120,20 @@ pub(crate) fn project_point(
 /// Minimum depth per cell of an image's depth buffer (`scale` × `scale` image pixels a
 /// cell). Depths are positive `f32`, whose bit patterns order like the values, so the
 /// minimum is an integer `fetch_min` and does not depend on the order of the writes.
+///
+/// It may hold only a window of the cells ([`DepthBuffer::window`]): writes outside it are
+/// left out, and only cells inside it may be read; there it holds what the whole buffer holds.
 pub(crate) struct DepthBuffer {
     width: usize,
     height: usize,
     scale: f32,
     /// Focal length in cells per radian (the larger of fx, fy), for the splat size.
     focal: f32,
+    /// The cells held: columns `x0 .. x0 + cols`, rows `y0 .. y0 + rows`.
+    x0: i32,
+    y0: i32,
+    cols: usize,
+    rows: usize,
     depth: Vec<AtomicU32>,
 }
 
@@ -133,21 +141,63 @@ impl DepthBuffer {
     pub(crate) fn new(cam: &Camera, scale: u32) -> DepthBuffer {
         let width = cam.width.div_ceil(scale) as usize;
         let height = cam.height.div_ceil(scale) as usize;
+        DepthBuffer::window(cam, scale, [0, 0], [width as i32 - 1, height as i32 - 1])
+    }
+
+    /// The buffer of [`DepthBuffer::new`], holding only the cells from `lo` to `hi` (column,
+    /// row; both included, cut to the image).
+    pub(crate) fn window(cam: &Camera, scale: u32, lo: [i32; 2], hi: [i32; 2]) -> DepthBuffer {
+        let width = cam.width.div_ceil(scale) as usize;
+        let height = cam.height.div_ceil(scale) as usize;
+        let x0 = lo[0].clamp(0, width as i32 - 1);
+        let y0 = lo[1].clamp(0, height as i32 - 1);
+        let x1 = hi[0].clamp(x0, width as i32 - 1);
+        let y1 = hi[1].clamp(y0, height as i32 - 1);
+        let (cols, rows) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
         DepthBuffer {
             width,
             height,
             scale: scale as f32,
             focal: (cam.fx.max(cam.fy) / f64::from(scale)) as f32,
-            depth: (0..width * height)
+            x0,
+            y0,
+            cols,
+            rows,
+            depth: (0..cols * rows)
                 .map(|_| AtomicU32::new(f32::INFINITY.to_bits()))
                 .collect(),
         }
+    }
+
+    /// The cells it holds.
+    pub(crate) fn cells(&self) -> usize {
+        self.cols * self.rows
     }
 
     /// Cell holding pixel `uv`.
     fn cell(&self, uv: [f32; 2]) -> (i32, i32) {
         let c = |v: f32, n: usize| (((v + 0.5) / self.scale) as i32).clamp(0, n as i32 - 1);
         (c(uv[0], self.width), c(uv[1], self.height))
+    }
+
+    /// The cell of [`Self::cell`] in a buffer of `cam` with cells of `scale` pixels, before one
+    /// is made.
+    pub(crate) fn cell_of(cam: &Camera, scale: u32, uv: [f32; 2]) -> (i32, i32) {
+        let n = |len: u32| len.div_ceil(scale) as i32;
+        let c = |v: f32, n: i32| (((v + 0.5) / scale as f32) as i32).clamp(0, n - 1);
+        (c(uv[0], n(cam.width)), c(uv[1], n(cam.height)))
+    }
+
+    /// Where cell (`x`, `y`) of the window is kept.
+    fn at(&self, x: i32, y: i32) -> &AtomicU32 {
+        debug_assert!(
+            x >= self.x0
+                && y >= self.y0
+                && ((x - self.x0) as usize) < self.cols
+                && ((y - self.y0) as usize) < self.rows,
+            "cell ({x}, {y}) outside the window"
+        );
+        &self.depth[(y - self.y0) as usize * self.cols + (x - self.x0) as usize]
     }
 
     /// Splat half-size (cells) of a point with neighbour spacing `spacing` (m): its footprint
@@ -158,14 +208,19 @@ impl DepthBuffer {
         ((0.5 * cells - 0.5).ceil() as i32).clamp(0, MAX_SPLAT)
     }
 
-    /// Writes the point's depth into the cells of its footprint (keeping the minimum).
+    /// Writes the point's depth into the cells of its footprint (keeping the minimum), as far
+    /// as they are in the window.
     pub(crate) fn splat(&self, p: &Projection, spacing: f32) {
         let (cx, cy) = self.cell(p.uv);
         let r = self.half_size(p, spacing);
         let bits = p.range.to_bits();
-        for y in (cy - r).max(0)..=(cy + r).min(self.height as i32 - 1) {
-            for x in (cx - r).max(0)..=(cx + r).min(self.width as i32 - 1) {
-                self.depth[y as usize * self.width + x as usize].fetch_min(bits, Ordering::Relaxed);
+        let (x1, y1) = (
+            self.x0 + self.cols as i32 - 1,
+            self.y0 + self.rows as i32 - 1,
+        );
+        for y in (cy - r).max(self.y0)..=(cy + r).min(y1) {
+            for x in (cx - r).max(self.x0)..=(cx + r).min(x1) {
+                self.at(x, y).fetch_min(bits, Ordering::Relaxed);
             }
         }
     }
@@ -177,11 +232,8 @@ impl DepthBuffer {
     pub(crate) fn is_visible(&self, p: &Projection, tol_abs: f64) -> bool {
         let (cx, cy) = self.cell(p.uv);
         let range = f64::from(p.range);
-        let depth = |x: i32, y: i32| {
-            f64::from(f32::from_bits(
-                self.depth[y as usize * self.width + x as usize].load(Ordering::Relaxed),
-            ))
-        };
+        let depth =
+            |x: i32, y: i32| f64::from(f32::from_bits(self.at(x, y).load(Ordering::Relaxed)));
         if range > depth(cx, cy) * (1.0 + DEPTH_TOLERANCE_REL) + tol_abs {
             return false;
         }

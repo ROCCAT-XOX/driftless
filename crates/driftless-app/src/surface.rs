@@ -14,7 +14,9 @@
 //!
 //! Beside the pages the loader welds the surface into one mesh and puts its faces into a tree
 //! ([`SurfacePick`]): what the brush hits and which faces a Stelle covers, the same faces the
-//! touch-up computes with. It is built from the file as read, in parallel to decoding the pages.
+//! touch-up computes with. It is built from the file as read, in parallel to decoding the pages,
+//! and keeps the file as read: a touch-up of the surface shown takes all of it instead of
+//! reading and welding the glb again ([`TouchupJob::prepared`]).
 //!
 //! [`mesh_edit`] turns what the touch-up changes on a surface (`page_edits` of
 //! `driftless-map`) into the touched-up state the view draws beside the computed one
@@ -37,8 +39,8 @@ use driftless_map::surface::edit::{read_patches, FaceBvh, PageEdit, WeldedSurfac
 use driftless_steps::marks::Marks;
 use driftless_steps::surface::{texture_sources, SURFACE_REPORT};
 use driftless_steps::touchup::{
-    edited_pages, run_touchup, touchup_fits, touchup_without_raw_data, StepOutcome, TouchupDone,
-    TouchupRequest, TOUCHUP_DIR,
+    edited_pages, run_touchup, touchup_fits, touchup_without_raw_data, FileStamp, PreparedSurface,
+    StepOutcome, TouchupDone, TouchupPrepared, TouchupRequest, TOUCHUP_DIR,
 };
 use driftless_steps::StepError;
 use image::RgbaImage;
@@ -115,11 +117,15 @@ impl SurfaceEdit {
 /// (absolute, f64, as read from the file) and its faces in a tree, built as the touch-up
 /// builds them (`driftless_map::surface::edit`), so a Stelle covers the same faces in the view
 /// as in the touch-up. About 60 bytes per corner of the pages: some 320 MB for a surface of
-/// 6.6 million triangles.
+/// 6.6 million triangles; with the file as read some 360 MB more.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SurfacePick {
-    pub surface: WeldedSurface,
-    pub bvh: FaceBvh,
+    pub surface: Arc<WeldedSurface>,
+    pub bvh: Arc<FaceBvh>,
+    /// The glb as read and how the file was then: a touch-up of the surface takes it with the
+    /// welded surface and the tree instead of reading the glb again
+    /// ([`SurfacePick::prepared`]). `None` for a surface not read from its file here.
+    pub read: Option<(FileStamp, Arc<Mesh>)>,
 }
 
 impl SurfacePick {
@@ -127,7 +133,32 @@ impl SurfacePick {
     pub fn new(mesh: &Mesh) -> SurfacePick {
         let surface = WeldedSurface::from_mesh(mesh);
         let bvh = FaceBvh::build(&surface);
-        SurfacePick { surface, bvh }
+        SurfacePick {
+            surface: Arc::new(surface),
+            bvh: Arc::new(bvh),
+            read: None,
+        }
+    }
+
+    /// [`SurfacePick::new`] of `mesh`, read from the file whose stamp was `glb` before it was
+    /// read, keeping both for a touch-up ([`SurfacePick::prepared`]).
+    pub fn from_file(glb: Option<FileStamp>, mesh: Arc<Mesh>) -> SurfacePick {
+        SurfacePick {
+            read: glb.map(|g| (g, Arc::clone(&mesh))),
+            ..SurfacePick::new(&mesh)
+        }
+    }
+
+    /// The surface as a touch-up takes it instead of reading its glb ([`PreparedSurface`]), if
+    /// it was read from a file here.
+    pub fn prepared(&self) -> Option<PreparedSurface> {
+        let (glb, mesh) = self.read.as_ref()?;
+        Some(PreparedSurface::new(
+            glb.clone(),
+            Arc::clone(mesh),
+            Arc::clone(&self.surface),
+            Arc::clone(&self.bvh),
+        ))
     }
 }
 
@@ -167,12 +198,15 @@ pub fn surface_glb(path: &Path) -> PathBuf {
 /// message and name the file.
 pub fn load_mesh(path: &Path, progress: &Progress) -> Result<LoadedSurface, StepError> {
     let path = surface_glb(path);
+    // Before it is read: a file changed meanwhile does not fit the stamp afterwards.
+    let stamp = FileStamp::of(&path);
     let mesh = read_mesh(&path, progress).map_err(|e| match e {
         ExportError::Io { path, source } if source.kind() == std::io::ErrorKind::NotFound => {
             StepError::Failed(format!("{path}: {}", text::SURFACE_FILE_MISSING))
         }
         e => e.into(),
     })?;
+    let mesh = Arc::new(mesh);
     let origin = origin_of(mesh.pages.iter().flat_map(|p| &p.positions));
     progress.phase(PHASE_LOAD_SURFACE, Some(mesh.pages.len() as u64 + 1));
     let fail = |e: String| StepError::Failed(format!("{}: {e}", path.display()));
@@ -180,7 +214,7 @@ pub fn load_mesh(path: &Path, progress: &Progress) -> Result<LoadedSurface, Step
     // the welding is one thread's work: it runs while the pages are decoded
     let (pick, pages) = rayon::join(
         || {
-            let pick = SurfacePick::new(&mesh);
+            let pick = SurfacePick::from_file(stamp, Arc::clone(&mesh));
             progress.advance(1);
             pick
         },
@@ -288,7 +322,7 @@ fn surface_edit(
 }
 
 /// The touch-up of a surface as a step ([`run_touchup_job`]).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TouchupJob {
     /// The surface folder; its map or model is the folder it lies in.
     pub surface: PathBuf,
@@ -297,6 +331,9 @@ pub struct TouchupJob {
     pub step: Option<(u32, u64)>,
     /// For the surface shown: the touched-up state for the view is made as well.
     pub view: Option<TouchupView>,
+    /// What the window has at hand: the surface shown as its loader read it
+    /// ([`SurfacePick::prepared`]) and the indices of the camera images it keeps.
+    pub prepared: TouchupPrepared,
 }
 
 /// The surface shown, as a touch-up of it sees the view ([`TouchupJob::view`]).
@@ -338,9 +375,10 @@ pub struct TouchupOutput {
 
 /// Computes the touch-up of the surface folder `job.surface`: the steps of the Stellen of its
 /// map or model replayed with the camera images if the raw data are there
-/// ([`run_touchup`], with its progress and cancel); for the surface shown then the touched-up
-/// state for the view (reading its glb anew), unless the view holds it already. A cancel
-/// after the cache is written is not taken any more: the step is done.
+/// ([`run_touchup`], with its progress and cancel, taking what [`TouchupJob::prepared`] holds);
+/// for the surface shown then the touched-up state for the view (from the surface as prepared,
+/// else reading its glb anew), unless the view holds it already. A cancel after the cache is
+/// written is not taken any more: the step is done.
 pub fn run_touchup_job(job: &TouchupJob, progress: &Progress) -> Result<TouchupOutput, StepError> {
     let dir = &job.surface;
     let owner = dir
@@ -360,6 +398,7 @@ pub fn run_touchup_job(job: &TouchupJob, progress: &Progress) -> Result<TouchupO
         surface_dir: dir.clone(),
         owner_dir: owner,
         sources,
+        prepared: job.prepared.clone(),
     };
     let done = run_touchup(&req, progress)?;
     let after = patches_key(dir);
@@ -377,9 +416,16 @@ pub fn run_touchup_job(job: &TouchupJob, progress: &Progress) -> Result<TouchupO
         Some(v) => {
             progress.phase(PHASE_TOUCHUP_VIEW, None);
             // the cache is written: the view gets it, also if cancelled meanwhile
-            let mesh = read_mesh(&dir.join(SURFACE_GLB), &Progress::new())?;
-            let s = WeldedSurface::from_mesh(&mesh);
-            let edit = surface_edit(dir, v.origin, &mesh, &s).map_err(StepError::Failed)?;
+            let glb = dir.join(SURFACE_GLB);
+            let edit = match job.prepared.surface.as_ref().filter(|p| p.fits(&glb)) {
+                Some(p) => surface_edit(dir, v.origin, &p.mesh, &p.welded),
+                None => {
+                    let mesh = read_mesh(&glb, &Progress::new())?;
+                    let s = WeldedSurface::from_mesh(&mesh);
+                    surface_edit(dir, v.origin, &mesh, &s)
+                }
+            }
+            .map_err(StepError::Failed)?;
             Some((v.load, ViewEdit::Set(edit)))
         }
     };

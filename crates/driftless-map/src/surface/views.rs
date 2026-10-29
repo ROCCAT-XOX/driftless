@@ -126,7 +126,7 @@ use crate::color::{
 };
 use crate::color_gpu::GpuStop;
 use crate::exposure::{estimate_exposure, sample_observations, Vignetting};
-use crate::visibility::{project_point, DepthBuffer, PointGrid};
+use crate::visibility::{project_point, DepthBuffer, PointGrid, Projection};
 use crate::MapError;
 use driftless_gpu::GpuContext;
 use driftless_io::camera::Camera;
@@ -608,6 +608,183 @@ pub(crate) fn image_views(
             Some((f as u32, view, sample))
         })
         .collect()
+}
+
+/// The faces of a surface given by their corners: `positions` (as the welded surface of
+/// [`super::edit`] holds them, `f64`) and per face its three vertices (`faces`); a mesh made of
+/// some of them holds the corners as `f32` (as `edit`'s parts of a surface do).
+#[derive(Clone, Copy)]
+pub(crate) struct CornerFaces<'a> {
+    pub positions: &'a [[f64; 3]],
+    pub faces: &'a [[u32; 3]],
+}
+
+impl CornerFaces<'_> {
+    /// The corners of face `f` as a mesh of some of the faces holds them, its centroid and its
+    /// longest edge, as [`Faces::new`] computes them on such a mesh.
+    fn splat_geometry(&self, f: u32) -> ([Vector3<f32>; 3], [f32; 3], f32) {
+        let [a, b, c] = self.faces[f as usize]
+            .map(|v| Vector3::from(self.positions[v as usize].map(|x| x as f32)));
+        let m = (a + b + c) / 3.0;
+        let edge = (b - a).norm().max((c - b).norm()).max((a - c).norm());
+        ([a, b, c], [m.x, m.y, m.z], edge)
+    }
+}
+
+/// A face of `view` that passes every test of [`image_views`] but the depth buffer's: its
+/// centroid and corners in the depth buffer's image and its view.
+struct Pending {
+    face: u32,
+    centre: Projection,
+    corners: [Projection; 3],
+    view: FaceView,
+}
+
+/// [`image_views`] for a Stelle ([`super::edit`]), the depth buffer kept only where it is read:
+/// the faces of `view` (indices into `mesh`, whose geometry `faces` holds) that `shot` sees, in
+/// the order of `view`, each with its view (without colour: `shot.rgb` is not looked at). The
+/// depth buffer holds the faces `splat` of `surface` (their ids there), which must hold every
+/// face whose samples can reach the cells the faces of `view` are tested in. With `cutout` the
+/// buffer holds only those cells – the cells of the centroid and the corners of every face that
+/// passes the other tests, and their neighbours – else the whole image; either way the result is
+/// what [`image_views`] gives on a mesh of both sets of faces, bit for bit: the same tests with
+/// the same numbers, the depth tests after the others. Returns the views and the number of
+/// cells of the buffer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn windowed_views(
+    mesh: &Mesh,
+    faces: &Faces,
+    view: &[u32],
+    surface: CornerFaces,
+    splat: &[u32],
+    shot: &Shot,
+    cfg: &ColorConfig,
+    cutout: bool,
+) -> (Vec<(u32, FaceView)>, usize) {
+    let world_to_cam = shot.world_from_cam.inverse();
+    let cam_pos = shot.world_from_cam.translation.vector;
+    let cam = shot.geometry;
+    // Every test of `image_views` but the depth buffer's, with the same numbers.
+    let pending: Vec<Pending> = view
+        .par_iter()
+        .filter_map(|&f| {
+            let f = f as usize;
+            let centre = faces.centroid[f];
+            let proj = project_point(&centre, cam, &world_to_cam, cfg.max_dist)?;
+            if f64::from(proj.theta) >= cfg.rim_theta {
+                return None;
+            }
+            let to_cam = cam_pos - Vector3::from(centre).cast::<f64>();
+            let cos = Vector3::from(faces.normal[f]).cast::<f64>().dot(&to_cam) / to_cam.norm();
+            if cos.is_nan() || cos <= 0.0 {
+                return None;
+            }
+            let mut uv = [[0.0f64; 2]; 3];
+            let mut at = [proj; 3];
+            for ((uv, at), &i) in uv.iter_mut().zip(&mut at).zip(&mesh.indices[f]) {
+                let p = Vector3::from(mesh.positions[i as usize]).cast::<f64>();
+                let pc = world_to_cam * Point3::from(p);
+                if pc.x.hypot(pc.y).atan2(pc.z) >= cfg.rim_theta {
+                    return None;
+                }
+                *uv = shot.full.project(&pc.coords)?;
+                *at = project_point(
+                    &mesh.positions[i as usize],
+                    cam,
+                    &world_to_cam,
+                    f64::INFINITY,
+                )?;
+            }
+            let area = 0.5
+                * ((uv[1][0] - uv[0][0]) * (uv[2][1] - uv[0][1])
+                    - (uv[2][0] - uv[0][0]) * (uv[1][1] - uv[0][1]))
+                    .abs();
+            let [a, b, c] =
+                mesh.indices[f].map(|i| Vector3::from(mesh.positions[i as usize]).cast::<f64>());
+            let cap = 0.5 * (b - a).cross(&(c - a)).norm() / (shot.min_texel * shot.min_texel);
+            let cos_s = Vector3::from(faces.smooth[f]).cast::<f64>().dot(&to_cam) / to_cam.norm();
+            let cos_s = cos_s.max(SMOOTH_COS_MIN);
+            let area = area * (cos_s / cos).clamp(0.5, 2.0);
+            let score = (area.min(cap) * cos_s) as f32 * shot.sharpness_norm;
+            if score.is_nan() || score <= 0.0 {
+                return None;
+            }
+            let (below, across) = (to_cam.z, to_cam.x.hypot(to_cam.y));
+            let carrier = faces.normal[f][2] > CARRIER_NORMAL_Z
+                && below > CARRIER_BELOW
+                && across < CARRIER_RADIUS
+                && across < below;
+            let angle = ((proj.theta / ANGLE_STEP).round() as u32).min(0x7f) as u8;
+            Some(Pending {
+                face: f as u32,
+                centre: proj,
+                corners: at,
+                view: FaceView {
+                    image: shot.rank,
+                    score,
+                    colour: [0; 3],
+                    tag: angle | if carrier { TAG_CARRIER } else { 0 },
+                },
+            })
+        })
+        .collect();
+    if pending.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let buffer = if cutout {
+        // The cells the depth tests read: those of the points tested and their neighbours.
+        let (mut lo, mut hi) = ([i32::MAX; 2], [i32::MIN; 2]);
+        for p in &pending {
+            for q in std::iter::once(&p.centre).chain(&p.corners) {
+                let (x, y) = DepthBuffer::cell_of(cam, cfg.zbuffer_scale, q.uv);
+                lo = [lo[0].min(x), lo[1].min(y)];
+                hi = [hi[0].max(x), hi[1].max(y)];
+            }
+        }
+        DepthBuffer::window(
+            cam,
+            cfg.zbuffer_scale,
+            [lo[0] - 1, lo[1] - 1],
+            [hi[0] + 1, hi[1] + 1],
+        )
+    } else {
+        DepthBuffer::new(cam, cfg.zbuffer_scale)
+    };
+    // Cells per radian, as the depth buffer sizes its splats.
+    let focal = cam.fx.max(cam.fy) / f64::from(cfg.zbuffer_scale);
+    splat.par_iter().for_each(|&f| {
+        let ([a, b, c], centroid, longest) = surface.splat_geometry(f);
+        // No point of the face is nearer than this.
+        let near = [a, b, c]
+            .iter()
+            .map(|p| (p.cast::<f64>() - cam_pos).norm())
+            .fold(f64::INFINITY, f64::min)
+            - f64::from(longest);
+        let n = (f64::from(longest) * focal / (near.max(1e-3) * SAMPLE_GAP_CELLS)).ceil();
+        let n = (n as usize).clamp(1, MAX_SUBDIVISIONS);
+        let spacing = longest / n as f32;
+        let put = |p: Vector3<f32>| {
+            if let Some(proj) = project_point(&[p.x, p.y, p.z], cam, &world_to_cam, cfg.max_dist) {
+                buffer.splat(&proj, spacing);
+            }
+        };
+        put(Vector3::from(centroid));
+        for i in 0..=n {
+            for j in 0..=n - i {
+                let (u, v) = (i as f32 / n as f32, j as f32 / n as f32);
+                put(a + (b - a) * u + (c - a) * v);
+            }
+        }
+    });
+    let tol = cfg.depth_tolerance;
+    let seen = pending
+        .into_par_iter()
+        .filter(|p| {
+            buffer.is_visible(&p.centre, tol) && p.corners.iter().all(|c| buffer.is_visible(c, tol))
+        })
+        .map(|p| (p.face, p.view))
+        .collect();
+    (seen, buffer.cells())
 }
 
 /// Exposure-corrected colour of view `v` (sRGB levels).

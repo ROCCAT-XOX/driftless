@@ -8,8 +8,11 @@
 //! device: a plain one (no object on it or in front of it, room before it), the roughest of them.
 //!
 //! Per action it prints the time and the peak memory, where the time went (the phases of the
-//! touch-up, the bytes read meanwhile), the size of the touched-up state the view uploads and
-//! the frame that uploads it; per Stelle how many images „Bilder neu“ looks at, the distance of
+//! touch-up, the bytes read meanwhile, the lines it adds to the protocol), the checksum of the
+//! patches (their cache is copied to `$DRIFTLESS_WORK/vergleich/`, to compare two versions of the
+//! program byte for byte), the size of the touched-up state the view uploads and the frame that
+//! uploads it; per source the time to index its images from the disk and from the page cache;
+//! per Stelle how many images „Bilder neu“ looks at, the distance of
 //! its points to their plane and their roughness before and after, the moves next to its border
 //! and the height step across it (the border itself stays), the colour difference across the
 //! border before and after the images were baked anew, and the holes the selection encloses
@@ -43,7 +46,7 @@ use driftless_app::ui::tools::{self, Tool};
 use driftless_app::ui::{brush, text, Action, DriftlessApp, ScanNode, Selection, Step, UiMessage};
 use driftless_export::mesh::{read_mesh, Mesh};
 use driftless_io::camera::Camera;
-use driftless_io::images::{decode_jpeg, for_each_image_where, RgbImage, Wanted};
+use driftless_io::images::{decode_jpeg, for_each_image_where, index_images, RgbImage, Wanted};
 use driftless_io::progress::Progress;
 use driftless_map::surface::edit::{
     dab_faces, dab_normal, read_patches, select_faces, write_patches, FaceBvh, SelectDab,
@@ -1620,8 +1623,10 @@ struct Run {
     /// Memory before and the peak while it ran.
     base: Option<u64>,
     peak: Option<u64>,
-    /// The messages it left in the status bar.
+    /// The messages it left in the status bar …
     messages: Vec<String>,
+    /// … and in the protocol.
+    protocol: Vec<String>,
 }
 
 /// The phase the window shows now: the touch-up's, „Bilder der Stelle suchen“ split into
@@ -1648,6 +1653,7 @@ fn phase_now(app: &DriftlessApp) -> Option<String> {
 /// Asks for `action` and steps the window until it is done, timing its phases.
 fn act(h: &mut H, action: Action, what: &str) -> Run {
     let messages_before = h.state().state().messages.len();
+    let log_before = h.state().state().log.len();
     reset_peak();
     let base = rss_now();
     let start = Instant::now();
@@ -1718,6 +1724,11 @@ fn act(h: &mut H, action: Action, what: &str) -> Run {
         .iter()
         .map(|m| m.text().to_string())
         .collect();
+    let log = &h.state().state().log;
+    let protocol = log[log_before.min(log.len())..]
+        .iter()
+        .map(|l| l.text.clone())
+        .collect();
     Run {
         what: what.to_string(),
         seconds: (done_at - start).as_secs_f64(),
@@ -1726,6 +1737,7 @@ fn act(h: &mut H, action: Action, what: &str) -> Run {
         base,
         peak,
         messages,
+        protocol,
     }
 }
 
@@ -1756,6 +1768,9 @@ fn print_run(r: &Run) {
     for m in &r.messages {
         eprintln!("    Meldung: {m}");
     }
+    for m in &r.protocol {
+        eprintln!("    Protokoll: {m}");
+    }
 }
 
 fn run_json(r: &Run) -> Value {
@@ -1767,6 +1782,7 @@ fn run_json(r: &Run) -> Value {
         "speicher_spitze": r.peak,
         "phasen": r.phases.iter().map(|p| json!({"name": p.name, "sekunden": p.seconds, "gelesen": p.read})).collect::<Vec<_>>(),
         "meldungen": r.messages,
+        "protokoll": r.protocol,
     })
 }
 
@@ -2026,6 +2042,20 @@ fn write_time(patches: &[SurfacePatch], work: &Path) -> (f64, u64) {
     (seconds, bytes)
 }
 
+/// The hash of the patches the touch-up of the surface in `dir` keeps now; a copy of its cache
+/// goes to `work/vergleich/<name>`, to compare the bytes of two versions of the program.
+fn keep_patches(dir: &Path, work: &Path, name: &str) -> Option<u64> {
+    let cache = dir.join(TOUCHUP_DIR);
+    let bytes = fs::read(cache.join(PATCHES_FILE)).ok()?;
+    let dest = work.join("vergleich").join(name);
+    let _ = fs::remove_dir_all(&dest);
+    fs::create_dir_all(&dest).unwrap();
+    for e in fs::read_dir(&cache).unwrap().flatten() {
+        fs::copy(e.path(), dest.join(e.file_name())).unwrap();
+    }
+    Some(driftless_map::content_hash(&bytes))
+}
+
 /// The steps of Stelle `nr` of the map or model in `owner`, as saved.
 fn steps_of(owner: &Path, nr: u32) -> Vec<EditStep> {
     Marks::load(owner)
@@ -2088,7 +2118,7 @@ fn measure(h: &mut H, target: &Target, work: &Path, shots: Option<&Path>, paint:
     let t = Instant::now();
     let (images, looked_at) = candidates(&g, &wall.faces, &sources, &ccfg);
     eprintln!(
-        "  Bilder der Quellen {images}, davon Kandidaten mit Tiefenpuffer {looked_at} (nachgezählt in {:.1} s)",
+        "  Bilder der Quellen {images}, davon Kandidaten nach Lage {looked_at} (nachgezählt in {:.1} s)",
         t.elapsed().as_secs_f64()
     );
     fs::write(
@@ -2145,6 +2175,27 @@ fn measure(h: &mut H, target: &Target, work: &Path, shots: Option<&Path>, paint:
         image_bags.len(),
         gb(bag_bytes)
     );
+    // the index of the images of every source (as the first action builds it), from the disk
+    // and from the page cache
+    let mut index_rows = Vec::new();
+    for src in &sources {
+        let evicted = src.images.bags.iter().all(|b| evict(b));
+        let t = Instant::now();
+        let index = index_images(&src.images.bags, &src.images.topics, &Progress::new()).unwrap();
+        let cold = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        index_images(&src.images.bags, &src.images.topics, &Progress::new()).unwrap();
+        let warm = t.elapsed().as_secs_f64();
+        eprintln!(
+            "  Bildverzeichnis {} ({} Bilder): {}{cold:.3} s, aus dem Cache {warm:.3} s",
+            src.images.bags[0].display(),
+            index.len(),
+            if evicted { "von der Platte " } else { "" },
+        );
+        index_rows.push(
+            json!({"bilder": index.len(), "kalt_s": evicted.then_some(cold), "warm_s": warm}),
+        );
+    }
     // with the bags in the page cache, as after the first action
     let t = Instant::now();
     for b in &image_bags {
@@ -2214,6 +2265,11 @@ fn measure(h: &mut H, target: &Target, work: &Path, shots: Option<&Path>, paint:
         let count = steps_of(&owner, nr).len();
         let run = act(h, action, what);
         print_run(&run);
+        let hash = keep_patches(&target.surface, work, &format!("{}-{file}", target.file));
+        eprintln!(
+            "    Änderungen: Prüfsumme {}",
+            hash.map_or("–".to_string(), |h| format!("{h:016x}"))
+        );
         let done = steps_of(&owner, nr);
         let refused = done.len() == count;
         let ps = patches(&target.surface);
@@ -2285,6 +2341,7 @@ fn measure(h: &mut H, target: &Target, work: &Path, shots: Option<&Path>, paint:
         let mut row = run_json(&run);
         row["abgelehnt"] = json!(refused);
         row["variante"] = json!(variant);
+        row["aenderungen_pruefsumme"] = json!(hash.map(|h| format!("{h:016x}")));
         row["aenderungen_bytes"] = json!(patch_bytes);
         row["schreiben_s"] = json!(write_s);
         row["hochladen_bytes"] = json!(upload);
@@ -2330,6 +2387,7 @@ fn measure(h: &mut H, target: &Target, work: &Path, shots: Option<&Path>, paint:
         "luecken": hole_rows,
         "ring": {"flaechen": ring.len(), "seiten": ring_pages, "dekodieren_s": ring_decode},
         "bildtaschen_bytes": bag_bytes,
+        "bildverzeichnis": index_rows,
         "malen_zug": run_json(&paint_run),
         "aktionen": actions,
         "malen": frames,

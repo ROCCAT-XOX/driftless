@@ -1,13 +1,17 @@
 //! Streaming reader for ROS1 bag files (format 2.0).
 //!
 //! Chunks are read and decompressed one at a time; the index is not required,
-//! so unindexed and truncated recordings stay readable.
+//! so unindexed and truncated recordings stay readable. [`BagReader::message_places`] finds
+//! where the messages lie without reading the chunks whole, and
+//! [`BagReader::read_message`] reads one message at its place.
 
+mod places;
 mod reader;
 mod record;
 #[cfg(any(test, feature = "test-util"))]
 pub mod writer;
 
+pub use places::{ChunkCompression, MessagePlace, PlacedMessage, Places};
 pub use reader::{BagReader, Connection, RawMessage};
 pub use record::Time;
 

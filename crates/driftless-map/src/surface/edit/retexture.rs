@@ -2,28 +2,31 @@
 //!
 //! The surface step looks through every image of every scan for every face; for one Stelle
 //! that would read and decode all images again (Büro: 3,831 images, about three times). Here
-//! no image is decoded to find the candidates, and only the best few are decoded at all.
+//! no image is decoded to find the candidates, only the best few get a depth buffer, and only
+//! the best few are read and decoded at all.
 //!
 //! **Which images show the Stelle** ([`region_views`]):
 //!
-//! 1. **Candidates**: the image headers of every source are listed without decoding a JPEG
-//!    ([`for_each_image_where`]); an image counts if its capture time lies on the trajectory,
-//!    the device turned no faster than [`ColorConfig::max_angular_rate`] then, and from its
-//!    camera (`trajectory(stamp + time_offset) · cam_in_body`) the Stelle lies within
-//!    [`ColorConfig::max_dist`], within [`ColorConfig::rim_theta`] of the optical axis and at
-//!    least one of its faces faces the camera. The quality pass of the surface step (sharpness
-//!    against the scan's median) needs the decoded images and is left out: the sharpness on the
-//!    Stelle itself is measured on the decoded few (step 6).
-//! 2. **Visibility**: per candidate a depth buffer as the surface step builds it, but only from
-//!    the faces that can reach the cells the Stelle is tested in: those in the cone from the
-//!    camera around the Stelle, widened by [`MAX_SPLAT`] + 2 cells ([`CONE_MARGIN`] times
-//!    over), and not farther than the Stelle's farthest point. A face beyond both changes no
-//!    cell a face of the Stelle is tested in, so a face of the Stelle is seen exactly when the
-//!    surface step would see it (with its own normals and depth tolerance). Which faces are in
-//!    the cone is decided with `acos`/`asin`, whose last bit can differ between machines; it
-//!    decides only about faces far from those cells, so the views do not depend on it. The
-//!    faces are found in a [`FaceBvh`] of the surface. The score of a face is the surface
-//!    step's ([`super::super::views`]: pixels at full size, capped at
+//! 1. **Candidates**: the image headers of every source, from the index of its images
+//!    ([`index_images`]: made once, no image read); an image counts if its capture time lies
+//!    on the trajectory, the device turned no faster than [`ColorConfig::max_angular_rate`]
+//!    then, and from its camera (`trajectory(stamp + time_offset) · cam_in_body`) the Stelle
+//!    lies within [`ColorConfig::max_dist`], within [`ColorConfig::rim_theta`] of the optical
+//!    axis and at least one of its faces faces the camera. The quality pass of the surface
+//!    step (sharpness against the scan's median) needs the decoded images and is left out: the
+//!    sharpness on the Stelle itself is measured on the decoded few (step 6).
+//! 2. **Visibility**: a depth buffer as the surface step builds it, but only from the faces
+//!    that can reach the cells the Stelle is tested in: those in the cone from the camera
+//!    around the Stelle, widened by [`MAX_SPLAT`] + 2 cells ([`CONE_MARGIN`] times over), and
+//!    not farther than the Stelle's farthest point. A face beyond both changes no cell a face
+//!    of the Stelle is tested in, so a face of the Stelle is seen exactly when the surface step
+//!    would see it (with its own normals and depth tolerance). Which faces are in the cone is
+//!    decided with `acos`/`asin`, whose last bit can differ between machines; it decides only
+//!    about faces far from those cells, so the views do not depend on it. The faces are found
+//!    in a [`FaceBvh`] of the surface. The buffer itself holds only those cells: the cells of
+//!    the centroids and corners of the faces tested and their neighbours
+//!    ([`windowed_views`]); splats outside them change nothing that is read. The score of a
+//!    face is the surface step's ([`super::super::views`]: pixels at full size, capped at
 //!    [`SurfaceConfig::min_texel`], times the cosine to the normal smoothed over two rings)
 //!    with `sharpness_norm` 1; a view that may show the carrier counts at
 //!    [`CARRIER_ALTERNATIVE`](super::super::views::CARRIER_ALTERNATIVE) of it, as in the slot
@@ -32,7 +35,20 @@
 //! 3. **Ranking**: an image covering at least [`FULL_COVERAGE`] of the Stelle's area can
 //!    texture it alone; those come first, then the others, each by their quality (the area-
 //!    weighted mean over the Stelle of `√(score / best score of the face)`, 0 where unseen),
-//!    then in stream order. [`decode_views`] decodes the first [`DECODED_VIEWS`] at full size.
+//!    then in stream order. [`decode_views`] reads (at their places in the bags,
+//!    [`read_indexed`]) and decodes the first [`DECODED_VIEWS`] at full size.
+//!
+//! **Only the best get a depth buffer.** Without a depth buffer every candidate already has, for
+//! every face of the Stelle, the score it would give it if nothing were in the way: the same
+//! numbers as with the buffer, which can only take a face away. These bounds rank the
+//! candidates; the first [`PRERANK_BATCH`] get a depth buffer, then, in rounds of twice as
+//! many, every candidate that could still change the best [`DECODED_VIEWS`] views: one that
+//! could raise the best score of a face one of them sees (and so their qualities), or whose
+//! bounds would put it before the last of them (its coverage could reach [`FULL_COVERAGE`]
+//! while that one's does not, or its quality could reach that one's, ties included). When
+//! none is left, the best views are the ones a depth buffer for every candidate gives, in the
+//! same order, with the same numbers ([`Sight`]); how many candidates that takes depends on
+//! how much is in the way.
 //!
 //! **Baking it anew** ([`retexture_region`]):
 //!
@@ -80,7 +96,7 @@
 
 use super::{dot, sub, EditError, FaceBvh, PatchPage, SurfacePatch, WeldedSurface};
 use crate::color::{
-    angular_rate, image_count, linear_table, luminance, sample_linear, ColorCamera, ColorConfig,
+    angular_rate, linear_table, luminance, sample_linear, ColorCamera, ColorConfig,
 };
 use crate::exposure::Vignetting;
 use crate::surface::atlas::{
@@ -92,14 +108,19 @@ use crate::surface::level::{
     level_region, FrozenEdge, GAIN_FLOOR, MIN_SEAM_LUMINANCE, SEAM_MIN_COS, SEAM_SAMPLES,
 };
 use crate::surface::views::{
-    all_cameras, image_views, Faces, Shot, TextureSource, UsedImage, ViewTable,
+    all_cameras, windowed_views, CornerFaces, Faces, Shot, TextureSource, UsedImage, ViewTable,
+    SMOOTH_COS_MIN,
 };
 use crate::surface::{encode_pages, Mesh, PageJpegs, SurfaceConfig, TexturedMesh};
 use crate::visibility::MAX_SPLAT;
 use crate::MapError;
 use driftless_export::mesh::{ImageKind, Mesh as PageMesh};
 use driftless_io::camera::Camera;
-use driftless_io::images::{decode_jpeg, for_each_image_where, ImageHeader, RgbImage, Wanted};
+use driftless_io::images::{
+    decode_jpeg, read_indexed, ImageError, ImageHeader, ImageIndex, RgbImage,
+};
+#[cfg(doc)]
+use driftless_io::images::{for_each_image_where, index_images};
 use driftless_io::progress::Progress;
 use driftless_traj::interpolate_pose;
 use nalgebra::{Isometry3, Point3, Vector3};
@@ -114,6 +135,12 @@ pub(crate) const DECODED_VIEWS: usize = 24;
 /// An image that sees at least this share of a Stelle's area can texture it alone: such images
 /// rank first ([`region_views`]).
 pub(crate) const FULL_COVERAGE: f32 = 0.9;
+
+/// Candidates of a Stelle given a depth buffer in the first round, the best by what they
+/// could see with nothing in the way ([`region_views`]); each further round twice as many,
+/// of those that could still change the best [`DECODED_VIEWS`]. How many it is changes only
+/// the time, never the views.
+pub(crate) const PRERANK_BATCH: usize = 2 * DECODED_VIEWS;
 
 /// The cone of faces that can hide a Stelle from a camera is widened by this many times
 /// the angle of [`MAX_SPLAT`] + 2 depth-buffer cells at the image centre: a splat reaches
@@ -182,33 +209,83 @@ pub(crate) struct RegionView {
     pub ring: Vec<u32>,
 }
 
+/// How [`region_views`] finds the images that see a Stelle (see the module docs, step 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Sight {
+    /// The best this many views are found, exactly as with a depth buffer for every candidate;
+    /// no more are given. `usize::MAX`: every view.
+    pub keep: usize,
+    /// Candidates given a depth buffer in the first round; each further round twice as many.
+    pub batch: usize,
+    /// Each depth buffer only over the cells the Stelle and its ring are tested in, else over
+    /// the whole image (the same views either way).
+    pub cutout: bool,
+}
+
+impl Sight {
+    /// What „Bilder neu“ needs: the [`DECODED_VIEWS`] best, in rounds from [`PRERANK_BATCH`]
+    /// candidates, each depth buffer over the cut-out.
+    pub(crate) const BEST: Sight = Sight {
+        keep: DECODED_VIEWS,
+        batch: PRERANK_BATCH,
+        cutout: true,
+    };
+    /// Every view: every candidate gets a depth buffer, in one round.
+    #[cfg(test)]
+    pub(crate) const ALL: Sight = Sight {
+        keep: usize::MAX,
+        batch: usize::MAX,
+        cutout: true,
+    };
+}
+
+/// What [`region_views`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SightStats {
+    /// The candidates (by headers and poses), …
+    pub candidates: usize,
+    /// … how many got a depth buffer, in how many rounds, …
+    pub buffered: usize,
+    pub rounds: usize,
+    /// … and the cells of their depth buffers, together.
+    pub cells: usize,
+}
+
 /// The images of `sources` that see faces of the Stelle `faces` (welded ids, any order) on the
-/// surface `s`, best first (see the module docs): those covering [`FULL_COVERAGE`] of it, then
-/// the others, each by [`RegionView::quality`], then by source and frame. Each view also lists
-/// the faces of `around` it sees ([`RegionView::ring`]; `around`: sorted, none of the Stelle,
-/// typically a ring around it), as the surface step would see them; the images and their views
-/// of the Stelle are the same with any `around`. `cfg` is the surface's (as its report has it).
-/// No image is decoded; the bags of every source are read once. Progress: phase „Bilder der
-/// Stelle suchen“, one step per image; a cancel is checked at every image and returns
-/// [`EditError::Cancelled`]. Same input, same views.
+/// surface `s` (its faces in the tree `bvh`), best first (see the module docs): those covering
+/// [`FULL_COVERAGE`] of it, then the others, each by [`RegionView::quality`], then by source and
+/// frame. Of them the best `sight.keep` ([`Sight::BEST`]: [`DECODED_VIEWS`]; `usize::MAX`:
+/// all), exactly as a depth buffer for every candidate gives them; and what it took. Each view
+/// also lists the faces of `around` it sees ([`RegionView::ring`]; `around`: sorted, none of
+/// the Stelle, typically a ring around it), as the surface step would see them; the images and
+/// their views of the Stelle are the same with any `around`. The images are listed from
+/// `indices` (per source the index of its images); none is read or decoded. `cfg` is the
+/// surface's (as its report has it). Progress: phase „Bilder der Stelle suchen“; a cancel is
+/// checked at every image and every round and returns [`EditError::Cancelled`]. Same input,
+/// same views.
 ///
-/// Fails if `cfg` is invalid, two cameras of one source share a name or the bags cannot be
-/// read.
+/// Fails if `cfg` is invalid or two cameras of one source share a name.
 ///
 /// # Panics
-/// If a face is not one of `s`, `around` is not sorted or holds a face of the Stelle.
+/// If a face is not one of `s`, `around` is not sorted or holds a face of the Stelle, or
+/// `indices` are not as many as `sources`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn region_views(
     s: &WeldedSurface,
+    bvh: &FaceBvh,
     faces: &[u32],
     around: &[u32],
     sources: &[TextureSource],
+    indices: &[Arc<ImageIndex>],
     cfg: &SurfaceConfig,
+    sight: Sight,
     progress: &Progress,
-) -> Result<Vec<RegionView>, EditError> {
+) -> Result<(Vec<RegionView>, SightStats), EditError> {
     if progress.is_cancelled() {
         return Err(EditError::Cancelled);
     }
     cfg.check()?;
+    assert_eq!(indices.len(), sources.len(), "an index per source");
     for src in sources {
         for (i, c) in src.cams.iter().enumerate() {
             if src.cams[..i].iter().any(|o| o.camera.name == c.camera.name) {
@@ -238,14 +315,16 @@ pub(crate) fn region_views(
         around.iter().all(|f| region.binary_search(f).is_err()),
         "the ring holds a face of the Stelle"
     );
+    let mut stats = SightStats::default();
     if region.is_empty() || sources.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), stats));
     }
     let ccfg = &cfg.color;
     let shape = Shape::new(s, &region);
-    let candidates = candidates(&shape, sources, ccfg, progress)?;
+    let candidates = candidates(&shape, sources, indices, ccfg, progress)?;
+    stats.candidates = candidates.len();
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), stats));
     }
     // The faces looked at: the Stelle and the ring; the cone of the depth buffer around both.
     let mut looked = region.clone();
@@ -254,30 +333,16 @@ pub(crate) fn region_views(
     let reach = (!around.is_empty()).then(|| Shape::new(s, &looked));
     let reach = reach.as_ref().unwrap_or(&shape);
 
-    // Per candidate the faces that can hide the Stelle from it; with the two rings around the
-    // Stelle (for its smoothed normals) the part of the surface to look at.
-    let bvh = FaceBvh::build(s);
-    let splats: Vec<Vec<u32>> = candidates
-        .par_iter()
-        .map(|c| {
-            let cam = &sources[c.source as usize].cams[c.camera as usize].camera;
-            in_front(s, &bvh, reach, &c.world_from_cam, cam, ccfg)
-        })
-        .collect();
-    drop(bvh);
-    if progress.is_cancelled() {
-        return Err(EditError::Cancelled);
-    }
-    let mut local = ring(s, &ring(s, &region));
-    local.extend_from_slice(around);
-    local.extend(splats.iter().flatten());
-    local.sort_unstable();
-    local.dedup();
-    let mesh = local_mesh(s, &local);
+    // The geometry of the faces looked at: with the two rings around the Stelle, its smoothed
+    // normals are those of the whole surface.
+    let mut near = ring(s, &ring(s, &region));
+    near.extend_from_slice(around);
+    near.sort_unstable();
+    near.dedup();
+    let mesh = local_mesh(s, &near);
     let geometry = Faces::new(&mesh);
-    let to_local = |f: &u32| local.binary_search(f).expect("a face of the part") as u32;
+    let to_local = |f: &u32| near.binary_search(f).expect("a face of the part") as u32;
     let view: Vec<u32> = looked.iter().map(to_local).collect();
-    let lin = linear_table();
     let downscaled: Vec<Vec<Camera>> = sources
         .iter()
         .map(|src| {
@@ -287,71 +352,147 @@ pub(crate) fn region_views(
                 .collect()
         })
         .collect();
+    let shot = |c: usize| {
+        let cand = &candidates[c];
+        let (src, cam) = (cand.source as usize, cand.camera as usize);
+        Shot {
+            geometry: &downscaled[src][cam],
+            full: &sources[src].cams[cam].camera,
+            world_from_cam: cand.world_from_cam,
+            rank: u32::try_from(c).expect("fewer than 2^32 images"),
+            sharpness_norm: 1.0,
+            rgb: None,
+            min_texel: cfg.min_texel,
+        }
+    };
 
-    // Per candidate the faces of the Stelle and of the ring it sees, with their scores.
-    let seen: Vec<Vec<(u32, f32)>> = candidates
-        .par_iter()
-        .zip(&splats)
-        .enumerate()
-        .map(|(rank, (c, splat))| {
-            let (src, cam) = (c.source as usize, c.camera as usize);
-            let splat: Vec<u32> = splat.iter().map(to_local).collect();
-            let shot = Shot {
-                geometry: &downscaled[src][cam],
-                full: &sources[src].cams[cam].camera,
-                world_from_cam: c.world_from_cam,
-                rank: u32::try_from(rank).expect("fewer than 2^32 images"),
-                sharpness_norm: 1.0,
-                rgb: None,
-                min_texel: cfg.min_texel,
-            };
-            image_views(
-                &mesh,
-                &geometry,
-                &splat,
-                &view,
-                &shot,
-                ccfg,
-                |_| false,
-                &lin,
-            )
-            .into_iter()
-            .map(|(f, v, _)| (local[f as usize], v.rank_score()))
-            .collect()
-        })
+    // Per candidate the scores its image could give the faces of the Stelle with nothing in the
+    // way, and the order by them.
+    let open = OpenFaces::new(&mesh, &region.iter().map(to_local).collect::<Vec<u32>>());
+    let bounds: Vec<Vec<f32>> = (0..candidates.len())
+        .into_par_iter()
+        .map(|c| open.scores(&mesh, &geometry, &shot(c), ccfg))
         .collect();
-    drop(splats);
-    // The Stelle's faces with their scores, and the ring's.
-    let seen: Vec<SeenFaces> = seen
-        .into_iter()
-        .map(|all| {
-            let (faces, ring): Scored2 = all
-                .into_iter()
-                .partition(|(f, _)| region.binary_search(f).is_ok());
-            (faces, ring.into_iter().map(|(f, _)| f).collect())
-        })
-        .collect();
-
-    // The best score of every face of the Stelle, for the quality.
-    let mut best = vec![0.0f32; region.len()];
-    for (f, score) in seen.iter().flat_map(|v| &v.0) {
-        let i = region.binary_search(f).expect("a face of the Stelle");
-        best[i] = best[i].max(*score);
+    if progress.is_cancelled() {
+        return Err(EditError::Cancelled);
     }
     let weights = shape.weights();
     let total: f64 = weights.iter().sum();
+    let order = by_bounds(&candidates, &bounds, &weights, total);
+
+    // Depth buffers in rounds, until the best `keep` cannot change any more (see the module
+    // docs): what each candidate sees of the Stelle (with its scores) and of the ring.
+    let mut seen: Vec<Option<SeenFaces>> = vec![None; candidates.len()];
+    let mut best = vec![0.0f32; region.len()];
+    let mut round: Vec<usize> = order.iter().copied().take(sight.batch).collect();
+    let mut size = sight.batch;
+    while !round.is_empty() {
+        stats.rounds += 1;
+        let found: Vec<(SeenFaces, usize)> = round
+            .par_iter()
+            .map(|&c| {
+                let cand = &candidates[c];
+                let cam = &sources[cand.source as usize].cams[cand.camera as usize].camera;
+                let splat = in_front(s, bvh, reach, &cand.world_from_cam, cam, ccfg);
+                let corners = CornerFaces {
+                    positions: s.positions(),
+                    faces: s.faces(),
+                };
+                let (views, cells) = windowed_views(
+                    &mesh,
+                    &geometry,
+                    &view,
+                    corners,
+                    &splat,
+                    &shot(c),
+                    ccfg,
+                    sight.cutout,
+                );
+                // The bound of a face it sees is its score (`OpenFaces::scores`).
+                #[cfg(debug_assertions)]
+                for (f, v) in &views {
+                    if let Ok(i) = region.binary_search(&near[*f as usize]) {
+                        assert_eq!(v.score.to_bits(), bounds[c][i].to_bits(), "face {f}");
+                    }
+                }
+                let (stelle, ring): Scored2 = views
+                    .into_iter()
+                    .map(|(f, v)| (near[f as usize], v.rank_score()))
+                    .partition(|(f, _)| region.binary_search(f).is_ok());
+                ((stelle, ring.into_iter().map(|(f, _)| f).collect()), cells)
+            })
+            .collect();
+        for (&c, (faces, cells)) in round.iter().zip(found) {
+            for (f, score) in &faces.0 {
+                let i = region.binary_search(f).expect("a face of the Stelle");
+                best[i] = best[i].max(*score);
+            }
+            stats.buffered += 1;
+            stats.cells += cells;
+            seen[c] = Some(faces);
+        }
+        if progress.is_cancelled() {
+            return Err(EditError::Cancelled);
+        }
+        let ranked = ranked_views(&candidates, &seen, &region, &best, &weights, total);
+        let rest: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|&c| seen[c].is_none())
+            .collect();
+        size = size.saturating_mul(2);
+        round = if ranked.len() < sight.keep {
+            rest.into_iter().take(size).collect()
+        } else {
+            let last = &ranked[sight.keep - 1];
+            let mut held = vec![false; region.len()];
+            for v in &ranked[..sight.keep] {
+                for (f, _) in &v.faces {
+                    held[region.binary_search(f).expect("a face of the Stelle")] = true;
+                }
+            }
+            let limit = Limit {
+                best: &best,
+                held: &held,
+                full: last.coverage >= FULL_COVERAGE,
+                quality: last.quality,
+            };
+            rest.into_iter()
+                .filter(|&c| limit.could_matter(&bounds[c], &weights, total))
+                .take(size)
+                .collect()
+        };
+    }
+    let mut views = ranked_views(&candidates, &seen, &region, &best, &weights, total);
+    views.truncate(sight.keep);
+    Ok((views, stats))
+}
+
+/// The views of the candidates that got a depth buffer (those of `seen`) and see a face of the
+/// Stelle `region`, ranked as [`region_views`] gives them, their qualities by `best`.
+fn ranked_views(
+    candidates: &[Candidate],
+    seen: &[Option<SeenFaces>],
+    region: &[u32],
+    best: &[f32],
+    weights: &[f64],
+    total: f64,
+) -> Vec<RegionView> {
     let mut views: Vec<RegionView> = candidates
-        .into_iter()
+        .iter()
         .zip(seen)
-        .filter(|(_, (faces, _))| !faces.is_empty())
-        .map(|(c, (faces, ring))| {
+        .filter_map(|(c, seen)| {
+            let (faces, ring) = seen.as_ref()?;
+            if faces.is_empty() {
+                return None;
+            }
             let (mut covered, mut quality) = (0.0f64, 0.0f64);
-            for (f, score) in &faces {
+            for (f, score) in faces {
                 let i = region.binary_search(f).expect("a face of the Stelle");
                 covered += weights[i];
                 quality += weights[i] * f64::from(score / best[i]).sqrt();
             }
-            RegionView {
+            Some(RegionView {
                 source: c.source,
                 frame: c.frame,
                 stamp: c.stamp,
@@ -359,9 +500,9 @@ pub(crate) fn region_views(
                 world_from_cam: c.world_from_cam,
                 coverage: (covered / total) as f32,
                 quality: (quality / total) as f32,
-                faces,
-                ring,
-            }
+                faces: faces.clone(),
+                ring: ring.clone(),
+            })
         })
         .collect();
     views.sort_by(|a, b| {
@@ -371,23 +512,218 @@ pub(crate) fn region_views(
             .then(b.quality.total_cmp(&a.quality))
             .then((a.source, a.frame).cmp(&(b.source, b.frame)))
     });
-    Ok(views)
+    views
+}
+
+/// The candidates that may see a face of the Stelle (some score of their `bounds` above 0),
+/// best first by their bounds: those that could cover [`FULL_COVERAGE`] of the Stelle, then by
+/// the quality the bounds would give (relative to the best bound of each face), then by source
+/// and frame.
+fn by_bounds(
+    candidates: &[Candidate],
+    bounds: &[Vec<f32>],
+    weights: &[f64],
+    total: f64,
+) -> Vec<usize> {
+    let mut top = vec![0.0f32; weights.len()];
+    for b in bounds {
+        for (t, &x) in top.iter_mut().zip(b) {
+            *t = t.max(x);
+        }
+    }
+    let keys: Vec<(bool, f64)> = bounds
+        .iter()
+        .map(|b| {
+            let (mut covered, mut quality) = (0.0f64, 0.0f64);
+            for ((&x, &w), &t) in b.iter().zip(weights).zip(&top) {
+                if x > 0.0 {
+                    covered += w;
+                    quality += w * f64::from(x / t).sqrt();
+                }
+            }
+            (covered / total >= f64::from(FULL_COVERAGE), quality / total)
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..candidates.len())
+        .filter(|&c| bounds[c].iter().any(|&x| x > 0.0))
+        .collect();
+    order.sort_by(|&a, &b| {
+        let id = |c: usize| (candidates[c].source, candidates[c].frame);
+        keys[b]
+            .0
+            .cmp(&keys[a].0)
+            .then(keys[b].1.total_cmp(&keys[a].1))
+            .then(id(a).cmp(&id(b)))
+    });
+    order
+}
+
+/// Relative slack of the bounds: they are the scores themselves where a face is seen; this
+/// only keeps a rounding of their last bit from ever deciding.
+const BOUND_SLACK: f32 = 1e-6;
+
+/// What the best `keep` views are, after a round (see [`Limit::could_matter`]).
+struct Limit<'a> {
+    /// The best score of every face of the Stelle so far.
+    best: &'a [f32],
+    /// The faces of the Stelle the best `keep` views see.
+    held: &'a [bool],
+    /// The last of them: whether it covers [`FULL_COVERAGE`], and its quality.
+    full: bool,
+    quality: f32,
+}
+
+impl Limit<'_> {
+    /// Whether a candidate without a depth buffer yet, which can give the faces of the Stelle
+    /// at most the scores `bounds`, could still change the best views: it could raise the best
+    /// score of a face one of them sees (and with it their qualities), or come before the last
+    /// of them by the most it could cover and the best quality it could have.
+    fn could_matter(&self, bounds: &[f32], weights: &[f64], total: f64) -> bool {
+        let raises = bounds
+            .iter()
+            .zip(self.best)
+            .zip(self.held)
+            .any(|((&x, &b), &h)| h && x * (1.0 + BOUND_SLACK) > b);
+        if raises {
+            return true;
+        }
+        let (mut covered, mut quality) = (0.0f64, 0.0f64);
+        for ((&x, &w), &b) in bounds.iter().zip(weights).zip(self.best) {
+            if x > 0.0 {
+                covered += w;
+                quality += w * if b > 0.0 {
+                    f64::from(x * (1.0 + BOUND_SLACK) / b).sqrt().min(1.0)
+                } else {
+                    1.0
+                };
+            }
+        }
+        // With a margin far above the rounding of the sums and of their `f32`: a tie with the
+        // last of the best (decided by source and frame) counts as coming before it.
+        let full = covered / total + 1e-6 >= f64::from(FULL_COVERAGE);
+        match (full, self.full) {
+            (true, false) => true,
+            (false, true) => false,
+            _ => quality / total + 1e-6 >= f64::from(self.quality),
+        }
+    }
+}
+
+/// The faces of a Stelle (indices into a part of the surface made a mesh) and their corners,
+/// for the scores an image could give them with nothing in the way ([`OpenFaces::scores`]).
+struct OpenFaces {
+    /// The faces, in the order of the Stelle.
+    faces: Vec<u32>,
+    /// The corners of all of them (vertices of the mesh), sorted …
+    verts: Vec<u32>,
+    /// … and per face its corners as indices into `verts`.
+    corners: Vec<[u32; 3]>,
+    /// Per face the cap of its score at the finest texel ([`SurfaceConfig::min_texel`]),
+    /// without the texel: half the length of the cross product of its edges.
+    half_cross: Vec<f64>,
+}
+
+impl OpenFaces {
+    fn new(mesh: &Mesh, faces: &[u32]) -> OpenFaces {
+        let mut verts: Vec<u32> = faces
+            .iter()
+            .flat_map(|&f| mesh.indices[f as usize])
+            .collect();
+        verts.sort_unstable();
+        verts.dedup();
+        let corners = faces
+            .iter()
+            .map(|&f| {
+                mesh.indices[f as usize].map(|v| verts.binary_search(&v).expect("a corner") as u32)
+            })
+            .collect();
+        let half_cross = faces
+            .iter()
+            .map(|&f| {
+                let [a, b, c] = mesh.indices[f as usize]
+                    .map(|i| Vector3::from(mesh.positions[i as usize]).cast::<f64>());
+                0.5 * (b - a).cross(&(c - a)).norm()
+            })
+            .collect();
+        OpenFaces {
+            faces: faces.to_vec(),
+            verts,
+            corners,
+            half_cross,
+        }
+    }
+
+    /// The score `shot` could give every face with nothing in the way: what
+    /// [`windowed_views`] gives it if the depth buffer lets it through (the same numbers), 0
+    /// where a test other than the depth buffer's rules it out (the tests only the depth
+    /// buffer's image needs are left out: never below the score it can get).
+    fn scores(&self, mesh: &Mesh, geometry: &Faces, shot: &Shot, cfg: &ColorConfig) -> Vec<f32> {
+        let world_to_cam = shot.world_from_cam.inverse();
+        let cam_pos = shot.world_from_cam.translation.vector;
+        let uv: Vec<Option<[f64; 2]>> = self
+            .verts
+            .iter()
+            .map(|&v| {
+                let p = Vector3::from(mesh.positions[v as usize]).cast::<f64>();
+                let pc = world_to_cam * Point3::from(p);
+                if pc.x.hypot(pc.y).atan2(pc.z) >= cfg.rim_theta {
+                    return None;
+                }
+                shot.full.project(&pc.coords)
+            })
+            .collect();
+        let texel2 = shot.min_texel * shot.min_texel;
+        self.faces
+            .iter()
+            .zip(&self.corners)
+            .zip(&self.half_cross)
+            .map(|((&f, c), &half_cross)| {
+                let f = f as usize;
+                let to_cam = cam_pos - Vector3::from(geometry.centroid[f]).cast::<f64>();
+                let cos =
+                    Vector3::from(geometry.normal[f]).cast::<f64>().dot(&to_cam) / to_cam.norm();
+                if cos.is_nan() || cos <= 0.0 {
+                    return 0.0;
+                }
+                let (Some(a), Some(b), Some(d)) =
+                    (uv[c[0] as usize], uv[c[1] as usize], uv[c[2] as usize])
+                else {
+                    return 0.0;
+                };
+                let area =
+                    0.5 * ((b[0] - a[0]) * (d[1] - a[1]) - (d[0] - a[0]) * (b[1] - a[1])).abs();
+                let cap = half_cross / texel2;
+                let cos_s =
+                    Vector3::from(geometry.smooth[f]).cast::<f64>().dot(&to_cam) / to_cam.norm();
+                let cos_s = cos_s.max(SMOOTH_COS_MIN);
+                let area = area * (cos_s / cos).clamp(0.5, 2.0);
+                let score = (area.min(cap) * cos_s) as f32 * shot.sharpness_norm;
+                if score.is_nan() || score <= 0.0 {
+                    0.0
+                } else {
+                    score
+                }
+            })
+            .collect()
+    }
 }
 
 /// Decodes the images of the first `k` of `views` (as [`region_views`] gives them: best first)
-/// at full size, the bags of each source read once, up to its last such image. Returns them
-/// as (index into `views`, image), by index. An image that cannot be decoded or has another
-/// size than its camera is left out, so there may be fewer. Progress: phase „Bilder der Stelle
-/// lesen“, one step per image; a cancel is checked at every image and returns
-/// [`EditError::Cancelled`].
+/// at full size, read from the bags at their places (`indices`, per source the index of its
+/// images, [`read_indexed`]). Returns them as (index into `views`, image), by index. An image
+/// that cannot be decoded or has another size than its camera is left out, so there may be
+/// fewer. Progress: phase „Bilder der Stelle lesen“, one step per image; a cancel is checked at
+/// every image and returns [`EditError::Cancelled`].
 ///
 /// Fails if the bags cannot be read or no longer hold the images the views were found in.
 ///
 /// # Panics
-/// If a view is not of `sources` (its source or camera is not there).
+/// If a view is not of `sources` (its source or camera is not there, or its frame not in the
+/// index of its source).
 pub(crate) fn decode_views(
     views: &[RegionView],
     sources: &[TextureSource],
+    indices: &[Arc<ImageIndex>],
     k: usize,
     progress: &Progress,
 ) -> Result<Vec<(usize, RgbImage)>, EditError> {
@@ -406,69 +742,63 @@ pub(crate) fn decode_views(
     }
     progress.phase(PHASE_DECODE, Some(chosen.len() as u64));
     let mut decoded: Vec<(usize, RgbImage)> = Vec::with_capacity(chosen.len());
+    let changed = || {
+        EditError::from(MapError::Images(
+            "Bilder haben sich zwischen zwei Durchläufen geändert".into(),
+        ))
+    };
     for (s, src) in sources.iter().enumerate() {
         // (frame, index into `views`) of the images of this source, in stream order.
-        let mut wanted: Vec<(u32, usize)> = chosen
+        let mut wanted: Vec<(usize, usize)> = chosen
             .iter()
             .enumerate()
             .filter(|(_, v)| v.source as usize == s)
-            .map(|(i, v)| (v.frame, i))
+            .map(|(i, v)| (v.frame as usize, i))
             .collect();
         if wanted.is_empty() {
             continue;
         }
         wanted.sort_unstable();
-        let (mut next, mut cancelled, mut changed) = (0usize, false, false);
-        let mut delivered = 0usize;
-        let read = for_each_image_where(
-            &src.images.bags,
-            &src.images.topics,
-            1,
-            |h: &ImageHeader| {
-                if progress.is_cancelled() {
-                    cancelled = true;
-                    return Wanted::Stop;
-                }
-                let Some(&(frame, i)) = wanted.get(next) else {
-                    return Wanted::Stop;
-                };
-                let frame = frame as usize;
-                if h.index < frame {
-                    return Wanted::No;
-                }
-                let view = &chosen[i];
-                let same = h.index == frame
+        // The views were found in this index: the same image there.
+        let index = &indices[s];
+        let headers: Vec<&ImageHeader> = index.headers().collect();
+        for &(frame, i) in &wanted {
+            let view = &chosen[i];
+            let at = headers.partition_point(|h| h.index < frame);
+            let same = headers.get(at).is_some_and(|h| {
+                h.index == frame
                     && h.stamp_ns == view.stamp
-                    && src.cams[view.camera as usize].camera.name == h.camera;
-                if !same {
-                    changed = true;
-                    return Wanted::Stop;
+                    && src.cams[view.camera as usize].camera.name == h.camera
+            });
+            if !same {
+                return Err(changed());
+            }
+        }
+        let frames: Vec<usize> = wanted.iter().map(|w| w.0).collect();
+        let mut delivered = 0usize;
+        let read = read_indexed(index, &frames, 1, |frame, image| {
+            let i = wanted[delivered].1;
+            debug_assert_eq!(wanted[delivered].0, frame);
+            delivered += 1;
+            progress.advance(1);
+            if let Ok(image) = image {
+                let cam = &src.cams[chosen[i].camera as usize].camera;
+                if (image.rgb.width, image.rgb.height) == (cam.width, cam.height) {
+                    decoded.push((i, image.rgb));
                 }
-                next += 1;
-                Wanted::Yes
-            },
-            |frame| {
-                let i = wanted[delivered].1;
-                delivered += 1;
-                progress.advance(1);
-                if let Ok(frame) = frame {
-                    let cam = &src.cams[chosen[i].camera as usize].camera;
-                    if (frame.rgb.width, frame.rgb.height) == (cam.width, cam.height) {
-                        decoded.push((i, frame.rgb));
-                    }
-                }
-                !progress.is_cancelled()
-            },
-        );
-        if cancelled || progress.is_cancelled() {
+            }
+            !progress.is_cancelled()
+        });
+        if progress.is_cancelled() {
             return Err(EditError::Cancelled);
         }
-        read.map_err(|e| MapError::Images(e.to_string()))?;
-        if changed || delivered < wanted.len() {
-            return Err(MapError::Images(
-                "Bilder haben sich zwischen zwei Durchläufen geändert".into(),
-            )
-            .into());
+        match read {
+            Ok(_) => {}
+            Err(ImageError::Changed(_)) => return Err(changed()),
+            Err(e) => return Err(MapError::Images(e.to_string()).into()),
+        }
+        if delivered < wanted.len() {
+            return Err(changed());
         }
     }
     decoded.sort_unstable_by_key(|d| d.0);
@@ -540,61 +870,45 @@ struct Candidate {
     world_from_cam: Isometry3<f64>,
 }
 
-/// The images of `sources` that may see the Stelle `shape`, by their headers and the poses
-/// alone (see the module docs), source by source in stream order.
+/// The images of `sources` that may see the Stelle `shape`, by their headers (`indices`, per
+/// source the index of its images) and the poses alone (see the module docs), source by source
+/// in stream order.
 fn candidates(
     shape: &Shape,
     sources: &[TextureSource],
+    indices: &[Arc<ImageIndex>],
     ccfg: &ColorConfig,
     progress: &Progress,
 ) -> Result<Vec<Candidate>, EditError> {
-    let total = sources
-        .iter()
-        .map(|src| image_count(&src.images))
-        .sum::<Option<u64>>();
-    progress.phase(PHASE_FIND, total);
+    progress.phase(PHASE_FIND, None);
     let mut found = Vec::new();
-    for (s, src) in sources.iter().enumerate() {
-        let mut cancelled = false;
-        let read = for_each_image_where(
-            &src.images.bags,
-            &src.images.topics,
-            1,
-            |h| {
-                if progress.is_cancelled() {
-                    cancelled = true;
-                    return Wanted::Stop;
-                }
-                progress.advance(1);
-                let Some(camera) = src.cams.iter().position(|c| c.camera.name == h.camera) else {
-                    return Wanted::No;
-                };
-                let t = h.stamp + ccfg.time_offset;
-                let Some(body) = interpolate_pose(&src.poses, t) else {
-                    return Wanted::No;
-                };
-                if angular_rate(&src.poses, t) > ccfg.max_angular_rate {
-                    return Wanted::No;
-                }
-                let cam = &src.cams[camera];
-                let world_from_cam = body * cam.cam_in_body;
-                if may_see(shape, &world_from_cam, &cam.camera, ccfg) {
-                    found.push(Candidate {
-                        source: s as u32,
-                        frame: u32::try_from(h.index).expect("fewer than 2^32 images"),
-                        stamp: h.stamp_ns,
-                        camera: camera as u32,
-                        world_from_cam,
-                    });
-                }
-                Wanted::No
-            },
-            |_| true,
-        );
-        if cancelled {
-            return Err(EditError::Cancelled);
+    for (s, (src, index)) in sources.iter().zip(indices).enumerate() {
+        for h in index.headers() {
+            if progress.is_cancelled() {
+                return Err(EditError::Cancelled);
+            }
+            let Some(camera) = src.cams.iter().position(|c| c.camera.name == h.camera) else {
+                continue;
+            };
+            let t = h.stamp + ccfg.time_offset;
+            let Some(body) = interpolate_pose(&src.poses, t) else {
+                continue;
+            };
+            if angular_rate(&src.poses, t) > ccfg.max_angular_rate {
+                continue;
+            }
+            let cam = &src.cams[camera];
+            let world_from_cam = body * cam.cam_in_body;
+            if may_see(shape, &world_from_cam, &cam.camera, ccfg) {
+                found.push(Candidate {
+                    source: s as u32,
+                    frame: u32::try_from(h.index).expect("fewer than 2^32 images"),
+                    stamp: h.stamp_ns,
+                    camera: camera as u32,
+                    world_from_cam,
+                });
+            }
         }
-        read.map_err(|e| MapError::Images(e.to_string()))?;
     }
     Ok(found)
 }
@@ -745,11 +1059,12 @@ pub struct RetextureDone {
 /// onto pages of its own (see the module docs), as variant `variant`: of the `n` images that
 /// can take it, best first, the `variant mod n`-th takes every face it sees; each further
 /// variant tries the next one. `s` is the welded surface as the earlier steps left it (their
-/// moves applied, [`WeldedSurface::apply_moves`]), `current` the surface with their patches
-/// applied ([`super::apply_patches`]): its texture around the Stelle is what the new images are
-/// matched to. `cfg` is the surface's (as its report has it). Progress: the phases „Bilder der
-/// Stelle suchen“, „Bilder der Stelle lesen“ and „Stelle neu backen“; a cancel returns
-/// [`EditError::Cancelled`]. Same input, the same patch, byte for byte.
+/// moves applied, [`WeldedSurface::apply_moves`]) and `bvh` the tree of its faces,
+/// `current` the surface with their patches applied ([`super::apply_patches`]): its texture
+/// around the Stelle is what the new images are matched to. `indices` hold, per source, where
+/// its images lie ([`index_images`]). `cfg` is the surface's (as its report has it). Progress:
+/// the phases „Bilder der Stelle suchen“, „Bilder der Stelle lesen“ and „Stelle neu backen“; a
+/// cancel returns [`EditError::Cancelled`]. Same input, the same patch, byte for byte.
 ///
 /// # Errors
 /// - [`EditError::NoFaces`] without faces, [`EditError::NoImages`] if no image of `sources`
@@ -759,25 +1074,32 @@ pub struct RetextureDone {
 ///   read or have changed, or a page of `current` cannot be decoded.
 ///
 /// # Panics
-/// If a face is not one of `s`.
+/// If a face is not one of `s`, `bvh` is not the tree of `s`'s faces, or `indices` are not
+/// as many as `sources`.
+#[allow(clippy::too_many_arguments)]
 pub fn retexture_region(
     s: &WeldedSurface,
+    bvh: &FaceBvh,
     current: &PageMesh,
     faces: &[u32],
     sources: &[TextureSource],
+    indices: &[Arc<ImageIndex>],
     variant: u32,
     cfg: &SurfaceConfig,
     progress: &Progress,
 ) -> Result<RetextureDone, EditError> {
     retexture(
         s,
+        bvh,
         current,
         faces,
         sources,
+        indices,
         variant,
         cfg,
         progress,
         Matching::Full,
+        Sight::BEST,
     )
 }
 
@@ -791,19 +1113,25 @@ enum Matching {
     Raw,
 }
 
-/// [`retexture_region`], the brightness matched as `matching` says.
+/// [`retexture_region`], the brightness matched as `matching` says, the images found as
+/// `sight` says.
 #[allow(clippy::too_many_arguments)]
 fn retexture(
     s: &WeldedSurface,
+    bvh: &FaceBvh,
     current: &PageMesh,
     faces: &[u32],
     sources: &[TextureSource],
+    indices: &[Arc<ImageIndex>],
     variant: u32,
     cfg: &SurfaceConfig,
     progress: &Progress,
     matching: Matching,
+    sight: Sight,
 ) -> Result<RetextureDone, EditError> {
-    let prep = prepare(s, current, faces, sources, cfg, progress)?;
+    let prep = prepare(
+        s, bvh, current, faces, sources, indices, cfg, sight, progress,
+    )?;
     let n = prep.ranked.len();
     let k = variant as usize % n;
     let labels = prep.labels(prep.ranked[k], sources, cfg);
@@ -891,15 +1219,28 @@ fn retexture(
 /// The images the variants of [`retexture_region`] take for the Stelle `faces`, in order:
 /// (source, frame).
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn variants(
     s: &WeldedSurface,
+    bvh: &FaceBvh,
     current: &PageMesh,
     faces: &[u32],
     sources: &[TextureSource],
+    indices: &[Arc<ImageIndex>],
     cfg: &SurfaceConfig,
     progress: &Progress,
 ) -> Result<Vec<(u32, u32)>, EditError> {
-    let prep = prepare(s, current, faces, sources, cfg, progress)?;
+    let prep = prepare(
+        s,
+        bvh,
+        current,
+        faces,
+        sources,
+        indices,
+        cfg,
+        Sight::BEST,
+        progress,
+    )?;
     Ok(prep
         .ranked
         .iter()
@@ -944,12 +1285,16 @@ struct Prepared<'a> {
 
 /// Steps 1 to 6 of the module docs: the images of the Stelle `faces`, decoded, their gains and
 /// their order.
+#[allow(clippy::too_many_arguments)]
 fn prepare<'a>(
     s: &WeldedSurface,
+    bvh: &FaceBvh,
     current: &'a PageMesh,
     faces: &[u32],
     sources: &[TextureSource],
+    indices: &[Arc<ImageIndex>],
     cfg: &SurfaceConfig,
+    sight: Sight,
     progress: &Progress,
 ) -> Result<Prepared<'a>, EditError> {
     if progress.is_cancelled() {
@@ -970,11 +1315,23 @@ fn prepare<'a>(
         return Err(EditError::NoFaces);
     }
     let ring = ring_around(s, &region);
-    let views = region_views(s, &region, &ring, sources, cfg, progress)?;
+    let sight = Sight {
+        keep: sight.keep.max(DECODED_VIEWS),
+        ..sight
+    };
+    let (views, looked) = region_views(
+        s, bvh, &region, &ring, sources, indices, cfg, sight, progress,
+    )?;
+    if looked.candidates > 0 {
+        progress.info(format!(
+            "Bilder der Stelle: {} von {} möglichen genau geprüft ({} Runde(n))",
+            looked.buffered, looked.candidates, looked.rounds
+        ));
+    }
     if views.is_empty() {
         return Err(EditError::NoImages);
     }
-    let decoded = decode_views(&views, sources, DECODED_VIEWS, progress)?;
+    let decoded = decode_views(&views, sources, indices, DECODED_VIEWS, progress)?;
     if decoded.is_empty() {
         return Err(EditError::NoImages);
     }
@@ -1673,8 +2030,11 @@ mod tests {
         paged, painted_mesh, scene, testscan_config, testscan_source, testscan_source_scaled,
         testscan_surface, walk_source,
     };
+    use crate::surface::views::image_views;
     use driftless_export::mesh::Mesh as PageMesh;
-    use driftless_io::images::{decode_jpeg, for_each_image, RgbImage};
+    use driftless_io::images::{
+        decode_jpeg, for_each_image, for_each_image_where, index_images, RgbImage, Wanted,
+    };
     use driftless_io::testdir::{SharedDir, TestDir};
     use driftless_io::testscan::{scan_with_images, shared, IMAGES, WALL_X};
     use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
@@ -1747,8 +2107,63 @@ mod tests {
         out
     }
 
+    /// The index of the images of every source.
+    fn index_of(sources: &[TextureSource]) -> Vec<Arc<ImageIndex>> {
+        sources
+            .iter()
+            .map(|src| {
+                let index =
+                    index_images(&src.images.bags, &src.images.topics, &Progress::new()).unwrap();
+                Arc::new(index)
+            })
+            .collect()
+    }
+
+    /// Every view of the Stelle `spot` in `sources` (no ring), each candidate with a depth
+    /// buffer.
     fn views(s: &WeldedSurface, spot: &[u32], sources: &[TextureSource]) -> Vec<RegionView> {
-        region_views(s, spot, &[], sources, &testscan_config(), &Progress::new()).unwrap()
+        views_with(s, spot, &[], sources, &testscan_config())
+    }
+
+    fn views_with(
+        s: &WeldedSurface,
+        spot: &[u32],
+        around: &[u32],
+        sources: &[TextureSource],
+        cfg: &SurfaceConfig,
+    ) -> Vec<RegionView> {
+        let bvh = FaceBvh::build(s);
+        let indices = index_of(sources);
+        region_views(
+            s,
+            &bvh,
+            spot,
+            around,
+            sources,
+            &indices,
+            cfg,
+            Sight::ALL,
+            &Progress::new(),
+        )
+        .unwrap()
+        .0
+    }
+
+    /// [`retexture_region`] with the tree of `s` and the indices of `sources` made here.
+    fn retexture_here(
+        s: &WeldedSurface,
+        current: &PageMesh,
+        faces: &[u32],
+        sources: &[TextureSource],
+        variant: u32,
+        cfg: &SurfaceConfig,
+        progress: &Progress,
+    ) -> Result<RetextureDone, EditError> {
+        let bvh = FaceBvh::build(s);
+        let indices = index_of(sources);
+        retexture_region(
+            s, &bvh, current, faces, sources, &indices, variant, cfg, progress,
+        )
     }
 
     #[test]
@@ -1769,7 +2184,14 @@ mod tests {
         // the wall may see it; the depth buffer tells them apart.
         let cfg = testscan_config();
         let shape = Shape::new(s, &spot);
-        let maybe = candidates(&shape, &sources, &cfg.color, &Progress::new()).unwrap();
+        let maybe = candidates(
+            &shape,
+            &sources,
+            &index_of(&sources),
+            &cfg.color,
+            &Progress::new(),
+        )
+        .unwrap();
         let by_source = |k: u32| maybe.iter().filter(|c| c.source == k).count();
         assert_eq!(
             [by_source(0), by_source(1), by_source(2)],
@@ -1837,8 +2259,8 @@ mod tests {
         );
         let sources = [room.scan.clone(), nearer(2.0)];
         let cfg = testscan_config();
-        let plain = region_views(s, &spot, &[], &sources, &cfg, &Progress::new()).unwrap();
-        let ringed = region_views(s, &spot, &around, &sources, &cfg, &Progress::new()).unwrap();
+        let plain = views_with(s, &spot, &[], &sources, &cfg);
+        let ringed = views_with(s, &spot, &around, &sources, &cfg);
         assert_eq!(plain.len(), ringed.len());
         for (a, b) in plain.iter().zip(&ringed) {
             assert!(a.ring.is_empty());
@@ -1911,7 +2333,8 @@ mod tests {
         assert!(found.windows(2).all(|w| w[0].source <= w[1].source));
         assert_eq!(DECODED_VIEWS, 24);
         let progress = Progress::new();
-        let decoded = decode_views(&found, &sources, DECODED_VIEWS, &progress).unwrap();
+        let indices = index_of(&sources);
+        let decoded = decode_views(&found, &sources, &indices, DECODED_VIEWS, &progress).unwrap();
         println!(
             "{} candidates, {} decoded ({:?})",
             found.len(),
@@ -1930,23 +2353,31 @@ mod tests {
         let again = views(s, &spot, &sources);
         assert_eq!(again, found);
         let decoded_again =
-            decode_views(&again, &sources, DECODED_VIEWS, &Progress::new()).unwrap();
+            decode_views(&again, &sources, &indices, DECODED_VIEWS, &Progress::new()).unwrap();
         assert_eq!(decoded_again, decoded);
         // Fewer views than asked for: all of them; none asked: none.
         assert_eq!(
-            decode_views(&found[..3], &sources, DECODED_VIEWS, &Progress::new())
-                .unwrap()
-                .len(),
+            decode_views(
+                &found[..3],
+                &sources,
+                &indices,
+                DECODED_VIEWS,
+                &Progress::new()
+            )
+            .unwrap()
+            .len(),
             3
         );
-        assert!(decode_views(&found, &sources, 0, &Progress::new())
-            .unwrap()
-            .is_empty());
+        assert!(
+            decode_views(&found, &sources, &indices, 0, &Progress::new())
+                .unwrap()
+                .is_empty()
+        );
         // A cancel stops it.
         let cancelled = Progress::new();
         cancelled.cancel();
         assert!(matches!(
-            decode_views(&found, &sources, DECODED_VIEWS, &cancelled),
+            decode_views(&found, &sources, &indices, DECODED_VIEWS, &cancelled),
             Err(EditError::Cancelled)
         ));
     }
@@ -1964,7 +2395,7 @@ mod tests {
         ];
         let mut cfg = testscan_config();
         cfg.color.rim_theta = 28f64.to_radians();
-        let found = region_views(s, &spot, &[], &sources, &cfg, &Progress::new()).unwrap();
+        let found = views_with(s, &spot, &[], &sources, &cfg);
         assert_eq!(found.len(), 2 * IMAGES);
         let (far, near) = (&found[0], &found[IMAGES]);
         println!(
@@ -2163,7 +2594,7 @@ mod tests {
 
     fn retextured(spot: &[u32], sources: &[TextureSource], variant: u32) -> RetextureDone {
         let room = room();
-        retexture_region(
+        retexture_here(
             &room.surface,
             &room.mesh,
             spot,
@@ -2348,18 +2779,21 @@ mod tests {
                 let src = std::slice::from_ref(exposed(gain));
                 let raw = retexture(
                     s,
+                    &FaceBvh::build(s),
                     &room.mesh,
                     &spot,
                     src,
+                    &index_of(src),
                     0,
                     &cfg,
                     &Progress::new(),
                     Matching::Raw,
+                    Sight::BEST,
                 )
                 .unwrap();
                 let clock = Instant::now();
                 let done =
-                    retexture_region(s, &room.mesh, &spot, src, 0, &cfg, &Progress::new()).unwrap();
+                    retexture_here(s, &room.mesh, &spot, src, 0, &cfg, &Progress::new()).unwrap();
                 let took = clock.elapsed();
                 assert_eq!(raw.patch.removed_faces, done.patch.removed_faces);
                 let (before, edges) = border_step(&raw.patch);
@@ -2391,7 +2825,17 @@ mod tests {
         // Three places, five images each: the scan's, and 2 m and 3.5 m nearer the wall.
         let sources = [room.scan.clone(), nearer(2.0), nearer(3.5)];
         let cfg = testscan_config();
-        let ranked = variants(s, &room.mesh, &spot, &sources, &cfg, &Progress::new()).unwrap();
+        let ranked = variants(
+            s,
+            &FaceBvh::build(s),
+            &room.mesh,
+            &spot,
+            &sources,
+            &index_of(&sources),
+            &cfg,
+            &Progress::new(),
+        )
+        .unwrap();
         let n = ranked.len();
         println!("{n} variants: {ranked:?}");
         assert_eq!(n, 3 * IMAGES);
@@ -2445,7 +2889,7 @@ mod tests {
         let s = &room.surface;
         let cfg = testscan_config();
         let run = |spot: &[u32], sources: &[TextureSource]| {
-            retexture_region(s, &room.mesh, spot, sources, 0, &cfg, &Progress::new())
+            retexture_here(s, &room.mesh, spot, sources, 0, &cfg, &Progress::new())
         };
         // The −x wall lies behind the scan's camera.
         let behind = wall_spot(s, 0.6);
@@ -2458,7 +2902,7 @@ mod tests {
         // A cancel stops it.
         let cancelled = Progress::new();
         cancelled.cancel();
-        let r = retexture_region(
+        let r = retexture_here(
             s,
             &room.mesh,
             &front_spot(s, 0.8),
@@ -2482,7 +2926,7 @@ mod tests {
             let page = &room.mesh.pages[p as usize];
             assert!(gray(page.indices[t as usize].map(|c| page.uvs[c as usize])));
         }
-        let r = retexture_region(
+        let r = retexture_here(
             s,
             &room.mesh,
             &behind,
@@ -2493,6 +2937,643 @@ mod tests {
         );
         assert!(matches!(r, Err(EditError::NoReference)), "{r:?}");
     }
+    /// A patch by the hash of its bytes and the variant it is, or why there is none.
+    type PatchOf = Result<(u64, (u32, u32)), String>;
+
+    /// The bytes [`write_patches`] writes for `patch`, hashed (FNV-1a).
+    fn patch_hash(patch: &SurfacePatch) -> u64 {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = TestDir::new(format!(
+            "driftless-edit-retexture-hash-{}-{n}",
+            std::process::id()
+        ));
+        write_patches(&dir, std::slice::from_ref(patch)).unwrap();
+        crate::content_hash(&fs::read(dir.join(PATCHES_FILE)).unwrap())
+    }
+
+    /// The walk through the painted room (`scene::walk_scene`) textured as the surface step
+    /// does it (1 cm texels, pages of 1024²) from the walk's images of both cameras, welded.
+    fn textured_walk() -> &'static (PageMesh, WeldedSurface, TextureSource) {
+        use crate::surface::{texture_mesh, SurfaceStats};
+        static WALK: OnceLock<(PageMesh, WeldedSurface, TextureSource)> = OnceLock::new();
+        WALK.get_or_init(|| {
+            let mesh = painted_mesh(&scene::walk_scene(), 0.1);
+            let src = walk_source("retexture-textured-walk", &[0, 1], 1..=11, 1.0);
+            let cfg = walk_config();
+            let mut stats = SurfaceStats::default();
+            let tex = texture_mesh(
+                &mesh,
+                std::slice::from_ref(&src),
+                &cfg,
+                &Progress::new(),
+                &mut stats,
+                None,
+            )
+            .unwrap();
+            let jpegs = encode_pages(&tex, cfg.jpeg_quality).unwrap();
+            let pages = tex.to_mesh(&jpegs).unwrap();
+            let s = WeldedSurface::from_mesh(&pages);
+            (pages, s, src)
+        })
+    }
+
+    /// The settings [`textured_walk`] was textured with.
+    fn walk_config() -> SurfaceConfig {
+        SurfaceConfig {
+            min_texel: 0.01,
+            page_size: 1024,
+            ..SurfaceConfig::default()
+        }
+    }
+
+    /// The faces of `s` whose centroid lies within `r` of `centre` and whose normal is within
+    /// about 25° of `normal`.
+    fn spot_at(s: &WeldedSurface, centre: [f64; 3], r: f64, normal: [f64; 3]) -> Vec<u32> {
+        (0..s.face_count() as u32)
+            .filter(|&f| {
+                norm(sub(s.face_centroid(f), centre)) < r && dot(s.face_normal(f), normal) > 0.9
+            })
+            .collect()
+    }
+
+    /// The patches of „Bilder neu“ on the synthetic scenes, recorded (Apple silicon, as
+    /// [`crate::surface::tests::full_surface_unchanged`]) before the images were found through
+    /// an index of the bags and the visibility was computed only for the best candidates and
+    /// over the cut-out of the image: the same images, the same patches, byte for byte.
+    #[test]
+    fn retexture_unchanged() {
+        let room = room();
+        let cfg = testscan_config();
+        let front = front_spot(&room.surface, 0.8);
+        let side = side_spot(&room.surface, 0.8);
+        let three = [room.scan.clone(), nearer(2.0), nearer(3.5)];
+        let two = [exposed(1.2).clone(), nearer(2.0)];
+        let mut got: Vec<(String, PatchOf)> = Vec::new();
+        let mut run = |name: &str,
+                       s: &WeldedSurface,
+                       mesh: &PageMesh,
+                       spot: &[u32],
+                       sources: &[TextureSource],
+                       variant: u32,
+                       cfg: &SurfaceConfig| {
+            let r = retexture_here(s, mesh, spot, sources, variant, cfg, &Progress::new())
+                .map(|d| (patch_hash(&d.patch), d.variant_of))
+                .map_err(|e| e.to_string());
+            got.push((name.to_string(), r));
+        };
+        run(
+            "front, scan",
+            &room.surface,
+            &room.mesh,
+            &front,
+            std::slice::from_ref(&room.scan),
+            0,
+            &cfg,
+        );
+        for v in [0, 4, 5, 10, 14] {
+            run(
+                &format!("front, three places, variant {v}"),
+                &room.surface,
+                &room.mesh,
+                &front,
+                &three,
+                v,
+                &cfg,
+            );
+        }
+        run(
+            "front, two sources, variant 3",
+            &room.surface,
+            &room.mesh,
+            &front,
+            &two,
+            3,
+            &cfg,
+        );
+        run(
+            "side, darker",
+            &room.surface,
+            &room.mesh,
+            &side,
+            std::slice::from_ref(exposed(0.8)),
+            0,
+            &cfg,
+        );
+        let (pages, s, src) = textured_walk();
+        let wcfg = walk_config();
+        let wall = spot_at(s, [1.0, 5.0, 0.3], 0.565, [0.0, -1.0, 0.0]);
+        let behind = spot_at(s, [-3.5, -4.0, 0.0], 1.0, [0.0, 1.0, 0.0]);
+        let floor = spot_at(s, [0.5, 1.5, -1.2], 0.6, [0.0, 0.0, 1.0]);
+        for (name, spot) in [
+            ("walk, +y wall", &wall),
+            ("walk, behind the pillar", &behind),
+        ] {
+            for v in [0, 1, 7] {
+                run(
+                    &format!("{name}, variant {v}"),
+                    s,
+                    pages,
+                    spot,
+                    std::slice::from_ref(src),
+                    v,
+                    &wcfg,
+                );
+            }
+        }
+        run(
+            "walk, floor",
+            s,
+            pages,
+            &floor,
+            std::slice::from_ref(src),
+            0,
+            &wcfg,
+        );
+        for (name, r) in &got {
+            match r {
+                Ok((h, v)) => println!("({name:?}, 0x{h:016x}, {v:?}),"),
+                Err(e) => println!("({name:?}, {e:?}),"),
+            }
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let want: [(&str, u64, (u32, u32)); 15] = [
+                ("front, scan", 0xad94db987087cb22, (1, 5)),
+                (
+                    "front, three places, variant 0",
+                    0xd31cfad808618677,
+                    (1, 15),
+                ),
+                (
+                    "front, three places, variant 4",
+                    0xd31cfad808618677,
+                    (5, 15),
+                ),
+                (
+                    "front, three places, variant 5",
+                    0xad94db987087cb22,
+                    (6, 15),
+                ),
+                (
+                    "front, three places, variant 10",
+                    0xc9827c5ba3b54492,
+                    (11, 15),
+                ),
+                (
+                    "front, three places, variant 14",
+                    0xc9827c5ba3b54492,
+                    (15, 15),
+                ),
+                ("front, two sources, variant 3", 0xd31cfad808618677, (4, 10)),
+                ("side, darker", 0xe9d513978068f927, (1, 5)),
+                ("walk, +y wall, variant 0", 0xe9188df5a88c99e5, (1, 11)),
+                ("walk, +y wall, variant 1", 0xd761518c9f1aaeae, (2, 11)),
+                ("walk, +y wall, variant 7", 0x8d19242da74739e6, (8, 11)),
+                (
+                    "walk, behind the pillar, variant 0",
+                    0xdbe31d78ed7db39c,
+                    (1, 11),
+                ),
+                (
+                    "walk, behind the pillar, variant 1",
+                    0x27c92c6de0d7443d,
+                    (2, 11),
+                ),
+                (
+                    "walk, behind the pillar, variant 7",
+                    0xc4db214a0b83abfc,
+                    (8, 11),
+                ),
+                ("walk, floor", 0x67b8828b5c08eca0, (1, 11)),
+            ];
+            let want: Vec<(String, PatchOf)> = want
+                .iter()
+                .map(|&(name, hash, variant)| (name.to_string(), Ok((hash, variant))))
+                .collect();
+            assert_eq!(got, want, "patches changed");
+        }
+    }
+
+    /// The room of [`room`] with a box (x 1.5 … 1.8, y −0.25 … 0.25, z −0.4 … 0.3; not in the
+    /// images): it hides [`front_spot`] from the places of [`crowd`] behind it.
+    fn boxed_room() -> &'static (PageMesh, WeldedSurface) {
+        static BOXED: OnceLock<(PageMesh, WeldedSurface)> = OnceLock::new();
+        BOXED.get_or_init(|| {
+            let mut mesh = room().mesh.clone();
+            let (lo, hi) = ([1.5, -0.25, -0.4], [1.8, 0.25, 0.3]);
+            let corner = |i: usize| [0, 1, 2].map(|k| if i >> k & 1 == 1 { hi[k] } else { lo[k] });
+            // Each side as two triangles, wound so that the normals point out of the box.
+            let sides: [[usize; 4]; 6] = [
+                [0, 2, 6, 4],
+                [1, 5, 7, 3],
+                [0, 4, 5, 1],
+                [2, 3, 7, 6],
+                [0, 1, 3, 2],
+                [4, 6, 7, 5],
+            ];
+            let mut page = driftless_export::mesh::MeshPage {
+                positions: (0..8).map(corner).collect(),
+                uvs: vec![[0.5, 0.5]; 8],
+                indices: Vec::new(),
+                image: None,
+                color: [128, 128, 128],
+            };
+            for [a, b, c, d] in sides {
+                page.indices.push([a as u32, b as u32, c as u32]);
+                page.indices.push([a as u32, c as u32, d as u32]);
+            }
+            mesh.pages.push(page);
+            let s = WeldedSurface::from_mesh(&mesh);
+            (mesh, s)
+        })
+    }
+
+    /// Places on a grid in front of the +x wall (x −2 … 4 m, y −1 … 3 m), the scan's images at
+    /// each (only the geometry counts): 100 candidates for [`front_spot`], some behind the
+    /// box of [`boxed_room`].
+    fn crowd() -> &'static Vec<TextureSource> {
+        static CROWD: OnceLock<Vec<TextureSource>> = OnceLock::new();
+        CROWD.get_or_init(|| {
+            let mut out = Vec::new();
+            for x in [-3.0, -2.0, -1.0, 0.0, 1.0] {
+                for y in [0.0, 0.5, 1.0, 1.5] {
+                    out.push(testscan_source(
+                        &room().dir,
+                        Isometry3::translation(x, y, 0.0),
+                    ));
+                }
+            }
+            out
+        })
+    }
+
+    /// A synthetic case of [`region_views`]: the surface, its tree, the Stelle, the ring looked
+    /// at with it, the sources, their indices, the settings.
+    struct Case {
+        name: String,
+        s: &'static WeldedSurface,
+        bvh: FaceBvh,
+        spot: Vec<u32>,
+        around: Vec<u32>,
+        sources: Vec<TextureSource>,
+        indices: Vec<Arc<ImageIndex>>,
+        cfg: SurfaceConfig,
+    }
+
+    impl Case {
+        fn new(
+            name: &str,
+            s: &'static WeldedSurface,
+            spot: Vec<u32>,
+            ring: bool,
+            sources: Vec<TextureSource>,
+            cfg: SurfaceConfig,
+        ) -> Case {
+            assert!(!spot.is_empty(), "{name}");
+            let around = if ring {
+                ring_around(s, &spot)
+            } else {
+                Vec::new()
+            };
+            Case {
+                name: name.to_string(),
+                s,
+                bvh: FaceBvh::build(s),
+                spot,
+                around,
+                indices: index_of(&sources),
+                sources,
+                cfg,
+            }
+        }
+
+        fn views(&self, sight: Sight) -> (Vec<RegionView>, SightStats) {
+            region_views(
+                self.s,
+                &self.bvh,
+                &self.spot,
+                &self.around,
+                &self.sources,
+                &self.indices,
+                &self.cfg,
+                sight,
+                &Progress::new(),
+            )
+            .unwrap()
+        }
+    }
+
+    /// The surface of [`room`] without its +x wall (behind it, the camera sees the Stelle).
+    fn open_room() -> &'static WeldedSurface {
+        static OPEN: OnceLock<WeldedSurface> = OnceLock::new();
+        OPEN.get_or_init(|| WeldedSurface::from_mesh(&without(&room().mesh, |c| c[0] > 5.9)))
+    }
+
+    /// Every synthetic scene of the tests above, as cases of [`region_views`].
+    fn cases() -> Vec<Case> {
+        let room = room();
+        let s = &room.surface;
+        let cfg = testscan_config();
+        let mut narrow = testscan_config();
+        narrow.color.rim_theta = 28f64.to_radians();
+        let (_, boxed) = boxed_room();
+        let (walk_s, walk_src) = walk();
+        let (_, tw, tw_src) = textured_walk();
+        let near = |s: &WeldedSurface, c: [f64; 3], r: f64, n: [f64; 3]| spot_at(s, c, r, n);
+        let mut out = vec![
+            Case::new(
+                "room, −x wall, three sources",
+                s,
+                wall_spot(s, 0.6),
+                false,
+                vec![
+                    room.scan.clone(),
+                    looking_back([1.0, 1.0, 0.25]),
+                    looking_back([6.6, 1.0, 0.25]),
+                ],
+                cfg.clone(),
+            ),
+            Case::new(
+                "room without the +x wall",
+                open_room(),
+                wall_spot(open_room(), 0.6),
+                false,
+                vec![
+                    room.scan.clone(),
+                    looking_back([1.0, 1.0, 0.25]),
+                    looking_back([6.6, 1.0, 0.25]),
+                ],
+                cfg.clone(),
+            ),
+            Case::new(
+                "room, 2 m and 5 m",
+                s,
+                wall_spot(s, 0.6),
+                true,
+                vec![
+                    looking_back([1.0, 1.0, 0.25]),
+                    looking_back([-2.0, 1.0, 0.25]),
+                ],
+                cfg.clone(),
+            ),
+            Case::new(
+                "room, six places",
+                s,
+                wall_spot(s, 0.6),
+                false,
+                (0..6)
+                    .map(|i| looking_back([-1.0 + f64::from(i), 1.0, 0.25]))
+                    .collect(),
+                cfg.clone(),
+            ),
+            Case::new(
+                "room, within 28°",
+                s,
+                wall_spot(s, 0.6),
+                false,
+                vec![
+                    looking_back([1.0, 1.0, 0.25]),
+                    looking_back([-2.5, 1.0, 0.25]),
+                ],
+                narrow,
+            ),
+            Case::new(
+                "room, front wall with ring",
+                s,
+                front_spot(s, 0.6),
+                true,
+                vec![room.scan.clone(), nearer(2.0)],
+                cfg.clone(),
+            ),
+            Case::new(
+                "room, front wall, three places",
+                s,
+                front_spot(s, 0.8),
+                true,
+                vec![room.scan.clone(), nearer(2.0), nearer(3.5)],
+                cfg.clone(),
+            ),
+            Case::new(
+                "room, the same place three times",
+                s,
+                front_spot(s, 0.8),
+                true,
+                vec![nearer(2.0), nearer(2.0), nearer(2.0)],
+                cfg.clone(),
+            ),
+            Case::new(
+                "room, a crowd of places",
+                s,
+                front_spot(s, 0.8),
+                true,
+                crowd().clone(),
+                cfg.clone(),
+            ),
+            Case::new(
+                "room with a box, a crowd of places",
+                boxed,
+                front_spot(boxed, 0.8),
+                true,
+                crowd().clone(),
+                cfg.clone(),
+            ),
+            Case::new(
+                "textured walk, +y wall",
+                tw,
+                near(tw, [1.0, 5.0, 0.3], 0.565, [0.0, -1.0, 0.0]),
+                true,
+                vec![tw_src.clone()],
+                walk_config(),
+            ),
+            Case::new(
+                "textured walk, behind the pillar",
+                tw,
+                near(tw, [-3.5, -4.0, 0.0], 1.0, [0.0, 1.0, 0.0]),
+                true,
+                vec![tw_src.clone()],
+                walk_config(),
+            ),
+            Case::new(
+                "textured walk, floor",
+                tw,
+                near(tw, [0.5, 1.5, -1.2], 0.6, [0.0, 0.0, 1.0]),
+                true,
+                vec![tw_src.clone()],
+                walk_config(),
+            ),
+        ];
+        for (c, r, n) in [
+            ([-3.5, -4.0, 0.0], 1.6, [0.0, 1.0, 0.0]),
+            ([0.5, 1.5, -1.2], 0.8, [0.0, 0.0, 1.0]),
+            ([1.0, 5.0, 0.3], 0.7, [0.0, -1.0, 0.0]),
+        ] {
+            out.push(Case::new(
+                &format!("walk on pages, Stelle at {c:?}"),
+                walk_s,
+                near(walk_s, c, r, n),
+                false,
+                vec![walk_src.clone()],
+                SurfaceConfig::default(),
+            ));
+        }
+        out
+    }
+
+    /// Only over the cut-out of each image the Stelle and its ring are tested in, the depth
+    /// buffer gives the same views as over the whole image: the same images, the same faces,
+    /// the same scores, bit for bit, in every scene; and it is smaller.
+    #[test]
+    fn cutout_visibility_matches_full() {
+        let all = Sight {
+            cutout: false,
+            ..Sight::ALL
+        };
+        let mut smaller = 0;
+        for case in cases() {
+            let (whole, whole_stats) = case.views(all);
+            let (cut, cut_stats) = case.views(Sight::ALL);
+            assert_eq!(cut, whole, "{}", case.name);
+            assert!(!whole.is_empty(), "{}", case.name);
+            assert_eq!(cut_stats.buffered, whole_stats.buffered, "{}", case.name);
+            assert!(cut_stats.cells <= whole_stats.cells, "{}", case.name);
+            smaller += usize::from(cut_stats.cells * 2 < whole_stats.cells);
+            println!(
+                "{}: {} views; depth buffers of {} candidates, {} cells instead of {}",
+                case.name,
+                cut.len(),
+                cut_stats.buffered,
+                cut_stats.cells,
+                whole_stats.cells
+            );
+        }
+        assert!(smaller >= 8, "the cut-out is smaller in {smaller} scenes");
+    }
+
+    /// Ranked first by what each image could see with nothing in the way, and given a depth
+    /// buffer only as long as one can still change the best [`DECODED_VIEWS`]: the same best
+    /// views as when every candidate gets one, in the same order, in every scene and in rounds
+    /// of any size; with them the same images decoded and the same patches, byte for byte. In
+    /// the crowd before the plain wall fewer candidates get a depth buffer (behind the box
+    /// every place that could see the Stelle without it has to be looked at).
+    #[test]
+    fn prerank_keeps_choice() {
+        for case in cases() {
+            let (all, all_stats) = case.views(Sight::ALL);
+            let best: Vec<RegionView> = all.iter().take(DECODED_VIEWS).cloned().collect();
+            for batch in [1, 2, 5, PRERANK_BATCH] {
+                let (got, stats) = case.views(Sight {
+                    batch,
+                    ..Sight::BEST
+                });
+                assert_eq!(got, best, "{}, rounds of {batch}", case.name);
+                assert!(stats.buffered <= all_stats.buffered, "{}", case.name);
+                if batch == PRERANK_BATCH {
+                    println!(
+                        "{}: {} candidates, {} views; depth buffers for {} of them in {} \
+                         round(s)",
+                        case.name,
+                        all_stats.candidates,
+                        all.len(),
+                        stats.buffered,
+                        stats.rounds
+                    );
+                }
+            }
+            if case.name == "room, a crowd of places" {
+                let (_, stats) = case.views(Sight::BEST);
+                assert!(
+                    stats.buffered < all_stats.buffered,
+                    "{}: {} of {}",
+                    case.name,
+                    stats.buffered,
+                    all_stats.buffered
+                );
+            }
+        }
+        // The patches: the room and its crowd, the textured walk.
+        let room = room();
+        let (boxed_mesh, boxed) = boxed_room();
+        let (pages, tw, tw_src) = textured_walk();
+        let three = [room.scan.clone(), nearer(2.0), nearer(3.5)];
+        type Check<'a> = (
+            &'a str,
+            &'a WeldedSurface,
+            &'a PageMesh,
+            Vec<u32>,
+            Vec<TextureSource>,
+            SurfaceConfig,
+        );
+        let checks: Vec<Check> = vec![
+            (
+                "front",
+                &room.surface,
+                &room.mesh,
+                front_spot(&room.surface, 0.8),
+                three.to_vec(),
+                testscan_config(),
+            ),
+            (
+                "crowd",
+                &room.surface,
+                &room.mesh,
+                front_spot(&room.surface, 0.8),
+                crowd().clone(),
+                testscan_config(),
+            ),
+            (
+                "crowd, box",
+                boxed,
+                boxed_mesh,
+                front_spot(boxed, 0.8),
+                crowd().clone(),
+                testscan_config(),
+            ),
+            (
+                "walk wall",
+                tw,
+                pages,
+                spot_at(tw, [1.0, 5.0, 0.3], 0.565, [0.0, -1.0, 0.0]),
+                vec![tw_src.clone()],
+                walk_config(),
+            ),
+            (
+                "walk pillar",
+                tw,
+                pages,
+                spot_at(tw, [-3.5, -4.0, 0.0], 1.0, [0.0, 1.0, 0.0]),
+                vec![tw_src.clone()],
+                walk_config(),
+            ),
+        ];
+        for (name, s, mesh, spot, sources, cfg) in checks {
+            let bvh = FaceBvh::build(s);
+            let indices = index_of(&sources);
+            for variant in [0, 1, 7, 23] {
+                let patch = |sight: Sight| {
+                    retexture(
+                        s,
+                        &bvh,
+                        mesh,
+                        &spot,
+                        &sources,
+                        &indices,
+                        variant,
+                        &cfg,
+                        &Progress::new(),
+                        Matching::Full,
+                        sight,
+                    )
+                    .map(|d| (patch_hash(&d.patch), d.variant_of))
+                    .map_err(|e| e.to_string())
+                };
+                let (with, without) = (patch(Sight::BEST), patch(Sight::ALL));
+                println!("{name}, variant {variant}: {with:?}");
+                assert_eq!(with, without, "{name}, variant {variant}");
+            }
+        }
+    }
+
     /// Time of „Bilder neu einspielen“ per phase, and the bytes of the bag it reads: the walk
     /// through the painted room (22 images of 640 × 480 from two cameras), textured as the
     /// surface step does it, and a Stelle of about 1 m² on the +y wall.
@@ -2531,7 +3612,7 @@ mod tests {
             }
         });
         let start = Instant::now();
-        let done = retexture_region(&s, &pages, &spot, sources, 0, &cfg, &progress).unwrap();
+        let done = retexture_here(&s, &pages, &spot, sources, 0, &cfg, &progress).unwrap();
         let end = Instant::now();
         let marks = marks.lock().unwrap().clone();
         let phases: Vec<String> = marks

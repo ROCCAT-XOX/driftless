@@ -4,6 +4,7 @@
 
 use driftless_export::mesh::{read_mesh, Mesh};
 use driftless_gpu::GpuPref;
+use driftless_io::images::ImageIndices;
 use driftless_io::progress::{Progress, ProgressSnapshot};
 use driftless_io::testdir::{SharedDir, TestDir};
 use driftless_io::testscan::{scan_with_images, shared, tmp};
@@ -15,8 +16,9 @@ use driftless_steps::marks::{DabInput, Marks, SmoothLevel, StepInput};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::surface::{run_surface, surface_fits, texture_sources, SurfaceRequest};
 use driftless_steps::touchup::{
-    edited_mesh, edited_pages, run_touchup, touchup_fits, touchup_without_raw_data, StepOutcome,
-    TouchupDone, TouchupRequest, TOUCHUP_DIR, TOUCHUP_REPORT,
+    edited_mesh, edited_pages, run_touchup, touchup_fits, touchup_without_raw_data,
+    PreparedSurface, StepOutcome, TouchupDone, TouchupPrepared, TouchupRequest, TOUCHUP_DIR,
+    TOUCHUP_REPORT,
 };
 use driftless_steps::StepError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -184,6 +186,7 @@ impl Scene {
             surface_dir: self.surface.clone(),
             owner_dir: self.map.clone(),
             sources,
+            prepared: TouchupPrepared::default(),
         }
     }
 
@@ -706,6 +709,7 @@ fn new_surface_reapplies() {
         surface_dir: second.clone(),
         owner_dir: scene.map.clone(),
         sources: texture_sources(&second).unwrap(),
+        prepared: TouchupPrepared::default(),
     };
     let done = run_touchup(&req, &Progress::new()).unwrap();
     assert_eq!(done.steps, 1);
@@ -908,4 +912,98 @@ fn edited_export_without_steps_or_current_cache() {
     assert!(names(&scene.surface)
         .iter()
         .all(|n| !n.starts_with(TOUCHUP_DIR)));
+}
+
+/// The program has the computed surface at hand already (read, welded, its tree): the
+/// touch-up takes it instead of reading the glb – the glb here made unreadable with its size
+/// and time kept – and gives the same patches. The indices of the images are built once and
+/// kept for the next run. A glb with another size or time is read anew.
+#[test]
+fn prepared_surface_is_used() {
+    let scene = Scene::new("nacharbeit-vorbereitet");
+    let front = scene.mark(&front_wall(&scene.surface), smooth(SmoothLevel::Strong));
+    scene.touch_up();
+    Marks::change(&scene.map, |m| {
+        m.add_step(front, StepInput::Retexture { variant: 1 })?;
+        Ok(())
+    })
+    .unwrap();
+    scene.touch_up();
+    let want = fs::read(scene.cache().join(PATCHES_FILE)).unwrap();
+    let glb = scene.surface.join("oberflaeche.glb");
+    let prepared = PreparedSurface::read(&glb, &Progress::new()).unwrap();
+    assert!(prepared.fits(&glb));
+
+    // The glb unreadable, its size and time as they were.
+    let meta = fs::metadata(&glb).unwrap();
+    let bytes = fs::read(&glb).unwrap();
+    fs::write(&glb, vec![0u8; bytes.len()]).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&glb)
+        .unwrap()
+        .set_modified(meta.modified().unwrap())
+        .unwrap();
+    assert!(prepared.fits(&glb));
+    fs::remove_dir_all(scene.cache()).unwrap();
+    // Without it the touch-up cannot read the surface …
+    assert!(run_touchup(&scene.request(scene.sources()), &Progress::new()).is_err());
+    // … with it, it computes the same patches without reading it, and keeps the indices.
+    let indices = Arc::new(ImageIndices::default());
+    let with = |prepared: &PreparedSurface| TouchupRequest {
+        prepared: TouchupPrepared {
+            surface: Some(prepared.clone()),
+            indices: Some(Arc::clone(&indices)),
+        },
+        ..scene.request(scene.sources())
+    };
+    let (progress, phases) = recording();
+    let done = run_touchup(&with(&prepared), &progress).unwrap();
+    assert_eq!(done.steps, 2);
+    assert_eq!(fs::read(scene.cache().join(PATCHES_FILE)).unwrap(), want);
+    let phases = phases.lock().unwrap().clone();
+    assert!(
+        !phases.iter().any(|p| p == "Nacharbeit: Oberfläche lesen"),
+        "{phases:?}"
+    );
+    assert_eq!(
+        phases.iter().filter(|p| *p == "Bilder verzeichnen").count(),
+        1,
+        "{phases:?}"
+    );
+    // Once more from nothing: the indices are kept.
+    fs::remove_dir_all(scene.cache()).unwrap();
+    let (progress, phases) = recording();
+    run_touchup(&with(&prepared), &progress).unwrap();
+    assert_eq!(fs::read(scene.cache().join(PATCHES_FILE)).unwrap(), want);
+    assert!(
+        !phases
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p == "Bilder verzeichnen"),
+        "{phases:?}"
+    );
+
+    // The glb back as it was, but written anew: another time, so it is read again.
+    fs::write(&glb, &bytes).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&glb)
+        .unwrap()
+        .set_modified(meta.modified().unwrap() + std::time::Duration::from_secs(5))
+        .unwrap();
+    assert!(!prepared.fits(&glb));
+    fs::remove_dir_all(scene.cache()).unwrap();
+    let (progress, phases) = recording();
+    run_touchup(&with(&prepared), &progress).unwrap();
+    assert!(
+        phases
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p == "Nacharbeit: Oberfläche lesen"),
+        "{phases:?}"
+    );
+    assert_eq!(fs::read(scene.cache().join(PATCHES_FILE)).unwrap(), want);
 }

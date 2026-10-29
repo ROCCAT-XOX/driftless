@@ -22,15 +22,17 @@ use crate::overlay::RunOverlay;
 use crate::pick::relative_to;
 use crate::project::{canonical, change_project, set_point_pair_enabled, Choices, Project};
 use crate::render::ShowMode;
-use crate::surface::{load_mesh, surface_glb, SurfaceEdit, TouchupOutput, ViewEdit};
+use crate::surface::{load_mesh, surface_glb, SurfaceEdit, TouchupOutput, ViewEdit, SURFACE_GLB};
 use crate::synthetic::synthetic_cloud;
 use driftless_gpu::GpuPref;
+use driftless_io::images::ImageIndices;
 use driftless_io::progress::{LogLine, Progress};
 use driftless_steps::export::{
     file_kind, ExportKind, ExportSource, MESH_EXTENSIONS, POINT_EXTENSIONS,
 };
 use driftless_steps::marks::{EditStep, Marks};
 use driftless_steps::merge::MODEL_LAS;
+use driftless_steps::touchup::TouchupPrepared;
 use driftless_steps::{correct, StepError};
 use eframe::egui;
 use std::collections::{BTreeSet, VecDeque};
@@ -536,6 +538,9 @@ pub struct DriftlessApp {
     focus_read: Option<Instant>,
     /// The brush at work: what it hits on the surface shown, the stroke, the Stellen as faces.
     brush: Brush,
+    /// Where the camera images of the scans lie in their bags, kept for every touch-up of this
+    /// window: only the first one that bakes images of a scan anew looks through its bags.
+    image_indices: Arc<ImageIndices>,
     /// Changes of the Stellen saved (or refused) so far, and their count when the read of the
     /// tree that runs began: a read that began before a change was saved brings the Stellen of
     /// before it, so they are not taken from it.
@@ -611,6 +616,7 @@ impl DriftlessApp {
             focus_read_at: None,
             focus_read: None,
             brush: Brush::default(),
+            image_indices: Arc::default(),
             marks_saved: 0,
             tree_marks_at: 0,
             double_shift: DoubleShift::default(),
@@ -734,6 +740,12 @@ impl DriftlessApp {
 
     pub fn view(&self) -> &View3d {
         &self.view
+    }
+
+    /// Where the camera images of the scans lie in their bags, as the window keeps it for its
+    /// touch-ups.
+    pub fn image_indices(&self) -> &ImageIndices {
+        &self.image_indices
     }
 
     /// Where the panels and the floating bars were in the last frame.
@@ -2219,7 +2231,12 @@ impl DriftlessApp {
             surface: surface.clone(),
             step,
         };
-        if let Err(e) = actions::start_step(&mut self.state, &mut self.jobs, &action) {
+        // what the window has at hand: the surface shown as the loader read it, the indices
+        let prepared = TouchupPrepared {
+            surface: self.brush.prepared(&surface.join(SURFACE_GLB)),
+            indices: Some(Arc::clone(&self.image_indices)),
+        };
+        if let Err(e) = actions::start_touchup(&mut self.state, &mut self.jobs, &action, prepared) {
             self.error(e);
             if let Some((nr, seq)) = step {
                 self.take_back_step(&surface, nr, seq);

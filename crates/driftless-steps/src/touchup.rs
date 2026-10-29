@@ -49,6 +49,7 @@ use crate::report_text;
 use crate::surface::{surface_config, SURFACE_REPORT};
 use driftless_export::mesh::{read_mesh, Mesh, MeshPage};
 use driftless_io::atomic_write;
+use driftless_io::images::{index_images, ImageError, ImageIndex, ImageIndices};
 use driftless_io::lock::FileLock;
 use driftless_io::progress::Progress;
 use driftless_map::surface::edit::{
@@ -57,10 +58,13 @@ use driftless_map::surface::edit::{
     WeldedSurface, EDIT_VERSION, PATCHES_FILE,
 };
 use driftless_map::surface::{SurfaceConfig, TextureSource};
+use driftless_map::MapError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
 
 /// The folder of the touch-up in the surface folder.
 pub const TOUCHUP_DIR: &str = "nacharbeit";
@@ -73,9 +77,11 @@ const NO_RAW_DATA: &str = "Rohdaten fehlen – Bilder nicht neu eingespielt";
 const TEMP_PREFIX: &str = "nacharbeit.tmp-";
 /// The phase of reading the surface.
 const PHASE_READ: &str = "Nacharbeit: Oberfläche lesen";
+/// The phase of indexing the camera images of the sources ([`index_images`]).
+const PHASE_INDEX: &str = "Bilder verzeichnen";
 
 /// The touch-up of one surface.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct TouchupRequest {
     /// The surface folder (`oberflaeche-NNN`).
     pub surface_dir: PathBuf,
@@ -85,6 +91,92 @@ pub struct TouchupRequest {
     /// The camera images of the surface ([`crate::surface::texture_sources`]); `None` if the
     /// raw data are gone.
     pub sources: Option<Vec<TextureSource>>,
+    /// What the program has at hand already; by default nothing, and everything is read here.
+    pub prepared: TouchupPrepared,
+}
+
+/// What the program has at hand already for a touch-up ([`TouchupRequest::prepared`]): it
+/// changes how long it takes, never what comes of it.
+#[derive(Clone, Debug, Default)]
+pub struct TouchupPrepared {
+    /// The computed surface, read and welded already; used only for the glb it was read
+    /// from, as long as the file is unchanged ([`PreparedSurface::fits`]).
+    pub surface: Option<PreparedSurface>,
+    /// Where the indices of the camera images are kept between runs; without, a run that bakes
+    /// images anew indexes them for itself.
+    pub indices: Option<Arc<ImageIndices>>,
+}
+
+/// A file as it was when it was read: its path, size and modification time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl FileStamp {
+    /// The stamp of the file at `path` now; `None` if it cannot be looked at.
+    pub fn of(path: &Path) -> Option<FileStamp> {
+        let meta = fs::metadata(path).ok()?;
+        Some(FileStamp {
+            path: path.to_path_buf(),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+/// The glb of a surface folder as [`run_touchup`] reads it: the mesh as read, welded, and the
+/// tree of its faces (the window's loader builds them for the brush). It belongs to the file it
+/// was read from, as it was then.
+#[derive(Clone, Debug)]
+pub struct PreparedSurface {
+    pub mesh: Arc<Mesh>,
+    pub welded: Arc<WeldedSurface>,
+    pub bvh: Arc<FaceBvh>,
+    glb: FileStamp,
+}
+
+impl PreparedSurface {
+    /// The surface read as `mesh` from the glb whose stamp was `glb` before it was read
+    /// ([`FileStamp::of`]), welded as `welded` ([`WeldedSurface::from_mesh`]) with the tree
+    /// `bvh` of its faces ([`FaceBvh::build`]).
+    pub fn new(
+        glb: FileStamp,
+        mesh: Arc<Mesh>,
+        welded: Arc<WeldedSurface>,
+        bvh: Arc<FaceBvh>,
+    ) -> PreparedSurface {
+        PreparedSurface {
+            mesh,
+            welded,
+            bvh,
+            glb,
+        }
+    }
+
+    /// Reads the glb at `glb`, welds it and builds the tree of its faces. Progress: the
+    /// reading. Fails as reading the glb fails.
+    pub fn read(glb: &Path, progress: &Progress) -> Result<PreparedSurface, StepError> {
+        let stamp = FileStamp::of(glb)
+            .ok_or_else(|| StepError::Failed(format!("{} nicht lesbar", glb.display())))?;
+        let mesh = read_mesh(glb, progress)?;
+        let welded = WeldedSurface::from_mesh(&mesh);
+        let bvh = FaceBvh::build(&welded);
+        Ok(PreparedSurface::new(
+            stamp,
+            Arc::new(mesh),
+            Arc::new(welded),
+            Arc::new(bvh),
+        ))
+    }
+
+    /// Whether it is the glb at `glb` as that file is now: the same path, size and
+    /// modification time.
+    pub fn fits(&self, glb: &Path) -> bool {
+        glb == self.glb.path && FileStamp::of(glb).is_some_and(|now| now == self.glb)
+    }
 }
 
 /// What [`run_touchup`] did.
@@ -376,12 +468,16 @@ fn smoothed_only(nr: u32, why: &EditError) -> String {
 struct Replay<'a> {
     /// The computed surface, as its glb holds it.
     mesh: &'a Mesh,
-    /// The welded surface with the moves of the steps so far, and the tree of its faces.
-    s: WeldedSurface,
-    bvh: FaceBvh,
+    /// The welded surface with the moves of the steps so far, and the tree of its faces
+    /// (shared with the program's until a step moves a vertex).
+    s: Arc<WeldedSurface>,
+    bvh: Arc<FaceBvh>,
     /// The patches of the steps so far, one per step.
     patches: Vec<SurfacePatch>,
     sources: Option<&'a [TextureSource]>,
+    /// Per source the index of its images, once a step needed them, and where they are kept.
+    indices: Option<Vec<Arc<ImageIndex>>>,
+    kept: Option<&'a ImageIndices>,
     cfg: &'a SurfaceConfig,
 }
 
@@ -428,8 +524,8 @@ impl Replay<'_> {
             EditStep::Smooth { level, .. } => {
                 match smooth_region(&self.s, &faces, smoothing(level)) {
                     Ok(moved) => {
-                        self.s.apply_moves(&moved);
-                        self.bvh = FaceBvh::build(&self.s);
+                        Arc::make_mut(&mut self.s).apply_moves(&moved);
+                        self.bvh = Arc::new(FaceBvh::build(&self.s));
                         // The images of the Stelle anew, onto the surface as it is smoothed now.
                         self.patches.push(SurfacePatch {
                             moved,
@@ -479,17 +575,58 @@ impl Replay<'_> {
 
     /// The images of the Stelle `faces` baked anew as `variant`, onto the surface as the steps
     /// so far left it.
-    fn bake(&self, faces: &[u32], variant: u32, progress: &Progress) -> Result<Baked, StepError> {
+    fn bake(
+        &mut self,
+        faces: &[u32],
+        variant: u32,
+        progress: &Progress,
+    ) -> Result<Baked, StepError> {
         let Some(sources) = self.sources else {
             return Ok(Baked::NoRawData);
         };
+        let indices = self.indices(sources, progress)?;
         let current = apply_patches(self.mesh, &self.s, &self.patches);
         match retexture_region(
-            &self.s, &current, faces, sources, variant, self.cfg, progress,
+            &self.s, &self.bvh, &current, faces, sources, &indices, variant, self.cfg, progress,
         ) {
             Ok(done) => Ok(Baked::Done(done)),
             Err(e) => refusal(e).map(Baked::Refused),
         }
+    }
+
+    /// Per source the index of its images: those kept ([`ImageIndices`]) where they are current,
+    /// else made now (phase „Bilder verzeichnen“), once per run.
+    fn indices(
+        &mut self,
+        sources: &[TextureSource],
+        progress: &Progress,
+    ) -> Result<Vec<Arc<ImageIndex>>, StepError> {
+        if let Some(indices) = &self.indices {
+            return Ok(indices.clone());
+        }
+        let kept = self.kept;
+        let mut announced = false;
+        let indices = sources
+            .iter()
+            .map(|src| {
+                let (bags, topics) = (&src.images.bags, &src.images.topics);
+                let made = kept.is_some_and(|k| k.holds(bags, topics));
+                if !made && !announced {
+                    progress.phase(PHASE_INDEX, None);
+                    announced = true;
+                }
+                match kept {
+                    Some(kept) => kept.get(bags, topics, progress),
+                    None => index_images(bags, topics, progress).map(Arc::new),
+                }
+            })
+            .collect::<Result<Vec<_>, ImageError>>()
+            .map_err(|e| match e {
+                ImageError::Cancelled => StepError::Cancelled,
+                e => EditError::from(MapError::Images(e.to_string())).into(),
+            })?;
+        self.indices = Some(indices.clone());
+        Ok(indices)
     }
 }
 
@@ -563,25 +700,44 @@ pub fn run_touchup(req: &TouchupRequest, progress: &Progress) -> Result<TouchupD
                 dir.join(SURFACE_REPORT).display()
             )
         })?;
-        progress.phase(PHASE_READ, None);
-        let mesh = read_mesh(&dir.join(SURFACE_GLB), progress)?;
-        check_cancel(progress)?;
-        let mut s = WeldedSurface::from_mesh(&mesh);
+        // The surface as read from its glb: the one the program has at hand, if it is of
+        // this glb as it is now.
+        let glb = dir.join(SURFACE_GLB);
+        let (mesh, mut s, tree) = match &req.prepared.surface {
+            Some(p) if p.fits(&glb) => (
+                Arc::clone(&p.mesh),
+                Arc::clone(&p.welded),
+                Some(Arc::clone(&p.bvh)),
+            ),
+            _ => {
+                progress.phase(PHASE_READ, None);
+                let mesh = read_mesh(&glb, progress)?;
+                check_cancel(progress)?;
+                let s = WeldedSurface::from_mesh(&mesh);
+                (Arc::new(mesh), Arc::new(s), None)
+            }
+        };
         if !patches_fit(&s, &patches) {
             steps.clear();
             patches.clear();
             reused = 0;
         }
-        for patch in &patches {
-            s.apply_moves(&patch.moved);
+        let moved = patches.iter().any(|p| !p.moved.is_empty());
+        for patch in patches.iter().filter(|p| !p.moved.is_empty()) {
+            Arc::make_mut(&mut s).apply_moves(&patch.moved);
         }
-        let bvh = FaceBvh::build(&s);
+        let bvh = match tree {
+            Some(tree) if !moved => tree,
+            _ => Arc::new(FaceBvh::build(&s)),
+        };
         let mut replay = Replay {
             mesh: &mesh,
             s,
             bvh,
             patches,
             sources: req.sources.as_deref(),
+            indices: None,
+            kept: req.prepared.indices.as_deref(),
             cfg: &cfg,
         };
         for (i, event) in events.iter().enumerate().skip(steps.len()) {

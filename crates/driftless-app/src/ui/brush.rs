@@ -52,6 +52,7 @@ use crate::render::ShowMode;
 use crate::surface::SurfacePick;
 use driftless_map::surface::edit::{dab_normal, select_faces, RayHit, SelectDab};
 use driftless_steps::marks::{Dab, DabInput, Mark, Marks, SmoothLevel, StepInput, MARKS_FILE};
+use driftless_steps::touchup::PreparedSurface;
 use eframe::egui::{self, Align2, Context, Key, KeyboardShortcut, Modifiers, Rect, Ui};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -762,6 +763,13 @@ impl Brush {
         self.selected.clear();
         self.ring = None;
         self.dirty = true;
+    }
+
+    /// The surface shown as its loader read it, for a touch-up of its glb `glb`
+    /// ([`SurfacePick::prepared`]); `None` for another surface or one not read from its file.
+    pub fn prepared(&self, glb: &Path) -> Option<PreparedSurface> {
+        let hits = self.hits.as_ref().filter(|h| h.glb == glb)?;
+        hits.pick.prepared()
     }
 
     /// Where the touch-up of the surface shown moved its corners (welded vertex, new place), as

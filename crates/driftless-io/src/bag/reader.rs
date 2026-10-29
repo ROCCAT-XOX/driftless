@@ -26,14 +26,14 @@ pub struct RawMessage {
 }
 
 pub struct BagReader<R: Read + Seek> {
-    r: R,
+    pub(super) r: R,
     conns: Vec<Connection>,
-    by_id: HashMap<u32, usize>,
+    pub(super) by_id: HashMap<u32, usize>,
     /// First byte after the bag header record.
-    data_start: u64,
-    file_len: u64,
+    pub(super) data_start: u64,
+    pub(super) file_len: u64,
     /// Offset of the index section from the bag header (0 = unindexed).
-    index_pos: u64,
+    pub(super) index_pos: u64,
 }
 
 impl BagReader<BufReader<File>> {
@@ -57,19 +57,19 @@ fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<bool, BagError> {
 }
 
 /// A top-level record header; the data (`data_len` bytes) has not been consumed yet.
-struct Head {
-    fields: Fields,
-    data_len: u64,
-    data_pos: u64,
+pub(super) struct Head {
+    pub(super) fields: Fields,
+    pub(super) data_len: u64,
+    pub(super) data_pos: u64,
 }
 
-enum Next {
+pub(super) enum Next {
     Eof,
     Record(Head),
 }
 
 /// Reads the next record header at `pos`. A partial header is `Truncated { offset: pos }`.
-fn read_head<R: Read>(r: &mut R, pos: u64, file_len: u64) -> Result<Next, BagError> {
+pub(super) fn read_head<R: Read>(r: &mut R, pos: u64, file_len: u64) -> Result<Next, BagError> {
     let trunc = BagError::Truncated { offset: pos };
     if pos >= file_len {
         return Ok(Next::Eof);
@@ -98,7 +98,7 @@ fn read_head<R: Read>(r: &mut R, pos: u64, file_len: u64) -> Result<Next, BagErr
     }))
 }
 
-fn parse_connection(fields: &Fields, data: &[u8]) -> Result<Connection, BagError> {
+pub(super) fn parse_connection(fields: &Fields, data: &[u8]) -> Result<Connection, BagError> {
     let d = Fields::parse(data)?;
     Ok(Connection {
         id: fields.u32("conn")?,
@@ -111,7 +111,11 @@ fn parse_connection(fields: &Fields, data: &[u8]) -> Result<Connection, BagError
     })
 }
 
-fn decompress(compression: &str, data: Vec<u8>, size_hint: usize) -> Result<Vec<u8>, BagError> {
+pub(super) fn decompress(
+    compression: &str,
+    data: Vec<u8>,
+    size_hint: usize,
+) -> Result<Vec<u8>, BagError> {
     match compression {
         "none" => Ok(data),
         "lz4" => {
@@ -220,7 +224,12 @@ impl<R: Read + Seek> BagReader<R> {
         &self.conns
     }
 
-    fn add_connection(&mut self, c: Connection) {
+    /// The topic of connection `id`, if the bag declares it (so far).
+    pub(super) fn topic_of(&self, id: u32) -> Option<&str> {
+        self.by_id.get(&id).map(|&i| self.conns[i].topic.as_str())
+    }
+
+    pub(super) fn add_connection(&mut self, c: Connection) {
         if !self.by_id.contains_key(&c.id) {
             self.by_id.insert(c.id, self.conns.len());
             self.conns.push(c);
