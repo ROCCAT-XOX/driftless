@@ -293,7 +293,7 @@ fn fingerprint_changes_with_content_only() {
     let dir = tmp("steps-marks-fingerprint");
     let marks = two_marks();
     let key = marks.fingerprint();
-    assert_eq!(key.len(), 64, "{key}");
+    assert_eq!(key.len(), 16, "{key}");
     assert!(key
         .bytes()
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));

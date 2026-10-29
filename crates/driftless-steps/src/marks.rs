@@ -47,11 +47,11 @@
 //! as it is. Any other unknown key (beside `stelle`, in a dab or a step), a missing key or a
 //! value of the wrong type makes the file unreadable instead of being dropped silently.
 
+use crate::map::hex;
 use crate::StepError;
 use driftless_io::lock::FileLock;
 use driftless_traj::nalgebra::Vector3;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -395,38 +395,23 @@ impl Marks {
         self.marks.len() != before
     }
 
-    /// The key of a cache made from the marks: SHA-256 (hex) of the marks in their order with
-    /// their numbers, dabs and steps. The counters and unknown keys are no part of it, so the
-    /// key stays the same through saving and loading and with a note added by hand, and an
+    /// The key of a cache made from the marks, hashed like the input ids of the steps
+    /// ([`hex`]): the marks in their order with their numbers, dabs and steps, numbers
+    /// written exactly (`{:?}`). The counters and unknown keys are no part of it, so the key
+    /// stays the same through saving and loading and with a note added by hand, and an
     /// undone change brings back the key from before it.
     pub fn fingerprint(&self) -> String {
-        let mut hash = Sha256::new();
+        let mut id = String::new();
         for m in &self.marks {
-            hash.update(m.nr.to_le_bytes());
-            hash.update((m.dabs.len() as u64).to_le_bytes());
+            id += &format!("stelle {}\n", m.nr);
             for d in &m.dabs {
-                for c in d.centre {
-                    hash.update(c.to_le_bytes());
-                }
-                for c in d.normal {
-                    hash.update(c.to_le_bytes());
-                }
-                hash.update(d.radius.to_le_bytes());
-                hash.update([u8::from(d.erase)]);
-                hash.update(d.seq.to_le_bytes());
+                id += &format!("{d:?}\n");
             }
-            hash.update((m.steps.len() as u64).to_le_bytes());
             for s in &m.steps {
-                let (kind, value) = match *s {
-                    EditStep::Smooth { level, .. } => (0u8, level as u32),
-                    EditStep::Retexture { variant, .. } => (1, variant),
-                };
-                hash.update([kind]);
-                hash.update(value.to_le_bytes());
-                hash.update(s.seq().to_le_bytes());
+                id += &format!("{s:?}\n");
             }
         }
-        format!("{:x}", hash.finalize())
+        hex(&id)
     }
 
     /// The index of mark `nr`.
@@ -623,11 +608,8 @@ mod tests {
 
     #[test]
     fn fingerprint_is_the_same_everywhere() {
-        // SHA-256 of nothing
-        assert_eq!(
-            Marks::default().fingerprint(),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
+        // FNV-1a of nothing, as for the input ids
+        assert_eq!(Marks::default().fingerprint(), "cbf29ce484222325");
         // the key of a cache made on another computer or by another build
         let mut marks = Marks::default();
         let floor = DabInput {
@@ -644,10 +626,7 @@ mod tests {
         marks
             .add_step(nr, StepInput::Retexture { variant: 1 })
             .unwrap();
-        assert_eq!(
-            marks.fingerprint(),
-            "8960dbef481df265c502d36f7e1f308888d4226bafc5f369a1a2e8d5eb3cdb53"
-        );
+        assert_eq!(marks.fingerprint(), "283f4379c1c83d2f");
     }
 
     #[test]
