@@ -299,6 +299,38 @@ impl Camera {
         self.eye = self.target - self.dir() * self.distance;
     }
 
+    /// Looks at a place along the opposite of `normal`, straight at it – at a wall from in
+    /// front, at a floor from above, at a ceiling from below (within ±[`PITCH_LIMIT_DEG`]) –
+    /// with `centre` in the middle, far enough that a sphere of `radius` around it fits an image
+    /// of this aspect ratio (width / height; not finite and positive: 1), as
+    /// [`Camera::frame_bounds`] fits a box. Straight up or down keeps the yaw; a normal without
+    /// a direction keeps the direction. A centre that is not finite leaves the camera as it is.
+    pub fn frame_facing(&mut self, centre: [f32; 3], normal: [f32; 3], radius: f32, aspect: f32) {
+        let centre = Vector3::from(centre);
+        if !centre.iter().all(|v| v.is_finite()) {
+            return;
+        }
+        let normal = Vector3::from(normal);
+        if let Some(n) = normal
+            .try_normalize(f32::EPSILON)
+            .filter(|n| n.iter().all(|v| v.is_finite()))
+        {
+            let look = -n;
+            // seen from straight above or below the yaw is any: keep it
+            if look.x.hypot(look.y) > 1e-4 {
+                self.yaw = look.y.atan2(look.x).rem_euclid(std::f32::consts::TAU);
+            }
+            self.pitch = clamp_pitch(look.z.clamp(-1.0, 1.0).asin());
+        }
+        let radius = if radius.is_finite() { radius } else { 0.0 }.max(MIN_DISTANCE);
+        let half_y = self.fov_y / 2.0;
+        let half_x = (half_y.tan() * safe_aspect(aspect)).atan();
+        let half = half_y.min(half_x);
+        self.target = centre;
+        self.distance = (radius / half.sin() * FRAME_MARGIN).max(MIN_DISTANCE);
+        self.eye = self.target - self.dir() * self.distance;
+    }
+
     /// The ray from the eye through a pixel of the view; for a degenerate viewport (see
     /// [`valid_viewport`]) the view direction.
     pub fn ray(&self, pixel_px: [f32; 2], viewport_px: [f32; 2]) -> Ray {

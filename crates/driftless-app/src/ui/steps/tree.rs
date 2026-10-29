@@ -12,10 +12,12 @@
 //! the full name and the folder show on hover. A run, a map, a model and a surface have
 //! „Exportieren …“ in their context menu (right click, [`Action::OpenExport`]). A run or map
 //! whose report is missing but which holds finished results is marked „unvollständig – neu
-//! rechnen“, why and what to do on hover ([`crate::leftovers`]).
+//! rechnen“, why and what to do on hover ([`crate::leftovers`]). „Bilder“ lists below the
+//! surfaces of the map or model whose surface is shown its Stellen ([`mark_list`]).
 
 use super::{badge, model_stale_hint};
 use crate::project::{MapInfo, ModelInfo, RunInfo, SurfaceInfo};
+use crate::render::mesh::mark_color;
 use crate::render::SCAN_COLORS;
 use crate::ui::theme::{icon, DARK};
 use crate::ui::{text, Action, AppState, Selection};
@@ -352,6 +354,66 @@ fn pair_list(ui: &mut Ui, state: &AppState, model: &ModelInfo, action: &mut Opti
             }
         });
 }
+
+/// „Markierte Stellen“: the Stellen of the map or model in `owner` („Stelle 1 · Wand“), each
+/// with a stripe in its colour and its last step small below it. A click shows a Stelle in the
+/// view and chooses it for the brush ([`Action::FrameMark`]; on the chosen one again: none,
+/// [`Action::SelectMark`]); right click „Löschen“ ([`Action::DeleteMark`]). Why `stellen.toml`
+/// cannot be read instead; nothing without Stellen.
+pub(super) fn mark_list(ui: &mut Ui, state: &AppState, owner: &Path, action: &mut Option<Action>) {
+    let marks = match state.marks.get(owner) {
+        Some(Ok(marks)) if !marks.marks.is_empty() => marks,
+        Some(Err(why)) => {
+            let why = RichText::new(why).color(DARK.warn);
+            ui.add(egui::Label::new(why).wrap());
+            return;
+        }
+        _ => return,
+    };
+    egui::CollapsingHeader::new(text::MARKS_LIST)
+        .id_salt(("stellen", owner))
+        .default_open(true)
+        .show(ui, |ui| {
+            for mark in &marks.marks {
+                let selected = state.brush.active == Some(mark.nr);
+                let [r, g, b, _] = mark_color(mark.nr);
+                let label = mark.label();
+                let row = ui.horizontal(|ui| {
+                    let (stripe, _) =
+                        ui.allocate_exact_size(egui::vec2(MARK_STRIPE, MARK_ROW), Sense::hover());
+                    ui.painter()
+                        .rect_filled(stripe, 1.0, Color32::from_rgb(r, g, b));
+                    entry(ui, selected, label.clone(), text::MARK_HINT)
+                });
+                let r = row.inner;
+                if let Some(step) = mark.steps.last() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(MARK_STRIPE + ui.spacing().item_spacing.x);
+                        let line = RichText::new(text::mark_step(step))
+                            .small()
+                            .color(DARK.text_dim);
+                        ui.add(egui::Label::new(line).truncate());
+                    });
+                }
+                r.context_menu(|ui| {
+                    if ui.button(text::MARK_DELETE).clicked() {
+                        *action = Some(Action::DeleteMark(mark.nr));
+                    }
+                });
+                if r.clicked() {
+                    *action = Some(if selected {
+                        Action::SelectMark(None)
+                    } else {
+                        Action::FrameMark(mark.nr)
+                    });
+                }
+            }
+        });
+}
+
+/// Width of the colour stripe of a Stelle in the list, and its height (points).
+const MARK_STRIPE: f32 = 3.0;
+const MARK_ROW: f32 = 18.0;
 
 fn cloud_leaf(ui: &mut Ui, state: &AppState, cloud: &Path, action: &mut Option<Action>) {
     let selected = state.selection == Selection::Cloud(cloud.to_path_buf());

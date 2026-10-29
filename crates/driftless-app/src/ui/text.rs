@@ -612,6 +612,119 @@ pub const PICKS_ON_CLOUD: &str = "misst an der Punktwolke, nicht an der Fläche"
 /// Measuring and picking look at points only.
 pub const TOOL_NEEDS_CLOUD: &str = "Messen und Punkt wählen brauchen eine Punktwolke";
 
+// The tool „Pinsel“: Stellen painted on the surface, their bar over the tools, their list in
+// „Bilder“.
+pub const TOOL_BRUSH: &str = "Pinsel";
+pub const TOOL_BRUSH_HINT: &str =
+    "Stellen auf die Oberfläche malen, um sie nachzuarbeiten (glätten, Bilder neu einspielen)";
+/// Why „Pinsel“ is off: no surface is loaded.
+pub const BRUSH_NEEDS_SURFACE: &str = "Pinsel braucht eine Oberfläche";
+/// Why „Pinsel“ is off: the surface is loaded, but only the points are shown.
+pub const BRUSH_NEEDS_SHOWN: &str =
+    "Pinsel malt auf die gezeigte Fläche: oben rechts „Fläche“ oder „beides“ wählen";
+/// Why „Pinsel“ is off: the surface shown is a file opened, no surface of the project.
+pub const BRUSH_NOT_IN_PROJECT: &str =
+    "Pinsel malt nur auf Oberflächen der Karten und Modelle des Projekts";
+/// The size of the brush in its bar, and its tooltip.
+pub const BRUSH_SIZE: &str = "Größe";
+pub const BRUSH_SIZE_HINT: &str = "Radius des Pinsels";
+/// ↶ in the bar of the brush.
+pub const BRUSH_UNDO: &str = "Zurücknehmen";
+/// Above the list of the Stellen of a map or model in „Bilder“.
+pub const MARKS_LIST: &str = "Markierte Stellen";
+pub const MARK_HINT: &str =
+    "Klick zeigt die Stelle in der Ansicht, der Pinsel malt dann in sie · Rechtsklick: Löschen";
+/// The context menu of a Stelle: takes it out with all its touch-up (no question first).
+pub const MARK_DELETE: &str = "Löschen";
+/// The label of the background work that writes `stellen.toml`.
+pub const MARKS_JOB: &str = "Stellen speichern";
+
+/// The key that erases with the brush: ⌥ (option) on a Mac – drawn by the icon font, the
+/// plain fonts lack it –, else Alt.
+pub fn erase_key() -> &'static str {
+    if cfg!(target_os = "macos") {
+        egui_phosphor::regular::OPTION
+    } else {
+        "Alt"
+    }
+}
+
+/// The keys that take back the last stroke or step: ⌘Z on a Mac, else Strg+Z.
+pub fn undo_keys() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌘Z"
+    } else {
+        "Strg+Z"
+    }
+}
+
+/// What a click with the brush does: „Pinsel: Stelle anmalen · mit ⌥ radieren“, painting
+/// into the chosen Stelle `active` „Pinsel: in Stelle 2 malen · mit ⌥ radieren · Esc: neue
+/// Stelle“.
+pub fn brush_hint(active: Option<u32>) -> String {
+    let erase = erase_key();
+    match active {
+        None => format!("Pinsel: Stelle anmalen · mit {erase} radieren"),
+        Some(nr) => {
+            format!("Pinsel: in Stelle {nr} malen · mit {erase} radieren · Esc: neue Stelle")
+        }
+    }
+}
+
+/// The tooltip of ↶.
+pub fn brush_undo_hint() -> String {
+    format!(
+        "Letzten Pinselzug oder Schritt zurücknehmen ({})",
+        undo_keys()
+    )
+}
+
+/// The mouse and keys of the view while the brush is chosen (the tooltip of the info); `fly`:
+/// in fly mode, where the right button looks around.
+pub fn view_help_brush(fly: bool) -> String {
+    let right = if fly { "umsehen" } else { "drehen" };
+    format!(
+        "Linke Taste: malen, mit {} radieren · rechte Taste: {right} · mittlere Taste oder \
+         Shift: verschieben · Rad: Zoom · {}: zurücknehmen · Esc: neue Stelle · F: alles zeigen",
+        erase_key(),
+        undo_keys()
+    )
+}
+
+/// A size of the brush (m) in whole centimetres: „20 cm“.
+pub fn centimetres(m: f32) -> String {
+    format!("{:.0} cm", f64::from(m) * 100.0)
+}
+
+/// The last step of a Stelle, under its name in the list: „geglättet „stark““, „ganz eben“,
+/// „Bilder neu eingespielt“.
+pub fn mark_step(step: &driftless_steps::marks::EditStep) -> String {
+    use driftless_steps::marks::{EditStep, SmoothLevel};
+    match step {
+        EditStep::Smooth {
+            level: SmoothLevel::Light,
+            ..
+        } => "geglättet „leicht“".into(),
+        EditStep::Smooth {
+            level: SmoothLevel::Strong,
+            ..
+        } => "geglättet „stark“".into(),
+        EditStep::Smooth {
+            level: SmoothLevel::Flat,
+            ..
+        } => "geglättet „ganz eben“".into(),
+        EditStep::Retexture { variant: 0, .. } => "Bilder neu eingespielt".into(),
+        EditStep::Retexture { variant, .. } => {
+            format!("Bilder neu eingespielt (Variante {})", variant + 1)
+        }
+    }
+}
+
+/// A change of the Stellen that could not be saved: they are read again from the file.
+pub fn marks_not_saved(why: &str) -> String {
+    format!("Stellen nicht gespeichert: {why}")
+}
+
 // Measurements (field „Planung“)
 pub const MEASUREMENTS: &str = "Messungen";
 pub const NO_MEASUREMENTS: &str =

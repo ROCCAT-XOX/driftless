@@ -12,6 +12,11 @@
 //! wählen“ a pose of the trajectory whatever the tool. The info, the tools and the
 //! measurements over the view are drawn by [`super::tools`].
 //!
+//! With the tool „Pinsel“ ([`Tool::Brush`]) the left button paints from the moment it is
+//! pressed (with ⌥/Alt it erases): the view moves nothing then and hands the way of the pointer
+//! to the window ([`View3d::brush_input`], [`super::brush`]). Shift + left and the middle button
+//! pan, the right button orbits (in fly mode: looks), and a double click frames nothing.
+//!
 //! Over the cloud the view draws the run of [`ViewOverlay`] (trajectory, odometry, loops,
 //! anchors, picked places); without a cloud the run alone. The height cut applies to the
 //! points and the surface only: the trajectory is neither cut nor kept from being clicked by
@@ -292,6 +297,26 @@ struct SurfaceShown {
     triangles: usize,
 }
 
+/// What the pointer did for the brush in the last frame ([`View3d::brush_input`]): filled only
+/// while the tool is [`Tool::Brush`]. Pixels are physical, from the top left of the view.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrushInput {
+    /// The size of the view (physical pixels), for the rays through its pixels.
+    pub viewport: [f32; 2],
+    /// Where the pointer is over the view while nothing else lies over it there, or while it
+    /// paints.
+    pub hover: Option<[f32; 2]>,
+    /// The left button went down on the view this frame without Shift: a stroke begins.
+    pub pressed: bool,
+    /// ⌥/Alt: held now, while painting since the press. The stroke erases.
+    pub erase: bool,
+    /// The way of the pointer this frame while it paints, in order: where it was pressed
+    /// first, then every place it moved to (and where it was let go).
+    pub path: Vec<[f32; 2]>,
+    /// The stroke ended this frame: the left button was let go (or the view lost it).
+    pub released: bool,
+}
+
 /// A press of the primary button inside the view, until it is released.
 #[derive(Debug, Clone, Copy)]
 struct Press {
@@ -353,6 +378,10 @@ pub struct View3d {
     edit_count: u64,
     /// „Nachher“: draw the touched-up state.
     show_edit: bool,
+    /// A stroke of the brush is being painted: whether it erases.
+    painting: Option<bool>,
+    /// What the pointer did for the brush in the last frame.
+    brush_input: BrushInput,
 }
 
 impl View3d {
@@ -460,6 +489,12 @@ impl View3d {
         self.tool = tool;
     }
 
+    /// What the pointer did for the brush in the last frame (empty unless the tool is
+    /// [`Tool::Brush`]).
+    pub fn brush_input(&self) -> &BrushInput {
+        &self.brush_input
+    }
+
     /// Marks point `index` of the cloud (index in the point set), or none.
     pub fn set_picked(&mut self, index: Option<u32>) {
         self.picked = index;
@@ -480,6 +515,8 @@ impl View3d {
         overlay: Option<ViewOverlay<'_>>,
         settings: &ViewSettings,
     ) -> Option<ViewEvent> {
+        // what the pointer does for the brush is told anew every frame
+        self.brush_input = BrushInput::default();
         let size = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
         // A collapsed or squeezed panel: no target, no camera change (aspect 0).
@@ -849,13 +886,22 @@ impl View3d {
         let ctx = ui.ctx();
         let mode = self.camera.mode;
         let shift = ctx.input(|i| i.modifiers.shift);
+        let brush = self.tool == Tool::Brush;
+        self.brush_stroke(ctx, response, rect, ppp, viewport, shift);
+        let painting = self.painting.is_some();
         let delta = response.drag_delta() * ppp;
         let by = |b| response.dragged_by(b);
-        // the tool „Verschieben“ pans with the left button; every other tool turns
-        let left_pans = self.tool == Tool::Pan;
+        // the tool „Verschieben“ pans with the left button, the brush paints with it (with
+        // Shift it pans); every other tool turns
+        let left_pans = self.tool == Tool::Pan || brush;
         match mode {
             CameraMode::Orbit => {
-                if by(PointerButton::Primary) && !shift && !left_pans {
+                if by(PointerButton::Primary) && painting {
+                    // the brush paints: the view stays
+                } else if (by(PointerButton::Primary) && !shift && !left_pans)
+                    || (by(PointerButton::Secondary) && brush)
+                {
+                    // the brush turns with the right button
                     self.camera.orbit(delta.x, delta.y);
                 } else if by(PointerButton::Primary)
                     || by(PointerButton::Secondary)
@@ -865,7 +911,9 @@ impl View3d {
                 }
             }
             CameraMode::Fly => {
-                if by(PointerButton::Primary) && left_pans {
+                if by(PointerButton::Primary) && painting {
+                    // the brush paints: the view stays
+                } else if by(PointerButton::Primary) && left_pans {
                     self.camera.pan(delta.x, delta.y, viewport);
                 } else if by(PointerButton::Primary) || by(PointerButton::Secondary) {
                     self.camera.look(delta.x, delta.y);
@@ -955,8 +1003,10 @@ impl View3d {
                 }
             }
         }
+        // a double click with the brush paints twice, it frames nothing
         if response.double_clicked()
             && event.is_none()
+            && !brush
             && self.hit_nothing(rect, ppp, viewport, cloud, pos, settings)
         {
             self.frame_all = true;
@@ -965,6 +1015,80 @@ impl View3d {
             ctx.request_repaint();
         }
         event
+    }
+
+    /// The brush's part of the input ([`BrushInput`]): a stroke begins where the left button
+    /// goes down on the view without Shift (at once, a click paints too), follows every place
+    /// the pointer moves to and ends where the button is let go. Another tool ends a stroke
+    /// that runs.
+    fn brush_stroke(
+        &mut self,
+        ctx: &egui::Context,
+        response: &egui::Response,
+        rect: Rect,
+        ppp: f32,
+        viewport: [f32; 2],
+        shift: bool,
+    ) {
+        let input = &mut self.brush_input;
+        input.viewport = viewport;
+        if self.tool != Tool::Brush {
+            if self.painting.take().is_some() {
+                input.released = true;
+            }
+            return;
+        }
+        let at = |p: egui::Pos2| to_physical([p.x, p.y], [rect.min.x, rect.min.y], ppp);
+        let (pressed, down, alt, hover, events) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.modifiers.alt,
+                i.pointer.hover_pos(),
+                i.events.clone(),
+            )
+        });
+        let begins = pressed && response.hovered() && !shift && self.painting.is_none();
+        if begins {
+            self.painting = Some(alt);
+            input.pressed = true;
+        }
+        if let Some(erase) = self.painting {
+            input.erase = erase;
+            // the way since the press (this frame) or since the last frame
+            let mut on = !begins;
+            for event in &events {
+                match event {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed,
+                        ..
+                    } => {
+                        if *pressed {
+                            on = true;
+                        }
+                        if on {
+                            input.path.push(at(*pos));
+                        }
+                    }
+                    egui::Event::PointerMoved(pos) if on => input.path.push(at(*pos)),
+                    _ => {}
+                }
+            }
+            if begins && input.path.is_empty() {
+                let press = ctx.input(|i| i.pointer.press_origin());
+                input.path.extend(press.map(at));
+            }
+            if !down {
+                input.released = true;
+                self.painting = None;
+            }
+        } else {
+            input.erase = alt;
+        }
+        let shown = response.hovered() || input.pressed || self.painting.is_some();
+        input.hover = hover.filter(|p| shown && rect.contains(*p)).map(at);
     }
 
     /// Whether no drawn point is under `pos`.

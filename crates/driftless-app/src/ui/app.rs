@@ -1,6 +1,7 @@
 //! The program: carries out the panels' actions, owns the job runners, the dialogs, the
 //! loaded cloud, the run drawn over it and the 3D view.
 
+use super::brush::{self, Brush, MarkChange};
 use super::compare::{compare_maps, compare_refs, default_refs, TrajRef};
 use super::correct::{Corrected, RunLoaded};
 use super::export::{self, ExportDialog};
@@ -15,6 +16,7 @@ use crate::cloud::{load_cloud, load_pair_cloud, LoadedCloud};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
 use crate::logfile::{self, Level, LogFile};
 use crate::overlay::RunOverlay;
+use crate::pick::relative_to;
 use crate::project::{canonical, change_project, set_point_pair_enabled, Choices, Project};
 use crate::render::ShowMode;
 use crate::surface::{load_mesh, surface_glb};
@@ -22,6 +24,7 @@ use crate::synthetic::synthetic_cloud;
 use driftless_gpu::GpuPref;
 use driftless_io::progress::{LogLine, Progress};
 use driftless_steps::export::{file_kind, ExportKind, MESH_EXTENSIONS, POINT_EXTENSIONS};
+use driftless_steps::marks::Marks;
 use driftless_steps::merge::MODEL_LAS;
 use driftless_steps::{correct, StepError};
 use eframe::egui;
@@ -306,6 +309,9 @@ enum HelperTask {
         label: String,
         bytes: Option<u64>,
     },
+    /// A change of the Stellen of the map or model in the folder, in its `stellen.toml`
+    /// ([`Marks::change`]); made on [`AppState::marks`] already.
+    Marks { owner: PathBuf, change: MarkChange },
 }
 
 /// What a „compute all“ button puts into the queue.
@@ -458,6 +464,13 @@ pub struct DriftlessApp {
     focus_read_at: Option<Instant>,
     /// When the last such read started ([`FOCUS_GAP`]).
     focus_read: Option<Instant>,
+    /// The brush at work: what it hits on the surface shown, the stroke, the Stellen as faces.
+    brush: Brush,
+    /// Changes of the Stellen saved (or refused) so far, and their count when the read of the
+    /// tree that runs began: a read that began before a change was saved brings the Stellen of
+    /// before it, so they are not taken from it.
+    marks_saved: u64,
+    tree_marks_at: u64,
 }
 
 impl DriftlessApp {
@@ -512,6 +525,9 @@ impl DriftlessApp {
             trash: crate::trash::system_trash,
             focus_read_at: None,
             focus_read: None,
+            brush: Brush::default(),
+            marks_saved: 0,
+            tree_marks_at: 0,
         }
     }
 
@@ -1102,6 +1118,8 @@ impl DriftlessApp {
             self.view.set_surface(None);
         }
         self.surface_stamp = None;
+        self.brush.set_surface(None);
+        self.state.brush.active = None;
     }
 
     /// Whether a surface is being loaded.
@@ -1170,10 +1188,20 @@ impl DriftlessApp {
         }
         match f.result {
             Ok(JobOutput::Surface(surface)) => {
+                let mut surface = *surface;
                 self.surface_stamp = stamp;
                 let (triangles, pages) = (surface.triangles(), surface.pages.len());
                 self.info(text::surface_loaded(&path, triangles, pages, f.seconds));
                 let z_range = surface.bounds().map_or([0.0; 2], |(lo, hi)| [lo[2], hi[2]]);
+                // the Stelle chosen belongs to the map or model of the surface before
+                let owner = |p: &Path| brush::owner_of(p).map(Path::to_path_buf);
+                let before = self.state.surface.as_ref().and_then(|s| owner(&s.path));
+                if before != owner(&path) {
+                    self.state.brush.active = None;
+                }
+                let pick = surface.pick.take();
+                self.brush
+                    .set_surface(pick.map(|pick| (path.clone(), surface.origin, pick)));
                 self.state.surface = Some(SurfaceSummary {
                     path,
                     triangles,
@@ -1190,7 +1218,7 @@ impl DriftlessApp {
                         self.overlay_version += 1;
                     }
                 }
-                self.view.set_surface(Some(*surface));
+                self.view.set_surface(Some(surface));
                 // the surface just picked is what is drawn; a computed one only in „Bilder“,
                 // the other steps keep showing the points
                 if std::mem::take(&mut self.surface_by_hand) || self.state.step == Step::Bilder {
@@ -1316,6 +1344,7 @@ impl DriftlessApp {
             Ok(()) => {
                 self.tree_task = Some(task);
                 self.tree_discard = false;
+                self.tree_marks_at = self.marks_saved;
             }
             Err(e) => self.error(e.to_string()),
         }
@@ -1377,7 +1406,14 @@ impl DriftlessApp {
                             ..
                         } = *read;
                         self.state.project = Some(project);
+                        // Stellen changed while the tree was read are newer than its
+                        let changed =
+                            self.marks_pending() || self.marks_saved != self.tree_marks_at;
+                        let marks = changed.then(|| std::mem::take(&mut self.state.marks));
                         self.state.set_tree(tree);
+                        if let Some(marks) = marks {
+                            self.state.marks = marks;
+                        }
                         self.tell_cloud(&dir, cloud);
                     }
                     Ok(_) => {}
@@ -1585,22 +1621,25 @@ impl DriftlessApp {
     /// the step is cancelled and [`DriftlessApp::take_close`] says when to close, so the
     /// window never waits for it inside the event loop.
     pub fn close_requested(&mut self) -> bool {
-        if !self.jobs.is_busy() {
+        // a stroke or ↶ not yet in `stellen.toml` is saved first
+        if !self.jobs.is_busy() && !self.marks_pending() {
             return true;
         }
         if !self.closing {
             self.closing = true;
-            self.pending = None;
-            self.stop_queue();
-            self.jobs.cancel();
-            self.info(text::CLOSE_AFTER_CANCEL.to_string());
+            if self.jobs.is_busy() {
+                self.pending = None;
+                self.stop_queue();
+                self.jobs.cancel();
+                self.info(text::CLOSE_AFTER_CANCEL.to_string());
+            }
         }
         false
     }
 
-    /// True once, after a put-off close, when the step has ended.
+    /// True once, after a put-off close, when the step has ended and the Stellen are saved.
     pub fn take_close(&mut self) -> bool {
-        if self.closing && !self.jobs.is_busy() {
+        if self.closing && !self.jobs.is_busy() && !self.marks_pending() {
             self.closing = false;
             return true;
         }
@@ -1721,6 +1760,9 @@ impl DriftlessApp {
                             Err(e) => Err(e.to_string()),
                         });
                     }
+                }
+                (Some(HelperTask::Marks { owner, .. }), result) => {
+                    self.marks_written(owner, result)
                 }
                 _ => {}
             }
@@ -1860,6 +1902,13 @@ impl DriftlessApp {
                     Ok(JobOutput::Done)
                 })
             }
+            HelperTask::Marks { owner, change } => {
+                let (owner, change) = (owner.clone(), change.clone());
+                self.helper.start(text::MARKS_JOB, move |_| {
+                    let (marks, _) = Marks::change(&owner, |m| Ok(change.apply(m)))?;
+                    Ok(JobOutput::Marks(Box::new(marks)))
+                })
+            }
         };
         match started {
             Ok(()) => {
@@ -1893,9 +1942,99 @@ impl DriftlessApp {
                     let id = id.clone();
                     self.relinked(&id, Err(StepError::Failed(e.to_string())))
                 }
+                HelperTask::Marks { owner, .. } => {
+                    let owner = owner.clone();
+                    self.marks_written(owner, Err(StepError::Failed(e.to_string())))
+                }
                 _ => self.error(e.to_string()),
             },
         }
+    }
+
+    /// Changes the Stellen of the map or model in `owner`: at once on those shown
+    /// ([`AppState::marks`]; a stroke chooses its Stelle if the surface of `owner` is shown),
+    /// then in its `stellen.toml` in the background, in order. A change that changes nothing
+    /// writes nothing; an unreadable file is changed not at all.
+    fn change_marks(&mut self, owner: PathBuf, change: MarkChange) {
+        let shown = brush::shown_owner(&self.state) == Some(owner.as_path());
+        let read = self
+            .state
+            .marks
+            .entry(owner.clone())
+            .or_insert_with(|| Ok(Marks::default()));
+        let marks = match read {
+            Ok(marks) => marks,
+            Err(e) => {
+                let e = text::marks_not_saved(e);
+                self.error(e);
+                return;
+            }
+        };
+        let before = marks.clone();
+        let painted = change.apply(marks);
+        let changed = *marks != before;
+        if marks.marks.is_empty() {
+            self.state.marks.remove(&owner);
+        }
+        if !changed {
+            return;
+        }
+        if shown && painted.is_some() {
+            self.state.brush.active = painted;
+        }
+        self.helper_queue
+            .push_back(HelperTask::Marks { owner, change });
+    }
+
+    /// A change of the Stellen of `owner` was written (or refused): the file as it is now is
+    /// shown, unless a later change of it is still to be written (it brings its own); a refusal
+    /// is said, and the tree – with the Stellen as the file has them – is read again.
+    fn marks_written(&mut self, owner: PathBuf, result: Result<JobOutput, StepError>) {
+        self.marks_saved += 1;
+        let later = self
+            .helper_queue
+            .iter()
+            .any(|t| matches!(t, HelperTask::Marks { owner: o, .. } if *o == owner));
+        match result {
+            Ok(JobOutput::Marks(marks)) if !later => {
+                if marks.marks.is_empty() {
+                    self.state.marks.remove(&owner);
+                } else {
+                    self.state.marks.insert(owner, Ok(*marks));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.error(text::marks_not_saved(&text::step_error(&e)));
+                self.refresh_tree();
+            }
+        }
+    }
+
+    /// Whether a change of the Stellen is still to be written.
+    fn marks_pending(&self) -> bool {
+        let marks = |t: &HelperTask| matches!(t, HelperTask::Marks { .. });
+        self.helper_running.as_ref().is_some_and(marks) || self.helper_queue.iter().any(marks)
+    }
+
+    /// Chooses Stelle `nr` of the surface shown and looks straight at it.
+    fn frame_mark(&mut self, nr: u32) {
+        self.state.brush.active = Some(nr);
+        let (Some(origin), Some((centre, normal, size))) =
+            (self.view_origin(), self.brush.place_of(&self.state, nr))
+        else {
+            return;
+        };
+        let view = self.layout.view;
+        let aspect = if view.height() > 0.0 {
+            view.width() / view.height()
+        } else {
+            1.0
+        };
+        let centre = relative_to(origin, centre);
+        self.view
+            .camera_mut()
+            .frame_facing(centre, normal, brush::frame_radius(size), aspect);
     }
 
     /// A switch of point pair `index` ended: the pairs are read again, the answer goes into
@@ -2523,6 +2662,24 @@ impl DriftlessApp {
                     None => self.error(text::unknown_scan(&id)),
                 }
             }
+            Action::Paint { owner, mark, dabs } => {
+                self.change_marks(owner, MarkChange::Paint { mark, dabs })
+            }
+            Action::SelectMark(nr) => self.state.brush.active = nr,
+            Action::FrameMark(nr) => self.frame_mark(nr),
+            Action::DeleteMark(nr) => {
+                if let Some(owner) = brush::shown_owner(&self.state).map(Path::to_path_buf) {
+                    if self.state.brush.active == Some(nr) {
+                        self.state.brush.active = None;
+                    }
+                    self.change_marks(owner, MarkChange::Delete(nr));
+                }
+            }
+            Action::UndoMark => {
+                if let Some(owner) = brush::shown_owner(&self.state).map(Path::to_path_buf) {
+                    self.change_marks(owner, MarkChange::Undo);
+                }
+            }
         }
     }
 
@@ -2851,6 +3008,14 @@ impl DriftlessApp {
         tools::keys(&ctx, &mut self.state);
 
         let mut actions: Vec<Action> = Vec::new();
+        actions.extend(brush::keys(&ctx, &mut self.state));
+        // without a surface of the project to paint on the brush goes back to „Drehen“
+        if self.state.tool == Tool::Brush && brush::blocked(&self.state).is_some() {
+            tools::select(&mut self.state, Tool::Orbit);
+        }
+        if let Some(marks) = self.brush.sync(&mut self.state) {
+            self.view.set_marks(marks);
+        }
         self.layout.rail = egui::Panel::left("leiste")
             .exact_size(rail::WIDTH)
             .resizable(false)
@@ -2900,10 +3065,27 @@ impl DriftlessApp {
                     event = self
                         .view
                         .show(ui, rs, self.cloud.as_ref(), overlay, &self.state.view);
+                    if let Some(origin) = origin {
+                        let uploading = self.view.is_uploading_surface();
+                        let input = self.view.brush_input();
+                        let camera = self.view.camera();
+                        let stroke =
+                            self.brush
+                                .input(&mut self.state, input, camera, origin, uploading);
+                        actions.extend(stroke);
+                    }
+                    if let Some(marks) = self.brush.take_marks(self.state.brush.active) {
+                        self.view.set_marks(marks);
+                        ui.ctx().request_repaint();
+                    }
                     if let (Some(origin), false) = (origin, self.view.is_uploading()) {
                         let camera = self.view.camera();
                         tools::paint_measurements(ui, rect, camera, origin, &self.state);
                         tools::paint_pairs(ui, rect, camera, origin, &self.state);
+                        if self.state.tool == Tool::Brush {
+                            let radius = self.state.brush.radius;
+                            self.brush.paint_ring(ui, rect, camera, origin, radius);
+                        }
                     }
                 }
                 (None, true) => {
@@ -2917,6 +3099,7 @@ impl DriftlessApp {
                     ui.centered_and_justified(|ui| ui.weak(hint));
                 }
             });
+        self.state.brush.painting = self.brush.painting();
         self.no_surface_hint(&ctx, central.response.rect);
         self.drop_hint(&ctx);
         match ctx.input(|i| dropped(&i.raw.dropped_files)) {

@@ -12,6 +12,10 @@
 //! The mipmaps of every page are made here too, in the loader's thread, so that the UI thread
 //! only copies them to the GPU.
 //!
+//! Beside the pages the loader welds the surface into one mesh and puts its faces into a tree
+//! ([`SurfacePick`]): what the brush hits and which faces a Stelle covers, the same faces the
+//! touch-up computes with. It is built from the file as read, in parallel to decoding the pages.
+//!
 //! [`mesh_edit`] turns what the touch-up changes on a surface (`page_edits` of
 //! `driftless-map`) into the touched-up state the view draws beside the computed one
 //! ([`crate::render::mesh::MeshRenderer::set_edit`]), made the same way.
@@ -22,11 +26,12 @@ use crate::ui::text;
 use driftless_export::mesh::{read_mesh, ImageKind, Mesh, MeshPage};
 use driftless_export::ExportError;
 use driftless_io::progress::Progress;
-use driftless_map::surface::edit::PageEdit;
+use driftless_map::surface::edit::{FaceBvh, PageEdit, WeldedSurface};
 use driftless_steps::StepError;
 use image::RgbaImage;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Phase name while the pages of a surface are decoded.
 pub const PHASE_LOAD_SURFACE: &str = "Oberfläche laden";
@@ -50,6 +55,30 @@ pub struct LoadedSurface {
     /// Per page the halvings of its texture down to 1 × 1 ([`mip_levels`]); a page without
     /// them gets them made when it is uploaded.
     pub mips: Vec<Vec<RgbaImage>>,
+    /// What the brush hits on it; the window keeps it while the surface is shown (the view
+    /// drops the pages once they are on the GPU). `None` where it was not built (a surface made
+    /// by hand).
+    pub pick: Option<Arc<SurfacePick>>,
+}
+
+/// The surface as the brush sees it: its pages welded into one mesh in its own frame
+/// (absolute, f64, as read from the file) and its faces in a tree, built as the touch-up
+/// builds them (`driftless_map::surface::edit`), so a Stelle covers the same faces in the view
+/// as in the touch-up. About 60 bytes per corner of the pages: some 320 MB for a surface of
+/// 6.6 million triangles.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SurfacePick {
+    pub surface: WeldedSurface,
+    pub bvh: FaceBvh,
+}
+
+impl SurfacePick {
+    /// Welds the pages of `mesh` and builds the tree of its faces.
+    pub fn new(mesh: &Mesh) -> SurfacePick {
+        let surface = WeldedSurface::from_mesh(mesh);
+        let bvh = FaceBvh::build(&surface);
+        SurfacePick { surface, bvh }
+    }
 }
 
 impl LoadedSurface {
@@ -82,9 +111,10 @@ pub fn surface_glb(path: &Path) -> PathBuf {
 
 /// Reads the surface at `path`: a `.glb` or `.obj`, or the [`SURFACE_GLB`] of a surface
 /// folder. Reading reports phase [`driftless_export::PHASE_READ`]; then the pages are decoded
-/// in parallel (phase [`PHASE_LOAD_SURFACE`], one step per page, a cancel check each). Problems
-/// that leave the surface usable (a missing OBJ texture) are warnings on `progress`; errors
-/// carry the reader's German message and name the file.
+/// in parallel (phase [`PHASE_LOAD_SURFACE`], one step per page, a cancel check each), and
+/// beside them its [`SurfacePick`] is built (one step more). Problems that leave the surface
+/// usable (a missing OBJ texture) are warnings on `progress`; errors carry the reader's German
+/// message and name the file.
 pub fn load_mesh(path: &Path, progress: &Progress) -> Result<LoadedSurface, StepError> {
     let path = surface_glb(path);
     let mesh = read_mesh(&path, progress).map_err(|e| match e {
@@ -94,27 +124,38 @@ pub fn load_mesh(path: &Path, progress: &Progress) -> Result<LoadedSurface, Step
         e => e.into(),
     })?;
     let origin = origin_of(mesh.pages.iter().flat_map(|p| &p.positions));
-    progress.phase(PHASE_LOAD_SURFACE, Some(mesh.pages.len() as u64));
+    progress.phase(PHASE_LOAD_SURFACE, Some(mesh.pages.len() as u64 + 1));
     let fail = |e: String| StepError::Failed(format!("{}: {e}", path.display()));
     check_pixels(&mesh.pages).map_err(fail)?;
-    let pages = mesh
-        .pages
-        .into_par_iter()
-        .enumerate()
-        .map(|(p, page)| {
-            if progress.is_cancelled() {
-                return Err(StepError::Cancelled);
-            }
-            let page = loaded_page(page, origin).map_err(|e| fail(text::bad_texture(p, &e)))?;
+    // the welding is one thread's work: it runs while the pages are decoded
+    let (pick, pages) = rayon::join(
+        || {
+            let pick = SurfacePick::new(&mesh);
             progress.advance(1);
-            Ok(page)
-        })
-        .collect::<Result<Vec<_>, StepError>>()?;
-    let (pages, mips) = pages.into_iter().unzip();
+            pick
+        },
+        || {
+            mesh.pages
+                .par_iter()
+                .enumerate()
+                .map(|(p, page)| {
+                    if progress.is_cancelled() {
+                        return Err(StepError::Cancelled);
+                    }
+                    let page =
+                        loaded_page(page, origin).map_err(|e| fail(text::bad_texture(p, &e)))?;
+                    progress.advance(1);
+                    Ok(page)
+                })
+                .collect::<Result<Vec<_>, StepError>>()
+        },
+    );
+    let (pages, mips) = pages?.into_iter().unzip();
     Ok(LoadedSurface {
         origin,
         pages,
         mips,
+        pick: Some(Arc::new(pick)),
     })
 }
 
@@ -148,7 +189,7 @@ fn check_pixels(pages: &[MeshPage]) -> Result<(), String> {
 /// (or 1 × 1 in the page's colour).
 #[allow(clippy::type_complexity)]
 fn loaded_page(
-    page: MeshPage,
+    page: &MeshPage,
     origin: [f64; 3],
 ) -> Result<((Vec<MeshVertex>, Vec<u32>, RgbaImage), Vec<RgbaImage>), String> {
     let image = match &page.image {
@@ -226,7 +267,7 @@ pub fn mesh_edit(
         .collect();
     let first = mesh.pages.len();
     let (extra, extra_mips) = added
-        .into_par_iter()
+        .par_iter()
         .enumerate()
         .map(|(i, page)| loaded_page(page, origin).map_err(|e| text::bad_texture(first + i, &e)))
         .collect::<Result<Vec<_>, String>>()?

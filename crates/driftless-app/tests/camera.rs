@@ -289,6 +289,63 @@ fn frame_bounds_shows_all_corners() {
 }
 
 #[test]
+fn frame_facing_looks_straight_at_a_place() {
+    for viewport in [VIEWPORT, [600.0, 1200.0], [900.0, 900.0]] {
+        let aspect = viewport[0] / viewport[1];
+        // a wall facing −y, a floor, a ceiling, a slope
+        for normal in [
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+            [0.6, 0.0, 0.8],
+        ] {
+            for mode in [CameraMode::Orbit, CameraMode::Fly] {
+                let mut cam = Camera::default();
+                cam.set_mode(mode);
+                let centre = [3.0, -2.0, 1.5];
+                cam.frame_facing(centre, normal, 0.5, aspect);
+                // along the opposite of the normal, as far as the pitch allows
+                let n = Vector3::from(normal).normalize();
+                assert!(cam.dir().dot(&-n) > 0.9998, "{normal:?} {:?}", cam.dir());
+                assert!(close(view_dir(&cam), cam.dir(), 1e-4));
+                // the place in the middle of the image, on the side of the normal
+                let q = project(&cam.view_proj(aspect), centre, viewport).expect("in front");
+                assert!((q[0] - viewport[0] / 2.0).abs() < 0.5, "{q:?}");
+                assert!((q[1] - viewport[1] / 2.0).abs() < 0.5, "{q:?}");
+                let eye = cam.eye_position() - Vector3::from(centre);
+                assert!(eye.dot(&n) > 0.0, "{eye:?}");
+                // the sphere of the radius fits: a point on it beside the centre is in the image
+                let side = cam.dir().cross(&Vector3::z());
+                let side = if side.norm() > 1e-3 {
+                    side.normalize()
+                } else {
+                    Vector3::x()
+                };
+                for s in [-0.5, 0.5] {
+                    let p = Vector3::from(centre) + side * s;
+                    let q = project(&cam.view_proj(aspect), p.into(), viewport).unwrap();
+                    assert!((0.0..=viewport[0]).contains(&q[0]), "{q:?}");
+                }
+            }
+        }
+    }
+    // straight down keeps the yaw; no direction keeps the view; no place changes nothing
+    let mut cam = Camera::default();
+    let yaw = cam.yaw;
+    cam.frame_facing([0.0; 3], [0.0, 0.0, 1.0], 1.0, ASPECT);
+    assert_eq!(cam.yaw, yaw);
+    let (yaw, pitch) = (cam.yaw, cam.pitch);
+    cam.frame_facing([1.0; 3], [0.0; 3], 1.0, ASPECT);
+    assert_eq!((cam.yaw, cam.pitch), (yaw, pitch));
+    assert!(close(cam.target, Vector3::from([1.0; 3]), 1e-6));
+    let before = cam.clone();
+    cam.frame_facing([f32::NAN, 0.0, 0.0], [0.0, -1.0, 0.0], 1.0, ASPECT);
+    assert_eq!(cam, before);
+    cam.frame_facing([0.0; 3], [0.0, -1.0, 0.0], f32::NAN, f32::NAN);
+    assert!(cam.distance.is_finite() && cam.distance > 0.0);
+}
+
+#[test]
 fn frame_bounds_ignores_empty_bounds() {
     let mut cam = Camera::default();
     cam.orbit(40.0, 10.0);

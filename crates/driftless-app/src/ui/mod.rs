@@ -4,13 +4,15 @@
 //!
 //! Layout: the rail at the left edge ([`rail`]: ☰, the three [`Step`]s, ⚙), next to it the
 //! field of the active step ([`steps`]), the 3D view ([`view3d`]) in the rest with its floating
-//! bars ([`tools`]: info, the switch Punkte · Fläche · beides, the tools and the cut), the
-//! status bar ([`status`]) at the bottom, the settings window ⚙ ([`settings`]), the window
-//! „Exportieren“ ([`export`]) and the window „Über Driftless“ ([`about`]).
+//! bars ([`tools`]: info, the switch Punkte · Fläche · beides, the tools, the cut and the bar of
+//! the brush, [`brush`]), the status bar ([`status`]) at the bottom, the settings window ⚙
+//! ([`settings`]), the window „Exportieren“ ([`export`]) and the window „Über Driftless“
+//! ([`about`]).
 
 pub mod about;
 pub mod actions;
 mod app;
+pub mod brush;
 pub mod compare;
 pub mod correct;
 pub mod export;
@@ -40,6 +42,7 @@ use driftless_gpu::GpuPref;
 use driftless_steps::export::{ExportRequest, ExportSource};
 use driftless_steps::inspect;
 use driftless_steps::map::MapSettings;
+use driftless_steps::marks::DabInput;
 use driftless_steps::pairs::PointPairEntry;
 use driftless_steps::slam::SlamSettings;
 use std::collections::{BTreeMap, VecDeque};
@@ -252,6 +255,23 @@ pub enum Action {
     /// „Aufräumen“: what jobs cut off left behind ([`AppState::leftovers_shown`]) goes to the
     /// trash.
     CleanUp,
+    /// A stroke of the brush (press to release) on a surface of the map or model in `owner`:
+    /// `dabs` into Stelle `mark`, or into a new one with `None` (also when `mark` is gone).
+    /// Saved in its `stellen.toml` in the background; one stroke is one step back for ↶.
+    Paint {
+        owner: PathBuf,
+        mark: Option<u32>,
+        dabs: Vec<DabInput>,
+    },
+    /// Chooses the Stelle the brush paints into (of the map or model of the surface shown);
+    /// `None`: the next stroke begins a new one.
+    SelectMark(Option<u32>),
+    /// Chooses the Stelle and shows it in the view, looking straight at it.
+    FrameMark(u32),
+    /// Takes the Stelle out of `stellen.toml` with all its touch-up (right click „Löschen“).
+    DeleteMark(u32),
+    /// ↶, ⌘Z: takes back the youngest stroke or step of the Stellen of the surface shown.
+    UndoMark,
 }
 
 /// A question the window asks before a change of the project, in a small window over the view
@@ -447,12 +467,15 @@ pub struct Tree {
     /// The folders a running job marks busy, with who holds them
     /// ([`crate::leftovers::busy_folders`]).
     pub busy: Vec<(PathBuf, String)>,
+    /// The Stellen of the maps and models, by folder ([`brush::read_marks`]).
+    pub marks: BTreeMap<PathBuf, brush::MarksRead>,
 }
 
-/// Reads the tree of `project` from disk: every scan folder, run, map, surface and model, and
-/// what jobs cut off left behind. A run without its `slam.json` or a map without its `map.json`
-/// (one being computed, or a leftover) is not in the tree – unless it holds finished results
-/// (maps, surfaces, the history of a run): then it stays, marked incomplete
+/// Reads the tree of `project` from disk: every scan folder, run, map, surface and model, the
+/// Stellen painted on them, and what jobs cut off left behind. A run without its `slam.json`
+/// or a map without its `map.json` (one being computed, or a leftover) is not in the tree –
+/// unless it holds finished results (maps, surfaces, the history of a run): then it stays,
+/// marked incomplete
 /// ([`RunInfo::incomplete`], [`crate::project::MapInfo::incomplete`]; see
 /// [`crate::leftovers`]). Can take seconds on a network share or with files iCloud moved away:
 /// call it off the UI thread.
@@ -467,7 +490,7 @@ pub fn read_tree(project: &Project) -> Tree {
         run.maps.retain(|m| !m.incomplete || holds_results(&m.dir));
         Some(run)
     };
-    let scans = project
+    let scans: Vec<ScanNode> = project
         .scans
         .iter()
         .map(|s| ScanNode {
@@ -487,13 +510,22 @@ pub fn read_tree(project: &Project) -> Tree {
         Ok(pairs) => (pairs, None),
         Err(e) => (Vec::new(), Some(e)),
     };
+    let models = project.models();
+    let owners = scans
+        .iter()
+        .flat_map(|s: &ScanNode| &s.runs)
+        .flat_map(|r| &r.maps)
+        .map(|m| m.dir.clone())
+        .chain(models.iter().map(|m| m.dir.clone()));
+    let marks = brush::read_marks(owners);
     Tree {
         scans,
-        models: project.models(),
+        models,
         point_pairs,
         point_pairs_error,
         leftovers: crate::leftovers::find(&project.dir, &ids),
         busy: crate::leftovers::busy_folders(&project.dir),
+        marks,
     }
 }
 
@@ -639,6 +671,12 @@ pub struct AppState {
     /// How long a leftover must lie untouched before it is offered; `None`:
     /// [`crate::leftovers::QUIET`] (tests: zero).
     pub leftover_quiet: Option<std::time::Duration>,
+    /// The Stellen of the maps and models, by folder, as last read with the tree and changed
+    /// since by this window (a stroke shows here at once and is saved in the background):
+    /// those of the surface shown are listed in „Bilder“ and marked in the view.
+    pub marks: BTreeMap<PathBuf, brush::MarksRead>,
+    /// The brush: its size and the Stelle it paints into.
+    pub brush: brush::BrushState,
 }
 
 impl AppState {
@@ -704,6 +742,7 @@ impl AppState {
         self.point_pairs_error = tree.point_pairs_error;
         self.leftovers = tree.leftovers;
         self.busy = tree.busy;
+        self.marks = tree.marks;
         // „Von Hand ausrichten“ of a model that is gone ends
         let gone = self
             .pairs

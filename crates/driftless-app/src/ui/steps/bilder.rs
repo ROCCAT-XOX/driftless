@@ -8,6 +8,9 @@
 //! ([`Action::ComputeAllSurfaces`]), „Oberfläche rechnen“ only the selected map. „ohne Fotos“
 //! lies under „▸ Erweitert“.
 //!
+//! Under the surfaces of the map or model whose surface is shown, its Stellen painted with the
+//! brush („Markierte Stellen“, [`tree::mark_list`]).
+//!
 //! Below the maps a card per model („Modell 001 · 3 Scans“) with its surfaces; selected, the
 //! main button computes the surface of the model from the images of all its scans
 //! ([`Action::RunModelSurface`]). A surface that no longer fits its model
@@ -20,6 +23,7 @@ use super::{
     model_stale_hint, no_project, pinned, quiet_button, segments, state_label, tree, StepState,
 };
 use crate::project::{MapInfo, ModelInfo, ScanState, SurfaceInfo, SurfaceSettings};
+use crate::ui::brush::shown_owner;
 use crate::ui::theme::{icon, DARK};
 use crate::ui::{text, Action, AppState, Queued, Selection, Step};
 use eframe::egui::{self, RichText, Ui};
@@ -199,6 +203,9 @@ fn map_list(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
                 for surface in &map.surfaces {
                     tree::surface_leaf(ui, state, surface, action);
                 }
+                if shown_owner(state) == Some(map.dir.as_path()) {
+                    tree::mark_list(ui, state, &map.dir, action);
+                }
             });
         }
     }
@@ -238,6 +245,9 @@ fn model_list(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
             ui.indent(("oberflaechen", &model.dir), |ui| {
                 for surface in &model.surfaces {
                     tree::surface_leaf(ui, state, surface, action);
+                }
+                if shown_owner(state) == Some(model.dir.as_path()) {
+                    tree::mark_list(ui, state, &model.dir, action);
                 }
             });
         }

@@ -87,6 +87,8 @@ pub enum JobOutput {
     MapCompare(Box<MapComparison>),
     /// The step „Exportieren“: what it wrote.
     Exported(Box<ExportReport>),
+    /// `stellen.toml` of a map or model after a change of its Stellen (helper runner).
+    Marks(Box<driftless_steps::marks::Marks>),
     /// Nothing to hand back; the job's effect is on disk.
     Done,
 }
