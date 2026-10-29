@@ -18,6 +18,7 @@
 
 mod bvh;
 mod patch;
+mod retexture;
 mod select;
 mod smooth;
 mod weld;

@@ -1,7 +1,7 @@
 //! JPEG decoding and a streaming reader for camera images stored in bags.
 
 use crate::bag::{BagError, BagReader, RawMessage};
-use crate::msg::{decode_compressed_image, MsgError};
+use crate::msg::{compressed_image_stamp, decode_compressed_image, stamp_secs, MsgError};
 use rayon::prelude::*;
 use std::path::PathBuf;
 use zune_jpeg::zune_core::bytestream::ZCursor;
@@ -149,6 +149,31 @@ fn decode_message(msg: &RawMessage, downscale: u32) -> Result<Frame, ImageError>
     })
 }
 
+/// Decodes `batch` in parallel and delivers the results to `f` in order, counting them in
+/// `stats`; empties the batch. `false` once `f` asks to stop.
+fn deliver(
+    batch: &mut Vec<RawMessage>,
+    downscale: u32,
+    stats: &mut ImageStats,
+    f: &mut impl FnMut(Result<Frame, ImageError>) -> bool,
+) -> bool {
+    let results: Vec<_> = batch
+        .par_iter()
+        .map(|m| decode_message(m, downscale))
+        .collect();
+    batch.clear();
+    for r in results {
+        match &r {
+            Ok(_) => stats.frames += 1,
+            Err(_) => stats.bad += 1,
+        }
+        if !f(r) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Streams all images of `topics` from `bags` (in the given bag order, file order within a bag)
 /// to `f`. Decoding runs on a few rayon threads, but frames reach `f` strictly in bag order and
 /// at most one decoded image per worker is held at a time. Undecodable images are passed to `f`
@@ -166,25 +191,6 @@ pub fn for_each_image(
     let mut stats = ImageStats::default();
     let mut batch: Vec<RawMessage> = Vec::with_capacity(workers);
 
-    // Decodes the batch in parallel and delivers results in order; false = stop.
-    let mut flush = |batch: &mut Vec<RawMessage>, stats: &mut ImageStats| -> bool {
-        let results: Vec<_> = batch
-            .par_iter()
-            .map(|m| decode_message(m, downscale))
-            .collect();
-        batch.clear();
-        for r in results {
-            match &r {
-                Ok(_) => stats.frames += 1,
-                Err(_) => stats.bad += 1,
-            }
-            if !f(r) {
-                return false;
-            }
-        }
-        true
-    };
-
     for path in bags {
         let mut reader = BagReader::open(path)?;
         for msg in reader.messages(&topic_refs) {
@@ -197,11 +203,100 @@ pub fn for_each_image(
                 Err(e) => return Err(e),
             };
             batch.push(msg);
-            if batch.len() == workers && !flush(&mut batch, &mut stats) {
+            if batch.len() == workers && !deliver(&mut batch, downscale, &mut stats, &mut f) {
                 return Ok(stats);
             }
         }
     }
-    flush(&mut batch, &mut stats);
+    deliver(&mut batch, downscale, &mut stats, &mut f);
+    Ok(stats)
+}
+
+/// An image message as its header tells it, before the image is decoded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageHeader {
+    /// Its place in the stream: the image messages of the topics over the bags in order,
+    /// counted from 0, as [`for_each_image`] delivers them (the undecodable ones too).
+    pub index: usize,
+    /// Camera name derived from the topic, as [`Frame::camera`].
+    pub camera: String,
+    /// The header's stamp (s), as [`Frame::stamp`] of the decoded image, bit for bit.
+    pub stamp: f64,
+    /// The same stamp in nanoseconds, exact.
+    pub stamp_ns: u64,
+}
+
+/// What [`for_each_image_where`] does with an image, decided by its [`ImageHeader`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wanted {
+    /// Decode it and pass it on.
+    Yes,
+    /// Pass over it: neither decoded nor passed on.
+    No,
+    /// End the stream here: neither this image nor any after it is read; the images wanted
+    /// before it are still decoded and passed on.
+    Stop,
+}
+
+/// [`for_each_image`] for the images `want` picks: every image message of `topics` in `bags`,
+/// in the same order, is first shown to `want` by its header ([`ImageHeader`]), without
+/// decoding; only the images it wants are decoded (at 1/`downscale`, a few at a time on rayon
+/// threads, as there) and passed to `f`, in stream order. So the images of a stream are listed
+/// without decoding a single one (`want` says [`Wanted::No`] to all), and a few are picked from
+/// it at the cost of reading the bags once ([`Wanted::Stop`] after the last one saves the
+/// rest). A message whose header cannot be read is not shown to `want` and counts as bad; a
+/// wanted image that cannot be decoded reaches `f` as `Err` and counts as bad as well
+/// ([`ImageStats::frames`] counts the decoded ones). Bags end at a cut as there. `f` returns
+/// `false` to stop early.
+pub fn for_each_image_where(
+    bags: &[PathBuf],
+    topics: &[String],
+    downscale: u32,
+    mut want: impl FnMut(&ImageHeader) -> Wanted,
+    mut f: impl FnMut(Result<Frame, ImageError>) -> bool,
+) -> Result<ImageStats, BagError> {
+    let workers = rayon::current_num_threads().clamp(1, MAX_WORKERS);
+    let topic_refs: Vec<&str> = topics.iter().map(String::as_str).collect();
+    let mut stats = ImageStats::default();
+    let mut batch: Vec<RawMessage> = Vec::with_capacity(workers);
+    let mut index = 0usize;
+
+    for path in bags {
+        let mut reader = BagReader::open(path)?;
+        for msg in reader.messages(&topic_refs) {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(BagError::Truncated { .. }) => {
+                    stats.truncated += 1;
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+            let at = index;
+            index += 1;
+            let Ok((sec, nsec)) = compressed_image_stamp(&msg.data) else {
+                stats.bad += 1;
+                continue;
+            };
+            let header = ImageHeader {
+                index: at,
+                camera: camera_name(&msg.topic),
+                stamp: stamp_secs(sec, nsec),
+                stamp_ns: u64::from(sec) * 1_000_000_000 + u64::from(nsec),
+            };
+            match want(&header) {
+                Wanted::Yes => batch.push(msg),
+                Wanted::No => continue,
+                Wanted::Stop => {
+                    deliver(&mut batch, downscale, &mut stats, &mut f);
+                    return Ok(stats);
+                }
+            }
+            if batch.len() == workers && !deliver(&mut batch, downscale, &mut stats, &mut f) {
+                return Ok(stats);
+            }
+        }
+    }
+    deliver(&mut batch, downscale, &mut stats, &mut f);
     Ok(stats)
 }

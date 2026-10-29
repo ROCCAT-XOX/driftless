@@ -10,6 +10,15 @@ pub struct CompressedImage {
     pub data: Vec<u8>,
 }
 
+/// The stamp of a `sensor_msgs/CompressedImage` as its header holds it, (seconds,
+/// nanoseconds), read without touching the image: what [`decode_compressed_image`] reads
+/// first (in seconds: [`super::stamp_secs`]).
+pub fn compressed_image_stamp(data: &[u8]) -> Result<(u32, u32), MsgError> {
+    let mut c = Cursor::new(data);
+    let _seq = c.u32()?;
+    Ok((c.u32()?, c.u32()?))
+}
+
 pub fn decode_compressed_image(data: &[u8]) -> Result<CompressedImage, MsgError> {
     let mut c = Cursor::new(data);
     let stamp = c.header()?;

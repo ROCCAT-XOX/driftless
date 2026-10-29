@@ -707,3 +707,85 @@ pub(crate) fn paged(
     }
     mesh
 }
+
+// ---- The scan with images of `driftless_io::testscan` (touch-up tests) -----------------
+
+use driftless_traj::Pose;
+use std::path::Path;
+
+/// The room of `driftless_io::testscan::room_scan` (m): `[-4, 6] × [-3, 5] × [-1.5, 2]`.
+pub(crate) const TESTSCAN_ROOM: ([f64; 3], [f64; 3]) = ([-4.0, -3.0, -1.5], [6.0, 5.0, 2.0]);
+
+/// Body poses of a device standing still at `device` (device → world) from 999.5 s to 1002 s
+/// at 10 Hz: around the images of `driftless_io::testscan::scan_with_images` (stamped 1000.3
+/// to 1001.1 s).
+pub(crate) fn still_poses(device: Isometry3<f64>) -> Vec<Pose> {
+    (0..=25)
+        .map(|i| Pose {
+            t: 999.5 + 0.1 * f64::from(i),
+            p: device.translation.vector,
+            q: device.rotation,
+        })
+        .collect()
+}
+
+/// The images of a scan folder made by `driftless_io::testscan::scan_with_images` as a
+/// texture source, with the device standing still at `device`: its bag, and its camera `left`
+/// from the calibration (the LiDAR mount the identity, as with the default settings). The
+/// images were taken at the origin; at another `device` they are just images with that pose,
+/// enough where only the geometry counts.
+pub(crate) fn testscan_source(dir: &Path, device: Isometry3<f64>) -> super::TextureSource {
+    let calib = driftless_io::calib::load_calibration(&dir.join("calibration/calib.json")).unwrap();
+    let c = &calib.cameras["left"];
+    let camera = driftless_io::camera::Camera::from_calib("left", c).unwrap();
+    let cam = crate::ColorCamera::new(camera, &c.lidar_to_cam.unwrap(), &Isometry3::identity());
+    super::TextureSource {
+        images: crate::ImageSource {
+            bags: vec![dir.join("IMAGE_0.bag")],
+            topics: vec!["/camera_left/image_raw".to_string()],
+        },
+        poses: still_poses(device),
+        cams: vec![cam],
+    }
+}
+
+/// The surface of the room of `driftless_io::testscan::scan_with_images` (the scan folder
+/// `dir`) as the surface step makes it from a map of that scan: walls, floor and ceiling from
+/// points 5 cm apart, measured from the room's centre, at the coarse settings of the step's
+/// tests (`crates/driftless-steps/tests/surface.rs`), textured from the scan's images (the
+/// device stood still at the origin). Returns its pages as `oberflaeche.glb` holds them, and
+/// the scan's source.
+pub(crate) fn testscan_surface(dir: &Path) -> (PageMesh, super::TextureSource) {
+    let (lo, hi) = TESTSCAN_ROOM;
+    let centre: [f32; 3] = std::array::from_fn(|k| ((lo[k] + hi[k]) / 2.0) as f32);
+    let half: [f32; 3] = std::array::from_fn(|k| ((hi[k] - lo[k]) / 2.0) as f32);
+    let scan = box_room(centre, half, 0.05);
+    let cfg = testscan_config();
+    let progress = driftless_io::progress::Progress::new();
+    let (mesh, mut stats) = super::build_mesh(&scan.input(), &cfg, &progress).unwrap();
+    let source = testscan_source(dir, Isometry3::identity());
+    let tex = super::texture_mesh(
+        &mesh,
+        std::slice::from_ref(&source),
+        &cfg,
+        &progress,
+        &mut stats,
+        None,
+    )
+    .unwrap();
+    assert!(stats.texture.faces_textured > 0, "{stats:?}");
+    let jpegs = super::encode_pages(&tex, cfg.jpeg_quality).unwrap();
+    (tex.to_mesh(&jpegs).unwrap(), source)
+}
+
+/// The coarse settings of the surface tests of the steps (`small_config` there).
+pub(crate) fn testscan_config() -> super::SurfaceConfig {
+    super::SurfaceConfig {
+        voxel: 0.15,
+        min_weight: 1,
+        min_component_faces: 10,
+        page_size: 256,
+        simplify_error: 0.01,
+        ..super::SurfaceConfig::default()
+    }
+}

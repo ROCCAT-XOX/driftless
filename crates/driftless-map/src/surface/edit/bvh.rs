@@ -279,6 +279,49 @@ impl FaceBvh {
         out
     }
 
+    /// The faces that `keep_face` keeps, of the boxes that `keep_box` lets through, sorted.
+    /// `keep_box` gets the lower and upper corner of a box (absolute, a little larger than its
+    /// faces); a box it refuses is skipped with everything in it, so it must let through every
+    /// box that can hold a face `keep_face` keeps.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used by the second part of „Bilder neu einspielen“"
+        )
+    )]
+    pub(super) fn faces_where(
+        &self,
+        keep_box: impl Fn([f64; 3], [f64; 3]) -> bool,
+        mut keep_face: impl FnMut(u32) -> bool,
+    ) -> Vec<u32> {
+        let mut out = Vec::new();
+        if self.nodes.is_empty() {
+            return out;
+        }
+        let mut stack: Vec<u32> = Vec::with_capacity(64);
+        stack.push(0);
+        while let Some(node) = stack.pop() {
+            let node = self.nodes[node as usize];
+            let lo = [0, 1, 2].map(|k| self.origin[k] + f64::from(node.lo[k]));
+            let hi = [0, 1, 2].map(|k| self.origin[k] + f64::from(node.hi[k]));
+            if !keep_box(lo, hi) {
+                continue;
+            }
+            if node.count == 0 {
+                stack.extend([node.start + 1, node.start]);
+                continue;
+            }
+            for &f in &self.order[node.start as usize..(node.start + node.count) as usize] {
+                if keep_face(f) {
+                    out.push(f);
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
     /// Where the ray enters the box of `node` (`t ≥ 0`), or `None` if it misses the box or
     /// the box lies wholly outside the height cut.
     fn enter(&self, node: u32, ray: &Ray) -> Option<f64> {

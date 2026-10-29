@@ -23,6 +23,9 @@
 //! model's id, the clean id and images of every scan in it, the settings and
 //! [`SURFACE_VERSION`]. A model merged by another version of the merge is refused, like one
 //! whose maps were computed anew since ([`crate::merge::version_fits`]).
+//!
+//! [`texture_sources`] finds the camera images of a computed surface again from its folder
+//! alone, as the surface step took them, for touching it up („Bilder neu einspielen“).
 
 use crate::error::{check_cancel, failed, StepError};
 use crate::export::is_page_of;
@@ -33,7 +36,9 @@ use crate::map::{
 };
 use crate::merge::{
     member_transform, read_model, version_fits, ModelMember, ModelReport, MERGE_VERSION,
+    MODEL_REPORT,
 };
+use crate::slam::SlamSettings;
 use crate::{PROGRAM, PROGRAM_KEY};
 use driftless_export::mesh;
 use driftless_gpu::{GpuChoice, GpuContext, GpuPref};
@@ -47,6 +52,7 @@ use driftless_map::surface::{
 use driftless_map::{load_stage, stage_fits};
 use driftless_traj::nalgebra::{Isometry3, Point3};
 use driftless_traj::Pose;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -570,11 +576,7 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
     // The rest of the cloud is not needed.
     drop(cloud);
     let sources: Vec<TextureSource> = color
-        .map(|c| TextureSource {
-            images: c.images,
-            poses,
-            cams: c.cams,
-        })
+        .map(|c| texture_source(c, poses))
         .into_iter()
         .collect();
     let target = Target {
@@ -738,6 +740,16 @@ fn moved_pose(t: &Isometry3<f64>, pose: &Pose) -> Pose {
     }
 }
 
+/// The texture source of a scan: its camera images and mounts (`color`) with the poses of its
+/// trajectory in the frame of the surface (`poses`; a member's moved into the model).
+fn texture_source(color: ColorInput, poses: Vec<Pose>) -> TextureSource {
+    TextureSource {
+        images: color.images,
+        poses,
+        cams: color.cams,
+    }
+}
+
 /// The points of every member moved to the model, their LiDAR positions (the sensors of a
 /// member after those of the members before it) and a texture source per member with
 /// images, its poses in the model.
@@ -785,11 +797,7 @@ fn model_points(
         let poses: Vec<Pose> = poses.iter().map(|p| moved_pose(t, p)).collect();
         sensors.extend(sensors_for_frames(&poses, &m.lidar_to_imu));
         if let Some(c) = m.color {
-            sources.push(TextureSource {
-                images: c.images,
-                poses,
-                cams: c.cams,
-            });
+            sources.push(texture_source(c, poses));
         }
         progress.advance(1);
     }
@@ -853,6 +861,179 @@ pub fn run_model_surface(
         obj: req.obj,
     };
     make_surface(points, sources, gpu, target, start, progress)
+}
+
+/// The file of a run of a project: its scan (`scan`, beside it `scan_rel`, both relative to
+/// the project folder as the program writes them) and its settings (`[slam]`); a run the
+/// command line made has none.
+const RUN_FILE: &str = "lauf.toml";
+/// The file of a project listing its scans (`[[scan]]` with `id`, `path` and `path_rel`).
+const PROJECT_FILE: &str = "project.toml";
+/// The folder of a project holding the runs of its scans: `<projekt>/scans/<id>/slam-NNN`.
+const SCANS_DIR: &str = "scans";
+
+/// What [`texture_sources`] reads of a run's [`RUN_FILE`].
+#[derive(Deserialize)]
+struct RunFile {
+    scan: String,
+    #[serde(default)]
+    scan_rel: Option<String>,
+    #[serde(default)]
+    slam: SlamSettings,
+}
+
+/// What [`texture_sources`] reads of a project's [`PROJECT_FILE`].
+#[derive(Deserialize)]
+struct ProjectFile {
+    #[serde(default, rename = "scan")]
+    scans: Vec<ProjectScan>,
+}
+
+#[derive(Deserialize)]
+struct ProjectScan {
+    id: String,
+    path: String,
+    #[serde(default)]
+    path_rel: Option<String>,
+}
+
+/// The camera images of the surface in `surface_dir`, for touching it up („Bilder neu
+/// einspielen“): the texture sources the surface step takes for it, found from the folder
+/// alone and without `clean.bin`. For a map's surface (the folder in the map folder
+/// `karte-NNN` of a run, or in a run folder holding its map) one source: the images and
+/// calibration of the scan with the run's settings (its `lauf.toml`) and trajectory, as
+/// [`run_surface`] takes them. For a model's surface (its report names the model, or the folder
+/// lies in it) one per scan in the model with images, its poses moved by `T_i`, as
+/// [`run_model_surface`] takes them. None for a surface computed without images
+/// (`--no-texture`), none from a scan without images or calibration.
+///
+/// The scan folder of a run is found as the program finds it: as `lauf.toml` names it, the
+/// relative path first where that folder exists, else the absolute one; failing both, as the
+/// project's `project.toml` names the scan (a scan given its folder anew). So a project moved
+/// or copied with its raw data finds them in the new place.
+///
+/// `Ok(None)` if the raw data are gone (a drive unplugged, a folder renamed): a scan folder,
+/// or the run folder of a scan in a model, cannot be found or read; and for a run of the
+/// command line, which names no scan. Fails if the folder holds no surface report, a
+/// trajectory or `modell.json` cannot be read, or the settings of a run are invalid.
+pub fn texture_sources(surface_dir: &Path) -> Result<Option<Vec<TextureSource>>, StepError> {
+    let path = surface_dir.join(SURFACE_REPORT);
+    let report: Value = fs::read_to_string(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
+        .map_err(|e| format!("{} nicht lesbar: {e}", path.display()))?;
+    if report["settings"]["texture"].as_bool() == Some(false) {
+        return Ok(Some(Vec::new()));
+    }
+    let dir = paths::canonical(surface_dir).unwrap_or_else(|_| surface_dir.to_path_buf());
+    match model_of(&dir, &report) {
+        Some(model) => model_sources(&model),
+        None => map_sources(&dir),
+    }
+}
+
+/// The model folder of the surface in `dir` with the report `report`: the one the report names
+/// (relative to the surface folder first where that folder exists, else absolute), else the
+/// folder above it if that holds a model; `None` for a map's surface.
+fn model_of(dir: &Path, report: &Value) -> Option<PathBuf> {
+    let named = &report["model"];
+    if named.is_object() {
+        let rel = named["dir_rel"]
+            .as_str()
+            .map(|r| paths::stored_path(dir, r))
+            .filter(|p| p.is_dir());
+        let abs = named["dir"].as_str().map(PathBuf::from);
+        if let Some(found) = rel.or(abs) {
+            return Some(found);
+        }
+    }
+    dir.parent()
+        .filter(|p| p.join(MODEL_REPORT).is_file())
+        .map(Path::to_path_buf)
+}
+
+/// The source of the map surface in `dir` (see [`texture_sources`]).
+fn map_sources(dir: &Path) -> Result<Option<Vec<TextureSource>>, StepError> {
+    let map_dir = dir.parent().unwrap_or(dir);
+    let in_run = ["slam.json", "traj.tum", RUN_FILE]
+        .iter()
+        .any(|f| map_dir.join(f).is_file());
+    let run_dir = if in_run {
+        map_dir
+    } else {
+        map_dir.parent().unwrap_or(map_dir)
+    };
+    let Some((scan, slam)) = run_scan(run_dir) else {
+        return Ok(None);
+    };
+    let lidar_to_imu = slam.config()?.odom.lidar_to_imu;
+    let Ok(project) = discover_project(&scan) else {
+        return Ok(None);
+    };
+    let (_, poses) = read_traj(run_dir)?;
+    Ok(Some(
+        color_input(&scan, &project, &lidar_to_imu, &Progress::new())
+            .map(|c| texture_source(c, poses))
+            .into_iter()
+            .collect(),
+    ))
+}
+
+/// The scan folder and the settings of the run `run_dir` of a project (see
+/// [`texture_sources`]); `None` for a run outside a project's `scans/<id>/` or whose scan no
+/// file names. The folder may be gone.
+fn run_scan(run_dir: &Path) -> Option<(PathBuf, SlamSettings)> {
+    let run: Option<RunFile> = fs::read_to_string(run_dir.join(RUN_FILE))
+        .ok()
+        .and_then(|t| toml::from_str(&t).ok());
+    let id_dir = run_dir.parent()?;
+    let scans = id_dir.parent()?;
+    let project = scans.parent()?;
+    if scans.file_name()? != SCANS_DIR {
+        return None;
+    }
+    let slam = run.as_ref().map(|r| r.slam.clone()).unwrap_or_default();
+    // As the program reads a path of a project file: the relative one first where that folder
+    // exists, else the path as written; both relative to the project folder if relative.
+    let stored = |path: &str, rel: Option<&str>| {
+        rel.filter(|r| !r.is_empty())
+            .map(|r| paths::stored_path(project, r))
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| paths::stored_path(project, path))
+    };
+    if let Some(r) = &run {
+        let scan = stored(&r.scan, r.scan_rel.as_deref());
+        if scan.is_dir() {
+            return Some((scan, slam));
+        }
+    }
+    let id = id_dir.file_name()?.to_str()?;
+    let file: ProjectFile =
+        toml::from_str(&fs::read_to_string(project.join(PROJECT_FILE)).ok()?).ok()?;
+    let entry = file.scans.iter().find(|s| s.id == id)?;
+    Some((stored(&entry.path, entry.path_rel.as_deref()), slam))
+}
+
+/// The sources of the model surface of the model in `model_dir` (see [`texture_sources`]).
+fn model_sources(model_dir: &Path) -> Result<Option<Vec<TextureSource>>, StepError> {
+    let model = read_model(model_dir)?;
+    let mut sources = Vec::new();
+    for m in model.members.iter().filter(|m| m.included) {
+        let lidar_to_imu = m.slam.config()?.odom.lidar_to_imu;
+        let Ok(project) = discover_project(&m.scan) else {
+            return Ok(None);
+        };
+        if !m.slam_dir.is_dir() {
+            return Ok(None);
+        }
+        let (_, poses) = read_traj(&m.slam_dir)?;
+        if let Ok(c) = color_input(&m.scan, &project, &lidar_to_imu, &Progress::new()) {
+            let t = member_transform(m);
+            let poses = poses.iter().map(|p| moved_pose(&t, p)).collect();
+            sources.push(texture_source(c, poses));
+        }
+    }
+    Ok(Some(sources))
 }
 
 #[cfg(test)]

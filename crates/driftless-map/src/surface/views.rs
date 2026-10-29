@@ -244,7 +244,7 @@ impl FaceView {
 
     /// Its score in the slot order: a [`FaceView::carrier`] view's counts at
     /// [`CARRIER_ALTERNATIVE`].
-    fn rank_score(&self) -> f32 {
+    pub(crate) fn rank_score(&self) -> f32 {
         if self.carrier() {
             self.score * CARRIER_ALTERNATIVE
         } else {
@@ -379,7 +379,10 @@ pub(crate) struct Faces {
 }
 
 impl Faces {
-    fn new(mesh: &Mesh) -> Faces {
+    /// The faces of `mesh` (see the fields). The smoothed normal of a face depends on the faces
+    /// up to two rings around it (faces sharing a vertex with faces sharing a vertex with it):
+    /// on a part of a mesh holding them, it is the one of the whole mesh.
+    pub(crate) fn new(mesh: &Mesh) -> Faces {
         let corners = |f: usize| mesh.indices[f].map(|i| Vector3::from(mesh.positions[i as usize]));
         let (centroid, longest): (Vec<[f32; 3]>, Vec<f32>) = (0..mesh.indices.len())
             .into_par_iter()
@@ -446,27 +449,36 @@ impl Faces {
 
 /// What one image contributes: per seen face its view, and for an exposure sample face also the
 /// view with its colour.
-type Found = Vec<(u32, FaceView, Option<View>)>;
+pub(crate) type Found = Vec<(u32, FaceView, Option<View>)>;
 
 /// One used image, ready to be looked through.
-struct Shot<'a> {
+pub(crate) struct Shot<'a> {
     /// Camera at 1/[`ColorConfig::downscale`] (depth buffer) and at full size (score).
-    geometry: &'a Camera,
-    full: &'a Camera,
-    world_from_cam: Isometry3<f64>,
-    rank: u32,
-    sharpness_norm: f32,
-    /// The image at 1/[`SHARPNESS_DOWNSCALE`].
-    rgb: &'a RgbImage,
+    pub geometry: &'a Camera,
+    pub full: &'a Camera,
+    pub world_from_cam: Isometry3<f64>,
+    pub rank: u32,
+    pub sharpness_norm: f32,
+    /// The image at 1/[`SHARPNESS_DOWNSCALE`], for the colours of the views and the exposure
+    /// samples; without it ([`super::edit`] looks before it decodes) every view's colour is
+    /// black and no face is sampled.
+    pub rgb: Option<&'a RgbImage>,
     /// [`SurfaceConfig::min_texel`].
-    min_texel: f64,
+    pub min_texel: f64,
 }
 
-/// The faces `shot` sees, in face order.
-fn image_views(
+/// The faces of `view` that `shot` sees, in the order of `view`: the depth buffer holds the
+/// faces of `splat`, which must hold every face whose samples can reach the cells the faces of
+/// `view` are tested in (and these faces themselves). The pass over a whole mesh gives the faces
+/// whose centroid lies within [`ColorConfig::max_dist`] plus [`Faces::reach`] of the camera
+/// (sorted) as both; a Stelle ([`super::edit`]) gives its faces as `view` and the faces in front
+/// of and around them as `splat`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn image_views(
     mesh: &Mesh,
     faces: &Faces,
-    grid: &PointGrid,
+    splat: &[u32],
+    view: &[u32],
     shot: &Shot,
     cfg: &ColorConfig,
     sampled: impl Fn(usize) -> bool + Sync,
@@ -474,13 +486,11 @@ fn image_views(
 ) -> Found {
     let world_to_cam = shot.world_from_cam.inverse();
     let cam_pos = shot.world_from_cam.translation.vector;
-    let mut candidates = grid.near(&cam_pos, cfg.max_dist + faces.reach);
-    candidates.par_sort_unstable();
     let cam = shot.geometry;
     let buffer = DepthBuffer::new(cam, cfg.zbuffer_scale);
     // Cells per radian, as the depth buffer sizes its splats.
     let focal = cam.fx.max(cam.fy) / f64::from(cfg.zbuffer_scale);
-    candidates.par_iter().for_each(|&f| {
+    splat.par_iter().for_each(|&f| {
         let f = f as usize;
         let [a, b, c] = mesh.indices[f].map(|i| Vector3::from(mesh.positions[i as usize]));
         let longest = faces.longest[f];
@@ -493,24 +503,23 @@ fn image_views(
         let n = (f64::from(longest) * focal / (near.max(1e-3) * SAMPLE_GAP_CELLS)).ceil();
         let n = (n as usize).clamp(1, MAX_SUBDIVISIONS);
         let spacing = longest / n as f32;
-        let splat = |p: Vector3<f32>| {
+        let put = |p: Vector3<f32>| {
             if let Some(proj) = project_point(&[p.x, p.y, p.z], cam, &world_to_cam, cfg.max_dist) {
                 buffer.splat(&proj, spacing);
             }
         };
-        splat(Vector3::from(faces.centroid[f]));
+        put(Vector3::from(faces.centroid[f]));
         for i in 0..=n {
             for j in 0..=n - i {
                 let (u, v) = (i as f32 / n as f32, j as f32 / n as f32);
-                splat(a + (b - a) * u + (c - a) * v);
+                put(a + (b - a) * u + (c - a) * v);
             }
         }
     });
 
     // Image coordinates at 1/`downscale` → at 1/SHARPNESS_DOWNSCALE (pixel centres at integers).
     let to_colour = f64::from(cfg.downscale) / f64::from(SHARPNESS_DOWNSCALE);
-    candidates
-        .par_iter()
+    view.par_iter()
         .filter_map(|&f| {
             let f = f as usize;
             let centre = faces.centroid[f];
@@ -566,21 +575,29 @@ fn image_views(
                 && below > CARRIER_BELOW
                 && across < CARRIER_RADIUS
                 && across < below;
-            let to_px = |p: [f32; 2]| p.map(|x| ((f64::from(x) + 0.5) * to_colour - 0.5) as f32);
-            let centre_rgb = sample_linear(shot.rgb, to_px(proj.uv), lin);
-            // Mean colour: the centroid and the points halfway to the corners (in the image).
-            let mut mean = centre_rgb;
-            for corner in at {
-                let half = [0, 1].map(|k| (proj.uv[k] + corner[k]) / 2.0);
-                let rgb = sample_linear(shot.rgb, to_px(half), lin);
-                for c in 0..3 {
-                    mean[c] += rgb[c];
+            let (colour, sample) = match shot.rgb {
+                Some(image) => {
+                    let to_px =
+                        |p: [f32; 2]| p.map(|x| ((f64::from(x) + 0.5) * to_colour - 0.5) as f32);
+                    let centre_rgb = sample_linear(image, to_px(proj.uv), lin);
+                    // Mean colour: the centroid and the points halfway to the corners (in the
+                    // image).
+                    let mut mean = centre_rgb;
+                    for corner in at {
+                        let half = [0, 1].map(|k| (proj.uv[k] + corner[k]) / 2.0);
+                        let rgb = sample_linear(image, to_px(half), lin);
+                        for c in 0..3 {
+                            mean[c] += rgb[c];
+                        }
+                    }
+                    let colour = mean.map(|v| srgb_value(v / 4.0).round().clamp(0.0, 255.0) as u8);
+                    // The carrier does not belong in the exposure fit either.
+                    let sample = (sampled(f) && !carrier)
+                        .then(|| View::new(score, shot.rank, centre_rgb, proj.theta));
+                    (colour, sample)
                 }
-            }
-            let colour = mean.map(|v| srgb_value(v / 4.0).round().clamp(0.0, 255.0) as u8);
-            // The carrier does not belong in the exposure fit either.
-            let sample = (sampled(f) && !carrier)
-                .then(|| View::new(score, shot.rank, centre_rgb, proj.theta));
+                None => ([0; 3], None),
+            };
             let angle = ((proj.theta / ANGLE_STEP).round() as u32).min(0x7f) as u8;
             let view = FaceView {
                 image: shot.rank,
@@ -1296,11 +1313,15 @@ fn cpu_views(pass: &Pass, progress: &Progress) -> Result<(Vec<FaceView>, Vec<Vie
                     world_from_cam: images[rank as usize].world_from_cam,
                     rank,
                     sharpness_norm,
-                    rgb: &frame.rgb,
+                    rgb: Some(&frame.rgb),
                     min_texel: cfg.min_texel,
                 };
-                for (f, view, colour) in image_views(mesh, faces, &grid, &shot, ccfg, sampled, &lin)
-                {
+                // The faces near the camera: splatted, and looked at.
+                let cam_pos = shot.world_from_cam.translation.vector;
+                let mut near = grid.near(&cam_pos, ccfg.max_dist + faces.reach);
+                near.par_sort_unstable();
+                let found = image_views(mesh, faces, &near, &near, &shot, ccfg, sampled, &lin);
+                for (f, view, colour) in found {
                     let f = f as usize;
                     keep_best_view(&mut per_face[f * k..(f + 1) * k], view);
                     if let Some(v) = colour {

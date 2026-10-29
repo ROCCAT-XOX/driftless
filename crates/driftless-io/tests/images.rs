@@ -1,10 +1,13 @@
 use driftless_io::bag::writer::{BagWriter, Compression};
 use driftless_io::bag::Time;
-use driftless_io::images::{decode_jpeg, for_each_image, ImageError};
+use driftless_io::images::{
+    decode_jpeg, for_each_image, for_each_image_where, ImageError, ImageHeader, Wanted,
+};
 use driftless_io::msg::encode::encode_compressed_image;
 use driftless_io::msg::CompressedImage;
 use driftless_io::testdir::TestDir;
 use jpeg_encoder::{ColorType, Encoder};
+use std::path::PathBuf;
 
 /// Solid-colour JPEG (quality 100, no chroma subsampling issues for flat colour).
 fn solid_jpeg(w: u16, h: u16, rgb: [u8; 3]) -> Vec<u8> {
@@ -186,4 +189,197 @@ fn gray_uses_bt601_weights() {
         data: vec![255, 255, 255, 255, 0, 0, 0, 0, 255],
     };
     assert_eq!(img.to_gray(), vec![255, 77, 29]);
+}
+
+/// A bag of five image messages, in this order: `left` and `right` at 1000.3 s, `left` at
+/// 1000.5 s whose JPEG is broken, a `left` message too short for its header, `right` at
+/// 1000.7 s. The good images are 32 × 24.
+fn mixed_bag(dir: &TestDir) -> (PathBuf, Vec<String>) {
+    let mut w = BagWriter::new(Compression::None);
+    let left = w.add_connection("/camera_left/image_raw", "sensor_msgs/CompressedImage");
+    let right = w.add_connection("/camera_right/image_raw", "sensor_msgs/CompressedImage");
+    let good = solid_jpeg(32, 24, [0, 0, 255]);
+    let image = |stamp: f64, data: &[u8]| {
+        encode_compressed_image(&CompressedImage {
+            stamp,
+            format: "jpeg".into(),
+            data: data.to_vec(),
+        })
+    };
+    let messages = [
+        (left, image(1000.3, &good)),
+        (right, image(1000.3, &good)),
+        (left, image(1000.5, &[1, 2, 3, 4])),
+        (left, vec![0, 0, 0]),
+        (right, image(1000.7, &good)),
+    ];
+    for (i, (conn, data)) in messages.into_iter().enumerate() {
+        w.write_message(
+            conn,
+            Time {
+                sec: i as u32,
+                nsec: 0,
+            },
+            &data,
+        );
+    }
+    let path = dir.join("bilder.bag");
+    std::fs::write(&path, w.finish()).unwrap();
+    let topics = vec![
+        "/camera_left/image_raw".to_string(),
+        "/camera_right/image_raw".to_string(),
+    ];
+    (path, topics)
+}
+
+/// What a header shows: (place in the stream, camera, stamp in ns).
+fn shown(h: &ImageHeader) -> (usize, String, u64) {
+    (h.index, h.camera.clone(), h.stamp_ns)
+}
+
+/// Listing the stream decodes nothing: every message with a readable header is shown with
+/// its place, camera and stamp; the broken JPEG is not noticed, the broken header counts as
+/// bad but keeps its place in the numbering.
+#[test]
+fn image_stream_lists_headers_without_decoding() {
+    let dir = TestDir::new(format!("driftless_images_list_{}", std::process::id()));
+    let (bag, topics) = mixed_bag(&dir);
+    let mut headers = Vec::new();
+    let mut delivered = 0;
+    let stats = for_each_image_where(
+        std::slice::from_ref(&bag),
+        &topics,
+        1,
+        |h| {
+            headers.push(shown(h));
+            Wanted::No
+        },
+        |_| {
+            delivered += 1;
+            true
+        },
+    )
+    .unwrap();
+    assert_eq!(delivered, 0);
+    assert_eq!(stats.frames, 0);
+    assert_eq!(stats.bad, 1, "{stats:?}");
+    assert_eq!(
+        headers,
+        [
+            (0, "left".to_string(), 1_000_300_000_000),
+            (1, "right".to_string(), 1_000_300_000_000),
+            (2, "left".to_string(), 1_000_500_000_000),
+            (4, "right".to_string(), 1_000_700_000_000),
+        ]
+    );
+}
+
+/// Only the wanted images are decoded, at the given size, in stream order; a broken one
+/// comes as an error. The header's stamp is the frame's, bit for bit.
+#[test]
+fn image_stream_decodes_only_wanted_images() {
+    let dir = TestDir::new(format!("driftless_images_wanted_{}", std::process::id()));
+    let (bag, topics) = mixed_bag(&dir);
+    let mut stamps = Vec::new();
+    let mut got = Vec::new();
+    let stats = for_each_image_where(
+        std::slice::from_ref(&bag),
+        &topics,
+        2,
+        |h| {
+            if [1, 2, 4].contains(&h.index) {
+                stamps.push(h.stamp);
+                Wanted::Yes
+            } else {
+                Wanted::No
+            }
+        },
+        |r| {
+            got.push(r.map(|f| (f.camera, f.stamp, f.rgb.width, f.rgb.height)));
+            true
+        },
+    )
+    .unwrap();
+    assert_eq!(stats.frames, 2);
+    assert_eq!(stats.bad, 2, "the broken header and the broken JPEG");
+    assert_eq!(got.len(), 3);
+    let first = got[0].as_ref().unwrap();
+    assert_eq!(first, &("right".to_string(), 1000.3, 16, 12));
+    assert!(matches!(got[1], Err(ImageError::Jpeg(_))), "{:?}", got[1]);
+    let last = got[2].as_ref().unwrap();
+    assert_eq!(last, &("right".to_string(), 1000.7, 16, 12));
+    assert_eq!(first.1.to_bits(), stamps[0].to_bits());
+    assert_eq!(last.1.to_bits(), stamps[2].to_bits());
+
+    // The same images as the full stream delivers at those places.
+    let mut all = Vec::new();
+    for_each_image(std::slice::from_ref(&bag), &topics, 2, |r| {
+        all.push(r.ok().map(|f| f.rgb));
+        true
+    })
+    .unwrap();
+    let mut again = Vec::new();
+    for_each_image_where(
+        &[bag],
+        &topics,
+        2,
+        |h| {
+            if [0, 4].contains(&h.index) {
+                Wanted::Yes
+            } else {
+                Wanted::No
+            }
+        },
+        |r| {
+            again.push(r.unwrap().rgb);
+            true
+        },
+    )
+    .unwrap();
+    assert_eq!(Some(&again[0]), all[0].as_ref());
+    assert_eq!(Some(&again[1]), all[4].as_ref());
+}
+
+/// `Stop` ends the stream after the images wanted so far; `f` returning `false` ends it too.
+#[test]
+fn image_stream_stops_where_wanted() {
+    let dir = TestDir::new(format!("driftless_images_stop_{}", std::process::id()));
+    let (bag, topics) = mixed_bag(&dir);
+    let mut seen = Vec::new();
+    let mut got = Vec::new();
+    let stats = for_each_image_where(
+        std::slice::from_ref(&bag),
+        &topics,
+        1,
+        |h| {
+            seen.push(h.index);
+            match h.index {
+                0 => Wanted::Yes,
+                1 => Wanted::Stop,
+                _ => Wanted::Yes,
+            }
+        },
+        |r| {
+            got.push(r.unwrap().stamp);
+            true
+        },
+    )
+    .unwrap();
+    assert_eq!(seen, [0, 1]);
+    assert_eq!(got, [1000.3]);
+    assert_eq!(stats.frames, 1);
+
+    let mut n = 0;
+    for_each_image_where(
+        &[bag],
+        &topics,
+        1,
+        |_| Wanted::Yes,
+        |_| {
+            n += 1;
+            false
+        },
+    )
+    .unwrap();
+    assert_eq!(n, 1);
 }
