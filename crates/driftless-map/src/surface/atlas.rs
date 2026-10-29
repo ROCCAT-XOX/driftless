@@ -489,6 +489,20 @@ pub(crate) fn absorb_islands(
     cfg: &SurfaceConfig,
     labels: &mut [Option<u32>],
 ) -> Absorbed {
+    absorb_islands_where(mesh, views, cams, cfg, labels, &|_, _| true)
+}
+
+/// [`absorb_islands`], where an island or patch takes image `l` only if `kept(face, l)` holds
+/// for every face of it as well: a Stelle ([`super::edit`]) says so which faces an image may
+/// not take after its photo consistency.
+pub(crate) fn absorb_islands_where(
+    mesh: &Mesh,
+    views: &ViewTable,
+    cams: &[crate::ColorCamera],
+    cfg: &SurfaceConfig,
+    labels: &mut [Option<u32>],
+    kept: &(dyn Fn(usize, u32) -> bool + Sync),
+) -> Absorbed {
     if cfg.smooth_weight == 0.0 {
         return Absorbed::default();
     }
@@ -499,7 +513,7 @@ pub(crate) fn absorb_islands(
         .map(|i| i.world_from_cam.inverse())
         .collect();
     let take = |labels: &mut [Option<u32>], gray: bool| {
-        take_over_small(mesh, views, cams, cfg, &nb, &w2c, labels, gray)
+        take_over_small(mesh, views, cams, cfg, &nb, &w2c, labels, gray, kept)
     };
     let (islands, _) = take(labels, false);
     let (_, gray_filled) = take(labels, true);
@@ -522,6 +536,7 @@ fn take_over_small(
     w2c: &[Isometry3<f64>],
     labels: &mut [Option<u32>],
     gray: bool,
+    kept: &(dyn Fn(usize, u32) -> bool + Sync),
 ) -> (usize, usize) {
     let n = labels.len();
     let limit = if gray { GRAY_PATCH_FACES } else { ISLAND_FACES };
@@ -574,6 +589,9 @@ fn take_over_small(
                     };
                     let eye = img.world_from_cam.translation.vector;
                     own.iter().all(|&f| {
+                        if !kept(f as usize, l) {
+                            return false;
+                        }
                         let tri = mesh.indices[f as usize];
                         let mut centre = Vector3::zeros();
                         for &i in &tri {

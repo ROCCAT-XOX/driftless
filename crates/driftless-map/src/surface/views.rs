@@ -85,7 +85,9 @@
 //! within the tolerance are a strict majority: with a 2/2 split (or no vote near the median)
 //! nothing says which side is right, and all views stay. The views' order is kept; at most
 //! [`MAX_VIEWS_PER_FACE`] per face. The exposure fit runs before this check (it needs the
-//! gains), so its sample still contains the dropped views.
+//! gains), so its sample still contains the dropped views. „Bilder neu einspielen“
+//! ([`super::edit`]) judges the views of a Stelle with the same votes and decision
+//! ([`voters`], [`consistent`]), on the colours against their surroundings in each image.
 //!
 //! For a port of the pass (GPU): the score uses the smoothed normals (computed once on the
 //! CPU, [`NORMAL_SMOOTH_ROUNDS`]). It has to fill [`ViewTable::per_face`] as
@@ -1078,42 +1080,16 @@ pub(crate) fn filter_views(
             });
         }
         // Votes: the first (best) view per camera (of its source) and stretch of VOTE_GAP.
-        let stretch = |i: usize| {
+        let voter = voters(n, |i| {
             let u = &images[slots[i].image as usize];
-            (u.exposure_camera, (u.stamp / VOTE_GAP).floor() as i64)
-        };
-        let mut voter = [false; MAX_VIEWS_PER_FACE];
-        for (i, v) in voter[..n].iter_mut().enumerate() {
-            *v = (0..i).all(|j| stretch(j) != stretch(i));
-        }
-        let votes = voter[..n].iter().filter(|&&v| v).count();
-        if votes < CONSISTENCY_MIN_VIEWS {
-            return;
-        }
-        let median: [f64; 3] = std::array::from_fn(|ch| {
-            let mut x = [0.0f64; MAX_VIEWS_PER_FACE];
-            let mut m = 0;
-            for i in (0..n).filter(|&i| voter[i]) {
-                x[m] = colours[i][ch];
-                m += 1;
-            }
-            x[..m].sort_by(f64::total_cmp);
-            (x[(m - 1) / 2] + x[m / 2]) / 2.0
+            stretch_of(u.exposure_camera, u.stamp)
         });
-        let near = |i: usize| {
-            (0..3)
-                .map(|ch| (colours[i][ch] - median[ch]).abs())
-                .fold(0.0, f64::max)
-                <= PHOTO_TOLERANCE
-        };
-        let agree = (0..n).filter(|&i| voter[i] && near(i)).count();
-        // Only a strict majority of the votes decides; otherwise all views stay.
-        if 2 * agree <= votes {
+        let Some(near) = consistent(&colours[..n], &voter[..n], PHOTO_TOLERANCE) else {
             return;
-        }
+        };
         let mut kept = 0;
         for i in 0..n {
-            if near(i) {
+            if near[i] {
                 slots[kept] = slots[i];
                 kept += 1;
             }
@@ -1122,6 +1098,82 @@ pub(crate) fn filter_views(
             *s = FaceView::EMPTY;
         }
     });
+}
+
+/// The vote of a view of `camera` (numbered as [`UsedImage::exposure_camera`], or any number
+/// unique per camera of a source) taken at `stamp` (s): its camera and stretch of
+/// [`VOTE_GAP`] of capture time (see the module docs, „Photo consistency“).
+pub(crate) fn stretch_of(camera: usize, stamp: f64) -> (usize, i64) {
+    (camera, (stamp / VOTE_GAP).floor() as i64)
+}
+
+/// Which of the `n` views of a face (best first, at most [`MAX_VIEWS_PER_FACE`]) vote in the
+/// photo consistency: the first of every `stretch` (the view's camera and stretch of capture
+/// time, [`stretch_of`]).
+pub(crate) fn voters<K: PartialEq>(
+    n: usize,
+    stretch: impl Fn(usize) -> K,
+) -> [bool; MAX_VIEWS_PER_FACE] {
+    let mut voter = [false; MAX_VIEWS_PER_FACE];
+    for (i, v) in voter[..n].iter_mut().enumerate() {
+        *v = (0..i).all(|j| stretch(j) != stretch(i));
+    }
+    voter
+}
+
+/// The photo consistency of the views of one face (see the module docs): `values` per view
+/// (best first, at most [`MAX_VIEWS_PER_FACE`]; the surface step: their exposure-corrected
+/// colours in sRGB levels), `voter` which of them vote ([`voters`]). Which views lie within
+/// `tolerance` of the median of the votes in every channel; `None` where that decides nothing:
+/// fewer than [`CONSISTENCY_MIN_VIEWS`] views or votes, or not a strict majority of the votes
+/// within the tolerance (all views stay).
+pub(crate) fn consistent(
+    values: &[[f64; 3]],
+    voter: &[bool],
+    tolerance: f64,
+) -> Option<[bool; MAX_VIEWS_PER_FACE]> {
+    let n = values.len();
+    let median = vote_median(values, voter)?;
+    let votes = voter.iter().filter(|&&v| v).count();
+    let mut near = [false; MAX_VIEWS_PER_FACE];
+    for (near, value) in near.iter_mut().zip(values) {
+        *near = (0..3)
+            .map(|ch| (value[ch] - median[ch]).abs())
+            .fold(0.0, f64::max)
+            <= tolerance;
+    }
+    let agree = (0..n).filter(|&i| voter[i] && near[i]).count();
+    // Only a strict majority of the votes decides; otherwise all views stay.
+    if 2 * agree <= votes {
+        return None;
+    }
+    Some(near)
+}
+
+/// The median per channel of the `values` of the views of a face that vote (`voter`; the mean
+/// of the middle two for an even count), as [`consistent`] judges them; `None` with fewer than
+/// [`CONSISTENCY_MIN_VIEWS`] views or votes.
+pub(crate) fn vote_median(values: &[[f64; 3]], voter: &[bool]) -> Option<[f64; 3]> {
+    let n = values.len();
+    assert!(n <= MAX_VIEWS_PER_FACE, "too many views per face");
+    assert_eq!(voter.len(), n, "a vote per view");
+    if n < CONSISTENCY_MIN_VIEWS {
+        return None;
+    }
+    let votes = voter.iter().filter(|&&v| v).count();
+    if votes < CONSISTENCY_MIN_VIEWS {
+        return None;
+    }
+    Some(std::array::from_fn(|ch| {
+        let mut x = [0.0f64; MAX_VIEWS_PER_FACE];
+        let mut m = 0;
+        for i in (0..n).filter(|&i| voter[i]) {
+            x[m] = values[i][ch];
+            m += 1;
+        }
+        x[..m].sort_by(f64::total_cmp);
+        (x[(m - 1) / 2] + x[m / 2]) / 2.0
+    }))
 }
 
 /// The views of every face of `mesh` in the images of `sources`, and the exposure of the

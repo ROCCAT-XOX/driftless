@@ -69,11 +69,16 @@
 //!    divided by the image's gain), relative to the median of them and at most 1, times its
 //!    quality orders the images: those covering [`FULL_COVERAGE`] first, then by quality ×
 //!    sharpness, then by source and stream order. Variant `k` takes the `k`-th (`k mod n`) for
-//!    every face it sees. The other faces take the next best by [`ICM_ROUNDS`] rounds of ICM
-//!    over their views in the other images, the faces of the chosen one and the outside held
-//!    (the outside never has the same image), as the surface step labels; then islands and
-//!    small gray patches take the image around them where its camera sees them
-//!    ([`absorb_islands`]). A face no image takes keeps its old texture.
+//!    every face it sees, but where the photo consistency (below) leaves its views out in a
+//!    group of at least [`ISLAND_FACES`] faces, and along the edge of such a group
+//!    ([`Prepared::taken_from`]). The other faces take the next best by [`ICM_ROUNDS`] rounds
+//!    of ICM over the views kept in the other images, the faces of the chosen one and the
+//!    outside held (the outside never has the same image), as the surface step labels; then
+//!    islands and small gray patches take the image around them where its camera sees them
+//!    and may take them ([`absorb_islands_where`]). A face no image takes keeps its old
+//!    texture. An image that takes faces from the chosen one is matched to it around them
+//!    ([`Judged::match_gain`]): the gains match the images to the old texture only around the
+//!    Stelle.
 //! 7. **Bake** ([`bake_region`]): the charts as the surface step makes them, at its texel size
 //!    ([`SurfaceConfig::min_texel`]), on pages of their own: the smallest power of two from
 //!    [`REGION_PAGE_MIN`] to [`REGION_PAGE_MAX`] that holds them, several if one does not; the
@@ -86,6 +91,40 @@
 //!    [`SurfaceConfig::jpeg_quality`]) hold them, corner `k` of a triangle the copy of its
 //!    face's corner `k`, where the (possibly smoothed) surface has it.
 //!
+//! **Photo consistency** ([`judge_views`]): a thing the surface does not have (a rod or a pipe
+//! well in front of a wall, a person walking by) shows in an image on the faces behind it, and
+//! from every place on other faces. As in the surface step, the views of every face in the
+//! decoded images are judged against the median of their votes (one per camera and stretch of
+//! capture time; a strict majority decides; the same decision, [`consistent`]), and a view that
+//! differs is left out for that face. What is compared is not the colour itself but the colour
+//! against the image's own colours of the faces around it: per view the face's colour in the
+//! image at 1/[`SHARPNESS_DOWNSCALE`], as the surface step looks (the mean at [`FACE_SAMPLES`],
+//! divided by the gain), over the median of its colours of the faces of the Stelle within
+//! [`CONSISTENCY_RADIUS`]; more than [`CONSISTENCY_RATIO`] off the median of the votes in a
+//! channel is something else. Measured on the wall Stellen of 1 m² of the black room and the
+//! Büro (24 images each), the tolerances keep apart what is not a thing in front:
+//! - the gains match the images to the old texture only around the Stelle, without the edge
+//!   falloff: in the black room the views of one face between two lamps differed by up to twice
+//!   in brightness (the glow seen from elsewhere), so the colours themselves are not compared;
+//! - against its surroundings a face differs between the images by up to three times where the
+//!   surface is glossy (the bright edges of the cabinet doors in the Büro): the factor is the
+//!   seam levelling's limit between exposure and content ([`MAX_SEAM_RATIO`]);
+//! - image noise: in the dark (sRGB 10 to 15) a face alone differs from its surroundings by
+//!   twice, so both sides count at least as bright as [`MIN_SEAM_LUMINANCE`];
+//! - the images lie a few centimetres apart on the surface (3–4 cm at a dark band next to a pipe
+//!   in the black room, up to 8 cm at the handles in the Büro): a view that agrees with the
+//!   median at a face within [`CONSISTENCY_SHIFT`] is kept.
+//!
+//! With a factor of 2 and without the floor and the shift, the views of every image of the Büro
+//! differed at 4 to 18 % of its faces, and taking them from the chosen image cut the handles and
+//! notched the edges of the doors; in the black room a brighter image replaced the chosen one's
+//! band in part. With these tolerances the images of the first six variants differ at no face of
+//! the black room's Stelle and at 1 to 11 of the Büro's, and the chosen image keeps every face. A
+//! rod 0.5 m in front of a wall, seen from 1.5 m, lies 25 cm and more apart in the images and
+//! differs by far more than three times. A thing wider than the surroundings is found only at its
+//! edges; one that differs from the wall by less than three times, or that the images show less
+//! than [`CONSISTENCY_SHIFT`] apart, is not found.
+//!
 //! Without an image that sees the Stelle it keeps its texture ([`EditError::NoImages`]); so it
 //! does with nothing around it to match the brightness to: no ring face whose texture an image
 //! sees, and no edge to a textured face ([`EditError::NoReference`]; a Stelle among gray faces).
@@ -97,19 +136,22 @@
 use super::{dot, sub, EditError, FaceBvh, PatchPage, SurfacePatch, WeldedSurface};
 use crate::color::{
     angular_rate, linear_table, luminance, sample_linear, ColorCamera, ColorConfig,
+    SHARPNESS_DOWNSCALE,
 };
 use crate::exposure::Vignetting;
 use crate::surface::atlas::{
-    absorb_islands, bake_region, footprint_sharpness, projects, RegionImage, ICM_ROUNDS,
+    absorb_islands_where, bake_region, footprint_sharpness, projects, RegionImage, ICM_ROUNDS,
+    ISLAND_FACES,
 };
 #[cfg(doc)]
 use crate::surface::atlas::{REGION_PAGE_MAX, REGION_PAGE_MIN};
 use crate::surface::level::{
-    level_region, FrozenEdge, GAIN_FLOOR, MIN_SEAM_LUMINANCE, SEAM_MIN_COS, SEAM_SAMPLES,
+    level_region, FrozenEdge, GAIN_FLOOR, MAX_SEAM_RATIO, MIN_SEAM_LUMINANCE, SEAM_MIN_COS,
+    SEAM_SAMPLES,
 };
 use crate::surface::views::{
-    all_cameras, windowed_views, CornerFaces, Faces, Shot, TextureSource, UsedImage, ViewTable,
-    SMOOTH_COS_MIN,
+    all_cameras, consistent, stretch_of, vote_median, voters, windowed_views, CornerFaces, Faces,
+    Shot, TextureSource, UsedImage, ViewTable, MAX_VIEWS_PER_FACE, SMOOTH_COS_MIN,
 };
 use crate::surface::{encode_pages, Mesh, PageJpegs, SurfaceConfig, TexturedMesh};
 use crate::visibility::MAX_SPLAT;
@@ -161,6 +203,25 @@ pub(crate) const SHARPNESS_TEXELS: f64 = 262_144.0;
 
 /// At most this many pages of the surface are decoded at once to read the old texture.
 pub(crate) const PAGES_AT_ONCE: usize = 4;
+
+/// The photo consistency of a Stelle ([`judge_views`]) compares how a view shows a face against
+/// how it shows the faces within this distance around it (m): the median of those colours.
+pub(crate) const CONSISTENCY_RADIUS: f64 = 0.2;
+
+/// A view of a face whose colour, against its own surroundings ([`CONSISTENCY_RADIUS`]), lies
+/// more than this factor (linear light, in any channel) from the median of the votes of the
+/// face's views shows something else there ([`judge_views`]): the limit between exposure and
+/// content of the seam levelling ([`MAX_SEAM_RATIO`]). Both sides count at least as bright as
+/// [`MIN_SEAM_LUMINANCE`].
+pub(crate) const CONSISTENCY_RATIO: f64 = MAX_SEAM_RATIO;
+
+/// A view that differs from the median of the votes at a face is not left out if it agrees with
+/// the median at a face within this distance (m): the images of a Stelle lie a few centimetres
+/// apart on it (black room 3–4 cm, Büro up to 8 cm), and their edges would differ everywhere.
+pub(crate) const CONSISTENCY_SHIFT: f64 = 0.05;
+
+// Every view of a face is judged in one array of the photo consistency.
+const _: () = assert!(DECODED_VIEWS <= MAX_VIEWS_PER_FACE);
 
 /// Where a face is sampled for its colour (barycentric weights of its corners): its centroid
 /// and the points halfway from it to the corners.
@@ -1100,6 +1161,7 @@ pub fn retexture_region(
         progress,
         Matching::Full,
         Sight::BEST,
+        Judging::Consistent,
     )
 }
 
@@ -1113,8 +1175,18 @@ enum Matching {
     Raw,
 }
 
+/// Which views of a face [`retexture`] lets take it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Judging {
+    /// Those the photo consistency keeps ([`judge_views`]): [`retexture_region`].
+    Consistent,
+    /// Every view, to compare with.
+    #[cfg(test)]
+    All,
+}
+
 /// [`retexture_region`], the brightness matched as `matching` says, the images found as
-/// `sight` says.
+/// `sight` says, their views judged as `judging` says.
 #[allow(clippy::too_many_arguments)]
 fn retexture(
     s: &WeldedSurface,
@@ -1128,15 +1200,55 @@ fn retexture(
     progress: &Progress,
     matching: Matching,
     sight: Sight,
+    judging: Judging,
 ) -> Result<RetextureDone, EditError> {
     let prep = prepare(
-        s, bvh, current, faces, sources, indices, cfg, sight, progress,
+        s, bvh, current, faces, sources, indices, cfg, sight, judging, progress,
     )?;
     let n = prep.ranked.len();
     let k = variant as usize % n;
-    let labels = prep.labels(prep.ranked[k], sources, cfg);
+    let main = prep.ranked[k];
+    let (mut labels, taken) = prep.labels(main, sources, cfg);
     if progress.is_cancelled() {
         return Err(EditError::Cancelled);
+    }
+
+    // The faces the photo consistency took from the chosen image and another image took
+    // instead: that image's colours there matched to the chosen image's around them, as an
+    // image of its own (`baked_from`: the decoded image of every label).
+    let mut baked_from: Vec<usize> = (0..prep.images.len()).collect();
+    let mut matched_gains: Vec<[f32; 3]> = Vec::new();
+    let mut replaced: Vec<(u32, usize)> = labels
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &l)| {
+            let l = l?;
+            (l != main as u32 && taken[i]).then_some((l, i))
+        })
+        .collect();
+    replaced.sort_unstable();
+    if !replaced.is_empty() {
+        progress.info(format!(
+            "Bilder der Stelle: {} von {} Flächen aus einem anderen Bild, weil das gewählte dort \
+             etwas anderes zeigt als die übrigen",
+            replaced.len(),
+            prep.region.len()
+        ));
+    }
+    let max_gain = cfg.color.exposure.max_gain;
+    for same in replaced.chunk_by(|a, b| a.0 == b.0) {
+        let c = same[0].0;
+        let faces: Vec<usize> = same.iter().map(|r| r.1).collect();
+        let m = prep
+            .judged
+            .match_gain(c, main as u32, &faces, &taken, max_gain);
+        let own = prep.gains[c as usize];
+        matched_gains.push(std::array::from_fn(|ch| own[ch] * m[ch]));
+        let label = baked_from.len() as u32;
+        baked_from.push(c as usize);
+        for i in faces {
+            labels[i] = Some(label);
+        }
     }
 
     // The faces with a new texture: those an image takes that it can bake them from.
@@ -1151,9 +1263,9 @@ fn retexture(
         .zip(&labels)
         .enumerate()
         .filter_map(|(i, (&f, &l))| {
-            let l = l?;
-            let camera = &camera_of(sources, &prep.images[l as usize].view).camera;
-            projects(&prep.mesh, i, &to_cam[l as usize], camera).then_some((f, l))
+            let c = baked_from[l? as usize];
+            let camera = &camera_of(sources, &prep.images[c].view).camera;
+            projects(&prep.mesh, i, &to_cam[c], camera).then_some((f, l?))
         })
         .unzip();
     if new.is_empty() {
@@ -1180,19 +1292,22 @@ fn retexture(
     }
 
     // Bake, level, encode.
-    let images: Vec<RegionImage> = prep
-        .images
+    let gains = prep.gains.iter().chain(&matched_gains);
+    let images: Vec<RegionImage> = baked_from
         .iter()
-        .zip(&prep.gains)
-        .map(|(c, &gain)| RegionImage {
-            world_from_cam: c.view.world_from_cam,
-            camera: &camera_of(sources, &c.view).camera,
-            rgb: &c.rgb,
-            gain: if matching == Matching::Full {
-                gain
-            } else {
-                [1.0; 3]
-            },
+        .zip(gains)
+        .map(|(&c, &gain)| {
+            let c = &prep.images[c];
+            RegionImage {
+                world_from_cam: c.view.world_from_cam,
+                camera: &camera_of(sources, &c.view).camera,
+                rgb: &c.rgb,
+                gain: if matching == Matching::Full {
+                    gain
+                } else {
+                    [1.0; 3]
+                },
+            }
         })
         .collect();
     let mesh = local_mesh(s, &new);
@@ -1239,6 +1354,7 @@ fn variants(
         indices,
         cfg,
         Sight::BEST,
+        Judging::Consistent,
         progress,
     )?;
     Ok(prep
@@ -1277,14 +1393,16 @@ struct Prepared<'a> {
     own_gain: Vec<bool>,
     /// The images best first: the variants.
     ranked: Vec<usize>,
+    /// The photo consistency of the views ([`judge_views`]).
+    judged: Judged,
     /// Where the faces of the Stelle and of the ring sit in the current surface.
     old: Located<'a>,
     /// The old texture of the ring's faces.
     ring_old: Vec<Option<OldFace>>,
 }
 
-/// Steps 1 to 6 of the module docs: the images of the Stelle `faces`, decoded, their gains and
-/// their order.
+/// Steps 1 to 6 of the module docs: the images of the Stelle `faces`, decoded, their gains,
+/// their order and their views judged (as `judging` says).
 #[allow(clippy::too_many_arguments)]
 fn prepare<'a>(
     s: &WeldedSurface,
@@ -1295,6 +1413,7 @@ fn prepare<'a>(
     indices: &[Arc<ImageIndex>],
     cfg: &SurfaceConfig,
     sight: Sight,
+    judging: Judging,
     progress: &Progress,
 ) -> Result<Prepared<'a>, EditError> {
     if progress.is_cancelled() {
@@ -1367,6 +1486,14 @@ fn prepare<'a>(
 
     let mesh = local_mesh(s, &region);
     let ranked = rank(s, &region, &mesh, &images, &gains, sources, cfg);
+    let judged = match judging {
+        Judging::Consistent => judge_views(s, bvh, &region, &images, &gains, sources, &lin),
+        #[cfg(test)]
+        Judging::All => Judged::none(region.len()),
+    };
+    if progress.is_cancelled() {
+        return Err(EditError::Cancelled);
+    }
     Ok(Prepared {
         neighbours: edge_neighbours(s, &region),
         region,
@@ -1376,6 +1503,7 @@ fn prepare<'a>(
         gains,
         own_gain: own.iter().map(Option::is_some).collect(),
         ranked,
+        judged,
         old,
         ring_old,
     })
@@ -1383,26 +1511,38 @@ fn prepare<'a>(
 
 impl Prepared<'_> {
     /// The image of every face of the Stelle (an index into `images`) for the variant whose
-    /// image is `main` (see the module docs, step 6); `None`: no image takes the face.
+    /// image is `main` (see the module docs, step 6); `None`: no image takes the face. And the
+    /// faces `main` does not take after the photo consistency ([`Prepared::taken_from`]); the
+    /// other images take no face whose view of it the photo consistency leaves out
+    /// ([`Judged::left_out`]).
     fn labels(
         &self,
         main: usize,
         sources: &[TextureSource],
         cfg: &SurfaceConfig,
-    ) -> Vec<Option<u32>> {
+    ) -> (Vec<Option<u32>>, Vec<bool>) {
         let n = self.region.len();
+        let main = main as u32;
+        let taken = self.taken_from(main);
         // Per face its views in the decoded images, best first (equal: the earlier image).
         let mut views: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n];
         for (c, image) in self.images.iter().enumerate() {
+            let c = c as u32;
             for &(f, score) in &image.view.faces {
                 let i = self.region.binary_search(&f).expect("a face of the Stelle");
-                views[i].push((c as u32, score));
+                let out = if c == main {
+                    taken[i]
+                } else {
+                    self.judged.left_out(i, c)
+                };
+                if !out {
+                    views[i].push((c, score));
+                }
             }
         }
         for v in &mut views {
             v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         }
-        let main = main as u32;
         let held: Vec<bool> = views
             .iter()
             .map(|v| v.iter().any(|x| x.0 == main))
@@ -1468,16 +1608,10 @@ impl Prepared<'_> {
                 }
             }
         }
-        // Islands and small gray patches take the image around them where its camera sees them.
+        // Islands and small gray patches take the image around them where its camera sees them,
+        // but not where the photo consistency kept it from them.
         let cams = all_cameras(sources);
-        let cam_base: Vec<usize> = sources
-            .iter()
-            .scan(0, |base, src| {
-                let b = *base;
-                *base += src.cams.len();
-                Some(b)
-            })
-            .collect();
+        let cam_base = camera_bases(sources);
         let table = ViewTable {
             images: self
                 .images
@@ -1494,9 +1628,102 @@ impl Prepared<'_> {
             gains: self.gains.clone(),
             vignetting: Vignetting::flat(cams.len(), cfg.color.exposure.max_gain),
         };
-        absorb_islands(&self.mesh, &table, &cams, cfg, &mut labels);
-        labels
+        let kept = |f: usize, c: u32| {
+            if c == main {
+                !taken[f]
+            } else {
+                !self.judged.left_out(f, c)
+            }
+        };
+        absorb_islands_where(&self.mesh, &table, &cams, cfg, &mut labels, &kept);
+        (labels, taken)
     }
+
+    /// The faces of the Stelle the chosen image `main` does not take although it sees them (see
+    /// the module docs, step 6): those where the photo consistency leaves its view out, in groups
+    /// over shared edges of at least [`ISLAND_FACES`] faces (a smaller group stays with it, as an
+    /// island would), and the faces sharing an edge with such a group that it sees and another
+    /// image sees and keeps: a thing in front covers the faces along its edge only in part, and
+    /// their mean colour differs less.
+    fn taken_from(&self, main: u32) -> Vec<bool> {
+        let n = self.region.len();
+        let mut sees = vec![false; n];
+        for &(f, _) in &self.images[main as usize].view.faces {
+            sees[self.region.binary_search(&f).expect("a face of the Stelle")] = true;
+        }
+        let mut others = vec![false; n];
+        for (c, image) in self.images.iter().enumerate() {
+            if c as u32 == main {
+                continue;
+            }
+            for &(f, _) in &image.view.faces {
+                let i = self.region.binary_search(&f).expect("a face of the Stelle");
+                others[i] |= !self.judged.left_out(i, c as u32);
+            }
+        }
+        // The faces of the Stelle sharing an edge with each.
+        let beside: Vec<Vec<usize>> = self
+            .neighbours
+            .iter()
+            .map(|edges| {
+                let mut v: Vec<usize> = edges
+                    .iter()
+                    .flatten()
+                    .filter_map(|g| self.region.binary_search(g).ok())
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            })
+            .collect();
+        let out: Vec<bool> = (0..n).map(|i| self.judged.left_out(i, main)).collect();
+        let mut taken = vec![false; n];
+        let mut group_of = vec![usize::MAX; n];
+        for start in 0..n {
+            if !out[start] || group_of[start] != usize::MAX {
+                continue;
+            }
+            let mut group = vec![start];
+            group_of[start] = start;
+            let mut k = 0;
+            while k < group.len() {
+                for &j in &beside[group[k]] {
+                    if out[j] && group_of[j] == usize::MAX {
+                        group_of[j] = start;
+                        group.push(j);
+                    }
+                }
+                k += 1;
+            }
+            if group.len() < ISLAND_FACES {
+                continue;
+            }
+            for &i in &group {
+                taken[i] = true;
+            }
+        }
+        let grown: Vec<usize> = (0..n)
+            .filter(|&j| !taken[j] && sees[j] && others[j])
+            .filter(|&j| beside[j].iter().any(|&i| taken[i]))
+            .collect();
+        for j in grown {
+            taken[j] = true;
+        }
+        taken
+    }
+}
+
+/// Per source the number of its first camera among the cameras of all sources in turn
+/// ([`all_cameras`], [`UsedImage::exposure_camera`]).
+fn camera_bases(sources: &[TextureSource]) -> Vec<usize> {
+    sources
+        .iter()
+        .scan(0, |base, src| {
+            let b = *base;
+            *base += src.cams.len();
+            Some(b)
+        })
+        .collect()
 }
 
 /// The faces within [`RING_ROUNDS`] rounds around the Stelle `region` (sorted): the faces
@@ -1920,6 +2147,330 @@ fn rank(
             .then(id(a).cmp(&id(b)))
     });
     order
+}
+
+/// The photo consistency of the views of a Stelle (see the module docs): per face of `region`
+/// (sorted; its faces in the tree `bvh` of `s`) the decoded `images` (indices, sorted) whose
+/// view of it shows something else than the others' views. A view gives the face its colour in
+/// its image at 1/[`SHARPNESS_DOWNSCALE`] ([`quarter_colours`]) against the median of its
+/// colours of the faces of the Stelle within [`CONSISTENCY_RADIUS`]: per channel
+/// `ln((colour + MIN_SEAM_LUMINANCE) / (median + MIN_SEAM_LUMINANCE))`. The views of a face vote
+/// as in the surface step, one per camera and stretch of capture time, and a view further than
+/// `ln` [`CONSISTENCY_RATIO`] from the median of the votes in a channel, where the votes within
+/// it are a strict majority ([`consistent`]), is left out, unless it lies within that of the
+/// median of the votes ([`vote_median`]) at a face within [`CONSISTENCY_SHIFT`]. Deterministic:
+/// per image and face an ordered map, medians of values.
+fn judge_views(
+    s: &WeldedSurface,
+    bvh: &FaceBvh,
+    region: &[u32],
+    images: &[Decoded],
+    gains: &[[f32; 3]],
+    sources: &[TextureSource],
+    lin: &[f32; 256],
+) -> Judged {
+    let n = region.len();
+    // The faces of the Stelle around each (indices into `region`, sorted; itself among them).
+    let around: Vec<Vec<u32>> = region
+        .par_iter()
+        .map(|&f| {
+            bvh.faces_within(s, s.face_centroid(f), CONSISTENCY_RADIUS)
+                .into_iter()
+                .filter_map(|g| region.binary_search(&g).ok().map(|i| i as u32))
+                .collect()
+        })
+        .collect();
+    // Per image the colour of every face it sees, …
+    let colours: Vec<Vec<Option<[f64; 3]>>> = images
+        .par_iter()
+        .zip(gains)
+        .map(|(c, gain)| {
+            let camera = &camera_of(sources, &c.view).camera;
+            quarter_colours(s, region, c, camera, gain, lin)
+        })
+        .collect();
+    // … against the median of its colours around the face.
+    let relative: Vec<Vec<Option<[f64; 3]>>> = colours
+        .par_iter()
+        .map(|colours| {
+            let mut near: Vec<f64> = Vec::new();
+            (0..n)
+                .map(|i| {
+                    let own = colours[i]?;
+                    Some(std::array::from_fn(|k| {
+                        near.clear();
+                        near.extend(
+                            around[i]
+                                .iter()
+                                .filter_map(|&j| colours[j as usize].map(|c| c[k])),
+                        );
+                        let middle = select_median(&mut near);
+                        ((own[k] + MIN_SEAM_LUMINANCE) / (middle + MIN_SEAM_LUMINANCE)).ln()
+                    }))
+                })
+                .collect()
+        })
+        .collect();
+    let cam_base = camera_bases(sources);
+    let tolerance = CONSISTENCY_RATIO.ln();
+    let judged: Vec<FaceVotes> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let f = region[i];
+            let mut views: Vec<(u32, f32)> = images
+                .iter()
+                .enumerate()
+                .filter(|&(c, _)| relative[c][i].is_some())
+                .filter_map(|(c, image)| {
+                    let at = image.view.faces.binary_search_by_key(&f, |v| v.0).ok()?;
+                    Some((c as u32, image.view.faces[at].1))
+                })
+                .collect();
+            views.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            let views: Vec<(u32, [f64; 3])> = views
+                .iter()
+                .map(|v| (v.0, relative[v.0 as usize][i].expect("a judged view")))
+                .collect();
+            let voter = voters(views.len(), |k| {
+                let view = &images[views[k].0 as usize].view;
+                let camera = cam_base[view.source as usize] + view.camera as usize;
+                stretch_of(camera, view.stamp as f64 * 1e-9)
+            });
+            let values: Vec<[f64; 3]> = views.iter().map(|v| v.1).collect();
+            let median = vote_median(&values, &voter[..views.len()]);
+            FaceVotes {
+                views,
+                voter,
+                median,
+            }
+        })
+        .collect();
+    // A view that differs where the votes decide is left out, unless it agrees with the median
+    // of the votes at a face within CONSISTENCY_SHIFT.
+    let near = |a: &[f64; 3], b: &[f64; 3]| (0..3).all(|k| (a[k] - b[k]).abs() <= tolerance);
+    let out = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let FaceVotes { views, voter, .. } = &judged[i];
+            let values: Vec<[f64; 3]> = views.iter().map(|v| v.1).collect();
+            let Some(kept) = consistent(&values, &voter[..views.len()], tolerance) else {
+                return Vec::new();
+            };
+            let shifted: Vec<usize> = bvh
+                .faces_within(s, s.face_centroid(region[i]), CONSISTENCY_SHIFT)
+                .into_iter()
+                .filter_map(|g| region.binary_search(&g).ok())
+                .collect();
+            let mut out: Vec<u32> = views
+                .iter()
+                .zip(&kept)
+                .filter(|&(v, &ok)| {
+                    !ok && !shifted
+                        .iter()
+                        .any(|&j| judged[j].median.is_some_and(|m| near(&v.1, &m)))
+                })
+                .map(|(v, _)| v.0)
+                .collect();
+            out.sort_unstable();
+            out
+        })
+        .collect();
+    Judged {
+        out,
+        colours,
+        around,
+    }
+}
+
+/// The views of one face of a Stelle as [`judge_views`] judges them.
+struct FaceVotes {
+    /// The images that see it with their values, best first (equal: the earlier image), as
+    /// [`Prepared::labels`] has them.
+    views: Vec<(u32, [f64; 3])>,
+    /// Which of them vote ([`voters`]) …
+    voter: [bool; MAX_VIEWS_PER_FACE],
+    /// … and the median of the votes ([`vote_median`]).
+    median: Option<[f64; 3]>,
+}
+
+/// What [`judge_views`] found for the views of a Stelle.
+struct Judged {
+    /// Per face of the Stelle the images (indices into the decoded images, sorted) whose view
+    /// of it is left out.
+    out: Vec<Vec<u32>>,
+    /// Per image the colour of every face of the Stelle it sees ([`quarter_colours`]); empty
+    /// where nothing was judged.
+    colours: Vec<Vec<Option<[f64; 3]>>>,
+    /// Per face of the Stelle the faces within [`CONSISTENCY_RADIUS`] (indices, sorted).
+    around: Vec<Vec<u32>>,
+}
+
+impl Judged {
+    /// Nothing left out, for a Stelle of `n` faces.
+    #[cfg(test)]
+    fn none(n: usize) -> Judged {
+        Judged {
+            out: vec![Vec::new(); n],
+            colours: Vec::new(),
+            around: Vec::new(),
+        }
+    }
+
+    /// Whether the view of face `i` (of the Stelle) in image `c` is left out.
+    fn left_out(&self, i: usize, c: u32) -> bool {
+        self.out[i].binary_search(&c).is_ok()
+    }
+
+    /// The brightness of image `c` against image `main` around the faces `replaced` (indices,
+    /// sorted) of the Stelle, which `c` takes because `main` may not (`taken`, per face; see
+    /// the module docs, step 6): per channel the median of
+    /// `ln((c + GAIN_FLOOR) / (main + GAIN_FLOOR))` of their colours ([`quarter_colours`]) over
+    /// the faces within [`CONSISTENCY_RADIUS`] of them that `main` takes and where `c`'s view is
+    /// not left out (at least [`MIN_GAIN_FACES`]), exponentiated and clamped to
+    /// `[1 / max_gain, max_gain]`; 1 without enough such faces.
+    fn match_gain(
+        &self,
+        c: u32,
+        main: u32,
+        replaced: &[usize],
+        taken: &[bool],
+        max_gain: f64,
+    ) -> [f32; 3] {
+        let mut near: Vec<u32> = replaced
+            .iter()
+            .flat_map(|&i| self.around[i].iter().copied())
+            .collect();
+        near.sort_unstable();
+        near.dedup();
+        let (ci, mi) = (c as usize, main as usize);
+        let mut logs: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for &j in &near {
+            let j = j as usize;
+            if self.left_out(j, c) || taken[j] {
+                continue;
+            }
+            let (Some(a), Some(b)) = (self.colours[ci][j], self.colours[mi][j]) else {
+                continue;
+            };
+            for (k, l) in logs.iter_mut().enumerate() {
+                l.push(((a[k] + GAIN_FLOOR) / (b[k] + GAIN_FLOOR)).ln());
+            }
+        }
+        if logs[0].len() < MIN_GAIN_FACES {
+            return [1.0; 3];
+        }
+        let lim = max_gain.max(1.0);
+        logs.map(|mut l| median(&mut l).exp().clamp(1.0 / lim, lim) as f32)
+    }
+}
+
+/// The colours of the faces of `region` (sorted) that `image` sees ([`RegionView::faces`]), in
+/// the order of `region` (`None` for the others and where a point is not in the image): the
+/// linear mean at [`FACE_SAMPLES`], bilinear in the image at 1/[`SHARPNESS_DOWNSCALE`] (each
+/// pixel the rounded mean of its block of the full image, as [`decode_jpeg`] makes it) of
+/// `camera`, divided by `gain`. Only the part of the small image that holds the points is made.
+fn quarter_colours(
+    s: &WeldedSurface,
+    region: &[u32],
+    image: &Decoded,
+    camera: &Camera,
+    gain: &[f32; 3],
+    lin: &[f32; 256],
+) -> Vec<Option<[f64; 3]>> {
+    let d = SHARPNESS_DOWNSCALE;
+    let small = camera.downscaled(d);
+    let to_cam = image.view.world_from_cam.inverse();
+    // Every face seen: its place in the Stelle and its points in the small image.
+    let points: Vec<(usize, [[f64; 2]; 4])> = image
+        .view
+        .faces
+        .iter()
+        .filter_map(|&(f, _)| {
+            let corners = s.face_corners(f);
+            let mut uv = [[0.0f64; 2]; 4];
+            for (uv, w) in uv.iter_mut().zip(&FACE_SAMPLES) {
+                let p = [0, 1, 2].map(|a| (0..3).map(|k| w[k] * corners[k][a]).sum::<f64>());
+                *uv = small.project(&(to_cam * Point3::from(p)).coords)?;
+            }
+            Some((region.binary_search(&f).expect("a face of the Stelle"), uv))
+        })
+        .collect();
+    let mut out = vec![None; region.len()];
+    let (w, h) = (image.rgb.width / d, image.rgb.height / d);
+    if points.is_empty() || w == 0 || h == 0 {
+        return out;
+    }
+    // The pixels the bilinear samples read, and one more on every side.
+    let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for (_, uv) in &points {
+        for p in uv {
+            for a in 0..2 {
+                lo[a] = lo[a].min(p[a]);
+                hi[a] = hi[a].max(p[a]);
+            }
+        }
+    }
+    let x0 = (lo[0].floor() - 1.0).clamp(0.0, f64::from(w - 1)) as u32;
+    let y0 = (lo[1].floor() - 1.0).clamp(0.0, f64::from(h - 1)) as u32;
+    let x1 = (hi[0].ceil() + 1.0).clamp(0.0, f64::from(w - 1)) as u32;
+    let y1 = (hi[1].ceil() + 1.0).clamp(0.0, f64::from(h - 1)) as u32;
+    let part = shrunk(&image.rgb, d, [x0, y0], [x1 - x0 + 1, y1 - y0 + 1]);
+    for (i, uv) in points {
+        let mut sum = [0.0f64; 3];
+        for p in uv {
+            let at = [(p[0] - f64::from(x0)) as f32, (p[1] - f64::from(y0)) as f32];
+            let c = sample_linear(&part, at, lin);
+            for k in 0..3 {
+                sum[k] += f64::from(c[k]);
+            }
+        }
+        out[i] = Some(std::array::from_fn(|k| {
+            sum[k] / FACE_SAMPLES.len() as f64 / f64::from(gain[k])
+        }));
+    }
+    out
+}
+
+/// The part `size` at `origin` of `image` made `d` times smaller, as [`decode_jpeg`] makes the
+/// whole: every pixel the rounded mean of its `d × d` block.
+fn shrunk(image: &RgbImage, d: u32, origin: [u32; 2], size: [u32; 2]) -> RgbImage {
+    let (w, d) = (image.width as usize, d as usize);
+    let area = (d * d) as u32;
+    let mut data = Vec::with_capacity(size[0] as usize * size[1] as usize * 3);
+    for oy in origin[1] as usize..(origin[1] + size[1]) as usize {
+        for ox in origin[0] as usize..(origin[0] + size[0]) as usize {
+            let mut sum = [0u32; 3];
+            for dy in 0..d {
+                let row = ((oy * d + dy) * w + ox * d) * 3;
+                for px in image.data[row..row + d * 3].as_chunks::<3>().0 {
+                    for c in 0..3 {
+                        sum[c] += u32::from(px[c]);
+                    }
+                }
+            }
+            data.extend(sum.iter().map(|s| ((s + area / 2) / area) as u8));
+        }
+    }
+    RgbImage {
+        width: size[0],
+        height: size[1],
+        data,
+    }
+}
+
+/// The median of `v` (the mean of the middle two for an even count), by selection; 0 if empty.
+/// The same value as [`median`].
+fn select_median(v: &mut [f64]) -> f64 {
+    let n = v.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let (below, &mut upper, _) = v.select_nth_unstable_by(n / 2, f64::total_cmp);
+    if n % 2 == 1 {
+        return upper;
+    }
+    let (_, &mut lower, _) = below.select_nth_unstable_by(n / 2 - 1, f64::total_cmp);
+    (lower + upper) / 2.0
 }
 
 /// The edges where the new texture meets the old one (see the module docs, step 8): every edge
@@ -2789,6 +3340,7 @@ mod tests {
                     &Progress::new(),
                     Matching::Raw,
                     Sight::BEST,
+                    Judging::Consistent,
                 )
                 .unwrap();
                 let clock = Instant::now();
@@ -2936,6 +3488,259 @@ mod tests {
             &Progress::new(),
         );
         assert!(matches!(r, Err(EditError::NoReference)), "{r:?}");
+    }
+
+    /// The rod of [`rod_wall`]: its middle (x, m), half its width, its colour. It stands 0.5 m
+    /// in front of the +y wall (y 4.46 … 4.54), from z −1.1 to 1.7.
+    const ROD_X: f64 = 0.025;
+    const ROD_HALF: f64 = 0.04;
+    const ROD: [u8; 3] = [40, 35, 30];
+    /// Where the camera of [`rod_wall`] stands (x, m), 1.5 m before the wall, one image a second.
+    const ROD_PLACES: [f64; 5] = [0.0, -0.5, 0.5, -1.0, 1.0];
+    /// The colour of the +y wall of the painted room (`scene::WALLS[3]`).
+    const WALL_Y: [u8; 3] = [60, 200, 200];
+
+    /// The +y wall of the painted room (y = 5, facing −y; x −2.5 … 2.5, z −1.2 … 1.8) as squares
+    /// of 5 cm, textured as the surface step does it (1 cm texels, pages of 1024²) from images
+    /// of the bare room, welded; and the images of the same moments with a thin rod in front of
+    /// the wall, which the surface does not have ([`ROD_X`]): the camera `left` looking at the
+    /// wall from [`ROD_PLACES`], at 1.5 m. From each place the rod hides another stripe of the
+    /// wall (12 cm wide, 25 cm and more apart).
+    fn rod_wall() -> &'static (PageMesh, WeldedSurface, TextureSource) {
+        use crate::surface::testutil::{grid, Steps};
+        use crate::surface::{texture_mesh, SurfaceStats};
+        static WALL: OnceLock<(PageMesh, WeldedSurface, TextureSource)> = OnceLock::new();
+        WALL.get_or_init(|| {
+            let bare = scene::Painted::new(vec![]);
+            let rod = scene::Painted::new(vec![(
+                scene::aabb(
+                    [ROD_X - ROD_HALF, 4.46, -1.1],
+                    [ROD_X + ROD_HALF, 4.54, 1.7],
+                ),
+                ROD,
+            )]);
+            let cam = scene::cameras()[0].clone();
+            let cam_y = cam.cam_in_body.translation.vector.y;
+            let body = move |x: f64| Isometry3::translation(x, 3.5 - cam_y, 0.0);
+            // Each place from half a second before its image on.
+            let traj = Steps(
+                ROD_PLACES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &x)| {
+                        let from = if i == 0 {
+                            0.0
+                        } else {
+                            scene::T0 + 0.5 + i as f64
+                        };
+                        (from, body(x))
+                    })
+                    .collect(),
+            );
+            let shots = || -> Vec<scene::Shot> {
+                (0..ROD_PLACES.len())
+                    .map(|i| scene::shot(0, scene::T0 + 1.0 + i as f64))
+                    .collect()
+            };
+            let cams = std::slice::from_ref(&cam);
+            let source = |name: &str, painted: &scene::Painted| TextureSource {
+                images: scene::write_bag(name, painted, &traj, cams, &shots()),
+                poses: scene::poses(&traj, 6.0),
+                cams: vec![cam.clone()],
+            };
+            let plain = source("retexture-wall-bare", &bare);
+            let with_rod = source("retexture-wall-rod", &rod);
+            let (positions, indices) = grid([100, 60], |i, j| {
+                [-2.5 + 0.05 * i as f64, 5.0, -1.2 + 0.05 * j as f64]
+            });
+            let mesh = Mesh {
+                positions: positions.iter().map(|p| p.map(|c| c as f32)).collect(),
+                indices,
+            };
+            let cfg = walk_config();
+            let mut stats = SurfaceStats::default();
+            let tex = texture_mesh(
+                &mesh,
+                std::slice::from_ref(&plain),
+                &cfg,
+                &Progress::new(),
+                &mut stats,
+                None,
+            )
+            .unwrap();
+            let jpegs = encode_pages(&tex, cfg.jpeg_quality).unwrap();
+            let pages = tex.to_mesh(&jpegs).unwrap();
+            let s = WeldedSurface::from_mesh(&pages);
+            (pages, s, with_rod)
+        })
+    }
+
+    /// The largest difference from the wall's colour (sRGB levels, any channel) of the patch's
+    /// texture at points `(dx, z)` of the +y wall of [`rod_wall`] (y = 5), `dx` from the line
+    /// where the rod lies in the image of its first place (seen from there, its middle on the
+    /// wall): bilinear in the page of the patch triangle that holds each.
+    fn off_the_wall(patch: &SurfacePatch, src: &TextureSource, points: &[[f64; 2]]) -> Vec<f64> {
+        let first = src.poses[0].p + src.poses[0].q * src.cams[0].cam_in_body.translation.vector;
+        // From the camera through the rod's middle (y 4.5) onto the wall (y 5).
+        let x = first.x + (ROD_X - first.x) * (5.0 - first.y) / (4.5 - first.y);
+        let images: Vec<RgbImage> = patch
+            .pages
+            .iter()
+            .map(|p| decode_jpeg(&p.jpeg, 1).unwrap())
+            .collect();
+        let colour = |p: [f64; 2]| -> [f64; 3] {
+            for (page, image) in patch.pages.iter().zip(&images) {
+                for tri in &page.indices {
+                    let c = tri.map(|k| page.positions[k as usize]);
+                    let (a, b, d) = ([c[0][0], c[0][2]], [c[1][0], c[1][2]], [c[2][0], c[2][2]]);
+                    let det = (b[0] - a[0]) * (d[1] - a[1]) - (d[0] - a[0]) * (b[1] - a[1]);
+                    let u = ((p[0] - a[0]) * (d[1] - a[1]) - (d[0] - a[0]) * (p[1] - a[1])) / det;
+                    let v = ((b[0] - a[0]) * (p[1] - a[1]) - (p[0] - a[0]) * (b[1] - a[1])) / det;
+                    let w = [1.0 - u - v, u, v];
+                    if w.iter().all(|&x| x >= -1e-9) {
+                        let uv = [0, 1].map(|a| {
+                            (0..3)
+                                .map(|k| w[k] * f64::from(page.uvs[tri[k] as usize][a]))
+                                .sum::<f64>() as f32
+                        });
+                        return colour_at(image, uv);
+                    }
+                }
+            }
+            panic!("{p:?} is on no triangle of the patch")
+        };
+        points
+            .iter()
+            .map(|&[dx, z]| {
+                let got = colour([x + dx, z]);
+                (0..3)
+                    .map(|c| (got[c] - f64::from(WALL_Y[c])).abs())
+                    .fold(0.0, f64::max)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn thin_occluder_not_baked() {
+        // A thin rod 0.5 m in front of the wall, in the images but not in the surface: seen from
+        // the first place (head-on, the best image: variant 0) it hides a stripe of the Stelle.
+        // The other four images show the wall there; their own stripes lie elsewhere. The Stelle
+        // takes the first image, but where the rod hides the wall in it (and along the edge of
+        // that, where it hides the faces in part) the faces take another.
+        let (pages, s, src) = rod_wall();
+        let cfg = walk_config();
+        let spot = spot_at(s, [0.0, 5.0, 0.0], 0.45, [0.0, -1.0, 0.0]);
+        assert!(spot.len() > 400, "{}", spot.len());
+        let sources = std::slice::from_ref(src);
+        let ranked = variants(
+            s,
+            &FaceBvh::build(s),
+            pages,
+            &spot,
+            sources,
+            &index_of(sources),
+            &cfg,
+            &Progress::new(),
+        )
+        .unwrap();
+        assert_eq!(ranked.len(), ROD_PLACES.len(), "{ranked:?}");
+        assert_eq!(ranked[0], (0, 0), "the head-on image first: {ranked:?}");
+        let done = retexture_here(s, pages, &spot, sources, 0, &cfg, &Progress::new()).unwrap();
+        assert_eq!(done.variant_of, (1, ROD_PLACES.len() as u32));
+        // Along the rod as the first image shows it, from z −0.3 to 0.3 m, and across it (10 cm
+        // either side of its middle; it hides 6 cm either side).
+        let along: Vec<[f64; 2]> = (-6..=6).map(|i| [0.0, 0.05 * f64::from(i)]).collect();
+        let across: Vec<[f64; 2]> = [-0.2, 0.0, 0.2]
+            .iter()
+            .flat_map(|&z| (-10..=10).map(move |i| [0.01 * f64::from(i), z]))
+            .collect();
+        let off = off_the_wall(&done.patch, src, &along);
+        println!("along the rod: {off:.1?} sRGB levels from the wall");
+        assert!(off.iter().all(|&d| d <= 8.0), "{off:.1?}");
+        let off = off_the_wall(&done.patch, src, &across);
+        println!("across it: {off:.0?}");
+        assert!(off.iter().all(|&d| d <= 8.0), "{off:.1?}");
+        // Without the judgement every view takes its faces: the first image bakes the rod onto
+        // the wall.
+        let all = retexture(
+            s,
+            &FaceBvh::build(s),
+            pages,
+            &spot,
+            sources,
+            &index_of(sources),
+            0,
+            &cfg,
+            &Progress::new(),
+            Matching::Full,
+            Sight::BEST,
+            Judging::All,
+        )
+        .unwrap();
+        let baked = off_the_wall(&all.patch, src, &along);
+        println!("without the judgement: {baked:.1?}");
+        assert!(baked.iter().all(|&d| d > 100.0), "{baked:.1?}");
+        // The same again, byte for byte.
+        let again = retexture_here(s, pages, &spot, sources, 0, &cfg, &Progress::new()).unwrap();
+        assert_eq!(patch_hash(&again.patch), patch_hash(&done.patch));
+    }
+
+    #[test]
+    fn select_median_is_the_median() {
+        use crate::surface::testutil::Lcg;
+        let mut rng = Lcg::new(7);
+        for n in [0, 1, 2, 3, 4, 5, 8, 9, 100, 101] {
+            let v: Vec<f64> = (0..n).map(|_| rng.range(0.0, 0.05)).collect();
+            let (mut a, mut b) = (v.clone(), v);
+            assert_eq!(
+                select_median(&mut a).to_bits(),
+                median(&mut b).to_bits(),
+                "{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn match_gain_over_the_faces_around() {
+        // Nine faces in a row, each with the faces up to four away around it; image 1 shows them
+        // 1.5 times as bright as image 0 (face 8: 4 times). Face 4 takes image 1 for image 0,
+        // whose view of it is left out.
+        let colour = |x: f64| Some([x, x, x]);
+        let judged = |out: Vec<Vec<u32>>| Judged {
+            out,
+            colours: vec![
+                (0..9).map(|_| colour(0.1)).collect(),
+                (0..9)
+                    .map(|i| colour(if i == 8 { 0.4 } else { 0.15 }))
+                    .collect(),
+            ],
+            around: (0..9u32)
+                .map(|i| (i.saturating_sub(4)..(i + 5).min(9)).collect())
+                .collect(),
+        };
+        // Image 0 does not take the faces where its view is left out.
+        let taken =
+            |out: &[Vec<u32>]| -> Vec<bool> { out.iter().map(|o| o.contains(&0)).collect() };
+        let rounded = |g: [f32; 3]| g.map(|x| (f64::from(x) * 1e6).round() / 1e6);
+        let lifted = ((0.15 + GAIN_FLOOR) / (0.1 + GAIN_FLOOR)) as f32;
+        let mut out = vec![Vec::new(); 9];
+        out[4] = vec![0];
+        // Around face 4: faces 0 to 8 but itself, seven at 1.5 and one at 4 times.
+        let g = judged(out.clone()).match_gain(1, 0, &[4], &taken(&out), 4.0);
+        assert_eq!(rounded(g), rounded([lifted; 3]));
+        // Clamped to the largest gain.
+        let mut bright = judged(out.clone());
+        for c in &mut bright.colours[1] {
+            *c = colour(0.5);
+        }
+        assert_eq!(bright.match_gain(1, 0, &[4], &taken(&out), 4.0), [4.0; 3]);
+        // Fewer than MIN_GAIN_FACES faces around that image 0 takes and where image 1's view is
+        // kept: no matching.
+        out[0] = vec![1];
+        out[1] = vec![0];
+        out[2] = vec![0, 1];
+        let few = taken(&out);
+        assert_eq!(judged(out).match_gain(1, 0, &[4], &few, 4.0), [1.0; 3]);
     }
     /// A patch by the hash of its bytes and the variant it is, or why there is none.
     type PatchOf = Result<(u64, (u32, u32)), String>;
@@ -3563,6 +4368,7 @@ mod tests {
                         &Progress::new(),
                         Matching::Full,
                         sight,
+                        Judging::Consistent,
                     )
                     .map(|d| (patch_hash(&d.patch), d.variant_of))
                     .map_err(|e| e.to_string())

@@ -19,7 +19,9 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
   Boden oder Decke auf eine Ebene; ist sie nicht eben genug, ändert sich nichts und Driftless sagt warum.
   Der Rand geht weich über. Danach werden die Bilder der Stelle von selbst neu eingespielt.
 - „Bilder neu einspielen“: schärfere, nähere und geradere Fotos für die Stelle, die Helligkeit an die
-  Umgebung angeglichen. Jeder weitere Druck probiert die nächstbeste Variante.
+  Umgebung angeglichen. Jeder weitere Druck probiert die nächstbeste Variante. Zeigt das gewählte Foto vor
+  der Wand etwas, das die übrigen Fotos anderswo zeigen, etwa eine Stange, nimmt die Stelle dort ein
+  anderes Foto.
 - „Vorher“ und „Nachher“, dazu ↶ (⌘Z, Strg+Z) für jeden Pinselzug, jeden Schritt und jedes „Löschen“,
   auch nach einem Neustart.
 - Die Nacharbeit rechnet im Hintergrund mit Fortschritt und „Abbrechen“. Gespeichert wird sie im Projekt
@@ -54,9 +56,10 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
   jedes Mal alle Kamerabilder der Scans (im Büro 6,7 GB). Malen auf der Büro-Oberfläche läuft auf einem
   MacBook Pro mit M4 Pro mit etwa 150 Bildern/s
   ([Messung](https://github.com/ROCCAT-XOX/driftless/blob/main/docs/ergebnisse/2026-10-29-pinsel.md)).
-- **Dünne Teile vor einer Stelle:** Ein Rohr oder Kabelkanal vor der Stelle, den die Oberfläche nur in
-  Stücken hat, kann bei „Bilder neu einspielen“ als Streifen auf der Stelle landen. Dann die nächste
-  Variante probieren oder ↶.
+- **Dünne Teile dicht an der Wand:** Ein Rohr oder Kabelkanal dicht vor der Stelle, den die Oberfläche nur
+  in Stücken hat, liegt in den Fotos je nach Standort ein paar Zentimeter anders, ebenso ein dunkler
+  Streifen daneben. „Bilder neu einspielen“ kann dann einen Streifen auf die Stelle legen, schärfer und
+  etwas versetzt. Dann die nächste Variante probieren oder ↶.
 
 ### Hinweis
 
