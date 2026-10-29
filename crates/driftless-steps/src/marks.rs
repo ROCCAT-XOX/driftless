@@ -43,9 +43,27 @@
 //! stroke or one step. `next_nr` and `next_seq` go on counting after an undo or a removal, so
 //! no number and no `seq` is used twice, also after a restart.
 //!
+//! „Löschen“ ([`Marks::remove`]) is a change like a stroke: the mark goes from `stelle` to
+//! `geloescht` with the `seq` of its removal, as it was, and [`Marks::undo`] brings it back in
+//! its place with its dabs and steps while that removal is the youngest change:
+//!
+//! ```toml
+//! [[geloescht]]
+//! seq = 5
+//!
+//! [geloescht.stelle]
+//! nr = 2
+//!
+//! [[geloescht.stelle.tupfer]]
+//! # …
+//! ```
+//!
+//! A file without `geloescht` (as written before it existed) reads as before.
+//!
 //! A key the program does not know in a mark (a note added by hand) is read and written back
-//! as it is. Any other unknown key (beside `stelle`, in a dab or a step), a missing key or a
-//! value of the wrong type makes the file unreadable instead of being dropped silently.
+//! as it is, also in a removed one. Any other unknown key (beside `stelle` and `geloescht`, in
+//! a removal, a dab or a step), a missing key or a value of the wrong type makes the file
+//! unreadable instead of being dropped silently.
 
 use crate::map::hex;
 use crate::StepError;
@@ -242,6 +260,19 @@ pub enum Undone {
     Stroke { mark: u32, dabs: usize },
     /// A step of mark `mark`.
     Step { mark: u32, step: EditStep },
+    /// The removal of mark `mark` („Löschen“): it is back, with its dabs and steps.
+    Removal { mark: u32 },
+}
+
+/// A mark taken out with „Löschen“ ([`Marks::remove`]), kept as it was so that
+/// [`Marks::undo`] can bring it back.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Removed {
+    /// The removal, in the order of the strokes and steps of the file.
+    seq: u64,
+    /// The mark as it was, with its dabs, steps and the keys the program does not know.
+    stelle: Mark,
 }
 
 /// Why the marks could not be read, written or changed; the message is German, for display.
@@ -273,8 +304,8 @@ impl From<MarksError> for StepError {
     }
 }
 
-/// The marks of a map or model, in the order begun. An unknown key beside `stelle` is an
-/// error instead of being dropped silently.
+/// The marks of a map or model, in the order begun. An unknown key beside `stelle` and
+/// `geloescht` is an error instead of being dropped silently.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Marks {
@@ -286,6 +317,9 @@ pub struct Marks {
     next_seq: u64,
     #[serde(rename = "stelle", default, skip_serializing_if = "Vec::is_empty")]
     pub marks: Vec<Mark>,
+    /// The marks taken out with „Löschen“, in the order removed: what ↶ can bring back.
+    #[serde(rename = "geloescht", default, skip_serializing_if = "Vec::is_empty")]
+    removed: Vec<Removed>,
 }
 
 impl Marks {
@@ -358,11 +392,24 @@ impl Marks {
         Ok(())
     }
 
-    /// Takes back the youngest stroke or step of the file, the one with the highest `seq`:
-    /// all dabs of the stroke, or the step. A mark left without dabs and steps goes as well.
-    /// `None` if there is nothing to take back.
+    /// Takes back the youngest stroke, step or removal of the file, the one with the highest
+    /// `seq`: all dabs of the stroke, or the step; a removed mark comes back in its place, as
+    /// it was. A mark left without dabs and steps goes as well. `None` if there is nothing to
+    /// take back.
     pub fn undo(&mut self) -> Option<Undone> {
         let seq = self.seqs().max()?;
+        if let Some(i) = self.removed.iter().rposition(|r| r.seq == seq) {
+            let mark = self.removed.remove(i).stelle;
+            let nr = mark.nr;
+            // the marks are in the order begun, which is the order of their numbers
+            let at = self
+                .marks
+                .iter()
+                .position(|m| m.nr > nr)
+                .unwrap_or(self.marks.len());
+            self.marks.insert(at, mark);
+            return Some(Undone::Removal { mark: nr });
+        }
         // a step before a stroke of the same `seq`, which only a hand edit makes
         let step = self.marks.iter().enumerate().find_map(|(i, m)| {
             let j = m.steps.iter().rposition(|s| s.seq() == seq)?;
@@ -388,18 +435,48 @@ impl Marks {
         Some(undone)
     }
 
-    /// Removes mark `mark` with its dabs and steps; whether it was there.
+    /// Removes mark `mark` with its dabs and steps („Löschen“); whether it was there. The
+    /// removal is a change with a new `seq`: [`Marks::undo`] brings the mark back while it is
+    /// the youngest.
     pub fn remove(&mut self, mark: u32) -> bool {
-        let before = self.marks.len();
-        self.marks.retain(|m| m.nr != mark);
-        self.marks.len() != before
+        let Some(index) = self.index(mark) else {
+            return false;
+        };
+        // above everything of the mark itself, so that it comes back before its strokes go
+        let seq = self.take_seq();
+        let stelle = self.marks.remove(index);
+        self.removed.push(Removed { seq, stelle });
+        true
+    }
+
+    /// Takes the step `seq` out of mark `mark` as if it had never been done – a step that
+    /// changed nothing (refused by the touch-up) –, not into the history: [`Marks::undo`] does
+    /// not bring it back. Whether it was there.
+    pub fn drop_step(&mut self, mark: u32, seq: u64) -> bool {
+        let Some(index) = self.index(mark) else {
+            return false;
+        };
+        let steps = &mut self.marks[index].steps;
+        let before = steps.len();
+        steps.retain(|s| s.seq() != seq);
+        steps.len() != before
+    }
+
+    /// Whether there are no marks and nothing [`Marks::undo`] could bring back.
+    pub fn is_empty(&self) -> bool {
+        self.marks.is_empty() && self.removed.is_empty()
+    }
+
+    /// Whether [`Marks::undo`] has something to take back: a stroke, a step or a removal.
+    pub fn can_undo(&self) -> bool {
+        self.seqs().next().is_some()
     }
 
     /// The key of a cache made from the marks, hashed like the input ids of the steps
     /// ([`hex`]): the marks in their order with their numbers, dabs and steps, numbers
-    /// written exactly (`{:?}`). The counters and unknown keys are no part of it, so the key
-    /// stays the same through saving and loading and with a note added by hand, and an
-    /// undone change brings back the key from before it.
+    /// written exactly (`{:?}`). The counters, unknown keys and removed marks are no part of
+    /// it, so the key stays the same through saving and loading and with a note added by hand,
+    /// and an undone change (also a removal) brings back the key from before it.
     pub fn fingerprint(&self) -> String {
         let mut id = String::new();
         for m in &self.marks {
@@ -419,15 +496,18 @@ impl Marks {
         self.marks.iter().position(|m| m.nr == nr)
     }
 
-    /// The `seq` of all dabs and steps.
+    /// The `seq` of all dabs, steps and removals (not of what the removed marks hold: they
+    /// come back as a whole).
     fn seqs(&self) -> impl Iterator<Item = u64> + '_ {
-        self.marks.iter().flat_map(|m| {
+        let marks = self.marks.iter().flat_map(|m| {
             let dabs = m.dabs.iter().map(|d| d.seq);
             dabs.chain(m.steps.iter().map(EditStep::seq))
-        })
+        });
+        marks.chain(self.removed.iter().map(|r| r.seq))
     }
 
-    /// The `seq` of a new stroke or step: above all in the file, also one added by hand.
+    /// The `seq` of a new stroke, step or removal: above all in the file, also one added by
+    /// hand.
     fn take_seq(&mut self) -> u64 {
         let above = self.seqs().max().map_or(1, |s| s.saturating_add(1));
         let seq = self.next_seq.max(above);
@@ -435,9 +515,11 @@ impl Marks {
         seq
     }
 
-    /// The number of a new mark: above all in the file, also one added by hand.
+    /// The number of a new mark: above all in the file, also one added by hand or removed
+    /// (it may come back).
     fn take_nr(&mut self) -> u32 {
-        let top = self.marks.iter().map(|m| m.nr).max();
+        let removed = self.removed.iter().map(|r| r.stelle.nr);
+        let top = self.marks.iter().map(|m| m.nr).chain(removed).max();
         let nr = self.next_nr.max(top.map_or(1, |n| n.saturating_add(1)));
         self.next_nr = nr.saturating_add(1);
         nr
@@ -494,14 +576,15 @@ mod tests {
         assert_eq!(marks.paint(None, &[dab(WALL, false)]), 1);
         assert_eq!(marks.undo(), Some(Undone::Stroke { mark: 1, dabs: 1 }));
         assert!(marks.marks.is_empty());
-        // after an undo and a removal the next mark and stroke count on
+        // after an undo and a removal (a change with a seq of its own) the next mark and
+        // stroke count on
         assert_eq!(marks.paint(None, &[dab(WALL, false)]), 2);
         assert!(marks.remove(2));
         assert_eq!(marks.paint(None, &[dab(WALL, false)]), 3);
-        assert_eq!(marks.marks[0].dabs[0].seq, 3);
-        assert_eq!((marks.next_nr, marks.next_seq), (4, 4));
+        assert_eq!(marks.marks[0].dabs[0].seq, 4);
+        assert_eq!((marks.next_nr, marks.next_seq), (4, 5));
         let back: Marks = toml::from_str(&toml::to_string(&marks).unwrap()).unwrap();
-        assert_eq!((back.next_nr, back.next_seq), (4, 4));
+        assert_eq!((back.next_nr, back.next_seq), (4, 5));
     }
 
     #[test]
@@ -627,6 +710,114 @@ mod tests {
             .add_step(nr, StepInput::Retexture { variant: 1 })
             .unwrap();
         assert_eq!(marks.fingerprint(), "283f4379c1c83d2f");
+    }
+
+    #[test]
+    fn undo_brings_a_removed_mark_back() {
+        let mut marks = Marks::default();
+        let wall = marks.paint(None, &[dab(WALL, false), dab(WALL, true)]);
+        let strong = StepInput::Smooth {
+            level: SmoothLevel::Strong,
+        };
+        marks.add_step(wall, strong).unwrap();
+        let floor = marks.paint(None, &[dab([0.0, 0.0, 1.0], false)]);
+        marks.marks[0]
+            .unknown
+            .insert("notiz".into(), "Fenster".into());
+        let before = marks.clone();
+        let key = marks.fingerprint();
+
+        // „Löschen“ takes it out with its dabs and its step, and is the youngest change
+        assert!(marks.remove(wall));
+        assert!(!marks.remove(wall));
+        assert_eq!(marks.marks.len(), 1);
+        assert_eq!(marks.marks[0].nr, floor);
+        assert_ne!(marks.fingerprint(), key);
+        assert!(!marks.is_empty() && marks.can_undo());
+        assert_eq!(marks.add_step(wall, strong), Err(MarksError::NoMark(wall)));
+
+        // it lasts through saving and loading, with what was added by hand
+        let text = toml::to_string(&marks).unwrap();
+        assert!(text.contains("[[geloescht]]"), "{text}");
+        assert!(text.contains("notiz = \"Fenster\""), "{text}");
+        let mut marks: Marks = toml::from_str(&text).unwrap();
+
+        // ↶ brings it back in its place, as it was: the key from before as well
+        assert_eq!(marks.undo(), Some(Undone::Removal { mark: wall }));
+        assert_eq!(marks.marks, before.marks);
+        assert_eq!(marks.fingerprint(), key);
+        // then the stroke on the floor, the step, the strokes on the wall
+        assert_eq!(
+            marks.undo(),
+            Some(Undone::Stroke {
+                mark: floor,
+                dabs: 1
+            })
+        );
+        assert_eq!(
+            marks.undo(),
+            Some(Undone::Step {
+                mark: wall,
+                step: EditStep::Smooth {
+                    level: SmoothLevel::Strong,
+                    seq: 2
+                }
+            })
+        );
+        assert_eq!(
+            marks.undo(),
+            Some(Undone::Stroke {
+                mark: wall,
+                dabs: 2
+            })
+        );
+        assert_eq!(marks.undo(), None);
+        assert!(marks.is_empty() && !marks.can_undo());
+    }
+
+    #[test]
+    fn removed_marks_keep_their_numbers() {
+        // also in a file without counters: a new Stelle never gets the number of one ↶ can
+        // bring back, nor a seq below its removal
+        let mut marks = Marks::default();
+        let a = marks.paint(None, &[dab(WALL, false)]);
+        let b = marks.paint(None, &[dab(WALL, false)]);
+        assert!(marks.remove(b));
+        assert!(marks.remove(a));
+        let mut text = toml::to_string(&marks).unwrap();
+        assert!(text.starts_with("next_nr = 3\nnext_seq = 5\n"), "{text}");
+        text = text.replace("next_nr = 3\nnext_seq = 5\n", "");
+        let mut marks: Marks = toml::from_str(&text).unwrap();
+        assert!(marks.marks.is_empty() && !marks.is_empty());
+        let c = marks.paint(None, &[dab(WALL, false)]);
+        assert_eq!(c, 3);
+        assert_eq!(marks.marks[0].dabs[0].seq, 5);
+        assert_eq!(marks.undo(), Some(Undone::Stroke { mark: c, dabs: 1 }));
+        assert_eq!(marks.undo(), Some(Undone::Removal { mark: a }));
+        assert_eq!(marks.undo(), Some(Undone::Removal { mark: b }));
+        assert_eq!(marks.marks.iter().map(|m| m.nr).collect::<Vec<_>>(), [a, b]);
+    }
+
+    #[test]
+    fn a_refused_step_goes_without_a_trace() {
+        let mut marks = Marks::default();
+        let nr = marks.paint(None, &[dab(WALL, false)]);
+        let flat = StepInput::Smooth {
+            level: SmoothLevel::Flat,
+        };
+        marks.add_step(nr, flat).unwrap();
+        let seq = marks.marks[0].steps[0].seq();
+        assert!(!marks.drop_step(nr, seq + 1));
+        assert!(!marks.drop_step(nr + 1, seq));
+        assert!(marks.drop_step(nr, seq));
+        assert!(marks.marks[0].steps.is_empty());
+        // not into the history: ↶ takes back the stroke, nothing brings the step back
+        assert_eq!(marks.undo(), Some(Undone::Stroke { mark: nr, dabs: 1 }));
+        assert_eq!(marks.undo(), None);
+        // the next seq is not that of the step again
+        let again = marks.paint(None, &[dab(WALL, false)]);
+        assert_eq!(marks.marks[0].nr, again);
+        assert!(marks.marks[0].dabs[0].seq > seq);
     }
 
     #[test]

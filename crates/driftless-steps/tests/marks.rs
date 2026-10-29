@@ -180,25 +180,49 @@ fn undo_survives_restart() {
 }
 
 #[test]
-fn remove_takes_steps_along() {
+fn remove_takes_steps_along_and_undo_brings_them_back() {
     let dir = tmp("steps-marks-remove");
     let mut marks = two_marks();
+    let key = marks.fingerprint();
     assert!(marks.remove(1));
     assert!(!marks.remove(1));
     assert_eq!(marks.marks.len(), 1);
     assert_eq!(marks.marks[0].nr, 2);
+    assert_ne!(marks.fingerprint(), key);
     marks.save(&dir).unwrap();
+    // the removed mark is kept apart, with its steps, for ↶
     let text = fs::read_to_string(dir.join(MARKS_FILE)).unwrap();
+    let (live, removed) = text.split_once("[[geloescht]]").expect("{text}");
     assert!(
-        !text.contains("stark") && !text.contains("bilder_neu"),
+        !live.contains("stark") && !live.contains("bilder_neu"),
+        "{text}"
+    );
+    assert!(
+        removed.contains("[geloescht.stelle]") && removed.contains("level = \"stark\""),
         "{text}"
     );
 
-    // undo takes only what mark 2 had: its step, then its stroke
+    // after a restart, undo brings it back first, as it was, then takes mark 2's step
     let mut marks = Marks::load(&dir).unwrap();
+    assert_eq!(marks.undo(), Some(Undone::Removal { mark: 1 }));
+    assert_eq!(marks.marks, two_marks().marks);
+    assert_eq!(marks.fingerprint(), key);
+    assert!(matches!(marks.undo(), Some(Undone::Step { mark: 2, .. })));
+
+    // a file written before removals were kept reads as before
+    let mut old = two_marks();
+    old.marks.remove(0);
+    fs::write(
+        dir.join(MARKS_FILE),
+        toml::to_string(&old).unwrap().replace("[[geloescht]]", ""),
+    )
+    .unwrap();
+    let mut marks = Marks::load(&dir).unwrap();
+    assert_eq!(marks.marks, old.marks);
     assert!(matches!(marks.undo(), Some(Undone::Step { mark: 2, .. })));
     assert_eq!(marks.undo(), Some(Undone::Stroke { mark: 2, dabs: 1 }));
     assert_eq!(marks.undo(), None);
+    assert!(marks.is_empty());
 }
 
 #[test]

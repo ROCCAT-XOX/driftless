@@ -376,6 +376,8 @@ pub struct View3d {
     pending_edit: Option<Option<MeshEdit>>,
     marks_count: u64,
     edit_count: u64,
+    /// A touched-up state was given for the surface last given (waiting or on the GPU).
+    edit_given: bool,
     /// „Nachher“: draw the touched-up state.
     show_edit: bool,
     /// A stroke of the brush is being painted: whether it erases.
@@ -401,6 +403,7 @@ impl View3d {
     pub fn set_surface(&mut self, surface: Option<LoadedSurface>) {
         self.pending_marks = None;
         self.pending_edit = None;
+        self.edit_given = false;
         if surface.is_none() {
             if let Some(mesh) = &mut self.mesh {
                 mesh.clear();
@@ -423,6 +426,7 @@ impl View3d {
     /// The touched-up state of the surface last given, replacing the one before, or none;
     /// uploaded once the surface is on the GPU ([`MeshRenderer::set_edit`]).
     pub fn set_edit(&mut self, edit: Option<MeshEdit>) {
+        self.edit_given = edit.is_some();
         self.pending_edit = Some(edit);
     }
 
@@ -430,6 +434,17 @@ impl View3d {
     /// the next frame on; uploads nothing.
     pub fn show_edit(&mut self, on: bool) {
         self.show_edit = on;
+    }
+
+    /// Whether the surface last given has a touched-up state ([`View3d::set_edit`]), on the GPU
+    /// or waiting for it.
+    pub fn has_edit(&self) -> bool {
+        self.edit_given
+    }
+
+    /// Whether „Nachher“ is drawn ([`View3d::show_edit`]) – where there is a touched-up state.
+    pub fn showing_edit(&self) -> bool {
+        self.show_edit
     }
 
     /// Whether a surface is shown or about to be.

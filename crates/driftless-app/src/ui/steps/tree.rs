@@ -389,7 +389,8 @@ pub(super) fn mark_list(ui: &mut Ui, state: &AppState, owner: &Path, action: &mu
                 if let Some(step) = mark.steps.last() {
                     ui.horizontal(|ui| {
                         ui.add_space(MARK_STRIPE + ui.spacing().item_spacing.x);
-                        let line = RichText::new(text::mark_step(step))
+                        let variant = state.touchup.variants.get(&(mark.nr, step.seq()));
+                        let line = RichText::new(text::mark_step_baked(step, variant.copied()))
                             .small()
                             .color(DARK.text_dim);
                         ui.add(egui::Label::new(line).truncate());
@@ -466,7 +467,7 @@ pub(super) fn surface_leaf(
     entry_menu(
         &r,
         state,
-        || ExportSource::Surface(surface.dir.clone()),
+        || super::super::export::surface_source(state, &surface.dir),
         manage,
         action,
     );

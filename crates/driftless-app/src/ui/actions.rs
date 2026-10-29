@@ -2,7 +2,8 @@
 //! it to the job runner. All work on disk – also creating the run or map folder and taking
 //! over earlier stages – happens in the job ([`run_slam_job`], [`run_map_job`]), so the
 //! window never waits, and a cancelled or failed step leaves no new folder behind. The export
-//! ([`Action::RunExport`]) runs the same way, but also without a project.
+//! ([`Action::RunExport`]) runs the same way, but also without a project. So does the touch-up
+//! of a surface ([`Action::Touchup`]), which the window queues itself.
 
 use super::{text, Action, AppState};
 use crate::jobs::{JobOutput, JobRunner};
@@ -10,18 +11,19 @@ use crate::project::{
     restore_job, run_map_job, run_merge_job, run_model_surface_job, run_pairs_merge_job,
     run_slam_job, run_surface_job, ScanState, SlamJob,
 };
+use crate::surface::{run_touchup_job, TouchupJob, TouchupView, SURFACE_GLB};
 use driftless_steps::export::run_export;
 use driftless_steps::inspect;
 use driftless_steps::map::MapStep;
 
 /// Starts the job of a step action (`Inspect`, `RunSlam`, `Reuse`, `RestoreHistory`,
-/// `RunMap`, `RunSurface`, `RunMerge`, `ApplyPairs`, `RunModelSurface`, `RunExport`) and
-/// records it in [`AppState::running`]. Only the export runs without a project; its checks
-/// are the step's own ([`run_export`]). Refused with a German message while a job runs, for a
-/// scan that cannot be read, a run without `submaps.bin` (reuse, restore), while a change of the
-/// corrections is being written (reuse, restore), for invalid map or surface settings, a map
-/// without `map.json` (surface), fewer than two scans to merge, a model not in the project,
-/// or any other action.
+/// `RunMap`, `RunSurface`, `RunMerge`, `ApplyPairs`, `RunModelSurface`, `RunExport`,
+/// `Touchup`) and records it in [`AppState::running`]. Only the export runs without a project;
+/// its checks are the step's own ([`run_export`]). Refused with a German message while a job
+/// runs, for a scan that cannot be read, a run without `submaps.bin` (reuse, restore), while a
+/// change of the corrections is being written (reuse, restore), for invalid map or surface
+/// settings, a map without `map.json` (surface), fewer than two scans to merge, a model not in
+/// the project, a surface folder not in the tree (touch-up), or any other action.
 pub fn start_step(
     state: &mut AppState,
     runner: &mut JobRunner,
@@ -180,6 +182,29 @@ pub fn start_step(
             runner.start(text::STEP_SURFACE, move |p| {
                 let done = run_model_surface_job(&model, &settings, gpu, p)?;
                 Ok(JobOutput::SurfaceStep(Box::new(done)))
+            })
+        }
+        Action::Touchup { surface, step } => {
+            if !state.all_surfaces().any(|s| s.dir == *surface) {
+                return Err(text::not_in_tree(surface));
+            }
+            // the surface shown gets its touched-up state for the view as well
+            let view = state
+                .surface
+                .as_ref()
+                .filter(|s| s.path == surface.join(SURFACE_GLB))
+                .map(|s| TouchupView {
+                    load: state.touchup.load,
+                    origin: s.origin,
+                    shown: state.touchup.shown,
+                });
+            let job = TouchupJob {
+                surface: surface.clone(),
+                step: *step,
+                view,
+            };
+            runner.start(text::STEP_TOUCHUP, move |p| {
+                Ok(JobOutput::Touchup(Box::new(run_touchup_job(&job, p)?)))
             })
         }
         _ => return Err(text::NOT_A_STEP.into()),

@@ -696,6 +696,20 @@ pub fn centimetres(m: f32) -> String {
     format!("{:.0} cm", f64::from(m) * 100.0)
 }
 
+/// [`mark_step`], with the variant of the images the touch-up of the surface shown baked for
+/// it, if known: „Bilder neu eingespielt (Variante 2 von 5)“.
+pub fn mark_step_baked(
+    step: &driftless_steps::marks::EditStep,
+    baked: Option<(u32, u32)>,
+) -> String {
+    match (step, baked) {
+        (driftless_steps::marks::EditStep::Retexture { .. }, Some(v)) => {
+            format!("Bilder neu eingespielt ({})", variant_of(v))
+        }
+        _ => mark_step(step),
+    }
+}
+
 /// The last step of a Stelle, under its name in the list: „geglättet „stark““, „ganz eben“,
 /// „Bilder neu eingespielt“.
 pub fn mark_step(step: &driftless_steps::marks::EditStep) -> String {
@@ -723,6 +737,119 @@ pub fn mark_step(step: &driftless_steps::marks::EditStep) -> String {
 /// A change of the Stellen that could not be saved: they are read again from the file.
 pub fn marks_not_saved(why: &str) -> String {
     format!("Stellen nicht gespeichert: {why}")
+}
+
+// The touch-up of the Stellen („Nacharbeit“): the steps in the bar of the brush, the step that
+// computes them, what it says.
+/// The touch-up as a step (status bar, Protokoll).
+pub const STEP_TOUCHUP: &str = "Nacharbeit";
+/// Before the three levels of smoothing in the bar.
+pub const SMOOTH_LEVELS: &str = "Glätten:";
+/// The levels: their label, their name (for screen readers and tests) and their tooltip.
+pub const SMOOTH_LIGHT: &str = "leicht";
+pub const SMOOTH_LIGHT_NAME: &str = "Glätten: leicht";
+pub const SMOOTH_LIGHT_HINT: &str = "Die Stelle leicht glätten: feines Rauschen weg";
+pub const SMOOTH_STRONG: &str = "stark";
+pub const SMOOTH_STRONG_NAME: &str = "Glätten: stark";
+pub const SMOOTH_STRONG_HINT: &str = "Die Stelle stark glätten: auch gröbere Unebenheiten weg";
+pub const SMOOTH_FLAT: &str = "ganz eben";
+pub const SMOOTH_FLAT_NAME: &str = "Glätten: ganz eben";
+pub const SMOOTH_FLAT_HINT: &str =
+    "Die Stelle auf eine Ebene legen – für Wände, Boden und Decke. Der Rand geht weich über.";
+/// „Bilder neu einspielen“ and its tooltip.
+pub const RETEXTURE: &str = "Bilder neu einspielen";
+pub const RETEXTURE_HINT: &str = "Die Bilder der Stelle neu einspielen: schärfere, nähere und \
+     geradere Fotos. Jeder weitere Druck probiert die nächstbeste Variante.";
+/// Why „Bilder neu einspielen“ is off (and refused): the scan folders cannot be found.
+pub const RETEXTURE_NO_RAW_DATA: &str =
+    "Rohdaten fehlen – Bilder können nicht neu eingespielt werden";
+/// Why „Bilder neu einspielen“ is off: the surface was computed without photos (gray).
+pub const RETEXTURE_NO_PHOTOS: &str = "Diese Oberfläche ist ohne Fotos gerechnet";
+/// „Melden …“ in the bar of the brush.
+pub const FEEDBACK_BUTTON: &str = "Melden …";
+
+/// ⇧⇧, the keys that open „Melden“ anywhere: the Shift symbol of the icon font twice (the plain
+/// fonts lack it).
+pub fn double_shift() -> String {
+    egui_phosphor::regular::ARROW_FAT_UP.repeat(2)
+}
+
+/// The tooltip of „Melden …“ in the bar of the brush.
+pub fn feedback_button_hint() -> String {
+    format!(
+        "Einen Fehler oder Wunsch zu dieser Stelle melden ({})",
+        double_shift()
+    )
+}
+
+/// „Vorher“ / „Nachher“ in the bar of the brush: the surface as computed or touched up.
+pub const EDIT_BEFORE: &str = "Vorher";
+pub const EDIT_BEFORE_HINT: &str = "Die Oberfläche, wie sie gerechnet wurde";
+pub const EDIT_AFTER: &str = "Nachher";
+pub const EDIT_AFTER_HINT: &str = "Die Oberfläche mit der Nacharbeit";
+/// Why „Vorher“ / „Nachher“ is off.
+pub const EDIT_NONE: &str = "Diese Oberfläche hat noch keine Nacharbeit";
+/// Why the steps are off: no Stelle chosen, a stroke being painted, the touch-up running.
+pub const STEPS_NEED_MARK: &str = "Erst eine Stelle anmalen oder in der Liste wählen";
+pub const STEPS_WAIT_PAINTING: &str = "Erst den Pinselzug beenden";
+pub const TOUCHUP_RUNS: &str = "Die Nacharbeit läuft";
+
+/// The Stelle `nr` asked for is gone (another window, ↶).
+pub fn mark_gone(nr: u32) -> String {
+    format!("Stelle {nr} gibt es nicht mehr")
+}
+
+/// The name of a level of smoothing in a message: „stark“.
+pub fn smooth_level(level: driftless_steps::marks::SmoothLevel) -> &'static str {
+    use driftless_steps::marks::SmoothLevel;
+    match level {
+        SmoothLevel::Light => SMOOTH_LIGHT,
+        SmoothLevel::Strong => SMOOTH_STRONG,
+        SmoothLevel::Flat => SMOOTH_FLAT,
+    }
+}
+
+/// „Variante 2 von 5“: the images a step baked, of how many there are.
+pub fn variant_of((variant, of): (u32, u32)) -> String {
+    format!("Variante {variant} von {of}")
+}
+
+/// A smoothing done: „Stelle 1 geglättet („stark“)“.
+pub fn touchup_smoothed(nr: u32, level: driftless_steps::marks::SmoothLevel) -> String {
+    format!("Stelle {nr} geglättet („{}“)", smooth_level(level))
+}
+
+/// Images baked anew: „Stelle 1: Bilder neu eingespielt (Variante 2 von 5)“.
+pub fn touchup_retextured(nr: u32, variant: Option<(u32, u32)>) -> String {
+    match variant {
+        Some(v) => format!("Stelle {nr}: Bilder neu eingespielt ({})", variant_of(v)),
+        None => format!("Stelle {nr}: Bilder neu eingespielt"),
+    }
+}
+
+/// A step that changed nothing, with why: it is taken back out of the Stellen.
+pub fn touchup_refused(nr: u32, why: &str) -> String {
+    format!("Stelle {nr}: {why}")
+}
+
+/// A step whose computation was cancelled or failed: taken back out of the Stellen.
+pub fn touchup_taken_back(nr: u32) -> String {
+    format!("Stelle {nr}: Schritt nicht ausgeführt und wieder herausgenommen")
+}
+
+/// The touch-up of the Stellen applied to another surface of the map or model (`label`).
+pub fn touchup_applied(label: &str) -> String {
+    format!("Nacharbeit übernommen: {label}")
+}
+
+/// The name of a surface with its touch-up in the window „Exportieren“.
+pub fn export_touched_up(label: &str) -> String {
+    format!("{label} mit Nacharbeit")
+}
+
+/// The camera images of a surface could not be found for its touch-up: it runs without them.
+pub fn raw_data_unreadable(why: &str) -> String {
+    format!("Kamerabilder der Oberfläche nicht lesbar, Nacharbeit ohne sie: {why}")
 }
 
 // Measurements (field „Planung“)

@@ -19,12 +19,14 @@ use crate::overlay::RunOverlay;
 use crate::pick::relative_to;
 use crate::project::{canonical, change_project, set_point_pair_enabled, Choices, Project};
 use crate::render::ShowMode;
-use crate::surface::{load_mesh, surface_glb};
+use crate::surface::{load_mesh, surface_glb, SurfaceEdit, TouchupOutput, ViewEdit};
 use crate::synthetic::synthetic_cloud;
 use driftless_gpu::GpuPref;
 use driftless_io::progress::{LogLine, Progress};
-use driftless_steps::export::{file_kind, ExportKind, MESH_EXTENSIONS, POINT_EXTENSIONS};
-use driftless_steps::marks::Marks;
+use driftless_steps::export::{
+    file_kind, ExportKind, ExportSource, MESH_EXTENSIONS, POINT_EXTENSIONS,
+};
+use driftless_steps::marks::{EditStep, Marks};
 use driftless_steps::merge::MODEL_LAS;
 use driftless_steps::{correct, StepError};
 use eframe::egui;
@@ -476,6 +478,9 @@ pub struct DriftlessApp {
 impl DriftlessApp {
     /// Without a window; `repaint` wakes the UI when a job ends.
     pub fn new(repaint: Arc<dyn Fn() + Send + Sync>) -> Self {
+        // „Nachher“ from the start, as the state says
+        let mut view = View3d::default();
+        view.show_edit(brush::TouchupState::default().after);
         DriftlessApp {
             state: AppState::default(),
             jobs: JobRunner::new(repaint.clone()),
@@ -494,7 +499,7 @@ impl DriftlessApp {
             cloud_run: None,
             overlay: None,
             overlay_version: 0,
-            view: View3d::default(),
+            view,
             render_state: None,
             status_asked: 0,
             gaps_asked: 0,
@@ -1120,6 +1125,9 @@ impl DriftlessApp {
         self.surface_stamp = None;
         self.brush.set_surface(None);
         self.state.brush.active = None;
+        self.state.touchup.shown = None;
+        self.state.touchup.edited = false;
+        self.state.touchup.variants.clear();
     }
 
     /// Whether a surface is being loaded.
@@ -1200,6 +1208,7 @@ impl DriftlessApp {
                     self.state.brush.active = None;
                 }
                 let pick = surface.pick.take();
+                let touchup = surface.touchup.take();
                 self.brush
                     .set_surface(pick.map(|pick| (path.clone(), surface.origin, pick)));
                 self.state.surface = Some(SurfaceSummary {
@@ -1224,12 +1233,36 @@ impl DriftlessApp {
                 if std::mem::take(&mut self.surface_by_hand) || self.state.step == Step::Bilder {
                     self.state.view.show = ShowMode::Surface;
                 }
+                self.surface_touchup(touchup);
             }
             Ok(_) => {}
             // a cancel for the next load needs no message
             Err(StepError::Cancelled) if self.next_surface.is_some() => {}
             Err(StepError::Cancelled) => self.info(text::job_cancelled(&f.label)),
             Err(e) => self.error(text::job_failed(&f.label, &text::step_error(&e))),
+        }
+    }
+
+    /// The touch-up of the surface just shown, as the loader found it: the view gets the
+    /// touched-up state at once if its cache fits; else (or if it was computed without the raw
+    /// data that are back) the touch-up is queued. Only for a surface of a map or model of the
+    /// project.
+    fn surface_touchup(&mut self, touchup: Option<crate::surface::LoadedTouchup>) {
+        self.state.touchup.load += 1;
+        self.state.touchup.shown = None;
+        self.state.touchup.edited = false;
+        self.state.touchup.variants.clear();
+        let (Some(touchup), Some(dir)) = (
+            touchup,
+            brush::shown_surface(&self.state).map(Path::to_path_buf),
+        ) else {
+            return;
+        };
+        if touchup.edit.is_some() {
+            self.set_view_edit(touchup.edit);
+        }
+        if touchup.stale {
+            self.want_touchup(dir, None);
         }
     }
 
@@ -1438,6 +1471,7 @@ impl DriftlessApp {
     /// stops, its measurements and surface go.
     fn opened(&mut self, read: ProjectRead) {
         self.stop_queue();
+        self.state.touchup.waiting.clear();
         // the measurements belong to the project shown (they are not saved yet)
         self.state.measurements.clear();
         self.state.measure_a = None;
@@ -1679,6 +1713,7 @@ impl DriftlessApp {
             || self.gaps_asked != self.state.tree_version
             || (self.state.project.is_some() && self.disk_asked != self.state.tree_version)
             || self.focus_read_at.is_some()
+            || !self.state.touchup.waiting.is_empty()
     }
 
     /// The window got the focus back: the tree is read again [`FOCUS_DELAY`] later (a scan
@@ -1954,8 +1989,11 @@ impl DriftlessApp {
     /// Changes the Stellen of the map or model in `owner`: at once on those shown
     /// ([`AppState::marks`]; a stroke chooses its Stelle if the surface of `owner` is shown),
     /// then in its `stellen.toml` in the background, in order. A change that changes nothing
-    /// writes nothing; an unreadable file is changed not at all.
-    fn change_marks(&mut self, owner: PathBuf, change: MarkChange) {
+    /// writes nothing; an unreadable file is changed not at all. A change of the Stellen that
+    /// have steps (a step added or taken back, a stroke into such a Stelle, „Löschen“ of one or
+    /// ↶ of that) queues the touch-up of the surface shown, to run once it is saved. Whether
+    /// anything changed.
+    fn change_marks(&mut self, owner: PathBuf, change: MarkChange) -> bool {
         let shown = brush::shown_owner(&self.state) == Some(owner.as_path());
         let read = self
             .state
@@ -1967,23 +2005,216 @@ impl DriftlessApp {
             Err(e) => {
                 let e = text::marks_not_saved(e);
                 self.error(e);
-                return;
+                return false;
             }
         };
         let before = marks.clone();
         let painted = change.apply(marks);
         let changed = *marks != before;
-        if marks.marks.is_empty() {
+        let restep = brush::stepped(marks) != brush::stepped(&before);
+        if marks.is_empty() {
             self.state.marks.remove(&owner);
         }
         if !changed {
-            return;
+            return false;
         }
         if shown && painted.is_some() {
             self.state.brush.active = painted;
         }
         self.helper_queue
             .push_back(HelperTask::Marks { owner, change });
+        if restep && shown {
+            if let Some(surface) = brush::shown_surface(&self.state).map(Path::to_path_buf) {
+                self.want_touchup(surface, None);
+            }
+        }
+        true
+    }
+
+    /// A step of Stelle `nr` of the surface shown ([`Action::Smooth`], [`Action::Retexture`]):
+    /// into `stellen.toml` like a stroke, then the touch-up of the surface queued, to tell what
+    /// came of the step. Refused with the reason while it cannot be done
+    /// ([`brush::mark_steps_blocked`]).
+    fn touchup_step(&mut self, nr: u32, change: MarkChange) {
+        if let Some(why) = brush::mark_steps_blocked(&self.state, nr) {
+            self.warn(why);
+            return;
+        }
+        let (Some(owner), Some(surface)) = (
+            brush::shown_owner(&self.state).map(Path::to_path_buf),
+            brush::shown_surface(&self.state).map(Path::to_path_buf),
+        ) else {
+            return;
+        };
+        if !self.change_marks(owner.clone(), change) {
+            self.warn(text::mark_gone(nr));
+            return;
+        }
+        // the step just added: the youngest of the Stelle
+        let seq = self
+            .mark_of(&owner, nr)
+            .and_then(|m| m.steps.last())
+            .map(EditStep::seq);
+        self.want_touchup(surface, seq.map(|seq| (nr, seq)));
+    }
+
+    /// Stelle `nr` of the map or model in `owner`, as shown ([`AppState::marks`]).
+    fn mark_of(&self, owner: &Path, nr: u32) -> Option<&driftless_steps::marks::Mark> {
+        let marks = self.state.marks.get(owner)?.as_ref().ok()?;
+        marks.marks.iter().find(|m| m.nr == nr)
+    }
+
+    /// Queues the touch-up of the surface folder `surface`, once per surface: a wish for one
+    /// that waits goes with it (keeping the step just added, `step`). It starts once the
+    /// Stellen are saved and no step runs ([`Self::advance_touchup`]).
+    fn want_touchup(&mut self, surface: PathBuf, step: Option<(u32, u64)>) {
+        let waiting = &mut self.state.touchup.waiting;
+        match waiting.iter_mut().find(|(s, _)| *s == surface) {
+            Some((_, waits)) => *waits = step.or(*waits),
+            None => waiting.push_back((surface, step)),
+        }
+    }
+
+    /// Starts the touch-up that waits first, once the Stellen are saved, no step runs, the end
+    /// of the last one has been carried out and no project switch waits. One of a surface no
+    /// longer in the tree is dropped.
+    fn advance_touchup(&mut self) {
+        if self.jobs.is_busy()
+            || self.marks_pending()
+            || self.step_end.is_some()
+            || self.pending.is_some()
+            || self.closing
+        {
+            return;
+        }
+        let Some((surface, step)) = self.state.touchup.waiting.pop_front() else {
+            return;
+        };
+        if !self.state.all_surfaces().any(|s| s.dir == surface) {
+            return;
+        }
+        let action = Action::Touchup {
+            surface: surface.clone(),
+            step,
+        };
+        if let Err(e) = actions::start_step(&mut self.state, &mut self.jobs, &action) {
+            self.error(e);
+            if let Some((nr, seq)) = step {
+                self.take_back_step(&surface, nr, seq);
+            }
+        }
+    }
+
+    /// Takes the step `seq` of Stelle `nr` of the map or model of the surface folder `surface`
+    /// out of `stellen.toml` again – one that changed nothing or did not run to its end – if it
+    /// is still there.
+    fn take_back_step(&mut self, surface: &Path, nr: u32, seq: u64) -> bool {
+        let Some(owner) = surface.parent().map(Path::to_path_buf) else {
+            return false;
+        };
+        let there = self
+            .mark_of(&owner, nr)
+            .is_some_and(|m| m.steps.iter().any(|s| s.seq() == seq));
+        there && self.change_marks(owner, MarkChange::DropStep { mark: nr, seq })
+    }
+
+    /// The touched-up state of the surface shown for the view (none: as computed; one that
+    /// changes nothing is none to the view), with the places its marks lie in „Nachher“.
+    fn set_view_edit(&mut self, edit: Option<SurfaceEdit>) {
+        self.state.touchup.shown = edit.as_ref().map(|e| e.key);
+        let (edit, moved) = match edit.filter(|e| !e.is_empty()) {
+            Some(e) => (Some(e.edit), e.moved),
+            None => (None, Vec::new()),
+        };
+        self.state.touchup.edited = edit.is_some();
+        self.brush.set_moved(&moved);
+        self.view.set_edit(edit);
+        self.view.show_edit(self.state.touchup.after);
+    }
+
+    /// A touch-up has run: the view gets the touched-up state of the surface shown, and what
+    /// came of the step just added (`pressed`: Stelle, seq) is told – done (with the hints of
+    /// the touch-up), or refused and taken out of `stellen.toml` again. A surface that got its
+    /// touch-up for the first time (a new surface taking the Stellen over) says so, with the
+    /// hints and the steps that do not apply to it. Recomputing after ↶ or „Löschen“ says
+    /// nothing.
+    fn touchup_done(&mut self, out: TouchupOutput, pressed: Option<(u32, u64)>) {
+        let TouchupOutput {
+            surface,
+            done,
+            raw,
+            first,
+            step: outcome,
+            view,
+        } = out;
+        let shown = brush::shown_surface(&self.state) == Some(surface.as_path());
+        if shown {
+            if let Some((load, edit)) = view {
+                match edit {
+                    ViewEdit::Set(edit) if load == self.state.touchup.load => {
+                        self.set_view_edit(edit)
+                    }
+                    _ => {}
+                }
+            }
+            self.state.touchup.variants = done
+                .outcomes
+                .iter()
+                .filter_map(|o| Some(((o.mark, o.seq), o.variant_of?)))
+                .collect();
+        }
+        let owner = surface.parent().map(Path::to_path_buf).unwrap_or_default();
+        // the step just added, unless it was taken back or its Stelle went meanwhile
+        let pressed = pressed.and_then(|(nr, seq)| {
+            let step = self
+                .mark_of(&owner, nr)?
+                .steps
+                .iter()
+                .find(|s| s.seq() == seq)?;
+            Some((nr, *step))
+        });
+        if let (Some((nr, step)), Some(outcome)) = (pressed, &outcome) {
+            let retexture = matches!(step, EditStep::Retexture { .. });
+            let refused = match &outcome.refused {
+                Some(why) => Some(text::touchup_refused(nr, why)),
+                None if retexture && (!raw || outcome.without_raw_data) => {
+                    Some(text::RETEXTURE_NO_RAW_DATA.to_string())
+                }
+                None => None,
+            };
+            match (refused, step) {
+                (Some(why), _) => {
+                    self.warn(why);
+                    self.take_back_step(&surface, nr, step.seq());
+                    return;
+                }
+                (None, EditStep::Smooth { level, .. }) => {
+                    self.info(text::touchup_smoothed(nr, level))
+                }
+                (None, EditStep::Retexture { .. }) => {
+                    self.info(text::touchup_retextured(nr, outcome.variant_of))
+                }
+            }
+            // the result is what one wants to see
+            self.state.touchup.after = true;
+            self.view.show_edit(true);
+        } else if first && done.steps > 0 {
+            // the Stellen taken over by a surface of the map or model that had no touch-up
+            let label = self
+                .state
+                .all_surfaces()
+                .find(|s| s.dir == surface)
+                .map_or_else(|| surface.display().to_string(), |s| s.label.clone());
+            self.info(text::touchup_applied(&label));
+            for (nr, why) in &done.refused {
+                self.info(text::touchup_refused(*nr, why));
+            }
+        } else {
+            return;
+        }
+        for hint in &done.hints {
+            self.info(hint.clone());
+        }
     }
 
     /// A change of the Stellen of `owner` was written (or refused): the file as it is now is
@@ -1997,7 +2228,7 @@ impl DriftlessApp {
             .any(|t| matches!(t, HelperTask::Marks { owner: o, .. } if *o == owner));
         match result {
             Ok(JobOutput::Marks(marks)) if !later => {
-                if marks.marks.is_empty() {
+                if marks.is_empty() {
                     self.state.marks.remove(&owner);
                 } else {
                     self.state.marks.insert(owner, Ok(*marks));
@@ -2080,6 +2311,7 @@ impl DriftlessApp {
         self.sync_run();
         self.sync_compare();
         self.tick_helper();
+        self.advance_touchup();
         self.state.map_status_pending = self.map_status_pending();
         if let Some(batch) = self.compute_all_waiting {
             if !self.state.map_status_pending {
@@ -2101,6 +2333,8 @@ impl DriftlessApp {
                     (JobOutput::Exported(report), Some(Action::RunExport(req))) => {
                         self.info(text::exported(report, req.format.kind()))
                     }
+                    // the touch-up says itself what came of it
+                    (JobOutput::Touchup(_), _) => {}
                     _ => self.info(text::job_done(&f.label, &text::duration(f.seconds))),
                 }
                 Some(output)
@@ -2122,9 +2356,13 @@ impl DriftlessApp {
             seconds: f.seconds,
         };
         // the step may have added runs or maps: its result is shown once the tree is read
-        // again (also after a check or an export: whatever changed on disk meanwhile shows)
+        // again (also after a check or an export: whatever changed on disk meanwhile shows);
+        // a touch-up changes nothing the tree shows
+        let touchup = matches!(end.step, Some(Action::Touchup { .. }));
         self.step_end = Some(end);
-        self.refresh_tree();
+        if !touchup {
+            self.refresh_tree();
+        }
     }
 
     /// The end of a step, once the tree after it is read: the queue counts it, its result is
@@ -2146,8 +2384,9 @@ impl DriftlessApp {
         // job, nor take the view from the user.
         let show = !queued
             || (self.state.queue.is_empty() && hand_loads.is_none_or(|n| n == self.hand_loads));
-        // an export shows nothing: a surface picked meanwhile stays one picked by hand
-        if show && !matches!(step, Some(Action::RunExport(_))) {
+        // an export or a touch-up shows nothing: a surface picked meanwhile stays one picked
+        // by hand
+        if show && !matches!(step, Some(Action::RunExport(_) | Action::Touchup { .. })) {
             self.surface_by_hand = false;
         }
         // a reuse started with the count of written changes (taken also if it failed)
@@ -2202,6 +2441,27 @@ impl DriftlessApp {
                     self.state.selection = Selection::Surface(done.dir.clone());
                     self.load_surface(&done.dir);
                 }
+                // a new surface of a map or model with a touch-up takes it over
+                let owner = done.dir.parent().unwrap_or(&done.dir);
+                let marks = self.state.marks.get(owner).and_then(|m| m.as_ref().ok());
+                if marks.is_some_and(brush::has_steps) {
+                    self.want_touchup(done.dir.clone(), None);
+                }
+            }
+            (Some(JobOutput::Touchup(out)), Some(Action::Touchup { step, .. })) => {
+                self.touchup_done(*out, step)
+            }
+            // cancelled or failed: the step just added did not happen, it goes again
+            (
+                None,
+                Some(Action::Touchup {
+                    surface,
+                    step: Some((nr, seq)),
+                }),
+            ) => {
+                if self.take_back_step(&surface, nr, seq) {
+                    self.info(text::touchup_taken_back(nr));
+                }
             }
             (Some(JobOutput::Inspect(report)), Some(Action::Inspect(scan))) => {
                 self.state.inspect = Some(InspectResult {
@@ -2212,6 +2472,7 @@ impl DriftlessApp {
             }
             _ => {}
         }
+        self.advance_touchup();
         self.advance_queue();
         if let Some(action) = self.pending.take() {
             self.apply(action);
@@ -2623,11 +2884,22 @@ impl DriftlessApp {
                 }
             }
             Action::OpenExport(source) => {
+                // the touch-up of a surface not shown may not be current yet
+                if let ExportSource::EditedSurface(dir) = &source {
+                    self.want_touchup(dir.clone(), None);
+                }
                 let name = export::source_name(&self.state, &source);
                 self.state.export = ExportDialog::new(vec![(source, name)]);
             }
             Action::OpenExportShown => {
-                match ExportDialog::new(export::shown_sources(&self.state)) {
+                let sources = export::shown_sources(&self.state);
+                // its touch-up is current before the export reads it (at once if it is)
+                for (source, _) in &sources {
+                    if let ExportSource::EditedSurface(dir) = source {
+                        self.want_touchup(dir.clone(), None);
+                    }
+                }
+                match ExportDialog::new(sources) {
                     Some(dialog) => self.state.export = Some(dialog),
                     None => self.info(text::EXPORT_NEEDS_VIEW.into()),
                 }
@@ -2663,7 +2935,7 @@ impl DriftlessApp {
                 }
             }
             Action::Paint { owner, mark, dabs } => {
-                self.change_marks(owner, MarkChange::Paint { mark, dabs })
+                self.change_marks(owner, MarkChange::Paint { mark, dabs });
             }
             Action::SelectMark(nr) => self.state.brush.active = nr,
             Action::FrameMark(nr) => self.frame_mark(nr),
@@ -2680,6 +2952,20 @@ impl DriftlessApp {
                     self.change_marks(owner, MarkChange::Undo);
                 }
             }
+            Action::Smooth { mark, level } => {
+                self.touchup_step(mark, MarkChange::Smooth { mark, level })
+            }
+            Action::Retexture { mark } => match brush::retexture_blocked(&self.state) {
+                Some(why) => self.warn(why),
+                None => self.touchup_step(mark, MarkChange::Retexture { mark }),
+            },
+            Action::ShowEdit(after) => {
+                self.state.touchup.after = after;
+                self.view.show_edit(after);
+            }
+            // the window „Melden“ comes with its own step of the plan (Task 11)
+            Action::OpenFeedback { .. } => {}
+            Action::Touchup { surface, step } => self.want_touchup(surface, step),
         }
     }
 
@@ -3013,6 +3299,9 @@ impl DriftlessApp {
         if self.state.tool == Tool::Brush && brush::blocked(&self.state).is_some() {
             tools::select(&mut self.state, Tool::Orbit);
         }
+        // the marks lie on the state drawn: „Nachher“ where the touch-up moved them
+        self.view.show_edit(self.state.touchup.after);
+        self.brush.set_after(self.state.touchup.after);
         if let Some(marks) = self.brush.sync(&mut self.state) {
             self.view.set_marks(marks);
         }

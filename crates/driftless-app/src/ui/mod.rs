@@ -42,7 +42,7 @@ use driftless_gpu::GpuPref;
 use driftless_steps::export::{ExportRequest, ExportSource};
 use driftless_steps::inspect;
 use driftless_steps::map::MapSettings;
-use driftless_steps::marks::DabInput;
+use driftless_steps::marks::{DabInput, SmoothLevel};
 use driftless_steps::pairs::PointPairEntry;
 use driftless_steps::slam::SlamSettings;
 use std::collections::{BTreeMap, VecDeque};
@@ -268,10 +268,39 @@ pub enum Action {
     SelectMark(Option<u32>),
     /// Chooses the Stelle and shows it in the view, looking straight at it.
     FrameMark(u32),
-    /// Takes the Stelle out of `stellen.toml` with all its touch-up (right click „Löschen“).
+    /// Takes the Stelle out of `stellen.toml` with all its touch-up (right click „Löschen“);
+    /// ↶ brings it back.
     DeleteMark(u32),
-    /// ↶, ⌘Z: takes back the youngest stroke or step of the Stellen of the surface shown.
+    /// ↶, ⌘Z: takes back the youngest stroke, step or „Löschen“ of the Stellen of the surface
+    /// shown; a step taken back (or a Stelle with steps) computes the touch-up anew.
     UndoMark,
+    /// „Glätten“ of Stelle `mark` of the surface shown with `level`: the step goes into
+    /// `stellen.toml`, then the touch-up of the surface is computed ([`Action::Touchup`]).
+    Smooth {
+        mark: u32,
+        level: SmoothLevel,
+    },
+    /// „Bilder neu einspielen“ of Stelle `mark` of the surface shown, with its next variant;
+    /// then the touch-up as for [`Action::Smooth`]. Refused while the raw data are gone.
+    Retexture {
+        mark: u32,
+    },
+    /// „Vorher“ (`false`) or „Nachher“ (`true`): the surface shown as computed, or touched up.
+    ShowEdit(bool),
+    /// „Melden …“ (⇧⇧): the window „Melden“, about Stelle `mark` of the surface shown if given.
+    OpenFeedback {
+        mark: Option<u32>,
+    },
+    /// The touch-up of the surface in the folder `surface` as a step, with its progress and
+    /// „Abbrechen“ ([`crate::surface::run_touchup_job`]): the steps of the Stellen of its map or
+    /// model replayed and kept in `nacharbeit/`; the view gets the touched-up state. `step`:
+    /// the step just added (Stelle, seq) – what came of it is told, and if it changed nothing
+    /// (or did not run to its end) it is taken out of `stellen.toml` again. The window queues
+    /// it ([`brush::TouchupState::waiting`]) once the Stellen are saved and no step runs.
+    Touchup {
+        surface: PathBuf,
+        step: Option<(u32, u64)>,
+    },
 }
 
 /// A question the window asks before a change of the project, in a small window over the view
@@ -677,6 +706,8 @@ pub struct AppState {
     pub marks: BTreeMap<PathBuf, brush::MarksRead>,
     /// The brush: its size and the Stelle it paints into.
     pub brush: brush::BrushState,
+    /// The touch-up of the Stellen: „Vorher“ / „Nachher“, what the view holds, what waits.
+    pub touchup: brush::TouchupState,
 }
 
 impl AppState {
@@ -1071,6 +1102,8 @@ impl AppState {
                 vec![run.clone()]
             }
             Action::RunSurface(map) => vec![map.clone()],
+            // it reads the Stellen of the map or model the surface folder lies in
+            Action::Touchup { surface, .. } => vec![surface.clone()],
             Action::RunMerge { picks, .. } => picks.iter().map(|p| p.map.clone()).collect(),
             Action::ApplyPairs { model, .. } | Action::RunModelSurface { model } => {
                 model_maps(model)
@@ -1226,6 +1259,12 @@ impl AppState {
                 )
             })
             .count()
+    }
+
+    /// Every surface of the tree: of the maps, then of the models, in the order of the list.
+    pub fn all_surfaces(&self) -> impl Iterator<Item = &crate::project::SurfaceInfo> {
+        let maps = self.all_maps().flat_map(|m| &m.surfaces);
+        maps.chain(self.models.iter().flat_map(|m| &m.surfaces))
     }
 
     /// Every map of the tree, in the order of the list.

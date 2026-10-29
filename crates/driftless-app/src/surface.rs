@@ -19,6 +19,12 @@
 //! [`mesh_edit`] turns what the touch-up changes on a surface (`page_edits` of
 //! `driftless-map`) into the touched-up state the view draws beside the computed one
 //! ([`crate::render::mesh::MeshRenderer::set_edit`]), made the same way.
+//!
+//! The touch-up of a surface of a map or model („Nacharbeit“, `driftless_steps::touchup`): the
+//! loader looks at its cache with the surface ([`LoadedSurface::touchup`]) – fitting, the view
+//! gets the touched-up state at once ([`SurfaceEdit`]); not fitting (or computed without the raw
+//! data that are back), the window computes it as a step ([`run_touchup_job`], which also makes
+//! the touched-up state for the view).
 
 pub use crate::render::mesh::MeshVertex;
 use crate::render::mesh::{mip_levels, MeshEdit};
@@ -26,15 +32,27 @@ use crate::ui::text;
 use driftless_export::mesh::{read_mesh, ImageKind, Mesh, MeshPage};
 use driftless_export::ExportError;
 use driftless_io::progress::Progress;
-use driftless_map::surface::edit::{FaceBvh, PageEdit, WeldedSurface};
+use driftless_map::content_hash;
+use driftless_map::surface::edit::{read_patches, FaceBvh, PageEdit, WeldedSurface, PATCHES_FILE};
+use driftless_steps::marks::Marks;
+use driftless_steps::surface::{texture_sources, SURFACE_REPORT};
+use driftless_steps::touchup::{
+    edited_pages, run_touchup, touchup_fits, touchup_without_raw_data, StepOutcome, TouchupDone,
+    TouchupRequest, TOUCHUP_DIR,
+};
 use driftless_steps::StepError;
 use image::RgbaImage;
 use rayon::prelude::*;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Phase name while the pages of a surface are decoded.
 pub const PHASE_LOAD_SURFACE: &str = "Oberfläche laden";
+/// Phase name while the loader makes the touched-up state of a surface for the view …
+pub const PHASE_LOAD_TOUCHUP: &str = "Nacharbeit laden";
+/// … and while the touch-up step makes it.
+pub const PHASE_TOUCHUP_VIEW: &str = "Nacharbeit: Ansicht vorbereiten";
 /// The glb in a surface folder.
 pub const SURFACE_GLB: &str = "oberflaeche.glb";
 /// Texture coordinate of the corners of a page without any (a plain colour).
@@ -59,6 +77,38 @@ pub struct LoadedSurface {
     /// drops the pages once they are on the GPU). `None` where it was not built (a surface made
     /// by hand).
     pub pick: Option<Arc<SurfacePick>>,
+    /// Its touch-up, for a surface folder whose map or model has Stellen with steps; `None`
+    /// without (or where `stellen.toml` cannot be read: the brush says why).
+    pub touchup: Option<LoadedTouchup>,
+}
+
+/// The touch-up of a surface as the loader found it ([`LoadedSurface::touchup`]).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LoadedTouchup {
+    /// It is to be computed: its cache does not fit the Stellen, or was computed without the
+    /// raw data that are back now.
+    pub stale: bool,
+    /// The touched-up state for the view, if the cache fits.
+    pub edit: Option<SurfaceEdit>,
+}
+
+/// The touched-up state of a surface for the view, made from the cache of its touch-up.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SurfaceEdit {
+    /// The key of the patches it was made from ([`patches_key`]): the same key, the same state.
+    pub key: u64,
+    /// For [`crate::render::mesh::MeshRenderer::set_edit`].
+    pub edit: MeshEdit,
+    /// Where the touch-up moved welded vertices, sorted by vertex: the marks of „Nachher“ lie
+    /// there.
+    pub moved: Vec<(u32, [f64; 3])>,
+}
+
+impl SurfaceEdit {
+    /// Whether it changes nothing on the surface (its steps were all refused here, or skipped).
+    pub fn is_empty(&self) -> bool {
+        self.edit.pages.is_empty() && self.edit.extra.is_empty() && self.moved.is_empty()
+    }
 }
 
 /// The surface as the brush sees it: its pages welded into one mesh in its own frame
@@ -151,11 +201,195 @@ pub fn load_mesh(path: &Path, progress: &Progress) -> Result<LoadedSurface, Step
         },
     );
     let (pages, mips) = pages?.into_iter().unzip();
+    let touchup = loaded_touchup(&path, origin, &mesh, &pick.surface, progress);
     Ok(LoadedSurface {
         origin,
         pages,
         mips,
         pick: Some(Arc::new(pick)),
+        touchup,
+    })
+}
+
+/// The touch-up of the surface at `glb` (read as `mesh`, welded as `s`, loaded with `origin`),
+/// if it is the glb of a surface folder whose map or model – the folder above – has Stellen
+/// with steps ([`LoadedSurface::touchup`]). A cache that cannot be made into the touched-up
+/// state is computed anew.
+fn loaded_touchup(
+    glb: &Path,
+    origin: [f64; 3],
+    mesh: &Mesh,
+    s: &WeldedSurface,
+    progress: &Progress,
+) -> Option<LoadedTouchup> {
+    let dir = glb.parent()?;
+    if glb.file_name()? != SURFACE_GLB || !dir.join(SURFACE_REPORT).is_file() {
+        return None;
+    }
+    let marks = Marks::load(dir.parent()?).ok()?;
+    if !marks.marks.iter().any(|m| !m.steps.is_empty()) {
+        return None;
+    }
+    if !touchup_fits(dir, &marks) {
+        return Some(LoadedTouchup {
+            stale: true,
+            edit: None,
+        });
+    }
+    // computed without the camera images, which are here now: computed anew with them
+    let raw_back = touchup_without_raw_data(dir) && matches!(texture_sources(dir), Ok(Some(_)));
+    progress.phase(PHASE_LOAD_TOUCHUP, None);
+    let edit = surface_edit(dir, origin, mesh, s).unwrap_or_else(|e| {
+        progress.warn(e);
+        None
+    });
+    Some(LoadedTouchup {
+        stale: raw_back || edit.is_none(),
+        edit,
+    })
+}
+
+/// The key of the patches in the cache of the touch-up of the surface folder `dir`: the hash of
+/// their file; `None` without one.
+pub fn patches_key(dir: &Path) -> Option<u64> {
+    let bytes = std::fs::read(dir.join(TOUCHUP_DIR).join(PATCHES_FILE)).ok()?;
+    Some(content_hash(&bytes))
+}
+
+/// The touched-up state of the surface folder `dir` for the view, from the cache of its
+/// touch-up, if it fits the Stellen: `mesh` is its glb as read, `s` welded, `origin` what it was
+/// loaded with. Decodes the pages the touch-up added: call it off the UI thread.
+fn surface_edit(
+    dir: &Path,
+    origin: [f64; 3],
+    mesh: &Mesh,
+    s: &WeldedSurface,
+) -> Result<Option<SurfaceEdit>, String> {
+    let Some(key) = patches_key(dir) else {
+        return Ok(None);
+    };
+    let Some((edits, added)) = edited_pages(dir, s, mesh).map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let patches = read_patches(&dir.join(TOUCHUP_DIR)).map_err(|e| e.to_string())?;
+    // the later patch wins, as when they are applied in order
+    let vertices = s.positions().len();
+    let moved: BTreeMap<u32, [f64; 3]> = patches
+        .iter()
+        .flat_map(|p| &p.moved)
+        .filter(|(v, _)| (*v as usize) < vertices)
+        .copied()
+        .collect();
+    Ok(Some(SurfaceEdit {
+        key,
+        edit: mesh_edit(origin, mesh, edits, added)?,
+        moved: moved.into_iter().collect(),
+    }))
+}
+
+/// The touch-up of a surface as a step ([`run_touchup_job`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TouchupJob {
+    /// The surface folder; its map or model is the folder it lies in.
+    pub surface: PathBuf,
+    /// The step just added (Stelle, seq): what came of it is told
+    /// ([`TouchupOutput::step`]).
+    pub step: Option<(u32, u64)>,
+    /// For the surface shown: the touched-up state for the view is made as well.
+    pub view: Option<TouchupView>,
+}
+
+/// The surface shown, as a touch-up of it sees the view ([`TouchupJob::view`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TouchupView {
+    /// The load it was shown with ([`crate::ui::brush::TouchupState::load`]).
+    pub load: u64,
+    /// The origin it was loaded with.
+    pub origin: [f64; 3],
+    /// The key of the touched-up state the view holds ([`SurfaceEdit::key`]).
+    pub shown: Option<u64>,
+}
+
+/// What the view should hold of a touch-up ([`TouchupOutput::view`]).
+#[derive(Debug)]
+pub enum ViewEdit {
+    /// What it holds is current.
+    Keep,
+    /// This touched-up state, or none.
+    Set(Option<SurfaceEdit>),
+}
+
+/// What [`run_touchup_job`] did.
+#[derive(Debug)]
+pub struct TouchupOutput {
+    /// The surface folder.
+    pub surface: PathBuf,
+    pub done: TouchupDone,
+    /// The camera images of the surface were found (the raw data are there).
+    pub raw: bool,
+    /// The surface got its touch-up now: it had no cache before, it has one now (a new surface
+    /// taking the Stellen over, the first step).
+    pub first: bool,
+    /// What came of [`TouchupJob::step`] (the Stelle's newest step if the seq is not found).
+    pub step: Option<StepOutcome>,
+    /// For the surface shown: the load it is for, and what the view should hold.
+    pub view: Option<(u64, ViewEdit)>,
+}
+
+/// Computes the touch-up of the surface folder `job.surface`: the steps of the Stellen of its
+/// map or model replayed with the camera images if the raw data are there
+/// ([`run_touchup`], with its progress and cancel); for the surface shown then the touched-up
+/// state for the view (reading its glb anew), unless the view holds it already. A cancel
+/// after the cache is written is not taken any more: the step is done.
+pub fn run_touchup_job(job: &TouchupJob, progress: &Progress) -> Result<TouchupOutput, StepError> {
+    let dir = &job.surface;
+    let owner = dir
+        .parent()
+        .ok_or_else(|| text::not_in_tree(dir))?
+        .to_path_buf();
+    let sources = match texture_sources(dir) {
+        Ok(sources) => sources,
+        Err(e) => {
+            progress.warn(text::raw_data_unreadable(&text::step_error(&e)));
+            None
+        }
+    };
+    let raw = sources.is_some();
+    let before = patches_key(dir);
+    let req = TouchupRequest {
+        surface_dir: dir.clone(),
+        owner_dir: owner,
+        sources,
+    };
+    let done = run_touchup(&req, progress)?;
+    let after = patches_key(dir);
+    let step = job.step.and_then(|(mark, seq)| {
+        let of_mark = || done.outcomes.iter().filter(move |o| o.mark == mark);
+        of_mark()
+            .find(|o| o.seq == seq)
+            .or_else(|| of_mark().next_back())
+            .cloned()
+    });
+    let view = match job.view {
+        None => None,
+        Some(v) if v.shown == after => Some((v.load, ViewEdit::Keep)),
+        Some(v) if after.is_none() => Some((v.load, ViewEdit::Set(None))),
+        Some(v) => {
+            progress.phase(PHASE_TOUCHUP_VIEW, None);
+            // the cache is written: the view gets it, also if cancelled meanwhile
+            let mesh = read_mesh(&dir.join(SURFACE_GLB), &Progress::new())?;
+            let s = WeldedSurface::from_mesh(&mesh);
+            let edit = surface_edit(dir, v.origin, &mesh, &s).map_err(StepError::Failed)?;
+            Some((v.load, ViewEdit::Set(edit)))
+        }
+    };
+    Ok(TouchupOutput {
+        surface: dir.clone(),
+        done,
+        raw,
+        first: before.is_none() && after.is_some(),
+        step,
+        view,
     })
 }
 

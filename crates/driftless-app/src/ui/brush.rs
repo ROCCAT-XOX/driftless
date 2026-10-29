@@ -21,13 +21,23 @@
 //!   under its lock ([`MarkChange`]); ↶ / ⌘Z (Windows: Strg+Z) takes back the youngest stroke
 //!   or step.
 //! - Every Stelle of the surface shown is marked in the view in its colour, the chosen one
-//!   stronger. The bar over the tools holds the size (5–100 cm, at first 20 cm, the radius) and
-//!   ↶; the list „Markierte Stellen“ in „Bilder“ ([`super::steps`]) shows the Stellen, a click
-//!   frames one ([`Action::FrameMark`]).
+//!   stronger. The list „Markierte Stellen“ in „Bilder“ ([`super::steps`]) shows the Stellen, a
+//!   click frames one ([`Action::FrameMark`]).
+//! - The bar over the tools has two rows. Above, the steps for the chosen Stelle: „Glätten:
+//!   leicht · stark · ganz eben“ ([`Action::Smooth`]), „Bilder neu einspielen“
+//!   ([`Action::Retexture`]; off while the raw data are gone, [`retexture_blocked`]) and
+//!   „Melden …“ ([`Action::OpenFeedback`]). Below, the size (5–100 cm, at first 20 cm, the
+//!   radius), „Vorher“ / „Nachher“ ([`Action::ShowEdit`]) and ↶. A step goes into
+//!   `stellen.toml` like a stroke ([`MarkChange`]); then the window computes the touch-up as a
+//!   step of its own, with its progress and „Abbrechen“ ([`Action::Touchup`]). The steps are
+//!   off while one runs or waits ([`steps_blocked`]).
+//! - „Nachher“ draws the surface with its touch-up; the marks then lie where the touch-up moved
+//!   the corners of their faces, „Vorher“ where they were computed ([`Brush::set_moved`],
+//!   [`Brush::set_after`]), so they lie on the surface drawn either way.
 //!
-//! The panels see [`BrushState`] and the marks in [`AppState`]; the window holds the [`Brush`]:
-//! the welded surface the loader built ([`SurfacePick`]), the stroke, the faces of every Stelle
-//! and the ring under the pointer.
+//! The panels see [`BrushState`], [`TouchupState`] and the marks in [`AppState`]; the window
+//! holds the [`Brush`]: the welded surface the loader built ([`SurfacePick`]), the stroke, the
+//! faces of every Stelle and the ring under the pointer.
 
 use super::steps::parse_decimal;
 use super::theme::{icon, DARK};
@@ -36,13 +46,14 @@ use super::view3d::{effective_show, target_size, BrushInput};
 use super::{text, Action, AppState};
 use crate::camera::Camera;
 use crate::pick::{project, relative_to};
+use crate::project::ScanState;
 use crate::render::mesh::{mark_color, mark_triangles, MarkTriangle};
 use crate::render::ShowMode;
 use crate::surface::SurfacePick;
 use driftless_map::surface::edit::{dab_normal, select_faces, RayHit, SelectDab};
-use driftless_steps::marks::{Dab, DabInput, Mark, Marks, MARKS_FILE};
+use driftless_steps::marks::{Dab, DabInput, Mark, Marks, SmoothLevel, StepInput, MARKS_FILE};
 use eframe::egui::{self, Align2, Context, Key, KeyboardShortcut, Modifiers, Rect, Ui};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -103,6 +114,40 @@ impl Default for BrushState {
     }
 }
 
+/// The touch-up of the Stellen as the panels see it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TouchupState {
+    /// „Nachher“ (the default): the view draws the surface shown with its touch-up; „Vorher“
+    /// (`false`): as computed.
+    pub after: bool,
+    /// The touched-up state the view holds of the surface shown: the key of the patches it was
+    /// made from ([`crate::surface::SurfaceEdit::key`]); `None`: none.
+    pub shown: Option<u64>,
+    /// That state differs from the surface as computed: „Vorher“ / „Nachher“ can be told apart.
+    pub edited: bool,
+    /// Counts the surfaces shown: a touched-up state made for one shown before is dropped.
+    pub load: u64,
+    /// The touch-ups waiting to run, in order: the surface folder, and the step just added
+    /// (Stelle, seq) whose outcome is told ([`Action::Touchup`]). One per surface.
+    pub waiting: VecDeque<(PathBuf, Option<(u32, u64)>)>,
+    /// What the last touch-up of the surface shown said of the images it baked, by Stelle and
+    /// step (seq): the variant of how many („Variante 2 von 5“).
+    pub variants: BTreeMap<(u32, u64), (u32, u32)>,
+}
+
+impl Default for TouchupState {
+    fn default() -> Self {
+        TouchupState {
+            after: true,
+            shown: None,
+            edited: false,
+            load: 0,
+            waiting: VecDeque::new(),
+            variants: BTreeMap::new(),
+        }
+    }
+}
+
 /// The Stellen of the maps and models in the folders `owners` that have any, or whose
 /// `stellen.toml` cannot be read (with why). Reads the files: call it with the tree, off the
 /// UI thread.
@@ -111,7 +156,7 @@ pub fn read_marks(owners: impl IntoIterator<Item = PathBuf>) -> BTreeMap<PathBuf
         .into_iter()
         .filter(|dir| dir.join(MARKS_FILE).exists())
         .filter_map(|dir| match Marks::load(&dir) {
-            Ok(marks) if marks.marks.is_empty() => None,
+            Ok(marks) if marks.is_empty() => None,
             Ok(marks) => Some((dir, Ok(marks))),
             Err(e) => Some((dir, Err(e.to_string()))),
         })
@@ -147,6 +192,107 @@ pub fn shown_marks(state: &AppState) -> Option<(&Path, Option<&Marks>)> {
     Some((owner, marks))
 }
 
+/// The folder of the surface shown, if it is one of a map or model of the project
+/// ([`shown_owner`]).
+pub fn shown_surface(state: &AppState) -> Option<&Path> {
+    shown_owner(state)?;
+    state.surface.as_ref()?.path.parent()
+}
+
+/// Whether the Stellen of the map or model of `marks` have a step: the surfaces of the map or
+/// model have a touch-up.
+pub fn has_steps(marks: &Marks) -> bool {
+    marks.marks.iter().any(|m| !m.steps.is_empty())
+}
+
+/// The Stellen of `marks` that have a step: what the touch-up is computed from. A change that
+/// leaves them as they were needs no touch-up.
+pub fn stepped(marks: &Marks) -> Vec<&Mark> {
+    marks.marks.iter().filter(|m| !m.steps.is_empty()).collect()
+}
+
+/// Whether the touch-up of the surface shown runs or waits.
+pub fn touchup_busy(state: &AppState) -> bool {
+    let Some(dir) = shown_surface(state) else {
+        return false;
+    };
+    let running = matches!(&state.running, Some(Action::Touchup { surface, .. }) if surface == dir);
+    running || state.touchup.waiting.iter().any(|(s, _)| s == dir)
+}
+
+/// Why the steps of the bar (glätten, Bilder neu einspielen) cannot be done now for the chosen
+/// Stelle: none is chosen, or [`mark_steps_blocked`]. `None` if they can.
+pub fn steps_blocked(state: &AppState) -> Option<String> {
+    let nr = state.brush.active;
+    match nr.map(|nr| mark_steps_blocked(state, nr)) {
+        Some(why) => why,
+        None => blocked(state)
+            .or_else(|| {
+                state
+                    .brush
+                    .painting
+                    .then(|| text::STEPS_WAIT_PAINTING.into())
+            })
+            .or_else(|| Some(text::STEPS_NEED_MARK.into())),
+    }
+}
+
+/// Why a step of Stelle `nr` of the surface shown cannot be done now: the brush cannot paint
+/// ([`blocked`]), a stroke is being painted, the Stelle is gone, its touch-up runs or waits,
+/// another step runs. `None` if it can.
+pub fn mark_steps_blocked(state: &AppState, nr: u32) -> Option<String> {
+    if let Some(why) = blocked(state) {
+        return Some(why);
+    }
+    if state.brush.painting {
+        return Some(text::STEPS_WAIT_PAINTING.into());
+    }
+    let there = shown_marks(state)
+        .and_then(|(_, marks)| marks)
+        .is_some_and(|m| m.marks.iter().any(|k| k.nr == nr));
+    if !there {
+        return Some(text::mark_gone(nr));
+    }
+    if touchup_busy(state) {
+        return Some(text::TOUCHUP_RUNS.into());
+    }
+    state.job.as_ref().map(|job| text::busy(&job.label))
+}
+
+/// Why „Bilder neu einspielen“ cannot be done on the surface shown, besides
+/// [`steps_blocked`]: it was computed without photos, the raw data of its scan (of a scan of its
+/// model) are gone – a drive unplugged, a folder renamed, as the tree last found them –, or no
+/// scan of it has camera images. `None` if it can.
+pub fn retexture_blocked(state: &AppState) -> Option<String> {
+    let owner = shown_owner(state)?;
+    let dir = shown_surface(state)?;
+    let surface = state.all_surfaces().find(|s| s.dir == dir);
+    if surface
+        .and_then(|s| s.settings.as_ref())
+        .is_some_and(|s| !s.texture)
+    {
+        return Some(text::RETEXTURE_NO_PHOTOS.into());
+    }
+    let scans: Vec<&super::ScanNode> = match state.map(owner) {
+        Some((scan, _, _)) => vec![scan],
+        None => state.model(owner).map_or_else(Vec::new, |m| {
+            let members = m.report.members.iter().filter(|m| m.included);
+            members.filter_map(|m| state.scan_at(&m.scan)).collect()
+        }),
+    };
+    if scans
+        .iter()
+        .any(|s| matches!(s.state, ScanState::Missing(_)))
+    {
+        return Some(text::RETEXTURE_NO_RAW_DATA.into());
+    }
+    // nothing to bake from: no scan of it has camera images
+    match scans.first() {
+        Some(first) if scans.iter().all(|s| s.no_color.is_some()) => first.no_color.clone(),
+        _ => None,
+    }
+}
+
 /// Why the brush cannot paint now – no surface shown, a surface not of the project, only the
 /// points shown, its `stellen.toml` unreadable –; `None` if it can.
 pub fn blocked(state: &AppState) -> Option<String> {
@@ -179,19 +325,113 @@ pub fn keys(ctx: &Context, state: &mut AppState) -> Option<Action> {
     undo.then_some(Action::UndoMark)
 }
 
-/// The bar of the brush over the tools (its bottom at `bottom`): the size, then the buttons for
-/// the Stellen ([`mark_buttons`]). Returns its rectangle and what was asked for.
+/// The bar of the brush over the tools (its bottom at `bottom`), in two rows: the steps for the
+/// chosen Stelle above; the size, „Vorher“ / „Nachher“ and ↶ below. Returns its rectangle and
+/// what was asked for.
 pub fn bar(ctx: &Context, view: Rect, bottom: f32, state: &mut AppState) -> (Rect, Option<Action>) {
     let mut action = None;
     let pos = egui::pos2(view.center().x, bottom);
     let rect = float(ctx, "pinsel", view, pos, Align2::CENTER_BOTTOM, |ui| {
         ui.horizontal(|ui| {
+            action = step_buttons(ui, state);
+        });
+        ui.horizontal(|ui| {
             size_slider(ui, &mut state.brush.radius);
             ui.separator();
-            action = mark_buttons(ui, state);
+            action = edit_buttons(ui, state).or(action.take());
+            ui.separator();
+            action = mark_buttons(ui, state).or(action.take());
         });
     });
     (rect, action)
+}
+
+/// A button of the bar that is on unless `off` says why, with `hint` (else that reason) on
+/// hover.
+fn step_button(ui: &mut Ui, label: &str, name: &str, hint: &str, off: Option<&str>) -> bool {
+    let r = ui
+        .add_enabled_ui(off.is_none(), |ui| {
+            bar_button(ui, None, Some(label), name, None)
+        })
+        .inner;
+    let r = match off {
+        Some(why) => r.on_disabled_hover_text(why),
+        None => r.on_hover_text(hint),
+    };
+    r.clicked()
+}
+
+/// The steps for the chosen Stelle: „Glätten: leicht · stark · ganz eben“, „Bilder neu
+/// einspielen“, „Melden …“. Off with the reason while they cannot be done ([`steps_blocked`],
+/// [`retexture_blocked`]); „Melden …“ is always on (without a Stelle chosen it reports none).
+fn step_buttons(ui: &mut Ui, state: &AppState) -> Option<Action> {
+    let mut action = None;
+    let off = steps_blocked(state);
+    let mark = state.brush.active;
+    ui.label(egui::RichText::new(text::SMOOTH_LEVELS).color(DARK.text_dim));
+    let levels = [
+        (
+            SmoothLevel::Light,
+            text::SMOOTH_LIGHT,
+            text::SMOOTH_LIGHT_NAME,
+            text::SMOOTH_LIGHT_HINT,
+        ),
+        (
+            SmoothLevel::Strong,
+            text::SMOOTH_STRONG,
+            text::SMOOTH_STRONG_NAME,
+            text::SMOOTH_STRONG_HINT,
+        ),
+        (
+            SmoothLevel::Flat,
+            text::SMOOTH_FLAT,
+            text::SMOOTH_FLAT_NAME,
+            text::SMOOTH_FLAT_HINT,
+        ),
+    ];
+    for (level, label, name, hint) in levels {
+        if step_button(ui, label, name, hint, off.as_deref()) {
+            action = mark.map(|mark| Action::Smooth { mark, level });
+        }
+    }
+    ui.separator();
+    let off = off.or_else(|| retexture_blocked(state));
+    let (label, hint) = (text::RETEXTURE, text::RETEXTURE_HINT);
+    if step_button(ui, label, label, hint, off.as_deref()) {
+        action = mark.map(|mark| Action::Retexture { mark });
+    }
+    ui.separator();
+    let (label, hint) = (text::FEEDBACK_BUTTON, text::feedback_button_hint());
+    if step_button(ui, label, label, &hint, None) {
+        action = Some(Action::OpenFeedback { mark });
+    }
+    action
+}
+
+/// „Vorher“ / „Nachher“: the surface shown as computed, or with its touch-up; the one drawn is
+/// filled. Off while the view holds no touch-up of it that changes anything.
+fn edit_buttons(ui: &mut Ui, state: &AppState) -> Option<Action> {
+    let edited = state.touchup.edited;
+    let mut action = None;
+    let sides = [
+        (false, text::EDIT_BEFORE, text::EDIT_BEFORE_HINT),
+        (true, text::EDIT_AFTER, text::EDIT_AFTER_HINT),
+    ];
+    for (after, label, hint) in sides {
+        let on = edited && state.touchup.after == after;
+        let r = ui
+            .add_enabled_ui(edited, |ui| {
+                bar_button(ui, None, Some(label), label, Some(on))
+            })
+            .inner;
+        let r = r
+            .on_hover_text(hint)
+            .on_disabled_hover_text(text::EDIT_NONE);
+        if r.clicked() {
+            action = Some(Action::ShowEdit(after));
+        }
+    }
+    action
 }
 
 /// „Größe“ and its slider in centimetres (the radius).
@@ -211,11 +451,10 @@ fn size_slider(ui: &mut Ui, radius: &mut f32) {
         .on_hover_text(text::BRUSH_SIZE_HINT);
 }
 
-/// The buttons for the Stellen of the surface shown: ↶ takes back the youngest stroke or step
-/// (off with nothing to take back and while painting). The touch-up steps of the chosen Stelle
-/// take their place before it.
+/// ↶ for the Stellen of the surface shown: takes back the youngest stroke, step or „Löschen“
+/// (off with nothing to take back and while painting).
 fn mark_buttons(ui: &mut Ui, state: &AppState) -> Option<Action> {
-    let any = shown_marks(state).is_some_and(|(_, m)| m.is_some_and(|m| !m.marks.is_empty()));
+    let any = shown_marks(state).is_some_and(|(_, m)| m.is_some_and(Marks::can_undo));
     let can = any && !state.brush.painting;
     let undo = ui
         .add_enabled_ui(can, |ui| {
@@ -242,24 +481,43 @@ pub enum MarkChange {
     },
     /// ↶ ([`Action::UndoMark`]).
     Undo,
-    /// „Löschen“ ([`Action::DeleteMark`]).
+    /// „Löschen“ ([`Action::DeleteMark`]): into the history, ↶ brings it back.
     Delete(u32),
+    /// „Glätten“ of a Stelle ([`Action::Smooth`]).
+    Smooth { mark: u32, level: SmoothLevel },
+    /// „Bilder neu einspielen“ of a Stelle ([`Action::Retexture`]), with the next variant of
+    /// the Stelle as the marks are when the change is made ([`Mark::next_variant`]).
+    Retexture { mark: u32 },
+    /// A step that changed nothing (Stelle, seq) taken out again, not into the history.
+    DropStep { mark: u32, seq: u64 },
 }
 
 impl MarkChange {
-    /// Makes the change on `marks`; with a stroke the number of the Stelle painted into.
+    /// Makes the change on `marks`; with a stroke the number of the Stelle painted into. A step
+    /// for a Stelle that is gone changes nothing.
     pub fn apply(&self, marks: &mut Marks) -> Option<u32> {
         match self {
-            MarkChange::Paint { mark, dabs } => Some(marks.paint(*mark, dabs)),
+            MarkChange::Paint { mark, dabs } => return Some(marks.paint(*mark, dabs)),
             MarkChange::Undo => {
                 marks.undo();
-                None
             }
             MarkChange::Delete(nr) => {
                 marks.remove(*nr);
-                None
+            }
+            &MarkChange::Smooth { mark, level } => {
+                let _ = marks.add_step(mark, StepInput::Smooth { level });
+            }
+            &MarkChange::Retexture { mark } => {
+                let variant = marks.marks.iter().find(|m| m.nr == mark);
+                if let Some(variant) = variant.map(Mark::next_variant) {
+                    let _ = marks.add_step(mark, StepInput::Retexture { variant });
+                }
+            }
+            &MarkChange::DropStep { mark, seq } => {
+                marks.drop_step(mark, seq);
             }
         }
+        None
     }
 }
 
@@ -299,16 +557,28 @@ struct Hits {
     /// The origin it is drawn relative to (whole metres): the marks are made relative to it.
     origin: [f64; 3],
     pick: Arc<SurfacePick>,
+    /// Where its touch-up moved welded vertices, by vertex: „Nachher“ draws them there.
+    moved: BTreeMap<u32, [f64; 3]>,
+    /// The marks lie on „Nachher“ (at the moved places), else on the surface as computed.
+    after: bool,
 }
 
 impl Hits {
-    /// The triangles of the faces `faces` as marks in `color`, made relative to the origin
-    /// exactly as the pages are, so they lie on them bit for bit.
+    /// Where vertex `v` is drawn: moved by the touch-up in „Nachher“, else as computed.
+    fn place(&self, v: u32) -> [f64; 3] {
+        let moved = self.after.then(|| self.moved.get(&v)).flatten();
+        moved
+            .copied()
+            .unwrap_or_else(|| self.pick.surface.positions()[v as usize])
+    }
+
+    /// The triangles of the faces `faces` as marks in `color`, at the places drawn, made
+    /// relative to the origin exactly as the pages are, so they lie on them bit for bit.
     fn triangles(&self, faces: &[u32], color: [u8; 4]) -> Vec<MarkTriangle> {
         let s = &self.pick.surface;
         let corners: Vec<[u32; 3]> = faces.iter().map(|&f| s.faces()[f as usize]).collect();
         let origin = self.origin;
-        let pos = |v: u32| relative_to(origin, s.positions()[v as usize]);
+        let pos = |v: u32| relative_to(origin, self.place(v));
         mark_triangles(&corners, pos, color)
     }
 
@@ -481,10 +751,58 @@ impl Brush {
     /// The surface shown from now on – its file, the origin it is drawn relative to and what
     /// the loader built to hit it –, or none. A stroke on the one before is dropped.
     pub fn set_surface(&mut self, surface: Option<(PathBuf, [f64; 3], Arc<SurfacePick>)>) {
-        self.hits = surface.map(|(glb, origin, pick)| Hits { glb, origin, pick });
+        self.hits = surface.map(|(glb, origin, pick)| Hits {
+            glb,
+            origin,
+            pick,
+            moved: BTreeMap::new(),
+            after: true,
+        });
         self.stroke = None;
         self.selected.clear();
         self.ring = None;
+        self.dirty = true;
+    }
+
+    /// Where the touch-up of the surface shown moved its corners (welded vertex, new place), as
+    /// the touched-up state the view holds has them; none: nothing moved, or no touch-up.
+    pub fn set_moved(&mut self, moved: &[(u32, [f64; 3])]) {
+        let Some(hits) = &mut self.hits else {
+            return;
+        };
+        let moved: BTreeMap<u32, [f64; 3]> = moved.iter().copied().collect();
+        if hits.moved != moved {
+            hits.moved = moved;
+            self.reshape();
+        }
+    }
+
+    /// Whether the view draws „Nachher“: the marks then lie at the places the touch-up moved
+    /// corners to.
+    pub fn set_after(&mut self, after: bool) {
+        let Some(hits) = &mut self.hits else {
+            return;
+        };
+        if hits.after != after {
+            hits.after = after;
+            if !hits.moved.is_empty() {
+                self.reshape();
+            }
+        }
+    }
+
+    /// The marks of every Stelle (and of the stroke) made anew from their faces, at the places
+    /// drawn now.
+    fn reshape(&mut self) {
+        let Some(hits) = &self.hits else {
+            return;
+        };
+        for (nr, selected) in &mut self.selected {
+            selected.tris = hits.triangles(&selected.faces, mark_color(*nr));
+        }
+        if let Some(stroke) = &mut self.stroke {
+            stroke.shown.tris = hits.triangles(&stroke.shown.faces, mark_color(stroke.nr));
+        }
         self.dirty = true;
     }
 

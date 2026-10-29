@@ -98,6 +98,23 @@ pub struct TouchupDone {
     pub hints: Vec<String>,
     /// The steps that changed nothing, in their order: the Stelle and why (German).
     pub refused: Vec<(u32, String)>,
+    /// What came of every step, in the order of the replay.
+    pub outcomes: Vec<StepOutcome>,
+}
+
+/// What came of one step of the touch-up ([`TouchupDone::outcomes`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepOutcome {
+    /// The Stelle …
+    pub mark: u32,
+    /// … and the step's `seq`.
+    pub seq: u64,
+    /// The images it baked: the variant, counted from 1, of how many („Variante 2 von 5“).
+    pub variant_of: Option<(u32, u32)>,
+    /// Why it changed nothing (German), if it was refused.
+    pub refused: Option<String>,
+    /// It needed the camera images, but the raw data were gone.
+    pub without_raw_data: bool,
 }
 
 /// [`TOUCHUP_REPORT`].
@@ -163,6 +180,17 @@ impl Report {
                 .steps
                 .iter()
                 .filter_map(|s| Some((s.mark, s.refused.clone()?)))
+                .collect(),
+            outcomes: self
+                .steps
+                .iter()
+                .map(|s| StepOutcome {
+                    mark: s.mark,
+                    seq: s.seq,
+                    variant_of: s.variant_of,
+                    refused: s.refused.clone(),
+                    without_raw_data: s.without_raw_data,
+                })
                 .collect(),
         }
     }
@@ -247,6 +275,15 @@ fn fitting(surface_dir: &Path, marks: &Marks) -> Option<Report> {
 /// computes those steps anew.
 pub fn touchup_fits(surface_dir: &Path, marks: &Marks) -> bool {
     stepped_fingerprint(marks).is_none() || fitting(surface_dir, marks).is_some()
+}
+
+/// Whether the cache in the surface folder `surface_dir` holds a step computed without the raw
+/// data (one that needed the camera images while they were gone): with the raw data back,
+/// [`run_touchup`] computes it anew, although the cache fits ([`touchup_fits`]). False
+/// without a cache.
+pub fn touchup_without_raw_data(surface_dir: &Path) -> bool {
+    read_report(&surface_dir.join(TOUCHUP_DIR))
+        .is_some_and(|r| r.steps.iter().any(|s| s.without_raw_data))
 }
 
 /// A step of a Stelle, in the order of the replay.

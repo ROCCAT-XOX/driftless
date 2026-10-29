@@ -95,8 +95,11 @@ fn job_line(ui: &mut Ui, job: &JobStatus, action: &mut Option<Action>) {
     }
     ui.label(RichText::new(text::duration(job.seconds)).color(DARK.text_dim));
     let p = &job.progress;
+    // a phase that names the step itself („Nacharbeit: Schritt 1 von 2“) stands alone
     let what = if p.phase.is_empty() {
         job.label.clone()
+    } else if p.phase.starts_with(&format!("{}: ", job.label)) {
+        p.phase.clone()
     } else {
         format!("{}: {}", job.label, p.phase)
     };

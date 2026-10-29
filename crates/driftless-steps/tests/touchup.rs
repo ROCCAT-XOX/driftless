@@ -15,8 +15,8 @@ use driftless_steps::marks::{DabInput, Marks, SmoothLevel, StepInput};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::surface::{run_surface, surface_fits, texture_sources, SurfaceRequest};
 use driftless_steps::touchup::{
-    edited_mesh, edited_pages, run_touchup, touchup_fits, TouchupDone, TouchupRequest, TOUCHUP_DIR,
-    TOUCHUP_REPORT,
+    edited_mesh, edited_pages, run_touchup, touchup_fits, touchup_without_raw_data, StepOutcome,
+    TouchupDone, TouchupRequest, TOUCHUP_DIR, TOUCHUP_REPORT,
 };
 use driftless_steps::StepError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -414,16 +414,28 @@ fn smooth_then_export_contains_it() {
     assert_eq!(edited_mesh(&scene.surface, &Progress::new()).unwrap(), None);
 
     let done = scene.touch_up();
-    assert_eq!(
-        done,
-        TouchupDone {
-            steps: 1,
-            hints: Vec::new(),
-            refused: Vec::new(),
-        }
-    );
+    assert_eq!((done.steps, &done.hints), (1, &Vec::new()));
+    assert!(done.refused.is_empty(), "{done:?}");
     assert_eq!(nr, 1);
     assert!(touchup_fits(&scene.surface, &scene.marks()));
+    // What came of the step: smoothed, then its images baked anew as the best variant.
+    let seq = scene.marks().marks[0].steps[0].seq();
+    let [outcome] = &done.outcomes[..] else {
+        panic!("{done:?}")
+    };
+    let variant_of = outcome.variant_of.expect("images baked");
+    assert!(variant_of.0 == 1 && variant_of.1 >= 1, "{done:?}");
+    assert_eq!(
+        *outcome,
+        StepOutcome {
+            mark: nr,
+            seq,
+            variant_of: Some(variant_of),
+            refused: None,
+            without_raw_data: false,
+        }
+    );
+    assert!(!touchup_without_raw_data(&scene.surface));
 
     // Moved points, and the images of the Stelle baked anew onto a page of its own.
     let edited = edited_mesh(&scene.surface, &Progress::new())
@@ -611,6 +623,31 @@ fn refused_steps_leave_the_others() {
         )
     );
     assert!(done.hints.is_empty(), "{done:?}");
+    // Each step with its seq: the refused ones say why, in the order of the replay.
+    let marks = scene.marks();
+    let seq_of = |nr: u32| marks.marks.iter().find(|m| m.nr == nr).unwrap().steps[0].seq();
+    let refused: Vec<(u32, u64, Option<&str>)> = done
+        .outcomes
+        .iter()
+        .map(|o| (o.mark, o.seq, o.refused.as_deref()))
+        .collect();
+    assert_eq!(refused.len(), 3, "{done:?}");
+    assert_eq!(
+        (refused[0].0, refused[0].1),
+        (flat, seq_of(flat)),
+        "{done:?}"
+    );
+    assert_eq!(refused[0].2, Some(done.refused[0].1.as_str()));
+    assert_eq!(
+        refused[1],
+        (
+            unseen,
+            seq_of(unseen),
+            Some("Kein Bild zeigt diese Stelle; sie bleibt, wie sie ist.")
+        )
+    );
+    assert_eq!(refused[2].2, None);
+    assert!(done.outcomes[..2].iter().all(|o| o.variant_of.is_none()));
     // The third step ran.
     let edited = edited_mesh(&scene.surface, &Progress::new())
         .unwrap()
@@ -697,13 +734,16 @@ fn no_raw_data() {
     // Smoothing works; the images are not baked anew, which a hint says once.
     let done = run_touchup(&scene.request(None), &Progress::new()).unwrap();
     assert_eq!(
-        done,
-        TouchupDone {
-            steps: 2,
-            hints: vec![NO_RAW_DATA.to_string()],
-            refused: Vec::new(),
-        }
+        (done.steps, &done.hints, &done.refused),
+        (2, &vec![NO_RAW_DATA.to_string()], &Vec::new())
     );
+    let outcomes: Vec<_> = done
+        .outcomes
+        .iter()
+        .map(|o| (o.mark, o.without_raw_data, o.variant_of))
+        .collect();
+    assert_eq!(outcomes, [(1, true, None), (2, true, None)]);
+    assert!(touchup_without_raw_data(&scene.surface));
     let edited = edited_mesh(&scene.surface, &Progress::new())
         .unwrap()
         .unwrap();
@@ -726,6 +766,13 @@ fn no_raw_data() {
     let done = scene.touch_up();
     assert_eq!(done.steps, 2);
     assert!(done.hints.is_empty() && done.refused.is_empty(), "{done:?}");
+    assert!(
+        done.outcomes
+            .iter()
+            .all(|o| !o.without_raw_data && o.variant_of.is_some()),
+        "{done:?}"
+    );
+    assert!(!touchup_without_raw_data(&scene.surface));
     let edited = edited_mesh(&scene.surface, &Progress::new())
         .unwrap()
         .unwrap();
