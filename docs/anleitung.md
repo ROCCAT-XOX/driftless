@@ -14,9 +14,12 @@ Wörter in „…“ stehen genau so im Programm.
 6. [Mehrere Scans zusammenführen](#6-mehrere-scans-zusammenführen)
 7. [Projekte verwalten](#7-projekte-verwalten)
 8. [Korrigieren](#8-korrigieren)
-9. [Ergebnis weitergeben](#9-ergebnis-weitergeben)
-10. [Bekannte Grenzen](#10-bekannte-grenzen)
-11. [Fehler melden](#11-fehler-melden)
+9. [Stellen nacharbeiten](#9-stellen-nacharbeiten)
+10. [Ergebnis weitergeben](#10-ergebnis-weitergeben)
+11. [Bekannte Grenzen](#11-bekannte-grenzen)
+12. [Melden](#12-melden)
+
+Abschnitt 9 und „Melden“ mit ⇧⇧ in Abschnitt 12 sind neu nach Version 0.1.0.
 
 **Wörter, die im Programm vorkommen**
 
@@ -28,6 +31,8 @@ Wörter in „…“ stehen genau so im Programm.
 | Oberfläche | Eine geschlossene Fläche mit den Fotos der Kameras darauf, zum Beispiel „Oberfläche 001“. |
 | Modell | Mehrere Scans, zu einem zusammengeführt, zum Beispiel „Modell 001“. |
 | Teilkarte | Ein kurzes Stück der Aufnahme. Die Laufbahn besteht aus solchen Stücken. |
+| Stelle | Ein Bereich, der mit dem Pinsel auf eine Oberfläche gemalt wurde, zum Beispiel „Stelle 1 · Wand“. |
+| Nacharbeit | Was an den Stellen einer Oberfläche geändert wurde: geglättet oder die Bilder neu eingespielt. |
 | Schleife | Zwei Stellen der Laufbahn, die derselbe Ort sind. Driftless zieht sie zusammen. |
 
 ## 1. Installieren
@@ -169,14 +174,14 @@ unten die Statusleiste mit „Protokoll“ und „Abbrechen“.
    Oberfläche“ den Grund.
 6. **Messen, wenn nötig.** Unten in der Ansicht „Messen“ wählen und zwei Punkte anklicken: Driftless
    zeigt den Abstand in Metern. Die Messungen stehen in „Planung“; sie werden noch nicht gespeichert.
-   Gegen ein Maßband oder einen Laser-Entfernungsmesser ist Driftless noch nicht geprüft (Abschnitt 10).
+   Gegen ein Maßband oder einen Laser-Entfernungsmesser ist Driftless noch nicht geprüft (Abschnitt 11).
 7. **Exportieren.** Rechtsklick auf eine Karte, eine Oberfläche oder ein Modell → „Exportieren …“. Im
-   Fenster das „Format“ wählen, dann „Ziel wählen …“. Welches Format wofür: Abschnitt 9.
+   Fenster das „Format“ wählen, dann „Ziel wählen …“. Welches Format wofür: Abschnitt 10.
 
-Unten in der Ansicht liegen die Werkzeuge „Drehen“, „Verschieben“, „Punkt wählen“, „Messen“ und
-„Schnitt“ (blendet zum Beispiel die Decke aus); „Alles“ zeigt wieder alles. In ⚙ „Einstellungen“ stehen
-„Farbart“ („Farbe“, „Intensität“, „Güte“, „je Scan“), „Grafikkarte nutzen“ („Auto“, „An“, „Aus“) und die
-Ebenen, zum Beispiel „Laufbahn“ und „Schleifen“.
+Unten in der Ansicht liegen die Werkzeuge „Drehen“, „Verschieben“, „Punkt wählen“, „Messen“,
+„Schnitt“ (blendet zum Beispiel die Decke aus) und „Pinsel“ (Abschnitt 9); „Alles“ zeigt wieder alles.
+In ⚙ „Einstellungen“ stehen „Farbart“ („Farbe“, „Intensität“, „Güte“, „je Scan“), „Grafikkarte nutzen“
+(„Auto“, „An“, „Aus“) und die Ebenen, zum Beispiel „Laufbahn“ und „Schleifen“.
 
 ## 5. Welche Einstellung?
 
@@ -362,9 +367,99 @@ wieder. Die Ebene „Schleifen“ in ⚙ „Einstellungen“ zeigt die Schleifen
 jeden Stand eines Laufs; ein gewählter Stand lässt sich mit „Diesen Stand wiederherstellen“
 zurückholen. Dabei entsteht ein neuer Stand, die alten bleiben.
 
-Ein schlechtes Stück der Laufbahn wegschneiden geht noch nicht (Abschnitt 10).
+Ein schlechtes Stück der Laufbahn wegschneiden geht noch nicht (Abschnitt 11).
 
-## 9. Ergebnis weitergeben
+## 9. Stellen nacharbeiten
+
+Neu nach Version 0.1.0. Wo eine Oberfläche rauscht oder fleckige Fotos hat, lässt sich die Stelle mit
+dem Pinsel anmalen und dort nachbessern: glätten oder die Bilder neu einspielen. Die gerechnete
+Oberfläche bleibt dabei, wie sie ist. Die Nacharbeit liegt daneben im Projekt und lässt sich jederzeit
+zurücknehmen.
+
+**Stelle anmalen.**
+
+1. In „Bilder“ eine Oberfläche einer Karte oder eines Modells zeigen, oben rechts „Fläche“ oder
+   „beides“.
+2. Unten in der Ansicht „Pinsel“ wählen. Ohne gezeigte Oberfläche ist der Pinsel aus; wenn die Maus
+   darauf zeigt, steht der Grund.
+3. Mit der linken Taste über die Stelle malen. Ein Kreis unter dem Zeiger zeigt, wie groß der Pinsel
+   ist. „Größe“ in der Leiste stellt seinen Radius ein, von 5 bis 100 cm, Vorgabe 20 cm.
+
+| Eingabe | mit dem Pinsel |
+|---|---|
+| linke Taste | malen |
+| ⌥ (Windows: Alt) und linke Taste | radieren |
+| rechte Taste | drehen |
+| mittlere Taste, oder Shift und linke Taste | verschieben |
+| Rad | zoomen |
+| ⌘Z (Windows: Strg+Z) | den letzten Pinselzug oder Schritt zurücknehmen |
+| Esc | keine Stelle wählen: der nächste Zug beginnt eine neue |
+
+**Stellen.** Ein angemalter Bereich ist eine Stelle. In „Bilder“ stehen die Stellen unter den
+Oberflächen ihrer Karte oder ihres Modells, unter „Markierte Stellen“, zum Beispiel „Stelle 1 · Wand“.
+Darunter steht klein der letzte Schritt. Ob Wand, Boden oder Decke, ergibt sich aus der Lage. In der
+Ansicht ist jede Stelle farbig markiert.
+
+- Malen ohne gewählte Stelle beginnt eine neue. Danach ist sie gewählt, und der Pinsel malt in sie.
+- Ein Klick in der Liste wählt die Stelle und zeigt sie in der Ansicht; ein zweiter Klick wählt sie ab.
+- Rechtsklick → „Löschen“ nimmt die Stelle samt ihrer Nacharbeit heraus. ↶ holt sie zurück.
+
+Die Stellen gehören zur Karte oder zum Modell, nicht zu einer einzelnen Oberfläche: Alle Oberflächen
+derselben Karte oder desselben Modells haben dieselben Stellen.
+
+**Glätten.** Über den Werkzeugen steht die Leiste des Pinsels. „Glätten:“ „leicht“, „stark“ oder „ganz
+eben“ wirkt auf die gewählte Stelle.
+
+| Stufe | wofür |
+|---|---|
+| „leicht“ | feines Rauschen |
+| „stark“ | auch gröbere Unebenheiten |
+| „ganz eben“ | legt die Stelle auf eine Ebene, für Wände, Boden und Decke |
+
+Der Rand bleibt, wo er ist, und die Fläche geht auf etwa 10 cm weich in ihn über: So entsteht keine
+Kante. Weicht eine Stelle zu weit von einer Ebene ab, zum Beispiel über eine Ecke, sagt Driftless bei
+„ganz eben“: „Diese Stelle ist nicht eben genug …“, mit der Abweichung, und ändert nichts. Nach dem
+Glätten spielt Driftless die Bilder der Stelle von selbst neu ein, damit sie auf der geglätteten
+Fläche sitzen.
+
+**Bilder neu einspielen.** „Bilder neu einspielen“ nimmt für die Stelle schärfere, nähere und geradere
+Fotos, möglichst eines für die ganze Stelle, und gleicht die Helligkeit am Rand an die Umgebung an. Von
+Hand wählt man keine Fotos aus: Jeder weitere Druck probiert die nächstbeste Variante. Die Meldung sagt,
+welche, zum Beispiel „Variante 2 von 5“. Dafür braucht Driftless die Kamerabilder der Scans.
+
+**Vorher und nachher.** „Vorher“ zeigt die Oberfläche, wie sie gerechnet wurde, „Nachher“ mit der
+Nacharbeit. Das Umschalten geht sofort.
+
+**Rückgängig.** ↶ in der Leiste des Pinsels, ⌘Z oder Strg+Z nimmt den letzten Pinselzug, den letzten
+Schritt oder das letzte „Löschen“ zurück, auch nach einem Neustart.
+
+**Im Hintergrund.** Jeder Schritt rechnet als „Nacharbeit“ im Hintergrund, mit Fortschritt in der
+Statusleiste. „Abbrechen“ hält an; der Schritt ist dann nicht ausgeführt und steht nicht in der Liste.
+Wie lange ein Schritt dauert, steht unter [Bekannte Grenzen](#11-bekannte-grenzen).
+
+**Gespeichert.** Die Stellen stehen in `stellen.toml` im Ordner der Karte oder des Modells, die
+Nacharbeit in `nacharbeit/` im Ordner der Oberfläche. Beides übersteht einen Neustart, das Verschieben
+oder Kopieren des Projekts und „Aufräumen“.
+
+**Neue Oberfläche.** Bekommt dieselbe Karte oder dasselbe Modell eine neue Oberfläche (andere
+„Feinheit“, neue Programmversion), übernimmt sie die Stellen. Driftless wendet die Nacharbeit dort im
+Hintergrund wieder an: „Nacharbeit übernommen: Oberfläche 002“. Eine neue Karte (andere „Genauigkeit“,
+korrigierte Laufbahn) und ein neu zusammengeführtes Modell beginnen ohne Stellen; die Stellen bleiben
+bei der alten Karte oder dem alten Modell.
+
+**Ohne Rohdaten.** Fehlen die Kamerabilder, etwa weil das Laufwerk mit den Scans nicht angesteckt ist,
+ist „Bilder neu einspielen“ aus: „Rohdaten fehlen – Bilder können nicht neu eingespielt werden“. Glätten
+geht trotzdem; die alten Fotos bleiben dann auf der Stelle und bewegen sich mit ihr. Sind die Rohdaten
+wieder da, spielt Driftless die Bilder nach, sobald die Oberfläche das nächste Mal gezeigt wird.
+
+**Export.** Eine Oberfläche mit Nacharbeit heißt in „Exportieren …“ zum Beispiel „Oberfläche 001 mit
+Nacharbeit“. glb, OBJ und PLY-Netz enthalten dann die Nacharbeit. Punktwolken und Karten ändert die
+Nacharbeit nicht. Die Kommandozeile exportiert die Oberfläche, wie sie gerechnet wurde.
+
+**Melden.** „Melden …“ in der Leiste des Pinsels meldet einen Fehler oder Wunsch zu der gewählten
+Stelle (Abschnitt 12).
+
+## 10. Ergebnis weitergeben
 
 Rechtsklick auf das Ergebnis → „Exportieren …“, „Format“ wählen, „Ziel wählen …“. Eine vorhandene Datei
 wird nur nach „Ersetzen“ überschrieben.
@@ -404,7 +499,7 @@ Dateigrößen, gemessen in [Baustein 3](ergebnisse/2026-10-27-baustein-3.md):
 | OBJ mit Seitenbildern | 267 MB |
 | PLY-Netz | 60 MB |
 
-## 10. Bekannte Grenzen
+## 11. Bekannte Grenzen
 
 Dieselbe Liste steht im [CHANGELOG](../CHANGELOG.md).
 
@@ -420,8 +515,53 @@ Dieselbe Liste steht im [CHANGELOG](../CHANGELOG.md).
 | SharePoint-Bibliotheken | Mit OneDrive abgeglichene SharePoint-Bibliotheken (unter `%USERPROFILE%\<Firmenname>`) erkennt Driftless nicht als Cloud-Ordner und warnt dort nicht; das tut es nur bei OneDrive selbst. Projekte nicht dort ablegen. |
 | 1 cm braucht viel Speicher | Eine Oberfläche mit 1 cm braucht bei großen Aufnahmen bis 9 GB Arbeitsspeicher (Büro: 7,7 GB, 20 Minuten). |
 | Verfehlte Qualitätsziele | Bei 1 cm bleiben in großen und in dunklen Räumen Stellen der Oberfläche offen: von oben gesehen im Büro 31 % (Ziel höchstens 30 %), in einem dunklen Raum 9,7 % (Ziel höchstens 6 %). 2 cm schließt mehr. Die Übergänge zwischen zwei Fotos (Nähte) sind deutlicher zu sehen als geplant. Die Oberflächen-Datei eines Raums ist bei 1 cm rund 100 MB groß statt höchstens 60 MB. Dieselbe Wand, mehrmals abgelaufen, liegt vor dem Glätten einige Millimeter auseinander (Ziel höchstens 5 mm); die Ursache ist offen, das Glätten legt sie wieder auf eine Fläche. |
+| Nacharbeit braucht Zeit | Ein Schritt auf einer Stelle von 1 m² dauerte auf dem Testrechner 12 bis 14 s statt der geplanten höchstens 5 s ([Messung](ergebnisse/2026-10-29-pinsel.md)). Am meisten kostet die Suche nach den Fotos, die die Stelle zeigen: Dafür liest Driftless jedes Mal alle Kamerabilder der Scans, im Büro 6,7 GB, im Modell aus drei Scans 11 GB. Liegen die Scans auf einem langsamen Laufwerk oder ist der Arbeitsspeicher knapp, dauert es länger. Malen und ↶ gehen sofort. |
+| Dünne Teile vor einer Stelle | Steht vor der Stelle etwas Dünnes, das die Oberfläche nur in Stücken hat, etwa ein Rohr oder ein Kabelkanal, kann „Bilder neu einspielen“ es als Streifen auf die Stelle legen. Dann die nächste Variante probieren oder mit ↶ zurücknehmen. |
 
-## 11. Fehler melden
+## 12. Melden
+
+### In der App: ⇧⇧
+
+Neu nach Version 0.1.0. Zweimal kurz Shift drücken, links oder rechts, überall in der App: Das Fenster
+„Melden“ geht auf. Shift gedrückt halten, etwa beim Verschieben oder schnelleren Fliegen, öffnet es nie,
+Großbuchstaben tippen auch nicht. „Melden …“ in der Leiste des Pinsels öffnet es für die gewählte Stelle.
+
+1. „Fehler“ oder „Wunsch“ wählen und in ein paar Worten beschreiben, was passiert ist oder was fehlt.
+2. Angehakt sind „Bild des Fensters anhängen“ (das Fenster, wie es vor dem Melden aussah) und, wenn auf
+   der gezeigten Oberfläche Stellen markiert sind, „Markierte Stellen anhängen (2)“ mit ihrer Zahl.
+3. „Melden“ speichert die Meldung: „Meldung gespeichert“. Esc schließt, ohne zu speichern.
+
+Von selbst kommen dazu: die Ansicht (Kamera), die Auswahl (Scan, Lauf, Karte, Oberfläche oder Modell),
+das Projekt, die Programmversion, das System, die Grafikkarte und die letzten 200 Zeilen des Protokolls.
+
+**Wo die Meldungen liegen.** Nur auf diesem Rechner, nichts wird hochgeladen. Jede Meldung ist ein
+eigener Ordner, benannt nach Zeit und Art, zum Beispiel `2026-10-29_101403_fehler` oder `…_wunsch`.
+
+| System | Ordner der Meldungen |
+|---|---|
+| Mac | `~/Library/Application Support/Driftless/Meldungen/` |
+| Windows | `%LOCALAPPDATA%\Driftless\Meldungen\` |
+
+| Datei in der Meldung | Inhalt |
+|---|---|
+| `meldung.toml` | Art, Zeit, Text, Stand und Antwort, dazu Projekt, Auswahl, Ansicht, Version, System, Grafikkarte |
+| `fenster.png` | das Bild des Fensters, wenn angehakt |
+| `stellen.toml` | eine Kopie der markierten Stellen, wenn angehakt: Sie bleibt lesbar, auch wenn das Projekt verschoben oder gelöscht wird |
+| `protokoll.txt` | die letzten 200 Zeilen des Protokolls |
+
+**Was daraus wurde.** ☰ → „Meldungen …“ zeigt alle Meldungen dieses Rechners, die neueste zuerst: Art,
+Zeit, Projekt, Text, Stand und Antwort. Der Stand ist „offen“ oder zum Beispiel „erledigt in 0.2.0“.
+Stand und Antwort stehen als Klartext in `meldung.toml`: Claude liest die offenen Meldungen in der
+nächsten Sitzung und trägt dort ein, was daraus wurde; die Liste zeigt es, sobald sie wieder geöffnet
+wird. „Ordner öffnen“ zeigt den Ordner einer Meldung im Finder oder Explorer. „Zur Ansicht“ öffnet ihr
+Projekt und stellt Auswahl und Ansicht wieder her, wie sie beim Melden waren.
+
+Ein Bild des Fensters zeigt, was gerade in der Ansicht war, auch Räume von Kunden. Deshalb bleibt die
+Meldung auf dem Rechner; ihre Bilder gehören nicht in ein Issue (siehe unten).
+
+### Auf GitHub
+
+So erfahren die Entwickler von einem Fehler, auch von einem anderen Rechner aus:
 
 1. ☰ → „Protokoll-Ordner öffnen“: Dort liegt `driftless.log`, das Protokoll des letzten Starts. Die
    Starts davor stehen in `driftless.1.log` bis `driftless.4.log`.
@@ -437,7 +577,7 @@ Dieselbe Liste steht im [CHANGELOG](../CHANGELOG.md).
 | Windows | `%LOCALAPPDATA%\Driftless\Logs\` |
 
 **Nie Kundendaten in ein Issue.** Das Projekt ist öffentlich, jeder kann die Issues lesen. Keine Scans,
-Punktwolken, Oberflächen, Fotos oder Bildschirmfotos von Kunden anhängen und keine Kundennamen nennen.
-Das Protokoll enthält Ordnernamen, zum Beispiel den des Projekts: vor dem Anhängen durchsehen und
-Kundennamen ersetzen, etwa durch *Kunde A*. Werden Scandaten zur Fehlersuche gebraucht, gehen sie auf
-anderem Weg, nie über das Issue.
+Punktwolken, Oberflächen, Fotos oder Bildschirmfotos von Kunden anhängen, auch kein `fenster.png` aus
+einer Meldung, und keine Kundennamen nennen. Das Protokoll enthält Ordnernamen, zum Beispiel den des
+Projekts: vor dem Anhängen durchsehen und Kundennamen ersetzen, etwa durch *Kunde A*. Werden Scandaten
+zur Fehlersuche gebraucht, gehen sie auf anderem Weg, nie über das Issue.
