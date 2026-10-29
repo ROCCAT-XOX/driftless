@@ -21,7 +21,8 @@
 //! with is selected, at least one, and none of its edges is an open edge of the surface. The
 //! back of a thin wall, the other wall at a corner and an object in front of a wall touch
 //! faces outside the spheres and stay out; so do the faces an erasing dab took, and with them
-//! an erased spot.
+//! an erased spot. And it must be small, at most [`MAX_HOLE_AREA`]: what is larger is a thing
+//! on the wall, such as a switch, not noise.
 
 use super::{dot, sub, unit, FaceBvh, RayHit, WeldedSurface};
 use rayon::prelude::*;
@@ -29,6 +30,11 @@ use rayon::prelude::*;
 /// A face counts for a dab if the dot product of their normals is above this: they are less
 /// than 60° apart.
 pub const MIN_NORMAL_DOT: f64 = 0.5;
+
+/// The largest hole [`select_faces`] closes (m²): 25 cm². Noise leaves holes of one to a few
+/// faces of 5–7.5 cm²; a switch or socket fused to the wall is about 100 cm² and must stay
+/// out, so that „ganz eben“ cannot flatten it.
+pub const MAX_HOLE_AREA: f64 = 0.0025;
 
 /// One dab of the brush, in the frame of the surface.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -241,10 +247,16 @@ fn enclosed_holes(
             leaks[g as usize] |= other;
         }
     }
+    // Per group its area, summed in the order of the faces.
+    let mut area = vec![0.0f64; candidates.len()];
+    for (i, &f) in candidates.iter().enumerate() {
+        let c = s.face_cross(f);
+        area[find(&mut parent, i as u32) as usize] += dot(c, c).sqrt() / 2.0;
+    }
     (0..candidates.len())
         .filter(|&i| {
             let g = find(&mut parent, i as u32) as usize;
-            touches[g] && !leaks[g]
+            touches[g] && !leaks[g] && area[g] <= MAX_HOLE_AREA
         })
         .map(|i| candidates[i])
         .collect()
@@ -762,15 +774,15 @@ mod tests {
         assert!(behind.iter().all(|f| chosen.binary_search(f).is_ok()));
     }
 
-    /// A bump: one vertex 4 cm out of a flat wall, so its six faces tilt by more than 60°. A
-    /// dab leaves them out and closing takes them in. A small erasing dab on the bump takes
-    /// nothing (the six fail its normal gate as well) but keeps the hole open: the last dab
-    /// whose sphere holds them erases.
+    /// A bump: one vertex 2 cm out of a wall of 1 cm squares, so its six faces tilt by more
+    /// than 60°. A dab leaves them out and closing takes them in (7.5 cm²). A small erasing
+    /// dab on the bump takes nothing (the six fail its normal gate as well) but keeps the hole
+    /// open: the last dab whose sphere holds them erases.
     #[test]
     fn erasing_over_a_hole_keeps_it_open() {
         let (positions, indices) = grid([100, 100], |i, j| {
-            let x = if (i, j) == (50, 50) { 0.04 } else { 0.0 };
-            [x, i as f64 * 0.02, j as f64 * 0.02]
+            let x = if (i, j) == (50, 50) { 0.02 } else { 0.0 };
+            [x, i as f64 * 0.01, j as f64 * 0.01]
         });
         let s = WeldedSurface::from_mesh(&paged(&positions, &indices, 13, 2));
         let bvh = FaceBvh::build(&s);
@@ -784,16 +796,86 @@ mod tests {
             radius,
             erase,
         };
-        let paint = dab([0.0, 1.05, 1.0], 0.2, false);
+        let paint = dab([0.0, 0.55, 0.5], 0.2, false);
         let raw = dab_faces(&s, &bvh, &paint);
         assert!(bump.iter().all(|f| raw.binary_search(f).is_err()));
         let closed = select_faces(&s, &bvh, &[paint]);
         assert!(bump.iter().all(|f| closed.binary_search(f).is_ok()));
         assert_eq!(closed.len(), raw.len() + bump.len());
 
-        let erase = dab([0.04, 1.0, 1.0], 0.005, true);
+        let erase = dab([0.02, 0.5, 0.5], 0.005, true);
         assert_eq!(bvh.faces_within(&s, erase.centre, erase.radius), bump);
         assert!(dab_faces(&s, &bvh, &erase).is_empty());
         assert_eq!(select_faces(&s, &bvh, &[paint, erase]), raw);
+    }
+
+    /// A box 8 × 8 cm, 1 cm proud of the wall (front and four sides, fused with the wall),
+    /// wholly inside one dab: the Stelle encloses it, but with about 96 cm² it is no noise
+    /// hole and stays out. Elsewhere in the dab a vertex 2.8 cm out of the wall tips two faces
+    /// past 60° (the other four stay at 54.5°); each is a hole of one face and is closed.
+    #[test]
+    fn fused_object_stays_out() {
+        let at = |k: usize| k as f64 * 0.02;
+        let (positions, mut indices) = grid([100, 100], |i, j| {
+            let x = if (i, j) == (50, 60) { 0.028 } else { 0.0 };
+            [x, at(i), at(j)]
+        });
+        // No wall under the box (0.96 ≤ y, z ≤ 1.04) ...
+        indices.retain(|t| {
+            let c = |k: usize| t.iter().map(|&v| positions[v as usize][k]).sum::<f64>() / 3.0;
+            !((0.96..1.04).contains(&c(1)) && (0.96..1.04).contains(&c(2)))
+        });
+        let mut parts = vec![(positions, indices)];
+        // ... but its front, and its sides from the wall's corners to the front's.
+        parts.push(grid([4, 4], |i, j| [0.01, at(48 + i), at(48 + j)]));
+        for side in [48, 52] {
+            parts.push(grid([4, 1], |i, k| [0.01 * k as f64, at(48 + i), at(side)]));
+            parts.push(grid([4, 1], |j, k| [0.01 * k as f64, at(side), at(48 + j)]));
+        }
+        let (positions, indices) = concat(&parts);
+        let s = WeldedSurface::from_mesh(&paged(&positions, &indices, 13, 3));
+        let bvh = FaceBvh::build(&s);
+        let on_box = |f: u32| {
+            let c = s.face_centroid(f);
+            c[0] > 0.0 && (0.96..=1.04).contains(&c[1]) && (0.96..=1.04).contains(&c[2])
+        };
+        let boxed: Vec<u32> = (0..s.face_count() as u32).filter(|&f| on_box(f)).collect();
+        let bump: Vec<u32> = (0..s.face_count() as u32)
+            .filter(|&f| !on_box(f) && s.face_normal(f)[0] < MIN_NORMAL_DOT)
+            .collect();
+        assert_eq!((boxed.len(), bump.len()), (64, 2));
+        let area: f64 = boxed
+            .iter()
+            .map(|&f| dot(s.face_cross(f), s.face_cross(f)).sqrt() / 2.0)
+            .sum();
+        assert!((area - 0.0096).abs() < 1e-6, "{area}");
+
+        let dab = SelectDab {
+            centre: [0.0, 1.0, 1.1],
+            normal: [1.0, 0.0, 0.0],
+            radius: 0.2,
+            erase: false,
+        };
+        let near = bvh.faces_within(&s, dab.centre, dab.radius);
+        assert!(boxed
+            .iter()
+            .chain(&bump)
+            .all(|f| near.binary_search(f).is_ok()));
+        let raw = dab_faces(&s, &bvh, &dab);
+        let chosen = select_faces(&s, &bvh, &[dab]);
+        // Enclosed: every face next to the box is selected.
+        let nbrs = edge_neighbours(&s);
+        for &f in &boxed {
+            for n in nbrs[f as usize].iter().filter(|&&n| !on_box(n)) {
+                assert!(chosen.binary_search(n).is_ok(), "{n} next to the box");
+            }
+        }
+        for f in &boxed {
+            assert!(chosen.binary_search(f).is_err(), "box face {f} is in");
+        }
+        for f in &bump {
+            assert!(raw.binary_search(f).is_err() && chosen.binary_search(f).is_ok());
+        }
+        assert_eq!(chosen.len(), raw.len() + bump.len());
     }
 }

@@ -19,7 +19,7 @@ mod smooth;
 mod weld;
 
 pub use bvh::{FaceBvh, RayHit, LEAF_FACES};
-pub use select::{dab_faces, dab_normal, select_faces, SelectDab, MIN_NORMAL_DOT};
+pub use select::{dab_faces, dab_normal, select_faces, SelectDab, MAX_HOLE_AREA, MIN_NORMAL_DOT};
 pub use smooth::{smooth_region, Smoothing};
 pub use weld::WeldedSurface;
 
