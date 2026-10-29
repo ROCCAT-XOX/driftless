@@ -87,6 +87,14 @@ pub enum JobOutput {
     MapCompare(Box<MapComparison>),
     /// The step „Exportieren“: what it wrote.
     Exported(Box<ExportReport>),
+    /// `stellen.toml` of a map or model after a change of its Stellen (helper runner).
+    Marks(Box<driftless_steps::marks::Marks>),
+    /// The step „Nacharbeit“: the touch-up of a surface, with what the view should show.
+    Touchup(Box<crate::surface::TouchupOutput>),
+    /// A report of „Melden“ written: its folder (helper runner).
+    FeedbackSaved(PathBuf),
+    /// The reports of this computer, the newest first (helper runner).
+    Reports(Vec<(PathBuf, crate::feedback::Feedback)>),
     /// Nothing to hand back; the job's effect is on disk.
     Done,
 }

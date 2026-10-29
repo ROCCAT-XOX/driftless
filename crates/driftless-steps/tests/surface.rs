@@ -1,21 +1,29 @@
 //! `run_surface` on the synthetic room scan (with camera images where noted), and
 //! `run_model_surface` on models of two scans of the furnished room.
 
+use driftless_io::calib::load_calibration;
+use driftless_io::camera::Camera;
+use driftless_io::images::{for_each_image_where, Wanted};
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
 use driftless_io::testdir::{SharedDir, TestDir};
 use driftless_io::testscan::{
-    furnished_room_bag, furnished_scan_with_images, room_bag, scan_with_images, shared, tmp,
+    furnished_room_bag, furnished_scan_with_images, room_bag, scan_with_images, shared, tmp, IMAGES,
 };
-use driftless_map::surface::SurfaceConfig;
+use driftless_map::surface::{SurfaceConfig, TextureSource};
+use driftless_map::{ColorCamera, ImageSource};
 use driftless_slam::align::AlignConfig;
 use driftless_steps::map::{map_input_for, run_map, MapInput, MapRequest, MapSettings, MapStep};
-use driftless_steps::merge::{run_merge, MergeMember, MergeRequest, MERGE_VERSION, MODEL_REPORT};
+use driftless_steps::merge::{
+    member_transform, read_model, run_merge, MergeMember, MergeRequest, MERGE_VERSION, MODEL_REPORT,
+};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::surface::{
-    model_surface_fits, run_model_surface, run_surface, surface_fits, ModelSurfaceRequest,
-    SurfaceRequest, SURFACE_REPORT,
+    model_surface_fits, run_model_surface, run_surface, surface_fits, texture_sources,
+    ModelSurfaceRequest, NoSources, SurfaceRequest, TextureSources, SURFACE_REPORT,
 };
 use driftless_steps::StepError;
+use driftless_traj::nalgebra::Isometry3;
+use driftless_traj::{read_tum, Pose};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -799,4 +807,499 @@ fn model_surface_cancel_writes_nothing() {
     let err = run_model_surface(&model_request(&s.both, &dest), &p).unwrap_err();
     assert_eq!(err, StepError::Cancelled);
     assert!(!dest.exists());
+}
+
+// The camera images of a surface for the touch-up („Bilder neu einspielen“): the same
+// sources as the surface step, found from the surface folder alone.
+
+/// The images of `src` as the stream has them: (camera, stamp), without decoding any.
+fn image_list(src: &TextureSource) -> Vec<(String, f64)> {
+    let mut list = Vec::new();
+    for_each_image_where(
+        &src.images.bags,
+        &src.images.topics,
+        1,
+        |h| {
+            list.push((h.camera.clone(), h.stamp));
+            Wanted::No
+        },
+        |_| true,
+    )
+    .unwrap();
+    list
+}
+
+/// `path` resolved, for comparing paths given another way.
+fn resolved(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap()
+}
+
+/// The sources of the surface in `surface`; panics without.
+fn sources_of(surface: &Path) -> Vec<TextureSource> {
+    match texture_sources(surface).unwrap() {
+        TextureSources::Found(sources) => sources,
+        other => panic!("keine Rohdaten für {}: {other:?}", surface.display()),
+    }
+}
+
+/// `t · pose`, as the model surface moves the poses of a scan.
+fn moved(t: &Isometry3<f64>, p: &Pose) -> Pose {
+    Pose {
+        t: p.t,
+        p: t.rotation * p.p + t.translation.vector,
+        q: t.rotation * p.q,
+    }
+}
+
+/// The source the surface step makes of `scan` (with the trajectory `poses`): its image bag
+/// and topic, its camera from the calibration (LiDAR mount: the default settings' identity).
+fn expected_source(scan: &Path, poses: Vec<Pose>) -> TextureSource {
+    let calib = load_calibration(&scan.join("calibration/calib.json")).unwrap();
+    let c = &calib.cameras["left"];
+    let camera = Camera::from_calib("left", c).unwrap();
+    TextureSource {
+        images: ImageSource {
+            bags: vec![resolved(&scan.join("IMAGE_0.bag"))],
+            topics: vec!["/camera_left/image_raw".to_string()],
+        },
+        poses,
+        cams: vec![ColorCamera::new(
+            camera,
+            &c.lidar_to_cam.unwrap(),
+            &Isometry3::identity(),
+        )],
+    }
+}
+
+/// `src` with its bags resolved (the folders of a project are found resolved or not).
+fn with_resolved_bags(mut src: TextureSource) -> TextureSource {
+    src.images.bags = src.images.bags.iter().map(|b| resolved(b)).collect();
+    src
+}
+
+/// A scan with images in a project as the program lays it out: the scan in
+/// `<projekt>/rohdaten/raum`, its run `scans/raum/slam-001` with `lauf.toml` (the scan relative
+/// to the project), the map `karte-001` and the surface `oberflaeche-001` in it, and
+/// `project.toml`. Returns (temporary folder, project, surface folder).
+fn project_with_surface(name: &str) -> (TestDir, PathBuf, PathBuf) {
+    let dir = tmp(name);
+    let project = dir.join("projekt");
+    let scan = project.join("rohdaten").join("raum");
+    fs::create_dir_all(&scan).unwrap();
+    scan_with_images(&scan);
+    fs::write(
+        project.join("project.toml"),
+        "format = 1\nname = \"P\"\n\n[[scan]]\nid = \"raum\"\npath = \"rohdaten/raum\"\n\
+         name = \"Raum\"\n",
+    )
+    .unwrap();
+    let run = project.join("scans").join("raum").join("slam-001");
+    slam(&scan, &run);
+    fs::write(
+        run.join("lauf.toml"),
+        "scan = \"rohdaten/raum\"\nerstellt = \"2026-10-29T08:00:00Z\"\n\n[slam]\n",
+    )
+    .unwrap();
+    let map_dir = run.join("karte-001");
+    let input = MapInput {
+        scan: scan.clone(),
+        slam_dir: run.clone(),
+        slam: SlamSettings::default(),
+        map: MapSettings {
+            step: MapStep::Clean,
+            ..MapSettings::default()
+        },
+    };
+    run_map(
+        &MapRequest {
+            input: input.clone(),
+            out_dir: map_dir.clone(),
+            all_files: false,
+        },
+        &Progress::new(),
+    )
+    .unwrap();
+    let surface = map_dir.join("oberflaeche-001");
+    let report = run_surface(
+        &SurfaceRequest {
+            map: input,
+            map_dir,
+            out_dir: surface.clone(),
+            config: small_config(),
+            texture: true,
+            gpu: driftless_gpu::GpuPref::Off,
+            obj: false,
+        },
+        &Progress::new(),
+    )
+    .unwrap();
+    assert!(
+        report["stats"]["texture"]["faces_textured"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "the surface step used the images: {report}"
+    );
+    (dir, project, surface)
+}
+
+#[test]
+fn texture_sources_match_surface_step() {
+    let (dir, project, surface) = project_with_surface("steps-texture-sources");
+    let scan = project.join("rohdaten").join("raum");
+    let run = project.join("scans").join("raum").join("slam-001");
+    let poses = read_tum(&run.join("traj.tum")).unwrap();
+    let sources = sources_of(&surface);
+    assert_eq!(sources.len(), 1);
+    let src = with_resolved_bags(sources[0].clone());
+    assert_eq!(src, expected_source(&scan, poses.clone()));
+    // Every image of the scan, of its one camera.
+    let images = image_list(&src);
+    assert_eq!(images.len(), IMAGES, "{images:?}");
+    assert!(images.iter().all(|(c, _)| c == "left"), "{images:?}");
+
+    // The project moved with its raw data: found in the new place.
+    let moved_to = dir.join("verschoben");
+    fs::rename(&project, &moved_to).unwrap();
+    let surface = moved_to.join(surface.strip_prefix(&project).unwrap());
+    let scan = moved_to.join("rohdaten").join("raum");
+    let src = with_resolved_bags(sources_of(&surface).remove(0));
+    assert_eq!(src, expected_source(&scan, poses.clone()));
+
+    // The raw data gone (a drive unplugged, the folder renamed): none, no error.
+    let elsewhere = moved_to.join("rohdaten").join("raum-woanders");
+    fs::rename(&scan, &elsewhere).unwrap();
+    assert!(matches!(
+        texture_sources(&surface).unwrap(),
+        TextureSources::Unavailable(NoSources::ScanFolder { .. })
+    ));
+
+    // The scan given its new folder in the project (`project.toml`, as „Ordner neu zuordnen“
+    // writes it; `lauf.toml` keeps the old one): found there.
+    let file = moved_to.join("project.toml");
+    let text = fs::read_to_string(&file).unwrap();
+    fs::write(
+        &file,
+        text.replace("rohdaten/raum", "rohdaten/raum-woanders"),
+    )
+    .unwrap();
+    let src = with_resolved_bags(sources_of(&surface).remove(0));
+    assert_eq!(src, expected_source(&elsewhere, poses));
+
+    // A surface computed without images has none either.
+    let gray = surface.with_file_name("oberflaeche-002");
+    fs::create_dir_all(&gray).unwrap();
+    let mut report: Value =
+        serde_json::from_str(&fs::read_to_string(surface.join(SURFACE_REPORT)).unwrap()).unwrap();
+    report["settings"]["texture"] = false.into();
+    fs::write(gray.join(SURFACE_REPORT), report.to_string()).unwrap();
+    assert_eq!(
+        texture_sources(&gray).unwrap(),
+        TextureSources::Found(Vec::new())
+    );
+
+    // No surface in the folder: an error that says so.
+    let err = texture_sources(&moved_to.join("scans")).unwrap_err();
+    assert!(err.to_string().contains(SURFACE_REPORT), "{err}");
+}
+
+#[test]
+fn texture_sources_of_a_model() {
+    let s = model_scene();
+    // A surface of the model of A and B outside its folder: the report leads to the model.
+    let dest = model_out("quellen");
+    run_model_surface(&model_request(&s.both, &dest), &Progress::new()).unwrap();
+    let model = read_model(&s.both).unwrap();
+    let sources = sources_of(&dest);
+    assert_eq!(sources.len(), 2, "one per scan with images");
+    for (src, m) in sources.into_iter().zip(&model.members) {
+        let own = read_tum(&m.slam_dir.join("traj.tum")).unwrap();
+        let t = member_transform(m);
+        let poses = own.iter().map(|p| moved(&t, p)).collect();
+        assert_eq!(
+            with_resolved_bags(src.clone()),
+            expected_source(&m.scan, poses)
+        );
+        assert_eq!(image_list(&src).len(), IMAGES);
+    }
+
+    // C has no images: only A's.
+    let dest = model_out("quellen-ohne-bilder");
+    run_model_surface(&model_request(&s.one_imageless, &dest), &Progress::new()).unwrap();
+    let model = read_model(&s.one_imageless).unwrap();
+    let a = &model.members[1];
+    let poses = read_tum(&a.slam_dir.join("traj.tum"))
+        .unwrap()
+        .iter()
+        .map(|p| moved(&member_transform(a), p))
+        .collect();
+    let sources = sources_of(&dest);
+    assert_eq!(sources.len(), 1);
+    assert_eq!(
+        with_resolved_bags(sources[0].clone()),
+        expected_source(&a.scan, poses)
+    );
+
+    // The raw data of a scan in the model gone: none for the model.
+    let missing = edited_model("quellen-fehlen", |m| {
+        m["members"][1]["scan"] = "/gibt/es/nicht".into();
+        m["members"][1]["scan_rel"] = Value::Null;
+    });
+    let surface = missing.join("oberflaeche");
+    fs::create_dir_all(&surface).unwrap();
+    fs::copy(dest.join(SURFACE_REPORT), surface.join(SURFACE_REPORT)).unwrap();
+    let mut report: Value =
+        serde_json::from_str(&fs::read_to_string(surface.join(SURFACE_REPORT)).unwrap()).unwrap();
+    report["model"]["dir"] = missing.display().to_string().into();
+    report["model"]["dir_rel"] = "..".into();
+    fs::write(surface.join(SURFACE_REPORT), report.to_string()).unwrap();
+    assert!(matches!(
+        texture_sources(&surface).unwrap(),
+        TextureSources::Unavailable(NoSources::ScanFolder { .. })
+    ));
+}
+
+/// Moves every position of the trajectory `traj` by `dx` m along x, as a corrected trajectory
+/// computed anew in the same folder does („Schleife eintragen → Jetzt neu rechnen“); returns
+/// the text it had.
+fn shift_traj(traj: &Path, dx: f64) -> String {
+    let text = fs::read_to_string(traj).unwrap();
+    let shifted: String = text
+        .lines()
+        .map(|l| {
+            if l.starts_with('#') || l.trim().is_empty() {
+                return format!("{l}\n");
+            }
+            let mut f: Vec<String> = l.split_whitespace().map(String::from).collect();
+            let x: f64 = f[1].parse().unwrap();
+            f[1] = format!("{}", x + dx);
+            format!("{}\n", f.join(" "))
+        })
+        .collect();
+    fs::write(traj, shifted).unwrap();
+    text
+}
+
+/// What is not there of the raw data of a map's surface is said by name: the calibration, the
+/// image bag, the scan folder, the scan of a run of the command line; raw data that are there
+/// but not those of the surface (the trajectory computed anew in its folder) make it stale.
+/// Each back as it was: found again.
+#[test]
+fn texture_sources_say_what_is_missing() {
+    let (dir, project, surface) = project_with_surface("steps-quellen-fehlen");
+    let scan = fs::canonicalize(project.join("rohdaten").join("raum")).unwrap();
+    let missing = |surface: &Path, what: &str| match texture_sources(surface).unwrap() {
+        TextureSources::Unavailable(why) => {
+            assert!(why.raw_data_missing(), "{what}: {why:?}");
+            why
+        }
+        found => panic!("{what}: {found:?}"),
+    };
+
+    let calib = scan.join("calibration").join("calib.json");
+    fs::rename(&calib, scan.join("calib.weg")).unwrap();
+    let why = missing(&surface, "calibration");
+    assert_eq!(
+        why.to_string(),
+        format!(
+            "Rohdaten fehlen – keine Kalibrierung: {} fehlt",
+            calib.display()
+        )
+    );
+    assert!(matches!(&why, NoSources::Images { scan: s, .. } if *s == scan));
+    fs::rename(scan.join("calib.weg"), &calib).unwrap();
+    assert_eq!(sources_of(&surface).len(), 1);
+
+    let bag = scan.join("IMAGE_0.bag");
+    fs::rename(&bag, scan.join("IMAGE_0.weg")).unwrap();
+    let why = missing(&surface, "image bag");
+    assert_eq!(
+        why.to_string(),
+        format!(
+            "Rohdaten fehlen – keine Kamerabilder: {} enthält keine IMAGE_*.bag",
+            scan.display()
+        )
+    );
+    fs::rename(scan.join("IMAGE_0.weg"), &bag).unwrap();
+    assert_eq!(sources_of(&surface).len(), 1);
+
+    let away = scan.with_file_name("raum-weg");
+    fs::rename(&scan, &away).unwrap();
+    let why = missing(&surface, "scan folder");
+    assert_eq!(
+        why,
+        NoSources::ScanFolder {
+            folder: scan.clone(),
+            why: format!("Scan-Ordner {} nicht gefunden", scan.display()),
+        }
+    );
+    assert_eq!(
+        why.to_string(),
+        format!(
+            "Rohdaten fehlen – Scan-Ordner {} nicht gefunden",
+            scan.display()
+        )
+    );
+    fs::rename(&away, &scan).unwrap();
+    assert_eq!(sources_of(&surface).len(), 1);
+
+    // the trajectory computed anew in its folder: the surface does not fit it any more
+    let run = project.join("scans").join("raum").join("slam-001");
+    let text = shift_traj(&run.join("traj.tum"), 0.3);
+    let stale = texture_sources(&surface).unwrap();
+    assert_eq!(stale, TextureSources::Unavailable(NoSources::SurfaceStale));
+    assert!(!NoSources::SurfaceStale.raw_data_missing());
+    assert_eq!(
+        NoSources::SurfaceStale.to_string(),
+        "Oberfläche veraltet – Bilder nur auf einer aktuellen Oberfläche neu einspielbar"
+    );
+    fs::write(run.join("traj.tum"), text).unwrap();
+    assert_eq!(sources_of(&surface).len(), 1);
+
+    // a run of the command line added to the project from elsewhere: it names no scan
+    let cli = dir.join("cli").join("lauf");
+    fs::create_dir_all(cli.parent().unwrap()).unwrap();
+    fs::rename(&run, &cli).unwrap();
+    fs::remove_file(cli.join("lauf.toml")).unwrap();
+    let surface = cli.join("karte-001").join("oberflaeche-001");
+    let cli = fs::canonicalize(&cli).unwrap();
+    let why = missing(&surface, "run of the command line");
+    assert_eq!(why, NoSources::CommandLineRun(cli.clone()));
+    assert_eq!(
+        why.to_string(),
+        format!(
+            "Rohdaten nicht gefunden – Lauf der Kommandozeile: zum Lauf {} ist kein Scan-Ordner \
+             bekannt",
+            cli.display()
+        )
+    );
+}
+
+/// The same for a model's surface: a scan of it short of its image bag makes the whole model
+/// short (never a part of the sources), a scan or run folder not found is named, an old model
+/// of a moved project says so, and a scan whose trajectory was computed anew makes it stale.
+#[test]
+fn texture_sources_of_a_model_say_what_is_missing() {
+    let s = model_scene();
+    // a copy of A, B and their model for this test alone, the model's absolute folders
+    // pointing nowhere: only its relative ones lead to the copy
+    let root = fs::canonicalize(s.a.parent().unwrap()).unwrap();
+    let dir = tmp("steps-quellen-modell-fehlt");
+    for name in ["raum-a", "raum-b"] {
+        copy_dir(&root.join(name), &dir.join(name));
+    }
+    let model = dir.join("modell");
+    fs::create_dir_all(&model).unwrap();
+    let text = fs::read_to_string(s.both.join(MODEL_REPORT)).unwrap();
+    let mut report: Value = serde_json::from_str(&text).unwrap();
+    for m in report["members"].as_array_mut().unwrap() {
+        for key in ["scan", "slam_dir", "map_dir"] {
+            let name = Path::new(m[key].as_str().unwrap())
+                .strip_prefix(&root)
+                .unwrap()
+                .to_path_buf();
+            m[key] = Path::new("/frueher")
+                .join(name)
+                .display()
+                .to_string()
+                .into();
+        }
+    }
+    fs::write(model.join(MODEL_REPORT), report.to_string()).unwrap();
+    let surface = model.join("oberflaeche-001");
+    run_model_surface(&model_request(&model, &surface), &Progress::new()).unwrap();
+    assert_eq!(sources_of(&surface).len(), 2);
+    let (a, b) = (
+        fs::canonicalize(dir.join("raum-a")).unwrap(),
+        fs::canonicalize(dir.join("raum-b")).unwrap(),
+    );
+
+    // B without its images: none at all, B named
+    fs::rename(b.join("IMAGE_0.bag"), b.join("IMAGE_0.weg")).unwrap();
+    let why = texture_sources(&surface).unwrap();
+    assert_eq!(
+        why,
+        TextureSources::Unavailable(NoSources::Images {
+            scan: b.clone(),
+            why: format!(
+                "keine Kamerabilder: {} enthält keine IMAGE_*.bag",
+                b.display()
+            ),
+        })
+    );
+    fs::rename(b.join("IMAGE_0.weg"), b.join("IMAGE_0.bag")).unwrap();
+    assert_eq!(sources_of(&surface).len(), 2);
+
+    // the run folder of B gone
+    let run = b.join("driftless");
+    fs::rename(&run, b.join("driftless-weg")).unwrap();
+    assert_eq!(
+        texture_sources(&surface).unwrap(),
+        TextureSources::Unavailable(NoSources::RunFolder(PathBuf::from(
+            "/frueher/raum-b/driftless"
+        )))
+    );
+    fs::rename(b.join("driftless-weg"), &run).unwrap();
+
+    // the scan folder of B gone (with its run in it)
+    fs::rename(&b, b.with_file_name("raum-b-weg")).unwrap();
+    let why = texture_sources(&surface).unwrap();
+    assert_eq!(
+        why,
+        TextureSources::Unavailable(NoSources::ScanFolder {
+            folder: PathBuf::from("/frueher/raum-b"),
+            why: "Scan-Ordner /frueher/raum-b nicht gefunden".into(),
+        })
+    );
+    fs::rename(b.with_file_name("raum-b-weg"), &b).unwrap();
+    assert_eq!(sources_of(&surface).len(), 2);
+
+    // the trajectory of A computed anew in its folder: the map of A no longer fits the model
+    let traj = a.join("driftless").join("traj.tum");
+    let text = shift_traj(&traj, 0.3);
+    assert_eq!(
+        texture_sources(&surface).unwrap(),
+        TextureSources::Unavailable(NoSources::SurfaceStale)
+    );
+    fs::write(&traj, text).unwrap();
+    assert_eq!(sources_of(&surface).len(), 2);
+
+    // an old model, of the folders of its scans only the absolute ones, at the old place of
+    // the project – its scans elsewhere, still there
+    for m in report["members"].as_array_mut().unwrap() {
+        for key in ["scan_rel", "slam_dir_rel", "map_dir_rel"] {
+            m.as_object_mut().unwrap().remove(key);
+        }
+        let name = Path::new(m["scan"].as_str().unwrap()).file_name().unwrap();
+        m["scan"] = dir.join(name).display().to_string().into();
+    }
+    fs::write(model.join(MODEL_REPORT), report.to_string()).unwrap();
+    let why = texture_sources(&surface).unwrap();
+    let model = fs::canonicalize(&model).unwrap();
+    assert_eq!(
+        why,
+        TextureSources::Unavailable(NoSources::OldModel(model.clone()))
+    );
+    assert_eq!(
+        why.unavailable().unwrap().to_string(),
+        format!(
+            "Rohdaten nicht gefunden – altes Modell: {} kennt die Ordner seiner Scans nur am \
+             früheren Ort des Projekts",
+            model.display()
+        )
+    );
+}
+
+/// Copies the folder `from` with everything in it to `to`.
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for e in fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let target = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &target);
+        } else {
+            fs::copy(e.path(), &target).unwrap();
+        }
+    }
 }

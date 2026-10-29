@@ -4,16 +4,19 @@
 //!
 //! Layout: the rail at the left edge ([`rail`]: ☰, the three [`Step`]s, ⚙), next to it the
 //! field of the active step ([`steps`]), the 3D view ([`view3d`]) in the rest with its floating
-//! bars ([`tools`]: info, the switch Punkte · Fläche · beides, the tools and the cut), the
-//! status bar ([`status`]) at the bottom, the settings window ⚙ ([`settings`]), the window
-//! „Exportieren“ ([`export`]) and the window „Über Driftless“ ([`about`]).
+//! bars ([`tools`]: info, the switch Punkte · Fläche · beides, the tools, the cut and the bar of
+//! the brush, [`brush`]), the status bar ([`status`]) at the bottom, the settings window ⚙
+//! ([`settings`]), the window „Exportieren“ ([`export`]), the window „Über Driftless“
+//! ([`about`]), and „Melden“ (⇧⇧) with the list of the reports ([`feedback`]).
 
 pub mod about;
 pub mod actions;
 mod app;
+pub mod brush;
 pub mod compare;
 pub mod correct;
 pub mod export;
+pub mod feedback;
 pub mod manage;
 pub mod rail;
 pub mod settings;
@@ -40,6 +43,7 @@ use driftless_gpu::GpuPref;
 use driftless_steps::export::{ExportRequest, ExportSource};
 use driftless_steps::inspect;
 use driftless_steps::map::MapSettings;
+use driftless_steps::marks::{DabInput, SmoothLevel};
 use driftless_steps::pairs::PointPairEntry;
 use driftless_steps::slam::SlamSettings;
 use std::collections::{BTreeMap, VecDeque};
@@ -252,6 +256,68 @@ pub enum Action {
     /// „Aufräumen“: what jobs cut off left behind ([`AppState::leftovers_shown`]) goes to the
     /// trash.
     CleanUp,
+    /// A stroke of the brush (press to release) on a surface of the map or model in `owner`:
+    /// `dabs` into Stelle `mark`, or into a new one with `None` (also when `mark` is gone).
+    /// Saved in its `stellen.toml` in the background; one stroke is one step back for ↶.
+    Paint {
+        owner: PathBuf,
+        mark: Option<u32>,
+        dabs: Vec<DabInput>,
+    },
+    /// Chooses the Stelle the brush paints into (of the map or model of the surface shown);
+    /// `None`: the next stroke begins a new one.
+    SelectMark(Option<u32>),
+    /// Chooses the Stelle and shows it in the view, looking straight at it.
+    FrameMark(u32),
+    /// Takes the Stelle out of `stellen.toml` with all its touch-up (right click „Löschen“);
+    /// ↶ brings it back.
+    DeleteMark(u32),
+    /// ↶, ⌘Z: takes back the youngest stroke, step or „Löschen“ of the Stellen of the surface
+    /// shown; a step taken back (or a Stelle with steps) computes the touch-up anew.
+    UndoMark,
+    /// „Glätten“ of Stelle `mark` of the surface shown with `level`: the step goes into
+    /// `stellen.toml`, then the touch-up of the surface is computed ([`Action::Touchup`]).
+    Smooth {
+        mark: u32,
+        level: SmoothLevel,
+    },
+    /// „Bilder neu einspielen“ of Stelle `mark` of the surface shown, with its next variant;
+    /// then the touch-up as for [`Action::Smooth`]. Refused while the raw data are gone.
+    Retexture {
+        mark: u32,
+    },
+    /// „Vorher“ (`false`) or „Nachher“ (`true`): the surface shown as computed, or touched up.
+    ShowEdit(bool),
+    /// „Melden …“ (⇧⇧): the window „Melden“, about Stelle `mark` of the surface shown if given,
+    /// with „Markierte Stellen anhängen (n)“ ticked where there are Stellen. With a GPU it opens
+    /// once the picture of the window has come, so the picture shows the window without it.
+    OpenFeedback {
+        mark: Option<u32>,
+    },
+    /// „Melden“ in the dialog: the report is written as a folder in the background
+    /// ([`crate::feedback::write`]), the dialog closes; „Meldung gespeichert“ says when it is.
+    SendFeedback,
+    /// ☰ → „Meldungen …“: the window with the reports of this computer, read anew.
+    OpenReports,
+    /// „Ordner öffnen“ of a report: its folder in Finder or Explorer.
+    OpenReportFolder(PathBuf),
+    /// „Zur Ansicht“ of the report in the folder: its project is opened, then its step and
+    /// selection are set, and once what they load is shown the camera is set as it was.
+    ReportView(PathBuf),
+    /// The touch-up of the surface in the folder `surface` as a step, with its progress and
+    /// „Abbrechen“ ([`crate::surface::run_touchup_job`]): the steps of the Stellen of its map or
+    /// model replayed and kept in `nacharbeit/`; the view gets the touched-up state. `step`:
+    /// the step just added (Stelle, seq) – what came of it is told, and if it changed nothing
+    /// (or did not run to its end) it is taken out of `stellen.toml` again. `tell`: it applies
+    /// the Stellen to a surface shown, exported or new – what came of it is told (see
+    /// [`brush::TouchupWish`]). The window queues it ([`brush::TouchupState::waiting`]) once the
+    /// Stellen are saved and no step runs; „Abbrechen“ stops it alone, not the queue of „Alle
+    /// rechnen“ it runs in.
+    Touchup {
+        surface: PathBuf,
+        step: Option<(u32, u64)>,
+        tell: bool,
+    },
 }
 
 /// A question the window asks before a change of the project, in a small window over the view
@@ -447,12 +513,15 @@ pub struct Tree {
     /// The folders a running job marks busy, with who holds them
     /// ([`crate::leftovers::busy_folders`]).
     pub busy: Vec<(PathBuf, String)>,
+    /// The Stellen of the maps and models, by folder ([`brush::read_marks`]).
+    pub marks: BTreeMap<PathBuf, brush::MarksRead>,
 }
 
-/// Reads the tree of `project` from disk: every scan folder, run, map, surface and model, and
-/// what jobs cut off left behind. A run without its `slam.json` or a map without its `map.json`
-/// (one being computed, or a leftover) is not in the tree – unless it holds finished results
-/// (maps, surfaces, the history of a run): then it stays, marked incomplete
+/// Reads the tree of `project` from disk: every scan folder, run, map, surface and model, the
+/// Stellen painted on them, and what jobs cut off left behind. A run without its `slam.json`
+/// or a map without its `map.json` (one being computed, or a leftover) is not in the tree –
+/// unless it holds finished results (maps, surfaces, the history of a run): then it stays,
+/// marked incomplete
 /// ([`RunInfo::incomplete`], [`crate::project::MapInfo::incomplete`]; see
 /// [`crate::leftovers`]). Can take seconds on a network share or with files iCloud moved away:
 /// call it off the UI thread.
@@ -467,7 +536,7 @@ pub fn read_tree(project: &Project) -> Tree {
         run.maps.retain(|m| !m.incomplete || holds_results(&m.dir));
         Some(run)
     };
-    let scans = project
+    let scans: Vec<ScanNode> = project
         .scans
         .iter()
         .map(|s| ScanNode {
@@ -487,13 +556,22 @@ pub fn read_tree(project: &Project) -> Tree {
         Ok(pairs) => (pairs, None),
         Err(e) => (Vec::new(), Some(e)),
     };
+    let models = project.models();
+    let owners = scans
+        .iter()
+        .flat_map(|s: &ScanNode| &s.runs)
+        .flat_map(|r| &r.maps)
+        .map(|m| m.dir.clone())
+        .chain(models.iter().map(|m| m.dir.clone()));
+    let marks = brush::read_marks(owners);
     Tree {
         scans,
-        models: project.models(),
+        models,
         point_pairs,
         point_pairs_error,
         leftovers: crate::leftovers::find(&project.dir, &ids),
         busy: crate::leftovers::busy_folders(&project.dir),
+        marks,
     }
 }
 
@@ -576,7 +654,8 @@ pub struct AppState {
     pub step: Step,
     /// What is still to compute by [`Action::ComputeAllMaps`] or
     /// [`Action::ComputeAllSurfaces`], in order; the first is the one being computed. Emptied
-    /// by „Abbrechen“, a failed step, closing and a project switch.
+    /// by „Abbrechen“ (not of a touch-up the window put in between), a failed step, closing and
+    /// a project switch.
     pub queue: VecDeque<Queued>,
     /// The background check of [`AppState::map_status`] has not caught up with the tree yet:
     /// until then a stale map or surface counts as fitting, so „Alle rechnen“ and „Alle
@@ -639,6 +718,18 @@ pub struct AppState {
     /// How long a leftover must lie untouched before it is offered; `None`:
     /// [`crate::leftovers::QUIET`] (tests: zero).
     pub leftover_quiet: Option<std::time::Duration>,
+    /// The Stellen of the maps and models, by folder, as last read with the tree and changed
+    /// since by this window (a stroke shows here at once and is saved in the background):
+    /// those of the surface shown are listed in „Bilder“ and marked in the view.
+    pub marks: BTreeMap<PathBuf, brush::MarksRead>,
+    /// The brush: its size and the Stelle it paints into.
+    pub brush: brush::BrushState,
+    /// The touch-up of the Stellen: „Vorher“ / „Nachher“, what the view holds, what waits.
+    pub touchup: brush::TouchupState,
+    /// The dialog „Melden“, while it is open.
+    pub feedback_dialog: Option<feedback::FeedbackDialog>,
+    /// The window „Meldungen auf diesem Rechner“, while it is open.
+    pub feedback_list: Option<feedback::ReportList>,
 }
 
 impl AppState {
@@ -704,6 +795,7 @@ impl AppState {
         self.point_pairs_error = tree.point_pairs_error;
         self.leftovers = tree.leftovers;
         self.busy = tree.busy;
+        self.marks = tree.marks;
         // „Von Hand ausrichten“ of a model that is gone ends
         let gone = self
             .pairs
@@ -1032,6 +1124,8 @@ impl AppState {
                 vec![run.clone()]
             }
             Action::RunSurface(map) => vec![map.clone()],
+            // it reads the Stellen of the map or model the surface folder lies in
+            Action::Touchup { surface, .. } => vec![surface.clone()],
             Action::RunMerge { picks, .. } => picks.iter().map(|p| p.map.clone()).collect(),
             Action::ApplyPairs { model, .. } | Action::RunModelSurface { model } => {
                 model_maps(model)
@@ -1041,6 +1135,7 @@ impl AppState {
                 let (S::Map(p)
                 | S::Model(p)
                 | S::Surface(p)
+                | S::EditedSurface(p)
                 | S::Run(p)
                 | S::PointFile(p)
                 | S::MeshFile(p)) = &req.source;
@@ -1186,6 +1281,12 @@ impl AppState {
                 )
             })
             .count()
+    }
+
+    /// Every surface of the tree: of the maps, then of the models, in the order of the list.
+    pub fn all_surfaces(&self) -> impl Iterator<Item = &crate::project::SurfaceInfo> {
+        let maps = self.all_maps().flat_map(|m| &m.surfaces);
+        maps.chain(self.models.iter().flat_map(|m| &m.surfaces))
     }
 
     /// Every map of the tree, in the order of the list.

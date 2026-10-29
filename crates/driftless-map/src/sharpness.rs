@@ -55,6 +55,94 @@ pub(crate) fn measure(img: &RgbImage) -> (f64, f64) {
     (var / gray_mean.max(SHARPNESS_MIN_MEAN), gray_mean)
 }
 
+/// Sums of the sharpness measure over some pixels of an image ([`Moments::of`]); the sums of
+/// several images (the charts of a Stelle) add up to one measure ([`Moments::sharpness`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Moments {
+    /// Sum, sum of squares and number of the 4-neighbour Laplacians.
+    lap: f64,
+    lap2: f64,
+    lap_n: f64,
+    /// Sum and number of the gray values.
+    gray: f64,
+    gray_n: f64,
+}
+
+impl Moments {
+    /// The sums over the pixels of `img` that `inside` (row-major, one per pixel) marks: the
+    /// 4-neighbour Laplacian of the gray image at every marked pixel whose four neighbours are
+    /// marked too (so no edge of the marked area counts), the gray value at every marked pixel.
+    /// Rows are summed in parallel and added in row order, so the sums are the same in every run.
+    ///
+    /// # Panics
+    /// If `inside` does not have one entry per pixel.
+    pub(crate) fn of(img: &RgbImage, inside: &[bool]) -> Moments {
+        let (w, h) = (img.width as usize, img.height as usize);
+        assert_eq!(inside.len(), w * h, "mask does not fit the image");
+        let gray = img.to_gray();
+        let rows: Vec<Moments> = (0..h)
+            .into_par_iter()
+            .map(|y| {
+                let mut m = Moments::default();
+                for x in 0..w {
+                    let i = y * w + x;
+                    if !inside[i] {
+                        continue;
+                    }
+                    m.gray += f64::from(gray[i]);
+                    m.gray_n += 1.0;
+                    let interior = x > 0 && y > 0 && x + 1 < w && y + 1 < h;
+                    if !(interior
+                        && inside[i - 1]
+                        && inside[i + 1]
+                        && inside[i - w]
+                        && inside[i + w])
+                    {
+                        continue;
+                    }
+                    let at = |j: usize| i32::from(gray[j]);
+                    let lap = at(i - 1) + at(i + 1) + at(i - w) + at(i + w) - 4 * at(i);
+                    let l = f64::from(lap);
+                    m.lap += l;
+                    m.lap2 += l * l;
+                    m.lap_n += 1.0;
+                }
+                m
+            })
+            .collect();
+        let mut sum = Moments::default();
+        for r in &rows {
+            sum.add(r);
+        }
+        sum
+    }
+
+    /// Adds the sums of `other`.
+    pub(crate) fn add(&mut self, other: &Moments) {
+        self.lap += other.lap;
+        self.lap2 += other.lap2;
+        self.lap_n += other.lap_n;
+        self.gray += other.gray;
+        self.gray_n += other.gray_n;
+    }
+
+    /// The sharpness of the summed pixels as [`sharpness`] measures it: the variance of the
+    /// Laplacians over `max(mean gray, SHARPNESS_MIN_MEAN)`; 0 without Laplacians.
+    pub(crate) fn sharpness(&self) -> f64 {
+        if self.lap_n == 0.0 {
+            return 0.0;
+        }
+        let mean = self.lap / self.lap_n;
+        let var = (self.lap2 / self.lap_n - mean * mean).max(0.0);
+        let gray = if self.gray_n > 0.0 {
+            self.gray / self.gray_n
+        } else {
+            0.0
+        };
+        var / gray.max(SHARPNESS_MIN_MEAN)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +269,44 @@ mod tests {
         // Mean gray is 200 / 25 = 8, below the floor, so the floor is the divisor.
         let want: f64 = (s2 / 9.0 - (s / 9.0f64).powi(2)) / SHARPNESS_MIN_MEAN;
         assert!((dot - want).abs() < 1e-9, "{dot} vs {want}");
+    }
+    #[test]
+    fn moments_measure_the_marked_pixels() {
+        let img = image(64, 48, texture);
+        // Everything marked: the measure of the whole image.
+        let (s, _) = measure(&img);
+        let all = Moments::of(&img, &vec![true; 64 * 48]);
+        assert!(
+            (all.sharpness() - s).abs() <= 1e-9 * s,
+            "{} vs {s}",
+            all.sharpness()
+        );
+        // A rectangle marked: the measure of the image cut to it, whatever lies around it.
+        let (x0, y0, w, h) = (10usize, 7usize, 30usize, 20usize);
+        let mut noisy = img.clone();
+        let mut inside = vec![false; 64 * 48];
+        for y in 0..48 {
+            for x in 0..64 {
+                let i = y * 64 + x;
+                if (x0..x0 + w).contains(&x) && (y0..y0 + h).contains(&y) {
+                    inside[i] = true;
+                } else {
+                    noisy.data[i * 3..i * 3 + 3]
+                        .copy_from_slice(&[((x * 97 + y * 31) % 256) as u8; 3]);
+                }
+            }
+        }
+        let cut = image(w as u32, h as u32, |x, y| {
+            texture(x + x0 as u32, y + y0 as u32)
+        });
+        let (want, _) = measure(&cut);
+        let got = Moments::of(&noisy, &inside).sharpness();
+        assert!((got - want).abs() <= 1e-9 * want, "{got} vs {want}");
+        // Sums add up; nothing marked measures nothing.
+        let mut twice = Moments::of(&noisy, &inside);
+        twice.add(&Moments::of(&noisy, &inside));
+        assert!((twice.sharpness() - want).abs() <= 1e-9 * want);
+        assert_eq!(Moments::of(&img, &vec![false; 64 * 48]).sharpness(), 0.0);
+        assert_eq!(Moments::default().sharpness(), 0.0);
     }
 }

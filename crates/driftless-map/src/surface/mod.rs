@@ -4,9 +4,11 @@
 //! measured from fused into a truncated signed distance field, fine and coarse) → [`extract`] → [`cleanup`] →
 //! [`simplify`] → camera views per face → one image per face → texture pages → seam
 //! levelling. [`write_glb`] and [`write_obj`] write the result, [`render_preview`] draws it.
+//! [`edit`] touches up a computed surface where the user painted Stellen on it.
 
 mod atlas;
 mod cleanup;
+pub mod edit;
 mod extract;
 mod level;
 mod mc_tables;
@@ -792,6 +794,53 @@ mod tests {
         assert_eq!(pages_hash(&run().0), h);
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         assert_eq!(h, 0x983d_b7f7_809e_1db6, "pages changed");
+    }
+
+    /// The pages of the walk on small pages (many of them, the gray block, split charts) and
+    /// from two sources of different exposure, recorded (Apple silicon, see
+    /// [`one_source_pages_unchanged`]) before the baking and the seam levelling were split into
+    /// parts that „Bilder neu einspielen“ shares: the surface step's pages stay byte for byte.
+    #[test]
+    fn full_surface_unchanged() {
+        let (painted, images, poses, cams) = scene::walk_data();
+        let mesh = painted_mesh(painted, 0.1);
+        let src = TextureSource {
+            images: images.clone(),
+            poses: poses.clone(),
+            cams: cams.clone(),
+        };
+        let run = |sources: &[TextureSource], page_size: u32, min_texel: f64| {
+            let cfg = SurfaceConfig {
+                min_texel,
+                page_size,
+                ..SurfaceConfig::default()
+            };
+            let mut stats = SurfaceStats::default();
+            let tex =
+                texture_mesh(&mesh, sources, &cfg, &Progress::new(), &mut stats, None).unwrap();
+            (pages_hash(&tex), tex.pages.len())
+        };
+        let two = [
+            walk_source("unchanged-left", &[0], 1..=11, 1.0),
+            walk_source("unchanged-right", &[1], 1..=11, 1.3),
+        ];
+        let got = [
+            run(std::slice::from_ref(&src), 256, 0.01),
+            run(std::slice::from_ref(&src), 64, 0.02),
+            run(&two, 512, 0.01),
+        ];
+        println!("{got:#018x?}");
+        assert_eq!(run(std::slice::from_ref(&src), 64, 0.02), got[1]);
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(
+            got,
+            [
+                (0x4b4b_881d_d450_4a97, 22),
+                (0x2c95_2c31_5651_194a, 147),
+                (0xd88b_cee4_8ab1_8ae7, 5)
+            ],
+            "pages changed"
+        );
     }
 
     /// [`texture_mesh`] of `mesh` from `sources` on the CPU, at 1 cm texels on 1024² pages.

@@ -12,6 +12,11 @@
 //! wählen“ a pose of the trajectory whatever the tool. The info, the tools and the
 //! measurements over the view are drawn by [`super::tools`].
 //!
+//! With the tool „Pinsel“ ([`Tool::Brush`]) the left button paints from the moment it is
+//! pressed (with ⌥/Alt it erases): the view moves nothing then and hands the way of the pointer
+//! to the window ([`View3d::brush_input`], [`super::brush`]). Shift + left and the middle button
+//! pan, the right button orbits (in fly mode: looks), and a double click frames nothing.
+//!
 //! Over the cloud the view draws the run of [`ViewOverlay`] (trajectory, odometry, loops,
 //! anchors, picked places); without a cloud the run alone. The height cut applies to the
 //! points and the surface only: the trajectory is neither cut nor kept from being clicked by
@@ -22,16 +27,24 @@
 //! Punktwolke / beides“ ([`ShowMode`]) picks what is drawn. It goes to the GPU a few pages per
 //! frame (about [`UPLOAD_SLICE_BYTES`]), the surface shown before stays until the last page is
 //! up. Picking still looks at points only.
+//!
+//! Over the surface the view marks the Stellen ([`View3d::set_marks`]) and draws its touched-up
+//! state („Nachher“, [`View3d::set_edit`], [`View3d::show_edit`]). Both belong to the surface
+//! last given: they wait until it is on the GPU, and a new surface drops them.
+//!
+//! A camera kept in absolute coordinates (a report of „Melden“) is set once what was given is
+//! on the GPU and has framed itself ([`View3d::restore_camera`]), in the frame the view then
+//! draws in ([`View3d::view_origin`]).
 
 use super::tools::Tool;
 use super::{text, ViewSettings};
-use crate::camera::{fly_motion, Camera, CameraMode, FlyKeys, ZOOM_FACTOR};
+use crate::camera::{fly_motion, Camera, CameraMode, CameraState, FlyKeys, ZOOM_FACTOR};
 use crate::cloud::{LoadedCloud, DEFAULT_POINT_M};
 use crate::lod::{select_nodes, Octree, PointVertex};
 use crate::overlay::RunOverlay;
 use crate::overlay::{COMPARE_B_COLOR, COMPARE_COLOR, PICK_COLOR};
 use crate::pick::{pick_point_spots, project, to_physical, Spots};
-use crate::render::mesh::MeshRenderer;
+use crate::render::mesh::{MarkTriangle, MeshEdit, MeshRenderer};
 use crate::render::{
     ColorMode, FrameParams, PointRenderer, PointSize, RenderTarget, ShowMode, NO_CUT,
 };
@@ -272,6 +285,11 @@ struct FrameKey {
     point_m: f32,
     /// How often a surface was uploaded, and the origin it is drawn in.
     surface: (u64, Option<[f64; 3]>),
+    /// How often the marks and the touched-up state on the GPU were replaced.
+    marks: u64,
+    edit: u64,
+    /// „Nachher“: the touched-up state is drawn.
+    show_edit: bool,
 }
 
 /// The surface on the GPU: what the view still needs of it.
@@ -281,6 +299,26 @@ struct SurfaceShown {
     /// Relative to `origin`.
     bounds: Option<([f32; 3], [f32; 3])>,
     triangles: usize,
+}
+
+/// What the pointer did for the brush in the last frame ([`View3d::brush_input`]): filled only
+/// while the tool is [`Tool::Brush`]. Pixels are physical, from the top left of the view.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrushInput {
+    /// The size of the view (physical pixels), for the rays through its pixels.
+    pub viewport: [f32; 2],
+    /// Where the pointer is over the view while nothing else lies over it there, or while it
+    /// paints.
+    pub hover: Option<[f32; 2]>,
+    /// The left button went down on the view this frame without Shift: a stroke begins.
+    pub pressed: bool,
+    /// ⌥/Alt: held now, while painting since the press. The stroke erases.
+    pub erase: bool,
+    /// The way of the pointer this frame while it paints, in order: where it was pressed
+    /// first, then every place it moved to (and where it was let go).
+    pub path: Vec<[f32; 2]>,
+    /// The stroke ended this frame: the left button was let go (or the view lost it).
+    pub released: bool,
 }
 
 /// A press of the primary button inside the view, until it is released.
@@ -336,6 +374,25 @@ pub struct View3d {
     next_page: usize,
     surface: Option<SurfaceShown>,
     surface_count: u64,
+    /// Marks and a touched-up state (`Some(None)`: none) waiting for the surface to be on the
+    /// GPU, and how often those on the GPU were replaced.
+    pending_marks: Option<Vec<MarkTriangle>>,
+    pending_edit: Option<Option<MeshEdit>>,
+    marks_count: u64,
+    edit_count: u64,
+    /// A touched-up state was given for the surface last given (waiting or on the GPU).
+    edit_given: bool,
+    /// „Nachher“: draw the touched-up state.
+    show_edit: bool,
+    /// A stroke of the brush is being painted: whether it erases.
+    painting: Option<bool>,
+    /// What the pointer did for the brush in the last frame.
+    brush_input: BrushInput,
+    /// The origin the camera's frame was drawn in, in the last frame drawn: the cloud's, else
+    /// the surface's, else the run's.
+    origin: Option<[f64; 3]>,
+    /// A camera to set once what was given is up on the GPU ([`View3d::restore_camera`]).
+    pending_camera: Option<CameraState>,
 }
 
 impl View3d {
@@ -350,8 +407,12 @@ impl View3d {
         self.last = None;
     }
 
-    /// Shows `surface` from the next frame on (replacing the one shown), or none.
+    /// Shows `surface` from the next frame on (replacing the one shown), or none. Marks and a
+    /// touched-up state given before belong to the surface before: they are dropped.
     pub fn set_surface(&mut self, surface: Option<LoadedSurface>) {
+        self.pending_marks = None;
+        self.pending_edit = None;
+        self.edit_given = false;
         if surface.is_none() {
             if let Some(mesh) = &mut self.mesh {
                 mesh.clear();
@@ -362,6 +423,37 @@ impl View3d {
         self.pending_surface = surface;
         self.next_page = 0;
         self.last = None;
+    }
+
+    /// Marks `tris` on the surface last given ([`View3d::set_surface`]), replacing the marks
+    /// before (none: empty): drawn from the next frame on, once the surface is on the GPU. See
+    /// [`MeshRenderer::set_marks`] for what they must be.
+    pub fn set_marks(&mut self, tris: Vec<MarkTriangle>) {
+        self.pending_marks = Some(tris);
+    }
+
+    /// The touched-up state of the surface last given, replacing the one before, or none;
+    /// uploaded once the surface is on the GPU ([`MeshRenderer::set_edit`]).
+    pub fn set_edit(&mut self, edit: Option<MeshEdit>) {
+        self.edit_given = edit.is_some();
+        self.pending_edit = Some(edit);
+    }
+
+    /// Draws the touched-up state („Nachher“, `true`) or the computed surface („Vorher“) from
+    /// the next frame on; uploads nothing.
+    pub fn show_edit(&mut self, on: bool) {
+        self.show_edit = on;
+    }
+
+    /// Whether the surface last given has a touched-up state ([`View3d::set_edit`]), on the GPU
+    /// or waiting for it.
+    pub fn has_edit(&self) -> bool {
+        self.edit_given
+    }
+
+    /// Whether „Nachher“ is drawn ([`View3d::show_edit`]) – where there is a touched-up state.
+    pub fn showing_edit(&self) -> bool {
+        self.show_edit
     }
 
     /// Whether a surface is shown or about to be.
@@ -411,6 +503,24 @@ impl View3d {
         &self.camera
     }
 
+    /// The origin the camera is relative to: that of the last frame drawn (the cloud's, else
+    /// the surface's, else the run's); `None` before the first one.
+    pub fn view_origin(&self) -> Option<[f64; 3]> {
+        self.origin
+    }
+
+    /// Sets the camera as `state` says (absolute, [`Camera::restore`]) once the cloud and the
+    /// surface given are up on the GPU and have framed themselves, in the frame the view then
+    /// draws in. A camera asked for before replaces this one.
+    pub fn restore_camera(&mut self, state: CameraState) {
+        self.pending_camera = Some(state);
+    }
+
+    /// Whether a camera of [`View3d::restore_camera`] still waits.
+    pub fn camera_pending(&self) -> bool {
+        self.pending_camera.is_some()
+    }
+
     /// For tools and measurements that move the camera themselves.
     pub fn camera_mut(&mut self) -> &mut Camera {
         &mut self.camera
@@ -419,6 +529,12 @@ impl View3d {
     /// What the left button and a click do from the next frame on.
     pub fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
+    }
+
+    /// What the pointer did for the brush in the last frame (empty unless the tool is
+    /// [`Tool::Brush`]).
+    pub fn brush_input(&self) -> &BrushInput {
+        &self.brush_input
     }
 
     /// Marks point `index` of the cloud (index in the point set), or none.
@@ -441,6 +557,8 @@ impl View3d {
         overlay: Option<ViewOverlay<'_>>,
         settings: &ViewSettings,
     ) -> Option<ViewEvent> {
+        // what the pointer does for the brush is told anew every frame
+        self.brush_input = BrushInput::default();
         let size = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
         // A collapsed or squeezed panel: no target, no camera change (aspect 0).
@@ -509,6 +627,21 @@ impl View3d {
         if let (Some(mesh), Some(origin)) = (&mut self.mesh, view_origin) {
             mesh.set_view_origin(origin);
         }
+        if let Some(mesh) = &mut self.mesh {
+            // „Vorher/Nachher“ also for the surface still shown while the next one uploads.
+            mesh.show_edit(self.show_edit);
+            // Marks and touched-up state once their surface is up.
+            if self.pending_surface.is_none() {
+                if let Some(tris) = self.pending_marks.take() {
+                    mesh.set_marks(device, queue, &tris);
+                    self.marks_count += 1;
+                }
+                if let Some(edit) = self.pending_edit.take() {
+                    mesh.set_edit(device, queue, edit);
+                    self.edit_count += 1;
+                }
+            }
+        }
         // The surface's bounds in the camera's frame.
         let surface_bounds = self.surface.and_then(|s| {
             let (lo, hi) = s.bounds?;
@@ -553,6 +686,14 @@ impl View3d {
                 self.camera.frame_bounds(min, max, aspect);
             }
             self.frame_all = false;
+        }
+        self.origin = view_origin;
+        // a camera asked for once the surface is up too (it framed itself above)
+        if self.pending_surface.is_none() {
+            if let (Some(state), Some(origin)) = (&self.pending_camera, view_origin) {
+                self.camera.restore(state, origin);
+                self.pending_camera = None;
+            }
         }
         self.camera.set_mode(settings.camera_mode);
 
@@ -603,6 +744,9 @@ impl View3d {
                 .point_m
                 .unwrap_or_else(|| cloud.map_or(DEFAULT_POINT_M, |c| c.point_m)),
             surface: (self.surface_count, view_origin),
+            marks: self.marks_count,
+            edit: self.edit_count,
+            show_edit: self.show_edit,
         };
         if self.last.as_ref() != Some(&key) {
             let started = Instant::now();
@@ -792,13 +936,22 @@ impl View3d {
         let ctx = ui.ctx();
         let mode = self.camera.mode;
         let shift = ctx.input(|i| i.modifiers.shift);
+        let brush = self.tool == Tool::Brush;
+        self.brush_stroke(ctx, response, rect, ppp, viewport, shift);
+        let painting = self.painting.is_some();
         let delta = response.drag_delta() * ppp;
         let by = |b| response.dragged_by(b);
-        // the tool „Verschieben“ pans with the left button; every other tool turns
-        let left_pans = self.tool == Tool::Pan;
+        // the tool „Verschieben“ pans with the left button, the brush paints with it (with
+        // Shift it pans); every other tool turns
+        let left_pans = self.tool == Tool::Pan || brush;
         match mode {
             CameraMode::Orbit => {
-                if by(PointerButton::Primary) && !shift && !left_pans {
+                if by(PointerButton::Primary) && painting {
+                    // the brush paints: the view stays
+                } else if (by(PointerButton::Primary) && !shift && !left_pans)
+                    || (by(PointerButton::Secondary) && brush)
+                {
+                    // the brush turns with the right button
                     self.camera.orbit(delta.x, delta.y);
                 } else if by(PointerButton::Primary)
                     || by(PointerButton::Secondary)
@@ -808,7 +961,9 @@ impl View3d {
                 }
             }
             CameraMode::Fly => {
-                if by(PointerButton::Primary) && left_pans {
+                if by(PointerButton::Primary) && painting {
+                    // the brush paints: the view stays
+                } else if by(PointerButton::Primary) && left_pans {
                     self.camera.pan(delta.x, delta.y, viewport);
                 } else if by(PointerButton::Primary) || by(PointerButton::Secondary) {
                     self.camera.look(delta.x, delta.y);
@@ -898,8 +1053,10 @@ impl View3d {
                 }
             }
         }
+        // a double click with the brush paints twice, it frames nothing
         if response.double_clicked()
             && event.is_none()
+            && !brush
             && self.hit_nothing(rect, ppp, viewport, cloud, pos, settings)
         {
             self.frame_all = true;
@@ -908,6 +1065,80 @@ impl View3d {
             ctx.request_repaint();
         }
         event
+    }
+
+    /// The brush's part of the input ([`BrushInput`]): a stroke begins where the left button
+    /// goes down on the view without Shift (at once, a click paints too), follows every place
+    /// the pointer moves to and ends where the button is let go. Another tool ends a stroke
+    /// that runs.
+    fn brush_stroke(
+        &mut self,
+        ctx: &egui::Context,
+        response: &egui::Response,
+        rect: Rect,
+        ppp: f32,
+        viewport: [f32; 2],
+        shift: bool,
+    ) {
+        let input = &mut self.brush_input;
+        input.viewport = viewport;
+        if self.tool != Tool::Brush {
+            if self.painting.take().is_some() {
+                input.released = true;
+            }
+            return;
+        }
+        let at = |p: egui::Pos2| to_physical([p.x, p.y], [rect.min.x, rect.min.y], ppp);
+        let (pressed, down, alt, hover, events) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.modifiers.alt,
+                i.pointer.hover_pos(),
+                i.events.clone(),
+            )
+        });
+        let begins = pressed && response.hovered() && !shift && self.painting.is_none();
+        if begins {
+            self.painting = Some(alt);
+            input.pressed = true;
+        }
+        if let Some(erase) = self.painting {
+            input.erase = erase;
+            // the way since the press (this frame) or since the last frame
+            let mut on = !begins;
+            for event in &events {
+                match event {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed,
+                        ..
+                    } => {
+                        if *pressed {
+                            on = true;
+                        }
+                        if on {
+                            input.path.push(at(*pos));
+                        }
+                    }
+                    egui::Event::PointerMoved(pos) if on => input.path.push(at(*pos)),
+                    _ => {}
+                }
+            }
+            if begins && input.path.is_empty() {
+                let press = ctx.input(|i| i.pointer.press_origin());
+                input.path.extend(press.map(at));
+            }
+            if !down {
+                input.released = true;
+                self.painting = None;
+            }
+        } else {
+            input.erase = alt;
+        }
+        let shown = response.hovered() || input.pressed || self.painting.is_some();
+        input.hover = hover.filter(|p| shown && rect.contains(*p)).map(at);
     }
 
     /// Whether no drawn point is under `pos`.

@@ -8,9 +8,24 @@ use std::io::Write;
 pub enum Compression {
     None,
     Lz4,
+    /// lz4 as [`Compression::Lz4`], the frame made with these settings.
+    Lz4Frame(Lz4Frame),
     /// Stores the chunk data uncompressed but labels it with this compression name
     /// (e.g. `"bz2"`), to test how readers handle unsupported compression.
     Labelled(&'static str),
+}
+
+/// How the lz4 frame of a chunk is made ([`Compression::Lz4Frame`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lz4Frame {
+    /// The largest block: 64, 256, 1024 or 4096 KiB.
+    pub block_kib: u32,
+    /// Blocks may refer to the ones before them (else each stands alone).
+    pub linked: bool,
+    pub block_checksums: bool,
+    pub content_checksum: bool,
+    /// The header holds the size of the content.
+    pub content_size: bool,
 }
 
 struct Pending {
@@ -150,6 +165,29 @@ impl BagWriter {
             Compression::Labelled(name) => (name, raw.clone()),
             Compression::Lz4 => {
                 let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
+                enc.write_all(&raw).unwrap();
+                ("lz4", enc.finish().unwrap())
+            }
+            Compression::Lz4Frame(f) => {
+                use lz4_flex::frame::{BlockMode, BlockSize, FrameInfo};
+                let block = match f.block_kib {
+                    64 => BlockSize::Max64KB,
+                    256 => BlockSize::Max256KB,
+                    1024 => BlockSize::Max1MB,
+                    4096 => BlockSize::Max4MB,
+                    other => panic!("no lz4 block of {other} KiB"),
+                };
+                let info = FrameInfo::new()
+                    .block_size(block)
+                    .block_mode(if f.linked {
+                        BlockMode::Linked
+                    } else {
+                        BlockMode::Independent
+                    })
+                    .block_checksums(f.block_checksums)
+                    .content_checksum(f.content_checksum)
+                    .content_size(f.content_size.then_some(raw.len() as u64));
+                let mut enc = lz4_flex::frame::FrameEncoder::with_frame_info(info, Vec::new());
                 enc.write_all(&raw).unwrap();
                 ("lz4", enc.finish().unwrap())
             }

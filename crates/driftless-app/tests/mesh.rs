@@ -1,16 +1,19 @@
 //! The textured surface: drawn offscreen into 64 × 64 pixels and read back (without a GPU
 //! adapter those tests are skipped), and the glb written by `driftless-map`, OBJ and foreign
-//! glb read back.
+//! glb read back. Also the marked Stellen over it and the touched-up state („Nachher“).
 
 use driftless_app::camera::{Camera, CameraMode};
 use driftless_app::cloud::PointSet;
 use driftless_app::lod::{build_octree, Octree};
-use driftless_app::render::mesh::{MeshRenderer, MeshVertex};
+use driftless_app::pick::project;
+use driftless_app::render::mesh::{
+    mark_color, mark_triangles, MarkTriangle, MeshEdit, MeshRenderer, MeshVertex, MARK_OUTLINE_PT,
+};
 use driftless_app::render::{
     headless_device, ColorMode, FrameParams, PointRenderer, PointSize, RenderTarget, ShowMode,
     NO_CUT,
 };
-use driftless_app::surface::{load_mesh, LoadedSurface};
+use driftless_app::surface::{load_mesh, mesh_edit, LoadedSurface};
 use driftless_io::images::RgbImage;
 use driftless_io::progress::Progress;
 use driftless_io::testdir::TestDir;
@@ -25,6 +28,9 @@ const BACKGROUND: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
 const RED: [u8; 3] = [255, 0, 0];
 const BLUE: [u8; 3] = [0, 0, 255];
 const GREEN: [u8; 3] = [0, 255, 0];
+const GRAY: [u8; 3] = [128, 128, 128];
+/// [`BACKGROUND`] as bytes.
+const BACKGROUND_RGB: [u8; 3] = [26, 26, 26];
 
 struct Gpu {
     device: wgpu::Device,
@@ -103,7 +109,12 @@ struct Image(Vec<[u8; 4]>);
 
 impl Image {
     fn centre(&self) -> [u8; 4] {
-        self.0[(SIZE / 2 * SIZE + SIZE / 2) as usize]
+        self.at(SIZE / 2, SIZE / 2)
+    }
+
+    /// Pixel `x`, `y` from the top left.
+    fn at(&self, x: u32, y: u32) -> [u8; 4] {
+        self.0[(y * SIZE + x) as usize]
     }
 }
 
@@ -416,15 +427,20 @@ fn external_buffer_is_a_german_error() {
     );
 }
 
-/// Draws what `mesh` holds and reads the centre back.
-fn centre_of(gpu: &Gpu, mesh: &MeshRenderer, frame: &FrameParams) -> [u8; 4] {
+/// Draws what `mesh` holds (without a cloud) and reads the image back.
+fn draw(gpu: &Gpu, mesh: &MeshRenderer, frame: &FrameParams) -> Image {
     let (device, queue) = (&gpu.device, &gpu.queue);
     let target = RenderTarget::new(device, [SIZE; 2], FORMAT);
     let mut points = PointRenderer::new(device, queue, FORMAT);
     let tree = no_cloud();
     points.upload_cloud(device, queue, &tree);
     points.render_with(device, queue, &target, frame, &tree, &[], Some(mesh));
-    read_back(gpu, &target).centre()
+    read_back(gpu, &target)
+}
+
+/// Draws what `mesh` holds and reads the centre back.
+fn centre_of(gpu: &Gpu, mesh: &MeshRenderer, frame: &FrameParams) -> [u8; 4] {
+    draw(gpu, mesh, frame).centre()
 }
 
 #[test]
@@ -705,4 +721,582 @@ fn load_mesh_refuses_oversized_textures() {
         err.contains("Texturen zu groß: 605 Mio. Pixel, höchstens 536 Mio."),
         "{err}"
     );
+}
+
+// --- The marked Stellen and the touched-up state („Vorher/Nachher“) ---
+
+/// A rectangle of one colour as `n × n` cells of two triangles each: `corner` and the two
+/// edges `a` and `b` from it. Cell (i, j) – `i` along `a`, `j` along `b` – holds the triangles
+/// `2 (j n + i)` and `2 (j n + i) + 1`, cornered like those of [`quad`].
+fn grid(
+    corner: [f32; 3],
+    a: [f32; 3],
+    b: [f32; 3],
+    n: u32,
+    rgb: [u8; 3],
+) -> (Vec<MeshVertex>, Vec<u32>, RgbaImage) {
+    let at = |s: f32, t: f32| [0, 1, 2].map(|k| corner[k] + s * a[k] + t * b[k]);
+    let mut vertices = Vec::new();
+    for j in 0..=n {
+        for i in 0..=n {
+            let (s, t) = (i as f32 / n as f32, j as f32 / n as f32);
+            vertices.push(MeshVertex {
+                pos: at(s, t),
+                uv: [s, t],
+            });
+        }
+    }
+    let v = |i: u32, j: u32| j * (n + 1) + i;
+    let mut indices = Vec::new();
+    for j in 0..n {
+        for i in 0..n {
+            indices.extend([v(i, j), v(i + 1, j), v(i + 1, j + 1)]);
+            indices.extend([v(i, j), v(i + 1, j + 1), v(i, j + 1)]);
+        }
+    }
+    let image = RgbaImage::from_pixel(8, 8, image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
+    (vertices, indices, image)
+}
+
+/// The triangles of the cells (i, j) of a [`grid`] of `n × n` with `i` and `j` in `range`.
+fn cells(n: u32, range: std::ops::Range<u32>) -> Vec<usize> {
+    let mut out = Vec::new();
+    for j in range.clone() {
+        for i in range.clone() {
+            let cell = (j * n + i) as usize;
+            out.extend([2 * cell, 2 * cell + 1]);
+        }
+    }
+    out
+}
+
+/// Copies of the triangles `tris` of `page` as one Stelle in `color`.
+fn marks_of(
+    page: &(Vec<MeshVertex>, Vec<u32>, RgbaImage),
+    tris: &[usize],
+    color: [u8; 4],
+) -> Vec<MarkTriangle> {
+    let corners: Vec<[u32; 3]> = tris
+        .iter()
+        .map(|&t| [page.1[3 * t], page.1[3 * t + 1], page.1[3 * t + 2]])
+        .collect();
+    mark_triangles(&corners, |v| page.0[v as usize].pos, color)
+}
+
+/// A camera at `eye` looking at `target`.
+fn look_at(eye: [f32; 3], target: [f32; 3]) -> Camera {
+    let d = [0, 1, 2].map(|k| target[k] - eye[k]);
+    camera(eye, d[1].atan2(d[0]), d[2].atan2(d[0].hypot(d[1])))
+}
+
+/// `top` with alpha `a` (of 255) over `under`.
+fn over(top: [u8; 3], a: u8, under: [u8; 3]) -> [u8; 3] {
+    let a = f32::from(a) / 255.0;
+    [0, 1, 2].map(|k| (f32::from(top[k]) * a + f32::from(under[k]) * (1.0 - a)).round() as u8)
+}
+
+/// How far `got` lies on the way from `from` to `to`: 0 at `from`, 1 at `to`.
+fn share(got: [u8; 4], from: [u8; 3], to: [u8; 3]) -> f32 {
+    let (mut along, mut length) = (0.0, 0.0);
+    for k in 0..3 {
+        let span = f32::from(to[k]) - f32::from(from[k]);
+        along += (f32::from(got[k]) - f32::from(from[k])) * span;
+        length += span * span;
+    }
+    along / length
+}
+
+/// Pixels from `p` to the rim of the convex polygon `poly` (on the screen, either winding):
+/// positive inside, negative outside.
+fn inside_by(poly: &[[f32; 2]], p: [f32; 2]) -> f32 {
+    let n = poly.len();
+    let edge = |k: usize| (poly[k], poly[(k + 1) % n]);
+    let area: f32 = (0..n)
+        .map(|k| {
+            let (a, b) = edge(k);
+            a[0] * b[1] - b[0] * a[1]
+        })
+        .sum();
+    (0..n)
+        .map(|k| {
+            let (a, b) = edge(k);
+            let e = [b[0] - a[0], b[1] - a[1]];
+            area.signum() * (e[0] * (p[1] - a[1]) - e[1] * (p[0] - a[0])) / e[0].hypot(e[1])
+        })
+        .fold(f32::INFINITY, f32::min)
+}
+
+/// A Stelle on a wall is tinted in its colour and outlined at its rim, and around it nothing
+/// changes. Its triangles are copies drawn over the wall's with the same depth: straight on and
+/// at a slant (where the depth changes fast across every triangle) every pixel inside is
+/// tinted, the plain wall shows through nowhere. A plate in front of it hides it.
+#[test]
+fn mark_tints_and_outlines() {
+    let Some(gpu) = gpu() else { return };
+    let (device, queue) = (&gpu.device, &gpu.queue);
+    // A red wall 2 m ahead of the eye at 0 (looking along +x), 4 × 4 m in cells of 0.5 m from
+    // the left (+y) and the bottom; the Stelle is its middle 2 × 2 m.
+    let wall = grid([2.0, 2.0, -2.0], [0.0, -4.0, 0.0], [0.0, 0.0, 4.0], 8, RED);
+    let color = mark_color(2);
+    let marks = marks_of(&wall, &cells(8, 2..6), color);
+    assert_eq!(marks.len(), 32);
+    let at = |i: u32, j: u32| [2.0, 2.0 - 0.5 * i as f32, -2.0 + 0.5 * j as f32];
+    let rim = [at(2, 2), at(6, 2), at(6, 6), at(2, 6)];
+    let rim_corners: Vec<[f32; 3]> = (2..=6)
+        .flat_map(|i| (2..=6).map(move |j| (i, j)))
+        .filter(|&(i, j)| i == 2 || i == 6 || j == 2 || j == 6)
+        .map(|(i, j)| at(i, j))
+        .collect();
+    let mut mesh = MeshRenderer::new(device, FORMAT);
+    mesh.upload(
+        device,
+        queue,
+        &LoadedSurface {
+            pages: vec![wall.clone()],
+            ..LoadedSurface::default()
+        },
+    );
+    let rgb = [color[0], color[1], color[2]];
+    let tint = over(rgb, color[3], RED);
+    for (name, cam) in [
+        ("gerade", camera([0.0; 3], 0.0, 0.0)),
+        ("schräg", look_at([0.3, -2.0, 1.2], [2.0, 0.0, 0.0])),
+    ] {
+        let straight = name == "gerade";
+        let f = frame(&cam, ShowMode::Surface, NO_CUT);
+        mesh.set_marks(device, queue, &[]);
+        let plain = draw(&gpu, &mesh, &f);
+        mesh.set_marks(device, queue, &marks);
+        let marked = draw(&gpu, &mesh, &f);
+        let vp = cam.view_proj(1.0);
+        let screen = |p: [f32; 3]| {
+            let q = project(&vp, p, [SIZE as f32; 2]).unwrap();
+            [q[0], q[1]]
+        };
+        let poly = rim.map(screen);
+        assert!(
+            poly.iter()
+                .flatten()
+                .all(|&c| c > 2.0 && c < SIZE as f32 - 2.0),
+            "{name}: {poly:?}"
+        );
+        let corners: Vec<[f32; 2]> = rim_corners.iter().map(|&p| screen(p)).collect();
+        let (mut inner, mut edge, mut outer) = (0, 0, 0);
+        let mut wrong = Vec::new();
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let p = [x as f32 + 0.5, y as f32 + 0.5];
+                let d = inside_by(&poly, p);
+                let (got, was) = (marked.at(x, y), plain.at(x, y));
+                if d < -1.0 {
+                    // around the Stelle: as without it
+                    outer += 1;
+                    if got != was {
+                        wrong.push(("außen", x, y, got));
+                    }
+                } else if d > MARK_OUTLINE_PT + 2.0 {
+                    // inside: tinted everywhere
+                    inner += 1;
+                    if !near(got, tint, 3) {
+                        wrong.push(("innen", x, y, got));
+                    }
+                } else if straight && d > 0.2 && d < MARK_OUTLINE_PT - 0.7 {
+                    // at the rim: the outline, opaque in the Stelle's colour; next to a corner
+                    // on the rim it may thin a little
+                    edge += 1;
+                    let at_corner = corners
+                        .iter()
+                        .any(|c| (c[0] - p[0]).hypot(c[1] - p[1]) < MARK_OUTLINE_PT + 0.5);
+                    let ok = if at_corner {
+                        share(got, tint, rgb) > 0.6
+                    } else {
+                        near(got, rgb, 3)
+                    };
+                    if !ok {
+                        wrong.push(("Rand", x, y, got));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{name}: Mitte {:?}, Rand (32, 5) {:?}, außen (32, 2) {:?}, ohne Stelle {:?}; \
+             geprüft {inner} innen, {edge} am Rand, {outer} außen",
+            marked.centre(),
+            marked.at(SIZE / 2, 5),
+            marked.at(SIZE / 2, 2),
+            plain.centre(),
+        );
+        assert!(
+            wrong.is_empty(),
+            "{name}: {} Pixel falsch, z. B. {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(8)]
+        );
+        assert!(
+            inner > 300 && outer > 100,
+            "{name}: {inner} innen, {outer} außen"
+        );
+        if straight {
+            assert!(edge > 100, "{edge} am Rand");
+        }
+    }
+
+    // A new surface drops the marks of the one before; a plate 0.5 m in front of the
+    // Stelle's middle hides the mark behind it.
+    let plate = quad([1.5, 0.25, -0.25], [0.0, -0.5, 0.0], [0.0, 0.0, 0.5], GREEN);
+    mesh.upload(
+        device,
+        queue,
+        &LoadedSurface {
+            pages: vec![wall, plate],
+            ..LoadedSurface::default()
+        },
+    );
+    let f = frame(&camera([0.0; 3], 0.0, 0.0), ShowMode::Surface, NO_CUT);
+    let img = draw(&gpu, &mesh, &f);
+    assert!(
+        near(img.at(SIZE / 2, 16), RED, 2),
+        "{:?}",
+        img.at(SIZE / 2, 16)
+    );
+    mesh.set_marks(device, queue, &marks);
+    let img = draw(&gpu, &mesh, &f);
+    assert!(near(img.centre(), GREEN, 2), "plate {:?}", img.centre());
+    assert!(
+        near(img.at(SIZE / 2, 16), tint, 3),
+        "{:?}",
+        img.at(SIZE / 2, 16)
+    );
+}
+
+/// The height cut takes the mark away with the surface under it (else it would float where the
+/// cut-away wall was), and „Punktwolke“ draws neither.
+#[test]
+fn marks_follow_height_cut() {
+    let Some(gpu) = gpu() else { return };
+    let (device, queue) = (&gpu.device, &gpu.queue);
+    // the whole red wall 2 m ahead is the Stelle; the cut keeps what lies below 0 m
+    let wall = grid([2.0, 2.0, -2.0], [0.0, -4.0, 0.0], [0.0, 0.0, 4.0], 2, RED);
+    let color = mark_color(1);
+    let marks = marks_of(&wall, &cells(2, 0..2), color);
+    let mut mesh = MeshRenderer::new(device, FORMAT);
+    mesh.upload(
+        device,
+        queue,
+        &LoadedSurface {
+            pages: vec![wall],
+            ..LoadedSurface::default()
+        },
+    );
+    mesh.set_marks(device, queue, &marks);
+    let tint = over([color[0], color[1], color[2]], color[3], RED);
+    let cam = camera([0.0; 3], 0.0, 0.0);
+    let uncut = draw(&gpu, &mesh, &frame(&cam, ShowMode::Surface, NO_CUT));
+    let cut = draw(&gpu, &mesh, &frame(&cam, ShowMode::Surface, [-10.0, 0.0]));
+    let (above, below) = ((SIZE / 2, 16), (SIZE / 2, 48));
+    assert!(
+        near(uncut.at(above.0, above.1), tint, 3),
+        "{:?}",
+        uncut.at(above.0, above.1)
+    );
+    assert!(
+        near(cut.at(above.0, above.1), BACKGROUND_RGB, 1),
+        "cut away: {:?}",
+        cut.at(above.0, above.1)
+    );
+    assert!(
+        near(cut.at(below.0, below.1), tint, 3),
+        "{:?}",
+        cut.at(below.0, below.1)
+    );
+    let points = draw(&gpu, &mesh, &frame(&cam, ShowMode::Cloud, NO_CUT));
+    assert!(
+        near(points.centre(), BACKGROUND_RGB, 1),
+        "{:?}",
+        points.centre()
+    );
+}
+
+/// `w × h` texels of `rgb`, encoded as JPEG.
+fn jpeg(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(w, h, image::Rgb(rgb));
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Jpeg).unwrap();
+    out.into_inner()
+}
+
+/// A computed surface and one step of touch-up on it, written and read back as the app does.
+struct EditCase {
+    /// The computed surface and the touched-up one (`apply_patches`), each read from its glb.
+    before: LoadedSurface,
+    after: LoadedSurface,
+    /// What the touch-up changes, for the view ([`mesh_edit`] of `page_edits`).
+    edit: MeshEdit,
+}
+
+/// The computed surface: a red page (upper left) and a green one (lower left) 3 m ahead of the
+/// absolute 0, a gray wall 7 m ahead behind everything (it fixes the bounds, so the touched-up
+/// surface has the same origin). The step moves the red page 1.7 m to the right („Glätten“)
+/// and puts the green page's second triangle on a blue page of its own („Bilder neu“).
+fn edit_case(name: &str) -> EditCase {
+    use driftless_export::mesh::{write_glb, ImageKind, Mesh, MeshPage, PageImage};
+    use driftless_map::surface::edit::{
+        apply_patches, page_edits, PatchPage, SurfacePatch, WeldedSurface,
+    };
+    let page = |corner: [f64; 3], a: [f64; 3], b: [f64; 3], rgb| MeshPage {
+        positions: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+            .iter()
+            .map(|[s, t]| [0, 1, 2].map(|k| corner[k] + s * a[k] + t * b[k]))
+            .collect(),
+        uvs: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        indices: vec![[0, 1, 2], [0, 2, 3]],
+        image: Some(PageImage {
+            kind: ImageKind::Png,
+            bytes: png(4, 4, rgb).into(),
+        }),
+        color: [255; 3],
+    };
+    let (left, up) = ([0.0, -1.3, 0.0], [0.0, 0.0, 1.3]);
+    let mesh = Mesh {
+        pages: vec![
+            page([3.0, 1.5, 0.2], left, up, RED),
+            page([3.0, 1.5, -1.5], left, up, GREEN),
+            page([7.0, 7.0, -7.0], [0.0, -14.0, 0.0], [0.0, 0.0, 14.0], GRAY),
+        ],
+    };
+    let s = WeldedSurface::from_mesh(&mesh);
+    let moved = (0..s.positions().len() as u32)
+        .filter(|&v| s.copies(v).iter().any(|&(page, _)| page == 0))
+        .map(|v| {
+            let p = s.positions()[v as usize];
+            (v, [p[0], p[1] - 1.7, p[2]])
+        })
+        .collect();
+    let face = 3;
+    assert_eq!(s.face_origin(face), (1, 1));
+    let patch = SurfacePatch {
+        moved,
+        removed_faces: vec![face],
+        pages: vec![PatchPage {
+            positions: s.faces()[face as usize]
+                .map(|v| s.positions()[v as usize])
+                .to_vec(),
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+            indices: vec![[0, 1, 2]],
+            faces: vec![face],
+            jpeg: jpeg(8, 8, BLUE).into(),
+        }],
+    };
+    let (edits, added) = page_edits(&s, &mesh, std::slice::from_ref(&patch));
+    let touched = apply_patches(&mesh, &s, &[patch]);
+    let dir = temp_dir(name);
+    let read = |file: &str, m: &Mesh| {
+        let path = dir.join(file);
+        write_glb(&path, m, &Progress::new()).unwrap();
+        load_mesh(&path, &Progress::new()).unwrap()
+    };
+    let before = read("vorher.glb", &mesh);
+    let after = read("nachher.glb", &touched);
+    assert_eq!(before.origin, after.origin);
+    let edit = mesh_edit(before.origin, &mesh, edits, added).unwrap();
+    EditCase {
+        before,
+        after,
+        edit,
+    }
+}
+
+/// What the view swaps in is the touched-up surface: the corners of the moved page, the
+/// triangles of the page that lost one and the added page are those of `apply_patches`, read
+/// back as the app reads a surface.
+#[test]
+fn mesh_edit_matches_touched_up_surface() {
+    let EditCase {
+        before,
+        after,
+        edit,
+    } = edit_case("bearbeitung");
+    assert_eq!(edit.pages.len(), 2, "{:?}", edit.pages);
+    // the red page: its corners moved, its triangles as they were
+    let (page, vertices, indices) = &edit.pages[0];
+    assert_eq!(*page, 0);
+    assert_eq!(vertices.as_ref(), Some(&after.pages[0].0));
+    assert_ne!(after.pages[0].0, before.pages[0].0);
+    assert_eq!(*indices, None);
+    // the green page: its corners as they were, its second triangle gone
+    let (page, vertices, indices) = &edit.pages[1];
+    assert_eq!((*page, vertices), (1, &None));
+    assert_eq!(indices.as_deref(), Some(&before.pages[1].1[..3]));
+    assert_eq!(indices.as_ref(), Some(&after.pages[1].1));
+    // the gray wall is untouched; the blue page is added, decoded with its mipmaps
+    assert_eq!(after.pages[2], before.pages[2]);
+    assert_eq!(after.pages.len(), 4);
+    assert_eq!(edit.extra, vec![after.pages[3].clone()]);
+    assert_eq!(edit.extra_mips, vec![after.mips[3].clone()]);
+}
+
+/// „Vorher/Nachher“: with the touched-up state given, the view draws the computed surface or
+/// the touched-up one – the same image as the touched-up surface uploaded as a surface of its
+/// own – and switching between them uploads nothing.
+#[test]
+fn edit_toggle_swaps_without_upload() {
+    let Some(gpu) = gpu() else { return };
+    let (device, queue) = (&gpu.device, &gpu.queue);
+    let EditCase {
+        before,
+        after,
+        edit,
+    } = edit_case("vorher-nachher");
+    // the eye at the absolute 0, looking along +x
+    let o = before.origin;
+    let rel = |p: [f64; 3]| [0, 1, 2].map(|k| (p[k] - o[k]) as f32);
+    let cam = camera(rel([0.0; 3]), 0.0, 0.0);
+    let f = frame(&cam, ShowMode::Surface, NO_CUT);
+    let vp = cam.view_proj(1.0);
+    let pixel = |p: [f64; 3]| {
+        let q = project(&vp, rel(p), [SIZE as f32; 2]).unwrap();
+        (q[0] as u32, q[1] as u32)
+    };
+    // the middles of the red page before and after its move, and of the green page's triangles
+    let red_before = pixel([3.0, 0.85, 0.85]);
+    let red_after = pixel([3.0, -0.85, 0.85]);
+    let kept = pixel([3.0, 0.633, -1.067]);
+    let redone = pixel([3.0, 1.067, -0.633]);
+    let check = |img: &Image, touched: bool| {
+        let px = |(x, y)| img.at(x, y);
+        let (red, gray) = if touched {
+            (red_after, red_before)
+        } else {
+            (red_before, red_after)
+        };
+        assert!(near(px(red), RED, 2), "{touched}: {:?}", px(red));
+        assert!(near(px(gray), GRAY, 2), "{touched}: {:?}", px(gray));
+        assert!(near(px(kept), GREEN, 2), "{touched}: {:?}", px(kept));
+        let want = if touched { BLUE } else { GREEN };
+        assert!(near(px(redone), want, 12), "{touched}: {:?}", px(redone));
+    };
+
+    let mut touched = MeshRenderer::new(device, FORMAT);
+    touched.upload(device, queue, &after);
+    let touched_image = draw(&gpu, &touched, &f);
+    check(&touched_image, true);
+
+    let mut mesh = MeshRenderer::new(device, FORMAT);
+    mesh.upload(device, queue, &before);
+    let computed_image = draw(&gpu, &mesh, &f);
+    check(&computed_image, false);
+    let surface_bytes = mesh.uploaded_bytes();
+    assert!(surface_bytes > 0);
+    mesh.set_edit(device, queue, Some(edit.clone()));
+    let with_edit = mesh.uploaded_bytes();
+    assert!(with_edit > surface_bytes, "{with_edit} vs {surface_bytes}");
+    eprintln!(
+        "hochgeladen: Oberfläche {surface_bytes} B, Bearbeitung {} B",
+        with_edit - surface_bytes
+    );
+
+    // „Vorher“ is the default
+    assert!(draw(&gpu, &mesh, &f).0 == computed_image.0);
+    for _ in 0..2 {
+        mesh.show_edit(true);
+        let img = draw(&gpu, &mesh, &f);
+        check(&img, true);
+        assert!(
+            img.0 == touched_image.0,
+            "Nachher = nachgearbeitete Oberfläche"
+        );
+        mesh.show_edit(false);
+        let img = draw(&gpu, &mesh, &f);
+        check(&img, false);
+        assert!(img.0 == computed_image.0, "Vorher = gerechnete Oberfläche");
+    }
+    assert_eq!(
+        mesh.uploaded_bytes(),
+        with_edit,
+        "Umschalten lädt nichts hoch"
+    );
+
+    // without the touched-up state „Nachher“ draws the computed surface
+    mesh.show_edit(true);
+    mesh.set_edit(device, queue, None);
+    assert!(draw(&gpu, &mesh, &f).0 == computed_image.0);
+    // a new surface drops the touched-up state of the one before
+    mesh.set_edit(device, queue, Some(edit));
+    assert!(draw(&gpu, &mesh, &f).0 == touched_image.0);
+    mesh.upload(device, queue, &before);
+    assert!(draw(&gpu, &mesh, &f).0 == computed_image.0);
+}
+
+/// The 3D view draws the marks and the touched-up state as soon as they are given – also when
+/// they come before the surface is up – and switches between „Vorher“ and „Nachher“: a frame is
+/// drawn anew only when its key changes, so each of them must be in it.
+#[test]
+fn view_redraws_for_marks_and_edit() {
+    use driftless_app::ui::view3d::View3d;
+    use driftless_app::ui::ViewSettings;
+    use eframe::egui;
+    use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
+    use egui_kittest::Harness;
+    if headless_device().is_none() {
+        skipped("kein GPU-Adapter");
+        return;
+    }
+    // A red floor of 4 × 4 m (the view looks down on it), all of it one Stelle; „Nachher“ the
+    // same floor on a blue page of its own, the red page without triangles.
+    let floor = |rgb| grid([-2.0, -2.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0], 4, rgb);
+    let color = mark_color(3);
+    let marks = marks_of(&floor(RED), &cells(4, 0..4), color);
+    let edit = MeshEdit {
+        pages: vec![(0, None, Some(Vec::new()))],
+        extra: vec![floor(BLUE)],
+        ..MeshEdit::default()
+    };
+    let rgb = [color[0], color[1], color[2]];
+    let (red_tint, blue_tint) = (over(rgb, color[3], RED), over(rgb, color[3], BLUE));
+    let rs = create_render_state(
+        default_wgpu_setup(),
+        egui_wgpu::RendererOptions::PREDICTABLE,
+    );
+    let r = rs.clone();
+    let mut h = Harness::builder()
+        .with_size([64.0, 64.0])
+        .with_pixels_per_point(1.0)
+        .renderer(WgpuTestRenderer::from_render_state(rs))
+        .build_ui_state(
+            move |ui, view: &mut View3d| {
+                egui::CentralPanel::no_frame().show(ui, |ui| {
+                    view.show(ui, &r, None, None, &ViewSettings::default());
+                });
+            },
+            View3d::default(),
+        );
+    fn centre(h: &mut Harness<'_, View3d>) -> [u8; 4] {
+        h.run();
+        h.render().unwrap().get_pixel(32, 32).0
+    }
+    // given right after the surface, before it is up: they wait for it
+    h.state_mut().set_surface(Some(LoadedSurface {
+        pages: vec![floor(RED)],
+        ..LoadedSurface::default()
+    }));
+    h.state_mut().set_marks(marks.clone());
+    let c = centre(&mut h);
+    assert!(near(c, red_tint, 3), "marked {c:?}");
+    h.state_mut().set_marks(Vec::new());
+    let c = centre(&mut h);
+    assert!(near(c, RED, 2), "unmarked {c:?}");
+    h.state_mut().set_marks(marks);
+    h.state_mut().set_edit(Some(edit));
+    let c = centre(&mut h);
+    assert!(near(c, red_tint, 3), "Vorher {c:?}");
+    h.state_mut().show_edit(true);
+    let c = centre(&mut h);
+    assert!(near(c, blue_tint, 3), "Nachher {c:?}");
+    h.state_mut().show_edit(false);
+    let c = centre(&mut h);
+    assert!(near(c, red_tint, 3), "Vorher again {c:?}");
+    h.state_mut().show_edit(true);
+    h.state_mut().set_edit(None);
+    let c = centre(&mut h);
+    assert!(near(c, red_tint, 3), "no touch-up {c:?}");
 }

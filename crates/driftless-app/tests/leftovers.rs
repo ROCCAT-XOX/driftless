@@ -636,3 +636,44 @@ fn focus_reads_the_tree_again() {
     focus(&mut h);
     assert!(missing(&h));
 }
+
+/// What a touch-up cut off left in a surface folder (`nacharbeit.tmp-…`, R2-M1 of the final
+/// review) is offered for „Aufräumen“ – unless it was cut off while it put its new cache in
+/// place: the next touch-up puts the old one back, so its folders are left alone until then.
+#[test]
+fn touchup_leftovers_are_offered() {
+    let dir = tmp("reste-nacharbeit");
+    let (project, run) = project(&dir);
+    let ids = ["halle".to_string()];
+    let surface = run.join("karte-001/oberflaeche-001");
+    let new = surface.join("nacharbeit.tmp-4242-neu");
+    file(&new, "aenderungen.bin", 30);
+    assert_eq!(
+        labels(&leftovers::find(&project, &ids)),
+        [(
+            LeftoverKind::Temp,
+            "nacharbeit.tmp-4242-neu (Oberfläche 001)".into(),
+            30
+        )]
+    );
+    assert!(leftovers::may_clean_up(&new));
+
+    // cut off between its two renames: an intact old cache aside, none in place
+    let aside = surface.join("nacharbeit.tmp-4242-alt");
+    file(&aside, "aenderungen.bin", 4);
+    fs::write(
+        aside.join("nacharbeit.json"),
+        r#"{"input_id":"x","glb_bytes":10,"edit_version":1,"patches_bytes":4,"steps":[]}"#,
+    )
+    .unwrap();
+    assert_eq!(leftovers::find(&project, &ids), Vec::new());
+    assert!(!leftovers::may_clean_up(&aside));
+    assert!(!leftovers::may_clean_up(&new));
+
+    // with a cache in place both are leftovers; the cache itself never is
+    fs::create_dir_all(surface.join("nacharbeit")).unwrap();
+    let found = leftovers::find(&project, &ids);
+    let paths: Vec<&Path> = found.iter().map(|l| l.path.as_path()).collect();
+    assert_eq!(paths, [aside.as_path(), new.as_path()]);
+    assert!(leftovers::may_clean_up(&aside));
+}

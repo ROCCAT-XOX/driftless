@@ -4,9 +4,11 @@
 //!   712.218 Dreiecke“), the numbers of the last frame, what a click does now and the clicked
 //!   point;
 //! - top right, while a surface is loaded, the switch Punkte · Fläche · beides (key `O`);
-//! - bottom centre the tools Drehen · Verschieben · Punkt wählen · Messen · Schnitt and the
-//!   button „Alles“ (key `F`); exactly one tool is active ([`Tool`]);
-//! - above them, with the tool „Schnitt“, the height cut: z min, z max, „Decke ausblenden“.
+//! - bottom centre the tools Drehen · Verschieben · Punkt wählen · Messen · Schnitt · Pinsel and
+//!   the button „Alles“ (key `F`); exactly one tool is active ([`Tool`]); „Pinsel“ only with a
+//!   surface of the project shown, else off with the reason;
+//! - above them, with the tool „Schnitt“, the height cut: z min, z max, „Decke ausblenden“; with
+//!   the tool „Pinsel“ its bar ([`super::brush::bar`]).
 //!
 //! Measuring: the first click on a point sets its first end, the second the other and adds the
 //! [`Measurement`]; Esc or another tool drops a first end. The view draws the lines with their
@@ -47,6 +49,9 @@ pub enum Tool {
     Measure,
     /// The height cut; its bar shows above the tools.
     Cut,
+    /// The left button paints Stellen on the surface ([`super::brush`]); its bar shows above
+    /// the tools, the right button turns the view.
+    Brush,
     /// Clicks set point pairs of a [`PairSession`]; only in the bar while one is open.
     Pairs,
 }
@@ -60,7 +65,7 @@ impl Tool {
 }
 
 /// The tools of the bar: tool, symbol, name, tooltip.
-const TOOLS: [(Tool, &str, &str, &str); 5] = [
+const TOOLS: [(Tool, &str, &str, &str); 6] = [
     (
         Tool::Orbit,
         icon::ORBIT,
@@ -81,6 +86,12 @@ const TOOLS: [(Tool, &str, &str, &str); 5] = [
         text::TOOL_MEASURE_HINT,
     ),
     (Tool::Cut, icon::CUT, text::TOOL_CUT, text::CUT_HINT),
+    (
+        Tool::Brush,
+        icon::BRUSH,
+        text::TOOL_BRUSH,
+        text::TOOL_BRUSH_HINT,
+    ),
 ];
 
 /// The distance between two points of the cloud (absolute coordinates).
@@ -112,6 +123,8 @@ pub struct ScreenLayout {
     pub show: Option<Rect>,
     pub tools: Option<Rect>,
     pub cut: Option<Rect>,
+    /// The bar of the brush ([`super::brush::bar`]).
+    pub brush: Option<Rect>,
     /// The legend of the quality colours ([`quality_legend`]).
     pub legend: Option<Rect>,
 }
@@ -127,6 +140,7 @@ impl Default for ScreenLayout {
             show: None,
             tools: None,
             cut: None,
+            brush: None,
             legend: None,
         }
     }
@@ -158,15 +172,15 @@ const SLIDER_WIDTH: f32 = 140.0;
 const END_RADIUS: f32 = 4.0;
 const LINE_WIDTH: f32 = 2.0;
 
-/// Makes `tool` the active one; a measurement being made is dropped, and „Punkt wählen“ or
-/// „Messen“ ends picking the places of a loop.
+/// Makes `tool` the active one; a measurement being made is dropped, and „Punkt wählen“,
+/// „Messen“ or „Pinsel“ ends picking the places of a loop.
 pub fn select(state: &mut AppState, tool: Tool) {
     if state.tool != tool {
         state.tool = tool;
         state.measure_a = None;
     }
-    // a click picks points now, not the places of a loop
-    if tool.picks_points() {
+    // a click picks points or paints now, not the places of a loop
+    if tool.picks_points() || tool == Tool::Brush {
         state.correct.picking = false;
     }
 }
@@ -198,7 +212,7 @@ pub fn point_clicked(state: &mut AppState, info: PointInfo) {
                 }
             }
         }
-        Tool::Orbit | Tool::Pan | Tool::Cut => {}
+        Tool::Orbit | Tool::Pan | Tool::Cut | Tool::Brush => {}
     }
 }
 
@@ -405,11 +419,12 @@ pub fn remember_text_focus(ctx: &Context) {
 }
 
 /// Whether the keys of the view (Esc, `O`, `F`, flying) are free: no text field has the
-/// keyboard, now or at the end of the last pass. A button or slider with the keyboard (after
-/// Tab, say) does not hold them.
+/// keyboard, now or at the end of the last pass, and no modal dialog („Melden“) lies over the
+/// window. A button or slider with the keyboard (after Tab, say) does not hold them.
 pub fn keys_free(ctx: &Context) -> bool {
     let before = ctx.data(|d| d.get_temp::<bool>(text_focus_id()));
-    !before.unwrap_or(false) && !ctx.text_edit_focused()
+    let modal = ctx.memory(|m| m.top_modal_layer().is_some());
+    !before.unwrap_or(false) && !ctx.text_edit_focused() && !modal
 }
 
 /// The floating bars over the view `view`, while a cloud or a surface is loaded. Their
@@ -425,6 +440,7 @@ pub fn floats(
     layout.show = None;
     layout.tools = None;
     layout.cut = None;
+    layout.brush = None;
     if state.cloud.is_none() && state.surface.is_none() {
         return None;
     }
@@ -432,17 +448,23 @@ pub fn floats(
     if state.surface.is_some() {
         layout.show = Some(show_switch(ctx, view, state));
     }
-    let (tools, action) = toolbar(ctx, view, state);
+    let (tools, mut action) = toolbar(ctx, view, state);
     layout.tools = Some(tools);
-    if state.tool == Tool::Cut {
-        layout.cut = cut_bar(ctx, view, tools.top() - GAP, state);
+    match state.tool {
+        Tool::Cut => layout.cut = cut_bar(ctx, view, tools.top() - GAP, state),
+        Tool::Brush => {
+            let (rect, asked) = super::brush::bar(ctx, view, tools.top() - GAP, state);
+            layout.brush = Some(rect);
+            action = action.or(asked);
+        }
+        _ => {}
     }
     action
 }
 
 /// A floating bar: an area at `pos` of the view (`pivot` its corner there), in
 /// [`theme::float_frame`]. Returns its rectangle.
-fn float(
+pub(super) fn float(
     ctx: &Context,
     id: &str,
     view: Rect,
@@ -482,9 +504,10 @@ fn info(ctx: &Context, view: Rect, state: &mut AppState) -> Rect {
             (Some(c), None) => text::info_cloud(c.points),
             (None, None) => return,
         };
-        let help = match s.view.camera_mode {
-            CameraMode::Orbit => text::VIEW_HELP_ORBIT,
-            CameraMode::Fly => text::VIEW_HELP_FLY,
+        let help = match (s.tool, s.view.camera_mode) {
+            (Tool::Brush, mode) => text::view_help_brush(mode == CameraMode::Fly),
+            (_, CameraMode::Orbit) => text::VIEW_HELP_ORBIT.into(),
+            (_, CameraMode::Fly) => text::VIEW_HELP_FLY.into(),
         };
         ui.label(RichText::new(head).color(DARK.text).strong())
             .on_hover_text(help);
@@ -544,6 +567,7 @@ pub fn click_hint(s: &AppState) -> Option<String> {
             None => text::PAIRS_LOADING.into(),
             Some(_) => p.prompt(),
         }),
+        Tool::Brush => Some(text::brush_hint(s.brush.active)),
         _ => None,
     }
 }
@@ -621,9 +645,20 @@ fn toolbar(ctx: &Context, view: Rect, state: &mut AppState) -> (Rect, Option<Act
                 text::TOOL_PAIRS_HINT,
             );
             let extra = state.pairs.is_some().then_some(pairs);
+            // the brush needs a surface of the project to paint on
+            let brush_off = super::brush::blocked(state);
             for (tool, symbol, name, hint) in TOOLS.into_iter().chain(extra) {
-                let r = bar_button(ui, Some(symbol), Some(name), name, Some(tool == active));
-                if r.on_hover_text(hint).clicked() {
+                let off = brush_off.as_ref().filter(|_| tool == Tool::Brush);
+                let r = ui
+                    .add_enabled_ui(off.is_none(), |ui| {
+                        bar_button(ui, Some(symbol), Some(name), name, Some(tool == active))
+                    })
+                    .inner;
+                let r = match off {
+                    Some(why) => r.on_disabled_hover_text(why.as_str()),
+                    None => r.on_hover_text(hint),
+                };
+                if r.clicked() {
                     chosen = Some(tool);
                 }
             }
@@ -649,7 +684,7 @@ fn toolbar(ctx: &Context, view: Rect, state: &mut AppState) -> (Rect, Option<Act
 /// A button of the floating bars: symbol and label, filled with the accent colour while `on`.
 /// `name` is what screen readers (and tests) see; `on` = `None` is a plain button, else a
 /// toggle.
-fn bar_button(
+pub(super) fn bar_button(
     ui: &mut Ui,
     symbol: Option<&str>,
     label: Option<&str>,
@@ -846,7 +881,7 @@ pub fn quality_legend(ctx: &Context, view: Rect, show: bool, layout: &mut Screen
     }
     use driftless_steps::overlay::{quality_color, QUALITY_GREEN, QUALITY_RED, QUALITY_YELLOW};
     // above the bars at the bottom, if any
-    let above = [layout.tools, layout.cut]
+    let above = [layout.tools, layout.cut, layout.brush]
         .into_iter()
         .flatten()
         .map(|r| r.top() - GAP)

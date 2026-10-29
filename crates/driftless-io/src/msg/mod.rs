@@ -9,7 +9,7 @@ mod pointcloud2;
 #[cfg(any(test, feature = "test-util"))]
 pub mod encode;
 
-pub use image::{decode_compressed_image, CompressedImage};
+pub use image::{compressed_image_stamp, decode_compressed_image, CompressedImage};
 pub use imu::{decode_imu, ImuSample};
 pub use pointcloud2::{decode_pointcloud2, LidarFrame, LidarPoint};
 
@@ -67,12 +67,19 @@ impl<'a> Cursor<'a> {
         Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
     }
 
-    /// `std_msgs/Header`: returns `stamp` in seconds. `seq` and `frame_id` are skipped.
+    /// `std_msgs/Header`: returns `stamp` in seconds ([`stamp_secs`]). `seq` and `frame_id`
+    /// are skipped.
     pub(crate) fn header(&mut self) -> Result<f64, MsgError> {
         let _seq = self.u32()?;
         let sec = self.u32()?;
         let nsec = self.u32()?;
         let _frame_id = self.string()?;
-        Ok(f64::from(sec) + f64::from(nsec) * 1e-9)
+        Ok(stamp_secs(sec, nsec))
     }
+}
+
+/// A header stamp of `sec` seconds and `nsec` nanoseconds in seconds, as every decoder here
+/// gives it.
+pub fn stamp_secs(sec: u32, nsec: u32) -> f64 {
+    f64::from(sec) + f64::from(nsec) * 1e-9
 }

@@ -117,6 +117,9 @@ pub fn source_name(state: &AppState, source: &ExportSource) -> String {
             text::export_choice(&label, MODEL_LAS)
         }
         ExportSource::Surface(d) => surface_label(state, d).unwrap_or_else(|| folder(d)),
+        ExportSource::EditedSurface(d) => {
+            text::export_touched_up(&surface_label(state, d).unwrap_or_else(|| folder(d)))
+        }
         ExportSource::Run(d) => {
             let label = state
                 .run(d)
@@ -166,15 +169,23 @@ fn folder(path: &Path) -> String {
 
 /// What „Exportieren …“ in ☰ offers: the cloud the view shows ([`ExportSource::detect`], so
 /// that `modell.las` is the model and keeps the names of its scans) and the surface (its folder
-/// for an `oberflaeche.glb`), with their names. Empty while neither is shown, or for a
-/// synthetic cloud.
+/// for an `oberflaeche.glb`; with its touch-up if its map or model has Stellen with steps,
+/// [`surface_source`]), with their names. Empty while neither is shown, or for a synthetic
+/// cloud.
 pub fn shown_sources(state: &AppState) -> Vec<(ExportSource, String)> {
     let cloud = state
         .cloud
         .as_ref()
         .and_then(|c| ExportSource::detect(&c.path).ok())
         .filter(|s| s.kind() == ExportKind::Points);
-    let surface = state.surface.as_ref().and_then(|s| shown_surface(&s.path));
+    let surface = state
+        .surface
+        .as_ref()
+        .and_then(|s| shown_surface(&s.path))
+        .map(|source| match source {
+            ExportSource::Surface(dir) => surface_source(state, &dir),
+            other => other,
+        });
     cloud
         .into_iter()
         .chain(surface)
@@ -183,6 +194,19 @@ pub fn shown_sources(state: &AppState) -> Vec<(ExportSource, String)> {
             (s, name)
         })
         .collect()
+}
+
+/// What the export of the surface folder `dir` reads: the surface with its touch-up
+/// ([`ExportSource::EditedSurface`]) if the map or model it lies in has Stellen with steps (as
+/// last read), else the surface as computed.
+pub fn surface_source(state: &AppState, dir: &Path) -> ExportSource {
+    let owner = dir.parent().unwrap_or(dir);
+    let marks = state.marks.get(owner).and_then(|m| m.as_ref().ok());
+    if marks.is_some_and(super::brush::has_steps) {
+        ExportSource::EditedSurface(dir.to_path_buf())
+    } else {
+        ExportSource::Surface(dir.to_path_buf())
+    }
 }
 
 /// The source of the surface file the view shows: the surface folder of an

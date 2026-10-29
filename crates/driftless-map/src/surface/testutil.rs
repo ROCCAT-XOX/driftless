@@ -610,3 +610,240 @@ pub(crate) fn floor_and_ceiling() -> super::TexturedMesh {
         ..Default::default()
     }
 }
+
+// ---- Page meshes for the touch-up tests (`driftless_export::mesh`) ---------------------
+
+use driftless_export::mesh::{Mesh as PageMesh, MeshPage};
+
+/// A fixed linear congruential generator (Knuth's MMIX constants): the same numbers on every
+/// machine, so random rays and noise never change between runs.
+pub(crate) struct Lcg(u64);
+
+impl Lcg {
+    pub fn new(seed: u64) -> Lcg {
+        Lcg(seed)
+    }
+
+    /// Uniform in `[0, 1)`, from the top 53 bits of the state.
+    pub fn unit(&mut self) -> f64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Uniform in `[lo, hi)`.
+    pub fn range(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * self.unit()
+    }
+
+    /// Nearly standard normal: the sum of 12 uniforms minus 6 (Irwin–Hall), so no function
+    /// that may round differently on another machine.
+    pub fn normal(&mut self) -> f64 {
+        (0..12).map(|_| self.unit()).sum::<f64>() - 6.0
+    }
+}
+
+/// Positions and triangles of a mesh with shared vertices.
+pub(crate) type Shared = (Vec<[f64; 3]>, Vec<[u32; 3]>);
+
+/// A grid of `n[0] × n[1]` squares, two triangles each, with vertex `(i, j)` at `at(i, j)`
+/// (called for `i` in `0..=n[0]`, then `j` in `0..=n[1]`). The faces' normals point along
+/// `∂at/∂i × ∂at/∂j`.
+pub(crate) fn grid(n: [usize; 2], mut at: impl FnMut(usize, usize) -> [f64; 3]) -> Shared {
+    let mut positions = Vec::with_capacity((n[0] + 1) * (n[1] + 1));
+    for i in 0..=n[0] {
+        for j in 0..=n[1] {
+            positions.push(at(i, j));
+        }
+    }
+    let id = |i: usize, j: usize| (i * (n[1] + 1) + j) as u32;
+    let mut indices = Vec::with_capacity(2 * n[0] * n[1]);
+    for i in 0..n[0] {
+        for j in 0..n[1] {
+            indices.push([id(i, j), id(i + 1, j), id(i, j + 1)]);
+            indices.push([id(i + 1, j), id(i + 1, j + 1), id(i, j + 1)]);
+        }
+    }
+    (positions, indices)
+}
+
+/// The meshes `parts` (positions and triangles) as one, without joining any vertices.
+pub(crate) fn concat(parts: &[Shared]) -> Shared {
+    let (mut positions, mut indices) = (Vec::new(), Vec::new());
+    for (p, t) in parts {
+        let base = positions.len() as u32;
+        positions.extend_from_slice(p);
+        indices.extend(t.iter().map(|tri| tri.map(|v| v + base)));
+    }
+    (positions, indices)
+}
+
+/// Pages as the surface step bakes them: the faces in order, cut into charts of `chart` faces,
+/// the charts dealt to `pages` pages in turn, every chart with its own copy of the vertices it
+/// uses (in order of first use). No images and no texture coordinates.
+pub(crate) fn paged(
+    positions: &[[f64; 3]],
+    indices: &[[u32; 3]],
+    chart: usize,
+    pages: usize,
+) -> PageMesh {
+    let mut mesh = PageMesh {
+        pages: vec![MeshPage::default(); pages],
+    };
+    for (c, faces) in indices.chunks(chart).enumerate() {
+        let page = &mut mesh.pages[c % pages];
+        let mut copy: BTreeMap<u32, u32> = BTreeMap::new();
+        for tri in faces {
+            let t = tri.map(|v| {
+                *copy.entry(v).or_insert_with(|| {
+                    page.positions.push(positions[v as usize]);
+                    (page.positions.len() - 1) as u32
+                })
+            });
+            page.indices.push(t);
+        }
+    }
+    mesh
+}
+
+// ---- The scan with images of `driftless_io::testscan` (touch-up tests) -----------------
+
+use driftless_traj::Pose;
+use std::path::Path;
+
+/// The room of `driftless_io::testscan::room_scan` (m): `[-4, 6] × [-3, 5] × [-1.5, 2]`.
+pub(crate) const TESTSCAN_ROOM: ([f64; 3], [f64; 3]) = ([-4.0, -3.0, -1.5], [6.0, 5.0, 2.0]);
+
+/// Body poses of a device standing still at `device` (device → world) from 999.5 s to 1002 s
+/// at 10 Hz: around the images of `driftless_io::testscan::scan_with_images` (stamped 1000.3
+/// to 1001.1 s).
+pub(crate) fn still_poses(device: Isometry3<f64>) -> Vec<Pose> {
+    (0..=25)
+        .map(|i| Pose {
+            t: 999.5 + 0.1 * f64::from(i),
+            p: device.translation.vector,
+            q: device.rotation,
+        })
+        .collect()
+}
+
+/// The images of a scan folder made by `driftless_io::testscan::scan_with_images` as a
+/// texture source, with the device standing still at `device`: its bag, and its camera `left`
+/// from the calibration (the LiDAR mount the identity, as with the default settings). The
+/// images were taken at the origin; at another `device` they are just images with that pose,
+/// enough where only the geometry counts.
+pub(crate) fn testscan_source(dir: &Path, device: Isometry3<f64>) -> super::TextureSource {
+    let calib = driftless_io::calib::load_calibration(&dir.join("calibration/calib.json")).unwrap();
+    let c = &calib.cameras["left"];
+    let camera = driftless_io::camera::Camera::from_calib("left", c).unwrap();
+    let cam = crate::ColorCamera::new(camera, &c.lidar_to_cam.unwrap(), &Isometry3::identity());
+    super::TextureSource {
+        images: crate::ImageSource {
+            bags: vec![dir.join("IMAGE_0.bag")],
+            topics: vec!["/camera_left/image_raw".to_string()],
+        },
+        poses: still_poses(device),
+        cams: vec![cam],
+    }
+}
+
+/// The images of the scan folder `dir` (made by `driftless_io::testscan::scan_with_images`) with
+/// every linear colour value times `gain` (clipped at white; the exposure of another moment), as
+/// a bag of their own `out/IMAGE_0.bag` with the same topic and stamps (JPEG quality 95, as the
+/// scan's): a texture source like [`testscan_source`] with the device standing still at `device`.
+pub(crate) fn testscan_source_scaled(
+    dir: &Path,
+    out: &Path,
+    device: Isometry3<f64>,
+    gain: f64,
+) -> super::TextureSource {
+    use driftless_io::bag::writer::{BagWriter, Compression};
+    use driftless_io::msg::encode::encode_compressed_image;
+    use driftless_io::msg::CompressedImage;
+    let src = testscan_source(dir, device);
+    let lin = crate::color::linear_table();
+    let mut bag = BagWriter::new(Compression::None);
+    let conn = bag.add_connection(&src.images.topics[0], "sensor_msgs/CompressedImage");
+    driftless_io::images::for_each_image(&src.images.bags, &src.images.topics, 1, |frame| {
+        let frame = frame.unwrap();
+        let rgb: Vec<u8> = frame
+            .rgb
+            .data
+            .iter()
+            .map(|&v| {
+                let l = (f64::from(lin[v as usize]) * gain) as f32;
+                crate::color::srgb_value(l).round().clamp(0.0, 255.0) as u8
+            })
+            .collect();
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .encode(
+                &rgb,
+                frame.rgb.width,
+                frame.rgb.height,
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        let msg = encode_compressed_image(&CompressedImage {
+            stamp: frame.stamp,
+            format: "jpeg".into(),
+            data: jpeg,
+        });
+        bag.write_message(conn, driftless_io::testscan::time(frame.stamp), &msg);
+        true
+    })
+    .unwrap();
+    std::fs::create_dir_all(out).unwrap();
+    let path = out.join("IMAGE_0.bag");
+    std::fs::write(&path, bag.finish()).unwrap();
+    super::TextureSource {
+        images: crate::ImageSource {
+            bags: vec![path],
+            topics: src.images.topics.clone(),
+        },
+        ..src
+    }
+}
+
+/// The surface of the room of `driftless_io::testscan::scan_with_images` (the scan folder
+/// `dir`) as the surface step makes it from a map of that scan: walls, floor and ceiling from
+/// points 5 cm apart, measured from the room's centre, at the coarse settings of the step's
+/// tests (`crates/driftless-steps/tests/surface.rs`), textured from the scan's images (the
+/// device stood still at the origin). Returns its pages as `oberflaeche.glb` holds them, and
+/// the scan's source.
+pub(crate) fn testscan_surface(dir: &Path) -> (PageMesh, super::TextureSource) {
+    let (lo, hi) = TESTSCAN_ROOM;
+    let centre: [f32; 3] = std::array::from_fn(|k| ((lo[k] + hi[k]) / 2.0) as f32);
+    let half: [f32; 3] = std::array::from_fn(|k| ((hi[k] - lo[k]) / 2.0) as f32);
+    let scan = box_room(centre, half, 0.05);
+    let cfg = testscan_config();
+    let progress = driftless_io::progress::Progress::new();
+    let (mesh, mut stats) = super::build_mesh(&scan.input(), &cfg, &progress).unwrap();
+    let source = testscan_source(dir, Isometry3::identity());
+    let tex = super::texture_mesh(
+        &mesh,
+        std::slice::from_ref(&source),
+        &cfg,
+        &progress,
+        &mut stats,
+        None,
+    )
+    .unwrap();
+    assert!(stats.texture.faces_textured > 0, "{stats:?}");
+    let jpegs = super::encode_pages(&tex, cfg.jpeg_quality).unwrap();
+    (tex.to_mesh(&jpegs).unwrap(), source)
+}
+
+/// The coarse settings of the surface tests of the steps (`small_config` there).
+pub(crate) fn testscan_config() -> super::SurfaceConfig {
+    super::SurfaceConfig {
+        voxel: 0.15,
+        min_weight: 1,
+        min_component_faces: 10,
+        page_size: 256,
+        simplify_error: 0.01,
+        ..super::SurfaceConfig::default()
+    }
+}

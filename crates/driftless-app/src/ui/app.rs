@@ -1,9 +1,11 @@
 //! The program: carries out the panels' actions, owns the job runners, the dialogs, the
 //! loaded cloud, the run drawn over it and the 3D view.
 
+use super::brush::{self, Brush, MarkChange, TouchupWish, Variant};
 use super::compare::{compare_maps, compare_refs, default_refs, TrajRef};
 use super::correct::{Corrected, RunLoaded};
 use super::export::{self, ExportDialog};
+use super::feedback::{FeedbackDialog, ReportList};
 use super::tools::{self, PairSession, ScreenLayout, Tool};
 use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
@@ -11,18 +13,27 @@ use super::{
     CloudCheck, CloudSummary, InspectResult, LogEntry, LogKind, ProjectRead, Queued, Selection,
     Step, SurfaceSummary, Tree, UiMessage, ViewSettings, ViewStats,
 };
+use crate::camera::CameraState;
 use crate::cloud::{load_cloud, load_pair_cloud, LoadedCloud};
+use crate::feedback::{DoubleShift, Feedback, FeedbackCamera, FeedbackKind, FeedbackProject};
 use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
 use crate::logfile::{self, Level, LogFile};
 use crate::overlay::RunOverlay;
+use crate::pick::relative_to;
 use crate::project::{canonical, change_project, set_point_pair_enabled, Choices, Project};
 use crate::render::ShowMode;
-use crate::surface::{load_mesh, surface_glb};
+use crate::surface::{load_mesh, surface_glb, SurfaceEdit, TouchupOutput, ViewEdit, SURFACE_GLB};
 use crate::synthetic::synthetic_cloud;
 use driftless_gpu::GpuPref;
+use driftless_io::images::ImageIndices;
 use driftless_io::progress::{LogLine, Progress};
-use driftless_steps::export::{file_kind, ExportKind, MESH_EXTENSIONS, POINT_EXTENSIONS};
+use driftless_steps::export::{
+    file_kind, ExportKind, ExportSource, MESH_EXTENSIONS, POINT_EXTENSIONS,
+};
+use driftless_steps::marks::{EditStep, Marks};
 use driftless_steps::merge::MODEL_LAS;
+use driftless_steps::surface::{NoSources, STALE_SURFACE};
+use driftless_steps::touchup::{TouchupPrepared, NO_RAW_DATA};
 use driftless_steps::{correct, StepError};
 use eframe::egui;
 use std::collections::{BTreeSet, VecDeque};
@@ -58,6 +69,10 @@ const HINT_TOP: f32 = 64.0;
 
 /// Seed of the synthetic cloud of `--synthetic`.
 const SYNTHETIC_SEED: u64 = 1;
+
+/// „Melden“ opens without the picture of the window if it has not come this long (s) after it
+/// was asked for (a window not drawn, a system without it).
+const SHOT_WAIT: f64 = 2.0;
 
 /// The arguments of `driftless-app [--version] [--synthetic N] [projekt-ordner]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -129,6 +144,8 @@ struct StoredUi {
     gpu: String,
     /// The folders the dialogs were last used in ([`LastFolders`]).
     folders: LastFolders,
+    /// The radius of the brush (m).
+    brush_radius: f32,
 }
 
 /// Which dialogs share their start folder ([`DriftlessApp::dialog_folder`]).
@@ -180,13 +197,21 @@ impl Default for StoredUi {
             &ViewSettings::default(),
             GpuPref::default(),
             &LastFolders::default(),
+            brush::DEFAULT_RADIUS,
         )
     }
 }
 
 impl StoredUi {
-    fn of(step: Step, v: &ViewSettings, gpu: GpuPref, folders: &LastFolders) -> Self {
+    fn of(
+        step: Step,
+        v: &ViewSettings,
+        gpu: GpuPref,
+        folders: &LastFolders,
+        brush_radius: f32,
+    ) -> Self {
         StoredUi {
+            brush_radius,
             folders: folders.clone(),
             step,
             color_mode: v.color_mode,
@@ -209,6 +234,16 @@ impl StoredUi {
     /// „Grafikkarte nutzen“ as stored; an unknown word is `auto`.
     fn gpu(&self) -> GpuPref {
         self.gpu.parse().unwrap_or_default()
+    }
+
+    /// The radius of the brush as stored, within its range.
+    fn brush_radius(&self) -> f32 {
+        if self.brush_radius.is_finite() {
+            self.brush_radius
+                .clamp(brush::MIN_RADIUS, brush::MAX_RADIUS)
+        } else {
+            brush::DEFAULT_RADIUS
+        }
     }
 
     /// The view settings as stored, the rest from `v`.
@@ -306,6 +341,70 @@ enum HelperTask {
         label: String,
         bytes: Option<u64>,
     },
+    /// A change of the Stellen of the map or model in the folder, in its `stellen.toml`
+    /// ([`Marks::change`]); made on [`AppState::marks`] already.
+    Marks { owner: PathBuf, change: MarkChange },
+    /// „Melden“: the report written as a folder of its own ([`crate::feedback::write`]).
+    Feedback(Box<FeedbackJob>),
+    /// The reports in the folder, for the list (☰ → „Meldungen …“).
+    ReadReports(PathBuf),
+}
+
+/// A report of „Melden“ to write ([`HelperTask::Feedback`]).
+#[derive(Debug, Clone, PartialEq)]
+struct FeedbackJob {
+    /// The folder of the reports.
+    dir: PathBuf,
+    report: Feedback,
+    /// The picture of the window and the Stellen, if attached.
+    image: Option<Arc<egui::ColorImage>>,
+    marks: Option<Marks>,
+    /// The log file whose last lines go along; without one (or an empty one) `log`, the last
+    /// lines of the Protokoll of the window.
+    log_file: Option<PathBuf>,
+    log: Vec<String>,
+}
+
+/// „Melden“ asked for, while the picture of the window is awaited: the Stelle it is about, and
+/// the time of the frame that asked for the picture.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FeedbackAsk {
+    mark: Option<u32>,
+    asked: Option<f64>,
+}
+
+/// What the picture of the window for „Melden“ is asked for with: its reply is told apart by it.
+struct FeedbackShot;
+
+/// Whether `data` came with the picture asked for by „Melden“.
+fn is_feedback_shot(data: &egui::UserData) -> bool {
+    data.data
+        .as_ref()
+        .is_some_and(|d| (**d).is::<FeedbackShot>())
+}
+
+/// „Zur Ansicht“ of a report, until its camera is set ([`DriftlessApp::advance_report_view`]).
+#[derive(Debug, Clone, PartialEq)]
+struct ReportView {
+    /// The project of the report, to be shown first; `None`: the one shown stays.
+    project: Option<PathBuf>,
+    step: Option<Step>,
+    selection: Option<Selection>,
+    camera: Option<CameraState>,
+    /// The project is shown and the step and selection are set: what they load is awaited.
+    selected: bool,
+}
+
+/// The graphics adapter of `rs` as the log file names it: „Apple M4 Pro (Metal, IntegratedGpu,
+/// …)“.
+fn graphics_of(rs: &egui_wgpu::RenderState) -> String {
+    let info = rs.adapter.get_info();
+    let details = [
+        format!("{:?}", info.backend),
+        format!("{:?}", info.device_type),
+        format!("{} {}", info.driver, info.driver_info),
+    ];
+    logfile::gpu_text(&info.name, &details)
 }
 
 /// What a „compute all“ button puts into the queue.
@@ -458,11 +557,40 @@ pub struct DriftlessApp {
     focus_read_at: Option<Instant>,
     /// When the last such read started ([`FOCUS_GAP`]).
     focus_read: Option<Instant>,
+    /// The brush at work: what it hits on the surface shown, the stroke, the Stellen as faces.
+    brush: Brush,
+    /// Where the camera images of the scans lie in their bags, kept for every touch-up of this
+    /// window: only the first one that bakes images of a scan anew looks through its bags.
+    image_indices: Arc<ImageIndices>,
+    /// Changes of the Stellen saved (or refused) so far, and their count when the read of the
+    /// tree that runs began: a read that began before a change was saved brings the Stellen of
+    /// before it, so they are not taken from it.
+    marks_saved: u64,
+    tree_marks_at: u64,
+    /// ⇧⇧ anywhere in the window opens „Melden“.
+    double_shift: DoubleShift,
+    /// „Melden“ asked for while the picture of the window is awaited.
+    feedback_ask: Option<FeedbackAsk>,
+    /// Where the reports go: the app's own folder ([`crate::feedback::default_dir`]) in the
+    /// program eframe starts ([`DriftlessApp::from_creation_context`]); else none, unless set
+    /// ([`DriftlessApp::with_feedback_dir`]), so that no test can write into the real one.
+    feedback_dir: Option<PathBuf>,
+    /// The dialogs of the reports being written, in order: one opens again if writing it fails.
+    feedback_saving: VecDeque<FeedbackDialog>,
+    /// The graphics adapter the window draws with, as the log file names it.
+    graphics: Option<String>,
+    /// „Zur Ansicht“ of a report, until its camera is set.
+    report_view: Option<ReportView>,
 }
 
 impl DriftlessApp {
-    /// Without a window; `repaint` wakes the UI when a job ends.
+    /// Without a window; `repaint` wakes the UI when a job ends. Without a folder for the reports
+    /// of „Melden“ ([`DriftlessApp::with_feedback_dir`]; the program eframe starts gets the app's
+    /// own).
     pub fn new(repaint: Arc<dyn Fn() + Send + Sync>) -> Self {
+        // „Nachher“ from the start, as the state says
+        let mut view = View3d::default();
+        view.show_edit(brush::TouchupState::default().after);
         DriftlessApp {
             state: AppState::default(),
             jobs: JobRunner::new(repaint.clone()),
@@ -481,7 +609,7 @@ impl DriftlessApp {
             cloud_run: None,
             overlay: None,
             overlay_version: 0,
-            view: View3d::default(),
+            view,
             render_state: None,
             status_asked: 0,
             gaps_asked: 0,
@@ -512,6 +640,16 @@ impl DriftlessApp {
             trash: crate::trash::system_trash,
             focus_read_at: None,
             focus_read: None,
+            brush: Brush::default(),
+            image_indices: Arc::default(),
+            marks_saved: 0,
+            tree_marks_at: 0,
+            double_shift: DoubleShift::default(),
+            feedback_ask: None,
+            feedback_dir: None,
+            feedback_saving: VecDeque::new(),
+            graphics: None,
+            report_view: None,
         }
     }
 
@@ -530,6 +668,13 @@ impl DriftlessApp {
     /// With another projects folder for the dialogs to start in (tests: not the home folder).
     pub fn with_projects_home(mut self, dir: Option<PathBuf>) -> Self {
         self.projects_home = dir;
+        self
+    }
+
+    /// With another folder for the reports of „Melden“ (tests: never the app's own); `None`:
+    /// „Melden“ cannot save.
+    pub fn with_feedback_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.feedback_dir = dir;
         self
     }
 
@@ -567,7 +712,8 @@ impl DriftlessApp {
 
     /// For eframe: writes the start line into the log file `log` (with the graphics adapter
     /// eframe chose and the project to open), opens the project of `args`, else the project
-    /// opened last, and starts generating the synthetic cloud if asked for.
+    /// opened last, and starts generating the synthetic cloud if asked for. The reports of
+    /// „Melden“ go into the app's own folder ([`crate::feedback::default_dir`]).
     pub fn from_creation_context(
         cc: &eframe::CreationContext<'_>,
         args: Args,
@@ -577,6 +723,7 @@ impl DriftlessApp {
         super::theme::apply(&cc.egui_ctx);
         let mut app = DriftlessApp::new(Arc::new(move || ctx.request_repaint()));
         app.log_file = log;
+        app.feedback_dir = crate::feedback::default_dir();
         app.themed = true;
         app.render_state = cc.wgpu_render_state.clone();
         app.restore_ui(&cc.egui_ctx, cc.storage);
@@ -584,18 +731,11 @@ impl DriftlessApp {
             .storage
             .and_then(|s| s.get_string(LAST_PROJECT_KEY))
             .filter(|s| !s.is_empty());
+        // kept: a report of „Melden“ names it too
+        app.graphics = cc.wgpu_render_state.as_ref().map(graphics_of);
         if let Some(file) = &app.log_file {
-            let gpu = cc.wgpu_render_state.as_ref().map(|rs| {
-                let info = rs.adapter.get_info();
-                let details = [
-                    format!("{:?}", info.backend),
-                    format!("{:?}", info.device_type),
-                    format!("{} {}", info.driver, info.driver_info),
-                ];
-                logfile::gpu_text(&info.name, &details)
-            });
             let project = args.project.clone().or(last.clone().map(PathBuf::from));
-            file.write_start(gpu.as_deref(), project.as_deref());
+            file.write_start(app.graphics.as_deref(), project.as_deref());
         }
         if let Some(dir) = args.project {
             app.apply(Action::OpenProject(dir));
@@ -610,6 +750,7 @@ impl DriftlessApp {
 
     /// With the GPU of a window (or of a test renderer): the 3D view draws with it.
     pub fn with_render_state(mut self, render_state: egui_wgpu::RenderState) -> Self {
+        self.graphics = Some(graphics_of(&render_state));
         self.render_state = Some(render_state);
         self
     }
@@ -626,6 +767,12 @@ impl DriftlessApp {
 
     pub fn view(&self) -> &View3d {
         &self.view
+    }
+
+    /// Where the camera images of the scans lie in their bags, as the window keeps it for its
+    /// touch-ups.
+    pub fn image_indices(&self) -> &ImageIndices {
+        &self.image_indices
     }
 
     /// Where the panels and the floating bars were in the last frame.
@@ -1102,6 +1249,16 @@ impl DriftlessApp {
             self.view.set_surface(None);
         }
         self.surface_stamp = None;
+        // a stroke on it ends where it got to
+        let stroke = self.brush.set_surface(None);
+        self.state.brush.active = None;
+        self.state.touchup.shown = None;
+        self.state.touchup.edited = false;
+        self.state.touchup.variants.clear();
+        self.state.touchup.outdated = false;
+        if let Some(stroke) = stroke {
+            self.apply(stroke);
+        }
     }
 
     /// Whether a surface is being loaded.
@@ -1170,10 +1327,23 @@ impl DriftlessApp {
         }
         match f.result {
             Ok(JobOutput::Surface(surface)) => {
+                let mut surface = *surface;
                 self.surface_stamp = stamp;
                 let (triangles, pages) = (surface.triangles(), surface.pages.len());
                 self.info(text::surface_loaded(&path, triangles, pages, f.seconds));
                 let z_range = surface.bounds().map_or([0.0; 2], |(lo, hi)| [lo[2], hi[2]]);
+                // the Stelle chosen belongs to the map or model of the surface before
+                let owner = |p: &Path| brush::owner_of(p).map(Path::to_path_buf);
+                let before = self.state.surface.as_ref().and_then(|s| owner(&s.path));
+                if before != owner(&path) {
+                    self.state.brush.active = None;
+                }
+                let pick = surface.pick.take();
+                let touchup = surface.touchup.take();
+                // a stroke on the surface before ends where it got to
+                let stroke = self
+                    .brush
+                    .set_surface(pick.map(|pick| (path.clone(), surface.origin, pick)));
                 self.state.surface = Some(SurfaceSummary {
                     path,
                     triangles,
@@ -1190,11 +1360,15 @@ impl DriftlessApp {
                         self.overlay_version += 1;
                     }
                 }
-                self.view.set_surface(Some(*surface));
+                self.view.set_surface(Some(surface));
                 // the surface just picked is what is drawn; a computed one only in „Bilder“,
                 // the other steps keep showing the points
                 if std::mem::take(&mut self.surface_by_hand) || self.state.step == Step::Bilder {
                     self.state.view.show = ShowMode::Surface;
+                }
+                self.surface_touchup(touchup);
+                if let Some(stroke) = stroke {
+                    self.apply(stroke);
                 }
             }
             Ok(_) => {}
@@ -1202,6 +1376,30 @@ impl DriftlessApp {
             Err(StepError::Cancelled) if self.next_surface.is_some() => {}
             Err(StepError::Cancelled) => self.info(text::job_cancelled(&f.label)),
             Err(e) => self.error(text::job_failed(&f.label, &text::step_error(&e))),
+        }
+    }
+
+    /// The touch-up of the surface just shown, as the loader found it: the view gets the
+    /// touched-up state at once if its cache fits; else (or if it was computed without the raw
+    /// data that are back) the touch-up is queued, to say what came of it. Only for a surface of
+    /// a map or model of the project.
+    fn surface_touchup(&mut self, touchup: Option<crate::surface::LoadedTouchup>) {
+        self.state.touchup.load += 1;
+        self.state.touchup.shown = None;
+        self.state.touchup.edited = false;
+        self.state.touchup.variants.clear();
+        self.state.touchup.outdated = false;
+        let (Some(touchup), Some(dir)) = (
+            touchup,
+            brush::shown_surface(&self.state).map(Path::to_path_buf),
+        ) else {
+            return;
+        };
+        if touchup.edit.is_some() {
+            self.set_view_edit(touchup.edit);
+        }
+        if touchup.stale {
+            self.want_touchup(dir, None, true);
         }
     }
 
@@ -1316,6 +1514,7 @@ impl DriftlessApp {
             Ok(()) => {
                 self.tree_task = Some(task);
                 self.tree_discard = false;
+                self.tree_marks_at = self.marks_saved;
             }
             Err(e) => self.error(e.to_string()),
         }
@@ -1377,7 +1576,14 @@ impl DriftlessApp {
                             ..
                         } = *read;
                         self.state.project = Some(project);
+                        // Stellen changed while the tree was read are newer than its
+                        let changed =
+                            self.marks_pending() || self.marks_saved != self.tree_marks_at;
+                        let marks = changed.then(|| std::mem::take(&mut self.state.marks));
                         self.state.set_tree(tree);
+                        if let Some(marks) = marks {
+                            self.state.marks = marks;
+                        }
                         self.tell_cloud(&dir, cloud);
                     }
                     Ok(_) => {}
@@ -1402,6 +1608,7 @@ impl DriftlessApp {
     /// stops, its measurements and surface go.
     fn opened(&mut self, read: ProjectRead) {
         self.stop_queue();
+        self.state.touchup.waiting.clear();
         // the measurements belong to the project shown (they are not saved yet)
         self.state.measurements.clear();
         self.state.measure_a = None;
@@ -1550,6 +1757,7 @@ impl DriftlessApp {
                 self.state.step = ui.step;
                 ui.apply_to(&mut self.state.view);
                 self.state.gpu = ui.gpu();
+                self.state.brush.radius = ui.brush_radius();
                 self.folders = ui.folders;
             }
             None => ctx.memory_mut(|m| {
@@ -1566,6 +1774,7 @@ impl DriftlessApp {
             &self.state.view,
             self.state.gpu,
             &self.folders,
+            self.state.brush.radius,
         );
         serde_json::to_string(&ui).unwrap_or_default()
     }
@@ -1585,22 +1794,28 @@ impl DriftlessApp {
     /// the step is cancelled and [`DriftlessApp::take_close`] says when to close, so the
     /// window never waits for it inside the event loop.
     pub fn close_requested(&mut self) -> bool {
-        if !self.jobs.is_busy() {
+        // a stroke or ↶ not yet in `stellen.toml`, a report not yet in its folder, are saved
+        // first
+        if !self.jobs.is_busy() && !self.marks_pending() && !self.feedback_pending() {
             return true;
         }
         if !self.closing {
             self.closing = true;
-            self.pending = None;
-            self.stop_queue();
-            self.jobs.cancel();
-            self.info(text::CLOSE_AFTER_CANCEL.to_string());
+            if self.jobs.is_busy() {
+                self.pending = None;
+                self.stop_queue();
+                self.jobs.cancel();
+                self.info(text::CLOSE_AFTER_CANCEL.to_string());
+            }
         }
         false
     }
 
-    /// True once, after a put-off close, when the step has ended.
+    /// True once, after a put-off close, when the step has ended and the Stellen and the reports
+    /// are saved.
     pub fn take_close(&mut self) -> bool {
-        if self.closing && !self.jobs.is_busy() {
+        let saving = self.marks_pending() || self.feedback_pending();
+        if self.closing && !self.jobs.is_busy() && !saving {
             self.closing = false;
             return true;
         }
@@ -1640,6 +1855,8 @@ impl DriftlessApp {
             || self.gaps_asked != self.state.tree_version
             || (self.state.project.is_some() && self.disk_asked != self.state.tree_version)
             || self.focus_read_at.is_some()
+            || !self.state.touchup.waiting.is_empty()
+            || self.report_view.is_some()
     }
 
     /// The window got the focus back: the tree is read again [`FOCUS_DELAY`] later (a scan
@@ -1722,6 +1939,11 @@ impl DriftlessApp {
                         });
                     }
                 }
+                (Some(HelperTask::Marks { owner, .. }), result) => {
+                    self.marks_written(owner, result)
+                }
+                (Some(HelperTask::Feedback(_)), result) => self.feedback_written(result),
+                (Some(HelperTask::ReadReports(_)), result) => self.reports_read(result),
                 _ => {}
             }
         }
@@ -1860,6 +2082,36 @@ impl DriftlessApp {
                     Ok(JobOutput::Done)
                 })
             }
+            HelperTask::Marks { owner, change } => {
+                let (owner, change) = (owner.clone(), change.clone());
+                self.helper.start(text::MARKS_JOB, move |_| {
+                    let (marks, _) = Marks::change(&owner, |m| Ok(change.apply(m)))?;
+                    Ok(JobOutput::Marks(Box::new(marks)))
+                })
+            }
+            HelperTask::Feedback(job) => {
+                let job = (**job).clone();
+                self.helper.start(text::FEEDBACK_JOB, move |_| {
+                    use crate::feedback::{last_lines, write, LOG_LINES};
+                    // the log file of this start, else what the window keeps of the Protokoll
+                    let lines = job
+                        .log_file
+                        .as_deref()
+                        .and_then(|path| last_lines(path, LOG_LINES).ok())
+                        .filter(|lines| !lines.is_empty())
+                        .unwrap_or(job.log);
+                    let image = job.image.as_deref();
+                    let folder = write(&job.dir, &job.report, image, job.marks.as_ref(), &lines)
+                        .map_err(|e| StepError::Failed(e.to_string()))?;
+                    Ok(JobOutput::FeedbackSaved(folder))
+                })
+            }
+            HelperTask::ReadReports(dir) => {
+                let dir = dir.clone();
+                self.helper.start(text::REPORTS_JOB, move |_| {
+                    Ok(JobOutput::Reports(crate::feedback::read_all(&dir)))
+                })
+            }
         };
         match started {
             Ok(()) => {
@@ -1893,9 +2145,347 @@ impl DriftlessApp {
                     let id = id.clone();
                     self.relinked(&id, Err(StepError::Failed(e.to_string())))
                 }
+                HelperTask::Marks { owner, .. } => {
+                    let owner = owner.clone();
+                    self.marks_written(owner, Err(StepError::Failed(e.to_string())))
+                }
+                HelperTask::Feedback(_) => {
+                    self.feedback_written(Err(StepError::Failed(e.to_string())))
+                }
+                HelperTask::ReadReports(_) => {
+                    self.reports_read(Err(StepError::Failed(e.to_string())))
+                }
                 _ => self.error(e.to_string()),
             },
         }
+    }
+
+    /// Changes the Stellen of the map or model in `owner`: at once on those shown
+    /// ([`AppState::marks`]; a stroke chooses its Stelle if the surface of `owner` is shown),
+    /// then in its `stellen.toml` in the background, in order. A change that changes nothing
+    /// writes nothing; an unreadable file is changed not at all. A change of what the touch-up
+    /// is computed from ([`brush::touchup_input`]: a step added or taken back, „Löschen“ of a
+    /// Stelle with steps or ↶ of that) queues the touch-up of the surface shown, to run once it
+    /// is saved – any change while „Nachher“ is behind ([`brush::TouchupState::outdated`]); if a
+    /// step runs meanwhile, the window says that „Nachher“ follows after it. Whether anything
+    /// changed.
+    fn change_marks(&mut self, owner: PathBuf, change: MarkChange) -> bool {
+        let shown = brush::shown_owner(&self.state) == Some(owner.as_path());
+        let read = self
+            .state
+            .marks
+            .entry(owner.clone())
+            .or_insert_with(|| Ok(Marks::default()));
+        let marks = match read {
+            Ok(marks) => marks,
+            Err(e) => {
+                let e = text::marks_not_saved(e);
+                self.error(e);
+                return false;
+            }
+        };
+        let before = marks.clone();
+        let painted = change.apply(marks);
+        let changed = *marks != before;
+        let restep = brush::touchup_input(marks) != brush::touchup_input(&before);
+        if marks.is_empty() {
+            self.state.marks.remove(&owner);
+        }
+        if !changed {
+            return false;
+        }
+        if shown && painted.is_some() {
+            self.state.brush.active = painted;
+        }
+        self.helper_queue
+            .push_back(HelperTask::Marks { owner, change });
+        let behind = self.state.touchup.outdated;
+        let surface = brush::shown_surface(&self.state).map(Path::to_path_buf);
+        if let (Some(surface), true) = (surface, shown && (restep || behind)) {
+            self.want_touchup(surface, None, false);
+            if let Some(job) = self.jobs.status().filter(|_| restep) {
+                self.info(text::touchup_after_job(&job.label));
+            }
+        }
+        true
+    }
+
+    /// A step of Stelle `nr` of the surface shown ([`Action::Smooth`], [`Action::Retexture`]):
+    /// into `stellen.toml` like a stroke, then the touch-up of the surface queued, to tell what
+    /// came of the step. Refused with the reason while it cannot be done
+    /// ([`brush::mark_steps_blocked`]).
+    fn touchup_step(&mut self, nr: u32, change: MarkChange) {
+        if let Some(why) = brush::mark_steps_blocked(&self.state, nr) {
+            self.warn(why);
+            return;
+        }
+        let (Some(owner), Some(surface)) = (
+            brush::shown_owner(&self.state).map(Path::to_path_buf),
+            brush::shown_surface(&self.state).map(Path::to_path_buf),
+        ) else {
+            return;
+        };
+        if !self.change_marks(owner.clone(), change) {
+            self.warn(text::mark_gone(nr));
+            return;
+        }
+        // the step just added: the youngest of the Stelle
+        let seq = self
+            .mark_of(&owner, nr)
+            .and_then(|m| m.steps.last())
+            .map(EditStep::seq);
+        self.want_touchup(surface, seq.map(|seq| (nr, seq)), false);
+    }
+
+    /// Stelle `nr` of the map or model in `owner`, as shown ([`AppState::marks`]).
+    fn mark_of(&self, owner: &Path, nr: u32) -> Option<&driftless_steps::marks::Mark> {
+        let marks = self.state.marks.get(owner)?.as_ref().ok()?;
+        marks.marks.iter().find(|m| m.nr == nr)
+    }
+
+    /// Queues the touch-up of the surface folder `surface`, once per surface: a wish for one
+    /// that waits goes with it (keeping the step just added, `step`, and telling what came of
+    /// it if either wish does, `tell`: see [`TouchupWish`]). It starts once the Stellen are
+    /// saved and no step runs ([`Self::advance_touchup`]).
+    fn want_touchup(&mut self, surface: PathBuf, step: Option<(u32, u64)>, tell: bool) {
+        let waiting = &mut self.state.touchup.waiting;
+        match waiting.iter_mut().find(|w| w.surface == surface) {
+            Some(wish) => {
+                wish.step = step.or(wish.step);
+                wish.tell |= tell;
+            }
+            None => waiting.push_back(TouchupWish {
+                surface,
+                step,
+                tell,
+            }),
+        }
+    }
+
+    /// Starts the touch-up that waits first, once the Stellen are saved, no step runs, the end
+    /// of the last one has been carried out and no project switch waits. One of a surface no
+    /// longer in the tree is dropped.
+    fn advance_touchup(&mut self) {
+        if self.jobs.is_busy()
+            || self.marks_pending()
+            || self.step_end.is_some()
+            || self.pending.is_some()
+            || self.closing
+        {
+            return;
+        }
+        let Some(TouchupWish {
+            surface,
+            step,
+            tell,
+        }) = self.state.touchup.waiting.pop_front()
+        else {
+            return;
+        };
+        if !self.state.all_surfaces().any(|s| s.dir == surface) {
+            return;
+        }
+        let action = Action::Touchup {
+            surface: surface.clone(),
+            step,
+            tell,
+        };
+        // what the window has at hand: the surface shown as the loader read it, the indices
+        let prepared = TouchupPrepared {
+            surface: self.brush.prepared(&surface.join(SURFACE_GLB)),
+            indices: Some(Arc::clone(&self.image_indices)),
+        };
+        if let Err(e) = actions::start_touchup(&mut self.state, &mut self.jobs, &action, prepared) {
+            self.error(e);
+            if let Some((nr, seq)) = step {
+                self.take_back_step(&surface, nr, seq);
+            }
+        }
+    }
+
+    /// Takes the step `seq` of Stelle `nr` of the map or model of the surface folder `surface`
+    /// out of `stellen.toml` again – one that changed nothing or did not run to its end – if it
+    /// is still there.
+    fn take_back_step(&mut self, surface: &Path, nr: u32, seq: u64) -> bool {
+        let Some(owner) = surface.parent().map(Path::to_path_buf) else {
+            return false;
+        };
+        let there = self
+            .mark_of(&owner, nr)
+            .is_some_and(|m| m.steps.iter().any(|s| s.seq() == seq));
+        there && self.change_marks(owner, MarkChange::DropStep { mark: nr, seq })
+    }
+
+    /// The touched-up state of the surface shown for the view (none: as computed; one that
+    /// changes nothing is none to the view), with the places its marks lie in „Nachher“.
+    fn set_view_edit(&mut self, edit: Option<SurfaceEdit>) {
+        self.state.touchup.shown = edit.as_ref().map(|e| e.key);
+        let (edit, moved) = match edit.filter(|e| !e.is_empty()) {
+            Some(e) => (Some(e.edit), e.moved),
+            None => (None, Vec::new()),
+        };
+        self.state.touchup.edited = edit.is_some();
+        self.brush.set_moved(&moved);
+        self.view.set_edit(edit);
+        self.view.show_edit(self.state.touchup.after);
+    }
+
+    /// A touch-up has run: the view gets the touched-up state of the surface shown (current
+    /// again: „Nachher“ is no longer behind), and what came of the step just added (`pressed`:
+    /// Stelle, seq) is told – done (with the hints of the touch-up), or refused and taken out of
+    /// `stellen.toml` again. A touch-up that applied the Stellen to a surface shown, exported or
+    /// new (`tell`) and changed its cache says so, with the steps the surface refuses and the
+    /// hints – images not baked anew with what is missing. Recomputing after ↶ or „Löschen“
+    /// says nothing.
+    fn touchup_done(&mut self, out: TouchupOutput, pressed: Option<(u32, u64)>, tell: bool) {
+        let TouchupOutput {
+            surface,
+            done,
+            no_sources,
+            changed,
+            step: outcome,
+            view,
+        } = out;
+        let shown = brush::shown_surface(&self.state) == Some(surface.as_path());
+        if shown {
+            if let Some((load, edit)) = view {
+                match edit {
+                    ViewEdit::Set(edit) if load == self.state.touchup.load => {
+                        self.set_view_edit(edit)
+                    }
+                    _ => {}
+                }
+            }
+            self.state.touchup.outdated = false;
+            self.state.touchup.variants = done
+                .outcomes
+                .iter()
+                .filter_map(|o| Some(((o.mark, o.seq), variant(o)?)))
+                .collect();
+        }
+        let owner = surface.parent().map(Path::to_path_buf).unwrap_or_default();
+        // the step just added, unless it was taken back or its Stelle went meanwhile
+        let pressed = pressed.and_then(|(nr, seq)| {
+            let step = self
+                .mark_of(&owner, nr)?
+                .steps
+                .iter()
+                .find(|s| s.seq() == seq)?;
+            Some((nr, *step))
+        });
+        if let (Some((nr, step)), Some(outcome)) = (pressed, &outcome) {
+            let retexture = matches!(step, EditStep::Retexture { .. });
+            let refused = match &outcome.refused {
+                Some(why) => Some(text::touchup_refused(nr, why)),
+                // no images to bake from: why (what is missing, or the surface is stale)
+                None if retexture && (no_sources.is_some() || outcome.without_raw_data) => {
+                    Some(match &no_sources {
+                        Some(why) => text::no_images_baked(why),
+                        None => text::RETEXTURE_NO_RAW_DATA.to_string(),
+                    })
+                }
+                None => None,
+            };
+            match (refused, step) {
+                (Some(why), _) => {
+                    self.warn(why);
+                    self.take_back_step(&surface, nr, step.seq());
+                    return;
+                }
+                (None, EditStep::Smooth { level, .. }) => {
+                    self.info(text::touchup_smoothed(nr, level))
+                }
+                (None, EditStep::Retexture { .. }) => {
+                    self.info(text::touchup_retextured(nr, variant(outcome)))
+                }
+            }
+            // the result is what one wants to see
+            self.state.touchup.after = true;
+            self.view.show_edit(true);
+        } else if tell && changed && done.steps > 0 {
+            // the Stellen applied to a surface of the map or model (anew)
+            let label = self
+                .state
+                .all_surfaces()
+                .find(|s| s.dir == surface)
+                .map_or_else(|| surface.display().to_string(), |s| s.label.clone());
+            self.info(text::touchup_applied(&label));
+            for (nr, why) in &done.refused {
+                self.info(text::touchup_refused(*nr, why));
+            }
+        } else {
+            return;
+        }
+        self.tell_hints(&done.hints, no_sources.as_ref());
+    }
+
+    /// Tells the hints of a touch-up: that images were not baked anew says why, with
+    /// `no_sources` (what is missing), instead of the bare hint; each once.
+    fn tell_hints(&mut self, hints: &[String], no_sources: Option<&NoSources>) {
+        let mut told: Vec<String> = Vec::new();
+        for hint in hints {
+            let hint = match no_sources {
+                Some(why) if hint == NO_RAW_DATA || hint == STALE_SURFACE => {
+                    text::no_images_baked(why)
+                }
+                _ => hint.clone(),
+            };
+            if !told.contains(&hint) {
+                told.push(hint.clone());
+                self.info(hint);
+            }
+        }
+    }
+
+    /// A change of the Stellen of `owner` was written (or refused): the file as it is now is
+    /// shown, unless a later change of it is still to be written (it brings its own); a refusal
+    /// is said, and the tree – with the Stellen as the file has them – is read again.
+    fn marks_written(&mut self, owner: PathBuf, result: Result<JobOutput, StepError>) {
+        self.marks_saved += 1;
+        let later = self
+            .helper_queue
+            .iter()
+            .any(|t| matches!(t, HelperTask::Marks { owner: o, .. } if *o == owner));
+        match result {
+            Ok(JobOutput::Marks(marks)) if !later => {
+                if marks.is_empty() {
+                    self.state.marks.remove(&owner);
+                } else {
+                    self.state.marks.insert(owner, Ok(*marks));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.error(text::marks_not_saved(&text::step_error(&e)));
+                self.refresh_tree();
+            }
+        }
+    }
+
+    /// Whether a change of the Stellen is still to be written.
+    fn marks_pending(&self) -> bool {
+        let marks = |t: &HelperTask| matches!(t, HelperTask::Marks { .. });
+        self.helper_running.as_ref().is_some_and(marks) || self.helper_queue.iter().any(marks)
+    }
+
+    /// Chooses Stelle `nr` of the surface shown and looks straight at it.
+    fn frame_mark(&mut self, nr: u32) {
+        self.state.brush.active = Some(nr);
+        let (Some(origin), Some((centre, normal, size))) =
+            (self.view_origin(), self.brush.place_of(&self.state, nr))
+        else {
+            return;
+        };
+        let view = self.layout.view;
+        let aspect = if view.height() > 0.0 {
+            view.width() / view.height()
+        } else {
+            1.0
+        };
+        let centre = relative_to(origin, centre);
+        self.view
+            .camera_mut()
+            .frame_facing(centre, normal, brush::frame_radius(size), aspect);
     }
 
     /// A switch of point pair `index` ended: the pairs are read again, the answer goes into
@@ -1907,6 +2497,321 @@ impl DriftlessApp {
             Ok(()) => self.info(text::pair_switched(index + 1, enabled)),
             Err(e) => self.error(e.to_string()),
         }
+    }
+
+    /// „Melden“ (⇧⇧, „Melden …“ in the bar of the brush), about Stelle `mark` if given. With a
+    /// GPU the picture of the window is asked for first, and the dialog opens in the frame it
+    /// comes in ([`Self::feedback_picture`]); without one at once, without a picture. One at a
+    /// time.
+    fn ask_feedback(&mut self, mark: Option<u32>) {
+        if self.state.feedback_dialog.is_some() || self.feedback_ask.is_some() {
+            return;
+        }
+        if self.render_state.is_none() {
+            self.open_feedback(mark, None);
+            return;
+        }
+        self.feedback_ask = Some(FeedbackAsk { mark, asked: None });
+    }
+
+    /// While „Melden“ waits for the picture of the window: asks for it once; opens the dialog in
+    /// the frame it comes in – painted after the frame that asked, so the dialog is not in it –
+    /// or without it after [`SHOT_WAIT`].
+    fn feedback_picture(&mut self, ctx: &egui::Context) {
+        let Some(ask) = self.feedback_ask else {
+            return;
+        };
+        let (time, image) = ctx.input(|i| {
+            let image = i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot {
+                    user_data, image, ..
+                } if is_feedback_shot(user_data) => Some(image.clone()),
+                _ => None,
+            });
+            (i.time, image)
+        });
+        let late = ask.asked.is_some_and(|at| time - at > SHOT_WAIT);
+        if image.is_some() || late {
+            self.feedback_ask = None;
+            self.open_feedback(ask.mark, image);
+            return;
+        }
+        if ask.asked.is_none() {
+            let shot = egui::UserData::new(FeedbackShot);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(shot));
+            self.feedback_ask = Some(FeedbackAsk {
+                asked: Some(time),
+                ..ask
+            });
+        }
+        // the next frames paint the picture and bring it
+        ctx.request_repaint();
+    }
+
+    /// Opens „Melden“ with the picture of the window, the Stellen of the surface shown (ticked if
+    /// there are any), the Stelle `mark` named if it is one of them, and what comes along by
+    /// itself ([`Self::feedback_context`]).
+    fn open_feedback(&mut self, mark: Option<u32>, image: Option<Arc<egui::ColorImage>>) {
+        let marks = brush::shown_marks(&self.state)
+            .and_then(|(_, marks)| marks)
+            .cloned();
+        let named = mark.and_then(|nr| {
+            let m = marks.as_ref()?.marks.iter().find(|m| m.nr == nr)?;
+            Some((nr, m.label()))
+        });
+        let context = self.feedback_context();
+        self.state.feedback_dialog = Some(FeedbackDialog::new(context, image, marks, named));
+    }
+
+    /// What comes along with a report without the user: version, system, graphics adapter, the
+    /// project, the step, the selection and the camera of the view.
+    fn feedback_context(&self) -> Feedback {
+        let mut f = Feedback::new(FeedbackKind::default());
+        f.version = super::about::version_line();
+        f.system = logfile::os_text();
+        f.graphics = self.graphics.clone().unwrap_or_default();
+        f.step = Some(super::feedback::step_word(self.state.step).to_string());
+        f.project = self
+            .state
+            .project
+            .as_ref()
+            .map(|p| FeedbackProject::new(&p.name, &p.dir));
+        f.selection = super::feedback::selection_record(&self.state);
+        f.camera = self.camera_state().map(FeedbackCamera::new);
+        f
+    }
+
+    /// The camera of the view in absolute coordinates, if the view draws something: in the frame
+    /// it last drew in.
+    fn camera_state(&self) -> Option<CameraState> {
+        let shown = self.cloud.is_some() || self.overlay.is_some() || self.view.has_surface();
+        let drawn = shown && self.render_state.is_some();
+        let origin = self.view.view_origin().filter(|_| drawn)?;
+        Some(self.view.camera().state(origin))
+    }
+
+    /// „Melden“ in the dialog: the report is written in the background as a folder of its own,
+    /// with the last lines of the log file (else of the Protokoll); the dialog closes. Without a
+    /// folder for the reports it stays, and says so.
+    fn send_feedback(&mut self) {
+        let Some(dialog) = self.state.feedback_dialog.take() else {
+            return;
+        };
+        let dir = self.feedback_dir.clone().filter(|_| dialog.can_send());
+        let Some(dir) = dir else {
+            if dialog.can_send() {
+                self.error(text::FEEDBACK_NO_FOLDER.into());
+            }
+            self.state.feedback_dialog = Some(dialog);
+            return;
+        };
+        let created = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        let job = FeedbackJob {
+            dir,
+            report: dialog.report(created),
+            image: dialog.image_to_attach(),
+            marks: dialog.marks_to_attach(),
+            log_file: self.log_file.as_ref().map(|f| f.path().to_path_buf()),
+            log: self.protocol_lines(crate::feedback::LOG_LINES),
+        };
+        self.feedback_saving.push_back(dialog);
+        self.helper_queue
+            .push_back(HelperTask::Feedback(Box::new(job)));
+    }
+
+    /// The last `n` lines of the Protokoll of the window, as the log file writes them.
+    fn protocol_lines(&self, n: usize) -> Vec<String> {
+        let log = &self.state.log;
+        log[log.len().saturating_sub(n)..]
+            .iter()
+            .map(|e| {
+                let level = match e.kind {
+                    LogKind::Info => Level::Info,
+                    LogKind::Warning => Level::Warning,
+                    LogKind::Error => Level::Error,
+                };
+                logfile::format_line(&e.time, level, &e.text)
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// A report was written (or not): „Meldung gespeichert“, and an open list reads it anew; if
+    /// it failed, why, and the dialog opens again with what was typed.
+    fn feedback_written(&mut self, result: Result<JobOutput, StepError>) {
+        let dialog = self.feedback_saving.pop_front();
+        match result {
+            Ok(output) => {
+                if let (JobOutput::FeedbackSaved(folder), Some(file)) = (&output, &self.log_file) {
+                    file.write(Level::Info, &folder.display().to_string());
+                }
+                self.info(text::FEEDBACK_SAVED.to_string());
+                if self.state.feedback_list.is_some() {
+                    self.open_reports();
+                }
+            }
+            Err(e) => {
+                self.error(text::feedback_not_saved(&text::step_error(&e)));
+                if self.state.feedback_dialog.is_none() {
+                    self.state.feedback_dialog = dialog;
+                }
+            }
+        }
+    }
+
+    /// Whether a report is still to be written.
+    fn feedback_pending(&self) -> bool {
+        let feedback = |t: &HelperTask| matches!(t, HelperTask::Feedback(_));
+        self.helper_running.as_ref().is_some_and(feedback) || self.helper_queue.iter().any(feedback)
+    }
+
+    /// ☰ → „Meldungen …“: the window with the reports, read anew from their folder.
+    fn open_reports(&mut self) {
+        let Some(dir) = self.feedback_dir.clone() else {
+            self.state.feedback_list = Some(ReportList {
+                problem: Some(text::FEEDBACK_NO_FOLDER.into()),
+                ..ReportList::default()
+            });
+            return;
+        };
+        let reading = ReportList {
+            reading: true,
+            ..ReportList::default()
+        };
+        // the reports read before stay shown until the new ones are there
+        let list = self.state.feedback_list.get_or_insert(reading);
+        list.reading = true;
+        list.problem = None;
+        self.helper_queue
+            .retain(|t| !matches!(t, HelperTask::ReadReports(_)));
+        self.helper_queue.push_back(HelperTask::ReadReports(dir));
+    }
+
+    /// The reports were read: into the list, if it is still open.
+    fn reports_read(&mut self, result: Result<JobOutput, StepError>) {
+        let Some(list) = &mut self.state.feedback_list else {
+            return;
+        };
+        list.reading = false;
+        match result {
+            Ok(JobOutput::Reports(reports)) => list.reports = reports,
+            Ok(_) => {}
+            Err(e) => list.problem = Some(text::step_error(&e)),
+        }
+    }
+
+    /// „Zur Ansicht“ of the report in `folder` (of the list): its project is opened if another
+    /// one is shown, then [`Self::advance_report_view`] sets its step, selection and camera.
+    fn report_view(&mut self, folder: &Path) {
+        let report = self
+            .state
+            .feedback_list
+            .as_ref()
+            .and_then(|l| l.reports.iter().find(|(p, _)| p == folder))
+            .map(|(_, f)| f.clone());
+        let Some(report) = report else {
+            self.error(text::REPORT_GONE.into());
+            return;
+        };
+        self.state.feedback_list = None;
+        let project = report.project.map(|p| p.dir);
+        if let Some(dir) = &project {
+            if !self.is_open(dir) {
+                self.apply(Action::OpenProject(dir.clone()));
+            }
+        }
+        let selection = report
+            .selection
+            .as_ref()
+            .and_then(super::feedback::selection_of);
+        self.report_view = Some(ReportView {
+            project,
+            step: report.step.as_deref().and_then(super::feedback::step_of),
+            selection,
+            camera: report.camera.map(|c| c.state),
+            selected: false,
+        });
+    }
+
+    /// „Zur Ansicht“ goes on as far as it can: once the project of the report is shown (its tree
+    /// read; a switch that waits for a step to stop waits too) its step and selection are set –
+    /// not before, the project shown resets the selection –; once what they load is loaded and
+    /// the run of the selection is read, the camera is set, by the view once it has all of it on
+    /// the GPU ([`View3d::restore_camera`]). Gives up if the project did not open (that said why).
+    fn advance_report_view(&mut self) {
+        let Some(view) = &self.report_view else {
+            return;
+        };
+        if !view.selected {
+            let opening = self.pending.is_some()
+                || self.state.opening.is_some()
+                || self.tree_pending()
+                || self.step_end.is_some();
+            if opening {
+                return;
+            }
+            if let Some(dir) = view.project.clone() {
+                if !self.is_open(&dir) {
+                    self.report_view = None;
+                    return;
+                }
+            }
+            let Some(view) = self.report_view.as_mut() else {
+                return;
+            };
+            view.selected = true;
+            let (step, selection) = (view.step.take(), view.selection.take());
+            if let Some(step) = step {
+                self.set_step(step);
+            }
+            match selection {
+                Some(s) if super::feedback::selection_known(&self.state, &s) => {
+                    self.apply(Action::Select(s))
+                }
+                Some(_) => self.info(text::REPORT_SELECTION_GONE.into()),
+                None => {}
+            }
+            // the run of the selection is asked for in the next tick
+            return;
+        }
+        if self.is_loading() || self.is_loading_surface() || self.run_loading() {
+            return;
+        }
+        if let Some(camera) = self.report_view.take().and_then(|v| v.camera) {
+            self.state.view.camera_mode = camera.mode;
+            self.restore_camera(camera);
+        }
+    }
+
+    /// Whether the run drawn is being read.
+    fn run_loading(&self) -> bool {
+        let run = |t: &HelperTask| matches!(t, HelperTask::LoadRun(_));
+        self.helper_running.as_ref().is_some_and(run) || self.helper_queue.iter().any(run)
+    }
+
+    /// Sets the camera of the view as `camera` says: by the view, once what it shows is up on
+    /// the GPU and framed; without a GPU (or with nothing to draw) at once, in the frame the view
+    /// would draw in.
+    fn restore_camera(&mut self, camera: CameraState) {
+        let shown = self.cloud.is_some() || self.overlay.is_some() || self.view.has_surface();
+        if self.render_state.is_some() && shown {
+            self.view.restore_camera(camera);
+            return;
+        }
+        let origin = self
+            .view
+            .view_origin()
+            .or_else(|| self.view_origin())
+            .or_else(|| self.overlay.as_ref().map(|o| o.origin))
+            .unwrap_or([0.0; 3]);
+        self.view.camera_mut().restore(&camera, origin);
+    }
+
+    /// Whether „Zur Ansicht“ of a report is still under way: its project, selection or camera
+    /// not set yet.
+    pub fn report_view_pending(&self) -> bool {
+        self.report_view.is_some() || self.view.camera_pending()
     }
 
     /// Once per frame: takes a finished step, the new log lines and the progress.
@@ -1941,12 +2846,15 @@ impl DriftlessApp {
         self.sync_run();
         self.sync_compare();
         self.tick_helper();
+        self.advance_touchup();
         self.state.map_status_pending = self.map_status_pending();
         if let Some(batch) = self.compute_all_waiting {
             if !self.state.map_status_pending {
                 self.compute_all(batch);
             }
         }
+        // last: what the selection of a report loads starts here, its run is read next tick
+        self.advance_report_view();
     }
 
     fn finished(&mut self, f: JobFinished) {
@@ -1962,13 +2870,18 @@ impl DriftlessApp {
                     (JobOutput::Exported(report), Some(Action::RunExport(req))) => {
                         self.info(text::exported(report, req.format.kind()))
                     }
+                    // the touch-up says itself what came of it
+                    (JobOutput::Touchup(_), _) => {}
                     _ => self.info(text::job_done(&f.label, &text::duration(f.seconds))),
                 }
                 Some(output)
             }
             Err(StepError::Cancelled) => {
                 self.info(text::job_cancelled(&f.label));
-                self.stop_queue();
+                // a touch-up stops alone: the queue the window put it in goes on
+                if !matches!(step, Some(Action::Touchup { .. })) {
+                    self.stop_queue();
+                }
                 None
             }
             Err(e) => {
@@ -1983,9 +2896,13 @@ impl DriftlessApp {
             seconds: f.seconds,
         };
         // the step may have added runs or maps: its result is shown once the tree is read
-        // again (also after a check or an export: whatever changed on disk meanwhile shows)
+        // again (also after a check or an export: whatever changed on disk meanwhile shows);
+        // a touch-up changes nothing the tree shows
+        let touchup = matches!(end.step, Some(Action::Touchup { .. }));
         self.step_end = Some(end);
-        self.refresh_tree();
+        if !touchup {
+            self.refresh_tree();
+        }
     }
 
     /// The end of a step, once the tree after it is read: the queue counts it, its result is
@@ -2007,8 +2924,9 @@ impl DriftlessApp {
         // job, nor take the view from the user.
         let show = !queued
             || (self.state.queue.is_empty() && hand_loads.is_none_or(|n| n == self.hand_loads));
-        // an export shows nothing: a surface picked meanwhile stays one picked by hand
-        if show && !matches!(step, Some(Action::RunExport(_))) {
+        // an export or a touch-up shows nothing: a surface picked meanwhile stays one picked
+        // by hand
+        if show && !matches!(step, Some(Action::RunExport(_) | Action::Touchup { .. })) {
             self.surface_by_hand = false;
         }
         // a reuse started with the count of written changes (taken also if it failed)
@@ -2063,6 +2981,37 @@ impl DriftlessApp {
                     self.state.selection = Selection::Surface(done.dir.clone());
                     self.load_surface(&done.dir);
                 }
+                // a new surface of a map or model with a touch-up takes it over
+                let owner = done.dir.parent().unwrap_or(&done.dir);
+                let marks = self.state.marks.get(owner).and_then(|m| m.as_ref().ok());
+                if marks.is_some_and(brush::has_steps) {
+                    self.want_touchup(done.dir.clone(), None, true);
+                }
+            }
+            (Some(JobOutput::Touchup(out)), Some(Action::Touchup { step, tell, .. })) => {
+                self.touchup_done(*out, step, tell)
+            }
+            // cancelled or failed: the step just added did not happen, it goes again
+            (
+                None,
+                Some(Action::Touchup {
+                    surface,
+                    step: Some((nr, seq)),
+                    ..
+                }),
+            ) => {
+                if self.take_back_step(&surface, nr, seq) {
+                    self.info(text::touchup_taken_back(nr));
+                }
+            }
+            // a recompute that did not run to its end: „Nachher“ of the surface shown is behind
+            // its Stellen until the next change computes it
+            (None, Some(Action::Touchup { surface, .. })) => {
+                let shown = brush::shown_surface(&self.state) == Some(surface.as_path());
+                if shown && self.pending.is_none() && !self.closing {
+                    self.state.touchup.outdated = true;
+                    self.info(text::TOUCHUP_OUTDATED.into());
+                }
             }
             (Some(JobOutput::Inspect(report)), Some(Action::Inspect(scan))) => {
                 self.state.inspect = Some(InspectResult {
@@ -2073,6 +3022,7 @@ impl DriftlessApp {
             }
             _ => {}
         }
+        self.advance_touchup();
         self.advance_queue();
         if let Some(action) = self.pending.take() {
             self.apply(action);
@@ -2352,8 +3302,11 @@ impl DriftlessApp {
             }
             // the status bar shows the step if one runs, else the load
             Action::Cancel if self.jobs.is_busy() => {
-                // nothing of the queue starts after the step that is stopped
-                self.stop_queue();
+                // nothing of the queue starts after the step that is stopped – but a touch-up
+                // the window put in between stops alone
+                if !matches!(self.state.running, Some(Action::Touchup { .. })) {
+                    self.stop_queue();
+                }
                 self.jobs.cancel();
             }
             Action::Cancel => {
@@ -2484,11 +3437,22 @@ impl DriftlessApp {
                 }
             }
             Action::OpenExport(source) => {
+                // the touch-up of a surface not shown may not be current yet
+                if let ExportSource::EditedSurface(dir) = &source {
+                    self.want_touchup(dir.clone(), None, true);
+                }
                 let name = export::source_name(&self.state, &source);
                 self.state.export = ExportDialog::new(vec![(source, name)]);
             }
             Action::OpenExportShown => {
-                match ExportDialog::new(export::shown_sources(&self.state)) {
+                let sources = export::shown_sources(&self.state);
+                // its touch-up is current before the export reads it (at once if it is)
+                for (source, _) in &sources {
+                    if let ExportSource::EditedSurface(dir) = source {
+                        self.want_touchup(dir.clone(), None, true);
+                    }
+                }
+                match ExportDialog::new(sources) {
                     Some(dialog) => self.state.export = Some(dialog),
                     None => self.info(text::EXPORT_NEEDS_VIEW.into()),
                 }
@@ -2523,6 +3487,52 @@ impl DriftlessApp {
                     None => self.error(text::unknown_scan(&id)),
                 }
             }
+            Action::Paint { owner, mark, dabs } => {
+                self.change_marks(owner, MarkChange::Paint { mark, dabs });
+            }
+            Action::SelectMark(nr) => self.state.brush.active = nr,
+            Action::FrameMark(nr) => self.frame_mark(nr),
+            Action::DeleteMark(nr) => {
+                if let Some(owner) = brush::shown_owner(&self.state).map(Path::to_path_buf) {
+                    if self.state.brush.active == Some(nr) {
+                        self.state.brush.active = None;
+                    }
+                    self.change_marks(owner, MarkChange::Delete(nr));
+                }
+            }
+            Action::UndoMark => {
+                if let Some(owner) = brush::shown_owner(&self.state).map(Path::to_path_buf) {
+                    self.change_marks(owner, MarkChange::Undo);
+                }
+            }
+            Action::Smooth { mark, level } => {
+                self.touchup_step(mark, MarkChange::Smooth { mark, level })
+            }
+            Action::Retexture { mark } => match brush::retexture_blocked(&self.state) {
+                Some(why) => self.warn(why),
+                None => self.touchup_step(mark, MarkChange::Retexture { mark }),
+            },
+            Action::ShowEdit(after) => {
+                self.state.touchup.after = after;
+                self.view.show_edit(after);
+            }
+            Action::OpenFeedback { mark } => self.ask_feedback(mark),
+            Action::SendFeedback => self.send_feedback(),
+            Action::OpenReports => self.open_reports(),
+            Action::OpenReportFolder(dir) => {
+                if let Err(e) = super::about::open_with_system(dir.as_os_str()) {
+                    self.error(text::open_failed(
+                        &dir.display().to_string(),
+                        &e.to_string(),
+                    ));
+                }
+            }
+            Action::ReportView(dir) => self.report_view(&dir),
+            Action::Touchup {
+                surface,
+                step,
+                tell,
+            } => self.want_touchup(surface, step, tell),
         }
     }
 
@@ -2847,10 +3857,33 @@ impl DriftlessApp {
             ctx.request_repaint_after(REPAINT_WHILE_BUSY);
         }
         self.update_title(&ctx);
-        show_mode_key(&ctx, &mut self.state);
-        tools::keys(&ctx, &mut self.state);
+        // while „Melden“ is open the keys of the view and the brush wait (Esc closes it)
+        let reporting = self.state.feedback_dialog.is_some();
+        if !reporting {
+            show_mode_key(&ctx, &mut self.state);
+            tools::keys(&ctx, &mut self.state);
+        }
+        // ⇧⇧ anywhere: „Melden“
+        if ctx.input(|i| self.double_shift.feed(&i.events, i.time)) {
+            self.ask_feedback(None);
+        }
+        self.feedback_picture(&ctx);
 
         let mut actions: Vec<Action> = Vec::new();
+        if !reporting {
+            actions.extend(brush::keys(&ctx, &mut self.state));
+        }
+        // without a surface of the project to paint on the brush goes back to „Drehen“
+        if self.state.tool == Tool::Brush && brush::blocked(&self.state).is_some() {
+            tools::select(&mut self.state, Tool::Orbit);
+        }
+        // the marks lie on the state drawn: „Nachher“ where the touch-up moved them
+        self.view.show_edit(self.state.touchup.after);
+        self.brush.set_after(self.state.touchup.after);
+        if let Some(marks) = self.brush.sync(&mut self.state) {
+            self.view.set_marks(marks);
+        }
+        let brush_chosen = self.state.tool == Tool::Brush;
         self.layout.rail = egui::Panel::left("leiste")
             .exact_size(rail::WIDTH)
             .resizable(false)
@@ -2879,6 +3912,8 @@ impl DriftlessApp {
         super::about::show(&ctx, &mut self.state.about_open);
         actions.extend(export::show(&ctx, &mut self.state));
         actions.extend(super::manage::show(&ctx, &mut self.state));
+        actions.extend(super::feedback::show_list(&ctx, &mut self.state));
+        actions.extend(super::feedback::show_dialog(&ctx, &mut self.state));
         self.view.set_tool(self.state.tool);
         self.view
             .set_picked(self.state.picked.as_ref().map(|p| p.index));
@@ -2900,10 +3935,28 @@ impl DriftlessApp {
                     event = self
                         .view
                         .show(ui, rs, self.cloud.as_ref(), overlay, &self.state.view);
+                    if let Some(origin) = origin {
+                        let uploading = self.view.is_uploading_surface();
+                        let input = self.view.brush_input();
+                        let camera = self.view.camera();
+                        let stroke =
+                            self.brush
+                                .input(&mut self.state, input, camera, origin, uploading);
+                        actions.extend(stroke);
+                    }
+                    let active = self.state.brush.active;
+                    if let Some(marks) = self.brush.take_marks(active, brush_chosen) {
+                        self.view.set_marks(marks);
+                        ui.ctx().request_repaint();
+                    }
                     if let (Some(origin), false) = (origin, self.view.is_uploading()) {
                         let camera = self.view.camera();
                         tools::paint_measurements(ui, rect, camera, origin, &self.state);
                         tools::paint_pairs(ui, rect, camera, origin, &self.state);
+                        if self.state.tool == Tool::Brush {
+                            let radius = self.state.brush.radius;
+                            self.brush.paint_ring(ui, rect, camera, origin, radius);
+                        }
                     }
                 }
                 (None, true) => {
@@ -2917,6 +3970,7 @@ impl DriftlessApp {
                     ui.centered_and_justified(|ui| ui.weak(hint));
                 }
             });
+        self.state.brush.painting = self.brush.painting();
         self.no_surface_hint(&ctx, central.response.rect);
         self.drop_hint(&ctx);
         match ctx.input(|i| dropped(&i.raw.dropped_files)) {
@@ -2973,6 +4027,14 @@ impl DriftlessApp {
         }
         tools::remember_text_focus(&ctx);
     }
+}
+
+/// What a step of a touch-up baked, as the list and the status bar say it ([`Variant`]).
+fn variant(o: &driftless_steps::touchup::StepOutcome) -> Option<Variant> {
+    Some(Variant {
+        of: o.variant_of?,
+        from: o.image.as_ref().map(|i| i.from),
+    })
 }
 
 /// What opening the file `path` asks for, by its extension ([`file_kind`]): a point cloud is
