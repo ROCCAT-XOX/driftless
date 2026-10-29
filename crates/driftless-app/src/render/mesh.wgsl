@@ -1,11 +1,14 @@
 // The textured surface: unlit triangles showing their photo page as it is.
 
+// The same block as in mark.wgsl (`MeshUniforms` in mesh.rs).
 struct Mesh {
     view_proj: mat4x4<f32>,
     // Added to every position: the surface's origin minus the view's (xyz).
     offset: vec4<f32>,
     // Height cut: fragments with z outside x..y are not drawn.
     z_range: vec4<f32>,
+    // For mark.wgsl: x = width of a Stelle's outline (physical pixels).
+    mark: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> mesh: Mesh;
@@ -13,7 +16,9 @@ struct Mesh {
 @group(1) @binding(1) var page_sampler: sampler;
 
 struct Out {
-    @builtin(position) clip: vec4<f32>,
+    // Invariant and computed exactly as in mark.wgsl: the copy of a triangle that marks a
+    // Stelle gets the same depth, bit for bit.
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) z: f32,
 };

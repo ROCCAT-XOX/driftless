@@ -11,13 +11,18 @@
 //! (JPEG or PNG, decoded to RGBA). A page without an image gets a 1 × 1 texture in its colour.
 //! The mipmaps of every page are made here too, in the loader's thread, so that the UI thread
 //! only copies them to the GPU.
+//!
+//! [`mesh_edit`] turns what the touch-up changes on a surface (`page_edits` of
+//! `driftless-map`) into the touched-up state the view draws beside the computed one
+//! ([`crate::render::mesh::MeshRenderer::set_edit`]), made the same way.
 
-use crate::render::mesh::mip_levels;
 pub use crate::render::mesh::MeshVertex;
+use crate::render::mesh::{mip_levels, MeshEdit};
 use crate::ui::text;
-use driftless_export::mesh::{read_mesh, ImageKind, MeshPage};
+use driftless_export::mesh::{read_mesh, ImageKind, Mesh, MeshPage};
 use driftless_export::ExportError;
 use driftless_io::progress::Progress;
+use driftless_map::surface::edit::PageEdit;
 use driftless_steps::StepError;
 use image::RgbaImage;
 use rayon::prelude::*;
@@ -162,18 +167,76 @@ fn loaded_page(
         }
     };
     let mips = mip_levels(&image);
-    let uv = |i: usize| page.uvs.get(i).copied().unwrap_or(NO_UV);
-    let vertices = page
-        .positions
+    let vertices = vertices(&page.positions, &page.uvs, origin);
+    let indices = page.indices.iter().flatten().copied().collect();
+    Ok(((vertices, indices, image), mips))
+}
+
+/// Corners for the GPU: `positions` relative to `origin` (subtracted in f64, then cast), each
+/// with its texture coordinate of `uvs` ([`NO_UV`] without).
+fn vertices(positions: &[[f64; 3]], uvs: &[[f32; 2]], origin: [f64; 3]) -> Vec<MeshVertex> {
+    positions
         .iter()
         .enumerate()
         .map(|(i, p)| MeshVertex {
             pos: [0, 1, 2].map(|k| (p[k] - origin[k]) as f32),
-            uv: uv(i),
+            uv: uvs.get(i).copied().unwrap_or(NO_UV),
+        })
+        .collect()
+}
+
+/// What the touch-up changes on the surface `mesh` (as read from its file, loaded with
+/// `origin`, its [`LoadedSurface::origin`]), for
+/// [`crate::render::mesh::MeshRenderer::set_edit`]: `edits` and `added` are what
+/// `driftless_map::surface::edit::page_edits` gives for `mesh`. A changed page gets all its
+/// corners anew if some moved – made like [`load_mesh`] makes them, with the page's texture
+/// coordinates, so a mark made from the moved places lies on them bit for bit – and its
+/// triangles without those taken off. The added pages are decoded with their mipmaps, in
+/// parallel: call it off the UI thread.
+///
+/// # Errors
+/// The message of [`text::bad_texture`] if the image of an added page cannot be read (counted
+/// as in the touched-up surface, after the pages of `mesh`).
+///
+/// # Panics
+/// If an edit names a page `mesh` does not have (edits of another surface).
+pub fn mesh_edit(
+    origin: [f64; 3],
+    mesh: &Mesh,
+    edits: Vec<PageEdit>,
+    added: Vec<MeshPage>,
+) -> Result<MeshEdit, String> {
+    let pages = edits
+        .into_iter()
+        .map(|edit| {
+            let page = &mesh.pages[edit.page as usize];
+            let vertices = edit
+                .positions
+                .map(|positions| vertices(&positions, &page.uvs, origin));
+            let indices = (!edit.removed.is_empty()).then(|| {
+                page.indices
+                    .iter()
+                    .enumerate()
+                    .filter(|&(t, _)| edit.removed.binary_search(&(t as u32)).is_err())
+                    .flat_map(|(_, tri)| *tri)
+                    .collect()
+            });
+            (edit.page, vertices, indices)
         })
         .collect();
-    let indices = page.indices.iter().flatten().copied().collect();
-    Ok(((vertices, indices, image), mips))
+    let first = mesh.pages.len();
+    let (extra, extra_mips) = added
+        .into_par_iter()
+        .enumerate()
+        .map(|(i, page)| loaded_page(page, origin).map_err(|e| text::bad_texture(first + i, &e)))
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .unzip();
+    Ok(MeshEdit {
+        pages,
+        extra,
+        extra_mips,
+    })
 }
 
 /// Centre of the bounds of `points` in whole metres; 0 without points.

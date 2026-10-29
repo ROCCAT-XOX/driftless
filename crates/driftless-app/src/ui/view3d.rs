@@ -22,6 +22,10 @@
 //! Punktwolke / beides“ ([`ShowMode`]) picks what is drawn. It goes to the GPU a few pages per
 //! frame (about [`UPLOAD_SLICE_BYTES`]), the surface shown before stays until the last page is
 //! up. Picking still looks at points only.
+//!
+//! Over the surface the view marks the Stellen ([`View3d::set_marks`]) and draws its touched-up
+//! state („Nachher“, [`View3d::set_edit`], [`View3d::show_edit`]). Both belong to the surface
+//! last given: they wait until it is on the GPU, and a new surface drops them.
 
 use super::tools::Tool;
 use super::{text, ViewSettings};
@@ -31,7 +35,7 @@ use crate::lod::{select_nodes, Octree, PointVertex};
 use crate::overlay::RunOverlay;
 use crate::overlay::{COMPARE_B_COLOR, COMPARE_COLOR, PICK_COLOR};
 use crate::pick::{pick_point_spots, project, to_physical, Spots};
-use crate::render::mesh::MeshRenderer;
+use crate::render::mesh::{MarkTriangle, MeshEdit, MeshRenderer};
 use crate::render::{
     ColorMode, FrameParams, PointRenderer, PointSize, RenderTarget, ShowMode, NO_CUT,
 };
@@ -272,6 +276,11 @@ struct FrameKey {
     point_m: f32,
     /// How often a surface was uploaded, and the origin it is drawn in.
     surface: (u64, Option<[f64; 3]>),
+    /// How often the marks and the touched-up state on the GPU were replaced.
+    marks: u64,
+    edit: u64,
+    /// „Nachher“: the touched-up state is drawn.
+    show_edit: bool,
 }
 
 /// The surface on the GPU: what the view still needs of it.
@@ -336,6 +345,14 @@ pub struct View3d {
     next_page: usize,
     surface: Option<SurfaceShown>,
     surface_count: u64,
+    /// Marks and a touched-up state (`Some(None)`: none) waiting for the surface to be on the
+    /// GPU, and how often those on the GPU were replaced.
+    pending_marks: Option<Vec<MarkTriangle>>,
+    pending_edit: Option<Option<MeshEdit>>,
+    marks_count: u64,
+    edit_count: u64,
+    /// „Nachher“: draw the touched-up state.
+    show_edit: bool,
 }
 
 impl View3d {
@@ -350,8 +367,11 @@ impl View3d {
         self.last = None;
     }
 
-    /// Shows `surface` from the next frame on (replacing the one shown), or none.
+    /// Shows `surface` from the next frame on (replacing the one shown), or none. Marks and a
+    /// touched-up state given before belong to the surface before: they are dropped.
     pub fn set_surface(&mut self, surface: Option<LoadedSurface>) {
+        self.pending_marks = None;
+        self.pending_edit = None;
         if surface.is_none() {
             if let Some(mesh) = &mut self.mesh {
                 mesh.clear();
@@ -362,6 +382,25 @@ impl View3d {
         self.pending_surface = surface;
         self.next_page = 0;
         self.last = None;
+    }
+
+    /// Marks `tris` on the surface last given ([`View3d::set_surface`]), replacing the marks
+    /// before (none: empty): drawn from the next frame on, once the surface is on the GPU. See
+    /// [`MeshRenderer::set_marks`] for what they must be.
+    pub fn set_marks(&mut self, tris: Vec<MarkTriangle>) {
+        self.pending_marks = Some(tris);
+    }
+
+    /// The touched-up state of the surface last given, replacing the one before, or none;
+    /// uploaded once the surface is on the GPU ([`MeshRenderer::set_edit`]).
+    pub fn set_edit(&mut self, edit: Option<MeshEdit>) {
+        self.pending_edit = Some(edit);
+    }
+
+    /// Draws the touched-up state („Nachher“, `true`) or the computed surface („Vorher“) from
+    /// the next frame on; uploads nothing.
+    pub fn show_edit(&mut self, on: bool) {
+        self.show_edit = on;
     }
 
     /// Whether a surface is shown or about to be.
@@ -509,6 +548,21 @@ impl View3d {
         if let (Some(mesh), Some(origin)) = (&mut self.mesh, view_origin) {
             mesh.set_view_origin(origin);
         }
+        if let Some(mesh) = &mut self.mesh {
+            // „Vorher/Nachher“ also for the surface still shown while the next one uploads.
+            mesh.show_edit(self.show_edit);
+            // Marks and touched-up state once their surface is up.
+            if self.pending_surface.is_none() {
+                if let Some(tris) = self.pending_marks.take() {
+                    mesh.set_marks(device, queue, &tris);
+                    self.marks_count += 1;
+                }
+                if let Some(edit) = self.pending_edit.take() {
+                    mesh.set_edit(device, queue, edit);
+                    self.edit_count += 1;
+                }
+            }
+        }
         // The surface's bounds in the camera's frame.
         let surface_bounds = self.surface.and_then(|s| {
             let (lo, hi) = s.bounds?;
@@ -603,6 +657,9 @@ impl View3d {
                 .point_m
                 .unwrap_or_else(|| cloud.map_or(DEFAULT_POINT_M, |c| c.point_m)),
             surface: (self.surface_count, view_origin),
+            marks: self.marks_count,
+            edit: self.edit_count,
+            show_edit: self.show_edit,
         };
         if self.last.as_ref() != Some(&key) {
             let started = Instant::now();
