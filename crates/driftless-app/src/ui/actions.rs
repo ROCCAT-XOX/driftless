@@ -208,7 +208,7 @@ pub fn start_touchup(
     if let Some(job) = runner.status() {
         return Err(text::busy(&job.label));
     }
-    let Action::Touchup { surface, step } = action else {
+    let Action::Touchup { surface, step, .. } = action else {
         return Err(text::NOT_A_STEP.into());
     };
     if state.project.is_none() {

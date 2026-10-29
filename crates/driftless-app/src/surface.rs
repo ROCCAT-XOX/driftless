@@ -40,7 +40,7 @@ use driftless_steps::marks::Marks;
 use driftless_steps::surface::{texture_sources, NoSources, TextureSources, SURFACE_REPORT};
 use driftless_steps::touchup::{
     edited_pages, run_touchup, touchup_fits, touchup_without_raw_data, FileStamp, PreparedSurface,
-    StepOutcome, TouchupDone, TouchupPrepared, TouchupRequest, TOUCHUP_DIR,
+    StepOutcome, TouchupDone, TouchupPrepared, TouchupRequest, TOUCHUP_DIR, TOUCHUP_REPORT,
 };
 use driftless_steps::StepError;
 use image::RgbaImage;
@@ -366,9 +366,9 @@ pub struct TouchupOutput {
     /// Why the camera images of the surface were not at hand (the raw data gone, or no longer
     /// those of the surface; [`NoSources`] says it in plain words); `None`: they were.
     pub no_sources: Option<NoSources>,
-    /// The surface got its touch-up now: it had no cache before, it has one now (a new surface
-    /// taking the Stellen over, the first step).
-    pub first: bool,
+    /// The cache of the touch-up changed: steps were computed anew (or taken from those kept
+    /// aside); `false` if it held all of them already, and nothing new is to be told.
+    pub changed: bool,
     /// What came of [`TouchupJob::step`] (the Stelle's newest step if the seq is not found).
     pub step: Option<StepOutcome>,
     /// For the surface shown: the load it is for, and what the view should hold.
@@ -394,6 +394,8 @@ pub fn run_touchup_job(job: &TouchupJob, progress: &Progress) -> Result<TouchupO
     });
     let no_sources = sources.unavailable().cloned();
     let before = patches_key(dir);
+    let report = || std::fs::read(dir.join(TOUCHUP_DIR).join(TOUCHUP_REPORT)).ok();
+    let report_before = report();
     let req = TouchupRequest {
         surface_dir: dir.clone(),
         owner_dir: owner,
@@ -433,7 +435,7 @@ pub fn run_touchup_job(job: &TouchupJob, progress: &Progress) -> Result<TouchupO
         surface: dir.clone(),
         done,
         no_sources,
-        first: before.is_none() && after.is_some(),
+        changed: after != before || report() != report_before,
         step,
         view,
     })

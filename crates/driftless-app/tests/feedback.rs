@@ -740,6 +740,30 @@ fn brush_bar_reports_mark() {
     assert_eq!(errors(h.state()), Vec::<String>::new());
 }
 
+/// An app made with [`DriftlessApp::new`] – every test's – has no folder for the reports: only
+/// the program started by eframe gets the app's own, so no test can write into it.
+#[test]
+fn new_app_has_no_reports_folder() {
+    let mut app = DriftlessApp::new(Arc::new(|| {}));
+    app.apply(Action::OpenReports);
+    let list = app.state().feedback_list.as_ref().expect("the list");
+    assert!(!list.reading, "{list:?}");
+    assert_eq!(list.problem.as_deref(), Some(text::FEEDBACK_NO_FOLDER));
+    // nothing to read, and „Melden“ says it cannot save
+    assert!(!app.wants_repaint_while_busy());
+    app.apply(Action::OpenFeedback { mark: None });
+    let dialog = app
+        .state_mut()
+        .feedback_dialog
+        .as_mut()
+        .expect("the dialog");
+    dialog.text = "Gibt es nicht".into();
+    app.apply(Action::SendFeedback);
+    assert_eq!(errors(&app), vec![text::FEEDBACK_NO_FOLDER.to_string()]);
+    assert!(app.state().feedback_dialog.is_some());
+    assert!(!app.wants_repaint_while_busy());
+}
+
 #[test]
 fn menu_lists_reports() {
     use driftless_app::ui::{rail, AppState};

@@ -1,20 +1,26 @@
 //! The touch-up of Stellen in the program, without a window: a Stelle painted
 //! ([`Action::Paint`]), then smoothed or its images baked anew as a background step with its
 //! progress; a refused step taken back out of `stellen.toml`; „Bilder neu einspielen“ off while
-//! the raw data are gone; a new surface of the map taking the touch-up over; the export holding
-//! it; „Aufräumen“ leaving it; ↶ on a step computing the touch-up anew; a new map starting
-//! without Stellen.
+//! the raw data are gone; a new surface of the map taking the touch-up over; the touch-up
+//! applied anew to a surface shown or exported saying what is missing and what it refuses; the
+//! export holding it; „Aufräumen“ leaving it; ↶ on a step computing the touch-up anew, and
+//! saying so while another step runs; „Abbrechen“ of a touch-up keeping the queue; the variant
+//! of the images named; a new map starting without Stellen. One test looks at the window with
+//! a GPU: the marks only with the brush, only the outline after a step (without an adapter it
+//! says it was skipped).
 //!
 //! The project is made once (`scan_with_images` outside the project folder, a run, a map and a
 //! coarse surface with images, as the program computes them); every test works on a copy.
 
+use driftless_app::jobs::JobOutput;
 use driftless_app::project::{
     canonical, run_map_job, run_slam_job, run_surface_job, MapInfo, Project, RunInfo, ScanEntry,
     ScanState, SlamJob, SurfaceInfo, SurfaceSettings,
 };
 use driftless_app::ui::tools::Tool;
 use driftless_app::ui::{
-    brush, export, text, Action, AppState, DriftlessApp, ScanNode, Step, SurfaceSummary, UiMessage,
+    brush, export, text, Action, AppState, DriftlessApp, Queued, ScanNode, Step, SurfaceSummary,
+    UiMessage,
 };
 use driftless_export::mesh::{read_mesh, Mesh};
 use driftless_gpu::GpuPref;
@@ -25,9 +31,9 @@ use driftless_map::surface::edit::{dab_normal, FaceBvh, WeldedSurface, PATCHES_F
 use driftless_map::surface::SurfaceConfig;
 use driftless_steps::export::{ExportFormat, ExportRequest, ExportSource};
 use driftless_steps::map::{MapSettings, MapSwitches};
-use driftless_steps::marks::{DabInput, EditStep, Marks, SmoothLevel, MARKS_FILE};
+use driftless_steps::marks::{DabInput, EditStep, Marks, SmoothLevel, StepInput, MARKS_FILE};
 use driftless_steps::slam::SlamSettings;
-use driftless_steps::surface::texture_sources;
+use driftless_steps::surface::{texture_sources, NoSources, STALE_SURFACE};
 use driftless_steps::touchup::{
     edited_mesh, touchup_fits, touchup_without_raw_data, FORMER_DIR, TOUCHUP_DIR, TOUCHUP_REPORT,
 };
@@ -318,6 +324,18 @@ fn front_wall(surface_dir: &Path) -> Vec<DabInput> {
     dabs
 }
 
+/// Another Stelle on the +x wall, beside [`front_wall`]: about 1.5 × 0.7 m around (6, −1, 0).
+fn lower_front_wall(surface_dir: &Path) -> Vec<DabInput> {
+    let targets: Vec<[f64; 3]> = (0..5)
+        .map(|i| [6.0, -1.4 + 0.2 * f64::from(i), 0.0])
+        .collect();
+    let dabs = dabs(surface_dir, &targets, 0.35);
+    for d in &dabs {
+        assert!(d.normal[0] < -0.9, "faces the device: {d:?}");
+    }
+    dabs
+}
+
 /// A Stelle across the corner of the −x and the −y wall: not flat.
 fn corner(surface_dir: &Path) -> Vec<DabInput> {
     let dabs = dabs(surface_dir, &[[-4.0, -2.6, 0.0], [-3.6, -3.0, 0.0]], 0.45);
@@ -502,7 +520,10 @@ fn marks_lie_on_the_state_drawn() {
     let mut state = crafted();
     let glb = state.surface.as_ref().unwrap().path.clone();
     let mut brush = Brush::default();
-    brush.set_surface(Some((glb, [0.0; 3], Arc::clone(&pick))));
+    assert_eq!(
+        brush.set_surface(Some((glb, [0.0; 3], Arc::clone(&pick)))),
+        None
+    );
     let corners = |tris: &[driftless_app::render::mesh::MarkTriangle]| -> Vec<[f32; 3]> {
         tris.iter().flat_map(|t| t.pos).collect()
     };
@@ -517,18 +538,18 @@ fn marks_lie_on_the_state_drawn() {
         .position(|p| *p == [1.0, 1.0, 1.0])
         .unwrap() as u32;
     brush.set_moved(&[(v, [1.0, 0.9, 1.0])]);
-    let after = brush.take_marks(Some(1)).expect("the marks anew");
+    let after = brush.take_marks(Some(1), true).expect("the marks anew");
     assert!(corners(&after).contains(&[1.0, 0.9, 1.0]));
     assert_eq!(after.len(), computed.len());
     // „Vorher“: where they were computed; „Nachher“ again: moved
     brush.set_after(false);
-    let before = brush.take_marks(Some(1)).expect("the marks anew");
+    let before = brush.take_marks(Some(1), true).expect("the marks anew");
     assert_eq!(before, computed);
     brush.set_after(true);
-    assert_eq!(brush.take_marks(Some(1)), Some(after));
+    assert_eq!(brush.take_marks(Some(1), true), Some(after));
     // nothing changed: nothing to hand over
     brush.set_after(true);
-    assert_eq!(brush.take_marks(Some(1)), None);
+    assert_eq!(brush.take_marks(Some(1), true), None);
 }
 
 #[test]
@@ -573,10 +594,18 @@ fn no_raw_data_disables_retexture() {
     assert_eq!(brush::retexture_blocked(scene.app.state()), None);
     scene.run(Action::Retexture { mark: nr });
     no_errors(&scene.app);
-    assert_eq!(
-        said(&scene.app).last().map(String::as_str),
-        Some(text::RETEXTURE_NO_RAW_DATA)
+    // what is missing: the folder of the scan
+    let why = texture_sources(&scene.surface)
+        .unwrap()
+        .unavailable()
+        .cloned()
+        .expect("no images");
+    assert!(
+        why.to_string()
+            .contains(&raw.join("raum").display().to_string()),
+        "{why}"
     );
+    assert_eq!(said(&scene.app).last(), Some(&text::no_images_baked(&why)));
     assert!(scene.marks().marks[0].steps.is_empty());
     assert!(!scene.cache().exists());
     assert!(!scene.app.view().has_edit());
@@ -610,9 +639,7 @@ fn no_raw_data_disables_retexture() {
     assert!(touchup_fits(&scene.surface, &marks));
     assert!(touchup_without_raw_data(&scene.surface));
     assert!(scene.app.view().has_edit());
-    assert!(said(&scene.app)
-        .iter()
-        .any(|m| m.contains("Rohdaten fehlen")));
+    assert!(said(&scene.app).contains(&text::no_images_baked(&why)));
     let without = scene.patches();
 
     // back again: the button is on, and showing the surface bakes the images of the
@@ -821,6 +848,293 @@ fn undo_step_recomputes() {
     assert!(touchup_fits(&scene.surface, &marks));
     assert_eq!(scene.patches(), strong);
     assert!(scene.app.view().has_edit());
+}
+
+/// The touch-up applied anew to a surface whose cache is older than the Stellen – shown or
+/// exported – says what came of it as the first one does: the images not baked anew (with what
+/// is missing) and the steps the surface refuses.
+#[test]
+fn reapplied_touchup_says_what_is_missing() {
+    let mut scene = Scene::new("nacharbeit-app-neu-angewendet");
+    let a = scene.paint(front_wall(&scene.surface));
+    scene.run(Action::Smooth {
+        mark: a,
+        level: SmoothLevel::Strong,
+    });
+    no_errors(&scene.app);
+    // a second surface of the map takes the Stellen over …
+    scene.app.state_mut().surface_settings = surface_settings(0.2);
+    scene.run(Action::RunSurface(scene.map.clone()));
+    no_errors(&scene.app);
+    let second = scene.map.join("oberflaeche-002");
+    assert!(touchup_fits(&second, &scene.marks()));
+    // … then the first one, shown again, gets another Stelle smoothed: the cache of the second
+    // is older than the Stellen now
+    scene.run(Action::LoadSurface(scene.surface.clone()));
+    let b = scene.paint(lower_front_wall(&scene.surface));
+    scene.run(Action::Smooth {
+        mark: b,
+        level: SmoothLevel::Light,
+    });
+    no_errors(&scene.app);
+    assert!(!touchup_fits(&second, &scene.marks()));
+    // another window adds a Stelle that lies on no surface, with a step
+    let (_, c) = Marks::change(&scene.map, |m| {
+        let far = DabInput {
+            centre: [50.0, 50.0, 50.0],
+            normal: [0.0, 0.0, 1.0],
+            radius: 0.2,
+            erase: false,
+        };
+        let c = m.paint(None, &[far]);
+        m.add_step(
+            c,
+            StepInput::Smooth {
+                level: SmoothLevel::Light,
+            },
+        )?;
+        Ok(c)
+    })
+    .unwrap();
+    // the drive with the raw data unplugged, the second surface shown
+    fs::rename(scene.dir.join("Rohdaten"), scene.dir.join("Rohdaten-weg")).unwrap();
+    let why = texture_sources(&second)
+        .unwrap()
+        .unavailable()
+        .cloned()
+        .expect("no images");
+    assert!(why.raw_data_missing(), "{why:?}");
+    let before = said(&scene.app).len();
+    scene.run(Action::LoadSurface(second.clone()));
+    no_errors(&scene.app);
+    let told = said(&scene.app)[before..].to_vec();
+    assert!(
+        told.contains(&text::touchup_applied("Oberfläche 002")),
+        "{told:?}"
+    );
+    assert!(
+        told.iter().any(|m| m.contains(&why.to_string())),
+        "{why} in {told:?}"
+    );
+    assert!(
+        told.iter().any(|m| m.starts_with(&format!("Stelle {c}: "))),
+        "{told:?}"
+    );
+    assert!(touchup_fits(&second, &scene.marks()));
+
+    // the same for a surface not shown that is exported: its touch-up is made current first,
+    // and says so
+    scene.run(Action::LoadSurface(scene.surface.clone()));
+    Marks::change(&scene.map, |m| {
+        m.add_step(
+            a,
+            StepInput::Smooth {
+                level: SmoothLevel::Light,
+            },
+        )
+    })
+    .unwrap();
+    assert!(!touchup_fits(&second, &Marks::load(&scene.map).unwrap()));
+    let before = said(&scene.app).len();
+    scene.run(Action::OpenExport(ExportSource::EditedSurface(
+        second.clone(),
+    )));
+    no_errors(&scene.app);
+    let told = said(&scene.app)[before..].to_vec();
+    assert!(
+        told.contains(&text::touchup_applied("Oberfläche 002")),
+        "{told:?}"
+    );
+    assert!(
+        told.iter().any(|m| m.contains(&why.to_string())),
+        "{why} in {told:?}"
+    );
+    assert!(touchup_fits(&second, &scene.marks()));
+
+    // the raw data back, but the trajectory of the run computed anew: the surface is stale, and
+    // applying the touch-up anew says so
+    fs::rename(scene.dir.join("Rohdaten-weg"), scene.dir.join("Rohdaten")).unwrap();
+    let traj = scene.map.parent().unwrap().join("traj.tum");
+    let tum = fs::read_to_string(&traj).unwrap();
+    let shifted: String = tum
+        .lines()
+        .map(|l| match l.split_whitespace().collect::<Vec<_>>()[..] {
+            [t, x, ref rest @ ..] if !l.starts_with('#') => {
+                let x: f64 = x.parse().unwrap();
+                format!("{t} {} {}\n", x + 0.3, rest.join(" "))
+            }
+            _ => format!("{l}\n"),
+        })
+        .collect();
+    fs::write(&traj, shifted).unwrap();
+    let stale = texture_sources(&second).unwrap();
+    assert_eq!(stale.unavailable(), Some(&NoSources::SurfaceStale));
+    Marks::change(&scene.map, |m| {
+        m.add_step(
+            b,
+            StepInput::Smooth {
+                level: SmoothLevel::Strong,
+            },
+        )
+    })
+    .unwrap();
+    let before = said(&scene.app).len();
+    scene.run(Action::LoadSurface(second.clone()));
+    no_errors(&scene.app);
+    let told = said(&scene.app)[before..].to_vec();
+    assert!(
+        told.contains(&text::touchup_applied("Oberfläche 002")),
+        "{told:?}"
+    );
+    assert!(told.contains(&STALE_SURFACE.to_string()), "{told:?}");
+    assert!(!told.iter().any(|m| m.contains("Rohdaten")), "{told:?}");
+}
+
+/// „Abbrechen“ of a touch-up stops it, not the queue of „Alle Oberflächen rechnen“ it runs
+/// in; a recompute cancelled leaves „Nachher“ behind the Stellen, which the window says, until
+/// the next change of a Stelle computes it.
+#[test]
+fn cancelled_touchup_keeps_the_queue() {
+    let mut scene = Scene::new("nacharbeit-app-abbrechen-warteschlange");
+    let a = scene.paint(front_wall(&scene.surface));
+    scene.run(Action::Smooth {
+        mark: a,
+        level: SmoothLevel::Strong,
+    });
+    let b = scene.paint(lower_front_wall(&scene.surface));
+    scene.run(Action::Smooth {
+        mark: b,
+        level: SmoothLevel::Strong,
+    });
+    no_errors(&scene.app);
+    // „Löschen“ of the first: the step of the second is computed anew
+    scene.app.apply(Action::DeleteMark(a));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !matches!(scene.app.state().running, Some(Action::Touchup { .. })) {
+        scene.app.tick();
+        assert!(Instant::now() < deadline, "the touch-up did not start");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // a queue waits behind it: a map that is not there (it says so when its turn comes)
+    let ghost = scene.map.with_file_name("karte-099");
+    scene
+        .app
+        .state_mut()
+        .queue
+        .push_back(Queued::Surface(ghost.clone()));
+    scene.app.apply(Action::Cancel);
+    assert_eq!(
+        scene.app.state().queue,
+        [Queued::Surface(ghost.clone())],
+        "the queue stays"
+    );
+    settle(&mut scene.app);
+    // the queue went on after the touch-up
+    assert_eq!(errors(&scene.app), vec![text::map_gone(&ghost)]);
+    let told = said(&scene.app);
+    if !told.contains(&text::job_cancelled(text::STEP_TOUCHUP)) {
+        eprintln!("cancelled_touchup_keeps_the_queue: the touch-up ended before the cancel");
+        return;
+    }
+    // „Nachher“ is behind the Stellen, which the window says
+    assert!(
+        told.contains(&text::TOUCHUP_OUTDATED.to_string()),
+        "{told:?}"
+    );
+    assert_eq!(
+        brush::after_behind(scene.app.state()).as_deref(),
+        Some(text::TOUCHUP_OUTDATED)
+    );
+    assert!(!touchup_fits(&scene.surface, &scene.marks()));
+    // ↶ brings the first back and computes the touch-up: „Nachher“ is current again
+    scene.run(Action::UndoMark);
+    let marks = scene.marks();
+    assert_eq!(marks.marks.len(), 2);
+    assert!(touchup_fits(&scene.surface, &marks));
+    assert_eq!(brush::after_behind(scene.app.state()), None);
+}
+
+/// ↶ of a step while another step runs: the touch-up waits for it, and the window says that
+/// „Nachher“ shows the new state only after that step.
+#[test]
+fn undo_while_a_step_runs_says_when() {
+    let mut scene = Scene::new("nacharbeit-app-zurueck-waehrenddessen");
+    let a = scene.paint(front_wall(&scene.surface));
+    scene.run(Action::Smooth {
+        mark: a,
+        level: SmoothLevel::Strong,
+    });
+    no_errors(&scene.app);
+    let label = "Karte rechnen";
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    scene
+        .app
+        .start_job(label, move |_| {
+            let _ = wait.recv();
+            Ok(JobOutput::Done)
+        })
+        .unwrap();
+    let before = said(&scene.app).len();
+    scene.app.apply(Action::UndoMark);
+    for _ in 0..50 {
+        scene.app.tick();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let told = said(&scene.app)[before..].to_vec();
+    assert!(
+        told.iter()
+            .any(|m| m.contains(text::EDIT_AFTER) && m.contains(label)),
+        "{told:?}"
+    );
+    // the step is taken back, its touch-up not yet: still the smoothing shown
+    assert!(scene.marks().marks[0].steps.is_empty());
+    assert!(scene.cache().join(TOUCHUP_REPORT).is_file());
+    assert!(scene.app.view().has_edit());
+    assert_eq!(
+        brush::after_behind(scene.app.state()),
+        Some(text::touchup_after_job(label))
+    );
+    go.send(()).unwrap();
+    settle(&mut scene.app);
+    no_errors(&scene.app);
+    assert!(!scene.cache().join(TOUCHUP_REPORT).exists());
+    assert!(!scene.app.view().has_edit());
+    assert_eq!(brush::after_behind(scene.app.state()), None);
+}
+
+/// „Bilder neu einspielen“ says which image a variant took, as it stands to the ones before
+/// („Variante 2 von 7 · andere Kamera“), in the status bar and in the list of the Stellen.
+#[test]
+fn variants_say_which_image() {
+    let mut scene = Scene::new("nacharbeit-app-varianten");
+    let nr = scene.paint(front_wall(&scene.surface));
+    scene.run(Action::Retexture { mark: nr });
+    scene.run(Action::Retexture { mark: nr });
+    no_errors(&scene.app);
+    let told = said(&scene.app);
+    let first = format!("Stelle {nr}: Bilder neu eingespielt (Variante 1 von ");
+    let second = format!("Stelle {nr}: Bilder neu eingespielt (Variante 2 von ");
+    let line = |start: &str| told.iter().find(|m| m.starts_with(start)).cloned();
+    let first = line(&first).unwrap_or_else(|| panic!("{told:?}"));
+    let second = line(&second).unwrap_or_else(|| panic!("{told:?}"));
+    assert!(first.ends_with(" · bestes Bild)"), "{first}");
+    assert!(
+        [
+            " · anderer Scan)",
+            " · andere Kamera)",
+            " · anderer Standort)",
+            " · fast wie Variante 1)",
+        ]
+        .iter()
+        .any(|end| second.ends_with(end)),
+        "{second}"
+    );
+    // the list of the Stellen says it the same way
+    let marks = scene.marks();
+    let step = marks.marks[0].steps.last().unwrap();
+    let baked = scene.app.state().touchup.variants.get(&(nr, step.seq()));
+    let listed = text::mark_step_baked(step, baked.copied());
+    assert_eq!(format!("Stelle {nr}: {listed}"), second, "{baked:?}");
 }
 
 /// The touch-up of the surface shown takes it as the loader read it: with its glb unreadable
@@ -1080,6 +1394,14 @@ fn bar_offers_the_steps() {
         click(&mut h, text::FEEDBACK_BUTTON),
         Some(Action::OpenFeedback { mark: None })
     );
+    // … and its tooltip names no Stelle
+    h.get_by_label(text::FEEDBACK_BUTTON).hover();
+    h.run();
+    h.get_by_label(&text::feedback_button_hint(None));
+    assert_eq!(
+        text::feedback_button_hint(None),
+        format!("Einen Fehler oder Wunsch melden ({})", text::double_shift())
+    );
 
     // the raw data gone: smoothing still works, the images not
     let mut state = crafted();
@@ -1091,7 +1413,11 @@ fn bar_offers_the_steps() {
     // while the touch-up of the surface runs or waits, the steps wait for it
     let surface = PathBuf::from(format!("{MAP}/oberflaeche-001"));
     let mut state = crafted();
-    state.touchup.waiting.push_back((surface.clone(), None));
+    state.touchup.waiting.push_back(brush::TouchupWish {
+        surface: surface.clone(),
+        step: None,
+        tell: false,
+    });
     let mut h = bar(state);
     off_with(&mut h, text::SMOOTH_LIGHT_NAME, text::TOUCHUP_RUNS);
     off_with(&mut h, text::RETEXTURE, text::TOUCHUP_RUNS);
@@ -1099,7 +1425,238 @@ fn bar_offers_the_steps() {
     state.running = Some(Action::Touchup {
         surface,
         step: None,
+        tell: false,
     });
     let h = bar(state);
     assert!(!on(&h, text::SMOOTH_STRONG_NAME));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The marks in the window, with a GPU
+// ---------------------------------------------------------------------------------------------
+
+type H = Harness<'static, DriftlessApp>;
+
+/// Says that the running test was skipped, and why, past the test harness's capture.
+fn skipped(why: &str) {
+    use std::io::Write;
+    let name = std::thread::current().name().unwrap_or("?").to_string();
+    let _ = writeln!(std::io::stderr(), "ÜBERSPRUNGEN {name}: {why}");
+}
+
+/// Frames until the work has ended and the surface shown is on the GPU, without errors.
+fn frames_until_idle(h: &mut H) {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        h.step();
+        let app = h.state();
+        if !app.wants_repaint_while_busy() && !app.view().is_uploading_surface() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "work did not end");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for _ in 0..3 {
+        h.step();
+    }
+    no_errors(h.state());
+}
+
+/// A copy of [`template`] in a window with a GPU, the project open in „Bilder“ and its surface
+/// shown; with the map and the surface folder. `None` without an adapter.
+fn window_scene(name: &str) -> Option<(TestDir, PathBuf, PathBuf, H)> {
+    use egui_kittest::wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer};
+    if driftless_app::render::headless_device().is_none() {
+        skipped("kein GPU-Adapter");
+        return None;
+    }
+    let dir = tmp(name);
+    copy_dir(template(), &dir);
+    own_paths(template(), &dir);
+    let project = canonical(&dir.join(PROJECT)).unwrap();
+    let rs = create_render_state(
+        default_wgpu_setup(),
+        egui_wgpu::RendererOptions::PREDICTABLE,
+    );
+    let mut app = DriftlessApp::new(Arc::new(|| {}))
+        .with_render_state(rs.clone())
+        .with_trash(gone);
+    app.apply(Action::OpenProject(project));
+    settle(&mut app);
+    no_errors(&app);
+    app.state_mut().gpu = GpuPref::Off;
+    app.state_mut().surface_settings = surface_settings(0.15);
+    app.apply(Action::SetStep(Step::Bilder));
+    let map = app.state().scans[0].runs[0].maps[0].clone();
+    let surface = map.surfaces[0].dir.clone();
+    app.apply(Action::LoadSurface(surface.clone()));
+    let mut h = Harness::builder()
+        .with_size([1200.0, 800.0])
+        .with_pixels_per_point(1.0)
+        .with_step_dt(1.0 / 60.0)
+        .renderer(WgpuTestRenderer::from_render_state(rs))
+        .build_ui_state(|ui, app: &mut DriftlessApp| app.show(ui), app);
+    frames_until_idle(&mut h);
+    assert!(h.state().state().surface.is_some());
+    Some((dir, map.dir, surface, h))
+}
+
+/// Where the absolute point `p` lies in the window (points; the scale is 1).
+fn on_screen(h: &H, p: [f64; 3]) -> eframe::egui::Pos2 {
+    use driftless_app::pick::{project, relative_to};
+    let app = h.state();
+    let view = app.layout().view;
+    let origin = app.state().surface.as_ref().expect("surface").origin;
+    let vp = app.view().camera().view_proj(view.width() / view.height());
+    let q = project(&vp, relative_to(origin, p), [view.width(), view.height()]).unwrap();
+    let pos = view.min + eframe::egui::vec2(q[0], q[1]);
+    assert!(view.contains(pos), "{p:?} at {pos:?} outside {view:?}");
+    pos
+}
+
+/// The part of the window around the Stelle of [`front_wall`] (it covers about y 0.25…1.75 m,
+/// z −0.35…0.35 m of the +x wall), without the floating bars over the view.
+struct Area {
+    rect: eframe::egui::Rect,
+    bars: Vec<eframe::egui::Rect>,
+}
+
+impl Area {
+    fn of_front_wall(h: &H) -> Area {
+        let corners = [[0.1, -0.5], [0.1, 0.5], [1.9, -0.5], [1.9, 0.5]];
+        let points: Vec<eframe::egui::Pos2> = corners
+            .iter()
+            .map(|&[y, z]| on_screen(h, [6.0, y, z]))
+            .collect();
+        let rect = eframe::egui::Rect::from_points(&points);
+        let l = h.state().layout();
+        let bars = [l.info, l.show, l.tools, l.cut, l.brush, l.legend]
+            .into_iter()
+            .flatten()
+            .collect();
+        Area { rect, bars }
+    }
+
+    /// How many of its pixels differ between `a` and `b`.
+    fn differing(&self, a: &image::RgbaImage, b: &image::RgbaImage) -> usize {
+        let r = self.rect;
+        let mut n = 0;
+        for y in r.min.y.max(0.0) as u32..(r.max.y as u32).min(a.height()) {
+            for x in r.min.x.max(0.0) as u32..(r.max.x as u32).min(a.width()) {
+                let p = eframe::egui::pos2(x as f32 + 0.5, y as f32 + 0.5);
+                if self.bars.iter().any(|b| b.contains(p)) {
+                    continue;
+                }
+                n += usize::from(a.get_pixel(x, y) != b.get_pixel(x, y));
+            }
+        }
+        n
+    }
+}
+
+fn pixel_at(image: &image::RgbaImage, pos: eframe::egui::Pos2) -> [u8; 4] {
+    image.get_pixel(pos.x as u32, pos.y as u32).0
+}
+
+/// The pointer over the rail, away from the view (no ring of the brush, no tooltip there).
+fn pointer_away(h: &mut H) {
+    h.event(eframe::egui::Event::PointerMoved(eframe::egui::pos2(
+        4.0, 300.0,
+    )));
+    h.step();
+}
+
+/// A drag with the left button from `from` to `to` (points) in small moves.
+fn paint_drag(h: &mut H, from: eframe::egui::Pos2, to: eframe::egui::Pos2) {
+    use eframe::egui::{Event, Modifiers, PointerButton};
+    let press = |pos, pressed| Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    h.event(Event::PointerMoved(from));
+    h.step();
+    h.event(press(from, true));
+    h.step();
+    for k in 1..=10 {
+        h.event(Event::PointerMoved(from + (to - from) * k as f32 / 10.0));
+        h.step();
+    }
+    h.event(press(to, false));
+    h.step();
+}
+
+/// The Stellen are marked only while the brush is chosen: with another tool the touched-up
+/// Stelle in „Nachher“ shows exactly as the surface drawn without any mark; with the brush a
+/// Stelle whose step just ran shows only its outline – its inside as it is – until the next
+/// stroke into it tints it again.
+#[test]
+fn marks_only_with_the_brush() {
+    use eframe::egui::accesskit::Role;
+    let Some((_dir, map, surface, mut h)) = window_scene("nacharbeit-app-markierung") else {
+        return;
+    };
+    h.state_mut().apply(Action::Paint {
+        owner: map.clone(),
+        mark: None,
+        dabs: front_wall(&surface),
+    });
+    frames_until_idle(&mut h);
+    let nr = h.state().state().brush.active.expect("the Stelle painted");
+    h.state_mut().apply(Action::Smooth {
+        mark: nr,
+        level: SmoothLevel::Strong,
+    });
+    frames_until_idle(&mut h);
+    assert!(h.state().view().has_edit());
+    assert!(h.state().view().showing_edit());
+    h.state_mut().apply(Action::FrameMark(nr));
+    pointer_away(&mut h);
+    frames_until_idle(&mut h);
+    let area = Area::of_front_wall(&h);
+    let middle = on_screen(&h, [6.0, 1.0, 0.0]);
+
+    // another tool: the pixels of the touched-up Stelle are those of the surface without marks
+    assert_eq!(h.state().state().tool, Tool::Orbit);
+    let shown = h.render().expect("render");
+    h.state_mut().view_mut().set_marks(Vec::new());
+    for _ in 0..3 {
+        h.step();
+    }
+    let bare = h.render().expect("render");
+    assert_eq!(area.differing(&shown, &bare), 0, "marked with another tool");
+
+    // the brush: after its step the Stelle shows its outline, its inside as it is
+    h.get_by_role_and_label(Role::Button, text::TOOL_BRUSH)
+        .click();
+    pointer_away(&mut h);
+    frames_until_idle(&mut h);
+    assert_eq!(h.state().state().tool, Tool::Brush);
+    let area = Area::of_front_wall(&h);
+    let outlined = h.render().expect("render");
+    assert_eq!(pixel_at(&outlined, middle), pixel_at(&bare, middle));
+    let rim = area.differing(&outlined, &bare);
+    assert!(rim > 0, "no outline");
+
+    // a stroke into it, between two places on the wall: tinted again, the inside too
+    let ends = dabs(&surface, &[[6.0, 0.8, 0.0], [6.0, 1.2, 0.0]], 0.2);
+    let (a, b) = (on_screen(&h, ends[0].centre), on_screen(&h, ends[1].centre));
+    paint_drag(&mut h, a, b);
+    pointer_away(&mut h);
+    frames_until_idle(&mut h);
+    let tinted = h.render().expect("render");
+    assert_ne!(pixel_at(&tinted, middle), pixel_at(&bare, middle));
+    let fill = area.differing(&tinted, &bare);
+    // (the Stelle is a few strips of the coarse wall: much of it lies at its rim)
+    assert!(fill > 3 * rim, "{fill} pixels tinted, {rim} outlined");
+
+    // another tool again: no mark at all
+    h.get_by_role_and_label(Role::Button, text::TOOL_ORBIT)
+        .click();
+    pointer_away(&mut h);
+    frames_until_idle(&mut h);
+    let area = Area::of_front_wall(&h);
+    let again = h.render().expect("render");
+    assert_eq!(area.differing(&again, &bare), 0, "marked with another tool");
 }

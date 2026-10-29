@@ -308,11 +308,15 @@ pub enum Action {
     /// „Abbrechen“ ([`crate::surface::run_touchup_job`]): the steps of the Stellen of its map or
     /// model replayed and kept in `nacharbeit/`; the view gets the touched-up state. `step`:
     /// the step just added (Stelle, seq) – what came of it is told, and if it changed nothing
-    /// (or did not run to its end) it is taken out of `stellen.toml` again. The window queues
-    /// it ([`brush::TouchupState::waiting`]) once the Stellen are saved and no step runs.
+    /// (or did not run to its end) it is taken out of `stellen.toml` again. `tell`: it applies
+    /// the Stellen to a surface shown, exported or new – what came of it is told (see
+    /// [`brush::TouchupWish`]). The window queues it ([`brush::TouchupState::waiting`]) once the
+    /// Stellen are saved and no step runs; „Abbrechen“ stops it alone, not the queue of „Alle
+    /// rechnen“ it runs in.
     Touchup {
         surface: PathBuf,
         step: Option<(u32, u64)>,
+        tell: bool,
     },
 }
 
@@ -650,7 +654,8 @@ pub struct AppState {
     pub step: Step,
     /// What is still to compute by [`Action::ComputeAllMaps`] or
     /// [`Action::ComputeAllSurfaces`], in order; the first is the one being computed. Emptied
-    /// by „Abbrechen“, a failed step, closing and a project switch.
+    /// by „Abbrechen“ (not of a touch-up the window put in between), a failed step, closing and
+    /// a project switch.
     pub queue: VecDeque<Queued>,
     /// The background check of [`AppState::map_status`] has not caught up with the tree yet:
     /// until then a stale map or surface counts as fitting, so „Alle rechnen“ and „Alle

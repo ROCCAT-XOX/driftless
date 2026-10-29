@@ -107,8 +107,9 @@ const FORMER_MAX_STEPS: usize = 64;
 /// … with at most about this many bytes of patches ([`patch_bytes`]).
 const FORMER_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// The hint of a step that needed the camera images while the raw data were gone (with a stale
-/// surface: [`STALE_SURFACE`]).
-const NO_RAW_DATA: &str = "Rohdaten fehlen – Bilder nicht neu eingespielt";
+/// surface: [`STALE_SURFACE`]); the program may say why instead (what is missing,
+/// [`crate::surface::NoSources`]).
+pub const NO_RAW_DATA: &str = "Rohdaten fehlen – Bilder nicht neu eingespielt";
 /// The start of the names of the folders a run writes before they are renamed into place
 /// (`-neu`), and of the old cache put aside meanwhile (`-alt`): what a killed run leaves.
 const TEMP_PREFIX: &str = "nacharbeit.tmp-";

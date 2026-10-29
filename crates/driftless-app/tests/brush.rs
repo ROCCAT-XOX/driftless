@@ -1,9 +1,12 @@
 //! The tool „Pinsel“ in the whole window: painting a Stelle on the surface of a map, erasing
-//! with ⌥/Alt, Shift and the right button still moving the view, taking back with ⌘Z (also
-//! after a restart), the list „Markierte Stellen“ in „Bilder“ with „Löschen“, and the tool off
-//! without a surface. The window draws with a GPU like `tests/ui_tools.rs` (without an adapter
-//! those tests say they were skipped); the project is made by hand: a scan, a run with a map
-//! and a surface that is a wall of 4 × 2.5 m.
+//! with ⌥/Alt (from the Stelle under the pointer; an erasing stroke that takes nothing is
+//! none), Shift and the right button still moving the view, taking back with ⌘Z (also after a
+//! restart, and with any tool), Esc left to a question over the view, the list „Markierte
+//! Stellen“ in „Bilder“ with „Löschen“, a damaged `stellen.toml` named, and the tool off without
+//! a surface. The window draws with a GPU like `tests/ui_tools.rs` (without an adapter those
+//! tests say they were skipped); the project is made by hand: a scan, a run with a map and a
+//! surface that is a wall of 4 × 2.5 m. Without a window: how long a frame of painting into a
+//! large Stelle takes (a measurement, ignored by default).
 
 use driftless_app::pick::{project, relative_to};
 use driftless_app::project::{
@@ -596,6 +599,103 @@ fn delete_from_list() {
     assert_eq!(h.state().state().brush.active, None);
 }
 
+/// ⌘Z takes the Stellen back with any tool, not only with the brush: „Löschen“ in the list
+/// works with any tool too.
+#[test]
+fn undo_with_any_tool() {
+    let Some((_dir, _project, map, mut h)) = wall_window("pinsel-zurueck-werkzeug") else {
+        return;
+    };
+    choose_brush(&mut h);
+    stroke(&mut h, FROM, TO, Modifiers::NONE);
+    assert_eq!(saved(&map).marks.len(), 1);
+    choose(&mut h, text::TOOL_ORBIT);
+    undo_keys(&mut h);
+    assert!(saved(&map).marks.is_empty(), "{:?}", saved(&map));
+    assert!(h.query_by_label("Stelle 1 · Wand").is_none());
+}
+
+/// ⌥ over another Stelle than the chosen one erases from the one under the pointer (and
+/// chooses it); an erasing stroke that takes nothing is dropped, so ⌘Z never takes back a
+/// stroke that did nothing.
+#[test]
+fn erase_where_the_pointer_is() {
+    let Some((_dir, _project, map, mut h)) = wall_window("pinsel-radieren-andere") else {
+        return;
+    };
+    choose_brush(&mut h);
+    stroke(&mut h, FROM, TO, Modifiers::NONE);
+    h.key_press(egui::Key::Escape);
+    h.step();
+    stroke(
+        &mut h,
+        [1.2, WALL_Y, 2.0],
+        [2.0, WALL_Y, 2.0],
+        Modifiers::NONE,
+    );
+    assert_eq!(h.state().state().brush.active, Some(2));
+    let (first, second) = (covered(&map, 1), saved(&map).marks[1].clone());
+    // over Stelle 1 while Stelle 2 is chosen
+    stroke(&mut h, FROM, [2.0, WALL_Y, 1.25], Modifiers::ALT);
+    let marks = saved(&map);
+    assert_eq!(marks.marks[1], second, "Stelle 2 unchanged");
+    let after = covered(&map, 1);
+    assert!(
+        after < first * 3 / 4 && after > 0,
+        "{first} → {after} faces"
+    );
+    assert_eq!(h.state().state().brush.active, Some(1));
+    // where no Stelle is, with Stelle 1 chosen: nothing taken, nothing saved
+    stroke(
+        &mut h,
+        [0.3, WALL_Y, 0.4],
+        [0.6, WALL_Y, 0.4],
+        Modifiers::ALT,
+    );
+    assert_eq!(saved(&map), marks);
+    // ⌘Z takes back the erasing over Stelle 1, the last stroke that did something
+    undo_keys(&mut h);
+    assert_eq!(covered(&map, 1), first);
+}
+
+/// Esc meant for another window – a question over the view – leaves the chosen Stelle alone;
+/// Esc of its own chooses none.
+#[test]
+fn esc_for_a_question_keeps_the_stelle() {
+    let Some((_dir, _project, _map, mut h)) = wall_window("pinsel-esc-frage") else {
+        return;
+    };
+    choose_brush(&mut h);
+    stroke(&mut h, FROM, TO, Modifiers::NONE);
+    assert_eq!(h.state().state().brush.active, Some(1));
+    h.state_mut().state_mut().ask = Some(driftless_app::ui::Ask::RemoveScan { id: "halle".into() });
+    h.step();
+    h.step();
+    h.key_press(egui::Key::Escape);
+    h.step();
+    assert_eq!(h.state().state().ask, None);
+    assert_eq!(h.state().state().brush.active, Some(1));
+    h.key_press(egui::Key::Escape);
+    h.step();
+    assert_eq!(h.state().state().brush.active, None);
+}
+
+/// A `stellen.toml` that cannot be read says where, in plain words, as the other files of the
+/// project do ([`text::damaged_toml`]), not with the reader's own text.
+#[test]
+fn damaged_marks_file_says_where() {
+    let dir = tmp("pinsel-kaputt");
+    let file = dir.join(MARKS_FILE);
+    let content = "[[stelle]]\nnr = \"eins\"\n";
+    fs::write(&file, content).unwrap();
+    let e = toml::from_str::<Marks>(content).unwrap_err();
+    let read = driftless_app::ui::brush::read_marks([dir.to_path_buf()]);
+    assert_eq!(
+        read.get(&dir.to_path_buf()),
+        Some(&Err(text::damaged_toml(&file, content, &e)))
+    );
+}
+
 fn cloud_summary() -> CloudSummary {
     CloudSummary {
         path: PathBuf::from("/k/color.las"),
@@ -810,4 +910,173 @@ fn list_of_marks() {
     );
     let h = panel(state);
     h.get_by_label("stellen.toml nicht lesbar: kaputt");
+}
+
+/// A floor of `w` × `d` m at z = 0 in square cells of `cell` m, two triangles each: one page
+/// without an image.
+fn floor_mesh(w: f64, d: f64, cell: f64) -> driftless_export::mesh::Mesh {
+    let (nx, ny) = ((w / cell).round() as u32, (d / cell).round() as u32);
+    let mut positions = Vec::new();
+    for j in 0..=ny {
+        for i in 0..=nx {
+            positions.push([f64::from(i) * cell, f64::from(j) * cell, 0.0]);
+        }
+    }
+    let at = |i: u32, j: u32| j * (nx + 1) + i;
+    let mut indices = Vec::new();
+    for j in 0..ny {
+        for i in 0..nx {
+            let (a, b, c, e) = (at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1));
+            indices.push([a, b, c]);
+            indices.push([a, c, e]);
+        }
+    }
+    driftless_export::mesh::Mesh {
+        pages: vec![driftless_export::mesh::MeshPage {
+            positions,
+            uvs: Vec::new(),
+            indices,
+            image: None,
+            color: [128, 128, 128],
+        }],
+    }
+}
+
+/// Painting into a Stelle of 30 m² on a floor as dense as the surface of the Büro (3,200 faces
+/// per m²: cells of 2.5 cm), with the brush of 20 cm and the rows of the Stelle 35 cm apart, as
+/// R3 measured it: a frame that lays dabs takes less than 10 ms (the brush and the marks for the
+/// view; with a GPU also writing them to it). The release selects the whole Stelle anew.
+#[test]
+#[ignore = "Messung, im Release: cargo test --release -p driftless-app --test brush -- --ignored timing_paint_large_stelle --nocapture"]
+fn timing_paint_large_stelle() {
+    use driftless_app::camera::Camera;
+    use driftless_app::surface::SurfacePick;
+    use driftless_app::ui::brush::Brush;
+    use driftless_app::ui::view3d::BrushInput;
+    use driftless_steps::marks::DabInput;
+    let mesh = floor_mesh(6.0, 6.0, 0.025);
+    let faces: usize = mesh.pages[0].indices.len();
+    let pick = Arc::new(SurfacePick::new(&mesh));
+    let origin = [3.0, 3.0, 0.0];
+    let glb = PathBuf::from(format!("{MAP}/oberflaeche-001/oberflaeche.glb"));
+    let mut state = state_with_map();
+    state.surface = Some(SurfaceSummary {
+        path: glb.clone(),
+        triangles: faces,
+        pages: 1,
+        origin,
+        z_range: [0.0, 0.0],
+    });
+    state.tool = Tool::Brush;
+    // the Stelle: 16 rows 35 cm apart over 5.5 × 5.5 m, a dab every 5 cm as the brush lays them
+    let mut marks = Marks::default();
+    let mut nr = None;
+    for row in 0..16 {
+        let y = 0.25 + 0.35 * f64::from(row);
+        let dabs: Vec<DabInput> = (0..=110)
+            .map(|i| DabInput {
+                centre: [0.25 + 0.05 * f64::from(i), y, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                radius: 0.2,
+                erase: false,
+            })
+            .collect();
+        nr = Some(marks.paint(nr, &dabs));
+    }
+    let dabs: usize = marks.marks[0].dabs.len();
+    state.marks.insert(PathBuf::from(MAP), Ok(marks));
+    state.brush.active = nr;
+    let mut brush = Brush::default();
+    brush.set_surface(Some((glb, origin, pick)));
+    let t = Instant::now();
+    let marks = brush.sync(&mut state).expect("the marks");
+    let first = t.elapsed();
+    assert!(marks.len() > 90_000, "{} faces marked", marks.len());
+    let gpu = headless_device().map(|(device, queue, _)| {
+        let mesh = driftless_app::render::mesh::MeshRenderer::new(
+            &device,
+            driftless_app::ui::view3d::VIEW_FORMAT,
+        );
+        (device, queue, mesh)
+    });
+    let mut gpu = gpu;
+    if gpu.is_none() {
+        skipped("kein GPU-Adapter: ohne Schreiben auf die Grafikkarte gemessen");
+    }
+
+    // the camera from above, the floor filling the view
+    let viewport = [1400.0f32, 900.0];
+    let mut camera = Camera::default();
+    camera.frame_facing([0.0; 3], [0.0, 0.0, 1.0], 3.5, viewport[0] / viewport[1]);
+    let vp = camera.view_proj(viewport[0] / viewport[1]);
+    let px = |p: [f64; 3]| {
+        let q = project(&vp, relative_to(origin, p), viewport).unwrap();
+        [q[0], q[1]]
+    };
+    // in the Stelle, beside it (every dab adds new faces), quickly, and erasing in it
+    let cases = [
+        ("in der Stelle, 5 cm je Bild", 2.9, 0.05, false),
+        ("daneben, 5 cm je Bild", 5.85, 0.05, false),
+        ("in der Stelle, 20 cm je Bild", 2.2, 0.20, false),
+        ("radieren, 5 cm je Bild", 1.5, 0.05, true),
+    ];
+    for (what, y, step, erase) in cases {
+        let mut cpu = Vec::new();
+        let mut all = Vec::new();
+        let frames = (4.0 / step) as usize;
+        let mut release = None;
+        for k in 0..=frames + 1 {
+            let x = 1.0 + step * k.min(frames) as f64;
+            let at = px([x, y, 0.0]);
+            let input = BrushInput {
+                viewport,
+                hover: Some(at),
+                pressed: k == 0,
+                erase,
+                path: vec![at],
+                released: k == frames + 1,
+            };
+            let t = Instant::now();
+            let stroke = brush.input(&mut state, &input, &camera, origin, false);
+            let tris = brush.take_marks(state.brush.active, true);
+            let brushed = t.elapsed();
+            if let (Some(tris), Some((device, queue, mesh))) = (&tris, &mut gpu) {
+                mesh.set_marks(device, queue, tris);
+                queue.submit(std::iter::empty());
+            }
+            let total = t.elapsed();
+            if k == frames + 1 {
+                release = Some(total);
+                let Some(Action::Paint { owner, mark, dabs }) = stroke else {
+                    panic!("the stroke as one change")
+                };
+                // what the window does with it: the Stelle in the state, and it stays chosen
+                let marks = state.marks.get_mut(&owner).unwrap().as_mut().unwrap();
+                marks.paint(mark, &dabs);
+                brush.sync(&mut state);
+            } else if k > 0 {
+                cpu.push(brushed.as_secs_f64() * 1e3);
+                all.push(total.as_secs_f64() * 1e3);
+            }
+        }
+        let stat = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            (v[v.len() / 2], v[v.len() * 9 / 10], v[v.len() - 1])
+        };
+        let (cpu_med, cpu_p90, cpu_max) = stat(&mut cpu);
+        let (med, p90, max) = stat(&mut all);
+        eprintln!(
+            "Pinsel auf 30 m² ({faces} Flächen, Stelle {dabs} Tupfer, {} Threads), {what}: \
+             Pinsel+Markierung Median {cpu_med:.2} ms, 90 % {cpu_p90:.2} ms, max {cpu_max:.2} ms; \
+             mit Grafikkarte Median {med:.2} ms, 90 % {p90:.2} ms, max {max:.2} ms; \
+             Loslassen {:.1} ms; erste Auswahl {:.1} ms",
+            rayon::current_num_threads(),
+            release.unwrap().as_secs_f64() * 1e3,
+            first.as_secs_f64() * 1e3,
+        );
+        assert!(
+            med < 10.0 && p90 < 10.0,
+            "{what}: Median {med:.2} ms, 90 % {p90:.2} ms"
+        );
+    }
 }

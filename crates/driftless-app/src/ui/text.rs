@@ -697,14 +697,14 @@ pub fn centimetres(m: f32) -> String {
 }
 
 /// [`mark_step`], with the variant of the images the touch-up of the surface shown baked for
-/// it, if known: „Bilder neu eingespielt (Variante 2 von 5)“.
+/// it, if known: „Bilder neu eingespielt (Variante 2 von 5 · andere Kamera)“.
 pub fn mark_step_baked(
     step: &driftless_steps::marks::EditStep,
-    baked: Option<(u32, u32)>,
+    baked: Option<super::brush::Variant>,
 ) -> String {
     match (step, baked) {
         (driftless_steps::marks::EditStep::Retexture { .. }, Some(v)) => {
-            format!("Bilder neu eingespielt ({})", variant_of(v))
+            format!("Bilder neu eingespielt ({})", variant(v))
         }
         _ => mark_step(step),
     }
@@ -774,12 +774,16 @@ pub fn double_shift() -> String {
     egui_phosphor::regular::ARROW_FAT_UP.repeat(2)
 }
 
-/// The tooltip of „Melden …“ in the bar of the brush.
-pub fn feedback_button_hint() -> String {
-    format!(
-        "Einen Fehler oder Wunsch zu dieser Stelle melden ({})",
-        double_shift()
-    )
+/// The tooltip of „Melden …“ in the bar of the brush: about the Stelle chosen (`mark`), else
+/// about none.
+pub fn feedback_button_hint(mark: Option<u32>) -> String {
+    match mark {
+        Some(nr) => format!(
+            "Einen Fehler oder Wunsch zu Stelle {nr} melden ({})",
+            double_shift()
+        ),
+        None => format!("Einen Fehler oder Wunsch melden ({})", double_shift()),
+    }
 }
 
 // „Melden“ (⇧⇧, `crate::feedback`) and ☰ → „Meldungen …“
@@ -916,6 +920,17 @@ pub const EDIT_AFTER: &str = "Nachher";
 pub const EDIT_AFTER_HINT: &str = "Die Oberfläche mit der Nacharbeit";
 /// Why „Vorher“ / „Nachher“ is off.
 pub const EDIT_NONE: &str = "Diese Oberfläche hat noch keine Nacharbeit";
+/// Beside „Vorher“ / „Nachher“ while „Nachher“ is behind the Stellen (why on hover).
+pub const AFTER_BEHIND: &str = "nicht aktuell";
+/// A touch-up that was to bring „Nachher“ up to date was cancelled (or failed).
+pub const TOUCHUP_OUTDATED: &str = "„Nachher“ ist nicht aktuell – es zeigt den Stand davor, \
+     bis eine Stelle geändert oder die Oberfläche neu geladen wird";
+
+/// ↶ or „Löschen“ while the step `job` runs: the touch-up waits for it.
+pub fn touchup_after_job(job: &str) -> String {
+    format!("„Nachher“ zeigt den neuen Stand erst nach „{job}“")
+}
+
 /// Why the steps are off: no Stelle chosen, a stroke being painted, the touch-up running.
 pub const STEPS_NEED_MARK: &str = "Erst eine Stelle anmalen oder in der Liste wählen";
 pub const STEPS_WAIT_PAINTING: &str = "Erst den Pinselzug beenden";
@@ -936,9 +951,27 @@ pub fn smooth_level(level: driftless_steps::marks::SmoothLevel) -> &'static str 
     }
 }
 
-/// „Variante 2 von 5“: the images a step baked, of how many there are.
-pub fn variant_of((variant, of): (u32, u32)) -> String {
-    format!("Variante {variant} von {of}")
+/// „Variante 2 von 5 · andere Kamera“: the images a step baked, of how many there are, and how
+/// its image stands to those of the variants before, if known.
+pub fn variant(v: super::brush::Variant) -> String {
+    let (variant, of) = v.of;
+    match v.from {
+        Some(from) => format!("Variante {variant} von {of} · {}", variant_from(from)),
+        None => format!("Variante {variant} von {of}"),
+    }
+}
+
+/// How the image of a variant stands to those of the variants before: „bestes Bild“,
+/// „anderer Scan“, „andere Kamera“, „anderer Standort“, „fast wie Variante 1“.
+pub fn variant_from(from: driftless_map::surface::edit::VariantFrom) -> String {
+    use driftless_map::surface::edit::VariantFrom;
+    match from {
+        VariantFrom::Best => "bestes Bild".into(),
+        VariantFrom::OtherScan => "anderer Scan".into(),
+        VariantFrom::OtherCamera => "andere Kamera".into(),
+        VariantFrom::OtherPlace => "anderer Standort".into(),
+        VariantFrom::Like(n) => format!("fast wie Variante {n}"),
+    }
 }
 
 /// A smoothing done: „Stelle 1 geglättet („stark“)“.
@@ -946,11 +979,20 @@ pub fn touchup_smoothed(nr: u32, level: driftless_steps::marks::SmoothLevel) -> 
     format!("Stelle {nr} geglättet („{}“)", smooth_level(level))
 }
 
-/// Images baked anew: „Stelle 1: Bilder neu eingespielt (Variante 2 von 5)“.
-pub fn touchup_retextured(nr: u32, variant: Option<(u32, u32)>) -> String {
-    match variant {
-        Some(v) => format!("Stelle {nr}: Bilder neu eingespielt ({})", variant_of(v)),
+/// Images baked anew: „Stelle 1: Bilder neu eingespielt (Variante 2 von 5 · andere Kamera)“.
+pub fn touchup_retextured(nr: u32, baked: Option<super::brush::Variant>) -> String {
+    match baked {
+        Some(v) => format!("Stelle {nr}: Bilder neu eingespielt ({})", variant(v)),
         None => format!("Stelle {nr}: Bilder neu eingespielt"),
+    }
+}
+
+/// No images baked anew, because of `why`: „Bilder nicht neu eingespielt: Rohdaten fehlen –
+/// Scan-Ordner … nicht gefunden“; a stale surface says so as it is („Oberfläche veraltet – …“).
+pub fn no_images_baked(why: &driftless_steps::surface::NoSources) -> String {
+    match why {
+        driftless_steps::surface::NoSources::SurfaceStale => why.to_string(),
+        _ => format!("Bilder nicht neu eingespielt: {why}"),
     }
 }
 
