@@ -610,3 +610,94 @@ pub(crate) fn floor_and_ceiling() -> super::TexturedMesh {
         ..Default::default()
     }
 }
+
+// ---- Page meshes for the touch-up tests (`driftless_export::mesh`) ---------------------
+
+use driftless_export::mesh::{Mesh as PageMesh, MeshPage};
+
+/// A fixed linear congruential generator (Knuth's MMIX constants): the same numbers on every
+/// machine, so random rays and noise never change between runs.
+pub(crate) struct Lcg(u64);
+
+impl Lcg {
+    pub fn new(seed: u64) -> Lcg {
+        Lcg(seed)
+    }
+
+    /// Uniform in `[0, 1)`, from the top 53 bits of the state.
+    pub fn unit(&mut self) -> f64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Uniform in `[lo, hi)`.
+    pub fn range(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * self.unit()
+    }
+}
+
+/// Positions and triangles of a mesh with shared vertices.
+pub(crate) type Shared = (Vec<[f64; 3]>, Vec<[u32; 3]>);
+
+/// A grid of `n[0] × n[1]` squares, two triangles each, with vertex `(i, j)` at `at(i, j)`
+/// (called for `i` in `0..=n[0]`, then `j` in `0..=n[1]`). The faces' normals point along
+/// `∂at/∂i × ∂at/∂j`.
+pub(crate) fn grid(n: [usize; 2], mut at: impl FnMut(usize, usize) -> [f64; 3]) -> Shared {
+    let mut positions = Vec::with_capacity((n[0] + 1) * (n[1] + 1));
+    for i in 0..=n[0] {
+        for j in 0..=n[1] {
+            positions.push(at(i, j));
+        }
+    }
+    let id = |i: usize, j: usize| (i * (n[1] + 1) + j) as u32;
+    let mut indices = Vec::with_capacity(2 * n[0] * n[1]);
+    for i in 0..n[0] {
+        for j in 0..n[1] {
+            indices.push([id(i, j), id(i + 1, j), id(i, j + 1)]);
+            indices.push([id(i + 1, j), id(i + 1, j + 1), id(i, j + 1)]);
+        }
+    }
+    (positions, indices)
+}
+
+/// The meshes `parts` (positions and triangles) as one, without joining any vertices.
+pub(crate) fn concat(parts: &[Shared]) -> Shared {
+    let (mut positions, mut indices) = (Vec::new(), Vec::new());
+    for (p, t) in parts {
+        let base = positions.len() as u32;
+        positions.extend_from_slice(p);
+        indices.extend(t.iter().map(|tri| tri.map(|v| v + base)));
+    }
+    (positions, indices)
+}
+
+/// Pages as the surface step bakes them: the faces in order, cut into charts of `chart` faces,
+/// the charts dealt to `pages` pages in turn, every chart with its own copy of the vertices it
+/// uses (in order of first use). No images and no texture coordinates.
+pub(crate) fn paged(
+    positions: &[[f64; 3]],
+    indices: &[[u32; 3]],
+    chart: usize,
+    pages: usize,
+) -> PageMesh {
+    let mut mesh = PageMesh {
+        pages: vec![MeshPage::default(); pages],
+    };
+    for (c, faces) in indices.chunks(chart).enumerate() {
+        let page = &mut mesh.pages[c % pages];
+        let mut copy: BTreeMap<u32, u32> = BTreeMap::new();
+        for tri in faces {
+            let t = tri.map(|v| {
+                *copy.entry(v).or_insert_with(|| {
+                    page.positions.push(positions[v as usize]);
+                    (page.positions.len() - 1) as u32
+                })
+            });
+            page.indices.push(t);
+        }
+    }
+    mesh
+}

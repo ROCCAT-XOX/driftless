@@ -4,9 +4,11 @@
 //! measured from fused into a truncated signed distance field, fine and coarse) → [`extract`] → [`cleanup`] →
 //! [`simplify`] → camera views per face → one image per face → texture pages → seam
 //! levelling. [`write_glb`] and [`write_obj`] write the result, [`render_preview`] draws it.
+//! [`edit`] touches up a computed surface where the user painted Stellen on it.
 
 mod atlas;
 mod cleanup;
+pub mod edit;
 mod extract;
 mod level;
 mod mc_tables;
