@@ -11,6 +11,7 @@ pub mod history;
 pub mod inspect;
 mod leftovers;
 pub mod map;
+pub mod marks;
 pub mod merge;
 pub mod overlay;
 pub mod pairs;
