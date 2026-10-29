@@ -428,3 +428,46 @@ Lies: `docs/anleitung.md`, `CHANGELOG.md`, `docs/ergebnisse/2026-10-28-version-0
 - [ ] **Step 2:** auf VM 101 laufen lassen: `driftless-vm sync`; in `/home/yannick/td/jmk6-2026-10-22/` fehlen die Verweise auf `20261022132520` und `20261022133028` (Ziel `/home/yannick/scans/<id>`, wie der vorhandene auf `20261022133554`) – anlegen; dann `driftless-vm run env DRIFTLESS_TESTDATA=/home/yannick/td DRIFTLESS_WORK=/home/yannick/work-pinsel cargo test -p driftless-app --release --test touchup_real -- --ignored --nocapture`, danach `/home/yannick/work-pinsel` wieder löschen; Zahlen in `docs/ergebnisse/2026-10-29-pinsel.md` (ohne Bilder, ohne Kundennamen). Ziele: Aktion auf 1 m² ≤ 5 s, Rand ohne sichtbaren Sprung (≤ 1 mm), Malen auf Büro ≥ 30 Bilder/s (Messung wie `tests/view3d.rs:419`).
 - [ ] **Step 3:** Anleitung und CHANGELOG schreiben; `cargo test --workspace`, Release-Clippy, `cargo deny check` grün.
 - [ ] **Step 4:** Commit `docs: Pinsel und Melden in der Anleitung, Messung auf echten Daten`.
+
+### Task 13: Schneller einspielen (Nachtrag nach der Messung vom 29.10.)
+
+Anlass: `docs/ergebnisse/2026-10-29-pinsel.md` – jede Aktion 12–14 s statt ≤ 5 s. Zeit geht in die Sichtbarkeit (6,8–9,0 s: ein Tiefenpuffer je Kandidat, 1.632 bzw. 3.002 Kandidaten), das Lesen aller Bildköpfe (1,2–1,9 s, 6,8–11 GB je Aktion), das Lesen bis zum letzten gewählten Bild (0,7–1,1 s, 2,8–4,8 GB) und im Büro das doppelte Lesen und Verschweißen der Oberfläche (2 × 1,0–1,2 s).
+
+**Files:**
+- Modify: `crates/driftless-map/src/surface/edit/retexture.rs` (Sichtbarkeit nur im Bildausschnitt der Stelle, Kandidaten vorab nach Lage reihen), `crates/driftless-io/src/images.rs` (Bildverzeichnis je Bildtasche, gezieltes Lesen), `crates/driftless-steps/src/touchup.rs` (vorbereitete Oberfläche und Verzeichnisse annehmen), App (`ui/app.rs`, `jobs.rs`, `surface.rs`: verschweißte Oberfläche und Baum aus dem Ladeauftrag in den Auftrag geben, Bildverzeichnisse je Scan im Prozess halten, zweites Lesen für die Ansicht entfällt)
+
+**Interfaces:**
+- Produces:
+```rust
+// driftless-io
+pub struct ImageIndex { /* je Bild: Zeitstempel, Kamera, Lage in der Datei; Schlüssel: Pfad, Größe, Änderungszeit */ }
+pub fn index_images(bags: &[PathBuf], topics: &[&str], progress: &Progress) -> Result<ImageIndex, ImageError>;
+pub fn read_indexed(index: &ImageIndex, frames: &[u32], downscale: u32, f: impl FnMut(Frame) -> Result<(), ImageError>) -> Result<(), ImageError>; // springt die Bilder direkt an
+// driftless-steps touchup
+pub struct TouchupPrepared { pub welded: Arc<WeldedSurface>, pub bvh: Arc<FaceBvh>, pub indices: Vec<Arc<ImageIndex>> } // optional im TouchupRequest
+```
+- Ergebnisse bleiben dieselben Bytes wie vorher, wo die Wahl gleich bleibt: dieselben 24 Bilder, derselbe Patch.
+
+- [ ] **Step 1: Failing tests:**
+  - `index_matches_sequential`: synthetische Bildtasche → `index_images` nennt dieselben Bilder wie `for_each_image_where`; `read_indexed` liefert für gewählte Bilder bytegleiche Pixel.
+  - `cutout_visibility_matches_full`: `region_views` mit Ausschnitt-Tiefenpuffer = ohne (gleiche Ansichten, gleiche Güten) auf allen bestehenden synthetischen Szenen.
+  - `prerank_keeps_choice`: mit Vorab-Reihung dieselben 24 dekodierten Bilder und dieselben Patch-Bytes wie ohne, auf allen synthetischen Szenen.
+  - `prepared_surface_is_used`: `run_touchup` mit `TouchupPrepared` liest die glb nicht noch einmal (Zähler/Zeitstempel) und gibt dieselben Patch-Bytes.
+  - Bestehende Tests (Oberfläche bytegleich, Nacharbeit, App) grün.
+- [ ] **Step 2–4:** FAIL → umsetzen → PASS.
+- [ ] **Step 5:** Messung wiederholen (`touchup_real` auf VM 101, nur die Nacharbeit auf dem vorhandenen Projekt; lange Läufe abgekoppelt starten). Ziel: jede Aktion ≤ 5 s auf Modell und Büro, Speicher nicht höher als vorher. Zahlen in `docs/ergebnisse/2026-10-29-pinsel.md` nachtragen (Abschnitt „Schneller“).
+- [ ] **Step 6:** Commit `perf(nacharbeit): Bilder einer Stelle schneller einspielen`.
+
+### Task 14: Verdeckung beim Einspielen (Nachtrag nach der Messung vom 29.10.)
+
+Anlass: Im dunklen Raum backt „Bilder neu“ ein dünnes Teil vor der Wand, das die Oberfläche nur in Stücken hat, als dunklen Streifen auf die Wand. Der Oberflächen-Schritt verhindert das mit Verdeckungsmaske und Fotokonsistenz (`views.rs`, `MASK_JUDGE_VIEWS`, „Photo consistency“); „Bilder neu“ hat beides nicht.
+
+**Files:**
+- Modify: `crates/driftless-map/src/surface/edit/retexture.rs` (Konsistenz der Ansichten je Fläche der Stelle wie im Oberflächen-Schritt; widerspricht das gewählte Bild an einer Fläche dem Median der übrigen guten Ansichten, nimmt die Fläche das nächstbeste stimmige Bild), ggf. `views.rs` (gemeinsame Prüfung herausziehen, voller Weg bytegleich)
+
+**Interfaces:** keine neuen öffentlichen; `retexture_region` gleich.
+
+- [ ] **Step 1: Failing test** `thin_occluder_not_baked`: synthetische Wand mit einem dünnen Stab davor, der in den Bildern zu sehen ist, aber nicht im Netz → nach „Bilder neu“ liegt die Farbe entlang der Stelle, an der der Stab in Variante 0 abgebildet würde, innerhalb von 8 sRGB-Stufen der Wandfarbe; ohne Prüfung (Gegenprobe) nicht. Außerdem: Oberfläche bytegleich (`full_surface_unchanged`), bestehende Retexture-Tests grün, deterministisch.
+- [ ] **Step 2–4:** FAIL → umsetzen → PASS.
+- [ ] **Step 5:** Messung im dunklen Raum wiederholen (VM 101, abgekoppelt): Streifen weg (Bild vorher/nachher, Kennzahl wie im Test), Randunterschied und Zeit wie in Task 13 nachtragen.
+- [ ] **Step 6:** Commit `fix(nacharbeit): verdeckte Bildteile nicht auf die Wand backen`.
