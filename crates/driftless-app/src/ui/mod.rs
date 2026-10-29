@@ -1041,6 +1041,7 @@ impl AppState {
                 let (S::Map(p)
                 | S::Model(p)
                 | S::Surface(p)
+                | S::EditedSurface(p)
                 | S::Run(p)
                 | S::PointFile(p)
                 | S::MeshFile(p)) = &req.source;

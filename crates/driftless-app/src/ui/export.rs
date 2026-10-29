@@ -116,7 +116,9 @@ pub fn source_name(state: &AppState, source: &ExportSource) -> String {
                 .map_or_else(|| folder(d), |m| m.label.clone());
             text::export_choice(&label, MODEL_LAS)
         }
-        ExportSource::Surface(d) => surface_label(state, d).unwrap_or_else(|| folder(d)),
+        ExportSource::Surface(d) | ExportSource::EditedSurface(d) => {
+            surface_label(state, d).unwrap_or_else(|| folder(d))
+        }
         ExportSource::Run(d) => {
             let label = state
                 .run(d)

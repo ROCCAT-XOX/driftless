@@ -242,6 +242,49 @@ fn settings_json(c: &SurfaceConfig, texture: bool) -> Value {
     })
 }
 
+/// The settings a surface was computed with, from its report `report` (`settings`, as
+/// [`settings_json`] writes them): the camera settings it does not hold take the defaults,
+/// which is what the program and `driftless surface` always use. `None` if a value is missing
+/// or of the wrong type; a report from before the coarse grid has no `coarse_fallback` (read as
+/// `true`), one from before `max_fill_gap` takes the default.
+pub(crate) fn surface_config(report: &Value) -> Option<SurfaceConfig> {
+    let s = &report["settings"];
+    let c = &s["color"];
+    let int = |v: &Value| v.as_u64();
+    let defaults = SurfaceConfig::default();
+    Some(SurfaceConfig {
+        voxel: s["voxel"].as_f64()?,
+        truncation_voxels: s["truncation_voxels"].as_f64()? as f32,
+        min_weight: int(&s["min_weight"])?.try_into().ok()?,
+        coarse_fallback: match &s["coarse_fallback"] {
+            Value::Null => true,
+            v => v.as_bool()?,
+        },
+        max_fill_gap: match &s["max_fill_gap"] {
+            Value::Null => defaults.max_fill_gap,
+            v => v.as_f64()?,
+        },
+        min_component_faces: int(&s["min_component_faces"])?.try_into().ok()?,
+        max_hole_perimeter: s["max_hole_perimeter"].as_f64()?,
+        simplify_error: s["simplify_error"].as_f64()?,
+        max_edge: s["max_edge"].as_f64()?,
+        min_texel: s["min_texel"].as_f64()?,
+        page_size: int(&s["page_size"])?.try_into().ok()?,
+        views_per_face: int(&s["views_per_face"])?.try_into().ok()?,
+        smooth_weight: s["smooth_weight"].as_f64()? as f32,
+        jpeg_quality: int(&s["jpeg_quality"])?.try_into().ok()?,
+        color: driftless_map::ColorConfig {
+            downscale: int(&c["downscale"])?.try_into().ok()?,
+            highlights: c["highlights"].as_bool()?,
+            max_dist: c["max_dist"].as_f64()?,
+            depth_tolerance: c["depth_tolerance"].as_f64()?,
+            min_sharpness: c["min_sharpness"].as_f64()?,
+            view_gap: c["view_gap"].as_f64()?,
+            ..defaults.color
+        },
+    })
+}
+
 fn accuracy_json(a: &Accuracy) -> Value {
     json!({
         "vertices": a.vertices,
@@ -1046,6 +1089,52 @@ mod tests {
             faces_unsupported,
             ..SurfaceStats::default()
         }
+    }
+
+    /// The settings of a report read back as they were given, through the text of the file;
+    /// what the report does not hold takes the defaults, and older reports still read.
+    #[test]
+    fn settings_read_back_from_the_report() {
+        let defaults = SurfaceConfig::default();
+        let given = SurfaceConfig {
+            voxel: 0.015,
+            truncation_voxels: 3.3,
+            min_weight: 3,
+            coarse_fallback: false,
+            max_fill_gap: 0.025,
+            min_component_faces: 77,
+            max_hole_perimeter: 1.25,
+            simplify_error: 0.0015,
+            max_edge: 0.21,
+            min_texel: 0.0031,
+            page_size: 2048,
+            views_per_face: 9,
+            smooth_weight: 0.35,
+            jpeg_quality: 83,
+            color: driftless_map::ColorConfig {
+                downscale: 4,
+                highlights: true,
+                max_dist: 9.5,
+                depth_tolerance: 0.07,
+                min_sharpness: 0.3,
+                view_gap: 0.6,
+                ..defaults.color
+            },
+        };
+        let text = serde_json::to_string(&json!({"settings": settings_json(&given, true)}));
+        let report: Value = serde_json::from_str(&text.unwrap()).unwrap();
+        assert_eq!(surface_config(&report), Some(given));
+        let mut old = report.clone();
+        let settings = old["settings"].as_object_mut().unwrap();
+        settings.remove("coarse_fallback");
+        settings.remove("max_fill_gap");
+        let old = surface_config(&old).unwrap();
+        assert!(old.coarse_fallback);
+        assert_eq!(old.max_fill_gap, defaults.max_fill_gap);
+        let mut broken = report;
+        broken["settings"]["voxel"] = "fein".into();
+        assert_eq!(surface_config(&broken), None);
+        assert_eq!(surface_config(&json!({})), None);
     }
 
     /// The figures of the real scans at the default 2 cm: the office B (2.0 of 8.6 million

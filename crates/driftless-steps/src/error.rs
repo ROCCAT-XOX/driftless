@@ -1,6 +1,7 @@
 //! The error of a step: cancelled, or failed with a German message for the user.
 
 use driftless_export::ExportError;
+use driftless_map::surface::edit::EditError;
 use driftless_map::MapError;
 use std::fmt;
 
@@ -52,6 +53,19 @@ impl From<ExportError> for StepError {
     fn from(e: ExportError) -> Self {
         match e {
             ExportError::Cancelled => StepError::Cancelled,
+            e => StepError::Failed(e.to_string()),
+        }
+    }
+}
+
+/// A touch-up step that could not run: cancelled, or failed with its German text (a step
+/// that only refused, such as [`EditError::NotFlat`], is no error of the touch-up step and is
+/// told apart before).
+impl From<EditError> for StepError {
+    fn from(e: EditError) -> Self {
+        match e {
+            EditError::Cancelled => StepError::Cancelled,
+            EditError::Map(e) => StepError::from(e),
             e => StepError::Failed(e.to_string()),
         }
     }
@@ -114,6 +128,15 @@ mod tests {
         );
         let boxed: Box<dyn std::error::Error> = Box::new(StepError::Cancelled);
         assert_eq!(StepError::from(boxed), StepError::Cancelled);
+        assert_eq!(StepError::from(EditError::Cancelled), StepError::Cancelled);
+        assert_eq!(
+            StepError::from(EditError::Map(MapError::Cancelled)),
+            StepError::Cancelled
+        );
+        assert_eq!(
+            StepError::from(EditError::NoImages),
+            StepError::Failed("Kein Bild zeigt diese Stelle; sie bleibt, wie sie ist.".into())
+        );
         let boxed: Box<dyn std::error::Error> = "nicht lesbar".into();
         assert_eq!(
             StepError::from(boxed),
