@@ -2281,7 +2281,7 @@ impl DriftlessApp {
         let TouchupOutput {
             surface,
             done,
-            raw,
+            no_sources,
             first,
             step: outcome,
             view,
@@ -2316,8 +2316,12 @@ impl DriftlessApp {
             let retexture = matches!(step, EditStep::Retexture { .. });
             let refused = match &outcome.refused {
                 Some(why) => Some(text::touchup_refused(nr, why)),
-                None if retexture && (!raw || outcome.without_raw_data) => {
-                    Some(text::RETEXTURE_NO_RAW_DATA.to_string())
+                // a stale surface says so, missing raw data the usual text
+                None if retexture && (no_sources.is_some() || outcome.without_raw_data) => {
+                    Some(match &no_sources {
+                        Some(why) if !why.raw_data_missing() => why.to_string(),
+                        _ => text::RETEXTURE_NO_RAW_DATA.to_string(),
+                    })
                 }
                 None => None,
             };

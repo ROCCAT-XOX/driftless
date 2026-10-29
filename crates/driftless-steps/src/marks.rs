@@ -472,6 +472,17 @@ impl Marks {
         self.seqs().next().is_some()
     }
 
+    /// The mark and `seq` of every step the file holds: of the marks, and of the marks taken
+    /// out with „Löschen“, which [`Marks::undo`] can bring back. A step taken back with
+    /// [`Marks::undo`] or [`Marks::drop_step`] is in none: it never comes back.
+    pub fn all_steps(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        let removed = self.removed.iter().map(|r| &r.stelle);
+        self.marks
+            .iter()
+            .chain(removed)
+            .flat_map(|m| m.steps.iter().map(move |s| (m.nr, s.seq())))
+    }
+
     /// The key of a cache made from the marks, hashed like the input ids of the steps
     /// ([`hex`]): the marks in their order with their numbers, dabs and steps, numbers
     /// written exactly (`{:?}`). The counters, unknown keys and removed marks are no part of
@@ -796,6 +807,29 @@ mod tests {
         assert_eq!(marks.undo(), Some(Undone::Removal { mark: a }));
         assert_eq!(marks.undo(), Some(Undone::Removal { mark: b }));
         assert_eq!(marks.marks.iter().map(|m| m.nr).collect::<Vec<_>>(), [a, b]);
+    }
+
+    /// Every step the file holds, also of a mark taken out with „Löschen“ (↶ brings it back);
+    /// a step taken back is in none.
+    #[test]
+    fn all_steps_of_the_file() {
+        let mut marks = Marks::default();
+        let a = marks.paint(None, &[dab(WALL, false)]);
+        let flat = StepInput::Smooth {
+            level: SmoothLevel::Flat,
+        };
+        marks.add_step(a, flat).unwrap();
+        let b = marks.paint(None, &[dab(WALL, false)]);
+        marks
+            .add_step(b, StepInput::Retexture { variant: 0 })
+            .unwrap();
+        assert!(marks.remove(a));
+        let all: Vec<(u32, u64)> = marks.all_steps().collect();
+        assert_eq!(all, [(b, 4), (a, 2)]);
+        // ↶ of the removal, then of the step of b: that one is gone for good
+        marks.undo();
+        marks.undo();
+        assert_eq!(marks.all_steps().collect::<Vec<_>>(), [(a, 2)]);
     }
 
     #[test]

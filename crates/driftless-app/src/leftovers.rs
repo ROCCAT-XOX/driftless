@@ -1,8 +1,9 @@
 //! What a job cut off left behind (a crash, a force quit, a power cut): a run, map, surface or
 //! model folder without its final report (`slam.json`, `map.json`, `oberflaeche.json`,
-//! `modell.json`; each step writes it last), or a stale `<name>.tmp` beside a file being
-//! written. A surface folder with its glb but without its report was cut off between the two:
-//! it is a leftover too, never a finished surface. A cancelled or failed job removes its new
+//! `modell.json`; each step writes it last), a stale `<name>.tmp` beside a file being
+//! written, or a folder `nacharbeit.tmp-…` a touch-up left in a surface folder. A surface
+//! folder with its glb but without its report was cut off between the two: it is a leftover
+//! too, never a finished surface. A cancelled or failed job removes its new
 //! folder itself ([`crate::project::StepDir`]); these are what remains when the program had no
 //! chance to. „Daten“ lists them as „unvollständig“, „Aufräumen“ moves them to the trash.
 //!
@@ -12,7 +13,9 @@
 //! offered. „Aufräumen“ never takes finished results along with a folder, also when they came
 //! after the list was made ([`may_clean_up`]). A run whose reuse was cut off while it put its
 //! new files in place holds its old result aside (`<name>.alt.tmp`): the next run puts it back
-//! ([`reuse_cut_off`]), so its `.tmp` files are left alone.
+//! ([`reuse_cut_off`]), so its `.tmp` files are left alone. So does a surface whose touch-up was
+//! cut off while it put its new cache in place ([`touchup_cut_off`]): its `nacharbeit.tmp-…`
+//! stay for the next touch-up.
 //!
 //! What a job may still write is left alone: a folder a running job marks busy ([`BUSY_FILE`],
 //! touched every [`BUSY_BEAT`]; this window's, another window's), and what was written to within
@@ -27,6 +30,7 @@ use driftless_steps::map::REPORT as MAP_REPORT;
 use driftless_steps::merge::MODEL_REPORT;
 use driftless_steps::slam::reuse_cut_off;
 use driftless_steps::surface::SURFACE_REPORT;
+use driftless_steps::touchup::{touchup_cut_off, touchup_leftovers};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -50,7 +54,8 @@ pub enum LeftoverKind {
     Map,
     Surface,
     Model,
-    /// A `<name>.tmp` in a folder that is complete otherwise.
+    /// A `<name>.tmp` in a folder that is complete otherwise, or a folder `nacharbeit.tmp-…` a
+    /// touch-up left in a surface folder.
     Temp,
 }
 
@@ -130,7 +135,7 @@ pub fn find(dir: &Path, scan_ids: &[String]) -> Vec<Leftover> {
 
 /// The surfaces `oberflaeche-NNN` of the map or model folder `dir` (named `parent`): one
 /// without its report (`oberflaeche.json`, written after the glb) whole, else its stale `.tmp`
-/// files.
+/// files and what its touch-up left ([`touchup_temps`]).
 fn surfaces(dir: &Path, parent: &str, out: &mut Vec<Leftover>) {
     for (_, digits, surface) in numbered(dir, SURFACE_NUMBERED) {
         let label = text::surface_label(&digits);
@@ -139,6 +144,7 @@ fn surfaces(dir: &Path, parent: &str, out: &mut Vec<Leftover>) {
         }
         if surface.join(SURFACE_REPORT).is_file() {
             temps(&surface, Some(&label), out);
+            touchup_temps(&surface, &label, out);
         } else {
             let label = format!("{label} ({parent})");
             out.push(folder(LeftoverKind::Surface, &surface, label));
@@ -170,6 +176,20 @@ fn temps(dir: &Path, parent: Option<&str>, out: &mut Vec<Leftover>) {
         .collect();
     found.sort_by(|a, b| a.path.cmp(&b.path));
     out.extend(found);
+}
+
+/// The folders `nacharbeit.tmp-…` a touch-up cut off left in the surface folder `dir` (named
+/// `label`), as `<name> (<label>)` – none while it was cut off putting its new cache in place
+/// ([`touchup_cut_off`]): the next touch-up puts the old one back.
+fn touchup_temps(dir: &Path, label: &str, out: &mut Vec<Leftover>) {
+    if touchup_cut_off(dir) {
+        return;
+    }
+    for path in touchup_leftovers(dir).into_iter().filter(|p| p.is_dir()) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let label = format!("{name} ({label})");
+        out.push(folder(LeftoverKind::Temp, &path, label));
+    }
 }
 
 /// The incomplete folder `dir` as a leftover.
@@ -226,16 +246,21 @@ pub fn holds_results(dir: &Path) -> bool {
 /// Whether „Aufräumen“ may move the leftover `path` to the trash now: a file unless it lies in
 /// a run whose reuse was cut off ([`reuse_cut_off`]: the next run puts its old files back); a
 /// folder unless a job marks it or a folder in it busy ([`busy_below`]), it has its report by
-/// now (a step finished it), or it holds finished results ([`holds_results`]) – each may have
-/// come after the leftovers were listed.
+/// now (a step finished it), it holds finished results ([`holds_results`]), or it is what a
+/// touch-up cut off while putting its new cache in place left ([`touchup_cut_off`]: the next
+/// touch-up puts the old one back) – each may have come after the leftovers were listed.
 pub fn may_clean_up(path: &Path) -> bool {
     let reports = [SLAM_REPORT, MAP_REPORT, SURFACE_REPORT, MODEL_REPORT];
     if !path.is_dir() {
         return !path.parent().is_some_and(reuse_cut_off);
     }
+    let of_touchup = path.parent().is_some_and(|surface| {
+        touchup_leftovers(surface).iter().any(|p| p == path) && touchup_cut_off(surface)
+    });
     busy_below(path).is_none()
         && !reports.iter().any(|r| path.join(r).is_file())
         && !holds_results(path)
+        && !of_touchup
 }
 
 /// Whether a running job marks the folder `dir` busy: its [`BUSY_FILE`] was touched within

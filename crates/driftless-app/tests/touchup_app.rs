@@ -28,7 +28,9 @@ use driftless_steps::map::{MapSettings, MapSwitches};
 use driftless_steps::marks::{DabInput, EditStep, Marks, SmoothLevel, MARKS_FILE};
 use driftless_steps::slam::SlamSettings;
 use driftless_steps::surface::texture_sources;
-use driftless_steps::touchup::{edited_mesh, touchup_fits, touchup_without_raw_data, TOUCHUP_DIR};
+use driftless_steps::touchup::{
+    edited_mesh, touchup_fits, touchup_without_raw_data, FORMER_DIR, TOUCHUP_DIR, TOUCHUP_REPORT,
+};
 use eframe::egui::accesskit::Toggled;
 use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
@@ -803,11 +805,12 @@ fn undo_step_recomputes() {
     assert_eq!(scene.patches(), strong);
     assert_eq!(scene.app.state().touchup.shown, shown);
 
-    // „Löschen“ takes the Stelle and its touch-up away …
+    // „Löschen“ takes the Stelle and its touch-up away – its step kept aside for ↶ …
     scene.run(Action::DeleteMark(nr));
     no_errors(&scene.app);
     assert!(scene.marks().marks.is_empty());
-    assert!(!scene.cache().exists());
+    assert!(!scene.cache().join(TOUCHUP_REPORT).exists());
+    assert!(scene.cache().join(FORMER_DIR).is_dir());
     assert!(!scene.app.view().has_edit());
     // … and ⌘Z brings both back
     scene.run(Action::UndoMark);
@@ -837,7 +840,10 @@ fn touchup_takes_the_loaded_surface() {
     let bytes = want.patches();
 
     let mut scene = Scene::new("nacharbeit-app-vorbereitet");
-    let sources = texture_sources(&scene.surface).unwrap().unwrap();
+    let sources = texture_sources(&scene.surface)
+        .unwrap()
+        .into_found()
+        .unwrap();
     let images = &sources[0].images;
     let nr = scene.paint(front_wall(&scene.surface));
     assert!(!scene

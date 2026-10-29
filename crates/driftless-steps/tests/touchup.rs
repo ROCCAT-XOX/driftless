@@ -8,17 +8,22 @@ use driftless_io::images::ImageIndices;
 use driftless_io::progress::{Progress, ProgressSnapshot};
 use driftless_io::testdir::{SharedDir, TestDir};
 use driftless_io::testscan::{scan_with_images, shared, tmp};
-use driftless_map::surface::edit::{dab_normal, FaceBvh, WeldedSurface, PATCHES_FILE};
-use driftless_map::surface::{SurfaceConfig, TextureSource};
+use driftless_map::surface::edit::{
+    dab_normal, read_patches, FaceBvh, SurfacePatch, WeldedSurface, PATCHES_FILE,
+};
+use driftless_map::surface::SurfaceConfig;
 use driftless_steps::export::{run_export, ExportFormat, ExportKind, ExportRequest, ExportSource};
 use driftless_steps::map::{run_map, MapInput, MapRequest, MapSettings, MapStep};
 use driftless_steps::marks::{DabInput, Marks, SmoothLevel, StepInput};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
-use driftless_steps::surface::{run_surface, surface_fits, texture_sources, SurfaceRequest};
+use driftless_steps::surface::{
+    run_surface, surface_fits, texture_sources, NoSources, SurfaceRequest, TextureSources,
+    STALE_SURFACE,
+};
 use driftless_steps::touchup::{
-    edited_mesh, edited_pages, run_touchup, touchup_fits, touchup_without_raw_data,
-    PreparedSurface, StepOutcome, TouchupDone, TouchupPrepared, TouchupRequest, TOUCHUP_DIR,
-    TOUCHUP_REPORT,
+    edited_mesh, edited_pages, run_touchup, touchup_cut_off, touchup_fits, touchup_leftovers,
+    touchup_without_raw_data, PreparedSurface, StepOutcome, TouchupDone, TouchupPrepared,
+    TouchupRequest, FORMER_DIR, TOUCHUP_DIR, TOUCHUP_REPORT,
 };
 use driftless_steps::StepError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,6 +34,14 @@ use std::time::SystemTime;
 
 /// The hint of a step that needed the camera images while the raw data were gone.
 const NO_RAW_DATA: &str = "Rohdaten fehlen – Bilder nicht neu eingespielt";
+
+/// The camera images as the program has them with the raw data gone (a drive unplugged).
+fn gone() -> TextureSources {
+    TextureSources::Unavailable(NoSources::ScanFolder {
+        folder: PathBuf::from("/Volumes/weg/raum"),
+        why: "Scan-Ordner /Volumes/weg/raum nicht gefunden".into(),
+    })
+}
 
 /// Where the device stood: the rays of the brush start here.
 const EYE: [f64; 3] = [0.0, 0.0, 0.0];
@@ -175,13 +188,13 @@ impl Scene {
     }
 
     /// The camera images of the surface, as the program finds them.
-    fn sources(&self) -> Option<Vec<TextureSource>> {
+    fn sources(&self) -> TextureSources {
         let sources = texture_sources(&self.surface).unwrap();
-        assert!(sources.as_ref().is_some_and(|s| s.len() == 1));
+        assert!(sources.found().is_some_and(|s| s.len() == 1), "{sources:?}");
         sources
     }
 
-    fn request(&self, sources: Option<Vec<TextureSource>>) -> TouchupRequest {
+    fn request(&self, sources: TextureSources) -> TouchupRequest {
         TouchupRequest {
             surface_dir: self.surface.clone(),
             owner_dir: self.map.clone(),
@@ -536,25 +549,18 @@ fn cache_is_reused() {
     assert_eq!(cache_times(&scene), times);
 
     // Dabs painted into the smoothed Stelle after its step count for later steps only: the
-    // cache no longer fits the Stellen, but the step is kept, not computed anew.
+    // cache still fits the Stellen, nothing is computed or written.
     Marks::change(&scene.map, |m| {
         let more = dabs(&scene.surface, &[[6.0, 2.0, 0.5]], 0.3);
         m.paint(Some(1), &more);
         Ok(())
     })
     .unwrap();
-    assert!(!touchup_fits(&scene.surface, &scene.marks()));
+    assert!(touchup_fits(&scene.surface, &scene.marks()));
     let (progress, phases) = recording();
     run_touchup(&scene.request(scene.sources()), &progress).unwrap();
-    assert!(
-        !phases
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|p| p.starts_with("Nacharbeit: Schritt")),
-        "{phases:?}"
-    );
-    assert!(touchup_fits(&scene.surface, &scene.marks()));
+    assert!(phases.lock().unwrap().is_empty(), "{phases:?}");
+    assert_eq!(cache_times(&scene), times);
     assert_eq!(fs::read(scene.cache().join(PATCHES_FILE)).unwrap(), bytes);
 
     // Computed anew from nothing, the step gives the same bytes: the later dabs do not count.
@@ -736,7 +742,7 @@ fn no_raw_data() {
     scene.mark(&dabs(&scene.surface, &[[6.0, -1.5, 0.5]], 0.3), retexture);
 
     // Smoothing works; the images are not baked anew, which a hint says once.
-    let done = run_touchup(&scene.request(None), &Progress::new()).unwrap();
+    let done = run_touchup(&scene.request(gone()), &Progress::new()).unwrap();
     assert_eq!(
         (done.steps, &done.hints, &done.refused),
         (2, &vec![NO_RAW_DATA.to_string()], &Vec::new())
@@ -761,7 +767,7 @@ fn no_raw_data() {
     // Still without them: kept as it is.
     let times = cache_times(&scene);
     assert_eq!(
-        run_touchup(&scene.request(None), &Progress::new()).unwrap(),
+        run_touchup(&scene.request(gone()), &Progress::new()).unwrap(),
         done
     );
     assert_eq!(cache_times(&scene), times);
@@ -1006,4 +1012,415 @@ fn prepared_surface_is_used() {
         "{phases:?}"
     );
     assert_eq!(fs::read(scene.cache().join(PATCHES_FILE)).unwrap(), want);
+}
+
+/// Moves every position of the trajectory `traj` by `dx` m along x, as a corrected trajectory
+/// computed anew in the same folder does; returns the text it had.
+fn shift_traj(traj: &Path, dx: f64) -> String {
+    let text = fs::read_to_string(traj).unwrap();
+    let shifted: String = text
+        .lines()
+        .map(|l| {
+            if l.starts_with('#') || l.trim().is_empty() {
+                return format!("{l}\n");
+            }
+            let mut f: Vec<String> = l.split_whitespace().map(String::from).collect();
+            let x: f64 = f[1].parse().unwrap();
+            f[1] = format!("{}", x + dx);
+            format!("{}\n", f.join(" "))
+        })
+        .collect();
+    fs::write(traj, shifted).unwrap();
+    text
+}
+
+/// The trajectory of the run computed anew in its folder („Schleife eintragen → Jetzt neu
+/// rechnen“, „Diesen Stand wiederherstellen“; probe P1 of the final review): the map and its
+/// surface are stale, and no images are baked onto it with the new poses. A step that needs
+/// them says why and is kept as made without them; the images baked before stay as they were.
+/// With the trajectory as it was, the step gets its images.
+#[test]
+fn stale_surface_bakes_no_images() {
+    let scene = Scene::new("nacharbeit-veraltet");
+    let retexture = Some(StepInput::Retexture { variant: 0 });
+    let first = scene.mark(&front_wall(&scene.surface), retexture);
+    scene.touch_up();
+    let baked = read_patches(&scene.cache()).unwrap();
+    assert!(!baked[0].pages.is_empty());
+
+    let run = scene.map.parent().unwrap().to_path_buf();
+    let text = shift_traj(&run.join("traj.tum"), 0.3);
+    let req = surface_request(&scene.project, &scene.surface, small_config());
+    assert!(!surface_fits(&req), "the surface is stale now");
+    let stale = texture_sources(&scene.surface).unwrap();
+    assert_eq!(stale, TextureSources::Unavailable(NoSources::SurfaceStale));
+
+    // „Bilder neu“ on another Stelle: nothing baked, said why; the first keeps its images
+    let second = scene.mark(&dabs(&scene.surface, &[[6.0, -1.5, 0.5]], 0.3), retexture);
+    let done = run_touchup(&scene.request(stale.clone()), &Progress::new()).unwrap();
+    assert!(done.refused.is_empty(), "{done:?}");
+    assert_eq!(done.hints, [STALE_SURFACE]);
+    let outcomes: Vec<_> = done
+        .outcomes
+        .iter()
+        .map(|o| (o.mark, o.without_raw_data, o.variant_of.is_some()))
+        .collect();
+    assert_eq!(outcomes, [(first, false, true), (second, true, false)]);
+    let patches = read_patches(&scene.cache()).unwrap();
+    assert_eq!(patches, [baked[0].clone(), SurfacePatch::default()]);
+    // a smoothing on it smooths; its images are not baked anew either
+    scene.mark(&back_wall(&scene.surface), smooth(SmoothLevel::Light));
+    let done = run_touchup(&scene.request(stale), &Progress::new()).unwrap();
+    assert_eq!(done.hints, [STALE_SURFACE]);
+    assert!(done.outcomes[2].without_raw_data, "{done:?}");
+    assert!(touchup_without_raw_data(&scene.surface));
+
+    // the trajectory as it was: the surface fits again, the steps get their images
+    fs::write(run.join("traj.tum"), text).unwrap();
+    assert!(surface_fits(&req));
+    let done = scene.touch_up();
+    assert!(
+        done.outcomes
+            .iter()
+            .all(|o| !o.without_raw_data && o.refused.is_none()),
+        "{done:?}"
+    );
+    assert!(done.outcomes[1].variant_of.is_some(), "{done:?}");
+    assert!(!touchup_without_raw_data(&scene.surface));
+    assert_eq!(read_patches(&scene.cache()).unwrap()[0], baked[0]);
+}
+
+/// The scan folder is there but its image bag is not (a copy without the images; probe P2 of
+/// the final review): the raw data are missing, said with what. A smoothing smooths, keeps its
+/// texture and is kept as made without them; once the bag is back it gets its images.
+#[test]
+fn missing_images_are_missing_raw_data() {
+    let scene = Scene::new("nacharbeit-ohne-bilder");
+    let scan = fs::canonicalize(scene.project.join("rohdaten").join("raum")).unwrap();
+    fs::rename(scan.join("IMAGE_0.bag"), scan.join("IMAGE_0.weg")).unwrap();
+    let sources = texture_sources(&scene.surface).unwrap();
+    let why = sources.unavailable().expect("no images").clone();
+    assert!(
+        matches!(&why, NoSources::Images { scan: s, .. } if *s == scan),
+        "{why:?}"
+    );
+    assert!(why.raw_data_missing());
+    assert_eq!(
+        why.to_string(),
+        format!(
+            "Rohdaten fehlen – keine Kamerabilder: {} enthält keine IMAGE_*.bag",
+            scan.display()
+        )
+    );
+
+    scene.mark(&front_wall(&scene.surface), smooth(SmoothLevel::Strong));
+    let done = run_touchup(&scene.request(sources), &Progress::new()).unwrap();
+    assert_eq!(done.hints, [NO_RAW_DATA]);
+    assert!(done.outcomes[0].without_raw_data, "{done:?}");
+    assert!(touchup_without_raw_data(&scene.surface));
+    assert!(touchup_fits(&scene.surface, &scene.marks()));
+
+    // the bag back: computed anew, with the images
+    fs::rename(scan.join("IMAGE_0.weg"), scan.join("IMAGE_0.bag")).unwrap();
+    let done = scene.touch_up();
+    assert!(done.hints.is_empty(), "{done:?}");
+    assert!(done.outcomes[0].variant_of.is_some(), "{done:?}");
+    assert!(!touchup_without_raw_data(&scene.surface));
+}
+
+/// A stroke painted into a Stelle after its step counts for later steps only (R2-M3 of the
+/// final review): the cache still fits – the view keeps „Nachher“, the export runs – and
+/// nothing is computed or written. A later step of the Stelle takes the stroke.
+#[test]
+fn stroke_after_a_step_keeps_the_cache() {
+    let scene = Scene::new("nacharbeit-zug-danach");
+    let nr = scene.mark(&front_wall(&scene.surface), smooth(SmoothLevel::Strong));
+    scene.touch_up();
+    let times = cache_times(&scene);
+    let edited = edited_mesh(&scene.surface, &Progress::new()).unwrap();
+    assert!(edited.is_some());
+
+    Marks::change(&scene.map, |m| {
+        m.paint(Some(nr), &dabs(&scene.surface, &[[6.0, 2.0, 0.5]], 0.3));
+        Ok(())
+    })
+    .unwrap();
+    assert!(touchup_fits(&scene.surface, &scene.marks()));
+    assert_eq!(
+        edited_mesh(&scene.surface, &Progress::new()).unwrap(),
+        edited
+    );
+    let out = scene.dir.join("ausgabe");
+    fs::create_dir_all(&out).unwrap();
+    let source = ExportSource::EditedSurface(scene.surface.clone());
+    export(source, &out.join("danach.glb"), ExportFormat::Glb);
+    let (progress, phases) = recording();
+    run_touchup(&scene.request(scene.sources()), &progress).unwrap();
+    assert!(phases.lock().unwrap().is_empty(), "{phases:?}");
+    assert_eq!(cache_times(&scene), times);
+
+    // the next step of the Stelle takes it: computed, that step only
+    Marks::change(&scene.map, |m| {
+        m.add_step(nr, StepInput::Retexture { variant: 1 })
+    })
+    .unwrap();
+    assert!(!touchup_fits(&scene.surface, &scene.marks()));
+    let (progress, phases) = recording();
+    run_touchup(&scene.request(scene.sources()), &progress).unwrap();
+    let phases = phases.lock().unwrap().clone();
+    assert!(
+        phases.iter().any(|p| p == "Nacharbeit: Schritt 2 von 2"),
+        "{phases:?}"
+    );
+    assert!(
+        !phases.iter().any(|p| p == "Nacharbeit: Schritt 1 von 2"),
+        "{phases:?}"
+    );
+    assert!(touchup_fits(&scene.surface, &scene.marks()));
+}
+
+/// What is in the cache folder below `dir`, as paths relative to it, sorted.
+fn tree(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).unwrap() {
+        let e = e.unwrap();
+        let name = e.file_name().to_string_lossy().into_owned();
+        if e.file_type().unwrap().is_dir() {
+            out.extend(tree(&e.path()).into_iter().map(|n| format!("{name}/{n}")));
+        } else {
+            out.push(name);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// „Löschen“ of an earlier Stelle and its ↶ while the raw data are gone (probe P3 of the final
+/// review): the later Stelle cannot get its images anew meanwhile, but what was baked with the
+/// raw data is kept aside (`nacharbeit/frueher/`), and ↶ brings every page back byte for byte,
+/// without the raw data and without computing. Nothing named `….tmp` or `oberflaeche…` stays.
+#[test]
+fn delete_and_undo_without_raw_data_keep_the_images() {
+    let scene = Scene::new("nacharbeit-loeschen-ohne-rohdaten");
+    scene.mark(&front_wall(&scene.surface), smooth(SmoothLevel::Strong));
+    let retexture = Some(StepInput::Retexture { variant: 0 });
+    scene.mark(&dabs(&scene.surface, &[[6.0, -1.5, 0.5]], 0.3), retexture);
+    let done = scene.touch_up();
+    let full = fs::read(scene.cache().join(PATCHES_FILE)).unwrap();
+    let pages = |scene: &Scene| {
+        let mesh = edited_mesh(&scene.surface, &Progress::new()).unwrap();
+        mesh.unwrap().pages.len()
+    };
+    let all_pages = pages(&scene);
+    assert!(all_pages >= scene.glb().pages.len() + 2);
+
+    // without the raw data, Stelle 1 deleted: Stelle 2 is computed anew without its images
+    Marks::change(&scene.map, |m| Ok(m.remove(1))).unwrap();
+    let gone_done = run_touchup(&scene.request(gone()), &Progress::new()).unwrap();
+    assert_eq!(gone_done.hints, [NO_RAW_DATA]);
+    assert!(gone_done.outcomes[0].without_raw_data, "{gone_done:?}");
+    assert!(pages(&scene) < all_pages);
+    let kept_aside = tree(&scene.cache());
+    assert!(
+        kept_aside
+            .iter()
+            .any(|n| n.starts_with(&format!("{FORMER_DIR}/"))),
+        "{kept_aside:?}"
+    );
+
+    // ↶: both Stellen back, and their images: byte for byte, nothing computed
+    Marks::change(&scene.map, |m| Ok(m.undo())).unwrap();
+    let (progress, phases) = recording();
+    let back = run_touchup(&scene.request(gone()), &progress).unwrap();
+    assert!(
+        !phases
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.starts_with("Nacharbeit: ")),
+        "{phases:?}"
+    );
+    assert_eq!(back, done);
+    assert_eq!(fs::read(scene.cache().join(PATCHES_FILE)).unwrap(), full);
+    assert_eq!(pages(&scene), all_pages);
+    assert!(touchup_fits(&scene.surface, &scene.marks()));
+    assert!(!touchup_without_raw_data(&scene.surface));
+    // nothing left aside: both are in the cache again
+    assert_eq!(tree(&scene.cache()), [PATCHES_FILE, TOUCHUP_REPORT]);
+    assert!(tmp_files(&scene.dir).is_empty());
+    assert!(names(&scene.surface)
+        .iter()
+        .filter(|n| n.starts_with("oberflaeche"))
+        .all(|n| n == "oberflaeche.glb" || n == "oberflaeche.json"));
+
+    // with the raw data back: nothing to compute either
+    let times = cache_times(&scene);
+    assert_eq!(scene.touch_up(), done);
+    assert_eq!(cache_times(&scene), times);
+}
+
+/// The Stelle deleted is the only one with steps: no step is left, yet what it was baked with
+/// stays aside while ↶ can bring it back – and ↶ does, byte for byte, without the raw data. A
+/// step taken back with ↶ can never come back: nothing of it is kept.
+#[test]
+fn only_stelle_deleted_and_back_without_raw_data() {
+    let scene = Scene::new("nacharbeit-einzige-loeschen");
+    let retexture = Some(StepInput::Retexture { variant: 0 });
+    scene.mark(&front_wall(&scene.surface), retexture);
+    let done = scene.touch_up();
+    let full = fs::read(scene.cache().join(PATCHES_FILE)).unwrap();
+
+    Marks::change(&scene.map, |m| Ok(m.remove(1))).unwrap();
+    assert!(touchup_fits(&scene.surface, &scene.marks()));
+    assert_eq!(
+        run_touchup(&scene.request(gone()), &Progress::new()).unwrap(),
+        TouchupDone::default()
+    );
+    assert_eq!(edited_mesh(&scene.surface, &Progress::new()).unwrap(), None);
+    let left = tree(&scene.cache());
+    assert!(
+        left.iter()
+            .all(|n| n.starts_with(&format!("{FORMER_DIR}/")))
+            && !left.is_empty(),
+        "{left:?}"
+    );
+
+    Marks::change(&scene.map, |m| Ok(m.undo())).unwrap();
+    assert_eq!(
+        run_touchup(&scene.request(gone()), &Progress::new()).unwrap(),
+        done
+    );
+    assert_eq!(fs::read(scene.cache().join(PATCHES_FILE)).unwrap(), full);
+    assert_eq!(tree(&scene.cache()), [PATCHES_FILE, TOUCHUP_REPORT]);
+
+    // ↶ of the step itself: it is gone for good, and so is its cache
+    Marks::change(&scene.map, |m| Ok(m.undo())).unwrap();
+    assert!(scene.marks().marks[0].steps.is_empty());
+    run_touchup(&scene.request(gone()), &Progress::new()).unwrap();
+    assert!(!scene.cache().exists());
+}
+
+/// A run killed between its two renames (the old cache put aside as `nacharbeit.tmp-…-alt`,
+/// the new one not yet in place; R2-M1 of the final review): the next run puts the old cache
+/// back instead of deleting it – without the raw data its images would be gone – and removes
+/// the rest. A damaged one put aside is not put back.
+#[test]
+fn cut_off_swap_puts_the_old_cache_back() {
+    let scene = Scene::new("nacharbeit-tausch-unterbrochen");
+    scene.mark(&front_wall(&scene.surface), smooth(SmoothLevel::Strong));
+    let done = scene.touch_up();
+    let bytes = fs::read(scene.cache().join(PATCHES_FILE)).unwrap();
+    assert!(!touchup_cut_off(&scene.surface));
+
+    let aside = scene.surface.join(format!("{TOUCHUP_DIR}.tmp-4242-alt"));
+    let new = scene.surface.join(format!("{TOUCHUP_DIR}.tmp-4242-neu"));
+    fs::rename(scene.cache(), &aside).unwrap();
+    fs::create_dir_all(&new).unwrap();
+    fs::write(new.join(PATCHES_FILE), b"halb").unwrap();
+    assert!(touchup_cut_off(&scene.surface));
+    assert_eq!(
+        touchup_leftovers(&scene.surface),
+        [aside.clone(), new.clone()]
+    );
+    // the readers see no cache meanwhile
+    assert!(!touchup_fits(&scene.surface, &scene.marks()));
+
+    let (progress, phases) = recording();
+    assert_eq!(
+        run_touchup(&scene.request(gone()), &progress).unwrap(),
+        done
+    );
+    assert!(
+        !phases
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.starts_with("Nacharbeit: ")),
+        "{phases:?}"
+    );
+    assert_eq!(fs::read(scene.cache().join(PATCHES_FILE)).unwrap(), bytes);
+    assert!(touchup_leftovers(&scene.surface).is_empty());
+    assert!(!touchup_cut_off(&scene.surface));
+    assert!(touchup_fits(&scene.surface, &scene.marks()));
+
+    // put aside damaged (its patches cut short): not put back, computed anew
+    fs::rename(scene.cache(), &aside).unwrap();
+    let patches = aside.join(PATCHES_FILE);
+    fs::write(&patches, &bytes[..bytes.len() / 2]).unwrap();
+    assert!(!touchup_cut_off(&scene.surface));
+    let done = scene.touch_up();
+    assert!(done.refused.is_empty(), "{done:?}");
+    assert_eq!(fs::read(scene.cache().join(PATCHES_FILE)).unwrap(), bytes);
+    assert!(touchup_leftovers(&scene.surface).is_empty());
+}
+
+/// Refused export of `source` to `out` as `format`, with overwriting: its message.
+fn refused(source: ExportSource, out: &Path, format: ExportFormat) -> String {
+    let req = ExportRequest {
+        source,
+        out: out.to_path_buf(),
+        format,
+        overwrite: true,
+    };
+    match run_export(&req, &Progress::new()) {
+        Err(StepError::Failed(m)) => m,
+        other => panic!("expected a refusal of {}, got {other:?}", out.display()),
+    }
+}
+
+/// The files the report of a surface lists – the OBJ of a surface computed with `--obj`, its
+/// `.mtl` and pages – are no target of an export of the surface, as computed or touched up
+/// (probe P4 of the final review): the computed folder stays as it is. Nor is any file in the
+/// folder of a touch-up, of any surface (probe P5): the next run of it would replace it.
+#[test]
+fn export_keeps_off_the_surface_and_the_touchup() {
+    let scene = Scene::new("nacharbeit-export-ziele");
+    let second = scene.map.join("oberflaeche-002");
+    let mut computed = surface_request(&scene.project, &second, small_config());
+    computed.obj = true;
+    run_surface(&computed, &Progress::new()).unwrap();
+    assert!(second.join("oberflaeche_seite_00.jpg").is_file());
+    scene.mark(&front_wall(&second), smooth(SmoothLevel::Strong));
+    let req = TouchupRequest {
+        surface_dir: second.clone(),
+        owner_dir: scene.map.clone(),
+        sources: texture_sources(&second).unwrap(),
+        prepared: TouchupPrepared::default(),
+    };
+    run_touchup(&req, &Progress::new()).unwrap();
+    scene.touch_up();
+    let before = files_in(&second);
+
+    for source in [
+        ExportSource::Surface(second.clone()),
+        ExportSource::EditedSurface(second.clone()),
+    ] {
+        for (out, format) in [
+            (second.join("oberflaeche.obj"), ExportFormat::Obj),
+            (
+                second.join("oberflaeche_seite_00.jpg"),
+                ExportFormat::PlyMesh,
+            ),
+        ] {
+            let m = refused(source.clone(), &out, format);
+            assert!(m.starts_with("Ziel ist die Quelle selbst"), "{m}");
+        }
+        for cache in [second.join(TOUCHUP_DIR), scene.cache()] {
+            let m = refused(source.clone(), &cache.join("meins.glb"), ExportFormat::Glb);
+            assert!(
+                m.starts_with(&format!(
+                    "Ziel liegt im Ordner der Nacharbeit {}",
+                    fs::canonicalize(&cache).unwrap().display()
+                )),
+                "{m}"
+            );
+            assert!(!cache.join("meins.glb").exists());
+        }
+    }
+    assert_eq!(files_in(&second), before);
+    assert!(surface_fits(&computed));
+    // next to the surface's own files: as before
+    let source = ExportSource::EditedSurface(second.clone());
+    export(source, &second.join("meins.glb"), ExportFormat::Glb);
+    assert!(surface_fits(&computed));
 }

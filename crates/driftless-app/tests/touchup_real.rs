@@ -2075,6 +2075,7 @@ fn measure(h: &mut H, target: &Target, work: &Path, shots: Option<&Path>, paint:
         .to_path_buf();
     let sources = texture_sources(&target.surface)
         .unwrap()
+        .into_found()
         .expect("the raw data of the surface");
     let t = Instant::now();
     let g = Geometry::read(&target.surface);
@@ -2438,8 +2439,14 @@ fn touchup_on_real_scans() {
     );
 
     eprintln!("\nKameras (Kegel der Verdeckung bei „Bilder neu“):");
-    let model_sources = texture_sources(&c.model_surface).unwrap().unwrap();
-    let buero_sources = texture_sources(&c.buero_surface).unwrap().unwrap();
+    let model_sources = texture_sources(&c.model_surface)
+        .unwrap()
+        .into_found()
+        .unwrap();
+    let buero_sources = texture_sources(&c.buero_surface)
+        .unwrap()
+        .into_found()
+        .unwrap();
     let mut all = model_sources.clone();
     all.extend(buero_sources);
     out["kameras"] = cameras(&all);
@@ -2469,7 +2476,13 @@ fn touchup_on_real_scans() {
     out["oberflaechen"] = Value::Array(results);
 
     // reading the image bag of B from the disk and from the page cache
-    let bag = bags(&texture_sources(&c.buero_surface).unwrap().unwrap())[0].clone();
+    let bag = bags(
+        &texture_sources(&c.buero_surface)
+            .unwrap()
+            .into_found()
+            .unwrap(),
+    )[0]
+    .clone();
     if evict(&bag) {
         let (bytes, cold) = read_through(&bag);
         let (_, warm) = read_through(&bag);

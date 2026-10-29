@@ -37,7 +37,7 @@ use driftless_io::progress::Progress;
 use driftless_map::content_hash;
 use driftless_map::surface::edit::{read_patches, FaceBvh, PageEdit, WeldedSurface, PATCHES_FILE};
 use driftless_steps::marks::Marks;
-use driftless_steps::surface::{texture_sources, SURFACE_REPORT};
+use driftless_steps::surface::{texture_sources, NoSources, TextureSources, SURFACE_REPORT};
 use driftless_steps::touchup::{
     edited_pages, run_touchup, touchup_fits, touchup_without_raw_data, FileStamp, PreparedSurface,
     StepOutcome, TouchupDone, TouchupPrepared, TouchupRequest, TOUCHUP_DIR,
@@ -271,7 +271,8 @@ fn loaded_touchup(
         });
     }
     // computed without the camera images, which are here now: computed anew with them
-    let raw_back = touchup_without_raw_data(dir) && matches!(texture_sources(dir), Ok(Some(_)));
+    let raw_back = touchup_without_raw_data(dir)
+        && matches!(texture_sources(dir), Ok(TextureSources::Found(_)));
     progress.phase(PHASE_LOAD_TOUCHUP, None);
     let edit = surface_edit(dir, origin, mesh, s).unwrap_or_else(|e| {
         progress.warn(e);
@@ -362,8 +363,9 @@ pub struct TouchupOutput {
     /// The surface folder.
     pub surface: PathBuf,
     pub done: TouchupDone,
-    /// The camera images of the surface were found (the raw data are there).
-    pub raw: bool,
+    /// Why the camera images of the surface were not at hand (the raw data gone, or no longer
+    /// those of the surface; [`NoSources`] says it in plain words); `None`: they were.
+    pub no_sources: Option<NoSources>,
     /// The surface got its touch-up now: it had no cache before, it has one now (a new surface
     /// taking the Stellen over, the first step).
     pub first: bool,
@@ -385,14 +387,12 @@ pub fn run_touchup_job(job: &TouchupJob, progress: &Progress) -> Result<TouchupO
         .parent()
         .ok_or_else(|| text::not_in_tree(dir))?
         .to_path_buf();
-    let sources = match texture_sources(dir) {
-        Ok(sources) => sources,
-        Err(e) => {
-            progress.warn(text::raw_data_unreadable(&text::step_error(&e)));
-            None
-        }
-    };
-    let raw = sources.is_some();
+    let sources = texture_sources(dir).unwrap_or_else(|e| {
+        let why = text::step_error(&e);
+        progress.warn(text::raw_data_unreadable(&why));
+        TextureSources::Unavailable(NoSources::Unreadable(why))
+    });
+    let no_sources = sources.unavailable().cloned();
     let before = patches_key(dir);
     let req = TouchupRequest {
         surface_dir: dir.clone(),
@@ -432,7 +432,7 @@ pub fn run_touchup_job(job: &TouchupJob, progress: &Progress) -> Result<TouchupO
     Ok(TouchupOutput {
         surface: dir.clone(),
         done,
-        raw,
+        no_sources,
         first: before.is_none() && after.is_some(),
         step,
         view,

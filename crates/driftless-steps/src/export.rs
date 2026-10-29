@@ -5,9 +5,10 @@
 //!
 //! Before anything is read, in this order: the format must fit the source
 //! ([`ExportFormat::kind`]), the target must not be a file of the source (compared as the
-//! file system resolves them), and without [`ExportRequest::overwrite`] none of the targets
-//! ([`export_targets`]: for OBJ also the `.mtl` and every page `<stem>_seite_NN.jpg|png`
-//! there) may exist.
+//! file system resolves them; of a surface every file its report lists), it must not lie in
+//! the folder of a touch-up (`nacharbeit/` of a surface: its next run replaces that folder),
+//! and without [`ExportRequest::overwrite`] none of the targets ([`export_targets`]: for OBJ
+//! also the `.mtl` and every page `<stem>_seite_NN.jpg|png` there) may exist.
 //! Every file is written through `<name>.tmp` and renamed at the end; a cancel or an error
 //! leaves the old files as they were, and the `.tmp` files a killed export to the same
 //! target left are removed first. An OBJ written over an older one removes the older one's
@@ -314,13 +315,18 @@ impl ExportSource {
     }
 
     /// The files of the source a target must never be: what is read and the report of the
-    /// folder; for an OBJ also its `.mtl`; for a touched-up surface also its touch-up and the
-    /// Stellen of its map or model.
+    /// folder; for an OBJ also its `.mtl`; for a surface also every file its report lists (the
+    /// OBJ of `--obj` with its `.mtl` and pages: the computed folder stays as it is), for a
+    /// touched-up one also its touch-up and the Stellen of its map or model.
     fn files(&self) -> Vec<PathBuf> {
         match self {
             ExportSource::Map(d) => vec![d.join(MAP_COLOR), d.join(MAP_CLEAN), d.join(MAP_REPORT)],
             ExportSource::Model(d) => vec![d.join(MODEL_LAS), d.join(MODEL_REPORT)],
-            ExportSource::Surface(d) => vec![d.join(SURFACE_GLB), d.join(SURFACE_REPORT)],
+            ExportSource::Surface(d) => {
+                let mut files = vec![d.join(SURFACE_GLB), d.join(SURFACE_REPORT)];
+                files.extend(listed_files(d));
+                files
+            }
             ExportSource::EditedSurface(d) => {
                 let cache = d.join(TOUCHUP_DIR);
                 let mut files = vec![
@@ -329,6 +335,7 @@ impl ExportSource {
                     cache.join(PATCHES_FILE),
                     cache.join(TOUCHUP_REPORT),
                 ];
+                files.extend(listed_files(d));
                 files.extend(d.parent().map(|owner| owner.join(MARKS_FILE)));
                 files
             }
@@ -337,6 +344,21 @@ impl ExportSource {
             ExportSource::MeshFile(f) => vec![f.clone(), f.with_extension("mtl")],
         }
     }
+}
+
+/// The files the report of the surface folder `dir` lists (`files`); none if it does not read.
+fn listed_files(dir: &Path) -> Vec<PathBuf> {
+    let report: Option<serde_json::Value> = fs::read_to_string(dir.join(SURFACE_REPORT))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok());
+    let Some(report) = report else {
+        return Vec::new();
+    };
+    let names = report["files"].as_array().into_iter().flatten();
+    names
+        .filter_map(serde_json::Value::as_str)
+        .map(|f| dir.join(f))
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -446,7 +468,8 @@ pub fn existing_targets(req: &ExportRequest) -> Vec<PathBuf> {
 }
 
 /// The checks before anything is read: the format fits the source, the folder of the target
-/// is there and no target is a file of the source. The existing targets are not checked here
+/// is there, no target is a file of the source, and none lies in the folder of a touch-up (of
+/// any surface: its next run would replace it). The existing targets are not checked here
 /// ([`existing_targets`]).
 pub fn check_export(req: &ExportRequest) -> Result<(), StepError> {
     let kind = req.source.kind();
@@ -486,6 +509,18 @@ pub fn check_export(req: &ExportRequest) -> Result<(), StepError> {
                 return Err(format!("Ziel ist die Quelle selbst: {}", target.display()).into());
             }
         }
+    }
+    // All targets lie in the folder of the target.
+    let in_cache = paths::canonical(dir)
+        .ok()
+        .and_then(|d| touchup::cache_folder_of(&d));
+    if let Some(cache) = in_cache {
+        return Err(format!(
+            "Ziel liegt im Ordner der Nacharbeit {}: Driftless ersetzt ihn bei jedem Schritt, \
+             die Datei ginge verloren – einen anderen Ordner wählen",
+            cache.display()
+        )
+        .into());
     }
     Ok(())
 }
