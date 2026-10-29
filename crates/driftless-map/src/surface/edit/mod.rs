@@ -5,7 +5,9 @@
 //! copies by their bits, as the PLY export does, and numbers the faces by their running index
 //! over the pages. [`FaceBvh`] finds the face a ray hits first and the faces near a point;
 //! [`select_faces`] turns the dabs of a Stelle into the faces they cover; [`smooth_region`]
-//! moves the vertices of a Stelle („Glätten“). Every step gives a [`SurfacePatch`]:
+//! moves the vertices of a Stelle („Glätten“); [`retexture_region`] bakes a Stelle anew from the
+//! camera images onto pages of its own („Bilder neu einspielen“). Every step gives a
+//! [`SurfacePatch`]:
 //! [`apply_patches`] makes the touched-up surface from the computed one and the patches,
 //! [`page_edits`] says the view which of its pages changed, and [`write_patches`] /
 //! [`read_patches`] keep the patches next to the surface.
@@ -28,6 +30,7 @@ pub use patch::{
     apply_patches, page_edits, read_patches, write_patches, PageEdit, PatchPage, SurfacePatch,
     PATCHES_FILE,
 };
+pub use retexture::{retexture_region, RetextureDone};
 pub use select::{dab_faces, dab_normal, select_faces, SelectDab, MAX_HOLE_AREA, MIN_NORMAL_DOT};
 pub use smooth::{smooth_region, Smoothing};
 pub use weld::WeldedSurface;
@@ -53,6 +56,18 @@ pub enum EditError {
     /// The Stelle covers no face of the surface.
     #[error("Die Stelle liegt nicht auf dieser Oberfläche.")]
     NoFaces,
+    /// „Bilder neu einspielen“: no camera image shows the Stelle (or none that does could be
+    /// read); it keeps its texture.
+    #[error("Kein Bild zeigt diese Stelle; sie bleibt, wie sie ist.")]
+    NoImages,
+    /// „Bilder neu einspielen“: around the Stelle there is no texture the new images could be
+    /// matched to (only unseen, gray faces, or none the images show) and no edge to such a
+    /// texture; it keeps its texture.
+    #[error(
+        "Um diese Stelle gibt es keine Textur, an die sich neue Bilder angleichen lassen; \
+         sie bleibt, wie sie ist."
+    )]
+    NoReference,
     /// The step was cancelled through its [`driftless_io::progress::Progress`].
     #[error("abgebrochen")]
     Cancelled,
@@ -126,6 +141,15 @@ mod tests {
             "Die Stelle liegt nicht auf dieser Oberfläche."
         );
         assert_eq!(EditError::Cancelled.to_string(), "abgebrochen");
+        assert_eq!(
+            EditError::NoImages.to_string(),
+            "Kein Bild zeigt diese Stelle; sie bleibt, wie sie ist."
+        );
+        assert_eq!(
+            EditError::NoReference.to_string(),
+            "Um diese Stelle gibt es keine Textur, an die sich neue Bilder angleichen lassen; \
+             sie bleibt, wie sie ist."
+        );
         let path = PathBuf::from("nacharbeit").join(PATCHES_FILE);
         let e = EditError::Unwritable {
             path: path.clone(),

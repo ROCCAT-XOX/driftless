@@ -47,6 +47,10 @@
 //!
 //! Unseen (gray) faces belong to no chart: they neither give nor take a correction.
 //!
+//! A Stelle baked anew onto pages of its own ([`level_region`]) is levelled the same way, but
+//! the texture around it stays: where a chart of the Stelle meets it, only the chart moves, by
+//! the whole difference.
+//!
 //! Two seam measures ([`SeamStats`]), sRGB luminance levels: **jump** follows `seam_jumps` of
 //! the point colouring: every mesh edge between two textured faces is sampled in both faces
 //! just inside the edge ([`EDGE_SAMPLE`]); the mean absolute difference of the pairs from
@@ -137,6 +141,76 @@ pub(crate) fn level_seams(
     labels: &[Option<u32>],
     tex: &mut TexturedMesh,
 ) -> SeamStats {
+    level(mesh, labels, tex, |tex, chart_of, edges, lin| {
+        border_corrections(mesh, tex, chart_of, edges, lin)
+    })
+}
+
+/// One edge between a face of a Stelle and a face outside it that keeps its texture
+/// ([`level_region`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FrozenEdge {
+    /// The face of the Stelle (of the mesh levelled).
+    pub inside: u32,
+    /// The edge's vertices (of the mesh levelled).
+    pub a: u32,
+    pub b: u32,
+    /// The texture of the face outside on the edge: its mean linear colour at [`SEAM_SAMPLES`]
+    /// of the way from `a` towards `b`, and from `b` towards `a`.
+    pub outside: [[f64; 3]; 2],
+}
+
+/// Levels a Stelle baked onto pages of its own (`tex`, its charts over the faces of `mesh`)
+/// against the texture around it, which stays as it is: as [`level_seams`], but at a vertex where
+/// a chart meets the outside along a [`FrozenEdge`] (not across a crease: the caller leaves
+/// those out) only the Stelle moves, by the whole difference. Such a chart's log gain there is
+/// minus its log ratio to the outside (the outside's colours at [`SEAM_SAMPLES`] of its edges at
+/// the vertex, its own at the same spots), clamped to `ln` [`MAX_SEAM_RATIO`]; a chart that
+/// meets such a chart at the vertex (and not the outside) takes the gain that matches it to that
+/// chart's corrected colour, and so on. Sides differing by more than [`MAX_SEAM_RATIO`] are
+/// content and left out, as between charts. Vertices without an edge to the outside are levelled
+/// between the charts as [`level_seams`] does (each side halfway); then the interior and the
+/// texels as there. With no frozen edges it is [`level_seams`]. Same input, byte-identical
+/// pages.
+///
+/// # Panics
+/// If `labels` or `tex` do not fit the mesh, or a frozen edge is not an edge of its face.
+pub(crate) fn level_region(
+    mesh: &Mesh,
+    labels: &[Option<u32>],
+    tex: &mut TexturedMesh,
+    frozen: &[FrozenEdge],
+) -> SeamStats {
+    for e in frozen {
+        let corners = mesh.indices[e.inside as usize];
+        assert!(
+            e.a != e.b && corners.contains(&e.a) && corners.contains(&e.b),
+            "{e:?} is no edge of its face {corners:?}"
+        );
+    }
+    level(mesh, labels, tex, |tex, chart_of, edges, lin| {
+        region_corrections(mesh, tex, chart_of, edges, frozen, lin)
+    })
+}
+
+/// A border vertex's correction: (chart, mesh vertex, log gain per channel).
+type Correction = (u32, u32, [f64; 3]);
+
+/// [`level_seams`] and [`level_region`]: the seam measures before and after, the corrections of
+/// the border vertices from `corrections` (given the chart of every face, the edges between
+/// textured faces and the sRGB table; returns the corrections, by vertex, and the chart pairs
+/// left out as content), the interior and the texels.
+fn level(
+    mesh: &Mesh,
+    labels: &[Option<u32>],
+    tex: &mut TexturedMesh,
+    corrections: impl FnOnce(
+        &TexturedMesh,
+        &[u32],
+        &[EdgePair],
+        &[f32; 256],
+    ) -> (Vec<Correction>, usize),
+) -> SeamStats {
     let n = mesh.indices.len();
     assert_eq!(labels.len(), n, "labels do not fit the mesh");
     assert_eq!(tex.face_ref.len(), n, "texture does not fit the mesh");
@@ -159,7 +233,7 @@ pub(crate) fn level_seams(
         .map(|chart| chart_vertices(mesh, tex, &chart.faces))
         .collect();
     let mut fixed: Vec<Vec<(u32, [f64; 3])>> = vec![Vec::new(); tex.charts.len()];
-    let (border, content_pairs) = border_corrections(mesh, tex, &chart_of, &edges, &lin);
+    let (border, content_pairs) = corrections(tex, &chart_of, &edges, &lin);
     let border_count = border.len();
     let clamped = border
         .iter()
@@ -326,20 +400,20 @@ fn edge_luminance(
     srgb_value(luminance(sample_linear(&page.image, px, lin)) as f32)
 }
 
-/// The log gain of every border vertex of every chart that borders another one there:
-/// (chart, mesh vertex, log gain per channel), from paired samples on the seams (see the module
-/// docs); and how many chart pairs at a vertex were left out as content.
-fn border_corrections(
+/// Per seam edge (between charts, not across a crease) and end vertex: the vertex, the lower and
+/// the higher chart, and the mean colour of each at [`SEAM_SAMPLES`] from the vertex; in edge
+/// order.
+type Paired = (u32, u32, u32, [f64; 3], [f64; 3]);
+
+/// The paired samples of the seams (see [`Paired`]).
+fn seam_pairs(
     mesh: &Mesh,
     tex: &TexturedMesh,
     chart_of: &[u32],
     edges: &[EdgePair],
     lin: &[f32; 256],
-) -> (Vec<(u32, u32, [f64; 3])>, usize) {
-    // Per seam edge and end vertex: (vertex, lower chart, higher chart, mean colour of each
-    // at SEAM_SAMPLES), in edge order.
-    type Paired = (u32, u32, u32, [f64; 3], [f64; 3]);
-    let paired: Vec<Paired> = edges
+) -> Vec<Paired> {
+    edges
         .par_iter()
         .filter(|e| chart_of[e[0] as usize] != chart_of[e[1] as usize])
         .filter(|e| {
@@ -356,30 +430,138 @@ fn border_corrections(
                 (g, f)
             };
             [(a, b), (b, a)].map(|(v, w)| {
-                let mean = |face: u32| {
-                    let mut sum = [0.0f64; 3];
-                    for &t in &SEAM_SAMPLES {
-                        let c = edge_colour(mesh, tex, face, v, w, t, lin);
-                        for k in 0..3 {
-                            sum[k] += f64::from(c[k]);
-                        }
-                    }
-                    sum.map(|x| x / SEAM_SAMPLES.len() as f64)
-                };
                 (
                     v,
                     chart_of[f as usize],
                     chart_of[g as usize],
-                    mean(f),
-                    mean(g),
+                    seam_mean(mesh, tex, f, v, w, lin),
+                    seam_mean(mesh, tex, g, v, w, lin),
                 )
             })
         })
-        .collect();
+        .collect()
+}
+
+/// The mean linear colour of face `face`'s texture at [`SEAM_SAMPLES`] of the way from its
+/// corner `v` towards its corner `w`.
+fn seam_mean(
+    mesh: &Mesh,
+    tex: &TexturedMesh,
+    face: u32,
+    v: u32,
+    w: u32,
+    lin: &[f32; 256],
+) -> [f64; 3] {
+    let mut sum = [0.0f64; 3];
+    for &t in &SEAM_SAMPLES {
+        let c = edge_colour(mesh, tex, face, v, w, t, lin);
+        for k in 0..3 {
+            sum[k] += f64::from(c[k]);
+        }
+    }
+    sum.map(|x| x / SEAM_SAMPLES.len() as f64)
+}
+
+/// Whether two mean colours of a seam differ by more than an exposure can ([`MAX_SEAM_RATIO`];
+/// a side darker than [`MIN_SEAM_LUMINANCE`] counts as that dark): content, not a seam.
+fn content(a: [f64; 3], b: [f64; 3]) -> bool {
+    let (la, lb) = (
+        luminance(a.map(|x| x as f32)),
+        luminance(b.map(|x| x as f32)),
+    );
+    la.max(lb) > MAX_SEAM_RATIO * la.min(lb).max(MIN_SEAM_LUMINANCE)
+}
+
+/// `ln((x + GAIN_FLOOR) / (y + GAIN_FLOOR))` per channel.
+fn log_ratio(x: [f64; 3], y: [f64; 3]) -> [f64; 3] {
+    [0, 1, 2].map(|k| ((x[k] + GAIN_FLOOR) / (y[k] + GAIN_FLOOR)).ln())
+}
+
+/// The chart pairs of the vertex `paired[order[*i]].0` (`order`: `paired` by vertex, then
+/// charts): per pair of charts the mean of their colours over its seam edges there, into
+/// `at_vertex` (cleared first); pairs that are [`content`] are counted, not kept. Moves `*i` past
+/// the vertex.
+fn pairs_at(
+    paired: &[Paired],
+    order: &[usize],
+    i: &mut usize,
+    at_vertex: &mut Vec<(u32, u32, [f64; 3], [f64; 3])>,
+    content_pairs: &mut usize,
+) {
+    let v = paired[order[*i]].0;
+    at_vertex.clear();
+    while *i < order.len() && paired[order[*i]].0 == v {
+        let (_, ca, cb, _, _) = paired[order[*i]];
+        let (mut sa, mut sb, mut n) = ([0.0f64; 3], [0.0f64; 3], 0.0);
+        while *i < order.len() && {
+            let p = &paired[order[*i]];
+            p.0 == v && p.1 == ca && p.2 == cb
+        } {
+            let p = &paired[order[*i]];
+            for k in 0..3 {
+                sa[k] += p.3[k];
+                sb[k] += p.4[k];
+            }
+            n += 1.0;
+            *i += 1;
+        }
+        let (sa, sb) = (sa.map(|x| x / n), sb.map(|x| x / n));
+        // Sides that differ by more than an exposure can are content (a highlight, an
+        // occlusion) rather than a seam.
+        if content(sa, sb) {
+            *content_pairs += 1;
+            continue;
+        }
+        at_vertex.push((ca, cb, sa, sb));
+    }
+}
+
+/// The corrections at vertex `v` from its chart pairs `at_vertex`, both sides moving: each chart
+/// minus the sum of its log ratios to the others, over the number of charts there, clamped to
+/// [`MAX_GAIN`] either way; by chart, appended to `out` (`sums`: room to work in).
+fn halfway(
+    at_vertex: &[(u32, u32, [f64; 3], [f64; 3])],
+    v: u32,
+    sums: &mut Vec<(u32, [f64; 3])>,
+    out: &mut Vec<Correction>,
+) {
+    sums.clear();
+    for &(ca, cb, sa, sb) in at_vertex {
+        for (c, d) in [(ca, log_ratio(sa, sb)), (cb, log_ratio(sb, sa))] {
+            match sums.iter_mut().find(|s| s.0 == c) {
+                Some(s) => {
+                    for (sum, x) in s.1.iter_mut().zip(d) {
+                        *sum += x;
+                    }
+                }
+                None => sums.push((c, d)),
+            }
+        }
+    }
+    let charts = sums.len() as f64;
+    sums.sort_by_key(|s| s.0);
+    for &(c, d) in sums.iter() {
+        let lim = MAX_GAIN.ln();
+        let delta = d.map(|x| (-x / charts).clamp(-lim, lim));
+        out.push((c, v, delta));
+    }
+}
+
+/// The log gain of every border vertex of every chart that borders another one there:
+/// (chart, mesh vertex, log gain per channel), from paired samples on the seams (see the module
+/// docs); and how many chart pairs at a vertex were left out as content.
+fn border_corrections(
+    mesh: &Mesh,
+    tex: &TexturedMesh,
+    chart_of: &[u32],
+    edges: &[EdgePair],
+    lin: &[f32; 256],
+) -> (Vec<Correction>, usize) {
+    let paired = seam_pairs(mesh, tex, chart_of, edges, lin);
     let mut order: Vec<usize> = (0..paired.len()).collect();
     order.par_sort_by_key(|&i| (paired[i].0, paired[i].1, paired[i].2));
     let mut out = Vec::new();
-    let mut content = 0usize;
+    let mut content_pairs = 0usize;
     // Per vertex: the chart pairs there (charts, mean colours), then per chart the sum of its
     // differences to the others.
     let mut at_vertex: Vec<(u32, u32, [f64; 3], [f64; 3])> = Vec::new();
@@ -387,60 +569,131 @@ fn border_corrections(
     let mut i = 0;
     while i < order.len() {
         let v = paired[order[i]].0;
-        at_vertex.clear();
-        while i < order.len() && paired[order[i]].0 == v {
-            let (_, ca, cb, _, _) = paired[order[i]];
-            let (mut sa, mut sb, mut n) = ([0.0f64; 3], [0.0f64; 3], 0.0);
-            while i < order.len() && {
-                let p = &paired[order[i]];
-                p.0 == v && p.1 == ca && p.2 == cb
+        pairs_at(&paired, &order, &mut i, &mut at_vertex, &mut content_pairs);
+        halfway(&at_vertex, v, &mut sums, &mut out);
+    }
+    (out, content_pairs)
+}
+
+/// [`border_corrections`] for [`level_region`]: at vertices on a [`FrozenEdge`] the charts take
+/// the whole difference to the outside (see there), elsewhere as between charts.
+fn region_corrections(
+    mesh: &Mesh,
+    tex: &TexturedMesh,
+    chart_of: &[u32],
+    edges: &[EdgePair],
+    frozen: &[FrozenEdge],
+    lin: &[f32; 256],
+) -> (Vec<Correction>, usize) {
+    let paired = seam_pairs(mesh, tex, chart_of, edges, lin);
+    let mut order: Vec<usize> = (0..paired.len()).collect();
+    order.par_sort_by_key(|&i| (paired[i].0, paired[i].1, paired[i].2));
+    // Per frozen edge of a face in a chart and end vertex: the vertex, the chart, its own mean
+    // colour and the outside's at SEAM_SAMPLES from the vertex; by vertex and chart, then edge.
+    let held: Vec<(u32, u32, [f64; 3], [f64; 3])> = frozen
+        .par_iter()
+        .filter(|e| chart_of[e.inside as usize] != NONE)
+        .flat_map_iter(|e| {
+            let c = chart_of[e.inside as usize];
+            [(e.a, e.b, e.outside[0]), (e.b, e.a, e.outside[1])]
+                .map(|(v, w, out)| (v, c, seam_mean(mesh, tex, e.inside, v, w, lin), out))
+        })
+        .collect();
+    let mut held_order: Vec<usize> = (0..held.len()).collect();
+    held_order.par_sort_by_key(|&i| (held[i].0, held[i].1));
+
+    let lim = MAX_SEAM_RATIO.ln();
+    let mut out = Vec::new();
+    let mut content_pairs = 0usize;
+    let mut at_vertex: Vec<(u32, u32, [f64; 3], [f64; 3])> = Vec::new();
+    let mut sums: Vec<(u32, [f64; 3])> = Vec::new();
+    // Per chart at the vertex with a frozen side: its mean colour and the outside's there.
+    let mut outside: Vec<(u32, [f64; 3], [f64; 3])> = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < order.len() || j < held_order.len() {
+        let v = match (order.get(i), held_order.get(j)) {
+            (Some(&p), Some(&h)) => paired[p].0.min(held[h].0),
+            (Some(&p), None) => paired[p].0,
+            (None, Some(&h)) => held[h].0,
+            (None, None) => unreachable!("one list is not done"),
+        };
+        if i < order.len() && paired[order[i]].0 == v {
+            pairs_at(&paired, &order, &mut i, &mut at_vertex, &mut content_pairs);
+        } else {
+            at_vertex.clear();
+        }
+        outside.clear();
+        while j < held_order.len() && held[held_order[j]].0 == v {
+            let c = held[held_order[j]].1;
+            let (mut own, mut out_side, mut n) = ([0.0f64; 3], [0.0f64; 3], 0.0);
+            while j < held_order.len() && {
+                let h = &held[held_order[j]];
+                h.0 == v && h.1 == c
             } {
-                let p = &paired[order[i]];
+                let h = &held[held_order[j]];
                 for k in 0..3 {
-                    sa[k] += p.3[k];
-                    sb[k] += p.4[k];
+                    own[k] += h.2[k];
+                    out_side[k] += h.3[k];
                 }
                 n += 1.0;
-                i += 1;
+                j += 1;
             }
-            let (sa, sb) = (sa.map(|x| x / n), sb.map(|x| x / n));
-            // Sides that differ by more than an exposure can are content (a highlight, an
-            // occlusion) rather than a seam.
-            let (la, lb) = (
-                luminance(sa.map(|x| x as f32)),
-                luminance(sb.map(|x| x as f32)),
-            );
-            if la.max(lb) > MAX_SEAM_RATIO * la.min(lb).max(MIN_SEAM_LUMINANCE) {
-                content += 1;
+            let (own, out_side) = (own.map(|x| x / n), out_side.map(|x| x / n));
+            if content(own, out_side) {
+                content_pairs += 1;
                 continue;
             }
-            at_vertex.push((ca, cb, sa, sb));
+            outside.push((c, own, out_side));
         }
-        sums.clear();
-        for &(ca, cb, sa, sb) in &at_vertex {
-            let ratio = |x: [f64; 3], y: [f64; 3]| {
-                [0, 1, 2].map(|k| ((x[k] + GAIN_FLOOR) / (y[k] + GAIN_FLOOR)).ln())
-            };
-            for (c, d) in [(ca, ratio(sa, sb)), (cb, ratio(sb, sa))] {
-                match sums.iter_mut().find(|s| s.0 == c) {
-                    Some(s) => {
-                        for (sum, x) in s.1.iter_mut().zip(d) {
-                            *sum += x;
-                        }
+        if outside.is_empty() {
+            halfway(&at_vertex, v, &mut sums, &mut out);
+            continue;
+        }
+        // The charts with a frozen side match it; then the charts that share a seam with a
+        // matched one match its corrected colour, until no chart at the vertex is left that
+        // does.
+        let mut matched: Vec<(u32, [f64; 3])> = outside
+            .iter()
+            .map(|&(c, own, out_side)| (c, log_ratio(own, out_side).map(|x| (-x).clamp(-lim, lim))))
+            .collect();
+        loop {
+            let mut next: Vec<(u32, [f64; 3], f64)> = Vec::new();
+            for &(ca, cb, sa, sb) in &at_vertex {
+                for (c, own, p, other) in [(ca, sa, cb, sb), (cb, sb, ca, sa)] {
+                    if matched.iter().any(|m| m.0 == c) {
+                        continue;
                     }
-                    None => sums.push((c, d)),
+                    let Some(&(_, dp)) = matched.iter().find(|m| m.0 == p) else {
+                        continue;
+                    };
+                    // own · e^d = other · e^dp.
+                    let r = log_ratio(other, own);
+                    let d = [0, 1, 2].map(|k| dp[k] + r[k]);
+                    match next.iter_mut().find(|x| x.0 == c) {
+                        Some(x) => {
+                            for (sum, v) in x.1.iter_mut().zip(d) {
+                                *sum += v;
+                            }
+                            x.2 += 1.0;
+                        }
+                        None => next.push((c, d, 1.0)),
+                    }
                 }
             }
+            if next.is_empty() {
+                break;
+            }
+            next.sort_by_key(|x| x.0);
+            for (c, sum, n) in next {
+                matched.push((c, sum.map(|x| (x / n).clamp(-lim, lim))));
+            }
         }
-        let charts = sums.len() as f64;
-        sums.sort_by_key(|s| s.0);
-        for &(c, d) in &sums {
-            let lim = MAX_GAIN.ln();
-            let delta = d.map(|x| (-x / charts).clamp(-lim, lim));
-            out.push((c, v, delta));
+        matched.sort_by_key(|m| m.0);
+        for (c, d) in matched {
+            out.push((c, v, d));
         }
     }
-    (out, content)
+    (out, content_pairs)
 }
 
 /// The step measure over `edges` (see the module docs): sRGB luminance levels. Returns the
@@ -1185,5 +1438,153 @@ mod tests {
         assert_eq!(page.indices, before.pages[0].indices);
         assert_eq!(tex.face_ref, before.face_ref);
         assert!(tex.textured.iter().any(|t| !t));
+    }
+    #[test]
+    fn region_without_frozen_edges_is_level_seams() {
+        let left = [120, 110, 100];
+        for right in [brighter(left, 1.2), brighter(left, 2.5), left] {
+            let (mesh, labels, mut a) = SMALL.build(left, right);
+            let mut b = a.clone();
+            let sa = level_seams(&mesh, &labels, &mut a);
+            let sb = level_region(&mesh, &labels, &mut b, &[]);
+            assert_eq!(a, b);
+            assert_eq!(sa, sb);
+        }
+    }
+
+    /// The edges between chart `outside` and the other chart of the wall as frozen edges of the
+    /// other chart's faces, with the colours of `outside` there.
+    fn frozen_from(mesh: &Mesh, tex: &TexturedMesh, outside: u32) -> Vec<FrozenEdge> {
+        let lin = linear_table();
+        let mut chart_of = vec![NONE; mesh.indices.len()];
+        for (c, chart) in tex.charts.iter().enumerate() {
+            for &f in &chart.faces {
+                chart_of[f as usize] = c as u32;
+            }
+        }
+        edge_pairs(mesh, &chart_of)
+            .into_iter()
+            .filter(|e| chart_of[e[0] as usize] != chart_of[e[1] as usize])
+            .map(|[f, g, a, b]| {
+                let (out, inside) = if chart_of[f as usize] == outside {
+                    (f, g)
+                } else {
+                    (g, f)
+                };
+                FrozenEdge {
+                    inside,
+                    a,
+                    b,
+                    outside: [
+                        seam_mean(mesh, tex, out, a, b, &lin),
+                        seam_mean(mesh, tex, out, b, a, &lin),
+                    ],
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn region_takes_the_whole_difference() {
+        // Chart 1 of the wall as a Stelle, chart 0 as the texture around it that stays: the
+        // Stelle borders it on one side only and takes the whole difference, as a whole.
+        let left = [120, 110, 100];
+        for factor in [1.2, 0.8, 2.5] {
+            let (mesh, mut labels, mut tex) = SMALL.build(left, brighter(left, factor));
+            let frozen = frozen_from(&mesh, &tex, 0);
+            // One edge of the seam per row of cells.
+            assert_eq!(frozen.len(), SMALL.cells[1]);
+            let outside = tex.charts.remove(0);
+            for &f in &outside.faces {
+                labels[f as usize] = None;
+                tex.textured[f as usize] = false;
+            }
+            let before = tex.clone();
+            let stats = level_region(&mesh, &labels, &mut tex, &frozen);
+            assert_eq!(stats.corrections, SMALL.cells[1] + 1, "{stats:?}");
+            let [x, y, w, h] = outside.rect;
+            for j in y..y + h {
+                for i in x..x + w {
+                    assert_eq!(texel(&tex, i, j), texel(&before, i, j), "({i}, {j})");
+                }
+            }
+            for [i, j] in rect_texels(&tex, 0) {
+                let got = texel(&tex, i, j);
+                for k in 0..3 {
+                    assert!(
+                        got[k].abs_diff(left[k]) <= 1,
+                        "× {factor}: texel ({i}, {j}) {got:?} vs {left:?}"
+                    );
+                }
+            }
+        }
+        // Sides further apart than an exposure can be are content: nothing changes.
+        let (mesh, mut labels, mut tex) = SMALL.build([40; 3], [200; 3]);
+        let frozen = frozen_from(&mesh, &tex, 0);
+        let outside = tex.charts.remove(0);
+        for &f in &outside.faces {
+            labels[f as usize] = None;
+            tex.textured[f as usize] = false;
+        }
+        let before = tex.clone();
+        let stats = level_region(&mesh, &labels, &mut tex, &frozen);
+        assert_eq!(tex, before);
+        assert_eq!(stats.content_pairs, SMALL.cells[1] + 1, "{stats:?}");
+    }
+
+    #[test]
+    fn region_match_reaches_the_chart_beside() {
+        // Both charts of the wall (one colour) are the Stelle; the texture that stays lies below
+        // chart 0 only, 20 % brighter. At the corner where the seam meets it, chart 1 has no
+        // edge to it: it matches chart 0's corrected colour there, so the seam stays closed.
+        let colour = [120, 110, 100];
+        let (mesh, labels, mut tex) = SMALL.build(colour, colour);
+        let half = SMALL.cells[0] / 2;
+        let below: [f64; 3] = brighter(colour, 1.2).map(lin);
+        let frozen: Vec<FrozenEdge> = (0..half)
+            .map(|iy| FrozenEdge {
+                // The lower triangle of cell (iy, 0): its first edge is the wall's bottom.
+                inside: (2 * iy * SMALL.cells[1]) as u32,
+                a: SMALL.vertex(iy, 0),
+                b: SMALL.vertex(iy + 1, 0),
+                outside: [below; 2],
+            })
+            .collect();
+        level_region(&mesh, &labels, &mut tex, &frozen);
+        let at = |c: usize, iy: usize, iz: usize| {
+            let [x, y] = SMALL.texel_of(&tex, c, iy, iz);
+            texel(&tex, x, y)
+        };
+        let want = brighter(colour, 1.2);
+        for (c, iy) in [(0, 0), (0, half / 2), (0, half), (1, half)] {
+            let got = at(c, iy, 0);
+            for k in 0..3 {
+                assert!(
+                    got[k].abs_diff(want[k]) <= 1,
+                    "chart {c}, ({iy}, 0): {got:?} vs {want:?}"
+                );
+            }
+        }
+        // Away from the bottom the seam has no step either.
+        for iz in 1..=SMALL.cells[1] {
+            let (a, b) = (at(0, half, iz), at(1, half, iz));
+            assert!(
+                (0..3).all(|k| a[k].abs_diff(b[k]) <= 1),
+                "({half}, {iz}): {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "is no edge of its face")]
+    fn frozen_edge_must_be_an_edge_of_its_face() {
+        let (mesh, labels, mut tex) = SMALL.build([100; 3], [100; 3]);
+        let edge = FrozenEdge {
+            inside: 0,
+            a: SMALL.vertex(5, 5),
+            b: SMALL.vertex(5, 6),
+            outside: [[0.5; 3]; 2],
+        };
+        level_region(&mesh, &labels, &mut tex, &[edge]);
     }
 }

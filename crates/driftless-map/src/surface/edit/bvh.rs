@@ -283,13 +283,6 @@ impl FaceBvh {
     /// `keep_box` gets the lower and upper corner of a box (absolute, a little larger than its
     /// faces); a box it refuses is skipped with everything in it, so it must let through every
     /// box that can hold a face `keep_face` keeps.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used by the second part of „Bilder neu einspielen“"
-        )
-    )]
     pub(super) fn faces_where(
         &self,
         keep_box: impl Fn([f64; 3], [f64; 3]) -> bool,

@@ -118,6 +118,12 @@ impl WeldedSurface {
         self.faces.len()
     }
 
+    /// Number of pages of the mesh it was welded from, those without triangles too: the pages a
+    /// touch-up adds come after them.
+    pub fn page_count(&self) -> usize {
+        self.page_first.len()
+    }
+
     /// The welded vertices (metres, the frame of the surface).
     pub fn positions(&self) -> &[[f64; 3]] {
         &self.positions
@@ -264,6 +270,7 @@ mod tests {
         assert_eq!(s.copies(3), &[(2, 2)]);
         assert_eq!(s.face_origin(0), (0, 0));
         assert_eq!(s.face_origin(1), (2, 0));
+        assert_eq!(s.page_count(), 3);
         assert_eq!(s.face_normal(0), [0.0, 0.0, 1.0]);
         assert_eq!(s.face_normal(1), [0.0, 0.0, 1.0]);
         assert_eq!(s.face_cross(1), [0.0, 0.0, 1.0]);

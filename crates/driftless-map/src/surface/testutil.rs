@@ -749,6 +749,64 @@ pub(crate) fn testscan_source(dir: &Path, device: Isometry3<f64>) -> super::Text
     }
 }
 
+/// The images of the scan folder `dir` (made by `driftless_io::testscan::scan_with_images`) with
+/// every linear colour value times `gain` (clipped at white; the exposure of another moment), as
+/// a bag of their own `out/IMAGE_0.bag` with the same topic and stamps (JPEG quality 95, as the
+/// scan's): a texture source like [`testscan_source`] with the device standing still at `device`.
+pub(crate) fn testscan_source_scaled(
+    dir: &Path,
+    out: &Path,
+    device: Isometry3<f64>,
+    gain: f64,
+) -> super::TextureSource {
+    use driftless_io::bag::writer::{BagWriter, Compression};
+    use driftless_io::msg::encode::encode_compressed_image;
+    use driftless_io::msg::CompressedImage;
+    let src = testscan_source(dir, device);
+    let lin = crate::color::linear_table();
+    let mut bag = BagWriter::new(Compression::None);
+    let conn = bag.add_connection(&src.images.topics[0], "sensor_msgs/CompressedImage");
+    driftless_io::images::for_each_image(&src.images.bags, &src.images.topics, 1, |frame| {
+        let frame = frame.unwrap();
+        let rgb: Vec<u8> = frame
+            .rgb
+            .data
+            .iter()
+            .map(|&v| {
+                let l = (f64::from(lin[v as usize]) * gain) as f32;
+                crate::color::srgb_value(l).round().clamp(0.0, 255.0) as u8
+            })
+            .collect();
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .encode(
+                &rgb,
+                frame.rgb.width,
+                frame.rgb.height,
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        let msg = encode_compressed_image(&CompressedImage {
+            stamp: frame.stamp,
+            format: "jpeg".into(),
+            data: jpeg,
+        });
+        bag.write_message(conn, driftless_io::testscan::time(frame.stamp), &msg);
+        true
+    })
+    .unwrap();
+    std::fs::create_dir_all(out).unwrap();
+    let path = out.join("IMAGE_0.bag");
+    std::fs::write(&path, bag.finish()).unwrap();
+    super::TextureSource {
+        images: crate::ImageSource {
+            bags: vec![path],
+            topics: src.images.topics.clone(),
+        },
+        ..src
+    }
+}
+
 /// The surface of the room of `driftless_io::testscan::scan_with_images` (the scan folder
 /// `dir`) as the surface step makes it from a map of that scan: walls, floor and ceiling from
 /// points 5 cm apart, measured from the room's centre, at the coarse settings of the step's

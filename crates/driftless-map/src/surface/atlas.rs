@@ -61,14 +61,20 @@
 //! Memory: the pages (3 bytes per texel), the per-face projection (≈ 40 bytes per face), and
 //! per image only its charts' rectangles; images are streamed one at a time.
 //!
+//! A Stelle baked anew („Bilder neu einspielen“, [`super::edit`]) uses the same parts – the
+//! projection, the charts with their texel scale and cuts, their rectangles, the placing of
+//! their faces and the filling – from images already decoded: [`bake_region`] puts it onto
+//! pages of its own (the smallest that hold it, [`region_pages`]), and
+//! [`footprint_sharpness`] measures how sharp an image shows it.
+//!
 //! [`ColorConfig::downscale`]: crate::ColorConfig::downscale
 
 use super::views::{FaceView, TextureSource, ViewTable};
 use super::{Mesh, SurfaceConfig};
 use crate::color::{frame_camera, image_count, linear_table, sample_linear, srgb_value, GRAY_MIN};
 use crate::exposure::Vignetting;
+use crate::sharpness::Moments;
 use crate::MapError;
-#[cfg(doc)]
 use driftless_io::camera::Camera;
 use driftless_io::images::{for_each_image, RgbImage};
 use driftless_io::progress::Progress;
@@ -108,6 +114,14 @@ pub const SPLIT_CUTS: usize = 16;
 /// The charts of one image are filled in batches of about this many texels (4 bytes each while
 /// they are filled).
 pub const FILL_BATCH_TEXELS: u64 = 16 << 20;
+/// Smallest side of a page a Stelle is baked onto ([`bake_region`]).
+pub const REGION_PAGE_MIN: u32 = 256;
+/// Largest side of a page a Stelle is baked onto ([`bake_region`]); a Stelle that needs more
+/// gets several pages.
+pub const REGION_PAGE_MAX: u32 = 4096;
+/// Largest side (texels) of a chart's rectangle when the sharpness of an image is measured on
+/// a Stelle ([`footprint_sharpness`]).
+pub const FOOTPRINT_SIDE: u32 = 2048;
 /// "No chart" / "not yet assigned".
 const NONE: u32 = u32::MAX;
 
@@ -706,6 +720,264 @@ impl Chart {
     }
 }
 
+/// The texel scale of a connected chart in [`bake`] and [`bake_region`]: `texel / min_texel`
+/// where the image is finer than [`SurfaceConfig::min_texel`] on the surface (`texel`: surface
+/// per image pixel, see the module docs), else 1.
+fn min_texel_scale(texel: f64, min_texel: f64) -> f64 {
+    if texel > 0.0 && texel < min_texel {
+        texel / min_texel
+    } else {
+        1.0
+    }
+}
+
+/// Face `f` of `mesh` in the image of `cam` (full size) at `world_to_cam`; `None` if a corner
+/// does not project.
+fn project(
+    mesh: &Mesh,
+    f: usize,
+    world_to_cam: &Isometry3<f64>,
+    cam: &Camera,
+) -> Option<Projected> {
+    let mut p = Projected {
+        uv: [[0.0; 2]; 3],
+        theta: [0.0; 3],
+    };
+    for (k, &i) in mesh.indices[f].iter().enumerate() {
+        let w = Vector3::from(mesh.positions[i as usize]).cast::<f64>();
+        let pc = world_to_cam * Point3::from(w);
+        let uv = cam.project(&pc.coords)?;
+        p.uv[k] = [uv[0] as f32, uv[1] as f32];
+        p.theta[k] = pc.x.hypot(pc.y).atan2(pc.z) as f32;
+    }
+    Some(p)
+}
+
+/// Whether every corner of face `f` of `mesh` projects into the image of `cam` (full size) at
+/// `world_to_cam`: whether [`bake_region`] can bake it from that image.
+pub(crate) fn projects(mesh: &Mesh, f: usize, world_to_cam: &Isometry3<f64>, cam: &Camera) -> bool {
+    project(mesh, f, world_to_cam, cam).is_some()
+}
+
+/// The charts of a mesh as parts ([`split_chart`]): the faces of every part (ascending within
+/// one) and per part its image (rank), texel scale and the first side of its rectangle.
+struct Parts {
+    faces: Vec<u32>,
+    start: Vec<usize>,
+    of: Vec<(u32, f64, [f64; 2])>,
+}
+
+impl Parts {
+    fn len(&self) -> usize {
+        self.of.len()
+    }
+
+    fn faces(&self, c: usize) -> &[u32] {
+        &self.faces[self.start[c]..self.start[c + 1]]
+    }
+}
+
+/// The charts of `mesh`: connected faces with the same label that project (`proj`), in face
+/// order; each with the texel scale `scale(texel)` (`texel`: `sqrt(surface area / image area)`
+/// of the chart) and, with `split`, cut into the parts that need the fewest texels
+/// ([`split_chart`]), else one part with the rectangle of [`best_axis`].
+fn chart_parts(
+    mesh: &Mesh,
+    labels: &[Option<u32>],
+    proj: &[Option<Projected>],
+    scale: impl Fn(f64) -> f64 + Sync,
+    split: bool,
+) -> Parts {
+    let n = mesh.indices.len();
+    let nb = Neighbours::new(mesh);
+    let (chart_of, chart_start, chart_faces) = connected(&nb, n, |f| proj[f].and(labels[f]));
+    drop((nb, chart_of));
+    let chart_rank: Vec<u32> = chart_start[..chart_start.len() - 1]
+        .iter()
+        .map(|&i| labels[chart_faces[i] as usize].expect("projected faces have a label"))
+        .collect();
+    let groups: Vec<(u32, f64, Vec<Part>)> = (0..chart_rank.len())
+        .into_par_iter()
+        .map(|c| {
+            let faces = &chart_faces[chart_start[c]..chart_start[c + 1]];
+            let (mut surface, mut image) = (0.0f64, 0.0f64);
+            for &f in faces {
+                surface += f64::from(mesh.face_area(f as usize));
+                image += pixel_area(&proj[f as usize].expect("chart faces are projected").uv);
+            }
+            let texel = if image > 0.0 {
+                (surface / image).sqrt()
+            } else {
+                0.0
+            };
+            let scale = scale(texel);
+            let parts = if split {
+                split_chart(faces.to_vec(), proj, scale)
+            } else {
+                vec![(faces.to_vec(), best_axis(corners(faces, proj)))]
+            };
+            (chart_rank[c], scale, parts)
+        })
+        .collect();
+    drop(chart_faces);
+    let mut parts = Parts {
+        faces: Vec::new(),
+        start: vec![0],
+        of: Vec::new(),
+    };
+    for (rank, scale, list) in groups {
+        for (part, axis) in list {
+            parts.faces.extend(part);
+            parts.start.push(parts.faces.len());
+            parts.of.push((rank, scale, axis));
+        }
+    }
+    parts
+}
+
+/// The rectangle of every part for pages of `page_size`²: the bounds of its corners along its
+/// sides at its texel scale, scaled down further where it would not fit the page, plus a border
+/// of [`MARGIN`] texels on every side; not placed yet (page 0, origin 0).
+fn chart_rects(parts: &Parts, proj: &[Option<Projected>], page_size: u32) -> Vec<Chart> {
+    let room = f64::from(page_size - 2 * MARGIN - 1);
+    (0..parts.len())
+        .into_par_iter()
+        .map(|c| {
+            let (rank, mut scale, axis) = parts.of[c];
+            let (lo, hi) = bounds(parts.faces(c), proj, axis);
+            let extent = (hi[0] - lo[0]).max(hi[1] - lo[1]);
+            if extent * scale > room {
+                scale = room / extent;
+            }
+            let core = |k: usize| {
+                let c = ((hi[k] - lo[k]) * scale + 1.0).ceil().max(1.0);
+                (c as u32).min(page_size - 2 * MARGIN)
+            };
+            Chart {
+                rank,
+                axis,
+                min: lo,
+                scale,
+                size: [core(0) + 2 * MARGIN, core(1) + 2 * MARGIN],
+                page: 0,
+                origin: [0, 0],
+            }
+        })
+        .collect()
+}
+
+/// Puts the faces of every chart (placed) onto its page of `page_size`²: a copy of the chart's
+/// vertices (ascending) with their texture coordinates, then its triangles (corner `k` the copy
+/// of the face's corner `k`), and records each face's triangle in `face_ref`. Returns the texel
+/// size on the surface (mm) of every face with texture area, in chart and face order.
+fn place_charts(
+    mesh: &Mesh,
+    charts: &[Chart],
+    parts: &Parts,
+    proj: &[Option<Projected>],
+    pages: &mut [TexturePage],
+    face_ref: &mut [(u32, u32)],
+    page_size: u32,
+) -> Vec<f64> {
+    let to_uv = |p: f64| (p / f64::from(page_size)) as f32;
+    let mut texel_mm: Vec<f64> = Vec::new();
+    for (c, chart) in charts.iter().enumerate() {
+        let page = &mut pages[chart.page as usize];
+        let faces = parts.faces(c);
+        let mut verts: Vec<u32> = faces
+            .iter()
+            .flat_map(|&f| mesh.indices[f as usize])
+            .collect();
+        verts.sort_unstable();
+        verts.dedup();
+        let base = page.positions.len();
+        page.positions
+            .extend(verts.iter().map(|&v| mesh.positions[v as usize]));
+        page.uvs.resize(base + verts.len(), [0.0; 2]);
+        for &f in faces {
+            let f = f as usize;
+            let p = proj[f].expect("chart faces are projected");
+            let mut tri = [0u32; 3];
+            for (k, corner) in tri.iter_mut().enumerate() {
+                let v = base
+                    + verts
+                        .binary_search(&mesh.indices[f][k])
+                        .expect("corner of the chart");
+                let t = chart.to_texel(p.uv[k]);
+                page.uvs[v] = [0, 1].map(|a| to_uv(f64::from(chart.origin[a]) + t[a]));
+                *corner = v as u32;
+            }
+            face_ref[f] = (chart.page, page.indices.len() as u32);
+            page.indices.push(tri);
+            let texels = pixel_area(&p.uv) * chart.scale * chart.scale;
+            if texels > 0.0 {
+                texel_mm.push((f64::from(mesh.face_area(f)) / texels).sqrt() * 1000.0);
+            }
+        }
+    }
+    texel_mm
+}
+
+/// Fills the charts `todo` (indices into `charts`, all of the image of `shot`, placed) on their
+/// pages from `shot`, in batches of about [`FILL_BATCH_TEXELS`] so that the large charts of one
+/// image are not all held at once. Returns how many texels their triangles cover.
+fn fill_charts(
+    charts: &[Chart],
+    todo: &[u32],
+    parts: &Parts,
+    proj: &[Option<Projected>],
+    shot: &Shot,
+    pages: &mut [TexturePage],
+) -> u64 {
+    let mut covered = 0u64;
+    let mut from = 0;
+    while from < todo.len() {
+        let mut to = from;
+        let mut texels = 0u64;
+        while to < todo.len() && (to == from || texels < FILL_BATCH_TEXELS) {
+            let size = charts[todo[to] as usize].size;
+            texels += u64::from(size[0]) * u64::from(size[1]);
+            to += 1;
+        }
+        let batch = &todo[from..to];
+        let filled: Vec<(Vec<u8>, u64)> = batch
+            .par_iter()
+            .map(|&c| fill_chart(&charts[c as usize], parts.faces(c as usize), proj, shot))
+            .collect();
+        for (&c, (buf, inside)) in batch.iter().zip(&filled) {
+            covered += inside;
+            let chart = &charts[c as usize];
+            let image = &mut pages[chart.page as usize].image;
+            let side = image.width as usize;
+            let row = chart.size[0] as usize * 3;
+            for (y, src_row) in buf.chunks_exact(row).enumerate() {
+                let start = ((chart.origin[1] as usize + y) * side + chart.origin[0] as usize) * 3;
+                image.data[start..start + row].copy_from_slice(src_row);
+            }
+        }
+        from = to;
+    }
+    covered
+}
+
+/// The [`ChartInfo`] of every chart (placed).
+fn chart_infos(charts: &[Chart], parts: &Parts) -> Vec<ChartInfo> {
+    charts
+        .iter()
+        .enumerate()
+        .map(|(c, chart)| ChartInfo {
+            page: chart.page,
+            rect: [
+                chart.origin[0],
+                chart.origin[1],
+                chart.size[0],
+                chart.size[1],
+            ],
+            faces: parts.faces(c).to_vec(),
+        })
+        .collect()
+}
+
 /// Bakes the texture: charts, pages and their images (see the module docs); `views` were found
 /// in the images of `sources`. Progress: phase „Textur backen“, one step per image of the
 /// streams of the sources that texture a chart (read one after the other); a cancel is
@@ -747,98 +1019,23 @@ pub(crate) fn bake(
             let r = labels[f]? as usize;
             let img = views.images.get(r)?;
             let cam = &sources.get(img.source)?.cams.get(img.camera)?.camera;
-            let mut p = Projected {
-                uv: [[0.0; 2]; 3],
-                theta: [0.0; 3],
-            };
-            for (k, &i) in mesh.indices[f].iter().enumerate() {
-                let w = Vector3::from(mesh.positions[i as usize]).cast::<f64>();
-                let pc = world_to_cam[r] * Point3::from(w);
-                let uv = cam.project(&pc.coords)?;
-                p.uv[k] = [uv[0] as f32, uv[1] as f32];
-                p.theta[k] = pc.x.hypot(pc.y).atan2(pc.z) as f32;
-            }
-            Some(p)
+            project(mesh, f, &world_to_cam[r], cam)
         })
         .collect();
 
-    // Charts: connected faces with the same label, in face order.
-    let nb = Neighbours::new(mesh);
-    let (chart_of, chart_start, chart_faces) = connected(&nb, n, |f| proj[f].and(labels[f]));
-    drop((nb, chart_of));
-    let chart_rank: Vec<u32> = chart_start[..chart_start.len() - 1]
-        .iter()
-        .map(|&i| labels[chart_faces[i] as usize].expect("projected faces have a label"))
-        .collect();
-
-    // Texel scale of every connected chart (`min_texel`), then poorly filled charts split
-    // into parts; the parts are the charts from here on.
-    let groups: Vec<(u32, f64, Vec<Part>)> = (0..chart_rank.len())
-        .into_par_iter()
-        .map(|c| {
-            let faces = &chart_faces[chart_start[c]..chart_start[c + 1]];
-            let (mut surface, mut image) = (0.0f64, 0.0f64);
-            for &f in faces {
-                surface += f64::from(mesh.face_area(f as usize));
-                image += pixel_area(&proj[f as usize].expect("chart faces are projected").uv);
-            }
-            let texel = if image > 0.0 {
-                (surface / image).sqrt()
-            } else {
-                0.0
-            };
-            let scale = if texel > 0.0 && texel < cfg.min_texel {
-                texel / cfg.min_texel
-            } else {
-                1.0
-            };
-            (
-                chart_rank[c],
-                scale,
-                split_chart(faces.to_vec(), &proj, scale),
-            )
-        })
-        .collect();
-    drop(chart_faces);
-    let mut part_faces: Vec<u32> = Vec::new();
-    let mut part_start: Vec<usize> = vec![0];
-    let mut part_of: Vec<(u32, f64, [f64; 2])> = Vec::new();
-    for (rank, scale, parts) in groups {
-        for (part, axis) in parts {
-            part_faces.extend(part);
-            part_start.push(part_faces.len());
-            part_of.push((rank, scale, axis));
-        }
-    }
-    let charts_n = part_of.len();
-    let faces_of = |c: usize| &part_faces[part_start[c]..part_start[c + 1]];
+    // Charts: connected faces with the same label, in face order, scaled to `min_texel`;
+    // poorly filled charts split into parts, the parts are the charts from here on.
+    let parts = chart_parts(
+        mesh,
+        labels,
+        &proj,
+        |texel| min_texel_scale(texel, cfg.min_texel),
+        true,
+    );
+    let charts_n = parts.len();
 
     // Chart rectangles: image bounding box, scaled to `min_texel` and to fit a page.
-    let room = f64::from(page_size - 2 * MARGIN - 1);
-    let mut charts: Vec<Chart> = (0..charts_n)
-        .into_par_iter()
-        .map(|c| {
-            let (rank, mut scale, axis) = part_of[c];
-            let (lo, hi) = bounds(faces_of(c), &proj, axis);
-            let extent = (hi[0] - lo[0]).max(hi[1] - lo[1]);
-            if extent * scale > room {
-                scale = room / extent;
-            }
-            let core = |k: usize| {
-                let c = ((hi[k] - lo[k]) * scale + 1.0).ceil().max(1.0);
-                (c as u32).min(page_size - 2 * MARGIN)
-            };
-            Chart {
-                rank,
-                axis,
-                min: lo,
-                scale,
-                size: [core(0) + 2 * MARGIN, core(1) + 2 * MARGIN],
-                page: 0,
-                origin: [0, 0],
-            }
-        })
-        .collect();
+    let mut charts = chart_rects(&parts, &proj, page_size);
 
     // Packing; the gray block first if any face is unseen.
     let unseen = proj.iter().filter(|p| p.is_none()).count();
@@ -895,41 +1092,15 @@ pub(crate) fn bake(
             page.indices.push(tri);
         }
     }
-    let mut texel_mm: Vec<f64> = Vec::new();
-    for (c, chart) in charts.iter().enumerate() {
-        let page = &mut pages[chart.page as usize];
-        let faces = faces_of(c);
-        let mut verts: Vec<u32> = faces
-            .iter()
-            .flat_map(|&f| mesh.indices[f as usize])
-            .collect();
-        verts.sort_unstable();
-        verts.dedup();
-        let base = page.positions.len();
-        page.positions
-            .extend(verts.iter().map(|&v| mesh.positions[v as usize]));
-        page.uvs.resize(base + verts.len(), [0.0; 2]);
-        for &f in faces {
-            let f = f as usize;
-            let p = proj[f].expect("chart faces are projected");
-            let mut tri = [0u32; 3];
-            for (k, corner) in tri.iter_mut().enumerate() {
-                let v = base
-                    + verts
-                        .binary_search(&mesh.indices[f][k])
-                        .expect("corner of the chart");
-                let t = chart.to_texel(p.uv[k]);
-                page.uvs[v] = [0, 1].map(|a| to_uv(f64::from(chart.origin[a]) + t[a]));
-                *corner = v as u32;
-            }
-            face_ref[f] = (chart.page, page.indices.len() as u32);
-            page.indices.push(tri);
-            let texels = pixel_area(&p.uv) * chart.scale * chart.scale;
-            if texels > 0.0 {
-                texel_mm.push((f64::from(mesh.face_area(f)) / texels).sqrt() * 1000.0);
-            }
-        }
-    }
+    let mut texel_mm = place_charts(
+        mesh,
+        &charts,
+        &parts,
+        &proj,
+        &mut pages,
+        &mut face_ref,
+        page_size,
+    );
 
     // Charts of every image (by rank), and per source the images that texture a chart.
     let mut by_rank: Vec<Vec<u32>> = vec![Vec::new(); views.images.len()];
@@ -1000,38 +1171,7 @@ pub(crate) fn bake(
                     camera: views.images[rank as usize].exposure_camera,
                     lin: &lin,
                 };
-                // In batches of at most FILL_BATCH_TEXELS, so that the large charts of one
-                // image are not all held at once.
-                let mut from = 0;
-                while from < todo.len() {
-                    let mut to = from;
-                    let mut texels = 0u64;
-                    while to < todo.len() && (to == from || texels < FILL_BATCH_TEXELS) {
-                        let size = charts[todo[to] as usize].size;
-                        texels += u64::from(size[0]) * u64::from(size[1]);
-                        to += 1;
-                    }
-                    let batch = &todo[from..to];
-                    let filled: Vec<(Vec<u8>, u64)> = batch
-                        .par_iter()
-                        .map(|&c| {
-                            fill_chart(&charts[c as usize], faces_of(c as usize), &proj, &shot)
-                        })
-                        .collect();
-                    for (&c, (buf, inside)) in batch.iter().zip(&filled) {
-                        covered += inside;
-                        let chart = &charts[c as usize];
-                        let image = &mut pages[chart.page as usize].image.data;
-                        let row = chart.size[0] as usize * 3;
-                        for (y, src_row) in buf.chunks_exact(row).enumerate() {
-                            let start = ((chart.origin[1] as usize + y) * side
-                                + chart.origin[0] as usize)
-                                * 3;
-                            image[start..start + row].copy_from_slice(src_row);
-                        }
-                    }
-                    from = to;
-                }
+                covered += fill_charts(&charts, &todo, &parts, &proj, &shot, &mut pages);
                 remaining -= 1;
                 remaining > 0
             });
@@ -1064,20 +1204,7 @@ pub(crate) fn bake(
         .map(|c| u64::from(c.size[0]) * u64::from(c.size[1]))
         .sum();
     let textured: Vec<bool> = proj.iter().map(Option::is_some).collect();
-    let infos: Vec<ChartInfo> = charts
-        .iter()
-        .enumerate()
-        .map(|(c, chart)| ChartInfo {
-            page: chart.page,
-            rect: [
-                chart.origin[0],
-                chart.origin[1],
-                chart.size[0],
-                chart.size[1],
-            ],
-            faces: faces_of(c).to_vec(),
-        })
-        .collect();
+    let infos = chart_infos(&charts, &parts);
     let stats = TextureStats {
         faces_textured: n - unseen,
         faces_untextured: unseen,
@@ -1107,6 +1234,199 @@ pub(crate) fn bake(
         },
         stats,
     ))
+}
+
+/// One image a Stelle is baked from ([`bake_region`], [`footprint_sharpness`]): where it was
+/// taken, its camera and the decoded image (both at full size), and the gain its colours are
+/// divided by (linear RGB).
+pub(crate) struct RegionImage<'a> {
+    pub world_from_cam: Isometry3<f64>,
+    pub camera: &'a Camera,
+    pub rgb: &'a RgbImage,
+    pub gain: [f32; 3],
+}
+
+impl RegionImage<'_> {
+    /// The image as [`fill_chart`] reads it: at full size, divided by its gain, no edge falloff.
+    fn shot<'a>(&'a self, vignetting: &'a Vignetting, lin: &'a [f32; 256]) -> Shot<'a> {
+        Shot {
+            rgb: self.rgb,
+            downscale: 1,
+            gain: self.gain,
+            vignetting,
+            camera: 0,
+            lin,
+        }
+    }
+}
+
+/// The side of the pages for charts of `sizes` (`[w, h]`, each side at most
+/// [`REGION_PAGE_MAX`]) and where they go: the smallest power of two from [`REGION_PAGE_MIN`]
+/// whose page holds them all, else pages of [`REGION_PAGE_MAX`] (as many as they need). Returns
+/// the side, the place of every chart ([`pack`]: page, top-left corner) and the number of pages.
+pub(crate) fn region_pages(sizes: &[[u32; 2]]) -> (u32, Vec<(u32, [u32; 2])>, u32) {
+    let largest = sizes.iter().map(|s| s[0].max(s[1])).max().unwrap_or(0);
+    let mut side = REGION_PAGE_MIN;
+    while side < REGION_PAGE_MAX {
+        if largest <= side {
+            let (at, pages) = pack(sizes, side, false);
+            if pages <= 1 {
+                return (side, at, pages);
+            }
+        }
+        side *= 2;
+    }
+    let (at, pages) = pack(sizes, side, false);
+    (side, at, pages)
+}
+
+/// Bakes a Stelle onto pages of its own: face `f` of `mesh` from `images[labels[f]]`. The charts
+/// are those [`bake`] makes (connected faces of one image, the texel scale by
+/// [`SurfaceConfig::min_texel`], split where poorly filled, rectangles of at most
+/// [`REGION_PAGE_MAX`]), packed onto pages of the side [`region_pages`] chooses; the texels of
+/// their triangles are the image's colours divided by its gain (no edge falloff: the falloff of
+/// the surface is not kept), the rest of every rectangle filled as [`bake`] fills it, texels of
+/// no chart [`UNSEEN_GRAY`]. Every face is textured. Same input, same pages.
+///
+/// # Panics
+/// If `labels` does not fit `mesh`, names no image of `images`, or a face does not project into
+/// its image.
+pub(crate) fn bake_region(
+    mesh: &Mesh,
+    labels: &[u32],
+    images: &[RegionImage],
+    cfg: &SurfaceConfig,
+) -> TexturedMesh {
+    let n = mesh.indices.len();
+    assert_eq!(labels.len(), n, "labels do not fit the mesh");
+    let world_to_cam: Vec<Isometry3<f64>> =
+        images.iter().map(|i| i.world_from_cam.inverse()).collect();
+    let proj: Vec<Option<Projected>> = (0..n)
+        .into_par_iter()
+        .map(|f| {
+            let l = labels[f] as usize;
+            let p = project(mesh, f, &world_to_cam[l], images[l].camera);
+            assert!(p.is_some(), "face {f} does not project into image {l}");
+            p
+        })
+        .collect();
+    let labels: Vec<Option<u32>> = labels.iter().map(|&l| Some(l)).collect();
+    let parts = chart_parts(
+        mesh,
+        &labels,
+        &proj,
+        |texel| min_texel_scale(texel, cfg.min_texel),
+        true,
+    );
+    let mut charts = chart_rects(&parts, &proj, REGION_PAGE_MAX);
+    let sizes: Vec<[u32; 2]> = charts.iter().map(|c| c.size).collect();
+    let (side, at, page_count) = region_pages(&sizes);
+    for (chart, &(page, origin)) in charts.iter_mut().zip(&at) {
+        chart.page = page;
+        chart.origin = origin;
+    }
+    let texels = side as usize * side as usize;
+    let mut pages: Vec<TexturePage> = (0..page_count)
+        .map(|_| TexturePage {
+            positions: Vec::new(),
+            uvs: Vec::new(),
+            indices: Vec::new(),
+            image: RgbImage {
+                width: side,
+                height: side,
+                data: vec![UNSEEN_GRAY; texels * 3],
+            },
+        })
+        .collect();
+    let mut face_ref = vec![(0u32, 0u32); n];
+    place_charts(
+        mesh,
+        &charts,
+        &parts,
+        &proj,
+        &mut pages,
+        &mut face_ref,
+        side,
+    );
+    let lin = linear_table();
+    let flat = Vignetting::flat(1, 1.0);
+    let mut by_image: Vec<Vec<u32>> = vec![Vec::new(); images.len()];
+    for (c, chart) in charts.iter().enumerate() {
+        by_image[chart.rank as usize].push(c as u32);
+    }
+    for (image, todo) in images.iter().zip(&by_image) {
+        if !todo.is_empty() {
+            let shot = image.shot(&flat, &lin);
+            fill_charts(&charts, todo, &parts, &proj, &shot, &mut pages);
+        }
+    }
+    TexturedMesh {
+        pages,
+        face_ref,
+        textured: vec![true; n],
+        charts: chart_infos(&charts, &parts),
+    }
+}
+
+/// The sharpness measure ([`Moments`]) of what `image` shows of the faces of `mesh` that `seen`
+/// marks, at `texel` (m) on the surface: their charts in the image (connected faces), each scaled
+/// so that a texel covers `texel` of the surface (an image finer than that is averaged down, a
+/// coarser one sampled up, so images of the same spot compare at the same resolution), filled
+/// as [`bake`] fills a chart (colours divided by the image's gain) and measured over the texels
+/// of their triangles. A rectangle is at most [`FOOTPRINT_SIDE`] texels on a side. Faces that do
+/// not project are left out.
+///
+/// # Panics
+/// If `seen` does not fit `mesh`.
+pub(crate) fn footprint_sharpness(
+    mesh: &Mesh,
+    seen: &[bool],
+    image: &RegionImage,
+    texel: f64,
+) -> Moments {
+    let n = mesh.indices.len();
+    assert_eq!(seen.len(), n, "faces do not fit the mesh");
+    let world_to_cam = image.world_from_cam.inverse();
+    let proj: Vec<Option<Projected>> = (0..n)
+        .into_par_iter()
+        .map(|f| {
+            if seen[f] {
+                project(mesh, f, &world_to_cam, image.camera)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let labels: Vec<Option<u32>> = seen.iter().map(|&s| s.then_some(0)).collect();
+    let parts = chart_parts(
+        mesh,
+        &labels,
+        &proj,
+        |t| if t > 0.0 { t / texel } else { 1.0 },
+        false,
+    );
+    let charts = chart_rects(&parts, &proj, FOOTPRINT_SIDE);
+    let lin = linear_table();
+    let flat = Vignetting::flat(1, 1.0);
+    let shot = image.shot(&flat, &lin);
+    let each: Vec<Moments> = (0..charts.len())
+        .into_par_iter()
+        .map(|c| {
+            let chart = &charts[c];
+            let (buf, inside) = chart_texels(chart, parts.faces(c), &proj, &shot);
+            let rgb = RgbImage {
+                width: chart.size[0],
+                height: chart.size[1],
+                data: buf,
+            };
+            Moments::of(&rgb, &inside)
+        })
+        .collect();
+    let mut sum = Moments::default();
+    for m in &each {
+        sum.add(m);
+    }
+    sum
 }
 
 /// Image point `p` in the frame of a rectangle whose first side runs along `axis` (unit
@@ -1311,6 +1631,25 @@ fn fill_chart(
     proj: &[Option<Projected>],
     shot: &Shot,
 ) -> (Vec<u8>, u64) {
+    let (mut buf, mut filled) = chart_texels(chart, faces, proj, shot);
+    let covered = filled.iter().filter(|&&f| f).count() as u64;
+    fill_rest(
+        &mut buf,
+        &mut filled,
+        chart.size[0] as usize,
+        chart.size[1] as usize,
+    );
+    (buf, covered)
+}
+
+/// The chart's rectangle (row-major sRGB, border included) with the texels of its triangles from
+/// `shot` and the rest [`UNSEEN_GRAY`], and which texels the triangles cover.
+fn chart_texels(
+    chart: &Chart,
+    faces: &[u32],
+    proj: &[Option<Projected>],
+    shot: &Shot,
+) -> (Vec<u8>, Vec<bool>) {
     let [w, h] = chart.size;
     let (wu, hu) = (w as usize, h as usize);
     let mut buf = vec![UNSEEN_GRAY; wu * hu * 3];
@@ -1351,9 +1690,7 @@ fn fill_chart(
             filled[j as usize * wu + i as usize] = true;
         });
     }
-    let covered = filled.iter().filter(|&&f| f).count() as u64;
-    fill_rest(&mut buf, &mut filled, wu, hu);
-    (buf, covered)
+    (buf, filled)
 }
 
 /// Fills the texels of a chart rectangle (`w × h`, row-major sRGB) that `filled` marks as
@@ -2590,5 +2927,134 @@ mod tests {
         let n = absorb_islands(&mesh, &views, &[island_camera()], &cfg, &mut labels);
         assert_eq!(n, Absorbed::default());
         assert_eq!(labels[cell_face(10, 10, false)], None);
+    }
+    #[test]
+    fn region_page_is_the_smallest_that_holds_it() {
+        assert_eq!(region_pages(&[]), (REGION_PAGE_MIN, Vec::new(), 0));
+        assert_eq!(
+            region_pages(&[[40, 30]]),
+            (REGION_PAGE_MIN, vec![(0, [0, 0])], 1)
+        );
+        assert_eq!(region_pages(&[[300, 200]]).0, 512);
+        // Each fits a page of 512 alone, together they need 1024.
+        let sizes = [[400, 300], [300, 400], [350, 350]];
+        let (side, at, pages) = region_pages(&sizes);
+        assert_eq!((side, pages), (1024, 1));
+        assert_eq!(pack(&sizes, side, false), (at, pages));
+        // More than a page of the largest side holds: several of them.
+        let (side, at, pages) = region_pages(&[[3000, 3000]; 3]);
+        assert_eq!((side, pages), (REGION_PAGE_MAX, 3));
+        assert_eq!(at, vec![(0, [0, 0]), (1, [0, 0]), (2, [0, 0])]);
+    }
+
+    #[test]
+    fn bake_region_has_pages_of_its_own() {
+        // The checkerboard of the front patch from 1.5 m: about 300 × 230 pixels of 6.5 mm.
+        let (mesh, src, front) = fixture("atlas-region", &[0.0], false);
+        assert_eq!(front, mesh.indices.len());
+        let cfg = SurfaceConfig::default();
+        let views =
+            collect_views(&mesh, std::slice::from_ref(&src), &cfg, &Progress::new()).unwrap();
+        let used = &views.images[0];
+        let mut rgb = None;
+        for_each_image(&src.images.bags, &src.images.topics, 1, |frame| {
+            rgb = Some(frame.unwrap().rgb);
+            false
+        })
+        .unwrap();
+        let rgb = rgb.unwrap();
+        let images = [RegionImage {
+            world_from_cam: used.world_from_cam,
+            camera: &src.cams[used.camera].camera,
+            rgb: &rgb,
+            gain: [1.0; 3],
+        }];
+        let labels = vec![0u32; front];
+        for (min_texel, side) in [(0.002, 512), (0.015, REGION_PAGE_MIN)] {
+            let cfg = SurfaceConfig {
+                min_texel,
+                ..cfg.clone()
+            };
+            let tex = bake_region(&mesh, &labels, &images, &cfg);
+            assert_eq!(tex.pages.len(), 1);
+            assert_pages_sane(&tex, side, front);
+            assert_charts(&tex, side);
+            assert!(tex.textured.iter().all(|&t| t));
+            assert_checker(&mesh, &tex, front);
+            assert_eq!(bake_region(&mesh, &labels, &images, &cfg), tex);
+        }
+        // Divided by the gain.
+        let darker = [RegionImage {
+            gain: [2.0; 3],
+            ..images[0]
+        }];
+        let tex = bake_region(&mesh, &labels, &darker, &cfg);
+        let lin = linear_table();
+        let (p, t) = tex.face_ref[0];
+        let page = &tex.pages[p as usize];
+        let uv = [0, 1].map(|k| {
+            page.indices[t as usize]
+                .iter()
+                .map(|&c| page.uvs[c as usize][k])
+                .sum::<f32>()
+                / 3.0
+        });
+        let got = texel(page, uv);
+        let plain = bake_region(&mesh, &labels, &images, &cfg);
+        let want = texel(&plain.pages[p as usize], uv);
+        for c in 0..3 {
+            let half = srgb_value(lin[want[c] as usize] / 2.0).round();
+            assert!(
+                (f64::from(got[c]) - half).abs() <= 1.0,
+                "{got:?} vs {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn footprint_sharpness_sees_blur() {
+        // The checkerboard from 1.5 m, sharp and blurred: at the same texel size the blurred
+        // image measures far less sharp; a coarser texel size averages the difference away.
+        let (mesh, src, front) = fixture("atlas-footprint", &[0.0], false);
+        let cfg = SurfaceConfig::default();
+        let views =
+            collect_views(&mesh, std::slice::from_ref(&src), &cfg, &Progress::new()).unwrap();
+        let used = &views.images[0];
+        let mut rgb = None;
+        for_each_image(&src.images.bags, &src.images.topics, 1, |frame| {
+            rgb = Some(frame.unwrap().rgb);
+            false
+        })
+        .unwrap();
+        let sharp = rgb.unwrap();
+        let blurred = RgbImage {
+            data: super::super::testutil::blur(&sharp.data, 2.0),
+            ..sharp.clone()
+        };
+        let seen = vec![true; front];
+        let measure = |rgb: &RgbImage, texel: f64| {
+            let image = RegionImage {
+                world_from_cam: used.world_from_cam,
+                camera: &src.cams[used.camera].camera,
+                rgb,
+                gain: [1.0; 3],
+            };
+            footprint_sharpness(&mesh, &seen, &image, texel).sharpness()
+        };
+        let (a, b) = (measure(&sharp, 0.0065), measure(&blurred, 0.0065));
+        println!("sharp {a:.3}, blurred {b:.3}");
+        assert!(a > 0.0 && b < 0.5 * a, "{a} vs {b}");
+        assert_eq!(measure(&sharp, 0.0065), a);
+        // Nothing seen: nothing measured.
+        let image = RegionImage {
+            world_from_cam: used.world_from_cam,
+            camera: &src.cams[used.camera].camera,
+            rgb: &sharp,
+            gain: [1.0; 3],
+        };
+        assert_eq!(
+            footprint_sharpness(&mesh, &vec![false; front], &image, 0.0065).sharpness(),
+            0.0
+        );
     }
 }
