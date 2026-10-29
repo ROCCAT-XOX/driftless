@@ -13,7 +13,10 @@
 //!
 //! An lz4 frame of another kind (linked blocks, a dictionary, another version, anything after
 //! its end) and anything that does not fit is decompressed whole, as the sequential reader
-//! does it, so it gives the same records or the same error.
+//! does it, so it gives the same records or the same error. So is a frame whose blocks hold
+//! more than the chunk's header gives as its size, more than [`LAZY_BYTES`] or more than
+//! [`LAZY_BLOCKS`] blocks: what the walk keeps of a chunk is never more than that, nor more
+//! than the sequential reader holds of it.
 
 use super::reader::{decompress, parse_connection, read_head, BagReader, Next};
 use super::record::*;
@@ -68,12 +71,23 @@ const FLG_DICTIONARY: u8 = 0b0000_0001;
 const BLOCK_STORED: u32 = 0x8000_0000;
 /// Pieces of the file are read at least this many bytes at a time.
 const PEEK: usize = 4096;
+/// The blocks of an lz4 chunk read one by one hold at most this many bytes, decompressed (as
+/// much as the sequential reader sets aside for a chunk up front), and never more than the
+/// chunk's header gives as its size; a chunk with more is decompressed whole.
+const LAZY_BYTES: u64 = 1 << 28;
+/// … and they are at most this many (the blocks of a common encoder hold 64 KiB or more, so this
+/// is as much again); a frame of more blocks is decompressed whole as well.
+const LAZY_BLOCKS: usize = 4096;
 
-/// Reads pieces of the file at given places, keeping the last [`PEEK`] bytes or more read.
+/// Reads pieces of the file at given places, keeping the last [`PEEK`] bytes or more read; and
+/// the buffers the compressed blocks of a frame are read into and decompressed into, one block
+/// after the other.
 #[derive(Default)]
 struct Peeker {
     start: u64,
     buf: Vec<u8>,
+    input: Vec<u8>,
+    output: Vec<u8>,
 }
 
 impl Peeker {
@@ -107,7 +121,8 @@ struct Block {
     /// Its place in the decompressed data and its length there.
     start: u64,
     len: u64,
-    /// Stored: where its bytes lie in the file. Compressed: `None`, its bytes in `data`.
+    /// Stored: where its bytes lie in the file. Compressed: `None`, its bytes in `data` (just
+    /// those: `len` of them).
     stored_at: Option<u64>,
     data: Vec<u8>,
 }
@@ -122,8 +137,10 @@ struct Frame {
     next: u64,
     end: u64,
     blocks: Vec<Block>,
-    /// The decompressed bytes of the blocks so far.
+    /// The decompressed bytes of the blocks so far, and the most they may be: the chunk's size
+    /// by its header, at most [`LAZY_BYTES`].
     total: u64,
+    limit: u64,
     /// The end mark was read.
     ended: bool,
 }
@@ -161,13 +178,14 @@ struct Chunk {
 }
 
 impl Frame {
-    /// The frame of the chunk data at `pos` (`len` bytes), if it is one this module reads
-    /// block by block (see the module docs).
+    /// The frame of the chunk data at `pos` (`len` bytes, `size` decompressed as the chunk's
+    /// header says), if it is one this module reads block by block (see the module docs).
     fn open<R: Read + Seek>(
         r: &mut R,
         peek: &mut Peeker,
         pos: u64,
         len: u64,
+        size: u32,
         file_len: u64,
     ) -> Result<Option<Frame>, BagError> {
         if len < 7 {
@@ -203,12 +221,14 @@ impl Frame {
             end: pos + len,
             blocks: Vec::new(),
             total: 0,
+            limit: u64::from(size).min(LAZY_BYTES),
             ended: false,
         }))
     }
 
     /// Reads the next block (its header; a compressed one whole, decompressed). `false` where
-    /// the frame does not go on as this module reads it: then it is decompressed whole.
+    /// the frame does not go on as this module reads it, or holds more than it may (more bytes
+    /// than its limit, more than [`LAZY_BLOCKS`] blocks): then it is decompressed whole.
     fn read_block<R: Read + Seek>(
         &mut self,
         r: &mut R,
@@ -230,10 +250,17 @@ impl Frame {
         let size = u64::from(word & !BLOCK_STORED);
         let at = self.next + 4;
         let next = at + size + if self.block_checksums { 4 } else { 0 };
-        if size == 0 || size > self.block_max as u64 || next > self.end {
+        if size == 0
+            || size > self.block_max as u64
+            || next > self.end
+            || self.blocks.len() >= LAZY_BLOCKS
+        {
             return Ok(false);
         }
         let block = if stored {
+            if self.total + size > self.limit {
+                return Ok(false);
+            }
             Block {
                 start: self.total,
                 len: size,
@@ -241,19 +268,25 @@ impl Frame {
                 data: Vec::new(),
             }
         } else {
-            let mut input = vec![0u8; size as usize];
+            // Read and decompressed in the walk's buffers; the block keeps just its bytes.
+            peek.input.resize(size as usize, 0);
             r.seek(SeekFrom::Start(at))?;
-            r.read_exact(&mut input)?;
-            let mut out = vec![0u8; self.block_max];
-            let Ok(n) = lz4_flex::block::decompress_into(&input, &mut out) else {
+            r.read_exact(&mut peek.input)?;
+            if peek.output.len() < self.block_max {
+                peek.output.resize(self.block_max, 0);
+            }
+            let out = &mut peek.output[..self.block_max];
+            let Ok(n) = lz4_flex::block::decompress_into(&peek.input, out) else {
                 return Ok(false);
             };
-            out.truncate(n);
+            if n == 0 || self.total + n as u64 > self.limit {
+                return Ok(false);
+            }
             Block {
                 start: self.total,
                 len: n as u64,
                 stored_at: None,
-                data: out,
+                data: out[..n].to_vec(),
             }
         };
         self.total += block.len;
@@ -433,7 +466,7 @@ impl<R: Read + Seek> Places<'_, R> {
                     "none" => {}
                     "lz4" => {
                         chunk.compression = ChunkCompression::Lz4;
-                        match Frame::open(r, &mut self.peek, pos, len, file_len)? {
+                        match Frame::open(r, &mut self.peek, pos, len, size, file_len)? {
                             Some(frame) => chunk.records = Records::Lz4(frame),
                             None => chunk.whole(r, "lz4")?,
                         }
@@ -609,5 +642,150 @@ impl<R: Read + Seek> BagReader<R> {
             ChunkCompression::Lz4 => "lz4",
         };
         decompress(name, data, place.chunk_size as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lz4_flex::frame::{BlockMode, BlockSize, FrameDecoder, FrameEncoder, FrameInfo};
+    use std::io::{Cursor, Write};
+
+    /// An lz4 frame of independent blocks of at most 64 KiB, with the checksum of its content:
+    /// a block for every part (each at most 64 KiB).
+    fn frame_of(parts: &[Vec<u8>]) -> Vec<u8> {
+        let info = FrameInfo::new()
+            .block_size(BlockSize::Max64KB)
+            .block_mode(BlockMode::Independent)
+            .content_checksum(true);
+        let mut enc = FrameEncoder::with_frame_info(info, Vec::new());
+        for part in parts {
+            enc.write_all(part).unwrap();
+            enc.flush().unwrap();
+        }
+        enc.finish().unwrap()
+    }
+
+    /// Reads the blocks of the frame `bytes` (said to hold `size` bytes, as a chunk's header says
+    /// it) as the walk does: whether it got through to the end mark, and the frame as far as it
+    /// got.
+    fn read_blocks(bytes: &[u8], size: u32) -> (bool, Frame) {
+        let len = bytes.len() as u64;
+        let mut r = Cursor::new(bytes.to_vec());
+        let mut peek = Peeker::default();
+        let mut frame = Frame::open(&mut r, &mut peek, 0, len, size, len)
+            .unwrap()
+            .expect("a frame read block by block");
+        while !frame.ended {
+            if !frame.read_block(&mut r, &mut peek, len).unwrap() {
+                return (false, frame);
+            }
+        }
+        (true, frame)
+    }
+
+    /// `n` bytes that compress well.
+    fn pattern(n: usize, k: u8) -> Vec<u8> {
+        (0..n).map(|i| (i % 7) as u8 + k).collect()
+    }
+
+    /// `n` bytes that do not compress.
+    fn noise(n: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// What the blocks read hold, put together (the stored ones from `bytes`).
+    fn content(bytes: &[u8], frame: &Frame) -> Vec<u8> {
+        let mut out = Vec::new();
+        for b in &frame.blocks {
+            match b.stored_at {
+                Some(at) => out.extend_from_slice(&bytes[at as usize..(at + b.len) as usize]),
+                None => out.extend_from_slice(&b.data),
+            }
+        }
+        out
+    }
+
+    /// The bytes the blocks read keep in memory.
+    fn kept(frame: &Frame) -> usize {
+        frame.blocks.iter().map(|b| b.data.capacity()).sum()
+    }
+
+    /// A compressed block keeps just its bytes, a stored one none; together they hold the frame's
+    /// content, as the frame decoder gives it.
+    #[test]
+    fn blocks_keep_just_their_bytes() {
+        let parts = vec![
+            pattern(65_536, 1),
+            noise(65_536, 7),
+            pattern(10_000, 3),
+            noise(500, 9),
+        ];
+        let whole = parts.concat();
+        let bytes = frame_of(&parts);
+        let (through, frame) = read_blocks(&bytes, whole.len() as u32);
+        assert!(through);
+        assert_eq!(frame.blocks.len(), 4);
+        let compressed: Vec<&Block> = frame
+            .blocks
+            .iter()
+            .filter(|b| b.stored_at.is_none())
+            .collect();
+        assert_eq!(
+            compressed.len(),
+            2,
+            "the patterns compress, the noise does not"
+        );
+        for b in compressed {
+            assert_eq!(b.data.capacity() as u64, b.len);
+        }
+        assert_eq!(kept(&frame), 65_536 + 10_000);
+        assert_eq!(content(&bytes, &frame), whole);
+        let mut decoded = Vec::new();
+        FrameDecoder::new(&bytes[..])
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, whole);
+    }
+
+    /// Blocks that hold more than the chunk's header says are not kept: reading stops at the
+    /// block that would go beyond (the chunk is then decompressed whole), having kept no more than
+    /// that size – also where a few bytes in the file stand for megabytes.
+    #[test]
+    fn no_more_than_the_size_is_kept() {
+        // 12 MiB of zeros in 192 blocks: a few KiB in the file.
+        let parts: Vec<Vec<u8>> = (0..192).map(|_| vec![0u8; 65_536]).collect();
+        let bytes = frame_of(&parts);
+        assert!(bytes.len() < 100_000, "{}", bytes.len());
+        let (through, frame) = read_blocks(&bytes, 192 * 65_536);
+        assert!(through);
+        assert_eq!(frame.total, 192 * 65_536);
+        let (through, frame) = read_blocks(&bytes, 1 << 20);
+        assert!(!through);
+        assert_eq!(frame.blocks.len(), 16);
+        assert!(kept(&frame) <= 1 << 20, "{}", kept(&frame));
+        // Stored blocks count as well.
+        let parts: Vec<Vec<u8>> = (0..4).map(|i| noise(65_536, i)).collect();
+        let bytes = frame_of(&parts);
+        let (through, frame) = read_blocks(&bytes, 3 * 65_536 - 1);
+        assert!(!through);
+        assert_eq!(frame.blocks.len(), 2);
+        assert_eq!(kept(&frame), 0);
+    }
+
+    /// A frame of more than [`LAZY_BLOCKS`] blocks is not read block by block.
+    #[test]
+    fn no_more_than_so_many_blocks_are_kept() {
+        let parts: Vec<Vec<u8>> = (0..LAZY_BLOCKS + 10).map(|i| vec![i as u8]).collect();
+        let bytes = frame_of(&parts);
+        let (through, frame) = read_blocks(&bytes, parts.len() as u32);
+        assert!(!through);
+        assert_eq!(frame.blocks.len(), LAZY_BLOCKS);
     }
 }

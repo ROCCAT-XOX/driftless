@@ -763,3 +763,153 @@ fn places_read_little_of_the_chunks() {
     assert_eq!(n, 9);
     assert!(read * 10 > size(&linked) * 9, "{read} of {}", size(&linked));
 }
+
+/// Chunks whose blocks hold more than their header says (`size` a quarter of what they hold):
+/// the walk keeps no more of a chunk than its header says and reads such a chunk whole, as the
+/// sequential reader does; the index and the images are the same as the stream's.
+#[test]
+fn chunks_larger_than_they_say_are_read_whole() {
+    let dir = TestDir::new(format!("driftless_images_size_{}", std::process::id()));
+    let lz4 = Compression::Lz4Frame(Lz4Frame {
+        block_kib: 64,
+        linked: false,
+        block_checksums: false,
+        content_checksum: true,
+        content_size: false,
+    });
+    let honest = image_bag(&dir, "ehrlich.bag", lz4, 3, true, 9, (256, 192), true);
+    let mut bytes = std::fs::read(&honest).unwrap();
+    let field = b"\x09\x00\x00\x00size=";
+    let mut patched = 0;
+    let mut at = 0;
+    while let Some(i) = bytes[at..].windows(field.len()).position(|w| w == field) {
+        let v = at + i + field.len();
+        let size = u32::from_le_bytes(bytes[v..v + 4].try_into().unwrap());
+        bytes[v..v + 4].copy_from_slice(&(size / 4).to_le_bytes());
+        patched += 1;
+        at = v + 4;
+    }
+    assert_eq!(
+        patched, 5,
+        "a chunk per three messages: nine images, five IMU messages"
+    );
+    let crafted = dir.join("zu-klein.bag");
+    std::fs::write(&crafted, &bytes).unwrap();
+    let topics = vec![
+        "/camera_left/image_raw".to_string(),
+        "/camera_right/image_raw".to_string(),
+    ];
+    for bag in [&honest, &crafted] {
+        let bags = std::slice::from_ref(bag);
+        let mut listed = Vec::new();
+        for_each_image_where(
+            bags,
+            &topics,
+            1,
+            |h| {
+                listed.push(h.clone());
+                Wanted::No
+            },
+            |_| true,
+        )
+        .unwrap();
+        let index = index_images(bags, &topics, &Progress::new()).unwrap();
+        assert_eq!(index.headers().cloned().collect::<Vec<_>>(), listed);
+        let mut all = Vec::new();
+        for_each_image(bags, &topics, 1, |r| {
+            all.push(r.map_err(|e| e.to_string()));
+            true
+        })
+        .unwrap();
+        let wanted: Vec<usize> = listed.iter().map(|h| h.index).collect();
+        read_indexed(&index, &wanted, 1, |i, r| {
+            assert_eq!(r.map_err(|e| e.to_string()), all[i], "image {i}");
+            true
+        })
+        .unwrap();
+    }
+    // The honest bag is read in pieces, the crafted one whole.
+    let size = |p: &PathBuf| std::fs::metadata(p).unwrap().len();
+    let (read, n) = walk_read(&honest);
+    assert_eq!(n, 14, "nine images, five IMU messages");
+    assert!(read * 10 < size(&honest) * 6, "{read} of {}", size(&honest));
+    let (read, n) = walk_read(&crafted);
+    assert_eq!(n, 14);
+    assert!(
+        read * 10 > size(&crafted) * 9,
+        "{read} of {}",
+        size(&crafted)
+    );
+}
+
+/// The index of real image bags (`$DRIFTLESS_BAGS`, paths separated by `:`; not in the
+/// repository) against the stream: the same headers; and a few images read at their places the
+/// same as the stream delivers them. Prints how long indexing took (from the page cache: the
+/// listing reads each bag first).
+#[test]
+#[ignore = "needs $DRIFTLESS_BAGS"]
+fn index_matches_on_real_bags() {
+    let Some(bags) = std::env::var_os("DRIFTLESS_BAGS") else {
+        eprintln!("DRIFTLESS_BAGS nicht gesetzt, Test übersprungen");
+        return;
+    };
+    let topics = vec![
+        "/camera_left/image_raw".to_string(),
+        "/camera_right/image_raw".to_string(),
+    ];
+    for bag in std::env::split_paths(&bags) {
+        let bags = std::slice::from_ref(&bag);
+        let t = std::time::Instant::now();
+        let mut listed = Vec::new();
+        for_each_image_where(
+            bags,
+            &topics,
+            1,
+            |h| {
+                listed.push(h.clone());
+                Wanted::No
+            },
+            |_| true,
+        )
+        .unwrap();
+        let sequential = t.elapsed();
+        let t = std::time::Instant::now();
+        let index = index_images(bags, &topics, &Progress::new()).unwrap();
+        let indexed = t.elapsed();
+        assert_eq!(index.headers().cloned().collect::<Vec<_>>(), listed);
+        // every 500th image, as the stream delivers it there
+        let wanted: Vec<usize> = listed.iter().map(|h| h.index).step_by(500).collect();
+        let mut want = Vec::new();
+        for_each_image_where(
+            bags,
+            &topics,
+            1,
+            |h| {
+                if wanted.contains(&h.index) {
+                    Wanted::Yes
+                } else {
+                    Wanted::No
+                }
+            },
+            |r| {
+                want.push(r.map(|f| f.rgb).map_err(|e| e.to_string()));
+                true
+            },
+        )
+        .unwrap();
+        let mut got = Vec::new();
+        read_indexed(&index, &wanted, 1, |_, r| {
+            got.push(r.map(|f| f.rgb).map_err(|e| e.to_string()));
+            true
+        })
+        .unwrap();
+        assert!(got == want, "{}: images differ", bag.display());
+        eprintln!(
+            "{}: {} images; listed in {sequential:.2?}, indexed in {indexed:.3?}; {} images \
+             read at their places, the same",
+            bag.display(),
+            listed.len(),
+            got.len()
+        );
+    }
+}
