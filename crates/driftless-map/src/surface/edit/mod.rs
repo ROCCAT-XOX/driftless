@@ -5,7 +5,10 @@
 //! copies by their bits, as the PLY export does, and numbers the faces by their running index
 //! over the pages. [`FaceBvh`] finds the face a ray hits first and the faces near a point;
 //! [`select_faces`] turns the dabs of a Stelle into the faces they cover; [`smooth_region`]
-//! moves the vertices of a Stelle („Glätten“).
+//! moves the vertices of a Stelle („Glätten“). Every step gives a [`SurfacePatch`]:
+//! [`apply_patches`] makes the touched-up surface from the computed one and the patches,
+//! [`page_edits`] says the view which of its pages changed, and [`write_patches`] /
+//! [`read_patches`] keep the patches next to the surface.
 //!
 //! Everything here runs on the CPU and is deterministic: the same surface, dabs and steps give
 //! the same faces and positions, byte for byte, on every machine and with any number of
@@ -14,16 +17,22 @@
 //! the touch-up step use the same code, so they see the same faces.
 
 mod bvh;
+mod patch;
 mod select;
 mod smooth;
 mod weld;
 
 pub use bvh::{FaceBvh, RayHit, LEAF_FACES};
+pub use patch::{
+    apply_patches, page_edits, read_patches, write_patches, PageEdit, PatchPage, SurfacePatch,
+    PATCHES_FILE,
+};
 pub use select::{dab_faces, dab_normal, select_faces, SelectDab, MAX_HOLE_AREA, MIN_NORMAL_DOT};
 pub use smooth::{smooth_region, Smoothing};
 pub use weld::WeldedSurface;
 
 use crate::MapError;
+use std::path::PathBuf;
 
 /// Version of the touch-up computation. A change that alters what a step gives (the faces a
 /// dab selects, how they are smoothed or re-textured) raises it, so cached touch-ups are
@@ -46,6 +55,16 @@ pub enum EditError {
     /// The step was cancelled through its [`driftless_io::progress::Progress`].
     #[error("abgebrochen")]
     Cancelled,
+    /// The patches could not be stored ([`write_patches`]); `path` is the file or its folder.
+    #[error("{} nicht schreibbar: {source}", .path.display())]
+    Unwritable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// The stored patches are missing, damaged or of another version ([`read_patches`]):
+    /// `why` says which (German).
+    #[error("{} nicht lesbar: {why}", .path.display())]
+    Unreadable { path: PathBuf, why: String },
     /// Reading, writing or computing failed (German, from [`MapError`]).
     #[error(transparent)]
     Map(MapError),
@@ -106,6 +125,26 @@ mod tests {
             "Die Stelle liegt nicht auf dieser Oberfläche."
         );
         assert_eq!(EditError::Cancelled.to_string(), "abgebrochen");
+        let path = PathBuf::from("nacharbeit").join(PATCHES_FILE);
+        let e = EditError::Unwritable {
+            path: path.clone(),
+            source: std::io::Error::other("Platte voll"),
+        };
+        assert_eq!(
+            e.to_string(),
+            format!("{} nicht schreibbar: Platte voll", path.display())
+        );
+        let e = EditError::Unreadable {
+            path: path.clone(),
+            why: "beschädigt (Prüfsumme stimmt nicht)".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "{} nicht lesbar: beschädigt (Prüfsumme stimmt nicht)",
+                path.display()
+            )
+        );
         // A cancelled computation stays a cancel, everything else keeps its text.
         assert!(matches!(
             EditError::from(MapError::Cancelled),

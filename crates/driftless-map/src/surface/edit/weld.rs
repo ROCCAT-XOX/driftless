@@ -169,6 +169,22 @@ impl WeldedSurface {
         [0, 1, 2].map(|k| (a[k] + b[k] + c[k]) / 3.0)
     }
 
+    /// Puts vertices at new places: `moved` as [`super::smooth_region`] or
+    /// [`super::SurfacePatch::moved`] has it, (vertex, position). Only the positions change:
+    /// the faces, their numbers and the copies stay, so the next step of a touch-up sees the
+    /// moved surface with the same ids. A [`super::FaceBvh`] built before no longer fits the
+    /// faces: build it anew.
+    ///
+    /// # Panics
+    /// If a vertex is not one of the surface.
+    pub fn apply_moves(&mut self, moved: &[(u32, [f64; 3])]) {
+        let n = self.positions.len();
+        for &(v, p) in moved {
+            assert!((v as usize) < n, "vertex {v} of {n}");
+            self.positions[v as usize] = p;
+        }
+    }
+
     /// FNV-1a over every byte (tests: the same surface, byte for byte).
     #[cfg(test)]
     pub(super) fn digest(&self) -> u64 {
@@ -315,6 +331,85 @@ mod tests {
         want.sort();
         got.sort();
         assert_eq!(got, want);
+    }
+
+    /// Moving vertices changes their positions and nothing else: the surface is the one
+    /// welded from the pages with every copy moved.
+    #[test]
+    fn apply_moves_changes_positions_only() {
+        let (positions, indices) = grid([12, 9], |i, j| {
+            [
+                i as f64 * 0.1,
+                j as f64 * 0.1,
+                ((i + 2 * j) % 5) as f64 * 0.01,
+            ]
+        });
+        let mesh = paged(&positions, &indices, 7, 3);
+        let s = WeldedSurface::from_mesh(&mesh);
+        // One vertex on a single page, one with copies on several, one written as −0.0.
+        let single = (0..s.positions().len() as u32)
+            .find(|&v| s.copies(v).len() == 1)
+            .unwrap();
+        let shared = (0..s.positions().len() as u32)
+            .find(|&v| {
+                let c = s.copies(v);
+                c.iter().any(|x| x.0 != c[0].0)
+            })
+            .unwrap();
+        let mut moved: Vec<(u32, [f64; 3])> = [single, shared]
+            .iter()
+            .map(|&v| (v, s.positions()[v as usize].map(|c| c + 0.025)))
+            .collect();
+        let last = s.positions().len() as u32 - 1;
+        assert!(single != last && shared != last);
+        moved.push((last, [-0.0, 7.0, 0.5]));
+
+        let mut t = s.clone();
+        t.apply_moves(&moved);
+        for (v, (&a, &b)) in s.positions().iter().zip(t.positions()).enumerate() {
+            match moved.iter().find(|m| m.0 as usize == v) {
+                Some(&(_, p)) => assert_eq!(b.map(f64::to_bits), p.map(f64::to_bits), "{v}"),
+                None => assert_eq!(b.map(f64::to_bits), a.map(f64::to_bits), "{v}"),
+            }
+        }
+        assert_eq!(t.faces(), s.faces());
+        for v in 0..s.positions().len() as u32 {
+            assert_eq!(t.copies(v), s.copies(v));
+        }
+        for f in 0..s.face_count() as u32 {
+            assert_eq!(t.face_origin(f), s.face_origin(f));
+        }
+
+        let mut edited = mesh.clone();
+        for &(v, p) in &moved {
+            for &(page, i) in s.copies(v) {
+                edited.pages[page as usize].positions[i as usize] = p;
+            }
+        }
+        assert_eq!(t, WeldedSurface::from_mesh(&edited));
+        assert_eq!(t.digest(), WeldedSurface::from_mesh(&edited).digest());
+
+        // Nothing to move: nothing changes.
+        let mut same = s.clone();
+        same.apply_moves(&[]);
+        assert_eq!(same.digest(), s.digest());
+    }
+
+    #[test]
+    #[should_panic(expected = "vertex 4 of 4")]
+    fn apply_moves_needs_a_vertex_of_the_surface() {
+        let mesh = Mesh {
+            pages: vec![page(
+                vec![
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [1.0, 1.0, 0.0],
+                ],
+                vec![[0, 1, 2], [1, 3, 2]],
+            )],
+        };
+        WeldedSurface::from_mesh(&mesh).apply_moves(&[(4, [0.0; 3])]);
     }
 
     #[test]
