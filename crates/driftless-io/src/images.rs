@@ -5,6 +5,7 @@ use crate::bag::{BagError, BagReader, ChunkCompression, MessagePlace, RawMessage
 use crate::msg::{compressed_image_stamp, decode_compressed_image, stamp_secs, MsgError};
 use crate::progress::Progress;
 use rayon::prelude::*;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -13,7 +14,10 @@ use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
 use zune_jpeg::JpegDecoder;
 
-/// Maximum number of images decoded concurrently (and therefore held in memory).
+/// Maximum number of images the streams ([`for_each_image`], [`for_each_image_where`]) decode
+/// concurrently (and therefore hold in memory, besides what their callers keep).
+/// [`read_indexed`] decodes as many at a time as rayon has threads: its callers ask for a few
+/// images by place and keep them all.
 const MAX_WORKERS: usize = 4;
 /// Largest accepted JPEG side length; guards against huge allocations from crafted headers.
 const MAX_DIMENSION: usize = 8192;
@@ -260,6 +264,10 @@ pub enum Wanted {
 /// wanted image that cannot be decoded reaches `f` as `Err` and counts as bad as well
 /// ([`ImageStats::frames`] counts the decoded ones). Bags end at a cut as there. `f` returns
 /// `false` to stop early.
+///
+/// The program lists and picks images through an index instead ([`index_images`],
+/// [`read_indexed`]: a bag is read once, then only where the images lie); this stream stays
+/// the reference the index is tested against (the same headers, numbering and images).
 pub fn for_each_image_where(
     bags: &[PathBuf],
     topics: &[String],
@@ -406,8 +414,10 @@ impl ImageIndex {
 /// Indexes the images of `topics` in `bags` (see [`ImageIndex`]): the messages of the stream as
 /// [`for_each_image_where`] shows them, with the same numbering, found without decoding an image
 /// and mostly without reading the chunks whole ([`BagReader::message_places`]). Bags end at a cut
-/// as there. Progress: one step per image message, in the phase the caller set; a cancel is
-/// checked at each and returns [`ImageError::Cancelled`].
+/// as there; one without an index (cut off) is first walked whole for its connections, as the
+/// stream does it ([`BagReader::open`]) – once, while the index is kept ([`ImageIndices`]).
+/// Progress: one step per image message, in the phase the caller set; a cancel is checked at
+/// each and returns [`ImageError::Cancelled`].
 ///
 /// Fails if a bag cannot be read (as [`for_each_image`] fails).
 pub fn index_images(
@@ -471,8 +481,11 @@ pub fn index_images(
 /// ([`ImageHeader::index`]; any order, each once) and passes them to `f` in stream order, with
 /// their place: the same frames, byte for byte, as [`for_each_image`] delivers there (an image
 /// that cannot be decoded comes as `Err` and counts as bad). Only these images are read: the
-/// message where it lies, or its chunk decompressed whole ([`BagReader::read_message`]). A few
-/// are decoded at a time on rayon threads. `f` returns `false` to stop.
+/// message where it lies, or its chunk decompressed whole ([`BagReader::read_message`]); a bag
+/// is opened for that alone ([`BagReader::for_places`]), so one without an index (cut off) is
+/// not walked whole for its connections on every call. As many images as rayon has threads are
+/// decoded at a time (not 4 as by the streams: the caller asked for them and keeps them). `f`
+/// returns `false` to stop.
 ///
 /// Fails with [`ImageError::Changed`] if a bag is no longer as it was indexed (its size,
 /// modification time or the header of an image read), or if a bag cannot be read.
@@ -483,6 +496,23 @@ pub fn read_indexed(
     index: &ImageIndex,
     frames: &[usize],
     downscale: u32,
+    f: impl FnMut(usize, Result<Frame, ImageError>) -> bool,
+) -> Result<ImageStats, ImageError> {
+    read_indexed_from(
+        index,
+        frames,
+        downscale,
+        |path| Ok(std::io::BufReader::new(std::fs::File::open(path)?)),
+        f,
+    )
+}
+
+/// [`read_indexed`], each bag read through what `open` makes of its path.
+fn read_indexed_from<R: Read + Seek>(
+    index: &ImageIndex,
+    frames: &[usize],
+    downscale: u32,
+    mut open: impl FnMut(&Path) -> std::io::Result<R>,
     mut f: impl FnMut(usize, Result<Frame, ImageError>) -> bool,
 ) -> Result<ImageStats, ImageError> {
     let mut wanted = frames.to_vec();
@@ -496,8 +526,7 @@ pub fn read_indexed(
     }
     let workers = rayon::current_num_threads().max(1);
     let mut stats = ImageStats::default();
-    let mut readers: Vec<Option<BagReader<std::io::BufReader<std::fs::File>>>> =
-        (0..index.bags.len()).map(|_| None).collect();
+    let mut readers: Vec<Option<BagReader<R>>> = (0..index.bags.len()).map(|_| None).collect();
     // The records of the last lz4 chunk read: (bag, chunk), records.
     let mut chunk: Option<((u32, u64), Vec<u8>)> = None;
     let mut batch: Vec<(usize, RawMessage)> = Vec::with_capacity(workers);
@@ -506,7 +535,11 @@ pub fn read_indexed(
         let bag = &index.bags[image.bag as usize];
         let reader = match &mut readers[image.bag as usize] {
             Some(r) => r,
-            slot => slot.insert(BagReader::open(&bag.path)?),
+            // The images are read at their places: the reader need not know the connections
+            // (a bag without an index, cut off, would be walked whole for them on every call).
+            slot => slot.insert(BagReader::for_places(
+                open(&bag.path).map_err(BagError::Io)?,
+            )?),
         };
         let place = &image.place;
         let data = match place.compression {
@@ -614,5 +647,120 @@ impl ImageIndices {
     pub fn holds(&self, bags: &[PathBuf], topics: &[String]) -> bool {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         kept.iter().any(|i| i.is_of(bags, topics) && i.is_current())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bag::writer::{BagWriter, Compression};
+    use crate::bag::Time;
+    use crate::msg::encode::encode_compressed_image;
+    use crate::msg::CompressedImage;
+    use crate::testdir::TestDir;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// Counts the bytes read through it.
+    struct Counting<R> {
+        inner: R,
+        read: Rc<Cell<u64>>,
+    }
+
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.set(self.read.get() + n as u64);
+            Ok(n)
+        }
+    }
+
+    impl<R: Seek> Seek for Counting<R> {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// A JPEG of noise (w × h, from `seed`): photos do not compress either.
+    fn noise_jpeg(w: u16, h: u16, seed: u32) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        let data: Vec<u8> = (0..w as usize * h as usize * 3)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 24) as u8
+            })
+            .collect();
+        let mut out = Vec::new();
+        jpeg_encoder::Encoder::new(&mut out, 90)
+            .encode(&data, w, h, jpeg_encoder::ColorType::Rgb)
+            .unwrap();
+        out
+    }
+
+    /// A bag of `n` images of camera `left`, one per lz4 chunk, cut off before its index (so it
+    /// has none: a recording that stopped abruptly); its path and the size of one chunk.
+    fn cut_bag(dir: &TestDir, n: u32) -> (PathBuf, u64) {
+        let mut w = BagWriter::new(Compression::Lz4).messages_per_chunk(1);
+        let left = w.add_connection("/camera_left/image_raw", "sensor_msgs/CompressedImage");
+        let mut chunk = 0;
+        for i in 0..n {
+            let msg = encode_compressed_image(&CompressedImage {
+                stamp: 2000.0 + 0.1 * f64::from(i),
+                format: "jpeg".into(),
+                data: noise_jpeg(256, 192, i),
+            });
+            chunk = chunk.max(msg.len() as u64);
+            w.write_message(left, Time { sec: i, nsec: 0 }, &msg);
+        }
+        let mut bytes = w.finish();
+        bytes.truncate(bytes.len() * 9 / 10);
+        let path = dir.join("abgeschnitten.bag");
+        std::fs::write(&path, bytes).unwrap();
+        (path, chunk)
+    }
+
+    /// An image of a bag without an index (cut off) is read where it lies: the bag is not
+    /// walked whole for its connections first, once per call (`BagReader::new` would).
+    #[test]
+    fn a_cut_bag_is_read_where_its_images_lie() {
+        let dir = TestDir::new(format!("driftless_images_cut_{}", std::process::id()));
+        let (bag, chunk) = cut_bag(&dir, 40);
+        let size = std::fs::metadata(&bag).unwrap().len();
+        let topics = vec!["/camera_left/image_raw".to_string()];
+        let index = index_images(std::slice::from_ref(&bag), &topics, &Progress::new()).unwrap();
+        assert_eq!(index.truncated(), 1);
+        assert!(index.len() >= 30, "{}", index.len());
+        let mut all = Vec::new();
+        for_each_image(std::slice::from_ref(&bag), &topics, 1, |r| {
+            all.push(r.unwrap());
+            true
+        })
+        .unwrap();
+        for frame in [0, 17, index.len() - 1] {
+            let read = Rc::new(Cell::new(0u64));
+            let mut got = Vec::new();
+            read_indexed_from(
+                &index,
+                &[frame],
+                1,
+                |path| {
+                    Ok(std::io::BufReader::new(Counting {
+                        inner: std::fs::File::open(path)?,
+                        read: Rc::clone(&read),
+                    }))
+                },
+                |i, r| {
+                    got.push((i, r.unwrap()));
+                    true
+                },
+            )
+            .unwrap();
+            assert_eq!(got, [(frame, all[frame].clone())]);
+            println!(
+                "image {frame}: {} of {size} bytes read (a chunk: {chunk})",
+                read.get()
+            );
+            assert!(read.get() <= chunk + 32 * 1024, "{} of {size}", read.get());
+        }
     }
 }

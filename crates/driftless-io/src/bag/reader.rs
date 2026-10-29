@@ -120,9 +120,12 @@ pub(super) fn decompress(
         "none" => Ok(data),
         "lz4" => {
             let mut out = Vec::with_capacity(size_hint.min(1 << 28));
+            // German for the program; the decoder's own text is English.
             lz4_flex::frame::FrameDecoder::new(data.as_slice())
                 .read_to_end(&mut out)
-                .map_err(|e| BagError::Malformed(format!("lz4 chunk: {e}")))?;
+                .map_err(|_| {
+                    BagError::Malformed("ein Chunk lässt sich nicht entpacken (lz4)".into())
+                })?;
             Ok(out)
         }
         other => Err(BagError::UnsupportedCompression(other.to_string())),
@@ -183,7 +186,24 @@ impl Chunk {
 }
 
 impl<R: Read + Seek> BagReader<R> {
-    pub fn new(mut r: R) -> Result<Self, BagError> {
+    pub fn new(r: R) -> Result<Self, BagError> {
+        let mut reader = BagReader::for_places(r)?;
+        let (index_pos, file_len) = (reader.index_pos, reader.file_len);
+        if index_pos > 0 && index_pos < file_len {
+            // Errors here (damaged index) fall through to the sequential scan below.
+            let _ = reader.read_index_connections(index_pos);
+        }
+        if reader.conns.is_empty() {
+            reader.scan_connections();
+        }
+        Ok(reader)
+    }
+
+    /// A reader for messages at their places ([`Self::read_message`], [`Self::read_chunk`]):
+    /// the bag header is read, the connections are not – not from the index, and for a bag
+    /// without one (cut off) the chunks are not walked whole for them, as [`Self::new`] does.
+    /// [`Self::connections`] is empty.
+    pub fn for_places(mut r: R) -> Result<Self, BagError> {
         let file_len = r.seek(SeekFrom::End(0))?;
         r.seek(SeekFrom::Start(0))?;
         let mut magic = [0u8; MAGIC.len()];
@@ -202,22 +222,14 @@ impl<R: Read + Seek> BagReader<R> {
         }
         let index_pos = head.fields.u64("index_pos").unwrap_or(0);
         let data_start = head.data_pos + head.data_len;
-        let mut reader = BagReader {
+        Ok(BagReader {
             r,
             conns: Vec::new(),
             by_id: HashMap::new(),
             data_start,
             file_len,
             index_pos,
-        };
-        if index_pos > 0 && index_pos < file_len {
-            // Errors here (damaged index) fall through to the sequential scan below.
-            let _ = reader.read_index_connections(index_pos);
-        }
-        if reader.conns.is_empty() {
-            reader.scan_connections();
-        }
-        Ok(reader)
+        })
     }
 
     pub fn connections(&self) -> &[Connection] {

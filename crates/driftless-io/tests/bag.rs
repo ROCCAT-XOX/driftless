@@ -126,6 +126,29 @@ fn unindexed_bag_reads_sequentially() {
     }
 }
 
+/// An lz4 chunk that cannot be decompressed says so in German, without the decoder's English
+/// text: it reaches the program („Bilder neu einspielen“).
+#[test]
+fn damaged_lz4_chunk_says_so() {
+    let (mut bytes, _) = build(Compression::Lz4, true, 1);
+    // The frame version of the first chunk's lz4 frame (FLG after the magic) set to 0.
+    let magic = 0x184D_2204u32.to_le_bytes();
+    let at = bytes
+        .windows(4)
+        .position(|w| w == magic)
+        .expect("an lz4 frame");
+    bytes[at + 4] &= 0b0011_1111;
+    let got = read_all(bytes, &[]);
+    let Some(Err(e)) = got.last() else {
+        panic!("{got:?}")
+    };
+    assert!(matches!(e, BagError::Malformed(_)), "{e:?}");
+    assert_eq!(
+        e.to_string(),
+        "Bag-Datei ist beschädigt: ein Chunk lässt sich nicht entpacken (lz4)"
+    );
+}
+
 #[test]
 fn rejects_non_bag() {
     let err = BagReader::new(Cursor::new(b"this is definitely not a bag file".to_vec()))

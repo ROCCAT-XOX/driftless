@@ -731,6 +731,121 @@ fn walk_read(path: &std::path::Path) -> (u64, usize) {
     (read.get() - before, n)
 }
 
+/// A reader for places ([`BagReader::for_places`]) reads the header of a bag and nothing more,
+/// also of one without an index (cut off), which [`BagReader::new`] walks whole for its
+/// connections; it reads the messages at their places as one that knows the connections.
+#[test]
+fn places_reader_reads_only_the_header() {
+    use driftless_io::bag::BagReader;
+    let dir = TestDir::new(format!(
+        "driftless_images_places_reader_{}",
+        std::process::id()
+    ));
+    let full = image_bag(
+        &dir,
+        "ganz.bag",
+        Compression::Lz4,
+        1,
+        true,
+        8,
+        (160, 120),
+        true,
+    );
+    let mut bytes = std::fs::read(&full).unwrap();
+    bytes.truncate(bytes.len() * 7 / 10);
+    let cut = dir.join("abgeschnitten.bag");
+    std::fs::write(&cut, &bytes).unwrap();
+    for (what, bag) in [("indexed", &full), ("cut off", &cut)] {
+        let bytes = std::fs::read(bag).unwrap();
+        let counted = |read: &std::rc::Rc<std::cell::Cell<u64>>| Counting {
+            inner: std::io::Cursor::new(bytes.clone()),
+            read: std::rc::Rc::clone(read),
+        };
+        let (lean, whole) = (std::rc::Rc::default(), std::rc::Rc::default());
+        let mut places = BagReader::for_places(counted(&lean)).unwrap();
+        let mut known = BagReader::new(counted(&whole)).unwrap();
+        println!(
+            "{what}: {} of {} bytes read for places, {} to know the connections",
+            lean.get(),
+            bytes.len(),
+            whole.get()
+        );
+        assert!(lean.get() <= 8192, "{what}: {}", lean.get());
+        assert!(places.connections().is_empty());
+        assert!(!known.connections().is_empty());
+        if what == "cut off" {
+            // walked up to the cut for its connections
+            assert!(whole.get() * 2 > bytes.len() as u64, "{}", whole.get());
+        }
+        // The same data at the places of the messages.
+        let found: Vec<_> = known
+            .message_places(&[], 12)
+            .take_while(Result::is_ok)
+            .map(Result::unwrap)
+            .collect();
+        assert!(found.len() >= 8, "{what}: {}", found.len());
+        for m in &found {
+            assert_eq!(
+                places.read_message(&m.place).unwrap(),
+                known.read_message(&m.place).unwrap(),
+                "{what}"
+            );
+        }
+    }
+}
+
+/// Time of five reads of one image ([`read_indexed`]) of a bag of 400 images of about 575 KB,
+/// one per lz4 chunk (230 MB, from the page cache), with its index and cut off (the last 1 %,
+/// the index with it).
+/// `cargo test -p driftless-io --release --test images timing_read_cut_bag -- --ignored --nocapture`
+#[test]
+#[ignore = "Messung"]
+fn timing_read_cut_bag() {
+    let dir = TestDir::new(format!(
+        "driftless_images_timing_cut_{}",
+        std::process::id()
+    ));
+    let full = image_bag(
+        &dir,
+        "ganz.bag",
+        Compression::Lz4,
+        1,
+        true,
+        400,
+        (560, 420),
+        true,
+    );
+    let mut bytes = std::fs::read(&full).unwrap();
+    bytes.truncate(bytes.len() * 99 / 100);
+    let cut = dir.join("abgeschnitten.bag");
+    std::fs::write(&cut, &bytes).unwrap();
+    let topics = vec![
+        "/camera_left/image_raw".to_string(),
+        "/camera_right/image_raw".to_string(),
+    ];
+    for (what, bag) in [("with index", &full), ("cut off", &cut)] {
+        let bags = std::slice::from_ref(bag);
+        let t = std::time::Instant::now();
+        let index = index_images(bags, &topics, &Progress::new()).unwrap();
+        let indexed = t.elapsed();
+        let t = std::time::Instant::now();
+        for frame in [10, 100, 200, 300, 390] {
+            read_indexed(&index, &[frame], 1, |_, r| {
+                r.unwrap();
+                true
+            })
+            .unwrap();
+        }
+        println!(
+            "{what}: {} MB, {} images; indexed in {indexed:.1?}, 5 × read_indexed of 1 image \
+             {:.1?}",
+            std::fs::metadata(bag).unwrap().len() / 1_000_000,
+            index.len(),
+            t.elapsed()
+        );
+    }
+}
+
 /// Of lz4 chunks of stored blocks (photos do not compress) the walk reads the headers of the
 /// records and blocks only; a frame of linked blocks it decompresses whole.
 #[test]
