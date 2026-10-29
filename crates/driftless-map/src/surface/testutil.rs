@@ -637,6 +637,12 @@ impl Lcg {
     pub fn range(&mut self, lo: f64, hi: f64) -> f64 {
         lo + (hi - lo) * self.unit()
     }
+
+    /// Nearly standard normal: the sum of 12 uniforms minus 6 (Irwin–Hall), so no function
+    /// that may round differently on another machine.
+    pub fn normal(&mut self) -> f64 {
+        (0..12).map(|_| self.unit()).sum::<f64>() - 6.0
+    }
 }
 
 /// Positions and triangles of a mesh with shared vertices.
