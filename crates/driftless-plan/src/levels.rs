@@ -25,8 +25,14 @@ const COLUMN_AREA: f64 = COLUMN * COLUMN;
 const RUN_GAP: u32 = 10;
 /// A run spanning more height steps than this is vertical, not a surface.
 const RUN_FLAT: u32 = 20;
-/// A height step belongs to a surface from this many columns (0.25 m²).
+/// A height step belongs to a surface from this many columns (0.25 m²) ...
 const SURFACE_COLUMNS: u32 = 25;
+/// ... and this share of the fullest step of the surface: a surface ends at a valley.
+const SURFACE_PEAK_SHARE: f64 = 0.05;
+/// A run counts if this many of the 8 neighbouring columns have a flat run this near in height
+/// (steps): a real surface is a patch, a stray point stands alone.
+const SUPPORT_COLUMNS: u32 = 2;
+const SUPPORT_REACH: u32 = 3;
 const MIN_POINTS: usize = 1000;
 
 /// Floor window below the median of a group of poses (metres).
@@ -44,6 +50,11 @@ const CEILING_EXTRA_SPREAD: f64 = 0.30;
 const MIN_STOREY_DISTANCE: f64 = 1.0;
 /// A step in the floor, in metres.
 const STEP_RANGE: (f64, f64) = (0.05, 0.50);
+/// Surfaces are compared by their area within this many height steps: real surfaces hold most
+/// of their columns there, a band of clutter all over the height only little of them.
+const CORE_STEPS: usize = 10;
+/// A surface spreading over more height than this is no step (metres).
+const STEP_MAX_SPREAD: f64 = 0.30;
 /// A surface below the lowest floor is worth a hint from this depth and share of its area.
 const BELOW_DEPTH: f64 = 1.0;
 const BELOW_SHARE: f64 = 0.25;
@@ -159,6 +170,8 @@ struct Surface {
     z: f64,
     /// Columns it covers, each counted once (m²).
     area: f64,
+    /// Columns within its fullest [`CORE_STEPS`] height steps, each counted once (m²).
+    core: f64,
 }
 
 /// A height at which many poses are.
@@ -296,17 +309,33 @@ fn flat_surfaces(xyz: &[[f64; 3]], progress: &Progress) -> Result<Vec<Surface>, 
     let step_of = |key: u64| (key & STEP_MAX) as u32;
     let steps = keys.iter().map(|&k| step_of(k)).max().unwrap_or(0) as usize + 1;
 
-    // Calls `f(column, step)` for every occupied step of a short run.
+    // The flat runs of every column, ascending; only those with neighbours count.
+    let mut runs: Vec<FlatRun> = Vec::new();
+    let mut key_at = 0;
+    for column in keys.chunk_by(|a, b| column_of(*a) == column_of(*b)) {
+        let id = column_of(column[0]);
+        for run in column.chunk_by(|a, b| step_of(*b) - step_of(*a) <= RUN_GAP) {
+            let (first, last) = (step_of(run[0]), step_of(run[run.len() - 1]));
+            if last - first <= RUN_FLAT {
+                runs.push(FlatRun {
+                    column: id,
+                    first,
+                    last,
+                    keys: (key_at as u32, (key_at + run.len()) as u32),
+                });
+            }
+            key_at += run.len();
+        }
+    }
+    check(progress)?;
+    let supported: Vec<bool> = runs.par_iter().map(|run| has_support(run, &runs)).collect();
+    check(progress)?;
+
+    // Calls `f(column, step)` for every occupied step of a counting run.
     let for_flat_steps = |f: &mut dyn FnMut(u64, u32)| {
-        for column in keys.chunk_by(|a, b| column_of(*a) == column_of(*b)) {
-            let id = column_of(column[0]);
-            for run in column.chunk_by(|a, b| step_of(*b) - step_of(*a) <= RUN_GAP) {
-                let height = step_of(run[run.len() - 1]) - step_of(run[0]);
-                if height <= RUN_FLAT {
-                    for &key in run {
-                        f(id, step_of(key));
-                    }
-                }
+        for (run, _) in runs.iter().zip(&supported).filter(|(_, ok)| **ok) {
+            for &key in &keys[run.keys.0 as usize..run.keys.1 as usize] {
+                f(run.column, step_of(key));
             }
         }
     };
@@ -314,9 +343,7 @@ fn flat_surfaces(xyz: &[[f64; 3]], progress: &Progress) -> Result<Vec<Surface>, 
     let mut profile = vec![0u32; steps];
     for_flat_steps(&mut |_, step| profile[step as usize] += 1);
 
-    // Neighbouring steps with enough area form one surface.
-    const NO_SURFACE: u32 = u32::MAX;
-    let mut surface_of = vec![NO_SURFACE; steps];
+    // Neighbouring steps with area form one surface; valleys separate surfaces.
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut step = 0;
     while step < steps {
@@ -326,28 +353,51 @@ fn flat_surfaces(xyz: &[[f64; 3]], progress: &Progress) -> Result<Vec<Surface>, 
         }
         let first = step;
         while step < steps && profile[step] >= SURFACE_COLUMNS {
-            surface_of[step] = spans.len() as u32;
             step += 1;
         }
-        spans.push((first, step - 1));
+        split_at_valleys(&profile, first, step - 1, &mut spans);
     }
+    spans.sort_unstable();
+
+    const NO_SURFACE: u32 = u32::MAX;
+    let mut surface_of = vec![NO_SURFACE; steps];
+    for (index, &(first, last)) in spans.iter().enumerate() {
+        surface_of[first..=last].fill(index as u32);
+    }
+
+    // The fullest `CORE_STEPS` steps of every surface, first and last step.
+    let core_of: Vec<(usize, usize)> = spans
+        .iter()
+        .map(|&(first, last)| fullest_steps(&profile, first, last))
+        .collect();
 
     // One column can have several steps of a surface: count it once.
     let mut last_column = vec![u64::MAX; spans.len()];
+    let mut last_core = vec![u64::MAX; spans.len()];
     let mut columns = vec![0u64; spans.len()];
+    let mut core_columns = vec![0u64; spans.len()];
     for_flat_steps(&mut |id, step| {
         let surface = surface_of[step as usize];
-        if surface != NO_SURFACE && last_column[surface as usize] != id {
-            last_column[surface as usize] = id;
-            columns[surface as usize] += 1;
+        if surface == NO_SURFACE {
+            return;
+        }
+        let surface = surface as usize;
+        if last_column[surface] != id {
+            last_column[surface] = id;
+            columns[surface] += 1;
+        }
+        let (from, to) = core_of[surface];
+        if (from..=to).contains(&(step as usize)) && last_core[surface] != id {
+            last_core[surface] = id;
+            core_columns[surface] += 1;
         }
     });
 
     let step_z = |step: usize| min[2] + step as f64 * Z_STEP;
     Ok(spans
         .iter()
-        .zip(&columns)
-        .map(|(&(first, last), &count)| {
+        .zip(columns.iter().zip(&core_columns))
+        .map(|(&(first, last), (&count, &core))| {
             let bins = &profile[first..=last];
             let weight: f64 = bins.iter().map(|&c| c as f64).sum();
             let moment: f64 = bins
@@ -360,9 +410,96 @@ fn flat_surfaces(xyz: &[[f64; 3]], progress: &Progress) -> Result<Vec<Surface>, 
                 high: step_z(last + 1),
                 z: min[2] + (moment / weight + 0.5) * Z_STEP,
                 area: count as f64 * COLUMN_AREA,
+                core: core as f64 * COLUMN_AREA,
             }
         })
         .collect())
+}
+
+/// A short run of height steps with points in one column.
+#[derive(Debug, Clone)]
+struct FlatRun {
+    column: u64,
+    first: u32,
+    last: u32,
+    /// Its entries in the sorted keys: start, end.
+    keys: (u32, u32),
+}
+
+/// Whether enough neighbouring columns have a flat run near this one in height. `runs` is
+/// sorted by column.
+fn has_support(run: &FlatRun, runs: &[FlatRun]) -> bool {
+    const COORD: u64 = (1 << 21) - 1;
+    let (x, y) = ((run.column >> 21) as i64, (run.column & COORD) as i64);
+    let near = |other: &FlatRun| {
+        other.first <= run.last + SUPPORT_REACH && run.first <= other.last + SUPPORT_REACH
+    };
+    let mut support = 0;
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            let (nx, ny) = (x + dx, y + dy);
+            if (dx == 0 && dy == 0) || nx < 0 || ny < 0 || nx as u64 > COORD || ny as u64 > COORD {
+                continue;
+            }
+            let id = ((nx as u64) << 21) | ny as u64;
+            let at = runs.partition_point(|r| r.column < id);
+            if runs[at..].iter().take_while(|r| r.column == id).any(near) {
+                support += 1;
+                if support >= SUPPORT_COLUMNS {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The first and last step of the `CORE_STEPS` fullest neighbouring steps of a surface.
+fn fullest_steps(profile: &[u32], first: usize, last: usize) -> (usize, usize) {
+    let bins = &profile[first..=last];
+    let width = CORE_STEPS.min(bins.len());
+    let mut best = (0u64, 0usize);
+    let mut sum: u64 = bins[..width].iter().map(|&c| c as u64).sum();
+    best.0 = sum;
+    for start in 1..=bins.len() - width {
+        sum += bins[start + width - 1] as u64;
+        sum -= bins[start - 1] as u64;
+        if sum > best.0 {
+            best = (sum, start);
+        }
+    }
+    (first + best.1, first + best.1 + width - 1)
+}
+
+/// Splits the stretch `first..=last` of steps with area into surfaces: a surface is the fullest
+/// step and what goes on from it while it stays above [`SURFACE_PEAK_SHARE`] of that step (and
+/// [`SURFACE_COLUMNS`]). What is left on both sides is split in the same way. So a thin band of
+/// stray points between floor and ceiling does not join them into one surface.
+fn split_at_valleys(profile: &[u32], first: usize, last: usize, spans: &mut Vec<(usize, usize)>) {
+    let mut todo = vec![(first, last)];
+    while let Some((low, high)) = todo.pop() {
+        let mut peak = low;
+        for step in low..=high {
+            if profile[step] > profile[peak] {
+                peak = step;
+            }
+        }
+        let keep = ((profile[peak] as f64 * SURFACE_PEAK_SHARE).ceil() as u32).max(SURFACE_COLUMNS);
+        let (mut from, mut to) = (peak, peak);
+        while from > low && profile[from - 1] >= keep {
+            from -= 1;
+        }
+        while to < high && profile[to + 1] >= keep {
+            to += 1;
+        }
+        spans.push((from, to));
+        if from > low {
+            todo.push((low, from - 1));
+        }
+        if to < high {
+            todo.push((to + 1, high));
+        }
+    }
 }
 
 /// The median height of the points in the surface: more exact than its height steps.
@@ -423,12 +560,12 @@ fn walk_groups(poses: &[[f64; 3]]) -> Vec<WalkGroup> {
 fn lowest_big(surfaces: &[Surface], candidates: &[usize]) -> Option<usize> {
     let largest = candidates
         .iter()
-        .map(|&i| surfaces[i].area)
+        .map(|&i| surfaces[i].core)
         .fold(0.0, f64::max);
     candidates
         .iter()
         .copied()
-        .find(|&i| surfaces[i].area >= MIN_AREA && surfaces[i].area >= BIG_SHARE * largest)
+        .find(|&i| surfaces[i].area >= MIN_AREA && surfaces[i].core >= BIG_SHARE * largest)
 }
 
 fn find_floor(surfaces: &[Surface], group: &WalkGroup, ceilings: &[usize]) -> Option<usize> {
@@ -498,7 +635,8 @@ fn step_hints(
         let height = (surface.z - z).abs();
         if floors.contains(&i)
             || ceilings.contains(&i)
-            || surface.area < MIN_AREA
+            || surface.core < MIN_AREA
+            || surface.high - surface.low > STEP_MAX_SPREAD
             || !(STEP_RANGE.0..=STEP_RANGE.1).contains(&height)
         {
             continue;
@@ -835,6 +973,165 @@ mod tests {
         }
         assert_eq!(Leveling::NONE.apply(p), p);
         assert_eq!(Leveling::NONE.undo(p), p);
+    }
+
+    /// Scatters `n` points evenly in the box from `min` to `max`, from a fixed generator.
+    fn scatter(data: &mut TestData, n: usize, min: [f64; 3], max: [f64; 3]) {
+        let mut seed: u64 = 0xACE1_0000_0000_0001;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 40) as f64 / (1u64 << 24) as f64
+        };
+        for _ in 0..n {
+            data.xyz.push([
+                min[0] + (max[0] - min[0]) * next(),
+                min[1] + (max[1] - min[1]) * next(),
+                min[2] + (max[2] - min[2]) * next(),
+            ]);
+        }
+    }
+
+    /// Floor and ceiling of the plain room, whatever was scattered.
+    fn assert_floor_and_ceiling(data: &TestData) {
+        let found = search(data);
+        assert_eq!(found.storeys.len(), 1, "{found:?}");
+        let storey = found.storeys[0];
+        assert!((storey.floor_z - FLOOR).abs() < 0.02, "{found:?}");
+        let ceiling = storey.ceiling_z.expect("Decke");
+        assert!((ceiling - CEILING).abs() < 0.02, "{found:?}");
+    }
+
+    #[test]
+    fn scattered_points_at_room_height_do_not_join_floor_and_ceiling() {
+        let base = scene().spacing(0.03).build();
+        assert_floor_and_ceiling(&base);
+        let high = FLOOR + 2.6;
+        // About a room, far outside and inside the room itself.
+        for (min, max) in [
+            ([-80.0, -80.0, FLOOR], [88.0, 88.0, high]),
+            ([20.0, 20.0, FLOOR], [60.0, 60.0, high]),
+            ([0.0, 0.0, FLOOR], [8.3, 7.9, high]),
+        ] {
+            let mut data = base.clone();
+            scatter(&mut data, 12_000, min, max);
+            assert_floor_and_ceiling(&data);
+        }
+    }
+
+    #[test]
+    fn scattered_points_over_part_of_the_height_leave_the_ceiling() {
+        let base = scene().spacing(0.03).build();
+        let high = FLOOR + 2.6;
+        for (from, to) in [(FLOOR + 1.8, high), (FLOOR, FLOOR + 1.0)] {
+            for (min, max) in [
+                ([20.0, 20.0, from], [80.0, 80.0, to]),
+                ([0.0, 0.0, from], [8.3, 7.9, to]),
+            ] {
+                let mut data = base.clone();
+                scatter(&mut data, 6_000, min, max);
+                assert_floor_and_ceiling(&data);
+            }
+        }
+    }
+
+    #[test]
+    fn a_low_ceiling_and_a_step_survive_scattered_points() {
+        // A low ceiling over 40 % of the room and a step of 20 cm in the floor.
+        let base = scene()
+            .spacing(0.03)
+            .slab([0.5, 0.5], [6.5, 5.5], FLOOR + 2.2)
+            .slab([2.0, 2.0], [4.0, 4.0], FLOOR + 0.2)
+            .build();
+        let mut data = base.clone();
+        scatter(
+            &mut data,
+            12_000,
+            [0.0, 0.0, FLOOR],
+            [8.3, 7.9, FLOOR + 2.6],
+        );
+        let found = search(&data);
+        assert_eq!(found.storeys.len(), 1, "{found:?}");
+        let storey = found.storeys[0];
+        assert!((storey.floor_z - FLOOR).abs() < 0.02, "{found:?}");
+        assert!(
+            (storey.ceiling_z.expect("Decke") - (FLOOR + 2.2)).abs() < 0.02,
+            "{found:?}"
+        );
+        assert!(
+            found.hints.iter().any(|h| h.contains("Absatz")),
+            "{:?}",
+            found.hints
+        );
+    }
+
+    /// Boxes of 30 × 30 × 15 cm at random places around a storey, their lower side at a random
+    /// height of `low` above the floor.
+    fn add_clutter(
+        mut scene: Scene,
+        count: usize,
+        min: [f64; 2],
+        max: [f64; 2],
+        low: f64,
+    ) -> Scene {
+        let mut seed: u64 = 0xBEEF_0000_0000_0001;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 40) as f64 / (1u64 << 24) as f64
+        };
+        for _ in 0..count {
+            let (x, y) = (
+                min[0] + (max[0] - min[0]) * next(),
+                min[1] + (max[1] - min[1]) * next(),
+            );
+            let z = FLOOR + 0.1 + low * next();
+            scene = scene.block([x, y, z], [x + 0.3, y + 0.3, z + 0.15]);
+        }
+        scene
+    }
+
+    #[test]
+    fn clutter_low_above_the_floor_does_not_beat_a_small_floor() {
+        // Over 60 cm of height, so the band of clutter lies in the search window of the floor
+        // and has more columns than the floor of the small room.
+        let way = [
+            [1.0, 1.0, 0.0],
+            [2.5, 1.0, 0.0],
+            [2.5, 3.0, 0.0],
+            [1.0, 3.0, 0.0],
+        ];
+        let small = Scene::new()
+            .spacing(0.02)
+            .room([0.0, 0.0], [3.5, 4.0], FLOOR, 2.6)
+            .walk(&way);
+        let data = add_clutter(small, 300, [-8.0, -8.0], [12.0, 12.0], 0.6).build();
+        let found = search(&data);
+        assert_eq!(found.storeys.len(), 1, "{found:?}");
+        let storey = found.storeys[0];
+        assert!((storey.floor_z - FLOOR).abs() < 0.02, "{found:?}");
+        assert!(
+            (storey.ceiling_z.expect("Decke") - CEILING).abs() < 0.02,
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn stray_points_alone_are_no_surface() {
+        // The whole volume filled with strays only: no floor comes out of them.
+        let mut data = Scene::new().walk(&LOOP_Z0).build();
+        scatter(
+            &mut data,
+            30_000,
+            [-5.0, -5.0, FLOOR],
+            [13.0, 13.0, FLOOR + 2.6],
+        );
+        assert_eq!(
+            find_storeys(&data.input(), &Progress::new()),
+            Err(PlanError::NoFloor)
+        );
     }
 
     #[test]
