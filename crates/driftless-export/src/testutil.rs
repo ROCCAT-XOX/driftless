@@ -1,7 +1,11 @@
 //! Synthetic clouds for tests: deterministic for a seed, no scan data.
 
-use crate::{Layout, Points, ScanInfo};
-use nalgebra::{Isometry3, Translation3, UnitQuaternion};
+use crate::{write_points, Layout, PointFormat, Points, ScanInfo};
+use driftless_io::progress::Progress;
+use driftless_traj::{write_tum, Pose};
+use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
+use std::fs;
+use std::path::Path;
 
 /// splitmix64: a small, fixed pseudo-random sequence.
 struct Rng(u64);
@@ -82,4 +86,45 @@ pub fn synthetic_points(n: usize, seed: u64, layout: Layout) -> Points {
         flags,
         scans,
     }
+}
+
+/// A map folder as the floor plan reads it, for the tests of the step, the command line and
+/// the app: `color.las` of the points `xyz` (all one colour), a `map.json` that holds only
+/// `steps.clean.input_id` and a `traj.tum` with a level pose per entry of `poses`, 0.1 s apart.
+///
+/// # Panics
+/// If a file cannot be written.
+pub fn write_map_folder(dir: &Path, xyz: &[[f64; 3]], poses: &[[f64; 3]]) {
+    fs::create_dir_all(dir).expect("test folder");
+    let points = Points {
+        xyz: xyz.to_vec(),
+        rgb: Some(vec![[40_000, 30_000, 20_000]; xyz.len()]),
+        intensity: None,
+        source: None,
+        time: None,
+        flags: None,
+        scans: Vec::new(),
+    };
+    write_points(
+        &dir.join("color.las"),
+        PointFormat::Las,
+        &points,
+        &Progress::new(),
+    )
+    .expect("color.las");
+    fs::write(
+        dir.join("map.json"),
+        "{\"steps\":{\"clean\":{\"input_id\":\"00000000000000aa\"}}}\n",
+    )
+    .expect("map.json");
+    let poses: Vec<Pose> = poses
+        .iter()
+        .enumerate()
+        .map(|(i, p)| Pose {
+            t: i as f64 * 0.1,
+            p: Vector3::from(*p),
+            q: UnitQuaternion::identity(),
+        })
+        .collect();
+    write_tum(&dir.join("traj.tum"), &poses).expect("traj.tum");
 }
