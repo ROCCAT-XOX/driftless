@@ -536,8 +536,13 @@ pub(crate) fn region_views(
                     .map(|v| near[v.0 as usize])
                     .filter(|f| region.binary_search(f).is_ok())
                     .collect();
+                // A ring face something hides shows that something: not its old texture, so
+                // it does not count for the brightness ([`ring_gain`]).
                 let (stelle, ring): Scored2 = views
                     .into_iter()
+                    .filter(|(f, _, hidden)| {
+                        !hidden || region.binary_search(&near[*f as usize]).is_ok()
+                    })
                     .map(|(f, v, _)| (near[f as usize], v.rank_score()))
                     .partition(|(f, _)| region.binary_search(f).is_ok());
                 progress.advance(1);
@@ -2400,12 +2405,13 @@ fn rank(
 /// its image at 1/[`SHARPNESS_DOWNSCALE`] ([`quarter_colours`]) against the median of its
 /// colours of the faces of the Stelle within [`CONSISTENCY_RADIUS`] ([`faces_around`]: at most
 /// [`CONSISTENCY_FACES`] of them): per channel
-/// `ln((colour + MIN_SEAM_LUMINANCE) / (median + MIN_SEAM_LUMINANCE))`. The views of a face vote
-/// as in the surface step, one per camera and stretch of capture time, and a view further than
-/// `ln` [`CONSISTENCY_RATIO`] from the median of the votes in a channel, where the votes within
-/// it are a strict majority ([`consistent`]), is left out, unless it lies within that of the
-/// median of the votes ([`vote_median`]) at a face within [`CONSISTENCY_SHIFT`]. Deterministic:
-/// per image and face an ordered map, medians of values.
+/// `ln((colour + MIN_SEAM_LUMINANCE) / (median + MIN_SEAM_LUMINANCE))`; a view showing none of
+/// those faces has no say at that face (it does not vote and is not left out). The views of a
+/// face vote as in the surface step, one per camera and stretch of capture time, and a view
+/// further than `ln` [`CONSISTENCY_RATIO`] from the median of the votes in a channel, where the
+/// votes within it are a strict majority ([`consistent`]), is left out, unless it lies within
+/// that of the median of the votes ([`vote_median`]) at a face within [`CONSISTENCY_SHIFT`].
+/// Deterministic: per image and face an ordered map, medians of values.
 fn judge_views(
     s: &WeldedSurface,
     bvh: &FaceBvh,
@@ -2434,6 +2440,10 @@ fn judge_views(
             (0..n)
                 .map(|i| {
                     let own = colours[i]?;
+                    // A view showing none of the faces around it has nothing to compare with.
+                    if around[i].iter().all(|&j| colours[j as usize].is_none()) {
+                        return None;
+                    }
                     Some(std::array::from_fn(|k| {
                         near.clear();
                         near.extend(
@@ -5270,6 +5280,127 @@ mod tests {
             let judged = judge_views(&s, &bvh, &spot, &images, &gains, sources, &linear_table());
             assert!(judged.around == around, "{step} m");
         }
+    }
+
+    /// A view that sees a face but none of the faces it is compared with (on a fine grid the
+    /// face itself is often not among them, [`faces_around`]) has nothing to compare with: it
+    /// has no say there, and is not left out for it (K1 of the final review).
+    #[test]
+    fn view_with_nothing_around_has_no_say() {
+        let (_, _, src) = textured_walk();
+        let sources = std::slice::from_ref(src);
+        let indices = index_of(sources);
+        let (s, spot) = wall_grid(0.02);
+        let bvh = FaceBvh::build(&s);
+        let (views, _) = region_views(
+            &s,
+            &bvh,
+            &spot,
+            &[],
+            &Occluders::default(),
+            sources,
+            &indices,
+            &walk_config(),
+            Sight::BEST,
+            &Progress::new(),
+        )
+        .unwrap();
+        let mut images: Vec<Decoded> = decode_views(&views, sources, &indices, 4, &Progress::new())
+            .unwrap()
+            .into_iter()
+            .map(|(i, rgb)| Decoded {
+                view: views[i].clone(),
+                rgb,
+            })
+            .collect();
+        let gains = vec![[1.0f32; 3]; images.len()];
+        let lin = linear_table();
+        let plain = judge_views(&s, &bvh, &spot, &images, &gains, sources, &lin);
+        let sees = |images: &[Decoded], i: usize| {
+            images[0]
+                .view
+                .faces
+                .binary_search_by_key(&spot[i], |v| v.0)
+                .ok()
+        };
+        let i = (0..spot.len())
+            .find(|&i| {
+                !plain.around[i].contains(&(i as u32))
+                    && sees(&images, i).is_some()
+                    && plain.out[i].is_empty()
+            })
+            .expect("a face not compared with itself");
+        // the view cut down to that one face
+        let kept = images[0].view.faces[sees(&images, i).unwrap()];
+        images[0].view.faces = vec![kept];
+        let judged = judge_views(&s, &bvh, &spot, &images, &gains, sources, &lin);
+        assert!(judged.colours[0][i].is_some(), "it shows the face");
+        assert!(
+            judged.around[i]
+                .iter()
+                .all(|&j| judged.colours[0][j as usize].is_none()),
+            "and none around it"
+        );
+        assert!(
+            !judged.out[i].contains(&0),
+            "no say, not left out: {:?}",
+            judged.out[i]
+        );
+    }
+
+    /// A face of the ring that something without a face hides in an image shows that something,
+    /// not the wall: it does not count for the brightness of that image ([`ring_gain`]) (K2 of
+    /// the review of „weniger Rauschen“).
+    #[test]
+    fn hidden_ring_faces_do_not_count() {
+        let (_, _, src) = textured_walk();
+        let sources = std::slice::from_ref(src);
+        let indices = index_of(sources);
+        let (s, spot) = wall_grid(0.04);
+        let bvh = FaceBvh::build(&s);
+        let ring: Vec<u32> = (0..s.face_count() as u32)
+            .filter(|f| spot.binary_search(f).is_err())
+            .filter(|&f| norm(sub(s.face_centroid(f), [1.0, 5.0, 0.3])) < 1.3)
+            .collect();
+        assert!(ring.len() > 100, "{}", ring.len());
+        // A sheet of points 10 cm in front of the wall, above the Stelle: it hides the ring there.
+        let sheet = Occluders {
+            points: (0..120)
+                .flat_map(|i| (0..25).map(move |j| (i, j)))
+                .map(|(i, j)| [-0.2 + 0.02 * i as f32, 4.9, 1.0 + 0.02 * j as f32])
+                .collect(),
+            spacing: 0.02,
+        };
+        let views_with = |occluders: &Occluders| {
+            region_views(
+                &s,
+                &bvh,
+                &spot,
+                &ring,
+                occluders,
+                sources,
+                &indices,
+                &walk_config(),
+                Sight::BEST,
+                &Progress::new(),
+            )
+            .unwrap()
+            .0
+        };
+        let plain = views_with(&Occluders::default());
+        let hidden = views_with(&sheet);
+        let mut fewer = 0;
+        for h in &hidden {
+            let Some(p) = plain
+                .iter()
+                .find(|p| (p.source, p.frame) == (h.source, h.frame))
+            else {
+                continue;
+            };
+            assert!(h.ring.iter().all(|f| p.ring.contains(f)));
+            fewer += usize::from(h.ring.len() < p.ring.len());
+        }
+        assert!(fewer > 0, "the sheet hides part of the ring in some image");
     }
 
     /// The photo consistency of a Stelle of 1 m² on uniform grids of 4, 2 and 1 cm ([`wall_grid`])

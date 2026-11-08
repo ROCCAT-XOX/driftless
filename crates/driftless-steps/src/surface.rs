@@ -49,8 +49,8 @@ use driftless_io::project::{discover_project, ProjectError};
 use driftless_io::{atomic_write, paths};
 use driftless_map::surface::{
     build_mesh, encode_pages, sensors_for_frames, surface_occluders, texture_mesh_with, Accuracy,
-    AccuracySplit, NoiseConfig, SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
-    OCCLUDERS_FILE,
+    AccuracySplit, NoiseConfig, Occluders, SurfaceConfig, SurfaceInput, SurfaceStats,
+    TextureSource, OCCLUDERS_FILE,
 };
 use driftless_map::{load_stage, stage_fits};
 use driftless_traj::nalgebra::{Isometry3, Point3};
@@ -531,7 +531,12 @@ fn make_surface(
         dense_xyz: points.dense.as_deref(),
     };
     let (mesh, mut stats) = build_mesh(&input, target.config, progress)?;
-    let occluders = surface_occluders(&mesh, input.xyz, target.config, progress, &mut stats);
+    // Without images nothing would read them: no „Bilder neu“ on a gray surface.
+    let occluders = if sources.is_empty() {
+        Occluders::default()
+    } else {
+        surface_occluders(&mesh, input.xyz, target.config, progress, &mut stats)
+    };
     // The points are not needed for the texture: free them before the pages are made.
     drop(points);
     let tex = texture_mesh_with(

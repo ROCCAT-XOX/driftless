@@ -38,12 +38,15 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
   und „Alle Oberflächen rechnen“ nicht an. Gespeichert wird sie im Projekt (`stellen.toml` bei der Karte
   oder dem Modell, `nacharbeit/` bei der Oberfläche); sie übersteht Neustart, Verschieben, Kopieren und
   „Aufräumen“. Eine neue Oberfläche derselben Karte oder desselben Modells übernimmt die Stellen.
-- Ohne die Rohdaten der Scans ist „Bilder neu einspielen“ aus, Glätten geht weiter. Driftless sagt, was
+- Ohne die Rohdaten der Scans ist „Bilder neu einspielen“ aus (der Knopf nennt den ersten Scan, dessen
+  Ordner fehlt), Glätten geht weiter. Driftless sagt, was
   fehlt (Scan-Ordner, Lauf-Ordner, Kamerabilder, Kalibrierung, Lauf der Kommandozeile, altes Modell), auch
   wenn es die Nacharbeit beim Laden oder Exportieren wieder anwendet. Passt eine Oberfläche nicht mehr zu
   ihren Rohdaten: „Oberfläche veraltet – Bilder nur auf einer aktuellen Oberfläche neu einspielbar“.
   Schon eingespielte Fotos bleiben, auch wenn eine frühere Stelle ohne Rohdaten gelöscht und mit ↶
-  zurückgeholt wird (`nacharbeit/frueher/`).
+  zurückgeholt wird (`nacharbeit/frueher/`); nach „Löschen“ sagt Driftless, wenn spätere Stellen dabei
+  ohne ihre Bilder neu gerechnet wurden. Liegen mehr als 64 Schritte vor, kommen die ersten 64 mit ihren
+  Fotos zurück, und nur die übrigen laufen ohne Rohdaten ohne Bilder.
 
 #### Melden
 
@@ -90,6 +93,10 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
   und verdeckt genauso.
 - `driftless surface --ohne anlegen,belichtung,entrauschen,verdeckung` schaltet diese Schritte zum Vergleich
   einzeln ab, `--ohne alles` alle vier. In der App gibt es dafür keinen Schalter.
+- Fremde Dateien werden strenger geprüft: Ein Chunk einer Bag-Datei, der nicht so groß ist wie sein Kopf
+  sagt oder entpackt mehr als 1 GiB hätte, ist ein klarer Fehler statt eines vollen Speichers; eine
+  `verdecker.bin` über der Höchstzahl an Punkten wird nicht gelesen. Graue Oberflächen (ohne Bilder) suchen
+  keine Verdecker mehr.
 - `oberflaeche.json` nennt neu die Rauheit der Wände, den Abstand der Wände zur Ebene der Punkte, das
   Bildrauschen vor und nach dem Dämpfen, die angelegten Ecken und die Zahl der Verdecker.
 

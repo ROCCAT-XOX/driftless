@@ -36,6 +36,8 @@ use crate::MapError;
 use driftless_io::camera::Camera;
 use nalgebra::Isometry3;
 use rayon::prelude::*;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 /// A face hides behind an occluder that is more than this nearer (m).
@@ -56,6 +58,8 @@ pub const OCCLUDER_MIN_POINTS: usize = 3;
 pub const OCCLUDERS_FILE: &str = "verdecker.bin";
 /// The first bytes of [`OCCLUDERS_FILE`].
 const FILE_ID: &[u8; 8] = b"DLVERDK1";
+/// The bytes of a file of [`OCCLUDER_MAX`] occluders, the most [`Occluders::read`] reads.
+const FILE_MAX: u64 = FILE_ID.len() as u64 + 12 + 12 * OCCLUDER_MAX as u64;
 
 /// The 13 neighbouring cells after a cell in key order: the other 13 see it from their side.
 const FORWARD: [[i32; 3]; 13] = [
@@ -106,17 +110,23 @@ impl Occluders {
     }
 
     /// The occluders [`Occluders::write`] wrote to `path`; `None` if there is no such file or it
-    /// is not one of them: another start, another size than the number of points says, a number
-    /// that is not finite, points without a spacing above 0.
+    /// is not one of them: another start, another size than the number of points says, more than
+    /// [`OCCLUDER_MAX`] points (the file comes from outside: its size is checked before it is
+    /// read), a number that is not finite, points without a spacing above 0.
     pub fn read(path: &Path) -> Option<Occluders> {
-        let bytes = std::fs::read(path).ok()?;
+        let file = File::open(path).ok()?;
+        if file.metadata().ok()?.len() > FILE_MAX {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.take(FILE_MAX + 1).read_to_end(&mut bytes).ok()?;
         let rest = bytes.strip_prefix(FILE_ID.as_slice())?;
         let (spacing, rest) = rest.split_first_chunk::<4>()?;
         let (count, rest) = rest.split_first_chunk::<8>()?;
         let spacing = f32::from_le_bytes(*spacing);
         let count = u64::from_le_bytes(*count);
         let ok_spacing = spacing.is_finite() && (spacing > 0.0 || (count == 0 && spacing == 0.0));
-        if !ok_spacing || count.checked_mul(12)? != rest.len() as u64 {
+        if !ok_spacing || count > OCCLUDER_MAX as u64 || count * 12 != rest.len() as u64 {
             return None;
         }
         let points: Vec<[f32; 3]> = rest
@@ -763,6 +773,37 @@ mod tests {
         assert_eq!(Occluders::read(&path).as_ref(), Some(&few));
         Occluders::default().write(&path).unwrap();
         assert_eq!(Occluders::read(&path), Some(Occluders::default()));
+    }
+
+    /// A file of more points than a run ever writes is refused, whatever its header says: at
+    /// [`OCCLUDER_MAX`] it reads, one more point (the length fitting the number) is `None`, and
+    /// so is a number too large for its file. Sparse files: none of them takes up room.
+    #[test]
+    fn too_many_points_is_none() {
+        let dir = TestDir::new(format!("driftless-occluders-many-{}", std::process::id()));
+        let path = dir.join(OCCLUDERS_FILE);
+        let write = |count: u64, points: u64| {
+            let mut head = FILE_ID.to_vec();
+            head.extend_from_slice(&0.02f32.to_le_bytes());
+            head.extend_from_slice(&count.to_le_bytes());
+            fs::write(&path, &head).unwrap();
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(head.len() as u64 + 12 * points).unwrap();
+        };
+        let max = OCCLUDER_MAX as u64;
+        write(max, max);
+        let read = Occluders::read(&path).expect("the most a run writes");
+        assert_eq!(read.points.len(), OCCLUDER_MAX);
+        write(max + 1, max + 1);
+        assert_eq!(Occluders::read(&path), None, "one point too many");
+        write(u64::MAX / 12 + 1, 1);
+        assert_eq!(
+            Occluders::read(&path),
+            None,
+            "12 times the number overflows"
+        );
+        write(u64::MAX, max + 1);
+        assert_eq!(Occluders::read(&path), None, "a number from nowhere");
     }
 
     #[test]

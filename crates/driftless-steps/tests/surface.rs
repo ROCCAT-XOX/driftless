@@ -339,7 +339,7 @@ fn check_occluders_file(dest: &Path, report: &Value) {
 
 #[test]
 fn occluders_file_belongs_to_the_surface() {
-    let (dir, out) = prepared("steps-surface-occluders", false);
+    let (dir, out) = prepared("steps-surface-occluders", true);
     let dest = out.join("oberflaeche");
     let req = request(&dir, &out, &dest);
     let report = run_surface(&req, &Progress::new()).unwrap();
@@ -365,7 +365,7 @@ fn occluders_file_belongs_to_the_surface() {
 
 #[test]
 fn no_occluders_file_with_the_switch_off() {
-    let (dir, out) = prepared("steps-surface-occluders-off", false);
+    let (dir, out) = prepared("steps-surface-occluders-off", true);
     let dest = out.join("oberflaeche");
     let mut req = request(&dir, &out, &dest);
     req.config.noise.occlude = false;
@@ -389,6 +389,7 @@ fn surface_without_images_is_gray_with_warning() {
     assert_eq!(t["untextured_area_share"], 1.0);
     assert_eq!(t["gray_filled"], 0);
     assert!(dest.join("oberflaeche.glb").is_file());
+    assert!(!dest.join(OCCLUDERS_FILE).exists(), "{report}");
 }
 
 #[test]
@@ -401,6 +402,10 @@ fn no_texture_skips_the_images() {
     let report = run_surface(&req, &p).unwrap();
     assert!(warnings(&p).is_empty());
     assert_eq!(report["stats"]["texture"]["faces_textured"], 0);
+    // no „Bilder neu“ without images: nothing would read the occluders
+    assert!(!dest.join(OCCLUDERS_FILE).exists(), "{report}");
+    assert!(!lists_occluders(&report), "{report}");
+    assert_eq!(report["stats"]["occluders"], 0);
     // another input id than with textures
     let with = request(&dir, &out, &dest);
     assert!(!surface_fits(&with));
