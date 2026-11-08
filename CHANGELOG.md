@@ -11,24 +11,39 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
 #### Stellen nacharbeiten
 
 - Werkzeug „Pinsel“ in der 3D-Ansicht: Stellen auf die Oberfläche einer Karte oder eines Modells malen,
-  mit ⌥ (Windows: Alt) radieren. Die Größe geht von 5 bis 100 cm, Vorgabe 20 cm. Drehen und Verschieben
-  gehen mit der rechten und der mittleren Taste weiter.
+  mit ⌥ (Windows: Alt) radieren, auch aus einer anderen als der gewählten Stelle. Die Größe geht von 5
+  bis 100 cm, Vorgabe 20 cm, und bleibt über einen Neustart. Drehen und Verschieben gehen mit der rechten
+  und der mittleren Taste weiter. Malen auf der Büro-Oberfläche läuft auf einem MacBook Pro mit M4 Pro mit
+  etwa 150 Bildern/s
+  ([Messung](https://github.com/ROCCAT-XOX/driftless/blob/main/docs/ergebnisse/2026-10-29-pinsel.md)),
+  auch auf einer nachgestellten Stelle von 30 m² flüssig.
 - „Markierte Stellen“ in „Bilder“: jede Stelle mit ihrer Lage („Stelle 1 · Wand“) und ihrem letzten
-  Schritt. Ein Klick zeigt sie, Rechtsklick → „Löschen“ nimmt sie samt Nacharbeit heraus.
+  Schritt. Ein Klick zeigt sie, Rechtsklick → „Löschen“ nimmt sie samt Nacharbeit heraus. Farbig
+  markiert sind die Stellen nur, solange der Pinsel gewählt ist; nach einem Schritt zeigt eine Stelle
+  nur ihren Umriss, bis wieder in sie gemalt wird.
 - „Glätten“ in drei Stufen, „leicht“, „stark“ und „ganz eben“. „Ganz eben“ legt eine Stelle von Wand,
   Boden oder Decke auf eine Ebene; ist sie nicht eben genug, ändert sich nichts und Driftless sagt warum.
   Der Rand geht weich über. Danach werden die Bilder der Stelle von selbst neu eingespielt.
 - „Bilder neu einspielen“: schärfere, nähere und geradere Fotos für die Stelle, die Helligkeit an die
-  Umgebung angeglichen. Jeder weitere Druck probiert die nächstbeste Variante. Zeigt das gewählte Foto vor
-  der Wand etwas, das die übrigen Fotos anderswo zeigen, etwa eine Stange, nimmt die Stelle dort ein
-  anderes Foto.
+  Umgebung angeglichen. Jeder weitere Druck probiert die nächstbeste Variante, zuerst je ein Foto einer
+  anderen Kamera, eines anderen Scans oder von einem anderen Standort, erst danach ähnliche. Meldung und
+  Liste sagen, welche: „Variante 2 von 5 · andere Kamera“. Zeigt das gewählte Foto vor der Wand etwas,
+  das die übrigen Fotos anderswo zeigen, etwa eine Stange, nimmt die Stelle dort meist ein anderes Foto:
+  wenn die Fotos es mindestens 5 cm versetzt zeigen und es sich mindestens um das Dreifache in der
+  Helligkeit abhebt (geprüft an einem nachgestellten Beispiel).
 - „Vorher“ und „Nachher“, dazu ↶ (⌘Z, Strg+Z) für jeden Pinselzug, jeden Schritt und jedes „Löschen“,
-  auch nach einem Neustart.
-- Die Nacharbeit rechnet im Hintergrund mit Fortschritt und „Abbrechen“. Gespeichert wird sie im Projekt
-  (`stellen.toml` bei der Karte oder dem Modell, `nacharbeit/` bei der Oberfläche); sie übersteht
-  Neustart, Verschieben, Kopieren und „Aufräumen“. Eine neue Oberfläche derselben Karte oder desselben
-  Modells übernimmt die Stellen.
-- Ohne die Rohdaten der Scans ist „Bilder neu einspielen“ aus, Glätten geht weiter.
+  auch nach einem Neustart. ⌘Z und Strg+Z wirken mit jedem Werkzeug. „nicht aktuell“ neben „Nachher“
+  sagt, wenn es noch den Stand davor zeigt.
+- Die Nacharbeit rechnet im Hintergrund mit Fortschritt und „Abbrechen“; „Abbrechen“ hält „Alle rechnen“
+  und „Alle Oberflächen rechnen“ nicht an. Gespeichert wird sie im Projekt (`stellen.toml` bei der Karte
+  oder dem Modell, `nacharbeit/` bei der Oberfläche); sie übersteht Neustart, Verschieben, Kopieren und
+  „Aufräumen“. Eine neue Oberfläche derselben Karte oder desselben Modells übernimmt die Stellen.
+- Ohne die Rohdaten der Scans ist „Bilder neu einspielen“ aus, Glätten geht weiter. Driftless sagt, was
+  fehlt (Scan-Ordner, Lauf-Ordner, Kamerabilder, Kalibrierung, Lauf der Kommandozeile, altes Modell), auch
+  wenn es die Nacharbeit beim Laden oder Exportieren wieder anwendet. Passt eine Oberfläche nicht mehr zu
+  ihren Rohdaten: „Oberfläche veraltet – Bilder nur auf einer aktuellen Oberfläche neu einspielbar“.
+  Schon eingespielte Fotos bleiben, auch wenn eine frühere Stelle ohne Rohdaten gelöscht und mit ↶
+  zurückgeholt wird (`nacharbeit/frueher/`).
 
 #### Melden
 
@@ -45,26 +60,32 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
 - Die Werkzeugleiste der Ansicht hat ein sechstes Werkzeug, „Pinsel“.
 - „Exportieren …“ einer Oberfläche mit Nacharbeit exportiert sie mit der Nacharbeit („Oberfläche 001
   mit Nacharbeit“, glb, OBJ und PLY-Netz). Die gerechnete Oberfläche selbst bleibt, wie sie ist; die
-  Kommandozeile exportiert weiter sie.
+  Kommandozeile exportiert weiter sie. Ein Ziel in `nacharbeit/` oder auf einer Datei der Oberfläche
+  selbst lehnt der Export ab.
+- „Aufräumen“ bietet auch halb geschriebene Ordner der Nacharbeit an (`nacharbeit.tmp-…`).
 - Die Anleitung hat die Abschnitte „Stellen nacharbeiten“ und „Melden“; die folgenden Abschnitte rücken
   eine Nummer weiter.
 
 ### Bekannte Grenzen
 
-- **Nacharbeit braucht Zeit:** Ein Schritt auf einer Stelle von 1 m² dauerte auf dem Testrechner 12 bis
-  14 s statt höchstens 5 s. Am meisten kostet die Suche nach den Fotos der Stelle; dabei liest Driftless
-  jedes Mal alle Kamerabilder der Scans (im Büro 6,7 GB). Malen auf der Büro-Oberfläche läuft auf einem
-  MacBook Pro mit M4 Pro mit etwa 150 Bildern/s
-  ([Messung](https://github.com/ROCCAT-XOX/driftless/blob/main/docs/ergebnisse/2026-10-29-pinsel.md)).
+- **Nacharbeit braucht Zeit:** Ein Schritt auf einer Stelle von 1 m² dauerte auf dem Testrechner
+  (6 Rechenkerne) 1,5 bis 2,8 s. Größere Stellen dauern länger; gemessen ist bisher nur 1 m². Der erste
+  Schritt nach dem Start legt ein Verzeichnis der Kamerabilder an; liest Driftless sie dafür vom
+  Laufwerk, kommen 0,4 bis 1,6 s dazu.
 - **Dünne Teile dicht an der Wand:** Ein Rohr oder Kabelkanal dicht vor der Stelle, den die Oberfläche nur
   in Stücken hat, liegt in den Fotos je nach Standort ein paar Zentimeter anders, ebenso ein dunkler
   Streifen daneben. „Bilder neu einspielen“ kann dann einen Streifen auf die Stelle legen, schärfer und
   etwas versetzt. Dann die nächste Variante probieren oder ↶.
+- **Stellen in zwei Fenstern:** Stellen derselben Karte oder desselben Modells gleichzeitig in zwei
+  Fenstern nachzuarbeiten ist nicht erprobt. Dafür nur ein Fenster nutzen.
 
 ### Hinweis
 
 - Laufbahnen, Karten und Oberflächen von 0.1.0 bleiben aktuell: Dieser Stand rechnet sie Byte für Byte
-  gleich (geprüft an einem Scan, die Oberfläche auf der Grafikkarte und auf dem Prozessor).
+  gleich (geprüft an einem Scan, die Oberfläche auf der Grafikkarte und auf dem Prozessor, auf einem
+  Zwischenstand dieses Zweigs; für den letzten Stand steht die Prüfung auf echten Daten noch aus).
+- Neu eingespielte Bilder der Nacharbeit sind auf demselben System Byte für Byte gleich. Zwischen
+  verschiedenen Systemen, etwa Mac und Windows, können einzelne Bildpunkte abweichen.
 
 ## [0.1.0] – 2026-10-28
 
