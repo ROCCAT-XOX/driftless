@@ -29,6 +29,8 @@ nalgebra = { version = "0.33", default-features = false, features = ["std"] }
 thiserror = "2"
 
 [dev-dependencies]
+# Independent reader that checks the DXF writer from the outside.
+dxf = "0.6.2"
 # Self dev-dependency: enables `test-util` for the integration tests in tests/.
 driftless-export = { path = ".", features = ["test-util"] }
 # The capped allocator of the crafted-file test.
