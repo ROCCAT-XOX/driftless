@@ -590,6 +590,9 @@ fn no_raw_data_disables_retexture() {
     // touch-up finds no images, says so, and takes the step back out
     let raw = scene.dir.join("Rohdaten");
     let away = scene.dir.join("Rohdaten-weg");
+    // the program names the folder as the project resolves it (on Windows the temp folder is
+    // an 8.3 short name, the project path the long one), so resolve it the same way first
+    let shown = canonical(&raw).unwrap().join("raum");
     fs::rename(&raw, &away).unwrap();
     assert_eq!(brush::retexture_blocked(scene.app.state()), None);
     scene.run(Action::Retexture { mark: nr });
@@ -601,8 +604,7 @@ fn no_raw_data_disables_retexture() {
         .cloned()
         .expect("no images");
     assert!(
-        why.to_string()
-            .contains(&raw.join("raum").display().to_string()),
+        why.to_string().contains(&shown.display().to_string()),
         "{why}"
     );
     assert_eq!(said(&scene.app).last(), Some(&text::no_images_baked(&why)));
