@@ -1,6 +1,6 @@
 # Driftless – Anleitung
 
-Für Version 0.1.0. Driftless macht aus den Aufnahmen des Handscanners 3DMakerPro JMK6 eine Punktwolke,
+Für Version 0.2.0. Driftless macht aus den Aufnahmen des Handscanners 3DMakerPro JMK6 eine Punktwolke,
 eine fotoähnliche Oberfläche und Dateien für andere Programme. Es läuft auf dem Mac und unter Windows
 und rechnet alles auf dem eigenen Rechner.
 
@@ -20,7 +20,7 @@ Wörter in „…“ stehen genau so im Programm.
 12. [Bekannte Grenzen](#12-bekannte-grenzen)
 13. [Melden](#13-melden)
 
-Die Abschnitte 9 und 10 und „Melden“ mit ⇧⇧ in Abschnitt 13 sind neu nach Version 0.1.0.
+Die Abschnitte 9 und 10 und „Melden“ mit ⇧⇧ in Abschnitt 13 sind neu in Version 0.2.0.
 
 **Wörter, die im Programm vorkommen**
 
@@ -43,8 +43,8 @@ die neueste Version öffnen und die Datei für das eigene System laden.
 
 | System | Datei |
 |---|---|
-| Mac | `Driftless-0.1.0-macos-arm64.dmg` |
-| Windows | `Driftless-0.1.0-setup.exe` |
+| Mac | `Driftless-0.2.0-macos-arm64.dmg` |
+| Windows | `Driftless-0.2.0-setup.exe` |
 
 ### Mac
 
@@ -220,7 +220,7 @@ Die Laufbahn vor der Karte braucht nur Sekunden: 9 s im kleinen Raum, 34 s im B�
 62 s). Den freien Platz für
 die Ergebnisse nennt [Voraussetzungen](#voraussetzungen).
 
-**Weniger Rauschen, von selbst.** Neu nach Version 0.1.0. Jede Oberfläche bekommt diese vier Schritte, einstellen
+**Weniger Rauschen, von selbst.** Neu in Version 0.2.0. Jede Oberfläche bekommt diese vier Schritte, einstellen
 muss man dafür nichts:
 
 | Schritt | Was er tut |
@@ -400,7 +400,7 @@ Ein schlechtes Stück der Laufbahn wegschneiden geht noch nicht (Abschnitt 12).
 
 ## 9. Stellen nacharbeiten
 
-Neu nach Version 0.1.0. Wo eine Oberfläche rauscht oder fleckige Fotos hat, lässt sich die Stelle mit
+Neu in Version 0.2.0. Wo eine Oberfläche rauscht oder fleckige Fotos hat, lässt sich die Stelle mit
 dem Pinsel anmalen und dort nachbessern: glätten oder die Bilder neu einspielen. Die gerechnete
 Oberfläche bleibt dabei, wie sie ist. Die Nacharbeit liegt daneben im Projekt und lässt sich jederzeit
 zurücknehmen.
@@ -654,7 +654,7 @@ Dieselbe Liste steht im [CHANGELOG](../CHANGELOG.md).
 
 ### In der App: ⇧⇧
 
-Neu nach Version 0.1.0. Zweimal kurz Shift drücken, links oder rechts, überall in der App: Das Fenster
+Neu in Version 0.2.0. Zweimal kurz Shift drücken, links oder rechts, überall in der App: Das Fenster
 „Melden“ geht auf. Shift gedrückt halten, etwa beim Verschieben oder schnelleren Fliegen, öffnet es nie,
 Großbuchstaben tippen auch nicht. „Melden …“ in der Leiste des Pinsels öffnet es für die gewählte Stelle.
 

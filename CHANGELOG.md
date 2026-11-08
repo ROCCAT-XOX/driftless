@@ -6,6 +6,8 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
 
 ## [Unreleased]
 
+## [0.2.0] – 2026-11-08
+
 ### Hinzugefügt
 
 #### Stellen nacharbeiten

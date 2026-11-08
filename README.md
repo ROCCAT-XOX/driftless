@@ -9,7 +9,7 @@ programs, known limits, reporting a bug.
 Open-source desktop software for processing handheld LiDAR scans — drift-corrected, cleanly colourised,
 correctable by hand. Runs natively on **macOS (Apple Silicon)** and **Windows**.
 
-> Status: **v0.1.0**, the first version for real jobs. What is in it and its known limits:
+> Status: **v0.2.0**. What is in it and its known limits:
 > [CHANGELOG.md](CHANGELOG.md) (German). The desktop program (`driftless-app`) and the command line
 > (`driftless`) read the raw recordings of the 3DMakerPro JMK6, compute the trajectory with loop closure
 > (correctable by hand: mark loops, switch off wrong automatic ones), a cleaned and coloured point cloud

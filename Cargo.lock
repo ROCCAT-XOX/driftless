@@ -1649,7 +1649,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "driftless-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -1687,7 +1687,7 @@ dependencies = [
 
 [[package]]
 name = "driftless-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "driftless-export"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "driftless-export",
  "driftless-io",
@@ -1734,7 +1734,7 @@ dependencies = [
 
 [[package]]
 name = "driftless-gpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "driftless-io",
@@ -1746,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "driftless-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nalgebra",
  "nalgebra-sparse",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "driftless-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "driftless-io",
  "image",
@@ -1771,7 +1771,7 @@ dependencies = [
 
 [[package]]
 name = "driftless-map"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "driftless-export",
  "driftless-gpu",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "driftless-odom"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "driftless-io",
  "driftless-odom",
@@ -1804,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "driftless-plan"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "driftless-io",
  "nalgebra",
@@ -1815,7 +1815,7 @@ dependencies = [
 
 [[package]]
 name = "driftless-slam"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "driftless-graph",
  "driftless-io",
@@ -1831,7 +1831,7 @@ dependencies = [
 
 [[package]]
 name = "driftless-steps"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "driftless-export",
  "driftless-gpu",
@@ -1854,7 +1854,7 @@ dependencies = [
 
 [[package]]
 name = "driftless-traj"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "driftless-io",
  "nalgebra",
