@@ -1793,6 +1793,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "driftless-plan"
+version = "0.1.0"
+dependencies = [
+ "driftless-io",
+ "nalgebra",
+ "rayon",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "driftless-slam"
 version = "0.1.0"
 dependencies = [
