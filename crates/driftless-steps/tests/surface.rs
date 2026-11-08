@@ -289,6 +289,7 @@ fn surface_without_dense_bin_still_succeeds() {
     ] {
         assert!(stats["snap"][key].is_number(), "{key}: {with}");
     }
+    assert!(stats["occluders"].is_u64(), "{with}");
     fs::remove_file(out.join("dense.bin")).unwrap();
     let p = Progress::new();
     let without = run_surface(&request(&dir, &out, &out.join("without")), &p).unwrap();

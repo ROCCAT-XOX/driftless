@@ -49,6 +49,12 @@
 //! slots by untagged ones, each of those scores above that share: the same decision.) Walls,
 //! desk edges and steps' risers near the path are not tagged.
 //!
+//! **Occluders** ([`super::occlude`], not yet on the GPU): what was measured but has no face
+//! hides the faces behind it from an image, though the depth buffer of the faces cannot know.
+//! Such a view counts [`OCCLUDED_SCORE`] of its score and is tagged like a carrier view; the
+//! rules for those then do the rest: it goes when another image shows the face, stays if none
+//! does, and is no part of the exposure fit.
+//!
 //! **Occlusion mask** ([`mask_views`], after the exposure fit): what moves with the device –
 //! the carrier's legs, a strap – sits in the same part of a camera's image in every frame, also
 //! farther than the carrier rule reaches. Every view of a face with at least
@@ -120,6 +126,7 @@
 //! per camera and [`ColorConfig::view_gap`]), the fit sees the
 //! [`SurfaceConfig::views_per_face`] best views by half octave of score.
 
+use super::occlude::{face_occluded, occluder_buffer, Occluders, OCCLUDED_SCORE};
 use super::{Mesh, SurfaceConfig};
 use crate::color::{
     frame_camera, image_count, keep_best, linear_table, quality_pass, sample_linear, srgb_value,
@@ -474,7 +481,8 @@ pub(crate) struct Shot<'a> {
 /// `view` are tested in (and these faces themselves). The pass over a whole mesh gives the faces
 /// whose centroid lies within [`ColorConfig::max_dist`] plus [`Faces::reach`] of the camera
 /// (sorted) as both; a Stelle ([`super::edit`]) gives its faces as `view` and the faces in front
-/// of and around them as `splat`.
+/// of and around them as `splat`. `occluders` is the depth buffer of what has no face
+/// ([`occluder_buffer`]), if there is any.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn image_views(
     mesh: &Mesh,
@@ -482,6 +490,7 @@ pub(crate) fn image_views(
     splat: &[u32],
     view: &[u32],
     shot: &Shot,
+    occluders: Option<&DepthBuffer>,
     cfg: &ColorConfig,
     sampled: impl Fn(usize) -> bool + Sync,
     lin: &[f32; 256],
@@ -577,6 +586,15 @@ pub(crate) fn image_views(
                 && below > CARRIER_BELOW
                 && across < CARRIER_RADIUS
                 && across < below;
+            let occluded = occluders.is_some_and(|buffer| {
+                let corners = mesh.indices[f].map(|i| mesh.positions[i as usize]);
+                face_occluded(buffer, corners, &proj, cam, &world_to_cam)
+            });
+            let (score, carrier) = if occluded {
+                (score * OCCLUDED_SCORE, true)
+            } else {
+                (score, carrier)
+            };
             let (colour, sample) = match shot.rgb {
                 Some(image) => {
                     let to_px =
@@ -1204,7 +1222,15 @@ pub(crate) fn collect_views_with(
     progress: &Progress,
     gpu: Option<&GpuContext>,
 ) -> Result<ViewTable, MapError> {
-    collect_views_on(mesh, sources, cfg, progress, gpu.map(|g| (g, None))).map(|(t, _)| t)
+    collect_views_on(
+        mesh,
+        &Occluders::default(),
+        sources,
+        cfg,
+        progress,
+        gpu.map(|g| (g, None)),
+    )
+    .map(|(t, _)| t)
 }
 
 /// What [`collect_views_on`] reports besides the views.
@@ -1224,9 +1250,11 @@ pub(crate) struct ViewsInfo {
 }
 
 /// [`collect_views_with`] with the GPU's batch size (faces per batch; `None`: as large as the
-/// device allows), and what the run reports.
+/// device allows), what hides faces from the images (see the module docs; ignored on the GPU so
+/// far), and what the run reports.
 pub(crate) fn collect_views_on(
     mesh: &Mesh,
+    occluders: &Occluders,
     sources: &[TextureSource],
     cfg: &SurfaceConfig,
     progress: &Progress,
@@ -1322,6 +1350,7 @@ pub(crate) fn collect_views_on(
         let pass = Pass {
             mesh,
             faces: &faces,
+            occluders,
             sources,
             cams: &cams,
             cfg,
@@ -1468,6 +1497,8 @@ impl Stream {
 pub(crate) struct Pass<'a> {
     pub mesh: &'a Mesh,
     pub faces: &'a Faces,
+    /// What hides faces from the images (see the module docs); only the CPU heeds it so far.
+    pub occluders: &'a Occluders,
     pub sources: &'a [TextureSource],
     /// [`all_cameras`] of `sources`.
     pub cams: &'a [ColorCamera],
@@ -1487,6 +1518,7 @@ fn cpu_views(pass: &Pass, progress: &Progress) -> Result<(Vec<FaceView>, Vec<Vie
     let Pass {
         mesh,
         faces,
+        occluders,
         sources,
         cams,
         cfg,
@@ -1503,6 +1535,7 @@ fn cpu_views(pass: &Pass, progress: &Progress) -> Result<(Vec<FaceView>, Vec<Vie
     let mut samples = vec![empty; sample_faces * k];
     {
         let grid = PointGrid::new(&faces.centroid);
+        let occluder_grid = PointGrid::new(&occluders.points);
         let lin = linear_table();
         let geometry: Vec<Camera> = cams
             .iter()
@@ -1549,7 +1582,18 @@ fn cpu_views(pass: &Pass, progress: &Progress) -> Result<(Vec<FaceView>, Vec<Vie
                 let cam_pos = shot.world_from_cam.translation.vector;
                 let mut near = grid.near(&cam_pos, ccfg.max_dist + faces.reach);
                 near.par_sort_unstable();
-                let found = image_views(mesh, faces, &near, &near, &shot, ccfg, sampled, &lin);
+                let cover = occluder_buffer(occluders, &occluder_grid, &shot, ccfg);
+                let found = image_views(
+                    mesh,
+                    faces,
+                    &near,
+                    &near,
+                    &shot,
+                    cover.as_ref(),
+                    ccfg,
+                    sampled,
+                    &lin,
+                );
                 for (f, view, colour) in found {
                     let f = f as usize;
                     keep_best_view(&mut per_face[f * k..(f + 1) * k], view);
@@ -2772,8 +2816,15 @@ mod tests {
         let cfg = SurfaceConfig::default();
         let k = cfg.views_per_face;
         let cpu = collect_views(&mesh, &sources, &cfg, &Progress::new()).unwrap();
-        let (gpu, info) =
-            collect_views_on(&mesh, &sources, &cfg, &Progress::new(), Some((&ctx, None))).unwrap();
+        let (gpu, info) = collect_views_on(
+            &mesh,
+            &Occluders::default(),
+            &sources,
+            &cfg,
+            &Progress::new(),
+            Some((&ctx, None)),
+        )
+        .unwrap();
         assert_eq!(info.gpu_fallback, None);
         assert!(cpu.images.iter().any(|i| i.source == 1));
         let (seen, same, off, worst, tint) = agreement(&cpu, &gpu, k);
@@ -2863,6 +2914,7 @@ mod tests {
                 collect_views(&mesh, std::slice::from_ref(&src), &cfg, &Progress::new()).unwrap();
             let (gpu, info) = collect_views_on(
                 &mesh,
+                &Occluders::default(),
                 std::slice::from_ref(&src),
                 &cfg,
                 &Progress::new(),
@@ -2922,6 +2974,7 @@ mod tests {
         let run = |batch: Option<usize>| {
             collect_views_on(
                 &mesh,
+                &Occluders::default(),
                 std::slice::from_ref(&src),
                 &cfg,
                 &Progress::new(),
@@ -2951,6 +3004,7 @@ mod tests {
         let run = |cfg: &SurfaceConfig, ctx: &GpuContext, batch: Option<usize>| {
             collect_views_on(
                 &mesh,
+                &Occluders::default(),
                 std::slice::from_ref(&src),
                 cfg,
                 &Progress::new(),
@@ -2980,6 +3034,7 @@ mod tests {
         });
         let (many, info) = collect_views_on(
             &mesh,
+            &Occluders::default(),
             std::slice::from_ref(&src),
             &cfg,
             &p,
@@ -3057,6 +3112,7 @@ mod tests {
         });
         let (table, info) = collect_views_on(
             &mesh,
+            &Occluders::default(),
             std::slice::from_ref(&src),
             &cfg,
             &p,

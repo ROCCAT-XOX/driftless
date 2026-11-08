@@ -48,8 +48,8 @@ use driftless_io::progress::Progress;
 use driftless_io::project::{discover_project, ProjectError};
 use driftless_io::{atomic_write, paths};
 use driftless_map::surface::{
-    build_mesh, encode_pages, sensors_for_frames, texture_mesh, Accuracy, AccuracySplit,
-    NoiseConfig, SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
+    build_mesh, encode_pages, sensors_for_frames, surface_occluders, texture_mesh_with, Accuracy,
+    AccuracySplit, NoiseConfig, SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
 };
 use driftless_map::{load_stage, stage_fits};
 use driftless_traj::nalgebra::{Isometry3, Point3};
@@ -433,6 +433,7 @@ fn stats_json(s: &SurfaceStats) -> Value {
             "reverted": s.snap.reverted,
             "mean_shift_mm": s.snap.mean_shift_mm,
         },
+        "occluders": s.occluders,
         "seconds": s.seconds,
         "gpu_batches": s.gpu_batches,
     })
@@ -528,10 +529,12 @@ fn make_surface(
         dense_xyz: points.dense.as_deref(),
     };
     let (mesh, mut stats) = build_mesh(&input, target.config, progress)?;
+    let occluders = surface_occluders(&mesh, input.xyz, target.config, progress, &mut stats);
     // The points are not needed for the texture: free them before the pages are made.
     drop(points);
-    let tex = texture_mesh(
+    let tex = texture_mesh_with(
         &mesh,
+        &occluders,
         &sources,
         target.config,
         progress,

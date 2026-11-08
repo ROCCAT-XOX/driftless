@@ -14,6 +14,7 @@ pub mod edit;
 mod extract;
 mod level;
 mod mc_tables;
+mod occlude;
 mod preview;
 mod simplify;
 mod snap;
@@ -29,6 +30,9 @@ pub use atlas::{TexturePage, TextureStats, TexturedMesh};
 pub use cleanup::{cleanup, CleanupStats};
 pub use extract::{extract, Mesh};
 pub use level::SeamStats;
+pub use occlude::{
+    find_occluders, Occluders, OCCLUDED_SCORE, OCCLUDER_GAP, OCCLUDER_MAX, OCCLUDER_MIN_EXTENT,
+};
 pub use preview::render_preview;
 pub use simplify::simplify;
 pub use snap::SnapStats;
@@ -265,6 +269,8 @@ pub struct SurfaceStats {
     /// how far it lies from the mean of its neighbours along its normal (mm). Measured with
     /// [`NoiseConfig::snap`] off as well.
     pub roughness: Accuracy,
+    /// Occluders the views heeded (see [`find_occluders`]); 0 with [`NoiseConfig::occlude`] off.
+    pub occluders: usize,
     /// Wall-clock seconds per phase (not deterministic; never written into the mesh files).
     pub seconds: BTreeMap<&'static str, f64>,
     /// Of `seconds["views"]`: the quality pass, the pass over the images and, on the GPU,
@@ -303,8 +309,28 @@ pub fn build_surface(
     progress: &Progress,
 ) -> Result<(TexturedMesh, SurfaceStats), MapError> {
     let (mesh, mut stats) = build_mesh(input, cfg, progress)?;
-    let tex = texture_mesh(&mesh, sources, cfg, progress, &mut stats, None)?;
+    let occluders = surface_occluders(&mesh, input.xyz, cfg, progress, &mut stats);
+    let tex = texture_mesh_with(&mesh, &occluders, sources, cfg, progress, &mut stats, None)?;
     Ok((tex, stats))
+}
+
+/// [`find_occluders`] as the chain runs it, between [`build_mesh`] and [`texture_mesh_with`],
+/// while the points are at hand; none with [`NoiseConfig::occlude`] off.
+pub fn surface_occluders(
+    mesh: &Mesh,
+    xyz: &[[f32; 3]],
+    cfg: &SurfaceConfig,
+    progress: &Progress,
+    stats: &mut SurfaceStats,
+) -> Occluders {
+    if !cfg.noise.occlude {
+        return Occluders::default();
+    }
+    let mut clock = Clock::new();
+    progress.phase("Oberfläche: Verdecker suchen", None);
+    let occluders = find_occluders(mesh, xyz, cfg);
+    clock.lap(stats, "occluders");
+    occluders
 }
 
 fn check_cancel(progress: &Progress) -> Result<(), MapError> {
@@ -394,13 +420,35 @@ pub fn texture_mesh(
     stats: &mut SurfaceStats,
     gpu: Option<&GpuContext>,
 ) -> Result<TexturedMesh, MapError> {
+    let none = Occluders::default();
+    texture_mesh_with(mesh, &none, sources, cfg, progress, stats, gpu)
+}
+
+/// [`texture_mesh`] with `occluders`: what has no face in `mesh` but hides the faces behind it
+/// from the images ([`find_occluders`]). Only the views on the CPU heed them so far.
+pub fn texture_mesh_with(
+    mesh: &Mesh,
+    occluders: &Occluders,
+    sources: &[TextureSource],
+    cfg: &SurfaceConfig,
+    progress: &Progress,
+    stats: &mut SurfaceStats,
+    gpu: Option<&GpuContext>,
+) -> Result<TexturedMesh, MapError> {
     cfg.check()?;
     let mut clock = Clock::new();
     check_cancel(progress)?;
+    stats.occluders = occluders.points.len();
     let tex = match sources {
         [_, ..] => {
-            let (mut views, info) =
-                views::collect_views_on(mesh, sources, cfg, progress, gpu.map(|g| (g, None)))?;
+            let (mut views, info) = views::collect_views_on(
+                mesh,
+                occluders,
+                sources,
+                cfg,
+                progress,
+                gpu.map(|g| (g, None)),
+            )?;
             stats.views_seconds = ViewsSeconds {
                 quality: info.quality_seconds,
                 pass: info.views_seconds,
@@ -1029,7 +1077,7 @@ mod tests {
     }
 
     /// The texel at the centre of face `f` in its page.
-    fn face_colour(tex: &TexturedMesh, f: usize) -> [u8; 3] {
+    pub(super) fn face_colour(tex: &TexturedMesh, f: usize) -> [u8; 3] {
         let (page, tri) = tex.face_ref[f];
         let page = &tex.pages[page as usize];
         let uv = page.indices[tri as usize].map(|v| page.uvs[v as usize]);

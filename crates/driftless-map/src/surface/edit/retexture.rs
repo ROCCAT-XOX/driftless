@@ -3375,6 +3375,7 @@ mod tests {
                     &all,
                     stelle,
                     &shot,
+                    None,
                     ccfg,
                     |_| false,
                     &lin,

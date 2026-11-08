@@ -225,6 +225,13 @@ impl DepthBuffer {
         }
     }
 
+    /// The point lies more than `gap` (m) behind the nearest depth of its own cell.
+    pub(crate) fn is_behind(&self, p: &Projection, gap: f64) -> bool {
+        let (cx, cy) = self.cell(p.uv);
+        let depth = f32::from_bits(self.at(cx, cy).load(Ordering::Relaxed));
+        f64::from(p.range) > f64::from(depth) + gap
+    }
+
     /// The point is at most `tol_abs` + [`DEPTH_TOLERANCE_REL`] of the depth behind the
     /// nearest depth of its cell, and no neighbouring cell holds something more than
     /// `tol_abs` + [`SILHOUETTE_REL`] of the depth nearer (it would lie on the silhouette of
@@ -385,6 +392,30 @@ mod tests {
         // A slanted surface (depth 10 % less one cell over) does not hide its neighbours.
         let slant = [[0.0, 0.0, 3.6], [0.32, 0.0, 4.0]];
         assert_eq!(visible_count(&slant, &[0.0, 0.0]), 2);
+    }
+
+    #[test]
+    fn behind_looks_at_its_own_cell_only() {
+        let cam = pinhole();
+        let world = Isometry3::identity();
+        let at = |p: [f32; 3]| project_point(&p, &cam, &world, 12.0).unwrap();
+        let buffer = DepthBuffer::new(&cam, 4);
+        let wall = at([0.0, 0.0, 4.0]);
+        assert!(
+            !buffer.is_behind(&wall, 0.02),
+            "an empty buffer hides nothing"
+        );
+        buffer.splat(&at([0.0, 0.0, 3.5]), 0.0);
+        assert!(buffer.is_behind(&wall, 0.02));
+        assert!(!buffer.is_behind(&wall, 0.6), "less than the gap in front");
+        assert!(
+            !buffer.is_behind(&at([0.0, 0.0, 3.0]), 0.02),
+            "in front of it"
+        );
+        // One cell over is not its cell.
+        let beside = at([0.32, 0.0, 4.0]);
+        assert_eq!(cell_offset(&[0.32, 0.0, 4.0]), 1);
+        assert!(!buffer.is_behind(&beside, 0.02));
     }
 
     /// Depth-buffer cells between the image centre and the projection of `p` along x.
