@@ -4,7 +4,7 @@
 //! measured from fused into a truncated signed distance field, fine and coarse) → [`extract`] → the
 //! vertices onto the planes of the points ([`NoiseConfig::snap`]) → [`cleanup`] →
 //! [`simplify`] → camera views per face → one image per face → texture pages → image noise
-//! damped per chart ([`NoiseConfig::denoise`]) → seam levelling. [`write_glb`] and [`write_obj`] write the result, [`render_preview`] draws it.
+//! damped per chart ([`NoiseConfig::denoise`]) → seam levelling. [`write_glb`] and [`write_obj`] write the result, [`render_preview`] draws it ([`render_relief`]: the form in gray, for test images).
 //! [`edit`] touches up a computed surface where the user painted Stellen on it.
 
 mod atlas;
@@ -34,7 +34,7 @@ pub use occlude::{
     find_occluders, Occluders, OCCLUDED_SCORE, OCCLUDERS_FILE, OCCLUDER_GAP, OCCLUDER_MAX,
     OCCLUDER_MIN_EXTENT,
 };
-pub use preview::render_preview;
+pub use preview::{render_preview, render_relief};
 pub use simplify::simplify;
 pub use snap::SnapStats;
 pub use tsdf::{FusedSdf, Tsdf};

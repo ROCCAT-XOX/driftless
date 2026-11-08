@@ -217,6 +217,30 @@ Die Laufbahn vor der Karte braucht nur Sekunden: 9 s im kleinen Raum, 34 s im B�
 62 s). Den freien Platz für
 die Ergebnisse nennt [Voraussetzungen](#voraussetzungen).
 
+**Weniger Rauschen, von selbst.** Neu nach Version 0.1.0. Jede Oberfläche bekommt diese vier Schritte, einstellen
+muss man dafür nichts:
+
+| Schritt | Was er tut |
+|---|---|
+| anlegen | Wo die Messpunkte eine ebene Fläche zeigen, legt Driftless die Oberfläche auf diese Ebene. Wände, Böden und Decken werden ruhiger, Kanten bleiben, wie sie sind. |
+| belichtung | Für jede Fläche nimmt Driftless lieber ein Foto, auf dem die Stelle gut belichtet ist, als eines, auf dem sie sehr dunkel oder überstrahlt ist. |
+| entrauschen | Körnung und farbige Sprenkel im Bild werden gedämpft, je Bildstück so stark, wie es rauscht. Schrift und Kanten bleiben scharf, saubere Fotos bleiben, wie sie sind. |
+| verdeckung | Was gemessen wurde, aber keine eigene Fläche hat, etwa ein dünnes Rohr oder eine Leiter, verdeckt beim Zuordnen der Fotos die Wand dahinter und malt sich nicht mehr auf sie. |
+
+„Bilder neu einspielen“ dämpft das Rauschen und beachtet die Verdeckung genauso, damit eine neue Stelle zu
+ihrer Umgebung passt. Die Grenzen stehen unter [Bekannte Grenzen](#11-bekannte-grenzen).
+
+Zum Vergleich lässt sich in der Kommandozeile jeder Schritt einzeln abschalten; in der App gibt es dafür keinen
+Schalter:
+
+```
+driftless surface <scan> --slam <lauf> --ohne entrauschen,verdeckung
+driftless surface <scan> --slam <lauf> --ohne alles
+```
+
+`--ohne` geht auch mit `--model`. Mit `--ohne alles` entsteht die Oberfläche wie vor diesen Schritten. Eine
+Oberfläche aus einer älteren Version gilt nicht mehr als aktuell und wird beim nächsten Rechnen neu erzeugt.
+
 ## 6. Mehrere Scans zusammenführen
 
 Mehrere Scans desselben Orts werden zu einem Modell, zum Beispiel ein großer Raum in Teilen. Jeder Scan
@@ -516,6 +540,7 @@ Dieselbe Liste steht im [CHANGELOG](../CHANGELOG.md).
 | 1 cm braucht viel Speicher | Eine Oberfläche mit 1 cm braucht bei großen Aufnahmen bis 9 GB Arbeitsspeicher (Büro: 7,7 GB, 20 Minuten). |
 | Verfehlte Qualitätsziele | Bei 1 cm bleiben in großen und in dunklen Räumen Stellen der Oberfläche offen: von oben gesehen im Büro 31 % (Ziel höchstens 30 %), in einem dunklen Raum 9,7 % (Ziel höchstens 6 %). 2 cm schließt mehr. Die Übergänge zwischen zwei Fotos (Nähte) sind deutlicher zu sehen als geplant. Die Oberflächen-Datei eines Raums ist bei 1 cm rund 100 MB groß statt höchstens 60 MB. Dieselbe Wand, mehrmals abgelaufen, liegt vor dem Glätten einige Millimeter auseinander (Ziel höchstens 5 mm); die Ursache ist offen, das Glätten legt sie wieder auf eine Fläche. |
 | Nacharbeit braucht Zeit | Ein Schritt auf einer Stelle von 1 m² dauerte auf dem Testrechner 12 bis 14 s statt der geplanten höchstens 5 s ([Messung](ergebnisse/2026-10-29-pinsel.md)). Am meisten kostet die Suche nach den Fotos, die die Stelle zeigen: Dafür liest Driftless jedes Mal alle Kamerabilder der Scans, im Büro 6,7 GB, im Modell aus drei Scans 11 GB. Liegen die Scans auf einem langsamen Laufwerk oder ist der Arbeitsspeicher knapp, dauert es länger. Malen und ↶ gehen sofort. |
+| Kleine Teile und Säume an Kanten | Nur was mehr als 2 cm vor einer Fläche steht, Punkte hat und zusammen mindestens 30 cm lang ist, verdeckt die Wand dahinter. Türgriffe und andere kleine Teile können deshalb weiter leicht versetzt im Bild liegen. Wo keine ebene Umgebung zu finden ist, also an Kanten und dünnen Teilen, bleibt ein schmaler Saum der Oberfläche, wie er war. |
 | Dünne Teile dicht an der Wand | Steht dicht vor der Stelle etwas Dünnes, das die Oberfläche nur in Stücken hat, etwa ein Rohr oder ein Kabelkanal, liegt es in den Fotos je nach Standort ein paar Zentimeter anders, ebenso ein dunkler Streifen daneben. „Bilder neu einspielen“ kann dann einen Streifen auf die Stelle legen, schärfer und etwas versetzt. Dann die nächste Variante probieren oder mit ↶ zurücknehmen. Was weiter vor der Wand steht und sich deutlich von ihr abhebt, etwa eine Stange, legt es nicht auf die Wand. |
 
 ## 12. Melden

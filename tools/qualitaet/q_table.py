@@ -5,7 +5,8 @@
 
 Rows = the goal table of the quality round (Z2-Z6; Z1 "Löcher von oben" needs the view tool) plus
 the run figures of the program itself (`dense_quality` in map.json, `accuracy_dense` in
-oberflaeche.json) next to the Python values of the same definition.
+oberflaeche.json) next to the Python values of the same definition. The figures of "weniger
+Rauschen" (roughness, walls_plane, noise, snap, occluders) come from the program's oberflaeche.json.
 """
 import json, os, sys
 
@@ -78,8 +79,17 @@ ROWS = [
     ("Oberfläche Kanten Median / Mittel / 95 % (mm)", lambda m: " / ".join(f(g(m, "surface", "accuracy", "edges", k), 2) for k in ("median_mm", "mean_mm", "p95_mm")), 0),
     ("Oberfläche gegen dense Wände Median / Mittel / 95 % (mm)", lambda m: " / ".join(f(g(m, "surface", "accuracy_dense", "walls", k), 2) for k in ("median_mm", "mean_mm", "p95_mm")), 0),
     ("Oberfläche gegen dense Kanten Median / Mittel / 95 % (mm)", lambda m: " / ".join(f(g(m, "surface", "accuracy_dense", "edges", k), 2) for k in ("median_mm", "mean_mm", "p95_mm")), 0),
+    ("Rauheit Wände Median / 95 % (mm)", lambda m: " / ".join(f(g(m, "surface", "roughness", k), 2) for k in ("median_mm", "p95_mm")), 0),
+    ("Wand zur Ebene der Punkte Median / 95 % (mm)", lambda m: " / ".join(f(g(m, "surface", "accuracy", "walls_plane", k), 2) for k in ("median_mm", "p95_mm")), 0),
+    ("Wand zur Ebene gegen dense Median / 95 % (mm)", lambda m: " / ".join(f(g(m, "surface", "accuracy_dense", "walls_plane", k), 2) for k in ("median_mm", "p95_mm")), 0),
+    ("Anlegen: Ecken / bewegt / ohne Ebene / zu weit / zurück", lambda m: " / ".join(f(g(m, "surface", "snap", k)) for k in ("vertices", "moved", "no_plane", "too_far", "reverted")), 0),
+    ("Anlegen: mittlere Verschiebung (mm)", lambda m: g(m, "surface", "snap", "mean_shift_mm"), 2),
+    ("Bildrauschen vorher → nachher (Stufen)", lambda m: f"{f(g(m,'surface','noise_before'),2)} → {f(g(m,'surface','noise_after'),2)}", 0),
+    ("Verdecker", lambda m: g(m, "surface", "occluders"), 0),
     ("Dreiecke fertig (Mio.)", lambda m: (g(m, "surface", "faces_final") or 0) / 1e6, 2),
     ("ohne Textur (%)", lambda m: g(m, "surface", "untextured_pct"), 2),
+    ("ohne Bild (Fläche %)", lambda m: 100 * g(m, "surface", "untextured_area_share") if g(m, "surface", "untextured_area_share") is not None else None, 2),
+    ("seam_step je m Naht", lambda m: g(m, "surface", "seam_step_per_m"), 2),
     ("seam_step nachher Mittel / Median", lambda m: f"{f(g(m,'surface','seam_step_after'))} / {f(g(m,'surface','seam_step_median_after'))}", 0),
     ("Karten (charts)", lambda m: g(m, "surface", "charts"), 0),
     ("Füllung Seiten (%)", lambda m: 100 * g(m, "surface", "fill_ratio") if g(m, "surface", "fill_ratio") is not None else None, 1),
