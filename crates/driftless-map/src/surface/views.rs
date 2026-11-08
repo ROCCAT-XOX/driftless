@@ -49,7 +49,7 @@
 //! slots by untagged ones, each of those scores above that share: the same decision.) Walls,
 //! desk edges and steps' risers near the path are not tagged.
 //!
-//! **Occluders** ([`super::occlude`], not yet on the GPU): what was measured but has no face
+//! **Occluders** ([`super::occlude`]): what was measured but has no face
 //! hides the faces behind it from an image, though the depth buffer of the faces cannot know.
 //! Such a view counts [`OCCLUDED_SCORE`] of its score and is tagged like a carrier view; the
 //! rules for those then do the rest: it goes when another image shows the face, stays if none
@@ -1250,8 +1250,8 @@ pub(crate) struct ViewsInfo {
 }
 
 /// [`collect_views_with`] with the GPU's batch size (faces per batch; `None`: as large as the
-/// device allows), what hides faces from the images (see the module docs; ignored on the GPU so
-/// far), and what the run reports.
+/// device allows), what hides faces from the images (see the module docs), and what the run
+/// reports.
 pub(crate) fn collect_views_on(
     mesh: &Mesh,
     occluders: &Occluders,
@@ -1497,7 +1497,7 @@ impl Stream {
 pub(crate) struct Pass<'a> {
     pub mesh: &'a Mesh,
     pub faces: &'a Faces,
-    /// What hides faces from the images (see the module docs); only the CPU heeds it so far.
+    /// What hides faces from the images (see the module docs).
     pub occluders: &'a Occluders,
     pub sources: &'a [TextureSource],
     /// [`all_cameras`] of `sources`.
@@ -1637,7 +1637,9 @@ mod tests {
         aabb, cameras, near_boundary, poses, render, shot, surface_cloud, walk, walk_data,
         walk_scene, write_bag, Painted, Shot, Trajectory, T0,
     };
-    use super::super::testutil::{blur, centroid, face_near, painted_mesh, walk_source, Steps};
+    use super::super::testutil::{
+        blur, centroid, face_near, painted_mesh, test_gpu, walk_source, Steps,
+    };
     use super::*;
     use crate::{colorize, ColorConfig, ExposureConfig};
     use driftless_gpu::GpuContext;
@@ -2851,12 +2853,6 @@ mod tests {
         }
     }
 
-    /// A GPU for the tests that fails instead of falling back to the CPU (else a broken
-    /// kernel would pass unnoticed).
-    fn test_gpu() -> Option<GpuContext> {
-        GpuContext::new_for_tests().map(|c| c.with_fallback(false))
-    }
-
     /// `mesh` with every vertex moved by up to ±1 cm (normals off by up to about 20°, as on
     /// real meshes).
     fn jittered(mut mesh: Mesh) -> Mesh {
@@ -3023,7 +3019,7 @@ mod tests {
         );
         // Room for the slots of a quarter of the faces (and no exposure samples): at least
         // four passes.
-        let budget = driftless_gpu::faces_pass_bytes(count, count / 4, k, 0, image, depth);
+        let budget = driftless_gpu::faces_pass_bytes(count, count / 4, k, 0, image, depth, 0);
         let small = ctx.with_budget(budget);
         let notes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = notes.clone();

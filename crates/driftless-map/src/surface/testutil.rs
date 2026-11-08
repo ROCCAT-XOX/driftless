@@ -386,6 +386,12 @@ pub(crate) fn edge_report(mesh: &Mesh) -> (usize, usize) {
     (repeated, boundary)
 }
 
+/// A GPU for the tests that fails instead of falling back to the CPU (else a broken kernel
+/// would pass unnoticed).
+pub(crate) fn test_gpu() -> Option<driftless_gpu::GpuContext> {
+    driftless_gpu::GpuContext::new_for_tests().map(|c| c.with_fallback(false))
+}
+
 // ---- Scenes with camera images ----------------------------------------------------------
 
 /// The colouring tests' synthetic scenes (painted room, fisheye cameras, rendered image bags).

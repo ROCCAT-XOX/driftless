@@ -425,7 +425,7 @@ pub fn texture_mesh(
 }
 
 /// [`texture_mesh`] with `occluders`: what has no face in `mesh` but hides the faces behind it
-/// from the images ([`find_occluders`]). Only the views on the CPU heed them so far.
+/// from the images ([`find_occluders`]).
 pub fn texture_mesh_with(
     mesh: &Mesh,
     occluders: &Occluders,

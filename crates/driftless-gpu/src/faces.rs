@@ -8,6 +8,10 @@
 //! `driftless_map::surface::views`. The slots stay on the GPU until
 //! [`FaceViews::read_views`] / [`FaceViews::read_samples`].
 //!
+//! What was measured but has no face ([`FaceOccluders`]) goes into a second depth buffer of the
+//! same cells; a view with one of 7 samples of its face behind it counts little and is tagged
+//! like a carrier view. Without occluders there is no pass over them and no second buffer.
+//!
 //! Every face goes into the depth buffer, but only the faces of one contiguous range keep
 //! views ([`FaceViews::keep`]): a mesh whose slots do not fit the budget runs in several
 //! passes over the images ([`face_passes`]), each with the same depth buffers and so the same
@@ -30,6 +34,8 @@ const FACE_BYTES: usize = 96;
 const SLOT_BYTES: usize = 12;
 /// Bytes of one exposure sample (`vec4<u32>`).
 const SAMPLE_BYTES: usize = 16;
+/// Bytes of one occluder on the GPU (`vec4<f32>`).
+const OCCLUDER_BYTES: usize = 16;
 /// Images submitted ahead of the GPU at most (bounds the staged image uploads).
 const IN_FLIGHT: usize = 2;
 /// Faces staged on the CPU at a time while uploading.
@@ -82,6 +88,19 @@ pub struct FaceParams {
     pub angle_step: f32,
     /// Largest distance from a centroid to its corners (m).
     pub reach: f64,
+    /// A sample of a face hides behind an occluder that is more than this nearer (m) ...
+    pub occluder_gap: f64,
+    /// ... and the view then counts this share of its score and is tagged like a carrier's.
+    pub occluded_score: f32,
+}
+
+/// What was measured but has no face: it hides the faces behind it from the images.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FaceOccluders<'o> {
+    /// World coordinates.
+    pub points: &'o [[f32; 3]],
+    /// Distance between neighbouring occluders (m): the size of their footprint in an image.
+    pub spacing: f32,
 }
 
 /// One image of the stream.
@@ -143,6 +162,7 @@ pub fn faces_bytes(
     sample_faces: usize,
     image_bytes: usize,
     depth_cells: usize,
+    occluders: usize,
 ) -> u64 {
     faces_pass_bytes(
         faces,
@@ -151,13 +171,15 @@ pub fn faces_bytes(
         sample_faces,
         image_bytes,
         depth_cells,
+        occluders,
     )
 }
 
 /// GPU memory of [`FaceViews`] with `faces` faces of which `kept` keep views (bytes): every
 /// face (96 B, the depth buffer needs them all), the slots of the kept ones (12 B per view),
 /// `sample_kept` exposure samples (16 B per view), the image and depth buffers
-/// ([`stream_bytes`]) and the readback chunk.
+/// ([`stream_bytes`]), the occluders and their depth buffer ([`occluder_bytes`]) and the
+/// readback chunk.
 pub fn faces_pass_bytes(
     faces: usize,
     kept: usize,
@@ -165,19 +187,31 @@ pub fn faces_pass_bytes(
     sample_kept: usize,
     image_bytes: usize,
     depth_cells: usize,
+    occluders: usize,
 ) -> u64 {
     let k = views_per_face as u64;
     faces as u64 * FACE_BYTES as u64
         + kept as u64 * SLOT_BYTES as u64 * k
         + sample_kept as u64 * SAMPLE_BYTES as u64 * k
         + stream_bytes(image_bytes, depth_cells, IN_FLIGHT)
+        + occluder_bytes(occluders, depth_cells)
         + READ_CHUNK
         + 4096
 }
 
+/// Memory of `occluders` occluders (16 B each) and their depth buffer, twice as in
+/// [`stream_bytes`]; without occluders neither is there.
+fn occluder_bytes(occluders: usize, depth_cells: usize) -> u64 {
+    if occluders == 0 {
+        return 0;
+    }
+    occluders as u64 * OCCLUDER_BYTES as u64 + depth_cells as u64 * 4 * 2
+}
+
 /// The passes of `faces` faces within the context's budget: the fewest contiguous ranges of
 /// about equal size, in order, whose [`faces_pass_bytes`] each fit (one range `0..faces` if
-/// all of them fit at once). `sample_stride`: every `stride`-th face keeps exposure samples.
+/// all of them fit at once). `sample_stride`: every `stride`-th face keeps exposure samples;
+/// `occluders` are in every pass.
 /// Fails ([`GpuRunError::Budget`]) if not even a pass of one face fits: the faces, images
 /// and depth buffers alone exceed the budget.
 pub fn face_passes(
@@ -187,6 +221,7 @@ pub fn face_passes(
     sample_stride: Option<usize>,
     image_bytes: usize,
     depth_cells: usize,
+    occluders: usize,
 ) -> Result<Vec<Range<usize>>, GpuRunError> {
     let need = |kept: usize| {
         faces_pass_bytes(
@@ -196,6 +231,7 @@ pub fn face_passes(
             sample_stride.map_or(0, |s| kept.div_ceil(s.max(1))),
             image_bytes,
             depth_cells,
+            occluders,
         )
     };
     passes_within(ctx.budget(), faces, need).ok_or_else(|| GpuRunError::Budget {
@@ -302,6 +338,10 @@ struct FacesUniform {
     carrier_radius: f32,
     carrier_alt: f32,
     angle_step: f32,
+    occluder_gap: f32,
+    occluded_score: f32,
+    occluder_count: u32,
+    occluder_spacing: f32,
     _pad: [u32; 2],
 }
 
@@ -344,6 +384,12 @@ pub struct FaceViews<'a> {
     uniform: wgpu::Buffer,
     depth: wgpu::Buffer,
     depth_capacity: usize,
+    /// The occluders relative to `origin` and their depth buffer (as large as `depth`).
+    /// Without occluders: one entry each, and no pass over them.
+    occluders: wgpu::Buffer,
+    occluder_count: usize,
+    occluder_spacing: f32,
+    occluder_depth: wgpu::Buffer,
     image: wgpu::Buffer,
     image_capacity: u64,
     lin: wgpu::Buffer,
@@ -353,8 +399,10 @@ pub struct FaceViews<'a> {
 impl<'a> FaceViews<'a> {
     /// Uploads `count` faces (`face(i)`, world coordinates) in batches of at most
     /// `batch_faces`, with empty slots for the faces of `keep` (see [`FaceViews::keep`]);
-    /// `linear` maps sRGB bytes to linear values. Fails without views per face, with 2³²
-    /// faces or more, with `keep` not within the faces, or when a buffer cannot be written.
+    /// `linear` maps sRGB bytes to linear values; `occluders` hide the faces behind them. Fails
+    /// without views per face, with 2³² faces or more, with more occluders than one buffer and
+    /// dispatch hold, with `keep` not within the faces, or when a buffer cannot be written.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: &'a GpuContext,
         count: usize,
@@ -363,6 +411,7 @@ impl<'a> FaceViews<'a> {
         params: FaceParams,
         batch_faces: usize,
         keep: Range<usize>,
+        occluders: FaceOccluders<'_>,
     ) -> Result<FaceViews<'a>, GpuRunError> {
         let k = params.views_per_face;
         if k == 0 {
@@ -374,6 +423,22 @@ impl<'a> FaceViews<'a> {
             )));
         }
         let device = ctx.device();
+        let limits = device.limits();
+        let most_occluders = MAX_DISPATCH_FACES.min(
+            usize::try_from(
+                limits
+                    .max_storage_buffer_binding_size
+                    .min(limits.max_buffer_size),
+            )
+            .unwrap_or(usize::MAX)
+                / OCCLUDER_BYTES,
+        );
+        if occluders.points.len() > most_occluders {
+            return Err(GpuRunError::Input(format!(
+                "{} Verdecker, erlaubt sind höchstens {most_occluders}",
+                occluders.points.len()
+            )));
+        }
         let origin = local_origin((0..count).map(|i| face(i).centroid));
         let local = |p: [f32; 3]| [0, 1, 2].map(|j| (f64::from(p[j]) - origin[j]) as f32);
         let batch = batch_faces.clamp(1, MAX_DISPATCH_FACES);
@@ -381,7 +446,7 @@ impl<'a> FaceViews<'a> {
             .step_by(batch)
             .map(|start| {
                 let len = batch.min(count - start);
-                let faces = upload(device, len, |i| {
+                let faces = upload(device, "Flächen", len, |i| {
                     let f = face(start + i);
                     let w = |p: [f32; 3], w: f32| {
                         let l = local(p);
@@ -406,6 +471,10 @@ impl<'a> FaceViews<'a> {
                 })
             })
             .collect::<Result<_, GpuRunError>>()?;
+        let occluder_buffer = upload(device, "Verdecker", occluders.points.len(), |i| {
+            let l = local(occluders.points[i]);
+            [l[0], l[1], l[2], 0.0f32]
+        })?;
         let lin = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Linear-Tabelle"),
             size: 256 * 4,
@@ -434,6 +503,10 @@ impl<'a> FaceViews<'a> {
             uniform,
             depth: storage(device, "Tiefenpuffer", 4),
             depth_capacity: 1,
+            occluders: occluder_buffer,
+            occluder_count: occluders.points.len(),
+            occluder_spacing: occluders.spacing,
+            occluder_depth: storage(device, "Tiefenpuffer Verdecker", 4),
             image: storage(device, "Bild", 4),
             image_capacity: 4,
             lin,
@@ -517,6 +590,8 @@ impl<'a> FaceViews<'a> {
                     entry(5, &self.samples),
                     entry(6, &self.image),
                     entry(7, &self.lin),
+                    entry(8, &self.occluders),
+                    entry(9, &self.occluder_depth),
                 ],
             })
         };
@@ -580,6 +655,9 @@ impl<'a> FaceViews<'a> {
         let mut rebind = false;
         if cells > self.depth_capacity {
             self.depth = storage(device, "Tiefenpuffer", cells as u64 * 4);
+            if self.occluder_count > 0 {
+                self.occluder_depth = storage(device, "Tiefenpuffer Verdecker", cells as u64 * 4);
+            }
             self.depth_capacity = cells;
             rebind = true;
         }
@@ -644,6 +722,10 @@ impl<'a> FaceViews<'a> {
             carrier_radius: p.carrier.radius as f32,
             carrier_alt: p.carrier.alternative,
             angle_step: p.angle_step,
+            occluder_gap: p.occluder_gap as f32,
+            occluded_score: p.occluded_score,
+            occluder_count: self.occluder_count as u32,
+            occluder_spacing: self.occluder_spacing,
             _pad: [0; 2],
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
@@ -658,8 +740,8 @@ impl<'a> FaceViews<'a> {
         failed(ctx)
     }
 
-    /// Clears `cells` of the depth buffer, splats every batch, then finds the views of the
-    /// kept faces.
+    /// Clears `cells` of the depth buffers, splats every batch and the occluders (if any; the
+    /// group of any batch holds them), then finds the views of the kept faces.
     fn dispatch(&self, cells: usize) -> wgpu::SubmissionIndex {
         let ctx = self.ctx;
         let pipes = pipelines(ctx);
@@ -670,13 +752,29 @@ impl<'a> FaceViews<'a> {
             });
         if cells > 0 {
             encoder.clear_buffer(&self.depth, 0, Some(cells as u64 * 4));
+            if self.occluder_count > 0 {
+                encoder.clear_buffer(&self.occluder_depth, 0, Some(cells as u64 * 4));
+            }
         }
         let splat = self.batches.iter().map(|b| (b.group.as_ref(), b.len));
+        let occluders = self
+            .batches
+            .first()
+            .filter(|_| self.occluder_count > 0)
+            .map(|b| (b.group.as_ref(), self.occluder_count));
         let views = self.views.iter().map(|v| (v.group.as_ref(), v.len));
         for (label, pipeline, groups) in [
             ("Tiefenpuffer", &pipes.splat, splat.collect::<Vec<_>>()),
+            (
+                "Tiefenpuffer Verdecker",
+                &pipes.splat_occluders,
+                occluders.into_iter().collect(),
+            ),
             ("Ansichten", &pipes.views, views.collect()),
         ] {
+            if groups.is_empty() {
+                continue;
+            }
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(label),
                 timestamp_writes: None,
@@ -776,15 +874,17 @@ pub(crate) fn check_image(len: usize, w: u32, h: u32) -> Result<(), GpuRunError>
     Ok(())
 }
 
-/// A storage buffer of `n` faces filled from `item`, staged in chunks.
-fn upload(
+/// A storage buffer of `n` items (at least room for one) filled from `item`, staged in chunks.
+fn upload<T: Pod>(
     device: &wgpu::Device,
+    label: &str,
     n: usize,
-    item: impl Fn(usize) -> [[f32; 4]; 6],
+    item: impl Fn(usize) -> T,
 ) -> Result<wgpu::Buffer, GpuRunError> {
+    let bytes = size_of::<T>();
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Flächen"),
-        size: (n * FACE_BYTES).max(FACE_BYTES) as u64,
+        label: Some(label),
+        size: (n * bytes).max(bytes) as u64,
         usage: wgpu::BufferUsages::STORAGE,
         mapped_at_creation: true,
     });
@@ -792,12 +892,12 @@ fn upload(
         let mut view = buffer
             .get_mapped_range_mut(..)
             .map_err(|e| GpuRunError::Device(format!("Puffer nicht beschreibbar ({e:?})")))?;
-        let mut staged: Vec<[[f32; 4]; 6]> = Vec::with_capacity(n.min(UPLOAD_CHUNK));
+        let mut staged: Vec<T> = Vec::with_capacity(n.min(UPLOAD_CHUNK));
         for start in (0..n).step_by(UPLOAD_CHUNK) {
             let end = (start + UPLOAD_CHUNK).min(n);
             staged.clear();
             staged.extend((start..end).map(&item));
-            view.slice(start * FACE_BYTES..end * FACE_BYTES)
+            view.slice(start * bytes..end * bytes)
                 .copy_from_slice(bytemuck::cast_slice(&staged));
         }
     }
@@ -809,6 +909,7 @@ fn upload(
 pub(crate) struct Pipelines {
     layout: wgpu::BindGroupLayout,
     splat: wgpu::ComputePipeline,
+    splat_occluders: wgpu::ComputePipeline,
     views: wgpu::ComputePipeline,
 }
 
@@ -838,6 +939,8 @@ fn pipelines(ctx: &GpuContext) -> &Pipelines {
                 buffer(5, write),
                 buffer(6, read),
                 buffer(7, read),
+                buffer(8, read),
+                buffer(9, write),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -862,6 +965,7 @@ fn pipelines(ctx: &GpuContext) -> &Pipelines {
         };
         Pipelines {
             splat: pipeline("splat_main"),
+            splat_occluders: pipeline("splat_occluders_main"),
             views: pipeline("views_main"),
             layout,
         }
@@ -893,8 +997,8 @@ mod tests {
     #[test]
     fn uniform_matches_the_shader_layout() {
         // Two cameras (48 B each), three rows and the camera position (16 B each), then
-        // seven blocks of four words.
-        assert_eq!(size_of::<FacesUniform>(), 96 + 64 + 7 * 16);
+        // eight blocks of four words.
+        assert_eq!(size_of::<FacesUniform>(), 96 + 64 + 8 * 16);
     }
 
     #[test]
@@ -917,11 +1021,11 @@ mod tests {
 
     #[test]
     fn a_pass_counts_every_face_but_only_its_slots() {
-        let all = faces_bytes(1000, 16, 10, 0, 0);
-        let half = faces_pass_bytes(1000, 500, 16, 5, 0, 0);
+        let all = faces_bytes(1000, 16, 10, 0, 0, 0);
+        let half = faces_pass_bytes(1000, 500, 16, 5, 0, 0, 0);
         assert_eq!(all - half, 500 * 12 * 16 + 5 * 16 * 16);
         assert_eq!(
-            faces_pass_bytes(1000, 0, 16, 0, 0, 0) - faces_pass_bytes(0, 0, 16, 0, 0, 0),
+            faces_pass_bytes(1000, 0, 16, 0, 0, 0, 0) - faces_pass_bytes(0, 0, 16, 0, 0, 0, 0),
             1000 * 96
         );
     }

@@ -1,9 +1,10 @@
 //! The pass of [`super::views`] over the images on the GPU.
 //!
 //! The GPU does what costs the time on the CPU: per used image the depth buffer from every
-//! face's samples, the visibility of centroid and corners, the score, the carrier tag, the
-//! mean colour and the angle, and the insertion into the face's slots (as `keep_best_view`)
-//! and the exposure samples (as `keep_sample`). One invocation per face, images in stream
+//! face's samples and the one of the occluders ([`super::occlude`], the same rule as on the
+//! CPU), the visibility of centroid and corners, the score, the carrier tag, the mean colour
+//! and the angle, and the insertion into the face's slots (as `keep_best_view`) and the
+//! exposure samples (as `keep_sample`). One invocation per face, images in stream
 //! order (the sources' streams one after the other): no atomics on the slots, the same order
 //! as the CPU on equal scores. The smoothed normals come from the CPU (`Faces`); after the
 //! last image the slots come back and the exposure fit, the occlusion mask and the photo
@@ -14,6 +15,7 @@
 //! contiguous range of faces ([`face_passes`]), the images decoded again each time; every
 //! face is in every depth buffer, so the views are the same as in one pass.
 
+use super::occlude::{OCCLUDED_SCORE, OCCLUDER_GAP};
 use super::views::{
     FaceView, Pass, ANGLE_STEP, CARRIER_ALTERNATIVE, CARRIER_BELOW, CARRIER_NORMAL_Z,
     CARRIER_RADIUS, MAX_SUBDIVISIONS, SAMPLE_GAP_CELLS, SMOOTH_COS_MIN,
@@ -24,8 +26,8 @@ use crate::color::{
 use crate::color_gpu::{vis_params, GpuStop, LOOKAHEAD};
 use crate::MapError;
 use driftless_gpu::{
-    face_passes, faces_batch, guarded, CarrierRule, FaceData, FaceImage, FaceParams, FaceViews,
-    GpuCamera, GpuContext, GpuRunError,
+    face_passes, faces_batch, guarded, CarrierRule, FaceData, FaceImage, FaceOccluders, FaceParams,
+    FaceViews, GpuCamera, GpuContext, GpuRunError,
 };
 use driftless_io::bag::BagError;
 use driftless_io::camera::Camera;
@@ -64,6 +66,7 @@ pub(crate) fn gpu_views(
     let Pass {
         mesh,
         faces,
+        occluders,
         cams,
         cfg,
         streams,
@@ -87,8 +90,16 @@ pub(crate) fn gpu_views(
     let (image_bytes, depth_cells) = stream_sizes(cams, ccfg);
     let count = mesh.indices.len();
     let sample_stride = (sample_faces > 0).then_some(stride);
-    let ranges =
-        face_passes(ctx, count, k, sample_stride, image_bytes, depth_cells).map_err(start)?;
+    let ranges = face_passes(
+        ctx,
+        count,
+        k,
+        sample_stride,
+        image_bytes,
+        depth_cells,
+        occluders.points.len(),
+    )
+    .map_err(start)?;
     let params = FaceParams {
         vis: vis_params(ccfg),
         rim_theta: ccfg.rim_theta,
@@ -106,6 +117,8 @@ pub(crate) fn gpu_views(
         },
         angle_step: ANGLE_STEP,
         reach: faces.reach,
+        occluder_gap: OCCLUDER_GAP,
+        occluded_score: OCCLUDED_SCORE,
     };
     let face = |f: usize| FaceData {
         corners: mesh.indices[f].map(|i| mesh.positions[i as usize]),
@@ -124,6 +137,10 @@ pub(crate) fn gpu_views(
             params,
             batch,
             ranges[0].clone(),
+            FaceOccluders {
+                points: &occluders.points,
+                spacing: occluders.spacing,
+            },
         )
     })
     .and_then(|v| v)

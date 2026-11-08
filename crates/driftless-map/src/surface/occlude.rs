@@ -225,10 +225,13 @@ pub(crate) fn face_occluded(
 #[cfg(test)]
 mod tests {
     use super::super::tests::face_colour;
-    use super::super::testutil::{centroid, face_near, grid, scene, Lcg, Steps};
-    use super::super::views::{collect_views, collect_views_on, TextureSource, ViewTable};
+    use super::super::testutil::{centroid, face_near, grid, scene, test_gpu, Lcg, Steps};
+    use super::super::views::{
+        all_cameras, collect_views, collect_views_on, TextureSource, ViewTable,
+    };
     use super::super::{texture_mesh_with, NoiseConfig, SurfaceStats};
     use super::*;
+    use driftless_gpu::GpuContext;
     use driftless_io::progress::Progress;
     use nalgebra::Isometry3;
 
@@ -345,13 +348,22 @@ mod tests {
     }
 
     fn views(mesh: &Mesh, occluders: &Occluders, src: &TextureSource) -> ViewTable {
+        views_on(mesh, occluders, src, None)
+    }
+
+    fn views_on(
+        mesh: &Mesh,
+        occluders: &Occluders,
+        src: &TextureSource,
+        gpu: Option<&GpuContext>,
+    ) -> ViewTable {
         collect_views_on(
             mesh,
             occluders,
             std::slice::from_ref(src),
             &config(),
             &Progress::new(),
-            None,
+            gpu.map(|g| (g, None)),
         )
         .unwrap()
         .0
@@ -484,27 +496,33 @@ mod tests {
 
     #[test]
     fn rod_is_not_painted_on_wall() {
+        rod_case("occlude-rod", None);
+    }
+
+    #[test]
+    fn rod_is_not_painted_on_wall_gpu() {
+        let Some(ctx) = test_gpu() else {
+            eprintln!("übersprungen: kein Grafikadapter vorhanden");
+            return;
+        };
+        rod_case("occlude-rod-gpu", Some(&ctx));
+    }
+
+    fn rod_case(bag: &str, gpu: Option<&GpuContext>) {
         // Head-on from x = 0 the rod hides a stripe of the wall in the best image; the second
         // image, from the side, shows the wall there. With two views the photo consistency
         // cannot tell which is right; only the occluders can.
         let mesh = wall();
-        let src = rod_source("occlude-rod", &[0.0, 1.0]);
+        let src = rod_source(bag, &[0.0, 1.0]);
         let cfg = config();
         let sources = std::slice::from_ref(&src);
         let occluders = find_occluders(&mesh, &full_rod(), &cfg);
         assert!(!occluders.is_empty());
         let run = |occ: &Occluders| {
             let mut stats = SurfaceStats::default();
-            let tex = texture_mesh_with(
-                &mesh,
-                occ,
-                sources,
-                &cfg,
-                &Progress::new(),
-                &mut stats,
-                None,
-            )
-            .unwrap();
+            let tex =
+                texture_mesh_with(&mesh, occ, sources, &cfg, &Progress::new(), &mut stats, gpu)
+                    .unwrap();
             (tex, stats)
         };
         let (plain, stats) = run(&Occluders::default());
@@ -516,6 +534,95 @@ mod tests {
             assert!(off_the_wall(before) > 100, "face {f}: {before:?}");
             assert!(off_the_wall(after) <= 3 * scene::TOL, "face {f}: {after:?}");
         }
+    }
+
+    #[test]
+    fn occluded_view_is_tagged_gpu() {
+        let Some(ctx) = test_gpu() else {
+            eprintln!("übersprungen: kein Grafikadapter vorhanden");
+            return;
+        };
+        let mesh = wall();
+        let occluders = find_occluders(&mesh, &full_rod(), &config());
+        let k = config().views_per_face;
+        let faces = mesh.indices.len();
+        // The views of a face that remain, in order, and which of them are marked.
+        let marked = |t: &ViewTable, f: usize| -> Vec<(u32, bool)> {
+            t.per_face[f * k..(f + 1) * k]
+                .iter()
+                .filter(|v| v.score > 0.0)
+                .map(|v| (v.image, v.carrier()))
+                .collect()
+        };
+        // One image: the marked views stay. Two: those with another view are gone again.
+        for places in [&[0.0][..], &[0.0, 1.0][..]] {
+            let bag = format!("occlude-tagged-gpu-{}", places.len());
+            let src = rod_source(&bag, places);
+            let cpu = views(&mesh, &occluders, &src);
+            let gpu = views_on(&mesh, &occluders, &src, Some(&ctx));
+            let tagged = (0..faces)
+                .filter(|&f| marked(&cpu, f).iter().any(|v| v.1))
+                .count();
+            let differ = (0..faces)
+                .filter(|&f| marked(&cpu, f) != marked(&gpu, f))
+                .count();
+            println!(
+                "{} Bilder: {tagged} markiert, {differ} anders",
+                places.len()
+            );
+            // Rounding may move a sample at the edge of the stripe into the next cell.
+            assert!(differ * 200 <= faces, "{differ} of {faces}");
+            if let [_] = places {
+                assert!(tagged > 10, "{tagged}");
+                let plain = views_on(&mesh, &Occluders::default(), &src, Some(&ctx));
+                for f in in_the_rods_shadow(&mesh, &src) {
+                    let (was, is) = (plain.per_face[f * k], gpu.per_face[f * k]);
+                    assert!(
+                        is.score > 0.0 && is.carrier() && !was.carrier(),
+                        "face {f}: {is:?}"
+                    );
+                    let ratio = is.score / was.score;
+                    assert!((ratio - OCCLUDED_SCORE).abs() < 1e-3, "face {f}: {ratio}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn occluders_in_several_passes_match_one_gpu() {
+        let Some(ctx) = test_gpu() else {
+            eprintln!("übersprungen: kein Grafikadapter vorhanden");
+            return;
+        };
+        let mesh = wall();
+        let src = rod_source("occlude-passes-gpu", &[0.0, 1.0]);
+        let cfg = config();
+        let occluders = find_occluders(&mesh, &full_rod(), &cfg);
+        let run = |ctx: &GpuContext| {
+            collect_views_on(
+                &mesh,
+                &occluders,
+                std::slice::from_ref(&src),
+                &cfg,
+                &Progress::new(),
+                Some((ctx, None)),
+            )
+            .unwrap()
+        };
+        let (one, info) = run(&ctx);
+        assert_eq!(info.gpu_passes, 1);
+        let (image, depth) = super::super::views_gpu::stream_sizes(
+            &all_cameras(std::slice::from_ref(&src)),
+            &cfg.color,
+        );
+        // Room for the slots of a quarter of the faces, and for all occluders in every pass.
+        let count = mesh.indices.len();
+        let k = cfg.views_per_face;
+        let n = occluders.points.len();
+        let budget = driftless_gpu::faces_pass_bytes(count, count / 4, k, 0, image, depth, n);
+        let (many, info) = run(&ctx.with_budget(budget));
+        assert!(info.gpu_passes >= 4, "{}", info.gpu_passes);
+        assert!(one == many);
     }
 
     #[test]
@@ -609,6 +716,28 @@ mod tests {
                 spacing: voxel,
             };
             assert!(views(&mesh, &far, &src) == plain, "{at:?}");
+        }
+    }
+
+    #[test]
+    fn no_occluders_same_views_gpu() {
+        let Some(ctx) = test_gpu() else {
+            eprintln!("übersprungen: kein Grafikadapter vorhanden");
+            return;
+        };
+        let mesh = wall();
+        let src = rod_source("occlude-none-gpu", &[0.0, 1.0]);
+        let plain = views_on(&mesh, &Occluders::default(), &src, Some(&ctx));
+        assert!(plain.per_face.iter().any(|v| v.score > 0.0));
+        assert!(plain.per_face.iter().all(|v| !v.carrier()));
+        // The pass over the occluders runs and finds no cell a face looks at.
+        let voxel = config().voxel as f32;
+        for at in [[0.0, 2.0, 0.0], [0.0, 5.0, 40.0]] {
+            let far = Occluders {
+                points: vec![at],
+                spacing: voxel,
+            };
+            assert!(views_on(&mesh, &far, &src, Some(&ctx)) == plain, "{at:?}");
         }
     }
 }
