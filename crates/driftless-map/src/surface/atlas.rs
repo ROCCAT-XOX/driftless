@@ -5,8 +5,13 @@
 //!    image (one of its kept views) of least cost `−sqrt(score / best score of the face) +
 //!    smooth_weight · (edge neighbours with another image)`, so that neighbours share an image
 //!    where the images are about equally good (the square root: the ratio of the linear
-//!    resolutions, as the score grows with the projected area). Faces without a view keep no
-//!    label. Then small charts are merged ([`merge_small_charts`]): a chart of fewer than
+//!    resolutions, as the score grows with the projected area). With
+//!    [`NoiseConfig::exposure`](super::NoiseConfig::exposure) the score counts times how well the
+//!    face is exposed in the image ([`exposure_weight`]), for the start as for the cost, the best
+//!    score being that of the best weighted view: dark rooms then take their texture from images
+//!    without the lamp in them, less grainy and less patchy; bright rooms hardly change.
+//!    Faces without a view keep no label. Then small charts are merged
+//!    ([`merge_small_charts`]): a chart of fewer than
 //!    [`MERGE_FACES`] faces takes the image of a neighbouring chart (the one with the most
 //!    shared edges first) if that image sees all its faces with at least [`MERGE_MIN_SCORE`] of
 //!    their best score. ICM alone cannot do this: inside a small chart every face agrees with
@@ -89,6 +94,15 @@ pub const MERGE_FACES: usize = 64;
 pub const MERGE_MIN_SCORE: f32 = 0.25;
 /// Rounds of merging.
 pub const MERGE_ROUNDS: usize = 4;
+/// Level of a face in an image (sRGB steps) from which on it counts as well exposed (see
+/// [`exposure_weight`]).
+pub const GOOD_LEVEL: f32 = 64.0;
+/// The weight of a view however dark the face is in it.
+pub const MIN_EXPOSURE_WEIGHT: f32 = 0.25;
+/// A channel at or above this level (sRGB steps) counts as blown out.
+pub const CLIPPED_LEVEL: u8 = 250;
+/// The weight of a view in which the face is blown out.
+pub const CLIPPED_WEIGHT: f32 = 0.5;
 /// A chart of fewer faces is an island (see [`absorb_islands`]).
 pub const ISLAND_FACES: usize = 8;
 /// A patch of fewer connected faces without a view is filled from a neighbouring chart (see
@@ -243,6 +257,18 @@ impl Neighbours {
     }
 }
 
+/// How well a face is exposed in a view, from its mean colour there (raw sRGB steps):
+/// `clamp(L / GOOD_LEVEL, MIN_EXPOSURE_WEIGHT, 1)` with `L = (R + 2G + B) / 4`, or
+/// [`CLIPPED_WEIGHT`] if a channel reaches [`CLIPPED_LEVEL`] (see the module docs).
+pub(crate) fn exposure_weight(colour: [u8; 3]) -> f32 {
+    if colour.iter().any(|&c| c >= CLIPPED_LEVEL) {
+        return CLIPPED_WEIGHT;
+    }
+    let [r, g, b] = colour.map(f32::from);
+    let level = (r + 2.0 * g + b) / 4.0;
+    (level / GOOD_LEVEL).clamp(MIN_EXPOSURE_WEIGHT, 1.0)
+}
+
 /// One image (by rank) per face, or `None` if no image shows it (see the module docs).
 /// Deterministic: faces are visited in index order, ties go to the better view.
 pub(crate) fn choose_labels(
@@ -254,9 +280,29 @@ pub(crate) fn choose_labels(
     let n = mesh.indices.len();
     assert_eq!(views.per_face.len(), n * k, "views do not fit the mesh");
     let slots = |f: usize| &views.per_face[f * k..(f + 1) * k];
+    let worth = |v: &FaceView| {
+        if cfg.noise.exposure {
+            v.score * exposure_weight(v.colour)
+        } else {
+            v.score
+        }
+    };
+    // The view a face starts with: the first one, or the one worth most (on a tie the earlier).
+    let start = |s: &[FaceView]| {
+        if !cfg.noise.exposure {
+            return s[0];
+        }
+        s.iter().take_while(|v| v.score > 0.0).fold(s[0], |top, v| {
+            if worth(v) > worth(&top) {
+                *v
+            } else {
+                top
+            }
+        })
+    };
     let mut labels: Vec<Option<u32>> = (0..n)
         .map(|f| {
-            let v = slots(f)[0];
+            let v = start(slots(f));
             (v.score > 0.0).then_some(v.image)
         })
         .collect();
@@ -268,7 +314,7 @@ pub(crate) fn choose_labels(
         let mut changed = false;
         for f in 0..n {
             let s = slots(f);
-            let best = s[0].score;
+            let best = worth(&start(s));
             if best <= 0.0 {
                 continue;
             }
@@ -279,7 +325,7 @@ pub(crate) fn choose_labels(
                     .iter()
                     .filter(|&&g| labels[g as usize] != Some(v.image))
                     .count();
-                let cost = -(v.score / best).sqrt() + cfg.smooth_weight * differ as f32;
+                let cost = -(worth(v) / best).sqrt() + cfg.smooth_weight * differ as f32;
                 if cost < pick.0 {
                     pick = (cost, Some(v.image));
                 }
@@ -1779,6 +1825,7 @@ mod tests {
     use super::super::testutil::scene::{cameras, poses, write_bag, Painted, Shot, H, T0, W};
     use super::super::testutil::Steps;
     use super::super::views::{collect_views, FaceView, UsedImage};
+    use super::super::NoiseConfig;
     use super::*;
     use crate::exposure::Vignetting;
     use crate::ColorCamera;
@@ -2063,19 +2110,7 @@ mod tests {
             }
             per_face[f * k..f * k + 2].copy_from_slice(&v);
         }
-        let image = |stamp: f64| UsedImage {
-            source: 0,
-            camera: 0,
-            exposure_camera: 0,
-            stamp,
-            world_from_cam: Isometry3::identity(),
-        };
-        let views = ViewTable {
-            images: vec![image(1.0), image(2.0)],
-            per_face,
-            gains: vec![[1.0; 3]; 2],
-            vignetting: Vignetting::flat(1, 4.0),
-        };
+        let views = two_images(per_face);
         let share = |labels: &[Option<u32>], image: u32| {
             labels.iter().filter(|&&l| l == Some(image)).count() as f64 / n as f64
         };
@@ -2416,6 +2451,11 @@ mod tests {
                 per_face[f * k + 1] = view(0, second);
             }
         }
+        two_images(per_face)
+    }
+
+    /// A view table of two images with the slots `per_face`.
+    fn two_images(per_face: Vec<FaceView>) -> ViewTable {
         let image = |stamp: f64| UsedImage {
             source: 0,
             camera: 0,
@@ -2452,6 +2492,218 @@ mod tests {
         for (f, &l) in labels.iter().enumerate() {
             assert_eq!(l, Some(u32::from(in_patch(f))), "face {f}");
         }
+    }
+
+    fn grey(level: u8) -> [u8; 3] {
+        [level; 3]
+    }
+
+    fn face_view(image: u32, score: f32, colour: [u8; 3]) -> FaceView {
+        FaceView {
+            image,
+            score,
+            colour,
+            tag: 0,
+        }
+    }
+
+    /// Every face of `mesh` has the same two views (best first).
+    fn even_views(mesh: &Mesh, k: usize, seen: [FaceView; 2]) -> ViewTable {
+        let n = mesh.indices.len();
+        let mut per_face = vec![FaceView::EMPTY; n * k];
+        for f in 0..n {
+            per_face[f * k..f * k + 2].copy_from_slice(&seen);
+        }
+        two_images(per_face)
+    }
+
+    /// Two images whose scores differ from face to face: image 0 scores 1, image 1 between
+    /// 0.8 and 1.2 (scattered); `colour` gives the colour of a face in an image.
+    fn scattered_views(mesh: &Mesh, k: usize, colour: impl Fn(usize, u32) -> [u8; 3]) -> ViewTable {
+        let n = mesh.indices.len();
+        let mut per_face = vec![FaceView::EMPTY; n * k];
+        for f in 0..n {
+            let other = 0.8 + 0.4 * ((f * 7919) % 101) as f32 / 100.0;
+            let mut v = [
+                face_view(0, 1.0, colour(f, 0)),
+                face_view(1, other, colour(f, 1)),
+            ];
+            if other > 1.0 {
+                v.swap(0, 1);
+            }
+            per_face[f * k..f * k + 2].copy_from_slice(&v);
+        }
+        two_images(per_face)
+    }
+
+    /// Asserts that every face takes `image`, with the default smoothing and without.
+    fn assert_all_take(mesh: &Mesh, views: &ViewTable, image: u32) {
+        let cfg = SurfaceConfig::default();
+        for smooth_weight in [cfg.smooth_weight, 0.0] {
+            let cfg = SurfaceConfig {
+                smooth_weight,
+                ..cfg.clone()
+            };
+            let labels = choose_labels(mesh, views, &cfg);
+            let others = labels.iter().filter(|&&l| l != Some(image)).count();
+            assert_eq!(others, 0, "smoothing {smooth_weight}");
+        }
+    }
+
+    /// The default settings with the given smoothing and without [`NoiseConfig::exposure`].
+    fn without_exposure(smooth_weight: f32) -> SurfaceConfig {
+        let cfg = SurfaceConfig::default();
+        SurfaceConfig {
+            smooth_weight,
+            noise: NoiseConfig {
+                exposure: false,
+                ..cfg.noise
+            },
+            ..cfg
+        }
+    }
+
+    #[test]
+    fn exposure_weight_follows_the_level() {
+        assert_eq!(exposure_weight(grey(0)), MIN_EXPOSURE_WEIGHT);
+        assert_eq!(exposure_weight(grey(15)), MIN_EXPOSURE_WEIGHT);
+        assert_eq!(exposure_weight(grey(32)), 0.5);
+        assert_eq!(exposure_weight(grey(64)), 1.0);
+        assert_eq!(exposure_weight(grey(249)), 1.0);
+        // Green counts twice.
+        assert_eq!(exposure_weight([0, 64, 0]), 0.5);
+        // One blown-out channel is enough, whatever the level.
+        assert_eq!(exposure_weight([250, 120, 120]), CLIPPED_WEIGHT);
+        assert_eq!(exposure_weight([0, 0, 255]), CLIPPED_WEIGHT);
+    }
+
+    #[test]
+    fn dark_view_loses_to_brighter() {
+        // Equally good; the dark one first, as it would win a tie.
+        let mesh = open_wall(8, 0.1);
+        let k = SurfaceConfig::default().views_per_face;
+        let seen = [face_view(0, 1.0, grey(15)), face_view(1, 1.0, grey(60))];
+        assert_all_take(&mesh, &even_views(&mesh, k, seen), 1);
+    }
+
+    #[test]
+    fn sharp_view_can_still_win() {
+        // The weight is a preference: 16 · 0.25 against 1 · 0.94 keeps the dark view …
+        let mesh = open_wall(8, 0.1);
+        let k = SurfaceConfig::default().views_per_face;
+        let seen = |score| [face_view(0, score, grey(15)), face_view(1, 1.0, grey(60))];
+        assert_all_take(&mesh, &even_views(&mesh, k, seen(16.0)), 0);
+        // … 3 · 0.25 does not.
+        assert_all_take(&mesh, &even_views(&mesh, k, seen(3.0)), 1);
+    }
+
+    #[test]
+    fn clipped_view_loses() {
+        // Bright enough by its level, but with a blown-out channel.
+        let mesh = open_wall(8, 0.1);
+        let k = SurfaceConfig::default().views_per_face;
+        let seen = [
+            face_view(0, 1.0, [252, 180, 170]),
+            face_view(1, 1.0, grey(120)),
+        ];
+        assert_all_take(&mesh, &even_views(&mesh, k, seen), 1);
+    }
+
+    #[test]
+    fn smoothing_counts_the_exposure() {
+        // Image 1 is the better one by score · weight (0.5 against 0.25). Weighed by the bare
+        // score, a little smoothing would not hold the faces on it (−1 + 3 · 0.05 < −0.71).
+        let mesh = open_wall(8, 0.1);
+        let k = SurfaceConfig::default().views_per_face;
+        let seen = [face_view(0, 1.0, grey(15)), face_view(1, 0.5, grey(120))];
+        let cfg = SurfaceConfig {
+            smooth_weight: 0.05,
+            ..SurfaceConfig::default()
+        };
+        let labels = choose_labels(&mesh, &even_views(&mesh, k, seen), &cfg);
+        assert_eq!(labels.iter().filter(|&&l| l != Some(1)).count(), 0);
+    }
+
+    #[test]
+    fn smoothing_is_relative_to_the_best_weighted_view() {
+        // A patch of 200 faces (too large to be merged) with its own best image in a wall of
+        // image 0, everything dark (weight 0.25). A corner face of the patch has one neighbour
+        // on its image and two on image 0. Against the best weighted view it keeps its image:
+        // −1 + 2 · 0.04 < −sqrt(0.9) + 0.04. Against the bare best score the patch would erode:
+        // −0.5 + 2 · 0.04 > −sqrt(0.225) + 0.04.
+        let mesh = open_wall(20, 0.1);
+        let cfg = SurfaceConfig {
+            smooth_weight: 0.04,
+            ..SurfaceConfig::default()
+        };
+        let k = cfg.views_per_face;
+        let n = mesh.indices.len();
+        let in_patch = |f: usize| {
+            let c = super::super::testutil::centroid(&mesh, f);
+            (0.5..1.5).contains(&c[1]) && (0.5..1.5).contains(&c[2])
+        };
+        assert_eq!((0..n).filter(|&f| in_patch(f)).count(), 200);
+        let mut per_face = vec![FaceView::EMPTY; n * k];
+        for f in 0..n {
+            if in_patch(f) {
+                per_face[f * k] = face_view(1, 1.0, grey(15));
+                per_face[f * k + 1] = face_view(0, 0.9, grey(15));
+            } else {
+                per_face[f * k] = face_view(0, 1.0, grey(15));
+            }
+        }
+        let labels = choose_labels(&mesh, &two_images(per_face), &cfg);
+        for (f, &l) in labels.iter().enumerate() {
+            assert_eq!(l, Some(u32::from(in_patch(f))), "face {f}");
+        }
+    }
+
+    #[test]
+    fn bright_scene_unchanged() {
+        let mesh = open_wall(20, 0.1);
+        let k = SurfaceConfig::default().views_per_face;
+        // Level c − 5, from 69 up to 238; no channel near the blown-out level.
+        let views = scattered_views(&mesh, k, |f, image| {
+            let c = (74 + (f * 31 + image as usize * 17) % 170) as u8;
+            [c, c, c - 20]
+        });
+        for smooth_weight in [SurfaceConfig::default().smooth_weight, 0.05, 0.0] {
+            let on = SurfaceConfig {
+                smooth_weight,
+                ..SurfaceConfig::default()
+            };
+            let labels = choose_labels(&mesh, &views, &on);
+            assert!(labels == choose_labels(&mesh, &views, &without_exposure(smooth_weight)));
+            if smooth_weight == 0.0 {
+                assert!(labels.contains(&Some(0)) && labels.contains(&Some(1)));
+            }
+        }
+    }
+
+    #[test]
+    fn exposure_off_keeps_labels() {
+        let mesh = open_wall(20, 0.1);
+        let k = SurfaceConfig::default().views_per_face;
+        // Image 0 is dark on half the faces, image 1 blown out on a third.
+        let uneven = scattered_views(&mesh, k, |f, image| match image {
+            0 if f % 2 == 0 => grey(12),
+            1 if f % 3 == 0 => grey(252),
+            _ => grey(150),
+        });
+        let plain = scattered_views(&mesh, k, |_, _| grey(150));
+        for smooth_weight in [SurfaceConfig::default().smooth_weight, 0.05, 0.0] {
+            let cfg = without_exposure(smooth_weight);
+            assert!(choose_labels(&mesh, &uneven, &cfg) == choose_labels(&mesh, &plain, &cfg));
+        }
+        // Without smoothing every face keeps its first view; the switch would change that.
+        let n = mesh.indices.len();
+        let first: Vec<Option<u32>> = (0..n).map(|f| Some(uneven.per_face[f * k].image)).collect();
+        assert!(choose_labels(&mesh, &uneven, &without_exposure(0.0)) == first);
+        let on = SurfaceConfig {
+            smooth_weight: 0.0,
+            ..SurfaceConfig::default()
+        };
+        assert!(choose_labels(&mesh, &uneven, &on) != first);
     }
 
     #[test]
