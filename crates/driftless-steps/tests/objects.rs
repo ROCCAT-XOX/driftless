@@ -22,6 +22,8 @@ fn input(kind: ObjectKind, points: &[[f64; 3]]) -> ObjectInput {
         note: String::new(),
         connection: None,
         diameter_mm: None,
+        height_m: None,
+        sill_m: None,
         properties: BTreeMap::new(),
     }
 }
@@ -644,4 +646,142 @@ fn errors_are_german_and_step_errors() {
     drop(held);
     objects.save(&dir).unwrap();
     assert_eq!(Objects::load(&dir).unwrap(), objects);
+}
+
+// ─── doors and windows set by hand ───────────────────────────────────────────────────────────
+
+/// Two edges `width` metres apart in x; `high` lifts the second edge (clicks at other heights).
+fn edges(width: f64, high: f64) -> [[f64; 3]; 2] {
+    [[1.0, 0.0, 0.5], [1.0 + width, 0.0, 0.5 + high]]
+}
+
+#[test]
+fn doors_and_windows_are_saved_and_read_back() {
+    let dir = tmp("steps-objects-tueren");
+    let mut objects = Objects::default();
+    let door = objects
+        .add(ObjectInput {
+            height_m: Some(2.0),
+            // what does not belong to a door is left out
+            sill_m: Some(0.4),
+            ..input(ObjectKind::Door, &edges(0.9, 1.0))
+        })
+        .unwrap();
+    let window = objects
+        .add(ObjectInput {
+            height_m: Some(1.3),
+            sill_m: Some(0.9),
+            ..input(ObjectKind::Window, &edges(1.2, 0.0))
+        })
+        .unwrap();
+    let plain = objects
+        .add(input(ObjectKind::Window, &edges(1.2, 0.0)))
+        .unwrap();
+    objects.save(&dir).unwrap();
+
+    let text = fs::read_to_string(dir.join(OBJECTS_FILE)).unwrap();
+    for line in [
+        "art = \"tuer\"",
+        "art = \"fenster\"",
+        "hoehe_m = 2.0",
+        "hoehe_m = 1.3",
+        "bruestung_m = 0.9",
+        "quelle = \"hand\"",
+    ] {
+        assert!(text.contains(line), "{line} fehlt in\n{text}");
+    }
+    assert!(!text.contains("bruestung_m = 0.4"), "{text}");
+    assert_eq!(text.matches("hoehe_m").count(), 2, "{text}");
+    assert_eq!(Objects::load(&dir).unwrap(), objects);
+
+    assert_eq!(objects.get(door).unwrap().sill_m, None);
+    assert_eq!(objects.get(door).unwrap().label(), "Tür 1");
+    assert_eq!(objects.get(window).unwrap().label(), "Fenster 2");
+    assert_eq!(objects.get(plain).unwrap().height_m, None);
+
+    // ↶ like any object, also a door with its height
+    assert_eq!(objects.undo(), Some(Undone::Added(plain)));
+    assert_eq!(objects.undo(), Some(Undone::Added(window)));
+    assert!(objects.remove(door));
+    assert_eq!(objects.undo(), Some(Undone::Removed(door)));
+    assert_eq!(objects.get(door).unwrap().height_m, Some(2.0));
+}
+
+#[test]
+fn a_door_or_window_under_30_cm_is_refused() {
+    use ObjectKind::{Door, Window};
+    let narrow = |kind| input(kind, &edges(0.29, 0.0));
+    let cases = [
+        (narrow(Door), "Tür muss mindestens 30 cm breit"),
+        (narrow(Window), "Fenster muss mindestens 30 cm breit"),
+        // height does not make it wider: the width is the one in the plane
+        (
+            input(Door, &[[1.0, 0.0, 0.0], [1.0, 0.2, 2.0]]),
+            "mindestens 30 cm",
+        ),
+        (input(Door, &[P]), "Tür braucht genau zwei Punkte"),
+        (
+            input(Window, &[P, Q, P]),
+            "Fenster braucht genau zwei Punkte",
+        ),
+        (
+            ObjectInput {
+                height_m: Some(0.0),
+                ..input(Door, &edges(0.9, 0.0))
+            },
+            "Höhe",
+        ),
+        (
+            ObjectInput {
+                sill_m: Some(-0.1),
+                ..input(Window, &edges(0.9, 0.0))
+            },
+            "Brüstung",
+        ),
+    ];
+    for (bad, part) in cases {
+        let mut objects = Objects::default();
+        let err = objects.add(bad.clone()).unwrap_err();
+        assert!(
+            matches!(&err, ObjectsError::Invalid(m) if m.contains(part)),
+            "{bad:?}: {err}"
+        );
+        assert_eq!(objects, Objects::default(), "{bad:?}");
+    }
+
+    // what is wide enough, however high the clicks are
+    let mut objects = Objects::default();
+    objects.add(input(Door, &edges(0.3, 1.5))).unwrap();
+    objects.add(input(Window, &edges(0.31, 0.0))).unwrap();
+    assert_eq!(objects.all().len(), 2);
+}
+
+#[test]
+fn a_door_written_by_hand_may_have_a_whole_number_as_height() {
+    let dir = tmp("steps-objects-tuer-handgeschrieben");
+    fs::write(
+        dir.join(OBJECTS_FILE),
+        "[[objekt]]\nnr = 1\nart = \"tuer\"\nhoehe_m = 2\n\
+         punkte = [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0]]\n",
+    )
+    .unwrap();
+    let objects = Objects::load(&dir).unwrap();
+    assert_eq!(objects.get(1).unwrap().height_m, Some(2.0));
+    assert_eq!(objects.get(1).unwrap().source, "hand");
+}
+
+#[test]
+fn a_narrow_door_in_the_file_makes_it_unreadable() {
+    let dir = tmp("steps-objects-tuer-schmal");
+    fs::write(
+        dir.join(OBJECTS_FILE),
+        "[[objekt]]\nnr = 1\nart = \"tuer\"\n\
+         punkte = [[0.0, 0.0, 1.0], [0.1, 0.0, 1.0]]\n",
+    )
+    .unwrap();
+    let err = Objects::load(&dir).unwrap_err();
+    assert!(
+        matches!(&err, ObjectsError::Invalid(m) if m.contains("Objekt 1") && m.contains("30 cm")),
+        "{err}"
+    );
 }

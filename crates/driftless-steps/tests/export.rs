@@ -1120,6 +1120,8 @@ fn socket_above(dir: &Path, x: f64) {
             note: String::new(),
             connection: None,
             diameter_mm: None,
+            height_m: None,
+            sill_m: None,
             properties: BTreeMap::new(),
         })
         .unwrap();

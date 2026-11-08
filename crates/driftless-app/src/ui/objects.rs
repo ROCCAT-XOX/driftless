@@ -1,6 +1,7 @@
-//! The tool „Objekt“ of the 3D view: sockets, connections, cables and pipes set by hand on what
-//! is shown, with the bar above the tools ([`bar`]) and the keys Enter, Backspace, Esc and ⌘Z.
-//! A click hits the points, like „Messen“, while only the surface is shown the surface.
+//! The tool „Objekt“ of the 3D view: sockets, connections, cables, pipes, doors and windows set
+//! by hand on what is shown, with the bar above the tools ([`bar`]) and the keys Enter,
+//! Backspace, Esc and ⌘Z. A click hits the points, like „Messen“, while only the surface is
+//! shown the surface. A door or window takes two clicks, its two edges, and is finished then.
 //!
 //! The objects live with the map or model ([`view_owner`]), not with a floor plan: in its
 //! `objekte.toml`, read with the tree into [`AppState::objects`], changed there at once and
@@ -13,6 +14,7 @@
 //! stay in memory, as they always did ([`MeasureView`]).
 
 use super::plan;
+use super::steps::parse_decimal;
 use super::theme::{icon, DARK};
 use super::tools::{bar_button, float, keys_free, Measurement, Tool};
 use super::view3d::{effective_show, target_size};
@@ -32,6 +34,13 @@ use std::path::{Path, PathBuf};
 const DEFAULT_DIAMETER: f32 = 50.0;
 /// The largest diameter the bar takes (mm).
 const MAX_DIAMETER: f64 = 2000.0;
+/// The height a door starts with (metres, from the floor).
+const DEFAULT_DOOR_HEIGHT: f64 = 2.0;
+/// The largest height or sill the bar takes (metres).
+const MAX_OPENING_HEIGHT: f64 = 10.0;
+/// The width of the view from which the settings of a kind fit beside the kinds in the bar
+/// (points); in a narrower window they go into a second row.
+const ONE_ROW_WIDTH: f32 = 660.0;
 /// Radius of a point object in the view and of the corners of a line (points), and the width
 /// of a line.
 const DOT_RADIUS: f32 = 5.0;
@@ -43,11 +52,13 @@ const MARK_RADIUS: f32 = 9.0;
 const MIN_FRAME_RADIUS: f64 = 0.5;
 
 /// The kinds the tool sets, in the order of the bar.
-const KINDS: [ObjectKind; 4] = [
+const KINDS: [ObjectKind; 6] = [
     ObjectKind::Socket,
     ObjectKind::Connection,
     ObjectKind::Cable,
     ObjectKind::Pipe,
+    ObjectKind::Door,
+    ObjectKind::Window,
 ];
 /// The sorts of connection, in the order of the bar.
 const CONNECTIONS: [ConnectionKind; 7] = [
@@ -63,7 +74,8 @@ const CONNECTIONS: [ConnectionKind; 7] = [
 /// What the objects of a map or model read as: why not, if `objekte.toml` cannot be read.
 pub type ObjectsRead = Result<Objects, String>;
 
-/// The tool „Objekt“: what is set next, and a line under way.
+/// The tool „Objekt“: what is set next, and a line under way (or the first edge of a door or
+/// window).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectTool {
     pub kind: ObjectKind,
@@ -71,7 +83,13 @@ pub struct ObjectTool {
     pub connection: ConnectionKind,
     /// The diameter of a pipe.
     pub diameter_mm: f32,
-    /// The points of a cable or pipe being set, absolute.
+    /// The height of a door (metres); 0: not known.
+    pub door_height_m: f64,
+    /// The height of a window (metres); 0: not known.
+    pub window_height_m: f64,
+    /// The sill of a window above the floor (metres); 0: not known.
+    pub sill_m: f64,
+    /// The points of a cable or pipe being set, absolute; the first edge of a door or window.
     pub line: Vec<[f64; 3]>,
     /// Why the last click or Enter set nothing (German).
     pub message: Option<String>,
@@ -85,6 +103,9 @@ impl Default for ObjectTool {
             kind: ObjectKind::Socket,
             connection: ConnectionKind::Power,
             diameter_mm: DEFAULT_DIAMETER,
+            door_height_m: DEFAULT_DOOR_HEIGHT,
+            window_height_m: 0.0,
+            sill_m: 0.0,
             line: Vec::new(),
             message: None,
             line_owner: None,
@@ -95,6 +116,12 @@ impl Default for ObjectTool {
 impl ObjectTool {
     /// The object of the tool with `points`.
     fn input(&self, points: Vec<[f64; 3]>) -> ObjectInput {
+        let known = |v: f64| (v > 0.0).then_some(v);
+        let (height, sill) = match self.kind {
+            ObjectKind::Door => (known(self.door_height_m), None),
+            ObjectKind::Window => (known(self.window_height_m), known(self.sill_m)),
+            _ => (None, None),
+        };
         ObjectInput {
             kind: self.kind,
             points,
@@ -102,6 +129,8 @@ impl ObjectTool {
             note: String::new(),
             connection: (self.kind == ObjectKind::Connection).then_some(self.connection),
             diameter_mm: (self.kind == ObjectKind::Pipe).then_some(self.diameter_mm),
+            height_m: height,
+            sill_m: sill,
             properties: BTreeMap::new(),
         }
     }
@@ -110,11 +139,13 @@ impl ObjectTool {
         matches!(self.kind, ObjectKind::Cable | ObjectKind::Pipe)
     }
 
-    /// Chooses the kind set next. A line under way stays while the next one is a line too.
+    /// Chooses the kind set next. A line under way stays while the next one is a line too; the
+    /// first edge of a door or window does not become the start of something else.
     fn choose(&mut self, kind: ObjectKind) {
+        let was_a_line = self.sets_a_line();
         self.kind = kind;
         self.message = None;
-        if !self.sets_a_line() {
+        if !(was_a_line && self.sets_a_line()) {
             self.line.clear();
         }
     }
@@ -354,7 +385,8 @@ fn sync_plan(state: &mut AppState) {
 
 /// A click of the tool on the point `position` (absolute): a socket or connection is set
 /// ([`Action::AddObject`]), a cable or pipe gets a point – the same point again (a double click)
-/// is no new one. Why not in [`ObjectTool::message`].
+/// is no new one –, a door or window its first edge, then with the second it is set. Why not in
+/// [`ObjectTool::message`]; a second edge that is refused leaves the first one, to try again.
 pub fn point_clicked(state: &mut AppState, position: [f64; 3]) -> Option<Action> {
     if let Some(why) = blocked(state) {
         state.object_tool.message = Some(why);
@@ -363,6 +395,9 @@ pub fn point_clicked(state: &mut AppState, position: [f64; 3]) -> Option<Action>
     let owner = view_owner(state)?;
     let tool = &mut state.object_tool;
     tool.message = None;
+    if tool.kind.is_opening() {
+        return opening_clicked(tool, owner, position);
+    }
     if !tool.sets_a_line() {
         let input = tool.input(vec![position]);
         return Some(Action::AddObject { owner, input });
@@ -372,6 +407,25 @@ pub fn point_clicked(state: &mut AppState, position: [f64; 3]) -> Option<Action>
         tool.line_owner = Some(owner);
     }
     None
+}
+
+/// A click of the tool on `position` while it sets a door or window.
+fn opening_clicked(tool: &mut ObjectTool, owner: PathBuf, position: [f64; 3]) -> Option<Action> {
+    let Some(&first) = tool.line.first() else {
+        tool.line.push(position);
+        tool.line_owner = Some(owner);
+        return None;
+    };
+    if first == position {
+        return None;
+    }
+    let input = tool.input(vec![first, position]);
+    if let Err(why) = input.check() {
+        tool.message = Some(why.to_string());
+        return None;
+    }
+    tool.line.clear();
+    Some(Action::AddObject { owner, input })
 }
 
 /// Ends the cable or pipe under way (Enter, double click): set with its points, if it has at
@@ -420,13 +474,16 @@ pub fn measured(state: &mut AppState) -> Option<Action> {
         note: String::new(),
         connection: None,
         diameter_mm: None,
+        height_m: None,
+        sill_m: None,
         properties: BTreeMap::new(),
     };
     Some(Action::AddObject { owner, input })
 }
 
 /// The keys of the tool, while no text field has the keyboard and nothing else waits for them:
-/// Enter ends a line, Backspace takes its last point back, Esc drops it.
+/// Enter ends a line, Backspace takes its last point back, Esc drops it (the first edge of a
+/// door or window as well).
 pub fn keys(ctx: &Context, state: &mut AppState) -> Option<Action> {
     if state.tool != Tool::Object || plan::on_screen(state) || !keys_free(ctx) {
         return None;
@@ -451,13 +508,15 @@ pub fn keys(ctx: &Context, state: &mut AppState) -> Option<Action> {
 }
 
 /// The bar of the tool over the tools (its bottom at `bottom`): the kind, for a connection the
-/// sort, for a pipe the diameter, and ↶; below them why the last click set nothing. Returns its
-/// rectangle and what was asked for.
+/// sort, for a pipe the diameter, for a door or window its height, for a window also the sill,
+/// and ↶; below them why the last click set nothing. Returns its rectangle and what was asked
+/// for.
 pub fn bar(ctx: &Context, view: Rect, bottom: f32, state: &mut AppState) -> (Rect, Option<Action>) {
     let mut undo = false;
     let can_undo = can_undo(state);
     let pos = egui::pos2(view.center().x, bottom);
     let tool = &mut state.object_tool;
+    let one_row = view.width() >= ONE_ROW_WIDTH;
     let rect = float(ctx, "objekt", view, pos, Align2::CENTER_BOTTOM, |ui| {
         ui.horizontal(|ui| {
             for kind in KINDS {
@@ -466,29 +525,9 @@ pub fn bar(ctx: &Context, view: Rect, bottom: f32, state: &mut AppState) -> (Rec
                     tool.choose(kind);
                 }
             }
-            match tool.kind {
-                ObjectKind::Connection => {
-                    ui.separator();
-                    ui.label(text::OBJECT_CONNECTION);
-                    egui::ComboBox::from_id_salt("objekt_sorte")
-                        .selected_text(tool.connection.label())
-                        .show_ui(ui, |ui| {
-                            for c in CONNECTIONS {
-                                ui.selectable_value(&mut tool.connection, c, c.label());
-                            }
-                        });
-                }
-                ObjectKind::Pipe => {
-                    ui.separator();
-                    let label = ui.label(text::OBJECT_DIAMETER);
-                    let field = egui::DragValue::new(&mut tool.diameter_mm)
-                        .range(0.0..=MAX_DIAMETER)
-                        .speed(1.0)
-                        .max_decimals(1)
-                        .suffix(" mm");
-                    ui.add(field).labelled_by(label.id);
-                }
-                _ => {}
+            if one_row && has_settings(tool.kind) {
+                ui.separator();
+                settings(ui, tool);
             }
             ui.separator();
             let r = ui
@@ -499,11 +538,77 @@ pub fn bar(ctx: &Context, view: Rect, bottom: f32, state: &mut AppState) -> (Rec
                 .on_hover_text(text::OBJECT_UNDO_HINT);
             undo = r.clicked();
         });
+        if !one_row && has_settings(tool.kind) {
+            ui.horizontal(|ui| settings(ui, tool));
+        }
         if let Some(message) = &tool.message {
             ui.add(egui::Label::new(RichText::new(message).color(DARK.warn)).wrap());
         }
     });
     (rect, undo.then_some(Action::UndoObject))
+}
+
+/// Whether the kind has settings in the bar.
+fn has_settings(kind: ObjectKind) -> bool {
+    matches!(
+        kind,
+        ObjectKind::Connection | ObjectKind::Pipe | ObjectKind::Door | ObjectKind::Window
+    )
+}
+
+/// The settings of the kind chosen: the sort of a connection, the diameter of a pipe, the
+/// height of a door or window and the sill of a window.
+fn settings(ui: &mut Ui, tool: &mut ObjectTool) {
+    match tool.kind {
+        ObjectKind::Connection => {
+            ui.label(text::OBJECT_CONNECTION);
+            egui::ComboBox::from_id_salt("objekt_sorte")
+                .selected_text(tool.connection.label())
+                .show_ui(ui, |ui| {
+                    for c in CONNECTIONS {
+                        ui.selectable_value(&mut tool.connection, c, c.label());
+                    }
+                });
+        }
+        ObjectKind::Pipe => {
+            let label = ui.label(text::OBJECT_DIAMETER);
+            let field = egui::DragValue::new(&mut tool.diameter_mm)
+                .range(0.0..=MAX_DIAMETER)
+                .speed(1.0)
+                .max_decimals(1)
+                .suffix(" mm");
+            ui.add(field).labelled_by(label.id);
+        }
+        ObjectKind::Door => length_field(ui, text::OBJECT_HEIGHT, &mut tool.door_height_m),
+        ObjectKind::Window => {
+            length_field(ui, text::OBJECT_HEIGHT, &mut tool.window_height_m);
+            length_field(ui, text::OBJECT_SILL, &mut tool.sill_m);
+        }
+        _ => {}
+    }
+}
+
+/// A height or sill of a door or window in the bar, in metres with a comma; 0 means not known
+/// and shows „–“, an empty field is that too.
+fn length_field(ui: &mut Ui, name: &str, value: &mut f64) {
+    let label = ui.label(name);
+    let field = egui::DragValue::new(value)
+        .range(0.0..=MAX_OPENING_HEIGHT)
+        .speed(0.01)
+        .custom_formatter(|v, _| {
+            if v > 0.0 {
+                text::meters(v)
+            } else {
+                text::OBJECT_LENGTH_UNKNOWN.to_string()
+            }
+        })
+        .custom_parser(|s| match s.trim_end_matches('m').trim() {
+            "" | text::OBJECT_LENGTH_UNKNOWN => Some(0.0),
+            number => parse_decimal(number),
+        });
+    ui.add(field)
+        .labelled_by(label.id)
+        .on_hover_text(text::OBJECT_LENGTH_HINT);
 }
 
 /// Draws the objects of the map or model shown over the view in `rect`, seen by `camera` in the

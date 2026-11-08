@@ -185,6 +185,8 @@ fn input(kind: ObjectKind, points: Vec<[f64; 3]>) -> ObjectInput {
         note: String::new(),
         connection: None,
         diameter_mm: None,
+        height_m: None,
+        sill_m: None,
         properties: Default::default(),
     }
 }
@@ -356,6 +358,226 @@ fn backspace_and_esc() {
     click(&mut h, A);
     choose(&mut h, Tool::Orbit);
     assert!(h.state().state().object_tool.line.is_empty());
+}
+
+// ─── doors and windows ───────────────────────────────────────────────────────────────────────
+
+#[test]
+fn door_is_set_with_two_clicks_and_has_its_height() {
+    let dir = tmp("objekt-tuer");
+    let (mut h, _, map) = plate_project(&dir);
+    choose(&mut h, Tool::Object);
+    h.state_mut().state_mut().object_tool.kind = ObjectKind::Door;
+    click(&mut h, A);
+    assert!(saved(&map).all().is_empty(), "noch nicht fertig");
+    assert_eq!(h.state().state().object_tool.line, vec![A]);
+    click(&mut h, B);
+    let list = saved(&map);
+    assert_eq!(list.all().len(), 1, "zwei Klicks, ein Objekt");
+    assert_eq!(list.all()[0].kind, ObjectKind::Door);
+    assert_eq!(list.all()[0].points, vec![A, B]);
+    assert_eq!(list.all()[0].height_m, Some(2.0), "Vorgabe");
+    assert_eq!(list.all()[0].sill_m, None);
+    assert!(h.state().state().object_tool.line.is_empty());
+    h.get_by_label("Tür 1");
+    // the next two clicks are the next door
+    click(&mut h, C);
+    assert_eq!(saved(&map).all().len(), 1);
+    click(&mut h, A);
+    assert_eq!(saved(&map).all().len(), 2);
+}
+
+#[test]
+fn window_has_no_height_unless_given() {
+    let dir = tmp("objekt-fenster");
+    let (mut h, _, map) = plate_project(&dir);
+    choose(&mut h, Tool::Object);
+    h.state_mut().state_mut().object_tool.kind = ObjectKind::Window;
+    click(&mut h, A);
+    click(&mut h, B);
+    let list = saved(&map);
+    assert_eq!(list.all()[0].kind, ObjectKind::Window);
+    assert_eq!(list.all()[0].height_m, None);
+    assert_eq!(list.all()[0].sill_m, None);
+
+    let tool = &mut h.state_mut().state_mut().object_tool;
+    tool.window_height_m = 1.3;
+    tool.sill_m = 0.9;
+    click(&mut h, A);
+    click(&mut h, C);
+    let list = saved(&map);
+    assert_eq!(list.all()[1].height_m, Some(1.3));
+    assert_eq!(list.all()[1].sill_m, Some(0.9));
+}
+
+#[test]
+fn a_door_under_30_cm_is_refused_and_the_first_edge_stays() {
+    let dir = tmp("objekt-tuer-schmal");
+    let (mut h, _, map) = plate_project(&dir);
+    choose(&mut h, Tool::Object);
+    h.state_mut().state_mut().object_tool.kind = ObjectKind::Door;
+    click(&mut h, A);
+    click(&mut h, [A[0] + 0.1, A[1], A[2]]);
+    assert!(saved(&map).all().is_empty());
+    let message = h.state().state().object_tool.message.clone();
+    assert!(
+        message.as_deref().is_some_and(|m| m.contains("30 cm")),
+        "{message:?}"
+    );
+    assert_eq!(
+        h.state().state().object_tool.line,
+        vec![A],
+        "die erste Kante bleibt"
+    );
+    // the message is shown, and the second edge can be set again
+    h.run_steps(2);
+    h.get_by_label(message.as_deref().unwrap());
+    click(&mut h, B);
+    assert_eq!(saved(&map).all().len(), 1);
+    assert!(h.state().state().object_tool.message.is_none());
+}
+
+#[test]
+fn the_same_point_twice_is_no_second_edge() {
+    let dir = tmp("objekt-tuer-doppelt");
+    let (mut h, _, map) = plate_project(&dir);
+    choose(&mut h, Tool::Object);
+    h.state_mut().state_mut().object_tool.kind = ObjectKind::Door;
+    click(&mut h, A);
+    click(&mut h, A);
+    assert!(saved(&map).all().is_empty());
+    assert_eq!(h.state().state().object_tool.line, vec![A]);
+    assert_eq!(h.state().state().object_tool.message, None);
+}
+
+#[test]
+fn keys_and_another_kind_drop_the_first_edge_and_undo_takes_a_door_back() {
+    let dir = tmp("objekt-tuer-tasten");
+    let (mut h, _, map) = plate_project(&dir);
+    choose(&mut h, Tool::Object);
+    h.state_mut().state_mut().object_tool.kind = ObjectKind::Door;
+    click(&mut h, A);
+    key(&mut h, Key::Backspace);
+    assert!(h.state().state().object_tool.line.is_empty());
+    click(&mut h, A);
+    key(&mut h, Key::Escape);
+    assert!(h.state().state().object_tool.line.is_empty());
+    assert_eq!(h.state().state().tool, Tool::Object);
+
+    // a first edge never becomes the start of a cable
+    click(&mut h, A);
+    h.get_by_role_and_label(Role::Button, "Kabel").click();
+    h.run_steps(2);
+    assert_eq!(h.state().state().object_tool.kind, ObjectKind::Cable);
+    assert!(h.state().state().object_tool.line.is_empty());
+    h.get_by_role_and_label(Role::Button, "Tür").click();
+    h.run_steps(2);
+    assert_eq!(h.state().state().object_tool.kind, ObjectKind::Door);
+
+    click(&mut h, A);
+    click(&mut h, B);
+    assert_eq!(saved(&map).all().len(), 1);
+    h.get_by_label("Tür 1");
+    undo_keys(&mut h);
+    assert!(saved(&map).all().is_empty());
+    assert!(h.query_by_label("Tür 1").is_none());
+}
+
+#[test]
+fn a_door_by_hand_in_the_plan_and_on_its_layer() {
+    let dir = tmp("objekt-tuer-plan");
+    let (mut h, _, map) = room_project(&dir);
+    compute(&mut h, &map);
+    h.get_by_label("Tür (0)");
+    // two edges on the longest wall of the plan, half way along it
+    let shown = h.state().state().plan.shown.clone().unwrap();
+    let plan = &shown.report.plan;
+    let wall_in_view = plan
+        .faces
+        .iter()
+        .max_by(|a, b| {
+            let len = |f: &&driftless_plan::WallFace| (f.b[0] - f.a[0]).hypot(f.b[1] - f.a[1]);
+            len(a).total_cmp(&len(b))
+        })
+        .unwrap();
+    let dir_on = {
+        let (dx, dy) = (
+            wall_in_view.b[0] - wall_in_view.a[0],
+            wall_in_view.b[1] - wall_in_view.a[1],
+        );
+        let len = dx.hypot(dy);
+        [dx / len, dy / len]
+    };
+    let along = |t: f64| {
+        plan.frame.to_map([
+            wall_in_view.a[0] + dir_on[0] * t,
+            wall_in_view.a[1] + dir_on[1] * t,
+            1.0,
+        ])
+    };
+    run(
+        &mut h,
+        Action::AddObject {
+            owner: map.clone(),
+            input: ObjectInput {
+                height_m: Some(2.0),
+                ..input(ObjectKind::Door, vec![along(1.0), along(1.9)])
+            },
+        },
+    );
+    // drawn at once, without calculating the plan again
+    h.get_by_label("Tür (1)");
+    let shown = h.state().state().plan.shown.clone().unwrap();
+    let on_door_layer = |shown: &driftless_app::ui::plan::ShownPlan| -> Vec<String> {
+        shown
+            .drawing
+            .entities
+            .iter()
+            .filter(|e| e.layer == "Tür")
+            .filter_map(|e| match &e.kind {
+                driftless_export::dxf::EntityKind::Shape(driftless_export::dxf::Shape::Text {
+                    value,
+                    ..
+                }) => Some(value.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(on_door_layer(&shown), ["Tür 0,90 × 2,00 m"]);
+    let on = shown
+        .drawing
+        .layers
+        .iter()
+        .find(|l| l.name == "Tür")
+        .unwrap()
+        .on;
+    assert!(on);
+    run(
+        &mut h,
+        Action::SetPlanLayer {
+            layer: "Tür".into(),
+            on: false,
+        },
+    );
+    let shown = h.state().state().plan.shown.clone().unwrap();
+    assert!(
+        !shown
+            .drawing
+            .layers
+            .iter()
+            .find(|l| l.name == "Tür")
+            .unwrap()
+            .on
+    );
+    run(
+        &mut h,
+        Action::SetPlanLayer {
+            layer: "Tür".into(),
+            on: true,
+        },
+    );
+    run(&mut h, Action::UndoObject);
+    h.get_by_label("Tür (0)");
 }
 
 // ─── the clicks of the view (with a GPU) ─────────────────────────────────────────────────────

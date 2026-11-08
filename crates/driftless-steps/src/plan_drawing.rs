@@ -11,12 +11,19 @@
 //! and text are drawn once ([`FloorPlan::distinct_openings`]). Every layer is there even when
 //! nothing is on it, one hidden in the program is written but off. Texts never lie on top of
 //! each other: one that finds no free place near its line is left out.
+//!
+//! A door or window set by hand is drawn like one the plan found: near a wall of the plan it is
+//! laid on that wall, cuts it (both faces of a wall with two) and takes the place of the
+//! openings it overlaps; the hand wins. Near no wall it is drawn where it was set, as a line
+//! with its text, so that nothing set is lost. The plan itself – rooms, dimensions, what was
+//! found – stays as computed.
 
 use crate::objects::{Object, ObjectKind, Objects};
 use crate::plan::PlanReport;
 use crate::PROGRAM;
 use driftless_export::dxf::{Block, Drawing, Entity, EntityKind, Layer, Shape};
 use driftless_plan::{metres, FloorPlan, Opening, OpeningKind, PlanFrame, Room, WallFace};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 const WALL: &str = "Wand";
@@ -48,8 +55,9 @@ pub const LAYERS: [(&str, u8); 11] = [
 
 /// Attributes of the blocks; the first one stands visibly next to the symbol.
 const BLOCK_TAGS: [&str; 5] = ["NR", "NAME", "ART", "HOEHE", "NOTIZ"];
-/// What the extended data of a cable or pipe always holds, which a free property cannot be.
-const LINE_TAGS: [&str; 7] = [
+/// What the extended data of a cable, pipe, door or window always holds, which a free property
+/// cannot be.
+const LINE_TAGS: [&str; 8] = [
     "NR",
     "NAME",
     "ART",
@@ -57,6 +65,7 @@ const LINE_TAGS: [&str; 7] = [
     "NOTIZ",
     "QUELLE",
     "DURCHMESSER_MM",
+    "BRUESTUNG",
 ];
 /// Longest tag made from the key of a free property, before a number that makes it unique.
 const MAX_TAG: usize = 64;
@@ -90,6 +99,20 @@ const MIN_PIECE: f64 = 0.001;
 const TICK: f64 = 35.355;
 /// Half the edge of the symbol of a block (mm).
 const SYMBOL: f64 = 75.0;
+/// How near a wall both edges of a door or window set by hand must lie to go on it (metres).
+const HAND_REACH: f64 = 0.30;
+/// The least of its width it must run along the wall, not across (a cosine, about 45°).
+const HAND_ALONG: f64 = 0.7;
+/// The least of its width on the wall, and not past its end.
+const HAND_ON_WALL: f64 = 0.5;
+/// An opening found gives way to one set by hand it overlaps by at least this (metres); less
+/// is the inaccuracy of the clicks and leaves both.
+const HAND_OVERLAP: f64 = 0.05;
+/// How far under the floor or over the ceiling a door or window may lie and still go on a wall
+/// of this storey (metres); further it is on another storey.
+const HAND_STOREY_SLACK: f64 = 0.5;
+/// The top of a storey without a flat ceiling, for that (metres).
+const HAND_NO_CEILING: f64 = 4.0;
 
 /// Where a plan is drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -121,19 +144,21 @@ pub fn elevation_mm(report: &PlanReport, export: &PlanExport) -> f64 {
 pub fn plan_drawing(report: &PlanReport, objects: &Objects, export: &PlanExport) -> Drawing {
     let plan = &report.plan;
     let tags = Tags::new(objects);
+    let placed = place_openings(plan, objects);
     let mut sheet = Sheet {
         frame: &plan.frame,
         as_cloud: export.placement == PlanPlacement::AsCloud,
         entities: Vec::new(),
         taken: Vec::new(),
     };
-    sheet.walls(plan);
+    sheet.walls(&placed.plan);
     // The names of the rooms stand where they stand; the other texts make way for them.
     sheet.reserve_room_labels(plan);
-    sheet.openings(plan);
+    sheet.openings(&placed.plan, &placed.on_wall, &tags.line);
     sheet.rooms(plan);
     sheet.dimensions(plan);
     sheet.objects(objects, &tags);
+    sheet.far_openings(&placed.far, &tags.line);
     Drawing {
         layers: LAYERS
             .iter()
@@ -147,6 +172,145 @@ pub fn plan_drawing(report: &PlanReport, objects: &Objects, export: &PlanExport)
         entities: sheet.entities,
         comments: comments(&plan.frame, export.placement),
     }
+}
+
+/// The doors and windows set by hand among the openings of a plan.
+struct Placed<'a> {
+    /// The plan with those near a wall among its openings, in place of the ones they overlap;
+    /// the plan as computed without any.
+    plan: Cow<'a, FloorPlan>,
+    /// Index into the openings of [`Self::plan`] → the object that opening is.
+    on_wall: BTreeMap<usize, &'a Object>,
+    /// Those near no wall of this plan: drawn where they were set.
+    far: Vec<&'a Object>,
+}
+
+/// Lays the doors and windows of `objects` on the walls of `plan`, as [`Placed`] says.
+fn place_openings<'a>(plan: &'a FloorPlan, objects: &'a Objects) -> Placed<'a> {
+    let mut near = Vec::new();
+    let mut far = Vec::new();
+    for object in objects.all().iter().filter(|o| o.kind.is_opening()) {
+        match lay_on_wall(plan, object) {
+            Some(opening) => near.push((object, opening)),
+            None => far.push(object),
+        }
+    }
+    if near.is_empty() {
+        return Placed {
+            plan: Cow::Borrowed(plan),
+            on_wall: BTreeMap::new(),
+            far,
+        };
+    }
+    let mut merged = plan.clone();
+    merged
+        .openings
+        .retain(|old| !near.iter().any(|(_, new)| overlaps(plan, old, new)));
+    let mut on_wall = BTreeMap::new();
+    for (object, opening) in near {
+        on_wall.insert(merged.openings.len(), object);
+        merged.openings.push(opening);
+    }
+    Placed {
+        plan: Cow::Owned(merged),
+        on_wall,
+        far,
+    }
+}
+
+/// `object` as an opening of the wall it lies at: the nearest face both its edges are within
+/// [`HAND_REACH`] of, along it and on it, on this storey. `None` if there is none.
+fn lay_on_wall(plan: &FloorPlan, object: &Object) -> Option<Opening> {
+    let [p, q] = object.points[..] else {
+        return None;
+    };
+    let (p, q) = (plan.frame.to_plan(p), plan.frame.to_plan(q));
+    let z = (p[2] + q[2]) / 2.0;
+    let top = plan
+        .storey
+        .ceiling_z
+        .map_or(HAND_NO_CEILING, |ceiling| ceiling - plan.storey.floor_z);
+    if z < -HAND_STOREY_SLACK || z > top + HAND_STOREY_SLACK {
+        return None;
+    }
+    let (p, q) = ([p[0], p[1]], [q[0], q[1]]);
+    let width = (q[0] - p[0]).hypot(q[1] - p[1]);
+    let mut nearest: Option<(f64, usize, f64, f64)> = None;
+    for (index, face) in plan.faces.iter().enumerate() {
+        let Some(wall) = Wall::of(face) else {
+            continue;
+        };
+        let (t0, t1) = (wall.along(p), wall.along(q));
+        let (from, to) = (t0.min(t1), t0.max(t1));
+        let distance = wall.distance(p).max(wall.distance(q));
+        let on_wall = to.min(wall.len) - from.max(0.0);
+        if distance <= HAND_REACH
+            && to - from >= HAND_ALONG * width
+            && on_wall >= HAND_ON_WALL * (to - from)
+            && nearest.is_none_or(|n| distance < n.0)
+        {
+            nearest = Some((distance, index, from, to));
+        }
+    }
+    let (_, face, from, to) = nearest?;
+    let (kind, sill) = match object.kind {
+        ObjectKind::Door => (OpeningKind::Door, 0.0),
+        _ => (OpeningKind::Window, object.sill_m.unwrap_or(0.0)),
+    };
+    Some(Opening {
+        kind,
+        face,
+        from,
+        to,
+        sill,
+        head: sill + object.height_m.unwrap_or(0.0),
+        crossed: false,
+        note: String::new(),
+    })
+}
+
+/// Whether the opening `new` set by hand covers the opening `old` of the plan: on the same face
+/// or the other face of the wall, along it by at least [`HAND_OVERLAP`].
+fn overlaps(plan: &FloorPlan, old: &Opening, new: &Opening) -> bool {
+    let paired = old.face == new.face
+        || plan.pairs.iter().any(|pair| {
+            (pair.front, pair.back) == (old.face, new.face)
+                || (pair.back, pair.front) == (old.face, new.face)
+        });
+    if !paired {
+        return false;
+    }
+    let (Some(wall), Some(other)) = (
+        plan.faces.get(new.face).and_then(Wall::of),
+        plan.faces.get(old.face).and_then(Wall::of),
+    ) else {
+        return false;
+    };
+    let (t0, t1) = (
+        wall.along(other.at(old.from, 0.0)),
+        wall.along(other.at(old.to, 0.0)),
+    );
+    t0.max(t1).min(new.to) - t0.min(t1).max(new.from) >= HAND_OVERLAP
+}
+
+/// How many doors, windows and unclear openings the plan shows with these objects: those it
+/// found, without the ones a door or window set by hand replaces, and the ones set by hand.
+pub fn opening_counts(plan: &FloorPlan, objects: &Objects) -> [usize; 3] {
+    let placed = place_openings(plan, objects);
+    let drawn: &FloorPlan = &placed.plan;
+    let distinct = drawn.distinct_openings();
+    let found = |kind: OpeningKind| {
+        distinct
+            .iter()
+            .filter(|&&i| drawn.openings[i].kind == kind)
+            .count()
+    };
+    let far = |kind: ObjectKind| placed.far.iter().filter(|o| o.kind == kind).count();
+    [
+        found(OpeningKind::Door) + far(ObjectKind::Door),
+        found(OpeningKind::Window) + far(ObjectKind::Window),
+        found(OpeningKind::Unclear),
+    ]
 }
 
 fn comments(frame: &PlanFrame, placement: PlanPlacement) -> Vec<String> {
@@ -275,6 +439,11 @@ impl Wall {
     /// How far along this face the point `p` lies.
     fn along(&self, p: [f64; 2]) -> f64 {
         (p[0] - self.a[0]) * self.dir[0] + (p[1] - self.a[1]) * self.dir[1]
+    }
+
+    /// How far off the line of this face the point `p` lies.
+    fn distance(&self, p: [f64; 2]) -> f64 {
+        ((p[0] - self.a[0]) * self.dir[1] - (p[1] - self.a[1]) * self.dir[0]).abs()
     }
 }
 
@@ -450,6 +619,22 @@ impl Sheet<'_> {
         self.add(layer, Shape::Line { a, b, dashed });
     }
 
+    /// A line with extended data.
+    fn line_with(
+        &mut self,
+        layer: &str,
+        a: [f64; 2],
+        b: [f64; 2],
+        dashed: bool,
+        xdata: Vec<String>,
+    ) {
+        self.entities.push(Entity {
+            layer: layer.to_string(),
+            kind: EntityKind::Shape(Shape::Line { a, b, dashed }),
+            xdata,
+        });
+    }
+
     /// The faces without their openings. Both entries of an opening in a wall with two faces
     /// cut their face; a door or window found from one side only cuts the other face as well.
     fn walls(&mut self, plan: &FloorPlan) {
@@ -490,14 +675,25 @@ impl Sheet<'_> {
         );
     }
 
-    /// End caps, symbol and text, once per real opening.
-    fn openings(&mut self, plan: &FloorPlan) {
+    /// End caps, symbol and text, once per real opening. One set by hand (`hand` by the index
+    /// of the opening) keeps the width it was set with, also past the end of the wall, and has
+    /// its own text and extended data.
+    fn openings(
+        &mut self,
+        plan: &FloorPlan,
+        hand: &BTreeMap<usize, &Object>,
+        tags: &BTreeMap<String, String>,
+    ) {
         for index in plan.distinct_openings() {
             let o = &plan.openings[index];
             let Some(wall) = plan.faces.get(o.face).and_then(Wall::of) else {
                 continue;
             };
-            let (from, to) = (o.from.max(0.0), o.to.min(wall.len));
+            let object = hand.get(&index).copied();
+            let (from, to) = match object {
+                Some(_) => (o.from, o.to),
+                None => (o.from.max(0.0), o.to.min(wall.len)),
+            };
             if to <= from {
                 continue;
             }
@@ -514,19 +710,28 @@ impl Sheet<'_> {
                 }
             }
             let (a, b) = (self.plan(wall.at(from, 0.0)), self.plan(wall.at(to, 0.0)));
+            let (hand_text, xdata) = match object {
+                Some(object) => (
+                    Some(opening_text(object, to - from)),
+                    opening_xdata(object, tags),
+                ),
+                None => (None, Vec::new()),
+            };
             let (layer, text) = match o.kind {
                 OpeningKind::Door => {
-                    self.line(DOOR, a, b, true);
-                    (DOOR, format!("Tür {}", size(to - from, o)))
+                    self.line_with(DOOR, a, b, true, xdata);
+                    let text = hand_text.unwrap_or_else(|| format!("Tür {}", size(to - from, o)));
+                    (DOOR, text)
                 }
                 OpeningKind::Window => {
                     for side in [-0.5, 0.5] {
                         let at = depth / 2.0 + side * WINDOW_LINES;
                         let (p, q) = (self.plan(wall.at(from, at)), self.plan(wall.at(to, at)));
-                        self.line(WINDOW, p, q, false);
+                        self.line_with(WINDOW, p, q, false, xdata.clone());
                     }
                     let brh = metres(o.sill);
-                    (WINDOW, format!("Fenster {}, BRH {brh}", size(to - from, o)))
+                    let found = || format!("Fenster {}, BRH {brh}", size(to - from, o));
+                    (WINDOW, hand_text.unwrap_or_else(found))
                 }
                 OpeningKind::Unclear => {
                     // The reason stands in the extended data, the plan only says „unklar“.
@@ -600,7 +805,42 @@ impl Sheet<'_> {
         }
     }
 
-    /// Every object on its layer, in the order added.
+    /// The doors and windows set by hand near no wall: a line where they were set, with their
+    /// text and data, in the plan and in both placements.
+    fn far_openings(&mut self, far: &[&Object], tags: &BTreeMap<String, String>) {
+        for o in far {
+            let [p, q] = o.points[..] else {
+                continue;
+            };
+            let (a, b) = (self.map(p), self.map(q));
+            let (pp, qp) = (self.frame.to_plan(p), self.frame.to_plan(q));
+            let width = (qp[0] - pp[0]).hypot(qp[1] - pp[1]);
+            let layer = if o.kind == ObjectKind::Door {
+                DOOR
+            } else {
+                WINDOW
+            };
+            let along = unit(a, b).unwrap_or([1.0, 0.0]);
+            let side = left_of(reading(along));
+            let text = opening_text(o, width);
+            let label = self.free_beside(middle(a, b), along, side, text);
+            self.entities.push(Entity {
+                layer: layer.to_string(),
+                kind: EntityKind::Shape(Shape::Polyline {
+                    points: vec![a, b],
+                    closed: false,
+                    dashed: false,
+                }),
+                xdata: opening_xdata(o, tags),
+            });
+            if let Some(label) = label {
+                self.add(layer, label);
+            }
+        }
+    }
+
+    /// Every object on its layer, in the order added. Doors and windows are not here: those on
+    /// a wall are among the openings, the others are [`Self::far_openings`].
     fn objects(&mut self, objects: &Objects, tags: &Tags) {
         for o in objects.all() {
             match o.kind {
@@ -612,6 +852,7 @@ impl Sheet<'_> {
                 ObjectKind::Cable => self.line_object(o, CABLE, &tags.line),
                 ObjectKind::Pipe => self.line_object(o, PIPE, &tags.line),
                 ObjectKind::Measure => self.measurement(o),
+                ObjectKind::Door | ObjectKind::Window => {}
             }
         }
     }
@@ -741,6 +982,47 @@ fn short_name(o: &Object) -> String {
     short
 }
 
+/// The text of a door or window set by hand, of width `width` (metres): „Tür 0,90 × 2,00 m“,
+/// „Fenster 1,20 m“ without a known height, the sill of a window as „BRH 0,90 m“ and a name
+/// after them, as with a measurement.
+fn opening_text(o: &Object, width: f64) -> String {
+    let mut text = match o.height_m {
+        Some(height) => format!("{} {} × {}", o.kind.label(), number(width), metres(height)),
+        None => format!("{} {}", o.kind.label(), metres(width)),
+    };
+    if let Some(sill) = o.sill_m.filter(|_| o.kind == ObjectKind::Window) {
+        text += &format!(", BRH {}", metres(sill));
+    }
+    let name = short_name(o);
+    if !name.is_empty() {
+        text += &format!(" · {name}");
+    }
+    text
+}
+
+/// The extended data of a door or window set by hand (heights in millimetres, empty if not
+/// known), as those of a cable.
+fn opening_xdata(o: &Object, tags: &BTreeMap<String, String>) -> Vec<String> {
+    let mm = |metres: f64| ((metres * 1000.0).round() as i64).to_string();
+    let mut xdata = vec![
+        format!("NR={}", o.nr),
+        format!("NAME={}", o.name),
+        format!("ART={}", o.kind.label()),
+        format!("HOEHE={}", o.height_m.map_or(String::new(), mm)),
+        format!("NOTIZ={}", o.note),
+        format!("QUELLE={}", o.source),
+    ];
+    xdata.extend(
+        o.properties
+            .iter()
+            .filter_map(|(key, value)| Some(format!("{}={value}", tags.get(key)?))),
+    );
+    if let Some(sill) = o.sill_m.filter(|_| o.kind == ObjectKind::Window) {
+        xdata.push(format!("BRUESTUNG={}", mm(sill)));
+    }
+    xdata
+}
+
 /// „Rohr 3“, with a name „Rohr 3 · Heizung“.
 fn title(o: &Object) -> String {
     let label = format!("{} {}", o.kind.label(), o.nr);
@@ -792,7 +1074,7 @@ fn property_tags<'a>(
     tags
 }
 
-/// The tags of the free properties, per block and for the cables and pipes.
+/// The tags of the free properties, per block and for the cables, pipes, doors and windows.
 struct Tags {
     socket: BTreeMap<String, String>,
     connection: BTreeMap<String, String>,
@@ -810,7 +1092,15 @@ impl Tags {
         Tags {
             socket: of(&[ObjectKind::Socket], &BLOCK_TAGS),
             connection: of(&[ObjectKind::Connection], &BLOCK_TAGS),
-            line: of(&[ObjectKind::Cable, ObjectKind::Pipe], &LINE_TAGS),
+            line: of(
+                &[
+                    ObjectKind::Cable,
+                    ObjectKind::Pipe,
+                    ObjectKind::Door,
+                    ObjectKind::Window,
+                ],
+                &LINE_TAGS,
+            ),
         }
     }
 

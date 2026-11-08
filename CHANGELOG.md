@@ -69,6 +69,12 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
   Doppelklick beendet einen Linienzug, Backspace nimmt den letzten Punkt zurück, Esc verwirft ihn. ↶ (⌘Z,
   Strg+Z) nimmt jede Änderung zurück, auch nach einem Neustart. Die Liste „Objekte“ in „Planung“ markiert,
   zeigt in 3D, benennt um, nimmt Notizen und löscht.
+- Türen und Fenster von Hand im Werkzeug „Objekt“: Der Laser sieht eine geschlossene Tür nur als Wand, ein
+  Fenster ohne Messung dahinter wird nicht erkannt. Zwei Klicks auf die beiden Kanten setzen sie, Höhe und
+  Brüstung sind freiwillig, unter 30 cm Breite lehnt die App ab. Nahe einer Wand (bis 30 cm) schneidet das
+  Objekt sie wie eine erkannte Öffnung, im Plan und im DXF, auf den Layern „Tür“ und „Fenster“, ohne dass der
+  Plan neu gerechnet wird; es gewinnt gegen eine erkannte Öffnung an derselben Stelle. Fern jeder Wand bleibt
+  es als Strich mit Beschriftung erhalten.
 - Objekte und Messungen gehören zur Karte oder zum Modell (`objekte.toml`) und überstehen einen neu
   gerechneten Grundriss, Neustart und Verschieben des Projekts.
 

@@ -17,6 +17,7 @@ use driftless_io::testdir::TestDir;
 use driftless_io::testscan::tmp;
 use driftless_map::{write_las, Cloud};
 use driftless_steps::merge::{ModelMember, ModelReport, MODEL_LAS, MODEL_REPORT};
+use driftless_steps::objects::ObjectKind;
 use driftless_steps::pairs::{stored_text, PointPairEntry, PointPairs, POINT_PAIRS_FILE};
 use driftless_steps::slam::SlamSettings;
 use driftless_traj::nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, Vector3};
@@ -452,12 +453,16 @@ fn small_window_no_overlap() {
     };
     let mut h = window(app, [1024.0, 640.0]);
     // the cut, then the brush and the tool „Objekt“ with their bars above the tools
-    for (tool, bar) in [
-        (Tool::Cut, "Schnitt"),
-        (Tool::Brush, "Pinsel"),
-        (Tool::Object, "Objekt"),
+    for (tool, bar, kind) in [
+        (Tool::Cut, "Schnitt", ObjectKind::Socket),
+        (Tool::Brush, "Pinsel", ObjectKind::Socket),
+        (Tool::Object, "Objekt", ObjectKind::Socket),
+        (Tool::Object, "Objekt, Tür", ObjectKind::Door),
+        // the widest: height and sill
+        (Tool::Object, "Objekt, Fenster", ObjectKind::Window),
     ] {
         h.state_mut().state_mut().tool = tool;
+        h.state_mut().state_mut().object_tool.kind = kind;
         h.run();
         assert_eq!(h.state().state().tool, tool);
         let l = h.state().layout();
@@ -501,6 +506,27 @@ fn small_window_no_overlap() {
     });
     assert!(label.width() < full - 20.0, "{} vs {full}", label.width());
     assert!(label.max.x <= l.step.max.x, "{label:?} vs {:?}", l.step);
+
+    // the smallest window: the bar of „Objekt“ with the settings of every kind stays in the view
+    h.set_size(egui::vec2(800.0, 500.0));
+    h.state_mut().state_mut().tool = Tool::Object;
+    for kind in [
+        ObjectKind::Socket,
+        ObjectKind::Connection,
+        ObjectKind::Pipe,
+        ObjectKind::Door,
+        ObjectKind::Window,
+    ] {
+        h.state_mut().state_mut().object_tool.kind = kind;
+        h.run();
+        let l = h.state().layout();
+        let bar = l.objects.expect("die Leiste ist da");
+        assert!(
+            l.view.contains_rect(bar),
+            "{kind:?}: {bar:?} / {:?}",
+            l.view
+        );
+    }
 }
 
 #[test]

@@ -10,11 +10,12 @@ use super::plan_view::PlanCamera;
 use super::theme::{icon, DARK};
 use super::{text, Action, AppState, Selection, Step};
 use driftless_export::dxf::Drawing;
-use driftless_plan::OpeningKind;
 use driftless_steps::export::ExportSource;
 use driftless_steps::objects::{ObjectKind, Objects};
 use driftless_steps::plan::{read_plan, PlanReport, TOP_VIEW_FILE};
-use driftless_steps::plan_drawing::{plan_drawing, PlanExport, PlanPlacement, LAYERS};
+use driftless_steps::plan_drawing::{
+    opening_counts, plan_drawing, PlanExport, PlanPlacement, LAYERS,
+};
 use driftless_steps::StepError;
 use eframe::egui::{self, RichText, Ui};
 use std::collections::BTreeSet;
@@ -223,16 +224,11 @@ pub fn export_source(state: &PlanState, dir: &Path) -> ExportSource {
 }
 
 /// The layers in the order of [`LAYERS`] with what lies on them: wall faces, openings of a
-/// kind, rooms, dimensions and objects of a kind, not the lines they are drawn with.
+/// kind (with the doors and windows set by hand, each once, as the plan draws them), rooms,
+/// dimensions and objects of a kind, not the lines they are drawn with.
 pub fn layer_counts(shown: &ShownPlan) -> Vec<(&'static str, usize)> {
     let plan = &shown.report.plan;
-    let openings = plan.distinct_openings();
-    let opening = |kind: OpeningKind| {
-        openings
-            .iter()
-            .filter(|&&i| plan.openings[i].kind == kind)
-            .count()
-    };
+    let [doors, windows, unclear] = opening_counts(plan, &shown.objects);
     let object = |kind: ObjectKind| {
         shown
             .objects
@@ -244,9 +240,9 @@ pub fn layer_counts(shown: &ShownPlan) -> Vec<(&'static str, usize)> {
     // in the order of LAYERS
     let counts = [
         plan.faces.len(),
-        opening(OpeningKind::Door),
-        opening(OpeningKind::Window),
-        opening(OpeningKind::Unclear),
+        doors,
+        windows,
+        unclear,
         plan.rooms.len(),
         plan.dims.len(),
         object(ObjectKind::Measure),

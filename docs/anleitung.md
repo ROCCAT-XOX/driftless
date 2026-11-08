@@ -535,8 +535,8 @@ Stelle (Abschnitt 13).
 ## 10. Grundriss und DXF
 
 Aus einer Karte oder einem Modell rechnet Driftless einen Grundriss: Wände, Türen, Fenster, Räume und
-Maße. Dazu kommen Steckdosen, Anschlüsse, Kabel und Rohre, die du von Hand setzt. Das Ergebnis geht als
-DXF ins CAD-Programm. Die Rohdaten braucht der Grundriss nicht.
+Maße. Dazu kommen Steckdosen, Anschlüsse, Kabel, Rohre, Türen und Fenster, die du von Hand setzt. Das
+Ergebnis geht als DXF ins CAD-Programm. Die Rohdaten braucht der Grundriss nicht.
 
 **Rechnen.** Links „Planung“ wählen. Jede Karte und jedes Modell hat eine Kachel mit Stand („nicht
 gerechnet“, „fertig“, „veraltet“). Kachel anklicken, unten „Grundriss rechnen“ drücken. Findet Driftless
@@ -552,11 +552,21 @@ ganz geschlossenen Umriss heißen „offen“.
 
 **Objekte setzen.** „3D“ wählen, unten das Werkzeug „Objekt“. Die Leiste darüber wählt die Art: „Steckdose“,
 „Anschluss“ (mit der Sorte „Strom“, „Wasser“, „Abwasser“, „Heizung“, „Gas“, „Netzwerk“ oder „Sonstiges“),
-„Kabel“ oder „Rohr“ (mit dem „Durchmesser“ in mm). Ein Klick setzt Steckdose oder Anschluss. Bei Kabel und
-Rohr setzt jeder Klick einen Punkt: Enter oder Doppelklick beendet den Linienzug, Backspace nimmt den
-letzten Punkt zurück, Esc verwirft ihn. Getroffen wird die Punktwolke, wie beim „Messen“; ist nur die
-Oberfläche zu sehen, die Oberfläche. ↶ (⌘Z, Strg+Z) nimmt die letzte Änderung zurück, auch nach einem
+„Kabel“, „Rohr“ (mit dem „Durchmesser“ in mm), „Tür“ oder „Fenster“. Ein Klick setzt Steckdose oder Anschluss.
+Bei Kabel und Rohr setzt jeder Klick einen Punkt: Enter oder Doppelklick beendet den Linienzug, Backspace
+nimmt den letzten Punkt zurück, Esc verwirft ihn. Getroffen wird die Punktwolke, wie beim „Messen“; ist nur
+die Oberfläche zu sehen, die Oberfläche. ↶ (⌘Z, Strg+Z) nimmt die letzte Änderung zurück, auch nach einem
 Neustart. „Objekt“ geht nur auf einer Karte oder einem Modell des Projekts.
+
+**Türen und Fenster von Hand.** Eine geschlossene Tür sieht der Laser nur als Wand, und ein Fenster ohne
+Messung dahinter erkennt Driftless bewusst nicht. Solche Öffnungen trägst du selbst ein: „Tür“ oder
+„Fenster“ wählen und die beiden Kanten der Öffnung anklicken; dann ist das Objekt fertig. Schmaler als 30 cm
+geht nicht. In der Leiste stehen „Höhe“ (bei der Tür als Vorgabe 2,00 m, beim Fenster keine) und beim Fenster
+„Brüstung“; „–“ (oder 0) heißt „nicht bekannt“. Liegt das Objekt bis 30 cm an einer Wand des Plans, legt Driftless es
+auf diese Wand, schneidet sie dort und beschriftet es wie eine erkannte Öffnung, zum Beispiel
+„Tür 0,90 × 2,00 m“ oder ohne bekannte Höhe „Fenster 1,20 m“. Überlappt es eine erkannte Öffnung, gilt die von
+Hand gesetzte. Ohne Wand in der Nähe steht es als Strich mit Beschriftung an seiner Stelle. Der Plan muss
+dafür nicht neu gerechnet werden, Räume und Maße ändern sich nicht.
 
 **Liste.** Unter „Objekte“ stehen alle Objekte der Karte oder des Modells. Ein Klick markiert eines im
 Plan, „In 3D zeigen“ führt in der Ansicht hin. Rechtsklick: „Umbenennen …“, „Notiz …“, „Löschen“.

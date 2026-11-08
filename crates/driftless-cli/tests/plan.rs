@@ -148,6 +148,8 @@ fn put_socket(dir: &Path) {
             note: String::new(),
             connection: None,
             diameter_mm: None,
+            height_m: None,
+            sill_m: None,
             properties: BTreeMap::new(),
         })
         .unwrap();

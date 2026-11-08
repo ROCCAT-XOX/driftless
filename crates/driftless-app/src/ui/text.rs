@@ -627,7 +627,7 @@ pub const TOOL_NEEDS_CLOUD: &str = "Messen und Punkt wählen brauchen eine Punkt
 // „Bilder“.
 pub const TOOL_OBJECT: &str = "Objekt";
 pub const TOOL_OBJECT_HINT: &str =
-    "Setzt Steckdosen, Anschlüsse, Kabel und Rohre in die Ansicht; sie gehören zur Karte oder zum Modell";
+    "Setzt Steckdosen, Anschlüsse, Kabel, Rohre, Türen und Fenster in die Ansicht; sie gehören zur Karte oder zum Modell";
 pub const TOOL_BRUSH: &str = "Pinsel";
 pub const TOOL_BRUSH_HINT: &str =
     "Stellen auf die Oberfläche malen, um sie nachzuarbeiten (glätten, Bilder neu einspielen)";
@@ -1878,6 +1878,11 @@ pub const NO_OBJECTS: &str =
     "Noch keine Objekte. Unten in der Ansicht „Objekt“ wählen und Stellen anklicken.";
 pub const OBJECT_CONNECTION: &str = "Sorte";
 pub const OBJECT_DIAMETER: &str = "Durchmesser";
+pub const OBJECT_HEIGHT: &str = "Höhe";
+pub const OBJECT_SILL: &str = "Brüstung";
+/// A height or sill not known, in the bar.
+pub const OBJECT_LENGTH_UNKNOWN: &str = "–";
+pub const OBJECT_LENGTH_HINT: &str = "– oder 0 heißt: nicht bekannt, dann steht es nicht im Plan";
 pub const OBJECT_UNDO_HINT: &str = "Nimmt die letzte Änderung an den Objekten zurück (⌘Z, Strg+Z)";
 pub const OBJECT_PIPE_NEEDS_DIAMETER: &str = "Ein Rohr braucht einen Durchmesser über 0 mm.";
 pub const OBJECT_SHOW_3D: &str = "In 3D zeigen";
@@ -1898,7 +1903,7 @@ pub fn object_line_short(kind: driftless_steps::objects::ObjectKind) -> &'static
 }
 /// What a click into the view does next with the tool „Objekt“.
 pub fn object_hint(kind: driftless_steps::objects::ObjectKind, points: usize) -> String {
-    use driftless_steps::objects::ObjectKind::{Cable, Pipe};
+    use driftless_steps::objects::ObjectKind::{Cable, Door, Pipe, Window};
     let name = kind.label();
     match (kind, points) {
         (Cable | Pipe, 0) => format!("{name}: ersten Punkt anklicken"),
@@ -1906,6 +1911,10 @@ pub fn object_hint(kind: driftless_steps::objects::ObjectKind, points: usize) ->
             "{name}: weiteren Punkt anklicken · Enter oder Doppelklick beendet · \
              Backspace nimmt zurück · Esc verwirft"
         ),
+        (Door | Window, 0) => format!("{name}: eine Kante anklicken"),
+        (Door | Window, _) => {
+            format!("{name}: andere Kante anklicken · Backspace nimmt zurück · Esc verwirft")
+        }
         _ => format!("{name}: Stelle anklicken"),
     }
 }
@@ -1920,6 +1929,17 @@ pub fn object_details(object: &driftless_steps::objects::Object) -> String {
             "Durchmesser {} mm",
             format!("{mm}").replace('.', ",")
         ));
+    }
+    if let Some(width) =
+        driftless_steps::objects::opening_width(&object.points).filter(|_| object.kind.is_opening())
+    {
+        lines.push(format!("Breite {}", meters(width)));
+    }
+    if let Some(height) = object.height_m {
+        lines.push(format!("Höhe {}", meters(height)));
+    }
+    if let Some(sill) = object.sill_m {
+        lines.push(format!("Brüstung {}", meters(sill)));
     }
     if !object.note.is_empty() {
         lines.push(object.note.clone());

@@ -312,6 +312,13 @@ fn mark_object(surface: &Surface, drawing: &Drawing, nr: u32) {
                 let pts = points.iter().map(|p| surface.at(*p)).collect();
                 surface.painter.add(Shape::line(pts, stroke));
             }
+            // a door or window set by hand on a wall: its sill or window lines
+            EntityKind::Shape(DrawnShape::Line { a, b, .. })
+                if entity.xdata.first() == Some(&tag) =>
+            {
+                let pts = vec![surface.at(*a), surface.at(*b)];
+                surface.painter.add(Shape::line(pts, stroke));
+            }
             _ => {}
         }
     }

@@ -1,6 +1,6 @@
-//! `objekte.toml`: the objects of a map or model – sockets, connections, cables and pipes set
-//! by hand, and the measurements kept –, in the folder of the map (`karte-NNN`, or the run
-//! folder for a map the command line wrote there) or model (`modelle/modell-NNN`). Built like
+//! `objekte.toml`: the objects of a map or model – sockets, connections, cables, pipes, doors
+//! and windows set by hand, and the measurements kept –, in the folder of the map (`karte-NNN`,
+//! or the run folder for a map the command line wrote there) or model (`modelle/modell-NNN`). Built like
 //! `stellen.toml` ([`crate::marks`]). They belong to the map or model and not to a floor plan,
 //! so a plan computed anew keeps them; the file names no paths and moves with the project.
 //!
@@ -28,6 +28,14 @@
 //! durchmesser_mm = 50.0
 //! quelle = "hand"
 //! seq = 2
+//!
+//! [[objekt]]
+//! nr = 3
+//! art = "tuer"
+//! punkte = [[1.0, 0.0, 0.0], [1.9, 0.0, 0.0]]
+//! hoehe_m = 2.0
+//! quelle = "hand"
+//! seq = 5
 //! ```
 //!
 //! Points are in metres in the frame of the map or model (absolute, not relative to the view).
@@ -73,9 +81,14 @@ pub const OBJECTS_FILE: &str = "objekte.toml";
 /// [`Object::source`] of an object set by hand.
 pub const SOURCE_HAND: &str = "hand";
 
+/// The narrowest door or window that can be set (metres, between its two edges).
+pub const MIN_OPENING_WIDTH: f64 = 0.30;
+/// The tolerance of that limit: two clicks at map coordinates do not hit 30 cm to the last digit.
+const WIDTH_TOLERANCE: f64 = 1e-9;
+
 /// Comment at the top of the file.
-const HEADER: &str = "# Driftless-Objekte: Steckdosen, Anschlüsse, Kabel, Rohre und Messungen \
-dieser Karte bzw. dieses Modells.\n# Punkte in Metern im Rahmen der Karte bzw. des Modells; \
+const HEADER: &str = "# Driftless-Objekte: Steckdosen, Anschlüsse, Kabel, Rohre, Türen, Fenster \
+und Messungen dieser Karte bzw. dieses Modells.\n# Punkte in Metern im Rahmen der Karte bzw. des Modells; \
 Rückgängig nimmt die Änderung mit der höchsten seq.\n\n";
 
 /// What an object is.
@@ -96,6 +109,12 @@ pub enum ObjectKind {
     /// A measurement between two points.
     #[serde(rename = "messung")]
     Measure,
+    /// A door set by hand: its two edges, at least [`MIN_OPENING_WIDTH`] apart.
+    #[serde(rename = "tuer")]
+    Door,
+    /// A window set by hand: its two edges, at least [`MIN_OPENING_WIDTH`] apart.
+    #[serde(rename = "fenster")]
+    Window,
 }
 
 impl ObjectKind {
@@ -107,7 +126,14 @@ impl ObjectKind {
             ObjectKind::Cable => "Kabel",
             ObjectKind::Pipe => "Rohr",
             ObjectKind::Measure => "Messung",
+            ObjectKind::Door => "Tür",
+            ObjectKind::Window => "Fenster",
         }
+    }
+
+    /// A door or window: an opening, set with its two edges.
+    pub fn is_opening(self) -> bool {
+        matches!(self, ObjectKind::Door | ObjectKind::Window)
     }
 }
 
@@ -156,7 +182,25 @@ pub struct ObjectInput {
     pub connection: Option<ConnectionKind>,
     /// For a [`ObjectKind::Pipe`].
     pub diameter_mm: Option<f32>,
+    /// The height of a door or window (metres), if known.
+    pub height_m: Option<f64>,
+    /// The sill of a window above the floor (metres), if known.
+    pub sill_m: Option<f64>,
     pub properties: BTreeMap<String, String>,
+}
+
+impl ObjectInput {
+    /// Whether it keeps the rules of [`Objects::add`]; why not, for display.
+    pub fn check(&self) -> Result<(), &'static str> {
+        check(
+            self.kind,
+            &self.points,
+            self.connection,
+            self.diameter_mm,
+            self.height_m,
+            self.sill_m,
+        )
+    }
 }
 
 /// An object of a map or model.
@@ -181,6 +225,16 @@ pub struct Object {
         rename = "durchmesser_mm"
     )]
     pub diameter_mm: Option<f32>,
+    /// The height of a door or window (metres), if known.
+    #[serde(rename = "hoehe_m", default, skip_serializing_if = "Option::is_none")]
+    pub height_m: Option<f64>,
+    /// The sill of a window above the floor (metres), if known.
+    #[serde(
+        rename = "bruestung_m",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sill_m: Option<f64>,
     /// Where it comes from: [`SOURCE_HAND`], so that a later automatic detection can write the
     /// same objects and tell its own.
     #[serde(rename = "quelle", default = "source_hand")]
@@ -271,12 +325,24 @@ impl From<ObjectsError> for StepError {
     }
 }
 
+/// The width of a door or window from its two edges, in the plane (metres): the clicks may be
+/// at different heights. By `sqrt`, which gives the same on every system (the check at reading
+/// must not depend on the `libm` of the machine).
+pub fn opening_width(points: &[[f64; 3]]) -> Option<f64> {
+    let [p, q] = points else {
+        return None;
+    };
+    Some(((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt())
+}
+
 /// The rules of an object; why it breaks one, for display.
 fn check(
     kind: ObjectKind,
     points: &[[f64; 3]],
     connection: Option<ConnectionKind>,
     diameter_mm: Option<f32>,
+    height_m: Option<f64>,
+    sill_m: Option<f64>,
 ) -> Result<(), &'static str> {
     let (fits, needs) = match kind {
         ObjectKind::Socket => (
@@ -296,6 +362,8 @@ fn check(
             "Ein Rohr braucht mindestens zwei Punkte.",
         ),
         ObjectKind::Measure => (points.len() == 2, "Eine Messung braucht genau zwei Punkte."),
+        ObjectKind::Door => (points.len() == 2, "Eine Tür braucht genau zwei Punkte."),
+        ObjectKind::Window => (points.len() == 2, "Ein Fenster braucht genau zwei Punkte."),
     };
     if !fits {
         return Err(needs);
@@ -308,6 +376,20 @@ fn check(
     }
     if kind == ObjectKind::Pipe && !diameter_mm.is_some_and(|d| d.is_finite() && d > 0.0) {
         return Err("Ein Rohr braucht einen Durchmesser über 0 mm.");
+    }
+    if kind.is_opening() {
+        if opening_width(points).is_none_or(|w| w < MIN_OPENING_WIDTH - WIDTH_TOLERANCE) {
+            return Err(match kind {
+                ObjectKind::Door => "Zu schmal: Eine Tür muss mindestens 30 cm breit sein.",
+                _ => "Zu schmal: Ein Fenster muss mindestens 30 cm breit sein.",
+            });
+        }
+        if height_m.is_some_and(|h| !(h.is_finite() && h > 0.0)) {
+            return Err("Die Höhe muss über 0 m liegen.");
+        }
+    }
+    if kind == ObjectKind::Window && sill_m.is_some_and(|s| !(s.is_finite() && s >= 0.0)) {
+        return Err("Die Brüstung darf nicht unter 0 m liegen.");
     }
     Ok(())
 }
@@ -370,9 +452,11 @@ impl Objects {
     /// Adds an object with a new number, from the hand ([`SOURCE_HAND`]); returns the number.
     /// A socket and a connection have exactly one point, a connection also its kind, a cable
     /// and a pipe at least two, a pipe also a diameter above 0, a measurement exactly two; all
-    /// coordinates are finite. Refused otherwise ([`ObjectsError::Invalid`]), nothing changed.
-    /// A kind of connection or a diameter given to another kind of object is left out: the
-    /// tool keeps its settings while another kind is set.
+    /// coordinates are finite. A door and a window have exactly two points at least
+    /// [`MIN_OPENING_WIDTH`] apart, and a height above 0 and a sill not below 0 if known.
+    /// Refused otherwise ([`ObjectsError::Invalid`]), nothing changed. A kind of connection, a
+    /// diameter, a height or a sill given to a kind of object it does not belong to is left
+    /// out: the tool keeps its settings while another kind is set.
     pub fn add(&mut self, input: ObjectInput) -> Result<u32, ObjectsError> {
         let ObjectInput {
             kind,
@@ -381,9 +465,11 @@ impl Objects {
             note,
             connection,
             diameter_mm,
+            height_m,
+            sill_m,
             properties,
         } = input;
-        check(kind, &points, connection, diameter_mm)
+        check(kind, &points, connection, diameter_mm, height_m, sill_m)
             .map_err(|why| ObjectsError::Invalid(why.to_string()))?;
         let seq = self.take_seq();
         let nr = self.take_nr();
@@ -395,6 +481,8 @@ impl Objects {
             note,
             connection: connection.filter(|_| kind == ObjectKind::Connection),
             diameter_mm: diameter_mm.filter(|_| kind == ObjectKind::Pipe),
+            height_m: height_m.filter(|_| kind.is_opening()),
+            sill_m: sill_m.filter(|_| kind == ObjectKind::Window),
             source: source_hand(),
             properties,
             seq,
@@ -552,8 +640,15 @@ impl Objects {
         }
         let removed = self.removed.iter().map(|r| &r.objekt);
         for o in self.objects.iter().chain(removed) {
-            check(o.kind, &o.points, o.connection, o.diameter_mm)
-                .map_err(|why| format!("Objekt {}: {why}", o.nr))?;
+            check(
+                o.kind,
+                &o.points,
+                o.connection,
+                o.diameter_mm,
+                o.height_m,
+                o.sill_m,
+            )
+            .map_err(|why| format!("Objekt {}: {why}", o.nr))?;
         }
         Ok(())
     }

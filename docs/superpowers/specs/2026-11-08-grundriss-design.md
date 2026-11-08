@@ -283,3 +283,19 @@ Danach `~/work-grundriss` löschen.
 
 Dann das eine Gesamt-Review, danach die Zahlen in `docs/ergebnisse/2026-11-xx-grundriss.md` (ohne Bilder, ohne
 Kundennamen). Bilder und PDF gehen an Yannick, nicht ins Repository.
+
+## 13. Nachtrag 08.11.
+
+- **Öffnungen nur mit Beleg in den Messdaten.** Von Yannick bestätigt: Ein Loch im Wandbild wird nur Tür oder
+  Fenster, wenn die Laufbahn hindurchging, die andere Seite der Wand dort auch offen ist oder dahinter gemessen
+  wurde. Eine geschlossene Tür ist für den Laser Wand, ein Fenster ohne Messung dahinter bleibt Wand.
+- **„unklar“ im DXF.** Auf dem Layer „Öffnung-unklar“ steht im Plan nur der kurze Text „unklar“; der Grund steht als
+  XDATA an der Linie (`GRUND=…`) und in `grundriss.json`.
+- **Türen und Fenster von Hand.** Neue Objektarten „Tür“ und „Fenster“ (`art = "tuer"` / `"fenster"` in
+  `objekte.toml`, zwei Punkte, mindestens 30 cm breit, in der Ebene gemessen; `hoehe_m` und `bruestung_m`
+  freiwillig). Liegen beide Kanten bis 30 cm an einer Wandfläche des Plans, entlang der Wand und auf diesem Stockwerk, wird
+  das Objekt auf diese Wand gelegt und wie eine erkannte Öffnung gezeichnet: Wand geschnitten (auch beide Flächen einer
+  Wand mit zwei Flächen), Laibung, Beschriftung nur einmal, auf den Layern `Tür` und `Fenster`, in beiden Lagen. Es
+  ersetzt erkannte Öffnungen (auch unklare), die es um mindestens 5 cm überlappt. Sonst bleibt es als Strich mit
+  Beschriftung an seiner Stelle. Die Erkennung, die Räume und die Maße bleiben unberührt; der Plan wird dafür
+  nicht neu gerechnet.

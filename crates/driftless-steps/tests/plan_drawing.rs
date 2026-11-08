@@ -101,6 +101,8 @@ fn input(kind: ObjectKind, points: Vec<[f64; 3]>) -> ObjectInput {
         note: String::new(),
         connection: None,
         diameter_mm: None,
+        height_m: None,
+        sill_m: None,
         properties: BTreeMap::new(),
     }
 }
@@ -895,4 +897,406 @@ fn odd_characters_in_names_read_back() {
     };
     assert!(name.starts_with("NAME=ä b;?"), "{name}");
     assert!(name.len() <= 300, "{}", name.len());
+}
+
+// ─── doors and windows set by hand ───────────────────────────────────────────────────────────
+
+/// A door or window set by hand with its two edges in the plan frame of [`plan_of`].
+fn hand(kind: ObjectKind, a: [f64; 3], b: [f64; 3]) -> ObjectInput {
+    input(kind, vec![a, b])
+}
+
+fn hand_door(a: [f64; 3], b: [f64; 3]) -> ObjectInput {
+    ObjectInput {
+        height_m: Some(2.0),
+        ..hand(ObjectKind::Door, a, b)
+    }
+}
+
+fn hand_window(a: [f64; 3], b: [f64; 3]) -> ObjectInput {
+    hand(ObjectKind::Window, a, b)
+}
+
+fn draw_with(plan: FloorPlan, objects: &Objects) -> Drawing {
+    plan_drawing(&report(plan), objects, &PlanExport::default())
+}
+
+fn counts(plan: &FloorPlan, objects: &Objects) -> [usize; 3] {
+    driftless_steps::plan_drawing::opening_counts(plan, objects)
+}
+
+/// The wall pieces lying at `y` (mm), from small to large x, as (from, to) x.
+fn pieces_at(d: &Drawing, y: f64) -> Vec<(f64, f64)> {
+    let mut pieces: Vec<(f64, f64)> = polylines(d, "Wand")
+        .iter()
+        .filter(|p| close(p[0][1], y) && close(p[1][1], y))
+        .map(|p| (round(p[0][0].min(p[1][0])), round(p[0][0].max(p[1][0]))))
+        .collect();
+    pieces.sort_by(|a, b| a.0.total_cmp(&b.0));
+    pieces
+}
+
+/// To a thousandth of a millimetre: floating point noise of the projection on another system.
+fn round(mm: f64) -> f64 {
+    (mm * 1000.0).round() / 1000.0
+}
+
+fn data<'a>(d: &'a Drawing, layer: &str) -> Vec<&'a Entity> {
+    entities(d, layer)
+        .into_iter()
+        .filter(|e| !e.xdata.is_empty())
+        .collect()
+}
+
+#[test]
+fn a_door_set_by_hand_cuts_the_wall_like_a_found_one() {
+    let plan = plan_of(vec![long_wall()]);
+    let mut objects = Objects::default();
+    // not exactly on the wall and with clicks at two heights: laid on the wall
+    let mut door = hand_door([2.0, 0.10, 0.5], [2.9, 0.12, 1.3]);
+    door.name = "Notausgang".to_string();
+    door.note = "schließt selbst".to_string();
+    add(&mut objects, door);
+    let d = draw_with(plan.clone(), &objects);
+
+    assert_eq!(pieces_at(&d, 0.0), [(0.0, 2000.0), (2900.0, 10_000.0)]);
+    let caps = lines(&d, "Wand");
+    assert_eq!(caps.len(), 2, "zwei Laibungen");
+    assert!(caps
+        .iter()
+        .any(|(a, b, _)| near(*a, [2000.0, 0.0]) && close(length(*a, *b), 120.0)));
+
+    let door_lines = lines(&d, "Tür");
+    assert_eq!(door_lines.len(), 3, "zwei Laibungen, eine Schwelle");
+    let dashed: Vec<_> = door_lines.iter().filter(|l| l.2).collect();
+    assert_eq!(dashed.len(), 1, "die Schwelle ist gestrichelt");
+    assert!(near(dashed[0].0, [2000.0, 0.0]) && near(dashed[0].1, [2900.0, 0.0]));
+    assert_eq!(
+        texts(&d, "Tür"),
+        ["Tür 0,90 × 2,00 m · Notausgang"],
+        "wie bei der Automatik, mit Name"
+    );
+
+    let with_data = data(&d, "Tür");
+    assert_eq!(with_data.len(), 1, "die Schwelle trägt die Angaben");
+    assert_eq!(
+        with_data[0].xdata,
+        [
+            "NR=1",
+            "NAME=Notausgang",
+            "ART=Tür",
+            "HOEHE=2000",
+            "NOTIZ=schließt selbst",
+            "QUELLE=hand"
+        ]
+    );
+    assert_eq!(counts(&plan, &objects), [1, 0, 0]);
+    dxf_bytes(&d, 0.0).expect("lässt sich schreiben");
+}
+
+#[test]
+fn a_window_set_by_hand_says_what_is_known() {
+    let plan = plan_of(vec![long_wall()]);
+    let mut objects = Objects::default();
+    add(
+        &mut objects,
+        hand_window([4.0, 0.05, 1.0], [5.2, 0.05, 1.0]),
+    );
+    let mut known = hand_window([6.0, 0.0, 1.0], [7.2, 0.0, 1.0]);
+    known.height_m = Some(1.3);
+    known.sill_m = Some(0.9);
+    add(&mut objects, known);
+    let d = draw_with(plan, &objects);
+
+    assert_eq!(
+        pieces_at(&d, 0.0),
+        [(0.0, 4000.0), (5200.0, 6000.0), (7200.0, 10_000.0)]
+    );
+    let window = lines(&d, "Fenster");
+    assert_eq!(window.len(), 4, "je Fenster die Doppellinie");
+    assert!(window.iter().all(|l| !l.2), "durchgezogen");
+    assert_eq!(
+        texts(&d, "Fenster"),
+        ["Fenster 1,20 m", "Fenster 1,20 × 1,30 m, BRH 0,90 m"]
+    );
+    assert_eq!(
+        data(&d, "Fenster")[0].xdata[3],
+        "HOEHE=",
+        "ohne bekannte Höhe"
+    );
+    assert!(data(&d, "Fenster")
+        .iter()
+        .any(|e| e.xdata.iter().any(|x| x == "BRUESTUNG=900")));
+}
+
+/// The same door by hand in both placements of a frame turned by `turn` degrees.
+fn door_in_both_placements(mut plan: FloorPlan, objects: Objects, check: impl Fn(&Drawing, bool)) {
+    let (sin, cos) = 23f64.to_radians().sin_cos();
+    plan.frame.axis = [cos, sin];
+    plan.frame.origin = [12.5, -3.0, -1.3];
+    let frame = plan.frame;
+    // the objects are stored in the map: set them there
+    let in_map = {
+        let mut map = Objects::default();
+        for o in objects.all() {
+            let points = o.points.iter().map(|p| frame.to_map(*p)).collect();
+            let mut input = hand(o.kind, [0.0; 3], [1.0, 0.0, 0.0]);
+            input.points = points;
+            input.height_m = o.height_m;
+            input.sill_m = o.sill_m;
+            input.name = o.name.clone();
+            map.add(input).unwrap();
+        }
+        map
+    };
+    for (placement, as_cloud) in [
+        (PlanPlacement::Walls, false),
+        (PlanPlacement::AsCloud, true),
+    ] {
+        let export = PlanExport {
+            placement,
+            hidden: Vec::new(),
+        };
+        let d = plan_drawing(&report(plan.clone()), &in_map, &export);
+        check(&d, as_cloud);
+        dxf_bytes(&d, 0.0).expect("lässt sich schreiben");
+    }
+}
+
+/// From the plan into the drawing of [`door_in_both_placements`].
+fn in_drawing(p: [f64; 2], as_cloud: bool) -> [f64; 2] {
+    if !as_cloud {
+        return [p[0] * 1000.0, p[1] * 1000.0];
+    }
+    let (sin, cos) = 23f64.to_radians().sin_cos();
+    [
+        (12.5 + cos * p[0] - sin * p[1]) * 1000.0,
+        (-3.0 + sin * p[0] + cos * p[1]) * 1000.0,
+    ]
+}
+
+#[test]
+fn a_door_by_hand_cuts_both_faces_and_is_labelled_once_in_both_placements() {
+    let mut plan = plan_of(vec![
+        face([0.0, 5.0], [6.0, 5.0], [0.0, -1.0]),
+        face([6.0, 5.2], [0.0, 5.2], [0.0, 1.0]),
+    ]);
+    plan.pairs = vec![WallPair {
+        front: 0,
+        back: 1,
+        thickness: 0.2,
+    }];
+    let mut objects = Objects::default();
+    // the two edges in the frame of the plan, nearer the face at y = 5.0
+    add(&mut objects, hand_door([1.0, 5.05, 1.0], [1.9, 5.05, 1.0]));
+
+    door_in_both_placements(plan, objects, |d, as_cloud| {
+        let piece = |a: [f64; 2], b: [f64; 2]| {
+            let (a, b) = (in_drawing(a, as_cloud), in_drawing(b, as_cloud));
+            polylines(d, "Wand")
+                .iter()
+                .any(|p| (near(p[0], a) && near(p[1], b)) || (near(p[0], b) && near(p[1], a)))
+        };
+        assert!(piece([0.0, 5.0], [1.0, 5.0]), "{:?}", polylines(d, "Wand"));
+        assert!(piece([1.9, 5.0], [6.0, 5.0]), "{:?}", polylines(d, "Wand"));
+        assert!(piece([0.0, 5.2], [1.0, 5.2]), "die andere Fläche auch");
+        assert!(piece([1.9, 5.2], [6.0, 5.2]), "die andere Fläche auch");
+        assert_eq!(polylines(d, "Wand").len(), 4);
+        assert_eq!(texts(d, "Tür"), ["Tür 0,90 × 2,00 m"], "nur einmal");
+        assert_eq!(lines(d, "Tür").iter().filter(|l| l.2).count(), 1);
+    });
+}
+
+#[test]
+fn the_hand_wins_over_an_opening_found() {
+    let mut plan = plan_of(vec![
+        face([0.0, 5.0], [8.0, 5.0], [0.0, -1.0]),
+        face([8.0, 5.2], [0.0, 5.2], [0.0, 1.0]),
+    ]);
+    plan.pairs = vec![WallPair {
+        front: 0,
+        back: 1,
+        thickness: 0.2,
+    }];
+    let mut found_door = opening(OpeningKind::Door, 0, 2.0, 3.0, 0.0, 2.05);
+    found_door.note = "gefunden".to_string();
+    // the second entry of the same door lies on the other face, measured from its own end
+    let found_other_side = opening(OpeningKind::Door, 1, 5.0, 6.0, 0.0, 2.05);
+    let unclear = opening(OpeningKind::Unclear, 0, 6.0, 7.0, 0.0, 2.0);
+    let far_door = opening(OpeningKind::Door, 0, 3.5, 4.5, 0.0, 2.05);
+    plan.openings = vec![found_door, found_other_side, unclear, far_door];
+    let mut objects = Objects::default();
+    // a window by hand over the found door, a door by hand over the unclear one
+    add(
+        &mut objects,
+        hand_window([2.2, 5.05, 1.0], [3.1, 5.05, 1.0]),
+    );
+    add(&mut objects, hand_door([5.9, 5.1, 1.0], [7.1, 5.1, 1.0]));
+    let d = draw_with(plan.clone(), &objects);
+
+    assert_eq!(texts(&d, "Tür"), ["Tür 1,00 × 2,05 m", "Tür 1,20 × 2,00 m"]);
+    assert_eq!(
+        texts(&d, "Fenster"),
+        ["Fenster 0,90 m"],
+        "die von Hand gewinnt"
+    );
+    assert!(texts(&d, "Öffnung-unklar").is_empty(), "unklar ist ersetzt");
+    assert_eq!(
+        pieces_at(&d, 5000.0),
+        [
+            (0.0, 2200.0),
+            (3100.0, 3500.0),
+            (4500.0, 5900.0),
+            (7100.0, 8000.0)
+        ],
+        "geschnitten wie die von Hand, nicht wie die gefundene"
+    );
+    assert_eq!(
+        pieces_at(&d, 5200.0),
+        [
+            (0.0, 2200.0),
+            (3100.0, 3500.0),
+            (4500.0, 5900.0),
+            (7100.0, 8000.0)
+        ],
+        "beide Flächen"
+    );
+    assert_eq!(counts(&plan, &objects), [2, 1, 0]);
+}
+
+#[test]
+fn a_centimetre_of_overlap_leaves_the_found_opening() {
+    let mut plan = plan_of(vec![long_wall()]);
+    plan.openings = vec![opening(OpeningKind::Door, 0, 2.0, 3.0, 0.0, 2.05)];
+    let mut objects = Objects::default();
+    add(&mut objects, hand_door([2.99, 0.0, 1.0], [3.9, 0.0, 1.0]));
+    let d = draw_with(plan, &objects);
+    assert_eq!(texts(&d, "Tür"), ["Tür 1,00 × 2,05 m", "Tür 0,91 × 2,00 m"]);
+}
+
+#[test]
+fn an_opening_far_from_a_wall_stays_as_a_line_with_its_text() {
+    let plan = plan_of(vec![long_wall()]);
+    let mut objects = Objects::default();
+    let (a, b) = ([2.0, 3.0, 1.0], [2.9, 3.0, 1.0]);
+    add(&mut objects, hand_door(a, b));
+    let d = draw_with(plan.clone(), &objects);
+    assert_eq!(pieces_at(&d, 0.0), [(0.0, 10_000.0)], "die Wand bleibt");
+    let drawn = polylines(&d, "Tür");
+    assert_eq!(drawn.len(), 1);
+    assert!(near(drawn[0][0], [2000.0, 3000.0]) && near(drawn[0][1], [2900.0, 3000.0]));
+    assert!(lines(&d, "Tür").is_empty(), "kein Türsymbol ohne Wand");
+    assert_eq!(texts(&d, "Tür"), ["Tür 0,90 × 2,00 m"]);
+    assert_eq!(
+        data(&d, "Tür")[0].xdata[0],
+        "NR=1",
+        "die Angaben stehen dran"
+    );
+    assert_eq!(counts(&plan, &objects), [1, 0, 0]);
+    dxf_bytes(&d, 0.0).expect("lässt sich schreiben");
+}
+
+#[test]
+fn without_walls_an_opening_is_a_line_at_its_place_in_both_placements() {
+    let mut objects = Objects::default();
+    add(&mut objects, hand_window([1.0, 1.0, 1.0], [2.2, 1.0, 1.0]));
+
+    door_in_both_placements(plan_of(Vec::new()), objects, |d, as_cloud| {
+        let drawn = polylines(d, "Fenster");
+        assert_eq!(drawn.len(), 1);
+        let (a, b) = (
+            in_drawing([1.0, 1.0], as_cloud),
+            in_drawing([2.2, 1.0], as_cloud),
+        );
+        assert!(near(drawn[0][0], a) && near(drawn[0][1], b), "{drawn:?}");
+        assert_eq!(texts(d, "Fenster"), ["Fenster 1,20 m"]);
+    });
+}
+
+#[test]
+fn an_opening_across_a_wall_or_past_its_end_or_on_another_storey_is_no_cut() {
+    let plan = plan_of(vec![long_wall()]);
+    for (name, a, b) in [
+        ("quer zur Wand", [3.0, 0.0, 1.0], [3.05, 0.30, 1.0]),
+        // the wall is 10 m long
+        ("hinter dem Ende", [10.2, 0.1, 1.0], [11.0, 0.1, 1.0]),
+        // 2.6 m to the ceiling in `plan_of`
+        ("ein Stockwerk höher", [3.0, 0.1, 4.0], [3.9, 0.1, 4.0]),
+    ] {
+        let mut objects = Objects::default();
+        add(&mut objects, hand_door(a, b));
+        let d = draw_with(plan.clone(), &objects);
+        assert_eq!(pieces_at(&d, 0.0), [(0.0, 10_000.0)], "{name}");
+        assert_eq!(polylines(&d, "Tür").len(), 1, "{name}");
+    }
+}
+
+#[test]
+fn a_door_at_the_end_of_a_wall_keeps_its_width() {
+    let plan = plan_of(vec![long_wall()]);
+    let mut objects = Objects::default();
+    // the last 40 cm of the door are past the end of the 10 m wall
+    add(&mut objects, hand_door([9.5, 0.0, 1.0], [10.4, 0.0, 1.0]));
+    let d = draw_with(plan, &objects);
+    assert_eq!(pieces_at(&d, 0.0), [(0.0, 9500.0)]);
+    assert_eq!(texts(&d, "Tür"), ["Tür 0,90 × 2,00 m"]);
+}
+
+#[test]
+fn doors_by_hand_read_back_from_the_dxf() {
+    let plan = plan_of(vec![
+        long_wall(),
+        face([0.0, 5.0], [6.0, 5.0], [0.0, -1.0]),
+        face([6.0, 5.2], [0.0, 5.2], [0.0, 1.0]),
+    ]);
+    let mut plan = plan;
+    plan.pairs = vec![WallPair {
+        front: 1,
+        back: 2,
+        thickness: 0.2,
+    }];
+    let mut objects = Objects::default();
+    add(&mut objects, hand_door([2.0, 0.0, 1.0], [2.9, 0.0, 1.0]));
+    add(&mut objects, hand_window([1.0, 5.1, 1.0], [2.2, 5.1, 1.0]));
+    add(
+        &mut objects,
+        hand_door([20.0, 20.0, 1.0], [20.9, 20.0, 1.0]),
+    );
+    let drawing = plan_drawing(&report(plan), &objects, &PlanExport::default());
+
+    let dir = tmp("plan-drawing-tueren");
+    let path = dir.join("plan.dxf");
+    write_dxf(&path, &drawing, 0.0, &Progress::new()).unwrap();
+    let back = dxf::Drawing::load_file(&path).expect("der Leser verschluckt sich nicht");
+    let found: Vec<_> = back.entities().collect();
+    let of_layer = |layer: &str| -> Vec<&&dxf::entities::Entity> {
+        found.iter().filter(|e| e.common.layer == layer).collect()
+    };
+    let doors = of_layer("Tür");
+    assert!(doors
+        .iter()
+        .any(|e| matches!(e.specific, EntityType::Line(_))));
+    let text_of = |e: &&&dxf::entities::Entity| match &e.specific {
+        EntityType::Text(t) => Some(t.value.clone()),
+        _ => None,
+    };
+    let door_texts: Vec<String> = doors.iter().filter_map(text_of).collect();
+    assert_eq!(door_texts.len(), 2, "{door_texts:?}");
+    assert!(
+        door_texts.iter().all(|t| t == "Tür 0,90 × 2,00 m"),
+        "{door_texts:?}"
+    );
+    let windows = of_layer("Fenster");
+    assert_eq!(windows.iter().filter_map(text_of).count(), 1);
+    assert_eq!(
+        of_layer("Wand")
+            .iter()
+            .filter(|e| matches!(e.specific, EntityType::LwPolyline(_)))
+            .count(),
+        6
+    );
+    assert!(doors.iter().any(|e| e.common.x_data.iter().any(|x| x
+        .items
+        .iter()
+        .any(|i| matches!(i, XDataItem::Str(s) if s == "ART=Tür")))));
 }

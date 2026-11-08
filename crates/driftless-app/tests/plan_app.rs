@@ -691,6 +691,8 @@ fn objects_of_the_owner_are_in_the_shown_plan() {
             note: String::new(),
             connection: None,
             diameter_mm: None,
+            height_m: None,
+            sill_m: None,
             properties: Default::default(),
         })
     })
