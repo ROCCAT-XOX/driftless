@@ -56,6 +56,8 @@ pub enum JobOutput {
     PlanStep(Box<PlanJobDone>),
     /// A plan read from its folder (helper runner).
     PlanLoaded(Box<ShownPlan>),
+    /// `objekte.toml` of a map or model after a change of its objects (helper runner).
+    Objects(Box<driftless_steps::objects::Objects>),
     /// A cloud with its levels of detail (loader runner).
     Cloud(Box<LoadedCloud>),
     /// A model with one of its scans beside it, for point pairs (loader runner).

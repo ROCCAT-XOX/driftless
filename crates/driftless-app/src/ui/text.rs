@@ -625,6 +625,9 @@ pub const TOOL_NEEDS_CLOUD: &str = "Messen und Punkt wählen brauchen eine Punkt
 
 // The tool „Pinsel“: Stellen painted on the surface, their bar over the tools, their list in
 // „Bilder“.
+pub const TOOL_OBJECT: &str = "Objekt";
+pub const TOOL_OBJECT_HINT: &str =
+    "Setzt Steckdosen, Anschlüsse, Kabel und Rohre in die Ansicht; sie gehören zur Karte oder zum Modell";
 pub const TOOL_BRUSH: &str = "Pinsel";
 pub const TOOL_BRUSH_HINT: &str =
     "Stellen auf die Oberfläche malen, um sie nachzuarbeiten (glätten, Bilder neu einspielen)";
@@ -1038,6 +1041,7 @@ pub const NO_MEASUREMENTS: &str =
     "Noch keine Messungen. Unten in der Ansicht „Messen“ wählen und zwei Punkte anklicken.";
 pub const MEASUREMENTS_NOT_SAVED: &str =
     "Messungen werden noch nicht gespeichert: sie gehen beim Schließen verloren.";
+pub const MEASUREMENTS_SAVED: &str = "Gespeichert bei dieser Karte bzw. diesem Modell.";
 pub const CLEAR_MEASUREMENTS: &str = "Messungen löschen";
 /// The legend of the quality colours in the view.
 pub const QUALITY_LEGEND: &str = "Güte";
@@ -1862,6 +1866,66 @@ pub const PLAN_PICK_OWNER: &str = "Zuerst eine Karte oder ein Modell wählen";
 pub const PLAN_MAP_INCOMPLETE: &str =
     "Die Karte ist nicht fertig gerechnet – zuerst in „Daten“ neu rechnen";
 pub const PLAN_LOAD_JOB: &str = "Grundriss lesen";
+// The tool „Objekt“ and its list in the field „Planung“
+pub const OBJECTS_NEED_OWNER: &str = "Objekte brauchen eine Karte oder ein Modell des Projekts";
+pub const OBJECTS_JOB: &str = "Objekte speichern";
+pub const OBJECTS: &str = "Objekte";
+pub const NO_OBJECTS: &str =
+    "Noch keine Objekte. Unten in der Ansicht „Objekt“ wählen und Stellen anklicken.";
+pub const OBJECT_CONNECTION: &str = "Sorte";
+pub const OBJECT_DIAMETER: &str = "Durchmesser";
+pub const OBJECT_UNDO_HINT: &str = "Nimmt die letzte Änderung an den Objekten zurück (⌘Z, Strg+Z)";
+pub const OBJECT_PIPE_NEEDS_DIAMETER: &str = "Ein Rohr braucht einen Durchmesser über 0 mm.";
+pub const OBJECT_SHOW_3D: &str = "In 3D zeigen";
+pub const OBJECT_RENAME: &str = "Umbenennen …";
+pub const OBJECT_NOTE: &str = "Notiz …";
+pub const OBJECT_DELETE: &str = "Löschen";
+pub const OBJECT_RENAME_TITLE: &str = "Objekt umbenennen";
+pub const OBJECT_NOTE_TITLE: &str = "Notiz zum Objekt";
+pub const OBJECT_NAME: &str = "Name";
+pub const OBJECT_NOTE_FIELD: &str = "Notiz";
+pub const OBJECT_NOTE_CONFIRM: &str = "Speichern";
+/// A line with fewer than two points cannot be ended.
+pub fn object_line_short(kind: driftless_steps::objects::ObjectKind) -> &'static str {
+    match kind {
+        driftless_steps::objects::ObjectKind::Pipe => "Ein Rohr braucht mindestens zwei Punkte.",
+        _ => "Ein Kabel braucht mindestens zwei Punkte.",
+    }
+}
+/// What a click into the view does next with the tool „Objekt“.
+pub fn object_hint(kind: driftless_steps::objects::ObjectKind, points: usize) -> String {
+    use driftless_steps::objects::ObjectKind::{Cable, Pipe};
+    let name = kind.label();
+    match (kind, points) {
+        (Cable | Pipe, 0) => format!("{name}: ersten Punkt anklicken"),
+        (Cable | Pipe, _) => format!(
+            "{name}: weiteren Punkt anklicken · Enter oder Doppelklick beendet · \
+             Backspace nimmt zurück · Esc verwirft"
+        ),
+        _ => format!("{name}: Stelle anklicken"),
+    }
+}
+/// What an entry of the list of objects says on hover.
+pub fn object_details(object: &driftless_steps::objects::Object) -> String {
+    let mut lines = vec![object.label()];
+    if let Some(connection) = object.connection {
+        lines.push(connection.label().to_string());
+    }
+    if let Some(mm) = object.diameter_mm {
+        lines.push(format!(
+            "Durchmesser {} mm",
+            format!("{mm}").replace('.', ",")
+        ));
+    }
+    if !object.note.is_empty() {
+        lines.push(object.note.clone());
+    }
+    lines.join("\n")
+}
+/// A change of the objects could not be saved.
+pub fn objects_not_saved(why: &str) -> String {
+    format!("Objekte nicht gespeichert: {why}")
+}
 pub const PLAN_LAYERS: &str = "Layer";
 /// A layer with what it holds: „Raum (2)“.
 pub fn plan_layer(name: &str, count: usize) -> String {

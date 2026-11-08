@@ -40,17 +40,36 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
 - ☰ → „Meldungen …“: alle Meldungen des Rechners mit Stand und Antwort. „Zur Ansicht“ öffnet das Projekt
   einer Meldung und stellt Auswahl und Ansicht wieder her.
 
+#### Grundriss und DXF
+
+- Feld „Planung“: Aus einer Karte oder einem Modell rechnet Driftless einen Grundriss mit Wänden, Türen,
+  Fenstern, Räumen und Maßen. Was unklar bleibt, wird als unklar gezeichnet; mehrere Stockwerke werden
+  gemeldet und einzeln gerechnet.
+- Plan-Ansicht mit Layern, Draufsicht, Verschieben und Zoomen; „DXF …“ exportiert AutoCAD 2000 in
+  Millimetern, wahlweise an den Wänden oder wie die Punktwolke. Die Kommandozeile hat `driftless plan`.
+- Werkzeug „Objekt“ in der 3D-Ansicht: Steckdosen, Anschlüsse, Kabel und Rohre von Hand setzen. Enter oder
+  Doppelklick beendet einen Linienzug, Backspace nimmt den letzten Punkt zurück, Esc verwirft ihn. ↶ (⌘Z,
+  Strg+Z) nimmt jede Änderung zurück, auch nach einem Neustart. Die Liste „Objekte“ in „Planung“ markiert,
+  zeigt in 3D, benennt um, nimmt Notizen und löscht.
+- Objekte und Messungen gehören zur Karte oder zum Modell (`objekte.toml`) und überstehen einen neu
+  gerechneten Grundriss, Neustart und Verschieben des Projekts.
+
 ### Geändert
 
-- Die Werkzeugleiste der Ansicht hat ein sechstes Werkzeug, „Pinsel“.
+- Die Werkzeugleiste der Ansicht hat ein sechstes Werkzeug, „Pinsel“, und ein siebtes, „Objekt“.
+- Messungen werden gespeichert: bei der Karte oder dem Modell (auch im Plan und im DXF). Auf einer Datei
+  von anderswo bleiben sie wie bisher nur bis zum Schließen.
+- „Messungen löschen“ nimmt alle Messungen als einen Schritt heraus, ↶ bringt sie zurück.
 - „Exportieren …“ einer Oberfläche mit Nacharbeit exportiert sie mit der Nacharbeit („Oberfläche 001
   mit Nacharbeit“, glb, OBJ und PLY-Netz). Die gerechnete Oberfläche selbst bleibt, wie sie ist; die
   Kommandozeile exportiert weiter sie.
-- Die Anleitung hat die Abschnitte „Stellen nacharbeiten“ und „Melden“; die folgenden Abschnitte rücken
-  eine Nummer weiter.
+- Die Anleitung hat die Abschnitte „Stellen nacharbeiten“, „Melden“ und „Grundriss und DXF“; die folgenden
+  Abschnitte rücken eine Nummer weiter.
 
 ### Bekannte Grenzen
 
+- **Grundriss:** Rohre und Kabel werden von Hand gesetzt, die automatische Erkennung kommt später. Türen
+  stehen als Öffnung im Plan, ohne Türblatt und Aufschlag. Ein Plan zeigt immer ein Stockwerk.
 - **Nacharbeit braucht Zeit:** Ein Schritt auf einer Stelle von 1 m² dauerte auf dem Testrechner 12 bis
   14 s statt höchstens 5 s. Am meisten kostet die Suche nach den Fotos der Stelle; dabei liest Driftless
   jedes Mal alle Kamerabilder der Scans (im Büro 6,7 GB). Malen auf der Büro-Oberfläche läuft auf einem

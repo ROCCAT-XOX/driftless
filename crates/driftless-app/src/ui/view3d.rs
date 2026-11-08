@@ -17,6 +17,10 @@
 //! to the window ([`View3d::brush_input`], [`super::brush`]). Shift + left and the middle button
 //! pan, the right button orbits (in fly mode: looks), and a double click frames nothing.
 //!
+//! With the tool „Objekt“ ([`Tool::Object`]) a click hits a point like „Messen“, or the surface
+//! while only the surface is shown ([`ViewEvent::SurfaceClick`]); a double click ends a line
+//! under way ([`ViewEvent::EndLine`]) and frames nothing, its second click sets no new point.
+//!
 //! Over the cloud the view draws the run of [`ViewOverlay`] (trajectory, odometry, loops,
 //! anchors, picked places); without a cloud the run alone. The height cut applies to the
 //! points and the surface only: the trajectory is neither cut nor kept from being clicked by
@@ -64,6 +68,8 @@ pub const CLICK_MAX_MOVE: f32 = 4.0;
 pub const CLICK_MAX_SECONDS: f64 = 0.3;
 /// Points within this distance (points) of the mouse can be picked.
 const PICK_RADIUS: f32 = 6.0;
+/// How far apart (points) the two clicks of a double click may lie.
+const DOUBLE_CLICK_POINTS: f32 = 6.0;
 /// Diameter of the largest markers – the picked point and the picked places (points); the
 /// submap anchors are half as large.
 pub const MARKER_PX: f32 = 14.0;
@@ -92,7 +98,7 @@ const MARKER_COLOR: u32 = 0xffff_ffff;
 const LEGEND_TOP: f32 = 56.0;
 
 /// What the view reports from a click.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ViewEvent {
     /// The index of the clicked point in the cloud's [`crate::cloud::PointSet`].
     PickedPoint(u32),
@@ -100,6 +106,13 @@ pub enum ViewEvent {
     PickedPose(usize),
     /// A click in the mode „Stellen wählen“ while the trajectory is hidden: nothing picked.
     TrajectoryHidden,
+    /// A click of the tool „Objekt“ while only the surface is shown: the pixel of the view
+    /// (physical, from its top left) and the size of the view; the program hits the surface
+    /// there.
+    SurfaceClick { px: [f32; 2], viewport: [f32; 2] },
+    /// A double click of the tool „Objekt“: the line under way ends, its second click is no
+    /// new point.
+    EndLine,
 }
 
 /// The run drawn over the cloud.
@@ -355,6 +368,8 @@ pub struct View3d {
     frame_all: bool,
     last: Option<FrameKey>,
     press: Option<Press>,
+    /// Where the last click ended: two clicks in a row at one place are a double click.
+    last_click: Option<egui::Pos2>,
     /// The picked point (index in the point set), marked in the view.
     picked: Option<u32>,
     /// What the left button and a click do.
@@ -937,6 +952,7 @@ impl View3d {
         let mode = self.camera.mode;
         let shift = ctx.input(|i| i.modifiers.shift);
         let brush = self.tool == Tool::Brush;
+        let object = self.tool == Tool::Object;
         self.brush_stroke(ctx, response, rect, ppp, viewport, shift);
         let painting = self.painting.is_some();
         let delta = response.drag_delta() * ppp;
@@ -1019,10 +1035,21 @@ impl View3d {
         if let (Some(p), Some(pos)) = (&mut self.press, pos) {
             p.moved = p.moved.max(p.pos.distance(pos));
         }
+        let surface_alone =
+            effective_show(settings.show, self.has_surface(), cloud.is_some()) == ShowMode::Surface;
         let mut event = None;
         if released {
             if let (Some(p), Some(pos)) = (self.press.take(), pos) {
-                if is_click(p.time, time, p.moved) {
+                let second = object
+                    && response.double_clicked()
+                    && self
+                        .last_click
+                        .is_some_and(|c| c.distance(pos) <= DOUBLE_CLICK_POINTS);
+                if is_click(p.time, time, p.moved) && second {
+                    event = Some(ViewEvent::EndLine);
+                    self.last_click = None;
+                } else if is_click(p.time, time, p.moved) {
+                    self.last_click = Some(pos);
                     let pixel = to_physical([pos.x, pos.y], [rect.min.x, rect.min.y], ppp);
                     // the trajectory is not cut by the height cut, so its poses are not either
                     let places = overlay.filter(|o| o.pick_places);
@@ -1037,6 +1064,11 @@ impl View3d {
                                 .pick(&vp, viewport, pixel, radius, o.avoid_submap)
                                 .map(ViewEvent::PickedPose)
                         }
+                        // only the surface shown: the program hits it with a ray
+                        (None, _) if object && surface_alone => Some(ViewEvent::SurfaceClick {
+                            px: pixel,
+                            viewport,
+                        }),
                         (None, Some(cloud)) if self.tool.picks_points() => pick_point_spots(
                             &cloud.tree,
                             &self.drawn,
@@ -1053,10 +1085,12 @@ impl View3d {
                 }
             }
         }
-        // a double click with the brush paints twice, it frames nothing
+        // a double click with the brush paints twice, with „Objekt“ it ends a line: it frames
+        // nothing
         if response.double_clicked()
             && event.is_none()
             && !brush
+            && !object
             && self.hit_nothing(rect, ppp, viewport, cloud, pos, settings)
         {
             self.frame_all = true;

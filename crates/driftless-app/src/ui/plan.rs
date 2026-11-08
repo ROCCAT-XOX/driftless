@@ -154,6 +154,20 @@ pub fn refresh_drawing(state: &mut PlanState) {
     Arc::make_mut(shown).drawing = drawing;
 }
 
+/// The plan shown takes `objects`, the ones of its map or model as they are now.
+pub fn set_objects(state: &mut PlanState, objects: Objects) {
+    if let Some(shown) = &mut state.shown {
+        Arc::make_mut(shown).objects = objects;
+    }
+    refresh_drawing(state);
+}
+
+/// The colour of the layer `name` in the plan and in the 3D view (of the objects drawn there).
+pub fn layer_colour(name: &str) -> egui::Color32 {
+    let index = LAYERS.iter().find(|&&(n, _)| n == name).map_or(0, |l| l.1);
+    super::plan_view::layer_colour(index)
+}
+
 /// Switches a layer of the plan shown (and of the plans shown after it).
 pub fn set_layer(state: &mut PlanState, layer: &str, on: bool) {
     if on {
@@ -244,8 +258,8 @@ pub fn layer_counts(shown: &ShownPlan) -> Vec<(&'static str, usize)> {
     LAYERS.iter().map(|&(name, _)| name).zip(counts).collect()
 }
 
-/// The part of the field for the plan shown: the layers, „Draufsicht“, the hints of the plan and
-/// „DXF …“. Nothing while none is shown.
+/// The part of the field for the plan shown: the layers, „Draufsicht“ and the hints of the plan.
+/// Nothing while none is shown.
 pub fn panel(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
     let Some(shown) = &state.plan.shown else {
         return;
@@ -289,6 +303,13 @@ pub fn panel(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
             let line = format!("{} {hint}", icon::HINT);
             ui.add(egui::Label::new(RichText::new(line).color(DARK.text_dim)).wrap());
         }
+    }
+}
+
+/// „DXF …“ of the plan shown; nothing while none is shown.
+pub fn dxf_button(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
+    if state.plan.shown.is_none() {
+        return;
     }
     ui.add_space(4.0);
     if ui

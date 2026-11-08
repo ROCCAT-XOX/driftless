@@ -5,7 +5,7 @@
 //! Layout: the rail at the left edge ([`rail`]: ☰, the three [`Step`]s, ⚙), next to it the
 //! field of the active step ([`steps`]), the 3D view ([`view3d`]) in the rest with its floating
 //! bars ([`tools`]: info, the switch Punkte · Fläche · beides, the tools, the cut and the bar of
-//! the brush, [`brush`]), the status bar ([`status`]) at the bottom, the settings window ⚙
+//! the brush, [`brush`], and of the tool „Objekt“, [`objects`]), the status bar ([`status`]) at the bottom, the settings window ⚙
 //! ([`settings`]), the window „Exportieren“ ([`export`]), the window „Über Driftless“
 //! ([`about`]), and „Melden“ (⇧⇧) with the list of the reports ([`feedback`]).
 
@@ -18,6 +18,7 @@ pub mod correct;
 pub mod export;
 pub mod feedback;
 pub mod manage;
+pub mod objects;
 pub mod plan;
 pub mod plan_view;
 pub mod rail;
@@ -162,6 +163,34 @@ pub enum Action {
     SetTopView(bool),
     /// „DXF …“: the window „Exportieren“ for the plan shown, with its layers as they are shown.
     OpenPlanExport,
+    /// Adds an object to the map or model in `owner`: shown at once, saved in its
+    /// `objekte.toml` in the background ([`objects::ObjectChange`]).
+    AddObject {
+        owner: PathBuf,
+        input: driftless_steps::objects::ObjectInput,
+    },
+    /// Takes object `nr` out of the list of the map or model; ↶ brings it back.
+    RemoveObject {
+        owner: PathBuf,
+        nr: u32,
+    },
+    RenameObject {
+        owner: PathBuf,
+        nr: u32,
+        name: String,
+    },
+    SetObjectNote {
+        owner: PathBuf,
+        nr: u32,
+        note: String,
+    },
+    /// ↶, ⌘Z with the tool „Objekt“: takes back the youngest change of the objects listed.
+    UndoObject,
+    /// Marks object `nr` of the objects listed and goes to it in the 3D view.
+    FrameObject(u32),
+    /// „Messungen löschen“: of the map or model as one step back for ↶; on a cloud from
+    /// elsewhere those in memory.
+    ClearMeasurements,
     /// „Von Hand ausrichten“ of scan `member` (from 0) of the model (folder): shows the
     /// model and that scan side by side and opens the tool „Punktpaare“.
     StartPairs {
@@ -354,6 +383,18 @@ pub enum Ask {
     RemoveScan { id: String },
     /// „Löschen …“ of a folder of the tree.
     Delete(DeleteQuestion),
+    /// „Umbenennen …“ of object `nr` of the map or model in `owner`: the name being typed.
+    RenameObject {
+        owner: PathBuf,
+        nr: u32,
+        name: String,
+    },
+    /// „Notiz …“ of object `nr`: the note being typed.
+    ObjectNote {
+        owner: PathBuf,
+        nr: u32,
+        note: String,
+    },
 }
 
 /// What „Löschen …“ asks: the folder, its name and size, what lies in it, and the models
@@ -539,6 +580,8 @@ pub struct Tree {
     pub busy: Vec<(PathBuf, String)>,
     /// The Stellen of the maps and models, by folder ([`brush::read_marks`]).
     pub marks: BTreeMap<PathBuf, brush::MarksRead>,
+    /// The objects of the maps and models, by folder ([`objects::read_objects`]).
+    pub objects: BTreeMap<PathBuf, objects::ObjectsRead>,
 }
 
 /// Reads the tree of `project` from disk: every scan folder, run, map, surface and model, the
@@ -581,13 +624,15 @@ pub fn read_tree(project: &Project) -> Tree {
         Err(e) => (Vec::new(), Some(e)),
     };
     let models = project.models();
-    let owners = scans
+    let owners: Vec<PathBuf> = scans
         .iter()
         .flat_map(|s: &ScanNode| &s.runs)
         .flat_map(|r| &r.maps)
         .map(|m| m.dir.clone())
-        .chain(models.iter().map(|m| m.dir.clone()));
-    let marks = brush::read_marks(owners);
+        .chain(models.iter().map(|m| m.dir.clone()))
+        .collect();
+    let marks = brush::read_marks(owners.iter().cloned());
+    let objects = objects::read_objects(owners);
     Tree {
         scans,
         models,
@@ -596,6 +641,7 @@ pub fn read_tree(project: &Project) -> Tree {
         leftovers: crate::leftovers::find(&project.dir, &ids),
         busy: crate::leftovers::busy_folders(&project.dir),
         marks,
+        objects,
     }
 }
 
@@ -715,8 +761,11 @@ pub struct AppState {
     pub picked: Option<view3d::PointInfo>,
     /// The tool of the view; always exactly one.
     pub tool: tools::Tool,
-    /// The measurements of the tool „Messen“, oldest first (not saved yet: Baustein 5).
+    /// The measurements of the tool „Messen“ of the map or model shown, oldest first; on a
+    /// cloud from elsewhere those made in memory ([`objects::MeasureView`]).
     pub measurements: Vec<tools::Measurement>,
+    /// Which measurements [`AppState::measurements`] holds.
+    pub measure_view: objects::MeasureView,
     /// The first end of a measurement being made (absolute); Esc or another tool drops it.
     pub measure_a: Option<[f64; 3]>,
     /// The manual corrections of the run the view draws.
@@ -746,6 +795,11 @@ pub struct AppState {
     /// since by this window (a stroke shows here at once and is saved in the background):
     /// those of the surface shown are listed in „Bilder“ and marked in the view.
     pub marks: BTreeMap<PathBuf, brush::MarksRead>,
+    /// The objects of the maps and models, by folder, as last read with the tree and changed
+    /// since by this window: listed in „Planung“, drawn in the view and the plan.
+    pub objects: BTreeMap<PathBuf, objects::ObjectsRead>,
+    /// The tool „Objekt“: what it sets next, a line under way.
+    pub object_tool: objects::ObjectTool,
     /// The brush: its size and the Stelle it paints into.
     pub brush: brush::BrushState,
     /// The touch-up of the Stellen: „Vorher“ / „Nachher“, what the view holds, what waits.
@@ -823,6 +877,7 @@ impl AppState {
         self.leftovers = tree.leftovers;
         self.busy = tree.busy;
         self.marks = tree.marks;
+        self.objects = tree.objects;
         // „Von Hand ausrichten“ of a model that is gone ends
         let gone = self
             .pairs

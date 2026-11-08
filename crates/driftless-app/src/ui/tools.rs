@@ -4,15 +4,18 @@
 //!   712.218 Dreiecke“), the numbers of the last frame, what a click does now and the clicked
 //!   point;
 //! - top right, while a surface is loaded, the switch Punkte · Fläche · beides (key `O`);
-//! - bottom centre the tools Drehen · Verschieben · Punkt wählen · Messen · Schnitt · Pinsel and
-//!   the button „Alles“ (key `F`); exactly one tool is active ([`Tool`]); „Pinsel“ only with a
-//!   surface of the project shown, else off with the reason;
+//! - bottom centre the tools Drehen · Verschieben · Punkt wählen · Messen · Schnitt · Pinsel ·
+//!   Objekt and the button „Alles“ (key `F`); exactly one tool is active ([`Tool`]); „Pinsel“
+//!   only with a surface of the project shown, „Objekt“ only with something of a map or model
+//!   of the project shown, else off with the reason;
 //! - above them, with the tool „Schnitt“, the height cut: z min, z max, „Decke ausblenden“; with
-//!   the tool „Pinsel“ its bar ([`super::brush::bar`]).
+//!   the tool „Pinsel“ its bar ([`super::brush::bar`]); with the tool „Objekt“ its bar
+//!   ([`super::objects::bar`]).
 //!
 //! Measuring: the first click on a point sets its first end, the second the other and adds the
 //! [`Measurement`]; Esc or another tool drops a first end. The view draws the lines with their
-//! distance ([`paint_measurements`]), the field „Planung“ lists them.
+//! distance ([`paint_measurements`]), the field „Planung“ lists them; they are kept with the map
+//! or model shown ([`super::objects`]).
 //!
 //! Point pairs („Von Hand ausrichten“, [`PairSession`]): the view shows a model and beside it
 //! one of its scans; the tool „Punktpaare“ (in the bar only then) takes a place in the model
@@ -55,18 +58,25 @@ pub enum Tool {
     Brush,
     /// Clicks set point pairs of a [`PairSession`]; only in the bar while one is open.
     Pairs,
+    /// Clicks set sockets, connections, cables and pipes ([`super::objects`]): on the points
+    /// like [`Tool::Measure`], while only the surface is shown on the surface. Its bar shows
+    /// above the tools.
+    Object,
 }
 
 impl Tool {
     /// Whether a click picks a point of the cloud (else it does nothing; dragging turns the
     /// view as with [`Tool::Orbit`], except with [`Tool::Pan`]).
     pub fn picks_points(self) -> bool {
-        matches!(self, Tool::Pick | Tool::Measure | Tool::Pairs)
+        matches!(
+            self,
+            Tool::Pick | Tool::Measure | Tool::Pairs | Tool::Object
+        )
     }
 }
 
 /// The tools of the bar: tool, symbol, name, tooltip.
-const TOOLS: [(Tool, &str, &str, &str); 6] = [
+const TOOLS: [(Tool, &str, &str, &str); 7] = [
     (
         Tool::Orbit,
         icon::ORBIT,
@@ -92,6 +102,12 @@ const TOOLS: [(Tool, &str, &str, &str); 6] = [
         icon::BRUSH,
         text::TOOL_BRUSH,
         text::TOOL_BRUSH_HINT,
+    ),
+    (
+        Tool::Object,
+        icon::OBJECT,
+        text::TOOL_OBJECT,
+        text::TOOL_OBJECT_HINT,
     ),
 ];
 
@@ -128,6 +144,8 @@ pub struct ScreenLayout {
     pub plan: Option<Rect>,
     /// The bar of the brush ([`super::brush::bar`]).
     pub brush: Option<Rect>,
+    /// The bar of the tool „Objekt“ ([`super::objects::bar`]).
+    pub objects: Option<Rect>,
     /// The legend of the quality colours ([`quality_legend`]).
     pub legend: Option<Rect>,
 }
@@ -145,6 +163,7 @@ impl Default for ScreenLayout {
             cut: None,
             plan: None,
             brush: None,
+            objects: None,
             legend: None,
         }
     }
@@ -161,6 +180,10 @@ const INFO_SHARE: f32 = 0.45;
 /// Height of a button of the bars (points).
 const BUTTON_HEIGHT: f32 = 28.0;
 const BUTTON_PAD: f32 = 9.0;
+/// In a view narrower than this the tools stand closer together, so that their names stay
+/// (points), with this padding.
+const COMPACT_VIEW: f32 = 760.0;
+const COMPACT_PAD: f32 = 5.0;
 /// A button with a symbol only (×) is smaller.
 const SMALL_BUTTON: f32 = 20.0;
 /// Least height of a row of text in the bars (points).
@@ -182,6 +205,7 @@ pub fn select(state: &mut AppState, tool: Tool) {
     if state.tool != tool {
         state.tool = tool;
         state.measure_a = None;
+        super::objects::cancel_line(state);
     }
     // a click picks points or paints now, not the places of a loop
     if tool.picks_points() || tool == Tool::Brush {
@@ -216,7 +240,8 @@ pub fn point_clicked(state: &mut AppState, info: PointInfo) {
                 }
             }
         }
-        Tool::Orbit | Tool::Pan | Tool::Cut | Tool::Brush => {}
+        // the window hands the point to the tool „Objekt“ itself ([`super::objects`])
+        Tool::Orbit | Tool::Pan | Tool::Cut | Tool::Brush | Tool::Object => {}
     }
 }
 
@@ -445,6 +470,7 @@ pub fn floats(
     layout.tools = None;
     layout.cut = None;
     layout.brush = None;
+    layout.objects = None;
     layout.plan = None;
     // over the plan only its own switch: the bars below belong to the 3D view
     if super::plan::on_screen(state) || (state.cloud.is_none() && state.surface.is_none()) {
@@ -462,6 +488,11 @@ pub fn floats(
         Tool::Brush => {
             let (rect, asked) = super::brush::bar(ctx, view, tools.top() - GAP, state);
             layout.brush = Some(rect);
+            action = action.or(asked);
+        }
+        Tool::Object => {
+            let (rect, asked) = super::objects::bar(ctx, view, tools.top() - GAP, state);
+            layout.objects = Some(rect);
             action = action.or(asked);
         }
         _ => {}
@@ -571,8 +602,9 @@ fn info(ctx: &Context, view: Rect, state: &mut AppState) -> Rect {
             if let (Some(why), Tool::Pairs) = (why, s.tool) {
                 ui.add(egui::Label::new(RichText::new(why).color(DARK.warn)).wrap());
             }
-            // the clicks hit the points, also while only the surface is seen
-            if s.tool.picks_points() && s.cloud.is_some() && shown == ShowMode::Surface {
+            // the clicks hit the points, also while only the surface is seen (not of „Objekt“)
+            let on_points = s.tool.picks_points() && s.tool != Tool::Object;
+            if on_points && s.cloud.is_some() && shown == ShowMode::Surface {
                 ui.add(
                     egui::Label::new(RichText::new(text::PICKS_ON_CLOUD).color(DARK.text_dim))
                         .wrap(),
@@ -595,6 +627,12 @@ fn info(ctx: &Context, view: Rect, state: &mut AppState) -> Rect {
 pub fn click_hint(s: &AppState) -> Option<String> {
     if s.correct.picking {
         return Some(text::VIEW_HELP_PICK.into());
+    }
+    if s.tool == Tool::Object {
+        return Some(text::object_hint(
+            s.object_tool.kind,
+            s.object_tool.line.len(),
+        ));
     }
     if s.tool.picks_points() && s.cloud.is_none() {
         return Some(text::TOOL_NEEDS_CLOUD.into());
@@ -675,6 +713,11 @@ fn toolbar(ctx: &Context, view: Rect, state: &mut AppState) -> (Rect, Option<Act
     let mut chosen = None;
     let mut action = None;
     let active = state.tool;
+    let pad = if view.width() < COMPACT_VIEW {
+        COMPACT_PAD
+    } else {
+        BUTTON_PAD
+    };
     let pos = view.center_bottom() - egui::vec2(0.0, BOTTOM_MARGIN);
     let rect = float(ctx, "werkzeuge", view, pos, Align2::CENTER_BOTTOM, |ui| {
         ui.horizontal(|ui| {
@@ -685,13 +728,25 @@ fn toolbar(ctx: &Context, view: Rect, state: &mut AppState) -> (Rect, Option<Act
                 text::TOOL_PAIRS_HINT,
             );
             let extra = state.pairs.is_some().then_some(pairs);
-            // the brush needs a surface of the project to paint on
+            // the brush needs a surface of the project to paint on, „Objekt“ a map or model
             let brush_off = super::brush::blocked(state);
+            let object_off = super::objects::blocked(state);
             for (tool, symbol, name, hint) in TOOLS.into_iter().chain(extra) {
-                let off = brush_off.as_ref().filter(|_| tool == Tool::Brush);
+                let off = match tool {
+                    Tool::Brush => brush_off.as_ref(),
+                    Tool::Object => object_off.as_ref(),
+                    _ => None,
+                };
                 let r = ui
                     .add_enabled_ui(off.is_none(), |ui| {
-                        bar_button(ui, Some(symbol), Some(name), name, Some(tool == active))
+                        padded_button(
+                            ui,
+                            Some(symbol),
+                            Some(name),
+                            name,
+                            Some(tool == active),
+                            pad,
+                        )
                     })
                     .inner;
                 let r = match off {
@@ -703,12 +758,13 @@ fn toolbar(ctx: &Context, view: Rect, state: &mut AppState) -> (Rect, Option<Act
                 }
             }
             ui.separator();
-            let r = bar_button(
+            let r = padded_button(
                 ui,
                 Some(icon::FIT),
                 Some(text::FIT_ALL),
                 text::FIT_ALL,
                 None,
+                pad,
             );
             if r.on_hover_text(text::FRAME_ALL_HINT).clicked() {
                 action = Some(Action::FrameAll);
@@ -730,6 +786,18 @@ pub(super) fn bar_button(
     label: Option<&str>,
     name: &str,
     on: Option<bool>,
+) -> egui::Response {
+    padded_button(ui, symbol, label, name, on, BUTTON_PAD)
+}
+
+/// [`bar_button`] with `pad` left and right of a button with a label.
+fn padded_button(
+    ui: &mut Ui,
+    symbol: Option<&str>,
+    label: Option<&str>,
+    name: &str,
+    on: Option<bool>,
+    pad: f32,
 ) -> egui::Response {
     let selected = on.unwrap_or(false);
     let fg = if !ui.is_enabled() {
@@ -754,7 +822,7 @@ pub(super) fn bar_button(
     let size = if label.is_none() {
         egui::vec2(SMALL_BUTTON.max(content + 6.0), SMALL_BUTTON)
     } else {
-        egui::vec2(content + 2.0 * BUTTON_PAD, BUTTON_HEIGHT)
+        egui::vec2(content + 2.0 * pad, BUTTON_HEIGHT)
     };
     let pad = (size.x - content) / 2.0;
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
@@ -921,7 +989,7 @@ pub fn quality_legend(ctx: &Context, view: Rect, show: bool, layout: &mut Screen
     }
     use driftless_steps::overlay::{quality_color, QUALITY_GREEN, QUALITY_RED, QUALITY_YELLOW};
     // above the bars at the bottom, if any
-    let above = [layout.tools, layout.cut, layout.brush]
+    let above = [layout.tools, layout.cut, layout.brush, layout.objects]
         .into_iter()
         .flatten()
         .map(|r| r.top() - GAP)

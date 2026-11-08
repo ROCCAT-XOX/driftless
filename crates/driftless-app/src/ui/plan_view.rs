@@ -42,6 +42,8 @@ const MIN_TEXT: f32 = 4.0;
 /// from the insertion point.
 const NUMBER_HEIGHT: f64 = 100.0;
 const NUMBER_X: f64 = 120.0;
+/// Radius of the ring around the object marked in the list (points).
+const MARK_RING: f32 = 12.0;
 
 /// Where the plan lies on the surface. `mm_per_point` 0 means not placed yet: it is fitted at
 /// the next frame.
@@ -142,7 +144,7 @@ pub fn bounds(drawing: &Drawing) -> ([f64; 2], [f64; 2]) {
 }
 
 /// The colour of an AutoCAD colour index on the dark background, for the indices of [`LAYERS`].
-fn layer_colour(index: u8) -> Color32 {
+pub(super) fn layer_colour(index: u8) -> Color32 {
     match index {
         1 => Color32::from_rgb(235, 87, 87),
         2 => Color32::from_rgb(235, 205, 90),
@@ -282,6 +284,33 @@ fn draw_top_view(ui: &Ui, surface: &Surface, texture: &TextureHandle, info: &Top
     }
 }
 
+/// The ring around object `nr` of the list („Klick markiert im Plan“), on a line a thick stroke
+/// over it. Nothing if its layer is off.
+fn mark_object(surface: &Surface, drawing: &Drawing, nr: u32) {
+    let number = nr.to_string();
+    let tag = format!("NR={nr}");
+    let stroke = Stroke::new(WALL_WIDTH + 1.5, DARK.accent);
+    let on = |layer: &str| drawing.layers.iter().any(|l| l.on && l.name == layer);
+    for entity in drawing.entities.iter().filter(|e| on(&e.layer)) {
+        match &entity.kind {
+            EntityKind::Insert { at, attributes, .. }
+                if attributes.first().is_some_and(|(_, v)| *v == number) =>
+            {
+                surface
+                    .painter
+                    .circle_stroke(surface.at(*at), MARK_RING, stroke);
+            }
+            EntityKind::Shape(DrawnShape::Polyline { points, .. })
+                if entity.xdata.first() == Some(&tag) =>
+            {
+                let pts = points.iter().map(|p| surface.at(*p)).collect();
+                surface.painter.add(Shape::line(pts, stroke));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Draws the plan shown on all the space of `ui`, and handles moving and zooming it.
 pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
     let rect = ui.max_rect();
@@ -363,6 +392,9 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
                 }
             }
         }
+    }
+    if let Some(nr) = state.plan.selected_object {
+        mark_object(&surface, &shown.drawing, nr);
     }
     // the names of the texts on the surface, for screen readers and the tests
     let texts = std::mem::take(&mut surface.texts);

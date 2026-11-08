@@ -31,13 +31,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The tools of the bar, in order.
-const TOOLS: [&str; 6] = [
+const TOOLS: [&str; 7] = [
     text::TOOL_ORBIT,
     text::TOOL_PAN,
     text::TOOL_PICK,
     text::TOOL_MEASURE,
     text::TOOL_CUT,
     text::TOOL_BRUSH,
+    text::TOOL_OBJECT,
 ];
 
 fn app() -> DriftlessApp {
@@ -450,8 +451,12 @@ fn small_window_no_overlap() {
         ..AppState::default()
     };
     let mut h = window(app, [1024.0, 640.0]);
-    // the cut, then the brush with its bar above the tools
-    for (tool, bar) in [(Tool::Cut, "Schnitt"), (Tool::Brush, "Pinsel")] {
+    // the cut, then the brush and the tool „Objekt“ with their bars above the tools
+    for (tool, bar) in [
+        (Tool::Cut, "Schnitt"),
+        (Tool::Brush, "Pinsel"),
+        (Tool::Object, "Objekt"),
+    ] {
         h.state_mut().state_mut().tool = tool;
         h.run();
         assert_eq!(h.state().state().tool, tool);
@@ -460,7 +465,14 @@ fn small_window_no_overlap() {
             ("Info", l.info),
             ("Ansicht", l.show),
             ("Werkzeuge", l.tools),
-            (bar, if tool == Tool::Cut { l.cut } else { l.brush }),
+            (
+                bar,
+                match tool {
+                    Tool::Cut => l.cut,
+                    Tool::Brush => l.brush,
+                    _ => l.objects,
+                },
+            ),
         ];
         let mut all = vec![("Leiste", l.rail), ("Schrittfeld", l.step)];
         for (what, rect) in floats {

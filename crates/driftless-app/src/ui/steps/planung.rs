@@ -1,7 +1,8 @@
 //! Step 3 „Planung“, in the form of „Bilder“: a card per map and model with its status (nicht
 //! gerechnet, rechnet, fertig ✓, veraltet) and its floor plans below it, „Mehrere Stockwerke
 //! gefunden“ with a button per storey, what belongs to the plan shown ([`plan::panel`]: layers,
-//! „Draufsicht“, hints, „DXF …“) and the measurements of the tool „Messen“ (not saved yet). At
+//! „Draufsicht“, hints), the objects of the map or model shown, the measurements of the tool
+//! „Messen“ (kept with the map or model, on a cloud from elsewhere in memory) and „DXF …“. At
 //! the bottom the main button „Grundriss rechnen“ for the map or model chosen; with only one in
 //! the project that one. A plan needs the map or model only, so raw data that are gone lock
 //! nothing here.
@@ -12,7 +13,8 @@ use super::{
 };
 use crate::project::{MapInfo, ModelInfo, PlanInfo};
 use crate::ui::theme::{self, icon, DARK};
-use crate::ui::{plan, text, Action, AppState, Selection, Step};
+use crate::ui::{objects, plan, text, Action, AppState, Ask, Selection, Step};
+use driftless_steps::objects::{Object, ObjectKind};
 use eframe::egui::{self, Align, Layout, RichText, Ui};
 use std::path::{Path, PathBuf};
 
@@ -85,16 +87,18 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
                 owner_list(ui, state, action);
                 storey_choice(ui, state, action);
                 plan::panel(ui, state, action);
+                object_list(ui, state, action);
                 job_progress(ui, state);
                 ui.add_space(6.0);
-                measurements(ui, state, false);
+                measurements(ui, state, action, false);
+                plan::dxf_button(ui, state, action);
             },
             |ui, (state, action)| compute_button(ui, state, action),
         );
         return action;
     }
     ui.add_space(4.0);
-    measurements(ui, state, true);
+    measurements(ui, state, &mut action, true);
     action
 }
 
@@ -231,10 +235,72 @@ fn compute_button(ui: &mut Ui, state: &AppState, action: &mut Option<Action>) {
     below_lines(ui, below);
 }
 
+/// „Objekte“ of the map or model the field is about ([`objects::listed_owner`]), without the
+/// measurements, which have their own list: a click marks one in the plan (again: lets it
+/// go), „In 3D zeigen“ goes to it, the right click „Umbenennen …“, „Notiz …“ and „Löschen“.
+/// Nothing without one; why not while its `objekte.toml` cannot be read.
+fn object_list(ui: &mut Ui, state: &mut AppState, action: &mut Option<Action>) {
+    let Some(owner) = objects::listed_owner(state) else {
+        return;
+    };
+    ui.add_space(6.0);
+    ui.strong(text::OBJECTS);
+    if let Some(Err(why)) = state.objects.get(&owner) {
+        let line = RichText::new(why).color(DARK.warn);
+        ui.add(egui::Label::new(line).wrap());
+        return;
+    }
+    let rows: Vec<Object> = objects::of(state, &owner)
+        .into_iter()
+        .flat_map(|o| o.all())
+        .filter(|o| o.kind != ObjectKind::Measure)
+        .cloned()
+        .collect();
+    if rows.is_empty() {
+        hint(ui, text::NO_OBJECTS);
+        return;
+    }
+    for object in rows {
+        let selected = state.plan.selected_object == Some(object.nr);
+        let r = tree::entry(ui, selected, object.label(), &text::object_details(&object));
+        if r.clicked() {
+            state.plan.selected_object = (!selected).then_some(object.nr);
+        }
+        r.context_menu(|ui| {
+            if ui.button(text::OBJECT_SHOW_3D).clicked() {
+                *action = Some(Action::FrameObject(object.nr));
+            }
+            if ui.button(text::OBJECT_RENAME).clicked() {
+                *action = Some(Action::Ask(Ask::RenameObject {
+                    owner: owner.clone(),
+                    nr: object.nr,
+                    name: object.name.clone(),
+                }));
+            }
+            if ui.button(text::OBJECT_NOTE).clicked() {
+                *action = Some(Action::Ask(Ask::ObjectNote {
+                    owner: owner.clone(),
+                    nr: object.nr,
+                    note: object.note.clone(),
+                }));
+            }
+            if ui.button(text::OBJECT_DELETE).clicked() {
+                *action = Some(Action::RemoveObject {
+                    owner: owner.clone(),
+                    nr: object.nr,
+                });
+            }
+        });
+        if selected && ui.small_button(text::OBJECT_SHOW_3D).clicked() {
+            *action = Some(Action::FrameObject(object.nr));
+        }
+    }
+}
+
 /// „Messungen“: a card per measurement with its distance, or how to make one; „Messungen
 /// löschen“ below them. `scroll`: the field does not scroll itself (no map to list), so the
 /// cards scroll here and the hint and the button stay in the field.
-fn measurements(ui: &mut Ui, state: &mut AppState, scroll: bool) {
+fn measurements(ui: &mut Ui, state: &mut AppState, action: &mut Option<Action>, scroll: bool) {
     ui.strong(text::MEASUREMENTS);
     if state.measurements.is_empty() {
         hint(ui, text::NO_MEASUREMENTS);
@@ -262,9 +328,16 @@ fn measurements(ui: &mut Ui, state: &mut AppState, scroll: bool) {
     } else {
         cards(ui);
     }
-    hint(ui, text::MEASUREMENTS_NOT_SAVED);
+    let saved = objects::measurements_saved(state);
+    hint(
+        ui,
+        if saved {
+            text::MEASUREMENTS_SAVED
+        } else {
+            text::MEASUREMENTS_NOT_SAVED
+        },
+    );
     if ui.button(text::CLEAR_MEASUREMENTS).clicked() {
-        state.measurements.clear();
-        state.measure_a = None;
+        *action = Some(Action::ClearMeasurements);
     }
 }
