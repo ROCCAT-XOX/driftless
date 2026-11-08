@@ -17,7 +17,11 @@ correctable by hand. Runs natively on **macOS (Apple Silicon)** and **Windows**.
 > formats (LAS/LAZ, E57, PLY, PCD, glb, OBJ, TUM, CSV). Projects can be renamed, moved, copied and
 > cleaned up; nothing is deleted for good without asking (Windows asks before it deletes a folder too
 > large for its Recycle Bin). Installers for macOS and Windows: see [Install](#install).
-> Results on real scans (German): [version 0.1.0: time, memory and disk per setting](docs/ergebnisse/2026-10-28-version-0-1.md),
+> Results on real scans (German): [version 0.2.0: summary and open points](docs/ergebnisse/2026-11-08-version-0-2.md),
+> [floor plan and DXF](docs/ergebnisse/2026-11-08-grundriss.md),
+> [less noise](docs/ergebnisse/2026-11-08-weniger-rauschen.md),
+> [brush and rework](docs/ergebnisse/2026-10-29-pinsel.md),
+> [version 0.1.0: time, memory and disk per setting](docs/ergebnisse/2026-10-28-version-0-1.md),
 > [export and installers](docs/ergebnisse/2026-10-27-baustein-3.md),
 > [merging scans](docs/ergebnisse/2026-10-27-baustein-1.md),
 > [quality round C and D](docs/ergebnisse/2026-10-26-qualitaet-c-d.md),
