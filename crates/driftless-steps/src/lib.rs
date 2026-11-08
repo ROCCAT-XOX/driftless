@@ -13,6 +13,7 @@ mod leftovers;
 pub mod map;
 pub mod marks;
 pub mod merge;
+pub mod objects;
 pub mod overlay;
 pub mod pairs;
 pub mod plan;
