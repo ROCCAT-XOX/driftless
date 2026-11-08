@@ -502,13 +502,16 @@ korrigierte Laufbahn) und ein neu zusammengeführtes Modell beginnen ohne Stelle
 bei der alten Karte oder dem alten Modell.
 
 **Ohne Rohdaten.** Fehlen die Kamerabilder, etwa weil das Laufwerk mit den Scans nicht angesteckt ist,
-ist „Bilder neu einspielen“ aus: „Rohdaten fehlen – Bilder können nicht neu eingespielt werden“. Glätten
-geht trotzdem; die alten Fotos bleiben dann auf der Stelle und bewegen sich mit ihr. Schon eingespielte
-Fotos bleiben auch, wenn eine frühere Stelle gelöscht und mit ↶ zurückgeholt wird. Sind die Rohdaten
-wieder da, spielt Driftless die Bilder nach, sobald die Oberfläche das nächste Mal gezeigt wird.
+ist „Bilder neu einspielen“ aus: „Rohdaten von „Scan“ fehlen – Bilder können nicht neu eingespielt
+werden“ (bei einem Modell der erste Scan, dessen Ordner fehlt). Glätten geht trotzdem; die alten Fotos
+bleiben dann auf der Stelle und bewegen sich mit ihr. Schon eingespielte Fotos bleiben auch, wenn eine
+frühere Stelle gelöscht und mit ↶ zurückgeholt wird (bei sehr vielen Schritten die ersten 64). Sind die
+Rohdaten wieder da, spielt Driftless die Bilder nach, sobald die Oberfläche das nächste Mal gezeigt
+wird.
 
-Was fehlt, sagt Driftless beim Drücken von „Bilder neu einspielen“ und wenn es die Nacharbeit beim
-Laden, beim Export oder auf einer neuen Oberfläche wieder anwendet, zum Beispiel „Bilder nicht neu
+Was fehlt, sagt Driftless beim Drücken von „Bilder neu einspielen“, wenn es die Nacharbeit beim
+Laden, beim Export oder auf einer neuen Oberfläche wieder anwendet, und wenn nach „Löschen“ spätere
+Stellen ohne ihre Bilder neu gerechnet werden (↶ holt sie zurück), zum Beispiel „Bilder nicht neu
 eingespielt: Rohdaten fehlen – Scan-Ordner … nicht gefunden“:
 
 | Meldung | heißt |

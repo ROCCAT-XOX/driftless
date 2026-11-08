@@ -777,6 +777,10 @@ pub const RETEXTURE_HINT: &str = "Die Bilder der Stelle neu einspielen: schärfe
 /// Why „Bilder neu einspielen“ is off (and refused): the scan folders cannot be found.
 pub const RETEXTURE_NO_RAW_DATA: &str =
     "Rohdaten fehlen – Bilder können nicht neu eingespielt werden";
+/// „Bilder neu einspielen“ off because the folder of `scan` is not there; a model has several.
+pub fn retexture_no_raw_data(scan: &str) -> String {
+    format!("Rohdaten von „{scan}“ fehlen – Bilder können nicht neu eingespielt werden")
+}
 /// Why „Bilder neu einspielen“ is off: the surface was computed without photos (gray).
 pub const RETEXTURE_NO_PHOTOS: &str = "Diese Oberfläche ist ohne Fotos gerechnet";
 /// „Melden …“ in the bar of the brush.

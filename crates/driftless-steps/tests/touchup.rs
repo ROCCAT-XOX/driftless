@@ -1403,6 +1403,54 @@ fn delete_and_undo_without_raw_data_keep_the_images() {
     assert_eq!(cache_times(&scene), times);
 }
 
+/// More steps than are kept aside (64) and „Löschen“ with its ↶ without the raw data (W2 of the
+/// final review): of the 66 steps replaced the first 64 stay aside, since a later one is of no
+/// use without those before it. ↶ brings those 64 back with their images, byte for byte; only
+/// the last two run without images, and the hint says so. With the raw data back they get them.
+#[test]
+fn past_the_limit_the_first_steps_keep_their_images() {
+    let scene = Scene::new("nacharbeit-kappung");
+    let retexture = Some(StepInput::Retexture { variant: 0 });
+    let first = scene.mark(&front_wall(&scene.surface), retexture);
+    let second = scene.mark(&dabs(&scene.surface, &[[6.0, -1.5, 0.5]], 0.3), retexture);
+    Marks::change(&scene.map, |m| {
+        for variant in 1..=64 {
+            m.add_step(second, StepInput::Retexture { variant })?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let done = scene.touch_up();
+    assert_eq!(done.steps, 66);
+    assert!(done.outcomes.iter().all(|o| !o.without_raw_data));
+    let full = read_patches(&scene.cache()).unwrap();
+
+    // without the raw data, Stelle 1 deleted: the first 64 of the 66 steps lie aside
+    Marks::change(&scene.map, |m| Ok(m.remove(first))).unwrap();
+    run_touchup(&scene.request(gone()), &Progress::new()).unwrap();
+    let aside = read_patches(&scene.cache().join(FORMER_DIR)).unwrap();
+    assert_eq!(aside.len(), 64);
+    assert!(aside[..] == full[..64]);
+
+    // ↶: 64 steps with their images, the last two without
+    Marks::change(&scene.map, |m| Ok(m.undo())).unwrap();
+    let back = run_touchup(&scene.request(gone()), &Progress::new()).unwrap();
+    assert_eq!(back.steps, 66);
+    let without: Vec<bool> = back.outcomes.iter().map(|o| o.without_raw_data).collect();
+    assert_eq!(without, [vec![false; 64], vec![true; 2]].concat());
+    assert_eq!(back.hints, [NO_RAW_DATA]);
+    let now = read_patches(&scene.cache()).unwrap();
+    assert!(now[..64] == full[..64]);
+    assert!(touchup_without_raw_data(&scene.surface));
+    // nothing left aside: the 64 are in the cache again
+    assert_eq!(tree(&scene.cache()), [PATCHES_FILE, TOUCHUP_REPORT]);
+
+    // with the raw data back the last two get their images
+    let again = scene.touch_up();
+    assert!(again.outcomes.iter().all(|o| !o.without_raw_data));
+    assert!(read_patches(&scene.cache()).unwrap() == full);
+}
+
 /// The Stelle deleted is the only one with steps: no step is left, yet what it was baked with
 /// stays aside while ↶ can bring it back – and ↶ does, byte for byte, without the raw data. A
 /// step taken back with ↶ can never come back: nothing of it is kept.

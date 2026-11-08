@@ -2405,7 +2405,8 @@ impl DriftlessApp {
     /// `stellen.toml` again. A touch-up that applied the Stellen to a surface shown, exported or
     /// new (`tell`) and changed its cache says so, with the steps the surface refuses and the
     /// hints – images not baked anew with what is missing. Recomputing after ↶ or „Löschen“
-    /// says nothing.
+    /// says nothing, but for images not baked anew: without the raw data later Stellen lose
+    /// theirs, which ↶ brings back.
     fn touchup_done(&mut self, out: TouchupOutput, pressed: Option<(u32, u64)>, tell: bool) {
         let TouchupOutput {
             surface,
@@ -2482,6 +2483,11 @@ impl DriftlessApp {
             for (nr, why) in &done.refused {
                 self.info(text::touchup_refused(*nr, why));
             }
+        } else if changed && no_sources.is_some() {
+            let lost = |hint: &&String| *hint == NO_RAW_DATA || *hint == STALE_SURFACE;
+            let hints: Vec<String> = done.hints.iter().filter(lost).cloned().collect();
+            self.tell_hints(&hints, no_sources.as_ref());
+            return;
         } else {
             return;
         }

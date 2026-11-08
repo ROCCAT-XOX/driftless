@@ -371,11 +371,11 @@ pub fn retexture_blocked(state: &AppState) -> Option<String> {
             members.filter_map(|m| state.scan_at(&m.scan)).collect()
         }),
     };
-    if scans
+    if let Some(missing) = scans
         .iter()
-        .any(|s| matches!(s.state, ScanState::Missing(_)))
+        .find(|s| matches!(s.state, ScanState::Missing(_)))
     {
-        return Some(text::RETEXTURE_NO_RAW_DATA.into());
+        return Some(text::retexture_no_raw_data(&missing.name));
     }
     // nothing to bake from: no scan of it has camera images
     match scans.first() {

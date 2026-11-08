@@ -42,8 +42,11 @@
 //! the camera images –, also while they are gone: so ↶ brings back the images of the later
 //! Stellen byte for byte without the raw data, and fast with them. A step taken back with ↶
 //! never returns and is not kept. At most [`FORMER_MAX_STEPS`] steps with about
-//! [`FORMER_MAX_BYTES`] of patches are kept, the newest; older ones go. With no step on any
-//! Stelle, the cache holds only what is kept aside, or goes.
+//! [`FORMER_MAX_BYTES`] of patches are kept: of the steps just replaced the first (a step is of
+//! use only with those before it), then what fits of those kept aside before; the later ones go,
+//! and with them the older sequences if the ones just replaced fill it. ↶ then brings back the
+//! first steps with their images and computes the others, as far as the raw data allow.
+//! With no step on any Stelle, the cache holds only what is kept aside, or goes.
 //!
 //! The folder is written as `nacharbeit.tmp-<process>-neu` under the lock of the cache and then
 //! renamed into place, the old one put aside first (`…-alt`) and removed after: there is never
@@ -806,21 +809,39 @@ fn patch_bytes(patch: &SurfacePatch) -> u64 {
     24 + 28 * n(patch.moved.len()) + 4 * n(patch.removed_faces.len()) + pages
 }
 
-/// The steps to keep aside of `former` (oldest first, each key once): the newest, at most
-/// [`FORMER_MAX_STEPS`] of them and about [`FORMER_MAX_BYTES`] of patches ([`patch_bytes`]);
-/// older ones go.
-fn bounded(mut former: Vec<Kept>) -> Vec<Kept> {
-    let (mut bytes, mut keep) = (0, 0);
-    for (_, patch) in former.iter().rev() {
+/// Takes the steps of `steps` from the first on as long as they fit in `room`: at most
+/// [`FORMER_MAX_STEPS`] in all and about [`FORMER_MAX_BYTES`] of patches ([`patch_bytes`]).
+fn first_that_fit(mut steps: Vec<Kept>, room: &mut (usize, u64)) -> Vec<Kept> {
+    let mut keep = 0;
+    for (_, patch) in &steps {
         let more = patch_bytes(patch);
-        if keep == FORMER_MAX_STEPS || bytes + more > FORMER_MAX_BYTES {
+        if room.0 == FORMER_MAX_STEPS || room.1 + more > FORMER_MAX_BYTES {
             break;
         }
-        bytes += more;
+        room.0 += 1;
+        room.1 += more;
         keep += 1;
     }
-    former.drain(..former.len() - keep);
-    former
+    steps.truncate(keep);
+    steps
+}
+
+/// What to keep aside of `older` and `replaced` (see [`kept_aside`]), each oldest first with its
+/// keys once: within the limits of [`first_that_fit`] the steps of `replaced` from the first on
+/// – a later one is of no use without the ones before it (`exact` in [`run_touchup`]), so a
+/// limit reached must cut off the end, not the start –, then, if all of those fit, what fits of
+/// `older`, again from the first. The steps just replaced come first: ↶ asks for them before the
+/// older ones.
+fn bounded(older: Vec<Kept>, replaced: Vec<Kept>) -> Vec<Kept> {
+    let mut room = (0, 0);
+    let wanted = replaced.len();
+    let replaced = first_that_fit(replaced, &mut room);
+    let older = if replaced.len() == wanted {
+        first_that_fit(older, &mut room)
+    } else {
+        Vec::new()
+    };
+    older.into_iter().chain(replaced).collect()
 }
 
 /// What to keep aside after a run (see the module docs): `before` (kept aside so far, oldest
@@ -835,18 +856,23 @@ fn kept_aside(
 ) -> Vec<Kept> {
     let held: BTreeSet<&str> = now.iter().map(|s| s.key.as_str()).collect();
     let mut seen = BTreeSet::new();
-    let mut former: Vec<Kept> = before
-        .into_iter()
-        .chain(dropped)
-        .rev()
-        .filter(|(r, _)| {
-            !held.contains(r.key.as_str())
-                && in_file.contains(&(r.mark, r.seq))
-                && seen.insert(r.key.clone())
-        })
-        .collect();
-    former.reverse();
-    bounded(former)
+    // newest first, so that of two with one key the older goes
+    let mut pick = |steps: Vec<Kept>| -> Vec<Kept> {
+        let mut picked: Vec<Kept> = steps
+            .into_iter()
+            .rev()
+            .filter(|(r, _)| {
+                !held.contains(r.key.as_str())
+                    && in_file.contains(&(r.mark, r.seq))
+                    && seen.insert(r.key.clone())
+            })
+            .collect();
+        picked.reverse();
+        picked
+    };
+    let replaced = pick(dropped);
+    let older = pick(before);
+    bounded(older, replaced)
 }
 
 /// Replays the steps of the Stellen of the map or model in [`TouchupRequest::owner_dir`] on the
@@ -1468,27 +1494,53 @@ mod tests {
         kept.iter().map(|(r, _)| r.key.as_str()).collect()
     }
 
-    /// At most 64 steps and about 64 MiB of patches are kept aside, the newest; the oldest go.
+    /// `n` steps with the keys `name` + number, each with a patch of `image`.
+    fn sequence(name: &str, n: u64, image: &Arc<[u8]>) -> Vec<Kept> {
+        (0..n)
+            .map(|i| (record(1, i, &format!("{name}{i:02}")), patch(image)))
+            .collect()
+    }
+
+    /// At most 64 steps and about 64 MiB of patches are kept aside, the first of the steps
+    /// just replaced: a later one is of no use without those before it.
     #[test]
     fn what_is_kept_aside_is_bounded() {
         let small: Arc<[u8]> = Arc::from(vec![0u8; 10]);
-        let many: Vec<Kept> = (0..70)
-            .map(|i| (record(1, i, &format!("k{i:02}")), patch(&small)))
-            .collect();
-        let kept = bounded(many);
+        let kept = bounded(Vec::new(), sequence("k", 70, &small));
         assert_eq!(kept.len(), FORMER_MAX_STEPS);
-        assert_eq!(kept[0].0.key, "k06");
-        assert_eq!(kept.last().unwrap().0.key, "k69");
+        assert_eq!(kept[0].0.key, "k00");
+        assert_eq!(kept.last().unwrap().0.key, "k63");
 
         let large: Arc<[u8]> = Arc::from(vec![0u8; 20 << 20]);
         assert_eq!(patch_bytes(&patch(&large)), 24 + 24 + (20 << 20));
-        let big: Vec<Kept> = (0..4)
-            .map(|i| (record(1, i, &format!("g{i}")), patch(&large)))
-            .collect();
-        assert_eq!(keys(&bounded(big)), ["g1", "g2", "g3"]);
-        // one alone larger than all that is kept: none
+        assert_eq!(
+            keys(&bounded(Vec::new(), sequence("g", 4, &large))),
+            ["g00", "g01", "g02"]
+        );
+        // one larger than all that is kept: none, and none after it either
         let huge: Arc<[u8]> = Arc::from(vec![0u8; (FORMER_MAX_BYTES + 1) as usize]);
-        assert!(bounded(vec![(record(1, 1, "h"), patch(&huge))]).is_empty());
+        let mut steps = sequence("h", 1, &huge);
+        steps.extend(sequence("s", 2, &small));
+        assert!(bounded(Vec::new(), steps).is_empty());
+    }
+
+    /// The steps just replaced first, whole if they fit; what is left of the room goes to the
+    /// older ones, from the first of them. Replaced steps that do not fit take all the room.
+    #[test]
+    fn replaced_steps_come_before_older_ones() {
+        let small: Arc<[u8]> = Arc::from(vec![0u8; 10]);
+        // both fit
+        let kept = bounded(sequence("o", 3, &small), sequence("n", 2, &small));
+        assert_eq!(keys(&kept), ["o00", "o01", "o02", "n00", "n01"]);
+        // 10 and 60: of the older ones the first four, the replaced ones all
+        let kept = bounded(sequence("o", 10, &small), sequence("n", 60, &small));
+        assert_eq!(kept.len(), FORMER_MAX_STEPS);
+        assert_eq!(keys(&kept)[..5], ["o00", "o01", "o02", "o03", "n00"]);
+        assert_eq!(kept.last().unwrap().0.key, "n59");
+        // the replaced ones reach the limit: the older ones go
+        let kept = bounded(sequence("o", 10, &small), sequence("n", 70, &small));
+        assert_eq!(kept.len(), FORMER_MAX_STEPS);
+        assert_eq!((kept[0].0.key.as_str(), keys(&kept)[63]), ("n00", "n63"));
     }
 
     /// Kept aside: what was before, then what the run dropped – not what the cache holds now,

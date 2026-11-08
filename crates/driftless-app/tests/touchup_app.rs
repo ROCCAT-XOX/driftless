@@ -614,17 +614,16 @@ fn no_raw_data_disables_retexture() {
 
     // once the tree is read again, the button is off
     scene.run(Action::OpenProject(scene.project.clone()));
+    let off = text::retexture_no_raw_data("raum");
     assert_eq!(
         brush::retexture_blocked(scene.app.state()).as_deref(),
-        Some(text::RETEXTURE_NO_RAW_DATA)
+        Some(off.as_str()),
+        "the scan is named"
     );
     // asked for anyway: refused at once, nothing written
     let before = fs::read(scene.map.join(MARKS_FILE)).unwrap();
     scene.app.apply(Action::Retexture { mark: nr });
-    assert_eq!(
-        said(&scene.app).last().map(String::as_str),
-        Some(text::RETEXTURE_NO_RAW_DATA)
-    );
+    assert_eq!(said(&scene.app).last(), Some(&off));
     assert!(scene.app.state().touchup.waiting.is_empty());
     settle(&mut scene.app);
     assert_eq!(fs::read(scene.map.join(MARKS_FILE)).unwrap(), before);
@@ -850,6 +849,42 @@ fn undo_step_recomputes() {
     assert!(touchup_fits(&scene.surface, &marks));
     assert_eq!(scene.patches(), strong);
     assert!(scene.app.view().has_edit());
+}
+
+/// „Löschen“ of an earlier Stelle without the raw data: the later Stelle is computed anew
+/// without its images, and the program says what is missing, though nothing else of that run
+/// is told; ↶ brings them back and says nothing more (K3 of the final review).
+#[test]
+fn delete_without_raw_data_says_so() {
+    let mut scene = Scene::new("nacharbeit-app-loeschen-ohne-rohdaten");
+    let first = scene.paint(front_wall(&scene.surface));
+    let second = scene.paint(lower_front_wall(&scene.surface));
+    scene.run(Action::Smooth {
+        mark: first,
+        level: SmoothLevel::Strong,
+    });
+    no_errors(&scene.app);
+    scene.run(Action::Retexture { mark: second });
+    no_errors(&scene.app);
+    let with_images = scene.patches();
+
+    fs::rename(scene.dir.join("Rohdaten"), scene.dir.join("Rohdaten-weg")).unwrap();
+    let why = texture_sources(&scene.surface)
+        .unwrap()
+        .unavailable()
+        .cloned()
+        .expect("no images");
+    scene.app.state_mut().messages.clear();
+    scene.run(Action::DeleteMark(first));
+    no_errors(&scene.app);
+    assert!(touchup_without_raw_data(&scene.surface));
+    assert_eq!(said(&scene.app), [text::no_images_baked(&why)]);
+
+    scene.app.state_mut().messages.clear();
+    scene.run(Action::UndoMark);
+    no_errors(&scene.app);
+    assert_eq!(scene.patches(), with_images);
+    assert!(said(&scene.app).is_empty(), "{:?}", said(&scene.app));
 }
 
 /// The touch-up applied anew to a surface whose cache is older than the Stellen – shown or
@@ -1411,7 +1446,11 @@ fn bar_offers_the_steps() {
     state.scans[0].state = ScanState::Missing("Scan-Ordner nicht gefunden".into());
     let mut h = bar(state);
     assert!(on(&h, text::SMOOTH_FLAT_NAME));
-    off_with(&mut h, text::RETEXTURE, text::RETEXTURE_NO_RAW_DATA);
+    off_with(
+        &mut h,
+        text::RETEXTURE,
+        &text::retexture_no_raw_data("Scan s"),
+    );
 
     // while the touch-up of the surface runs or waits, the steps wait for it
     let surface = PathBuf::from(format!("{MAP}/oberflaeche-001"));
