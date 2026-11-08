@@ -268,6 +268,27 @@ fn surface_without_dense_bin_still_succeeds() {
         with["stats"]["accuracy_dense"]["walls"]["median_mm"].is_number(),
         "{with}"
     );
+    // The measures of `anlegen`, against the dense cloud as well.
+    let stats = &with["stats"];
+    assert!(
+        stats["accuracy"]["walls_plane"]["p95_mm"].is_number(),
+        "{with}"
+    );
+    assert!(
+        stats["accuracy_dense"]["walls_plane"]["p95_mm"].is_number(),
+        "{with}"
+    );
+    assert!(stats["roughness"]["median_mm"].is_number(), "{with}");
+    for key in [
+        "vertices",
+        "moved",
+        "no_plane",
+        "too_far",
+        "reverted",
+        "mean_shift_mm",
+    ] {
+        assert!(stats["snap"][key].is_number(), "{key}: {with}");
+    }
     fs::remove_file(out.join("dense.bin")).unwrap();
     let p = Progress::new();
     let without = run_surface(&request(&dir, &out, &out.join("without")), &p).unwrap();

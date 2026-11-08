@@ -351,6 +351,7 @@ fn accuracy_split_json(a: &AccuracySplit) -> Value {
         "all": accuracy_json(&a.all),
         "walls": accuracy_json(&a.walls),
         "edges": accuracy_json(&a.edges),
+        "walls_plane": accuracy_json(&a.walls_plane),
     })
 }
 
@@ -421,6 +422,15 @@ fn stats_json(s: &SurfaceStats) -> Value {
         "accuracy_p95_mm": s.accuracy.all.p95_mm,
         "accuracy": accuracy_split_json(&s.accuracy),
         "accuracy_dense": s.accuracy_dense.as_ref().map(accuracy_split_json),
+        "roughness": accuracy_json(&s.roughness),
+        "snap": {
+            "vertices": s.snap.vertices,
+            "moved": s.snap.moved,
+            "no_plane": s.snap.no_plane,
+            "too_far": s.snap.too_far,
+            "reverted": s.snap.reverted,
+            "mean_shift_mm": s.snap.mean_shift_mm,
+        },
         "seconds": s.seconds,
         "gpu_batches": s.gpu_batches,
     })

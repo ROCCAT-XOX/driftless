@@ -144,7 +144,11 @@ fn fit(pts: impl Iterator<Item = Vector3<f64>>) -> (Vector3<f64>, Vector3<f64>, 
 /// [`REFITS`] times, to the neighbours within [`INLIER_SIGMAS`] times the RMS distance of
 /// the last fit (at least [`MIN_BAND`], at most `max_shift`). On a plain wall that comes
 /// back to all neighbours.
-fn project(rel: &[Vector3<f64>], inner: usize, cfg: &SmoothConfig) -> Option<Vector3<f64>> {
+pub(crate) fn project(
+    rel: &[Vector3<f64>],
+    inner: usize,
+    cfg: &SmoothConfig,
+) -> Option<Vector3<f64>> {
     // Written so that NaN spreads (degenerate neighbourhoods) count as not planar.
     let planar = |least: f64, middle: f64| least < cfg.planarity * middle;
     let mut plane = fit(rel.iter().copied());

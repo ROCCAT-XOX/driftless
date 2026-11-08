@@ -99,6 +99,24 @@ pub(crate) fn wall_x(x0: f32, half: f64, step: f64, dense: impl Fn(f64, f64) -> 
     }
 }
 
+/// Noise of standard deviation 1, roughly normal: a pure function of `i` (four uniform numbers
+/// from SplitMix64, added up).
+pub(crate) fn noise(i: u64) -> f64 {
+    let mut sum = 0.0;
+    for k in 1..=4u64 {
+        let mut z = i
+            .wrapping_mul(4)
+            .wrapping_add(k)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        sum += (z >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0;
+    }
+    // Each is uniform on [-1, 1] (variance 1/3), four of them have variance 4/3.
+    sum / (4.0f64 / 3.0).sqrt()
+}
+
 // ---- Mesh fixtures (built directly, no TSDF) -------------------------------------------
 
 use super::Mesh;
