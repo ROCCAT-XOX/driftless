@@ -4267,11 +4267,13 @@ mod tests {
         })
     }
 
-    /// The settings [`textured_walk`] was textured with.
+    /// The settings [`textured_walk`] was textured with, without the measures against noise:
+    /// the hashes of [`retexture_unchanged`] guard that path.
     fn walk_config() -> SurfaceConfig {
         SurfaceConfig {
             min_texel: 0.01,
             page_size: 1024,
+            noise: crate::surface::NoiseConfig::OFF,
             ..SurfaceConfig::default()
         }
     }
@@ -4291,7 +4293,8 @@ mod tests {
     /// an index of the bags and the visibility was computed only for the best candidates and
     /// over the cut-out of the image: the same images, the same patches, byte for byte. Recorded
     /// again where the variants take other images in their new order ([`variant_order`],
-    /// `EDIT_VERSION` 2); the first variant of every Stelle is the same.
+    /// `EDIT_VERSION` 2); the first variant of every Stelle is the same. They are the values of
+    /// the path without the measures against noise, which is why later versions leave them.
     #[test]
     fn retexture_unchanged() {
         let room = room();

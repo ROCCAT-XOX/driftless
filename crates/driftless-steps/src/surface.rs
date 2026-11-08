@@ -49,7 +49,7 @@ use driftless_io::project::{discover_project, ProjectError};
 use driftless_io::{atomic_write, paths};
 use driftless_map::surface::{
     build_mesh, encode_pages, sensors_for_frames, texture_mesh, Accuracy, AccuracySplit,
-    SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
+    NoiseConfig, SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
 };
 use driftless_map::{load_stage, stage_fits};
 use driftless_traj::nalgebra::{Isometry3, Point3};
@@ -65,7 +65,7 @@ pub const SURFACE_REPORT: &str = "oberflaeche.json";
 /// Part of the input id: raised whenever the surface gives another result for the same
 /// settings, so an older folder counts as stale. Only then: the program version is no part
 /// of the id (see the rule at the step versions in [`crate::map`]).
-const SURFACE_VERSION: u32 = 13;
+const SURFACE_VERSION: u32 = 14;
 /// File stem of the glb and the obj.
 const STEM: &str = "oberflaeche";
 /// Share of the faces the coarse grid offered that were dropped for lack of a point within
@@ -261,6 +261,34 @@ fn settings_json(c: &SurfaceConfig, texture: bool) -> Value {
             "min_sharpness": c.color.min_sharpness,
             "view_gap": c.color.view_gap,
         },
+        "noise": {
+            "snap": c.noise.snap,
+            "exposure": c.noise.exposure,
+            "denoise": c.noise.denoise,
+            "occlude": c.noise.occlude,
+        },
+    })
+}
+
+/// The switches against noise from the `settings` of a surface report: without the entry (a
+/// report from before the switches) the default, as for a single switch the entry does not hold.
+/// `None` if the entry or a switch is of the wrong type.
+pub fn noise_config(settings: &Value) -> Option<NoiseConfig> {
+    let n = match &settings["noise"] {
+        Value::Null => return Some(NoiseConfig::default()),
+        n @ Value::Object(_) => n,
+        _ => return None,
+    };
+    let defaults = NoiseConfig::default();
+    let switch = |key: &str, default: bool| match &n[key] {
+        Value::Null => Some(default),
+        v => v.as_bool(),
+    };
+    Some(NoiseConfig {
+        snap: switch("snap", defaults.snap)?,
+        exposure: switch("exposure", defaults.exposure)?,
+        denoise: switch("denoise", defaults.denoise)?,
+        occlude: switch("occlude", defaults.occlude)?,
     })
 }
 
@@ -268,7 +296,8 @@ fn settings_json(c: &SurfaceConfig, texture: bool) -> Value {
 /// [`settings_json`] writes them): the camera settings it does not hold take the defaults,
 /// which is what the program and `driftless surface` always use. `None` if a value is missing
 /// or of the wrong type; a report from before the coarse grid has no `coarse_fallback` (read as
-/// `true`), one from before `max_fill_gap` takes the default.
+/// `true`), one from before `max_fill_gap` takes the default, and so does one without the
+/// switches against noise ([`noise_config`]).
 pub(crate) fn surface_config(report: &Value) -> Option<SurfaceConfig> {
     let s = &report["settings"];
     let c = &s["color"];
@@ -304,6 +333,7 @@ pub(crate) fn surface_config(report: &Value) -> Option<SurfaceConfig> {
             view_gap: c["view_gap"].as_f64()?,
             ..defaults.color
         },
+        noise: noise_config(s)?,
     })
 }
 
@@ -1386,21 +1416,100 @@ mod tests {
                 view_gap: 0.6,
                 ..defaults.color
             },
+            noise: NoiseConfig {
+                snap: false,
+                exposure: true,
+                denoise: false,
+                occlude: true,
+            },
         };
         let text = serde_json::to_string(&json!({"settings": settings_json(&given, true)}));
         let report: Value = serde_json::from_str(&text.unwrap()).unwrap();
+        assert_eq!(
+            report["settings"]["noise"],
+            json!({"snap": false, "exposure": true, "denoise": false, "occlude": true})
+        );
         assert_eq!(surface_config(&report), Some(given));
         let mut old = report.clone();
         let settings = old["settings"].as_object_mut().unwrap();
         settings.remove("coarse_fallback");
         settings.remove("max_fill_gap");
+        settings.remove("noise");
         let old = surface_config(&old).unwrap();
         assert!(old.coarse_fallback);
         assert_eq!(old.max_fill_gap, defaults.max_fill_gap);
-        let mut broken = report;
+        assert_eq!(old.noise, NoiseConfig::ON);
+        let mut broken = report.clone();
         broken["settings"]["voxel"] = "fein".into();
         assert_eq!(surface_config(&broken), None);
+        let mut broken = report;
+        broken["settings"]["noise"] = "aus".into();
+        assert_eq!(surface_config(&broken), None);
         assert_eq!(surface_config(&json!({})), None);
+    }
+
+    #[test]
+    fn noise_config_reads_the_switches() {
+        let read = |noise: Value| noise_config(&json!({ "noise": noise }));
+        assert_eq!(
+            read(json!({"snap": false, "exposure": true, "denoise": true, "occlude": false})),
+            Some(NoiseConfig {
+                snap: false,
+                occlude: false,
+                ..NoiseConfig::ON
+            })
+        );
+        assert_eq!(
+            read(json!({"snap": true, "exposure": false, "denoise": false, "occlude": true})),
+            Some(NoiseConfig {
+                exposure: false,
+                denoise: false,
+                ..NoiseConfig::ON
+            })
+        );
+        let all_off = json!({"snap": false, "exposure": false, "denoise": false, "occlude": false});
+        assert_eq!(read(all_off), Some(NoiseConfig::OFF));
+        // No entry (a report from before the switches): the default.
+        assert_eq!(noise_config(&json!({})), Some(NoiseConfig::ON));
+        assert_eq!(read(Value::Null), Some(NoiseConfig::ON));
+        // A switch the entry does not hold takes its default as well.
+        assert_eq!(
+            read(json!({"snap": false})),
+            Some(NoiseConfig {
+                snap: false,
+                ..NoiseConfig::ON
+            })
+        );
+        // Wrong types, of the entry or of a switch.
+        assert_eq!(read(json!("aus")), None);
+        assert_eq!(read(json!(false)), None);
+        assert_eq!(read(json!(["snap"])), None);
+        assert_eq!(read(json!({"snap": "nein"})), None);
+        assert_eq!(read(json!({"occlude": 0})), None);
+    }
+
+    /// `--ohne` gives another input id: a surface computed with other switches counts as stale.
+    #[test]
+    fn switches_are_part_of_the_input_id() {
+        let id = |noise| {
+            let config = SurfaceConfig {
+                noise,
+                ..SurfaceConfig::default()
+            };
+            plan_text("clean\n".into(), "bilder\n", &config).id
+        };
+        assert_ne!(id(NoiseConfig::OFF), id(NoiseConfig::ON));
+        let without_snap = NoiseConfig {
+            snap: false,
+            ..NoiseConfig::ON
+        };
+        let without_occlude = NoiseConfig {
+            occlude: false,
+            ..NoiseConfig::ON
+        };
+        assert_ne!(id(without_snap), id(NoiseConfig::ON));
+        assert_ne!(id(without_snap), id(without_occlude));
+        assert_eq!(id(NoiseConfig::OFF), id(NoiseConfig::OFF));
     }
 
     /// The figures of the real scans at the default 2 cm: the office B (2.0 of 8.6 million

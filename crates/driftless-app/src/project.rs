@@ -96,8 +96,8 @@ use driftless_steps::slam::{
     CACHE_FILE, CORRECTIONS_FILE,
 };
 use driftless_steps::surface::{
-    model_surface_fits, run_model_surface, run_surface, surface_fits, ModelSurfaceRequest,
-    SurfaceRequest, SURFACE_REPORT,
+    model_surface_fits, noise_config, run_model_surface, run_surface, surface_fits,
+    ModelSurfaceRequest, SurfaceRequest, SURFACE_REPORT,
 };
 use driftless_steps::StepError;
 use serde::{Deserialize, Serialize};
@@ -291,7 +291,7 @@ impl SurfaceSettings {
     /// hold every camera setting; those take the defaults, which is what the program and
     /// `driftless surface` always use. `None` if a value is missing or of the wrong type;
     /// reports from before the coarse grid have no `coarse_fallback` and read as `true`, and
-    /// ones without `max_fill_gap` take the default.
+    /// ones without `max_fill_gap` or the switches against noise take the default.
     pub fn from_report(report: &serde_json::Value) -> Option<SurfaceSettings> {
         let s = &report["settings"];
         let f64_of = |v: &serde_json::Value| v.as_f64();
@@ -328,6 +328,7 @@ impl SurfaceSettings {
                 view_gap: f64_of(&c["view_gap"])?,
                 ..defaults.color
             },
+            noise: noise_config(s)?,
         };
         Some(SurfaceSettings {
             config,
@@ -2209,6 +2210,7 @@ pub fn run_model_surface_job(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use driftless_map::surface::NoiseConfig;
 
     #[test]
     fn stored_paths() {
@@ -2266,6 +2268,26 @@ mod tests {
         let wide = SurfaceSettings::from_report(&report).unwrap();
         assert_eq!(wide.config.max_fill_gap, 0.03);
         report["settings"]["max_fill_gap"] = "weit".into();
+        assert_eq!(SurfaceSettings::from_report(&report), None);
+        // Before the switches against noise: no key, all on; stored switches are kept.
+        report["settings"]["max_fill_gap"] = 0.03.into();
+        let noise = |report: &serde_json::Value| {
+            SurfaceSettings::from_report(report).map(|s| s.config.noise)
+        };
+        assert_eq!(noise(&report), Some(NoiseConfig::ON));
+        report["settings"]["noise"] = serde_json::json!({
+            "snap": false, "exposure": true, "denoise": false, "occlude": true
+        });
+        assert_eq!(
+            noise(&report),
+            Some(NoiseConfig {
+                snap: false,
+                exposure: true,
+                denoise: false,
+                occlude: true,
+            })
+        );
+        report["settings"]["noise"] = "aus".into();
         assert_eq!(SurfaceSettings::from_report(&report), None);
     }
 }

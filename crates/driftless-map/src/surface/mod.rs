@@ -69,6 +69,44 @@ pub fn sensors_for_frames(poses: &[Pose], lidar_to_imu: &Isometry3<f64>) -> Vec<
 /// Smallest texture page: the gray block of unseen faces and a chart with its border fit.
 pub const MIN_PAGE_SIZE: u32 = 16;
 
+/// The measures against noise on the finished surface, each of which can be switched off to
+/// compare a run without it (`driftless surface --ohne`). With [`NoiseConfig::OFF`] the surface
+/// comes out as it did before these measures, byte for byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoiseConfig {
+    /// Vertices of the raw mesh move onto the plane of the points around them (`anlegen`).
+    pub snap: bool,
+    /// The image of a face is chosen with how well the face was exposed in it (`belichtung`).
+    pub exposure: bool,
+    /// An edge-preserving filter damps the image noise of every chart (`entrauschen`).
+    pub denoise: bool,
+    /// Points far from the mesh hide what lies behind them from the images (`verdeckung`).
+    pub occlude: bool,
+}
+
+impl NoiseConfig {
+    /// All measures on: the default.
+    pub const ON: NoiseConfig = NoiseConfig {
+        snap: true,
+        exposure: true,
+        denoise: true,
+        occlude: true,
+    };
+    /// All measures off.
+    pub const OFF: NoiseConfig = NoiseConfig {
+        snap: false,
+        exposure: false,
+        denoise: false,
+        occlude: false,
+    };
+}
+
+impl Default for NoiseConfig {
+    fn default() -> Self {
+        NoiseConfig::ON
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceConfig {
     /// Edge length of a TSDF voxel (m).
@@ -109,6 +147,8 @@ pub struct SurfaceConfig {
     pub jpeg_quality: u8,
     /// Camera selection and exposure for the texture; images are used at full size.
     pub color: ColorConfig,
+    /// Which measures against noise run.
+    pub noise: NoiseConfig,
 }
 
 impl Default for SurfaceConfig {
@@ -132,6 +172,7 @@ impl Default for SurfaceConfig {
                 downscale: 1,
                 ..ColorConfig::default()
             },
+            noise: NoiseConfig::default(),
         }
     }
 }
@@ -756,7 +797,8 @@ mod tests {
     /// platform's `exp`/`atan2` may differ in the last bit, so only determinism is checked
     /// there). Recorded before several sources were supported, and again for surface v13: the
     /// small gray patches are filled and 16 views are kept per face, and each of the two alone
-    /// changes these pages.
+    /// changes these pages. The hash guards the path without the measures against noise
+    /// ([`NoiseConfig::OFF`]).
     #[test]
     fn one_source_pages_unchanged() {
         let (painted, images, poses, cams) = scene::walk_data();
@@ -769,6 +811,7 @@ mod tests {
         let cfg = SurfaceConfig {
             min_texel: 0.01,
             page_size: 1024,
+            noise: NoiseConfig::OFF,
             ..SurfaceConfig::default()
         };
         let run = || {
@@ -800,6 +843,7 @@ mod tests {
     /// from two sources of different exposure, recorded (Apple silicon, see
     /// [`one_source_pages_unchanged`]) before the baking and the seam levelling were split into
     /// parts that „Bilder neu einspielen“ shares: the surface step's pages stay byte for byte.
+    /// The hashes guard the path without the measures against noise ([`NoiseConfig::OFF`]).
     #[test]
     fn full_surface_unchanged() {
         let (painted, images, poses, cams) = scene::walk_data();
@@ -813,6 +857,7 @@ mod tests {
             let cfg = SurfaceConfig {
                 min_texel,
                 page_size,
+                noise: NoiseConfig::OFF,
                 ..SurfaceConfig::default()
             };
             let mut stats = SurfaceStats::default();

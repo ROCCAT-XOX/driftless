@@ -836,7 +836,8 @@ pub(crate) fn testscan_surface(dir: &Path) -> (PageMesh, super::TextureSource) {
     (tex.to_mesh(&jpegs).unwrap(), source)
 }
 
-/// The coarse settings of the surface tests of the steps (`small_config` there).
+/// The coarse settings of the surface tests of the steps (`small_config` there), without the
+/// measures against noise: the hashes of `retexture_unchanged` guard that path.
 pub(crate) fn testscan_config() -> super::SurfaceConfig {
     super::SurfaceConfig {
         voxel: 0.15,
@@ -844,6 +845,7 @@ pub(crate) fn testscan_config() -> super::SurfaceConfig {
         min_component_faces: 10,
         page_size: 256,
         simplify_error: 0.01,
+        noise: super::NoiseConfig::OFF,
         ..super::SurfaceConfig::default()
     }
 }
