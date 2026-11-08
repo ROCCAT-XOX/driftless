@@ -126,7 +126,8 @@ pub fn free_space(_dir: &Path) -> Option<u64> {
     None
 }
 
-/// The folders of `tree` whose size the window shows: every run, map, surface and model.
+/// The folders of `tree` whose size the window shows: every run, map, surface, floor plan and
+/// model.
 pub fn tree_folders(tree: &Tree) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for run in tree.scans.iter().flat_map(|s| &s.runs) {
@@ -134,11 +135,13 @@ pub fn tree_folders(tree: &Tree) -> Vec<PathBuf> {
         for map in &run.maps {
             out.push(map.dir.clone());
             out.extend(map.surfaces.iter().map(|s| s.dir.clone()));
+            out.extend(map.plans.iter().map(|p| p.dir.clone()));
         }
     }
     for model in &tree.models {
         out.push(model.dir.clone());
         out.extend(model.surfaces.iter().map(|s| s.dir.clone()));
+        out.extend(model.plans.iter().map(|p| p.dir.clone()));
     }
     out
 }

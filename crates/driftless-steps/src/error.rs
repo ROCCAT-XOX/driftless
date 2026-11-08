@@ -1,7 +1,9 @@
 //! The error of a step: cancelled, or failed with a German message for the user.
 
 use driftless_export::ExportError;
+use driftless_map::surface::edit::EditError;
 use driftless_map::MapError;
+use driftless_plan::PlanError;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +54,28 @@ impl From<ExportError> for StepError {
     fn from(e: ExportError) -> Self {
         match e {
             ExportError::Cancelled => StepError::Cancelled,
+            e => StepError::Failed(e.to_string()),
+        }
+    }
+}
+
+impl From<PlanError> for StepError {
+    fn from(e: PlanError) -> Self {
+        match e {
+            PlanError::Cancelled => StepError::Cancelled,
+            e => StepError::Failed(e.to_string()),
+        }
+    }
+}
+
+/// A touch-up step that could not run: cancelled, or failed with its German text (a step
+/// that only refused, such as [`EditError::NotFlat`], is no error of the touch-up step and is
+/// told apart before).
+impl From<EditError> for StepError {
+    fn from(e: EditError) -> Self {
+        match e {
+            EditError::Cancelled => StepError::Cancelled,
+            EditError::Map(e) => StepError::from(e),
             e => StepError::Failed(e.to_string()),
         }
     }
@@ -114,6 +138,22 @@ mod tests {
         );
         let boxed: Box<dyn std::error::Error> = Box::new(StepError::Cancelled);
         assert_eq!(StepError::from(boxed), StepError::Cancelled);
+        assert_eq!(StepError::from(EditError::Cancelled), StepError::Cancelled);
+        assert_eq!(
+            StepError::from(EditError::Map(MapError::Cancelled)),
+            StepError::Cancelled
+        );
+        assert_eq!(
+            StepError::from(EditError::NoImages),
+            StepError::Failed("Kein Bild zeigt diese Stelle; sie bleibt, wie sie ist.".into())
+        );
+        assert_eq!(StepError::from(PlanError::Cancelled), StepError::Cancelled);
+        assert_eq!(
+            StepError::from(PlanError::NoWalls),
+            StepError::Failed(
+                "Keine Wände gefunden: Aus diesen Punkten entsteht kein Grundriss.".into()
+            )
+        );
         let boxed: Box<dyn std::error::Error> = "nicht lesbar".into();
         assert_eq!(
             StepError::from(boxed),

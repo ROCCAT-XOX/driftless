@@ -5,7 +5,7 @@
 //! the surface of a merged model ([`driftless_steps::surface::run_model_surface`]).
 
 use driftless_gpu::GpuPref;
-use driftless_map::surface::SurfaceConfig;
+use driftless_map::surface::{NoiseConfig, SurfaceConfig};
 use driftless_steps::map::map_input_for;
 use driftless_steps::scan::extrinsic_values;
 use driftless_steps::slam::SlamSettings;
@@ -13,6 +13,21 @@ use driftless_steps::surface::{
     run_model_surface, run_surface, ModelSurfaceRequest, SurfaceRequest,
 };
 use std::path::{Path, PathBuf};
+
+/// What `--ohne` switches off.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Without {
+    /// Ecken nicht an die Ebene der Messpunkte legen
+    Anlegen,
+    /// Gut belichtete Bilder nicht bevorzugen
+    Belichtung,
+    /// Bildrauschen nicht dämpfen
+    Entrauschen,
+    /// Dünne Teile ohne Fläche verdecken die Wand dahinter nicht
+    Verdeckung,
+    /// Alle vier abschalten
+    Alles,
+}
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -60,11 +75,30 @@ pub struct Args {
     /// nur oberflaeche.glb (ein OBJ macht auch `driftless export`)
     #[arg(long)]
     obj: bool,
+    /// Maßnahmen gegen Rauschen abschalten, zum Vergleich; mehrere mit Komma getrennt
+    #[arg(long, value_enum, value_name = "WAS", value_delimiter = ',')]
+    ohne: Vec<Without>,
+}
+
+/// All measures against noise except those in `without`.
+fn noise(without: &[Without]) -> NoiseConfig {
+    let mut n = NoiseConfig::ON;
+    for w in without {
+        match w {
+            Without::Anlegen => n.snap = false,
+            Without::Belichtung => n.exposure = false,
+            Without::Entrauschen => n.denoise = false,
+            Without::Verdeckung => n.occlude = false,
+            Without::Alles => n = NoiseConfig::OFF,
+        }
+    }
+    n
 }
 
 fn config(args: &Args) -> SurfaceConfig {
     SurfaceConfig {
         voxel: args.voxel,
+        noise: noise(&args.ohne),
         ..SurfaceConfig::default()
     }
 }
@@ -187,5 +221,69 @@ mod tests {
         assert_eq!(parse(&["--gpu", "aus"]).gpu, GpuPref::Off);
         let argv = ["surface", "scan", "--slam", "ziel", "--gpu", "ja"];
         assert!(Cli::try_parse_from(argv).is_err());
+    }
+
+    #[test]
+    fn ohne_switches_measures_off() {
+        let noise = |extra: &[&str]| parse(extra).config.noise;
+        assert_eq!(noise(&[]), NoiseConfig::ON);
+        assert_eq!(noise(&["--ohne", "alles"]), NoiseConfig::OFF);
+        assert_eq!(
+            noise(&["--ohne", "anlegen,verdeckung"]),
+            NoiseConfig {
+                snap: false,
+                occlude: false,
+                ..NoiseConfig::ON
+            }
+        );
+        // Every word switches its own measure.
+        let one = |word, off: fn(&mut NoiseConfig)| {
+            let mut want = NoiseConfig::ON;
+            off(&mut want);
+            assert_eq!(noise(&["--ohne", word]), want, "{word}");
+        };
+        one("anlegen", |n| n.snap = false);
+        one("belichtung", |n| n.exposure = false);
+        one("entrauschen", |n| n.denoise = false);
+        one("verdeckung", |n| n.occlude = false);
+        // Given twice, or `alles` within a list.
+        assert_eq!(
+            noise(&["--ohne", "belichtung", "--ohne", "entrauschen"]),
+            NoiseConfig {
+                exposure: false,
+                denoise: false,
+                ..NoiseConfig::ON
+            }
+        );
+        assert_eq!(noise(&["--ohne", "anlegen,alles"]), NoiseConfig::OFF);
+    }
+
+    #[test]
+    fn ohne_works_for_a_model() {
+        let argv = ["surface", "--model", "m", "--ohne", "entrauschen"];
+        let args = Cli::try_parse_from(argv).unwrap().args;
+        let r = model_request(&args, Path::new("m"));
+        assert_eq!(
+            r.config.noise,
+            NoiseConfig {
+                denoise: false,
+                ..NoiseConfig::ON
+            }
+        );
+        let args = Cli::try_parse_from(["surface", "--model", "m"])
+            .unwrap()
+            .args;
+        assert_eq!(
+            model_request(&args, Path::new("m")).config.noise,
+            NoiseConfig::ON
+        );
+    }
+
+    #[test]
+    fn ohne_refuses_unknown_words() {
+        for value in ["glaetten", "anlegen,glaetten", "Alles", ""] {
+            let argv = ["surface", "scan", "--slam", "ziel", "--ohne", value];
+            assert!(Cli::try_parse_from(argv).is_err(), "{value:?}");
+        }
     }
 }

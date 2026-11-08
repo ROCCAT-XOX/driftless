@@ -2,10 +2,11 @@
 // the per-image part of `driftless_map::surface::views`: the depth buffer splatted from each
 // face's centroid and a barycentric grid of samples (`image_views`), the view of each face
 // (centroid and corners visible, score, carrier tag, mean colour, angle) and its insertion
-// into the face's slots (`keep_best_view`), plus the exposure samples (`keep_best`).
+// into the face's slots (`keep_best_view`), plus the exposure samples (`keep_best`). What has
+// no face hides the faces behind it from the image (`occluder_buffer`, `face_occluded`).
 //
 // Each invocation owns one face and the image's views dispatch runs after the previous
-// image's, so the slots need no atomics; the depth buffer is a minimum per cell (an integer
+// image's, so the slots need no atomics; the depth buffers are a minimum per cell (an integer
 // atomic on the bits of the positive range), independent of the order of the writes.
 
 struct Params {
@@ -52,6 +53,13 @@ struct Params {
     carrier_radius: f32,
     carrier_alt: f32,
     angle_step: f32,
+    // A sample of a face hides behind an occluder more than `occluder_gap` nearer (m); its
+    // view then counts `occluded_score` of its score and is tagged like a carrier's.
+    occluder_gap: f32,
+    occluded_score: f32,
+    // Occluders in `occluders` (0: none, not looked at) and how far apart they are (m).
+    occluder_count: u32,
+    occluder_spacing: f32,
     _pad0: u32,
     _pad1: u32,
 }
@@ -93,6 +101,10 @@ struct Face {
 @group(0) @binding(6) var<storage, read> image: array<u32>;
 // sRGB byte → linear, 256 entries (`linear_table`).
 @group(0) @binding(7) var<storage, read> lin: array<f32>;
+// What has no face, relative to the origin (w unused), `u.occluder_count` of them.
+@group(0) @binding(8) var<storage, read> occluders: array<vec4<f32>>;
+// As `depth`, but of the occluders alone; not looked at without any.
+@group(0) @binding(9) var<storage, read_write> occluder_depth: array<atomic<u32>>;
 
 const PI: f32 = 3.14159265358979323846;
 // Largest linear colour a sample holds (`RGB_RANGE`).
@@ -119,17 +131,28 @@ fn depth_at(x: i32, y: i32) -> vec2<f32> {
     return vec2<f32>(bitcast<f32>(~stored), 1.0);
 }
 
-// Writes the range of local point `p` into the cells of its footprint (`DepthBuffer::splat`
-// after `project_point` with `max_dist`).
-fn splat_point(p: vec3<f32>, spacing: f32) {
+// The cells of a point's footprint (`x0`…`x1`, `y0`…`y1`, none if `x1 < x0`) and the word of
+// its range.
+struct Footprint {
+    x0: i32,
+    x1: i32,
+    y0: i32,
+    y1: i32,
+    bits: u32,
+}
+
+// The footprint of local point `p` (`DepthBuffer::splat` after `project_point` with
+// `max_dist`).
+fn footprint(p: vec3<f32>, spacing: f32) -> Footprint {
+    let none = Footprint(0, -1, 0, -1, 0u);
     let pc = cam_from_local(p);
     let range = length(pc);
     if range > u.max_dist || range == 0.0 {
-        return;
+        return none;
     }
     let q = camera_project(u.geo, pc);
     if q.z < 0.5 {
-        return;
+        return none;
     }
     let cell = cell_of(q.xy);
     let cells = spacing * u.focal / range;
@@ -137,14 +160,32 @@ fn splat_point(p: vec3<f32>, spacing: f32) {
     if cells == cells {
         r = i32(clamp(ceil(0.5 * cells - 0.5), 0.0, f32(u.max_splat)));
     }
-    let bits = ~bitcast<u32>(range);
-    let y0 = max(cell.y - r, 0);
-    let y1 = min(cell.y + r, i32(u.depth_h) - 1);
-    let x0 = max(cell.x - r, 0);
-    let x1 = min(cell.x + r, i32(u.depth_w) - 1);
-    for (var y = y0; y <= y1; y++) {
-        for (var x = x0; x <= x1; x++) {
-            atomicMax(&depth[u32(y) * u.depth_w + u32(x)], bits);
+    return Footprint(
+        max(cell.x - r, 0),
+        min(cell.x + r, i32(u.depth_w) - 1),
+        max(cell.y - r, 0),
+        min(cell.y + r, i32(u.depth_h) - 1),
+        ~bitcast<u32>(range),
+    );
+}
+
+// Writes the range of local point `p` into the cells of its footprint.
+fn splat_point(p: vec3<f32>, spacing: f32) {
+    let s = footprint(p, spacing);
+    for (var y = s.y0; y <= s.y1; y++) {
+        for (var x = s.x0; x <= s.x1; x++) {
+            atomicMax(&depth[u32(y) * u.depth_w + u32(x)], s.bits);
+        }
+    }
+}
+
+// The same for the occluders' buffer (the depth buffers are different variables, and WGSL has
+// no pointers to them as arguments).
+fn splat_occluder(p: vec3<f32>) {
+    let s = footprint(p, u.occluder_spacing);
+    for (var y = s.y0; y <= s.y1; y++) {
+        for (var x = s.x0; x <= s.x1; x++) {
+            atomicMax(&occluder_depth[u32(y) * u.depth_w + u32(x)], s.bits);
         }
     }
 }
@@ -210,6 +251,47 @@ fn splat_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             splat_point(a + (b - a) * s + (c - a) * t, spacing);
         }
     }
+}
+
+@compute @workgroup_size(64)
+fn splat_occluders_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= u.occluder_count {
+        return;
+    }
+    splat_occluder(occluders[i].xyz);
+}
+
+// `DepthBuffer::is_behind` on the occluders: range `range` at pixel `uv` lies more than the
+// gap behind the nearest occluder of its own cell.
+fn behind_occluder(uv: vec2<f32>, range: f32) -> bool {
+    let cell = cell_of(uv);
+    let stored = atomicLoad(&occluder_depth[u32(cell.y) * u.depth_w + u32(cell.x)]);
+    return stored != 0u && range > bitcast<f32>(~stored) + u.occluder_gap;
+}
+
+// `face_occluded`: whether an occluder hides one of the 7 samples of face `f`, whose centroid
+// is at pixel `uv` and range `range`: the centroid, the corners, the middles of the edges.
+fn face_occluded(f: Face, uv: vec2<f32>, range: f32) -> bool {
+    if behind_occluder(uv, range) {
+        return true;
+    }
+    let a = f.a.xyz;
+    let b = f.b.xyz;
+    let c = f.c.xyz;
+    var points = array<vec3<f32>, 6>(a, (a + b) * 0.5, b, (b + c) * 0.5, c, (c + a) * 0.5);
+    for (var m = 0u; m < 6u; m++) {
+        let pc = cam_from_local(points[m]);
+        let r = length(pc);
+        if r == 0.0 {
+            continue;
+        }
+        let q = camera_project(u.geo, pc);
+        if q.z >= 0.5 && behind_occluder(q.xy, r) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Linear value of channel `ch` of pixel (x, y).
@@ -419,13 +501,18 @@ fn views_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cap = 0.5 * length(cross(f.b.xyz - f.a.xyz, f.c.xyz - f.a.xyz)) / u.min_texel2;
     let cos_s = max(dot(f.smoothed.xyz, to_cam) / dist, u.smooth_cos_min);
     area = area * clamp(cos_s / cos_n, 0.5, 2.0);
-    let score = min(area, cap) * cos_s * u.sharpness;
+    var score = min(area, cap) * cos_s * u.sharpness;
     if !(score > 0.0) {
         return;
     }
     let across = length(to_cam.xy);
-    let carrier = f.normal.z > u.carrier_nz && to_cam.z > u.carrier_below
+    var carrier = f.normal.z > u.carrier_nz && to_cam.z > u.carrier_below
         && across < u.carrier_radius && across < to_cam.z;
+    // Behind something that has no face: counts little, and goes like a carrier view.
+    if u.occluder_count > 0u && face_occluded(f, q.xy, range) {
+        score = score * u.occluded_score;
+        carrier = true;
+    }
     // Mean colour: the centroid and the points halfway to the corners.
     let centre_rgb = sample_linear(to_px(q.xy));
     var mean = centre_rgb;

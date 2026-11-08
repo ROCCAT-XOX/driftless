@@ -3,7 +3,9 @@
 //! between two points, and setting point pairs by hand („Von Hand ausrichten“).
 
 use driftless_app::pick::{project, relative_to};
-use driftless_app::project::{ModelInfo, Project, ScanEntry, ScanState};
+use driftless_app::project::{
+    MapInfo, ModelInfo, Project, RunInfo, ScanEntry, ScanState, SurfaceInfo,
+};
 use driftless_app::render::{headless_device, ShowMode};
 use driftless_app::ui::tools::{self, Measurement, PairSession, Tool};
 use driftless_app::ui::view3d::PointInfo;
@@ -15,6 +17,7 @@ use driftless_io::testdir::TestDir;
 use driftless_io::testscan::tmp;
 use driftless_map::{write_las, Cloud};
 use driftless_steps::merge::{ModelMember, ModelReport, MODEL_LAS, MODEL_REPORT};
+use driftless_steps::objects::ObjectKind;
 use driftless_steps::pairs::{stored_text, PointPairEntry, PointPairs, POINT_PAIRS_FILE};
 use driftless_steps::slam::SlamSettings;
 use driftless_traj::nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, Vector3};
@@ -29,12 +32,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The tools of the bar, in order.
-const TOOLS: [&str; 5] = [
+const TOOLS: [&str; 7] = [
     text::TOOL_ORBIT,
     text::TOOL_PAN,
     text::TOOL_PICK,
     text::TOOL_MEASURE,
     text::TOOL_CUT,
+    text::TOOL_BRUSH,
+    text::TOOL_OBJECT,
 ];
 
 fn app() -> DriftlessApp {
@@ -386,6 +391,36 @@ fn small_window_no_overlap() {
         .take(80)
         .collect();
     assert_eq!(name.chars().count(), 80);
+    // the surface shown is one of the map of the scan: the brush can paint on it
+    let map = PathBuf::from("/p/scans/s/slam-001/karte-001");
+    let surface = map.join("oberflaeche-001");
+    let run = RunInfo {
+        dir: PathBuf::from("/p/scans/s/slam-001"),
+        label: "SLAM 001".into(),
+        settings: SlamSettings::default(),
+        has_result: true,
+        has_cache: false,
+        has_previous: false,
+        has_odometry: false,
+        cloud: None,
+        maps: vec![MapInfo {
+            dir: map.clone(),
+            label: "Karte 001".into(),
+            settings: None,
+            clouds: Vec::new(),
+            surfaces: vec![SurfaceInfo {
+                dir: surface.clone(),
+                label: "Oberfläche 001".into(),
+                stale: false,
+                settings: None,
+                hints: Vec::new(),
+            }],
+            plans: Vec::new(),
+            incomplete: false,
+        }],
+        history: Vec::new(),
+        incomplete: false,
+    };
     let mut app = app();
     *app.state_mut() = AppState {
         project: Some(Project {
@@ -404,39 +439,64 @@ fn small_window_no_overlap() {
             name: name.clone(),
             state: ScanState::Ready,
             no_color: None,
-            runs: Vec::new(),
+            runs: vec![run],
         }],
         selection: Selection::Scan("s".into()),
         cloud: Some(cloud_summary()),
-        surface: Some(surface_summary()),
+        surface: Some(SurfaceSummary {
+            path: surface.join("oberflaeche.glb"),
+            ..surface_summary()
+        }),
         picked: Some(point()),
         tool: Tool::Cut,
         ..AppState::default()
     };
-    let h = window(app, [1024.0, 640.0]);
-    let l = h.state().layout();
-    let floats = [
-        ("Info", l.info),
-        ("Ansicht", l.show),
-        ("Werkzeuge", l.tools),
-        ("Schnitt", l.cut),
-    ];
-    let mut all = vec![("Leiste", l.rail), ("Schrittfeld", l.step)];
-    for (what, rect) in floats {
-        let rect = rect.unwrap_or_else(|| panic!("{what} not shown"));
-        assert!(
-            l.view.contains_rect(rect),
-            "{what} {rect:?} outside {:?}",
-            l.view
-        );
-        all.push((what, rect));
-    }
-    for (i, (a, ra)) in all.iter().enumerate() {
-        for (b, rb) in &all[i + 1..] {
-            assert!(!overlap(*ra, *rb), "{a} {ra:?} overlaps {b} {rb:?}");
+    let mut h = window(app, [1024.0, 640.0]);
+    // the cut, then the brush and the tool „Objekt“ with their bars above the tools
+    for (tool, bar, kind) in [
+        (Tool::Cut, "Schnitt", ObjectKind::Socket),
+        (Tool::Brush, "Pinsel", ObjectKind::Socket),
+        (Tool::Object, "Objekt", ObjectKind::Socket),
+        (Tool::Object, "Objekt, Tür", ObjectKind::Door),
+        // the widest: height and sill
+        (Tool::Object, "Objekt, Fenster", ObjectKind::Window),
+    ] {
+        h.state_mut().state_mut().tool = tool;
+        h.state_mut().state_mut().object_tool.kind = kind;
+        h.run();
+        assert_eq!(h.state().state().tool, tool);
+        let l = h.state().layout();
+        let floats = [
+            ("Info", l.info),
+            ("Ansicht", l.show),
+            ("Werkzeuge", l.tools),
+            (
+                bar,
+                match tool {
+                    Tool::Cut => l.cut,
+                    Tool::Brush => l.brush,
+                    _ => l.objects,
+                },
+            ),
+        ];
+        let mut all = vec![("Leiste", l.rail), ("Schrittfeld", l.step)];
+        for (what, rect) in floats {
+            let rect = rect.unwrap_or_else(|| panic!("{what} not shown"));
+            assert!(
+                l.view.contains_rect(rect),
+                "{what} {rect:?} outside {:?}",
+                l.view
+            );
+            all.push((what, rect));
+        }
+        for (i, (a, ra)) in all.iter().enumerate() {
+            for (b, rb) in &all[i + 1..] {
+                assert!(!overlap(*ra, *rb), "{a} {ra:?} overlaps {b} {rb:?}");
+            }
         }
     }
     // the name is cut with „…“: narrower than written out, inside the field
+    let l = *h.state().layout();
     let label = h.get_by_label(&name).rect();
     let font = egui::TextStyle::Body.resolve(&h.ctx.global_style());
     let full = h.ctx.fonts_mut(|f| {
@@ -446,6 +506,27 @@ fn small_window_no_overlap() {
     });
     assert!(label.width() < full - 20.0, "{} vs {full}", label.width());
     assert!(label.max.x <= l.step.max.x, "{label:?} vs {:?}", l.step);
+
+    // the smallest window: the bar of „Objekt“ with the settings of every kind stays in the view
+    h.set_size(egui::vec2(800.0, 500.0));
+    h.state_mut().state_mut().tool = Tool::Object;
+    for kind in [
+        ObjectKind::Socket,
+        ObjectKind::Connection,
+        ObjectKind::Pipe,
+        ObjectKind::Door,
+        ObjectKind::Window,
+    ] {
+        h.state_mut().state_mut().object_tool.kind = kind;
+        h.run();
+        let l = h.state().layout();
+        let bar = l.objects.expect("die Leiste ist da");
+        assert!(
+            l.view.contains_rect(bar),
+            "{kind:?}: {bar:?} / {:?}",
+            l.view
+        );
+    }
 }
 
 #[test]
@@ -741,6 +822,7 @@ fn pair_model(dir: &Path, root: &Path) -> ModelInfo {
             warnings: Vec::new(),
         },
         surfaces: Vec::new(),
+        plans: Vec::new(),
     }
 }
 

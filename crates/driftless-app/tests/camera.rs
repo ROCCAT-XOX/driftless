@@ -1,6 +1,6 @@
 //! Camera maths: orbit and fly, reverse-Z projection, rays and the view volume.
 
-use driftless_app::camera::{fly_motion, Camera, CameraMode, FlyKeys, FAST_FACTOR};
+use driftless_app::camera::{fly_motion, Camera, CameraMode, CameraState, FlyKeys, FAST_FACTOR};
 use driftless_app::pick::project;
 use nalgebra::Vector3;
 
@@ -289,6 +289,63 @@ fn frame_bounds_shows_all_corners() {
 }
 
 #[test]
+fn frame_facing_looks_straight_at_a_place() {
+    for viewport in [VIEWPORT, [600.0, 1200.0], [900.0, 900.0]] {
+        let aspect = viewport[0] / viewport[1];
+        // a wall facing −y, a floor, a ceiling, a slope
+        for normal in [
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+            [0.6, 0.0, 0.8],
+        ] {
+            for mode in [CameraMode::Orbit, CameraMode::Fly] {
+                let mut cam = Camera::default();
+                cam.set_mode(mode);
+                let centre = [3.0, -2.0, 1.5];
+                cam.frame_facing(centre, normal, 0.5, aspect);
+                // along the opposite of the normal, as far as the pitch allows
+                let n = Vector3::from(normal).normalize();
+                assert!(cam.dir().dot(&-n) > 0.9998, "{normal:?} {:?}", cam.dir());
+                assert!(close(view_dir(&cam), cam.dir(), 1e-4));
+                // the place in the middle of the image, on the side of the normal
+                let q = project(&cam.view_proj(aspect), centre, viewport).expect("in front");
+                assert!((q[0] - viewport[0] / 2.0).abs() < 0.5, "{q:?}");
+                assert!((q[1] - viewport[1] / 2.0).abs() < 0.5, "{q:?}");
+                let eye = cam.eye_position() - Vector3::from(centre);
+                assert!(eye.dot(&n) > 0.0, "{eye:?}");
+                // the sphere of the radius fits: a point on it beside the centre is in the image
+                let side = cam.dir().cross(&Vector3::z());
+                let side = if side.norm() > 1e-3 {
+                    side.normalize()
+                } else {
+                    Vector3::x()
+                };
+                for s in [-0.5, 0.5] {
+                    let p = Vector3::from(centre) + side * s;
+                    let q = project(&cam.view_proj(aspect), p.into(), viewport).unwrap();
+                    assert!((0.0..=viewport[0]).contains(&q[0]), "{q:?}");
+                }
+            }
+        }
+    }
+    // straight down keeps the yaw; no direction keeps the view; no place changes nothing
+    let mut cam = Camera::default();
+    let yaw = cam.yaw;
+    cam.frame_facing([0.0; 3], [0.0, 0.0, 1.0], 1.0, ASPECT);
+    assert_eq!(cam.yaw, yaw);
+    let (yaw, pitch) = (cam.yaw, cam.pitch);
+    cam.frame_facing([1.0; 3], [0.0; 3], 1.0, ASPECT);
+    assert_eq!((cam.yaw, cam.pitch), (yaw, pitch));
+    assert!(close(cam.target, Vector3::from([1.0; 3]), 1e-6));
+    let before = cam.clone();
+    cam.frame_facing([f32::NAN, 0.0, 0.0], [0.0, -1.0, 0.0], 1.0, ASPECT);
+    assert_eq!(cam, before);
+    cam.frame_facing([0.0; 3], [0.0, -1.0, 0.0], f32::NAN, f32::NAN);
+    assert!(cam.distance.is_finite() && cam.distance > 0.0);
+}
+
+#[test]
 fn frame_bounds_ignores_empty_bounds() {
     let mut cam = Camera::default();
     cam.orbit(40.0, 10.0);
@@ -444,4 +501,66 @@ fn zoom_in_fly_mode_moves_forward() {
         cam.zoom(3.0);
     }
     assert!((cam.eye_position() - eye).dot(&dir) > 20.0);
+}
+
+/// The camera kept in absolute coordinates ([`CameraState`]) comes back where it was, also in
+/// the frame of another origin, in both modes; a state that is not finite changes nothing.
+#[test]
+fn camera_state_is_absolute_and_comes_back() {
+    let from = [512_000.0, 5_400_000.0, 100.0];
+    let to = [512_003.0, 5_399_998.0, 99.0];
+    for mode in [CameraMode::Orbit, CameraMode::Fly] {
+        let mut cam = Camera {
+            target: Vector3::new(2.25, 1.5, 1.25),
+            yaw: 100f32.to_radians(),
+            pitch: (-12.5f32).to_radians(),
+            distance: 3.5,
+            fov_y: 50f32.to_radians(),
+            ..Camera::default()
+        };
+        cam.set_mode(mode);
+        let state = cam.state(from);
+        assert_eq!(state.mode, mode);
+        let abs = |v: Vector3<f32>, o: [f64; 3]| [0, 1, 2].map(|k| o[k] + f64::from(v[k]));
+        for k in 0..3 {
+            assert!((state.target[k] - abs(cam.target, from)[k]).abs() < 1e-6);
+            assert!((state.eye[k] - abs(cam.eye_position(), from)[k]).abs() < 1e-6);
+        }
+        assert!((state.yaw_deg - 100.0).abs() < 1e-4, "{state:?}");
+        assert!((state.pitch_deg + 12.5).abs() < 1e-4, "{state:?}");
+        assert!((state.distance_m - 3.5).abs() < 1e-6);
+        assert!((state.fov_y_deg - 50.0).abs() < 1e-4);
+        // into a camera that draws in the frame of `to`
+        let mut back = Camera::default();
+        back.restore(&state, to);
+        assert_eq!(back.mode, mode);
+        let again = back.state(to);
+        for k in 0..3 {
+            assert!(
+                (again.target[k] - state.target[k]).abs() < 1e-3,
+                "{again:?}"
+            );
+            assert!((again.eye[k] - state.eye[k]).abs() < 1e-3, "{again:?}");
+        }
+        assert!((again.yaw_deg - state.yaw_deg).abs() < 0.01);
+        assert!((again.pitch_deg - state.pitch_deg).abs() < 0.01);
+        assert!((again.distance_m - state.distance_m).abs() < 1e-4);
+        assert!((again.fov_y_deg - state.fov_y_deg).abs() < 1e-4);
+        assert!(close(view_dir(&back), view_dir(&cam), 1e-5));
+        // a state that is not finite (a file edited by hand) leaves the camera as it is
+        let before = back.clone();
+        let mut bad: CameraState = state.clone();
+        bad.target[1] = f64::NAN;
+        back.restore(&bad, to);
+        assert_eq!(back, before);
+        let mut bad = state.clone();
+        bad.distance_m = f64::INFINITY;
+        back.restore(&bad, to);
+        assert_eq!(back, before);
+        // a pitch beyond the limit is held at it
+        let mut steep = state.clone();
+        steep.pitch_deg = -120.0;
+        back.restore(&steep, to);
+        assert!((back.pitch.to_degrees() + 89.0).abs() < 1e-3);
+    }
 }

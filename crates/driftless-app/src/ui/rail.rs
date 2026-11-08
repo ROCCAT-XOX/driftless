@@ -49,8 +49,8 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
 }
 
 /// The entries of ☰: what the old menu bar „Projekt“ had, „Lauf hinzufügen“ for the scan of
-/// the selection, „Exportieren …“ for what the view shows, „Protokoll-Ordner öffnen“ and „Über
-/// Driftless …“ (both carried out here).
+/// the selection, „Exportieren …“ for what the view shows, „Protokoll-Ordner öffnen“,
+/// „Meldungen …“ (the reports of „Melden“) and „Über Driftless …“ (carried out here).
 fn project_menu(ui: &mut Ui, state: &mut AppState, action: &mut Option<Action>) {
     let has_project = state.project.is_some();
     if ui.button(text::NEW_PROJECT).clicked() {
@@ -84,6 +84,10 @@ fn project_menu(ui: &mut Ui, state: &mut AppState, action: &mut Option<Action>) 
     ui.separator();
     if ui.button(text::OPEN_LOG_FOLDER).clicked() {
         *action = Some(Action::OpenLogFolder);
+    }
+    let reports = ui.button(text::REPORTS).on_hover_text(text::reports_hint());
+    if reports.clicked() {
+        *action = Some(Action::OpenReports);
     }
     if ui.button(text::ABOUT).clicked() {
         state.about_open = true;

@@ -342,6 +342,8 @@ fn whole_run_on_real_scans() {
             ExportKind::Points => ExportSource::Model(model.clone()),
             ExportKind::Mesh => ExportSource::Surface(model_surface.clone()),
             ExportKind::Trajectory => ExportSource::Run(s1_run.clone()),
+            // A plan is checked in its own pass.
+            ExportKind::Plan => continue,
         };
         let file = out.join(format!("abnahme-{}.{}", format.name(), format.extension()));
         app.apply(Action::RunExport(ExportRequest {

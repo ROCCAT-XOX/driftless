@@ -77,6 +77,10 @@ pub mod icon {
     pub const PICK: &str = p::CROSSHAIR;
     pub const MEASURE: &str = p::RULER;
     pub const CUT: &str = p::SCISSORS;
+    pub const BRUSH: &str = p::PAINT_BRUSH;
+    pub const OBJECT: &str = p::PLUG;
+    /// ↶: takes back the last stroke or step of the brush.
+    pub const UNDO: &str = p::ARROW_U_UP_LEFT;
     pub const PAIRS: &str = p::LINK;
     pub const FIT: &str = p::CORNERS_OUT;
     pub const CHECK: &str = p::CHECK_CIRCLE;

@@ -13,6 +13,7 @@ use driftless_steps::export::{
     check_export, existing_targets, ExportFormat, ExportKind, ExportRequest, ExportSource,
 };
 use driftless_steps::merge::MODEL_LAS;
+use driftless_steps::plan_drawing::{PlanExport, PlanPlacement};
 use eframe::egui::{self, Context, Ui};
 use std::path::{Path, PathBuf};
 
@@ -53,6 +54,7 @@ pub fn default_format(kind: ExportKind) -> ExportFormat {
         ExportKind::Points => ExportFormat::Laz,
         ExportKind::Mesh => ExportFormat::Glb,
         ExportKind::Trajectory => ExportFormat::Csv,
+        ExportKind::Plan => ExportFormat::Dxf,
     }
 }
 
@@ -80,6 +82,15 @@ impl ExportDialog {
             .into_iter()
             .filter(|f| f.kind() == kind)
             .collect()
+    }
+
+    /// How the chosen floor plan is exported; `None` for any other source.
+    fn plan_export(&mut self) -> Option<&mut PlanExport> {
+        let last = self.choices.len() - 1;
+        match &mut self.choices[self.chosen.min(last)].0 {
+            ExportSource::Plan { export, .. } => Some(export),
+            _ => None,
+        }
     }
 
     /// Chooses source `k`; a source of another kind starts with its first format.
@@ -117,6 +128,9 @@ pub fn source_name(state: &AppState, source: &ExportSource) -> String {
             text::export_choice(&label, MODEL_LAS)
         }
         ExportSource::Surface(d) => surface_label(state, d).unwrap_or_else(|| folder(d)),
+        ExportSource::EditedSurface(d) => {
+            text::export_touched_up(&surface_label(state, d).unwrap_or_else(|| folder(d)))
+        }
         ExportSource::Run(d) => {
             let label = state
                 .run(d)
@@ -139,6 +153,7 @@ pub fn source_name(state: &AppState, source: &ExportSource) -> String {
             }
         }
         ExportSource::MeshFile(f) => folder(f),
+        ExportSource::Plan { dir, .. } => state.tree_label(dir).unwrap_or_else(|| folder(dir)),
     }
 }
 
@@ -166,15 +181,23 @@ fn folder(path: &Path) -> String {
 
 /// What „Exportieren …“ in ☰ offers: the cloud the view shows ([`ExportSource::detect`], so
 /// that `modell.las` is the model and keeps the names of its scans) and the surface (its folder
-/// for an `oberflaeche.glb`), with their names. Empty while neither is shown, or for a
-/// synthetic cloud.
+/// for an `oberflaeche.glb`; with its touch-up if its map or model has Stellen with steps,
+/// [`surface_source`]), with their names. Empty while neither is shown, or for a synthetic
+/// cloud.
 pub fn shown_sources(state: &AppState) -> Vec<(ExportSource, String)> {
     let cloud = state
         .cloud
         .as_ref()
         .and_then(|c| ExportSource::detect(&c.path).ok())
         .filter(|s| s.kind() == ExportKind::Points);
-    let surface = state.surface.as_ref().and_then(|s| shown_surface(&s.path));
+    let surface = state
+        .surface
+        .as_ref()
+        .and_then(|s| shown_surface(&s.path))
+        .map(|source| match source {
+            ExportSource::Surface(dir) => surface_source(state, &dir),
+            other => other,
+        });
     cloud
         .into_iter()
         .chain(surface)
@@ -183,6 +206,19 @@ pub fn shown_sources(state: &AppState) -> Vec<(ExportSource, String)> {
             (s, name)
         })
         .collect()
+}
+
+/// What the export of the surface folder `dir` reads: the surface with its touch-up
+/// ([`ExportSource::EditedSurface`]) if the map or model it lies in has Stellen with steps (as
+/// last read), else the surface as computed.
+pub fn surface_source(state: &AppState, dir: &Path) -> ExportSource {
+    let owner = dir.parent().unwrap_or(dir);
+    let marks = state.marks.get(owner).and_then(|m| m.as_ref().ok());
+    if marks.is_some_and(super::brush::has_steps) {
+        ExportSource::EditedSurface(dir.to_path_buf())
+    } else {
+        ExportSource::Surface(dir.to_path_buf())
+    }
 }
 
 /// The source of the surface file the view shows: the surface folder of an
@@ -279,6 +315,11 @@ pub fn show(ctx: &Context, state: &mut AppState) -> Option<Action> {
                         let label = ui.label(text::EXPORT_FORMAT);
                         format_choice(ui, dialog, label.id);
                         ui.end_row();
+                        if let Some(export) = dialog.plan_export() {
+                            ui.label(text::EXPORT_PLACEMENT);
+                            placement_choice(ui, export);
+                            ui.end_row();
+                        }
                     });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -299,6 +340,17 @@ pub fn show(ctx: &Context, state: &mut AppState) -> Option<Action> {
         state.export = None;
     }
     action
+}
+
+/// Lage of a floor plan: „An den Wänden“ (the default) or „Wie die Punktwolke“.
+fn placement_choice(ui: &mut Ui, export: &mut PlanExport) {
+    ui.vertical(|ui| {
+        let place = &mut export.placement;
+        ui.radio_value(place, PlanPlacement::Walls, text::EXPORT_PLACEMENT_WALLS)
+            .on_hover_text(text::EXPORT_PLACEMENT_WALLS_HINT);
+        ui.radio_value(place, PlanPlacement::AsCloud, text::EXPORT_PLACEMENT_CLOUD)
+            .on_hover_text(text::EXPORT_PLACEMENT_CLOUD_HINT);
+    });
 }
 
 /// Was: the name of the one source, or a choice of several.

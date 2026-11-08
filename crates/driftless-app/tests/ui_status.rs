@@ -54,6 +54,20 @@ fn status_shows_progress_and_cancel() {
 }
 
 #[test]
+fn a_phase_that_names_the_step_stands_alone() {
+    // „Nacharbeit: Schritt 1 von 2“, not „Nacharbeit: Nacharbeit: Schritt 1 von 2“
+    let mut job = job(0, None, false);
+    job.label = text::STEP_TOUCHUP.into();
+    job.progress.phase = "Nacharbeit: Schritt 1 von 2".into();
+    let mut h = harness(with_job(job));
+    h.run_steps(3);
+    h.get_by_label("Nacharbeit: Schritt 1 von 2");
+    assert!(h
+        .query_by_label_contains("Nacharbeit: Nacharbeit")
+        .is_none());
+}
+
+#[test]
 fn status_without_total_shows_spinner() {
     let mut h = harness(with_job(job(7, None, false)));
     h.run_steps(3);

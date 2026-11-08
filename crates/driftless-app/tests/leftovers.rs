@@ -169,6 +169,30 @@ fn finds_what_a_cut_off_job_left() {
     assert_eq!(leftovers::find(&project, &ids).len(), 6);
 }
 
+/// A map cut off before its report that has objects in it (`driftless map -o` into a folder a
+/// map already was in) and a model cut off with objects: the objects keep them from the trash.
+#[test]
+fn folders_with_objects_are_no_leftovers() {
+    let dir = tmp("reste-objekte");
+    let (project, run) = project(&dir);
+    let ids = ["halle".to_string()];
+    file(&run.join("karte-002"), "dense.bin.tmp", 2000);
+    file(&project.join("modelle/modell-001"), "modell.las.tmp", 500);
+    let (map, model) = (run.join("karte-002"), project.join("modelle/modell-001"));
+    assert_eq!(leftovers::find(&project, &ids).len(), 2);
+
+    file(&map, "objekte.toml", 10);
+    file(&model, "objekte.toml", 10);
+    // what is still offered is only the stale temporary files, not the folders with the objects
+    let found = leftovers::find(&project, &ids);
+    assert!(
+        found.iter().all(|l| l.kind == LeftoverKind::Temp),
+        "{found:?}"
+    );
+    assert!(leftovers::holds_results(&map));
+    assert!(!leftovers::may_clean_up(&map));
+}
+
 /// What a recompute cut off in a run's or a map's own folder leaves (by a crash, or by an
 /// older program): the run without its report, but with its history and its finished map; a
 /// second map without its report, but with a finished surface – and in it a surface cut off; a
@@ -635,4 +659,45 @@ fn focus_reads_the_tree_again() {
     std::thread::sleep(FOCUS_GAP);
     focus(&mut h);
     assert!(missing(&h));
+}
+
+/// What a touch-up cut off left in a surface folder (`nacharbeit.tmp-…`, R2-M1 of the final
+/// review) is offered for „Aufräumen“ – unless it was cut off while it put its new cache in
+/// place: the next touch-up puts the old one back, so its folders are left alone until then.
+#[test]
+fn touchup_leftovers_are_offered() {
+    let dir = tmp("reste-nacharbeit");
+    let (project, run) = project(&dir);
+    let ids = ["halle".to_string()];
+    let surface = run.join("karte-001/oberflaeche-001");
+    let new = surface.join("nacharbeit.tmp-4242-neu");
+    file(&new, "aenderungen.bin", 30);
+    assert_eq!(
+        labels(&leftovers::find(&project, &ids)),
+        [(
+            LeftoverKind::Temp,
+            "nacharbeit.tmp-4242-neu (Oberfläche 001)".into(),
+            30
+        )]
+    );
+    assert!(leftovers::may_clean_up(&new));
+
+    // cut off between its two renames: an intact old cache aside, none in place
+    let aside = surface.join("nacharbeit.tmp-4242-alt");
+    file(&aside, "aenderungen.bin", 4);
+    fs::write(
+        aside.join("nacharbeit.json"),
+        r#"{"input_id":"x","glb_bytes":10,"edit_version":1,"patches_bytes":4,"steps":[]}"#,
+    )
+    .unwrap();
+    assert_eq!(leftovers::find(&project, &ids), Vec::new());
+    assert!(!leftovers::may_clean_up(&aside));
+    assert!(!leftovers::may_clean_up(&new));
+
+    // with a cache in place both are leftovers; the cache itself never is
+    fs::create_dir_all(surface.join("nacharbeit")).unwrap();
+    let found = leftovers::find(&project, &ids);
+    let paths: Vec<&Path> = found.iter().map(|l| l.path.as_path()).collect();
+    assert_eq!(paths, [aside.as_path(), new.as_path()]);
+    assert!(leftovers::may_clean_up(&aside));
 }

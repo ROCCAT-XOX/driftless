@@ -85,6 +85,18 @@ fn pinned<C>(
     list: impl FnOnce(&mut Ui, &mut C, bool),
     bottom: impl FnOnce(&mut Ui, &mut C),
 ) {
+    pinned_with(ui, step, true, cx, list, bottom);
+}
+
+/// [`pinned`], without the toggle „▸ Erweitert“ if the field has nothing under it.
+fn pinned_with<C>(
+    ui: &mut Ui,
+    step: Step,
+    toggle: bool,
+    cx: &mut C,
+    list: impl FnOnce(&mut Ui, &mut C, bool),
+    bottom: impl FnOnce(&mut Ui, &mut C),
+) {
     let advanced_id = advanced_id(step);
     let mut advanced = ui.data_mut(|d| *d.get_persisted_mut_or(advanced_id, false));
     // The scroll area leaves the height the bottom took in the last frame.
@@ -100,7 +112,7 @@ fn pinned<C>(
     let top = ui.cursor().top();
     ui.add_space(8.0);
     bottom(ui, cx);
-    if advanced_toggle(ui, advanced) {
+    if toggle && advanced_toggle(ui, advanced) {
         advanced = !advanced;
         ui.data_mut(|d| d.insert_persisted(advanced_id, advanced));
     }

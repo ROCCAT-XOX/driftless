@@ -23,6 +23,11 @@
 //! model's id, the clean id and images of every scan in it, the settings and
 //! [`SURFACE_VERSION`]. A model merged by another version of the merge is refused, like one
 //! whose maps were computed anew since ([`crate::merge::version_fits`]).
+//!
+//! [`texture_sources`] finds the camera images of a computed surface again from its folder
+//! alone, as the surface step took them, for touching it up („Bilder neu einspielen“) – only
+//! while the raw data are those the surface was made from; else it says why there are none
+//! ([`NoSources`]).
 
 use crate::error::{check_cancel, failed, StepError};
 use crate::export::is_page_of;
@@ -33,21 +38,26 @@ use crate::map::{
 };
 use crate::merge::{
     member_transform, read_model, version_fits, ModelMember, ModelReport, MERGE_VERSION,
+    MODEL_REPORT,
 };
+use crate::slam::SlamSettings;
 use crate::{PROGRAM, PROGRAM_KEY};
 use driftless_export::mesh;
 use driftless_gpu::{GpuChoice, GpuContext, GpuPref};
 use driftless_io::progress::Progress;
-use driftless_io::project::discover_project;
+use driftless_io::project::{discover_project, ProjectError};
 use driftless_io::{atomic_write, paths};
 use driftless_map::surface::{
-    build_mesh, encode_pages, sensors_for_frames, texture_mesh, Accuracy, AccuracySplit,
-    SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
+    build_mesh, encode_pages, sensors_for_frames, surface_occluders, texture_mesh_with, Accuracy,
+    AccuracySplit, NoiseConfig, Occluders, SurfaceConfig, SurfaceInput, SurfaceStats,
+    TextureSource, OCCLUDERS_FILE,
 };
 use driftless_map::{load_stage, stage_fits};
 use driftless_traj::nalgebra::{Isometry3, Point3};
 use driftless_traj::Pose;
+use serde::Deserialize;
 use serde_json::{json, Value};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -56,7 +66,7 @@ pub const SURFACE_REPORT: &str = "oberflaeche.json";
 /// Part of the input id: raised whenever the surface gives another result for the same
 /// settings, so an older folder counts as stale. Only then: the program version is no part
 /// of the id (see the rule at the step versions in [`crate::map`]).
-const SURFACE_VERSION: u32 = 13;
+const SURFACE_VERSION: u32 = 14;
 /// File stem of the glb and the obj.
 const STEM: &str = "oberflaeche";
 /// Share of the faces the coarse grid offered that were dropped for lack of a point within
@@ -107,24 +117,42 @@ fn images_of(
     Ok(color_input(scan, &project, lidar_to_imu, progress))
 }
 
+/// The part of the input id of a surface for its camera images: their id if the texture is on
+/// and the scan has images (`color`), else a mark that there are none („texture off“, „no
+/// images“).
+fn images_text(texture: bool, color: Option<&ColorInput>) -> String {
+    match (texture, color) {
+        (false, _) => "texture off\n".into(),
+        (true, Some(c)) => c.id.clone(),
+        (true, None) => "no images\n".into(),
+    }
+}
+
 fn images_part(
     req: &SurfaceRequest,
     progress: &Progress,
 ) -> Result<(String, Option<ColorInput>), StepError> {
     if !req.texture {
-        return Ok(("texture off\n".into(), None));
+        return Ok((images_text(false, None), None));
     }
     let odom = req.map.slam.config()?.odom;
     match images_of(&req.map.scan, &odom.lidar_to_imu, progress)? {
-        Ok(c) => Ok((c.id.clone(), Some(c))),
+        Ok(c) => Ok((images_text(true, Some(&c)), Some(c))),
         Err(why) => {
             progress.warn(format!(
                 "{why} – Oberfläche ohne Textur, alle Flächen grau; fehlt das nur in der Kopie, \
                  es vom Gerät dazukopieren und die Oberfläche neu rechnen"
             ));
-            Ok(("no images\n".into(), None))
+            Ok((images_text(true, None), None))
         }
     }
+}
+
+/// The input id of a surface of the `clean.bin` of `clean_id` with the images part `images`
+/// ([`images_text`]) and `config`.
+fn plan_text(clean_id: String, images: &str, config: &SurfaceConfig) -> Plan {
+    let id = format!("{clean_id}surface v{SURFACE_VERSION}\n{images}{config:?}\n");
+    Plan { id, clean_id }
 }
 
 fn plan(
@@ -133,11 +161,13 @@ fn plan(
 ) -> Result<(Plan, Option<ColorInput>), StepError> {
     let clean_id = clean_stage_id(&req.map)?;
     let (images, color) = images_part(req, progress)?;
-    let id = format!(
-        "{clean_id}surface v{SURFACE_VERSION}\n{images}{:?}\n",
-        req.config
-    );
-    Ok((Plan { id, clean_id }, color))
+    Ok((plan_text(clean_id, &images, &req.config), color))
+}
+
+/// Whether the surface report `report` in `dir` is of the input id `id` (full text) and the
+/// files it lists are there with their sizes ([`files_intact`]).
+fn report_fits(dir: &Path, report: &Value, id: &str) -> bool {
+    report["input_id"].as_str() == Some(hex(id).as_str()) && files_intact(dir, report)
 }
 
 /// Whether `out_dir` holds the surface of this request: its report has the current input id,
@@ -150,8 +180,7 @@ pub fn surface_fits(req: &SurfaceRequest) -> bool {
         // Warnings are of no interest here.
         let (plan, _) = plan(req, &Progress::new()).ok()?;
         Some(
-            report["input_id"].as_str() == Some(hex(&plan.id).as_str())
-                && files_intact(&req.out_dir, &report)
+            report_fits(&req.out_dir, &report, &plan.id)
                 && stage_fits(&req.map_dir.join(CLEAN_BIN), &plan.clean_id),
         )
     };
@@ -178,12 +207,13 @@ fn files_intact(dir: &Path, report: &Value) -> bool {
 }
 
 /// Whether a surface writes the file `name`: the glb, the OBJ with its `.mtl` and pages, the
-/// report.
+/// occluders, the report.
 fn owns(name: &str) -> bool {
     let fixed = [
         format!("{STEM}.glb"),
         format!("{STEM}.obj"),
         format!("{STEM}.mtl"),
+        OCCLUDERS_FILE.to_string(),
         SURFACE_REPORT.to_string(),
     ];
     fixed.iter().any(|f| f == name) || is_page_of(name.as_ref(), STEM.as_ref())
@@ -233,6 +263,79 @@ fn settings_json(c: &SurfaceConfig, texture: bool) -> Value {
             "min_sharpness": c.color.min_sharpness,
             "view_gap": c.color.view_gap,
         },
+        "noise": {
+            "snap": c.noise.snap,
+            "exposure": c.noise.exposure,
+            "denoise": c.noise.denoise,
+            "occlude": c.noise.occlude,
+        },
+    })
+}
+
+/// The switches against noise from the `settings` of a surface report: without the entry (a
+/// report from before the switches) the default, as for a single switch the entry does not hold.
+/// `None` if the entry or a switch is of the wrong type.
+pub fn noise_config(settings: &Value) -> Option<NoiseConfig> {
+    let n = match &settings["noise"] {
+        Value::Null => return Some(NoiseConfig::default()),
+        n @ Value::Object(_) => n,
+        _ => return None,
+    };
+    let defaults = NoiseConfig::default();
+    let switch = |key: &str, default: bool| match &n[key] {
+        Value::Null => Some(default),
+        v => v.as_bool(),
+    };
+    Some(NoiseConfig {
+        snap: switch("snap", defaults.snap)?,
+        exposure: switch("exposure", defaults.exposure)?,
+        denoise: switch("denoise", defaults.denoise)?,
+        occlude: switch("occlude", defaults.occlude)?,
+    })
+}
+
+/// The settings a surface was computed with, from its report `report` (`settings`, as
+/// [`settings_json`] writes them): the camera settings it does not hold take the defaults,
+/// which is what the program and `driftless surface` always use. `None` if a value is missing
+/// or of the wrong type; a report from before the coarse grid has no `coarse_fallback` (read as
+/// `true`), one from before `max_fill_gap` takes the default, and so does one without the
+/// switches against noise ([`noise_config`]).
+pub(crate) fn surface_config(report: &Value) -> Option<SurfaceConfig> {
+    let s = &report["settings"];
+    let c = &s["color"];
+    let int = |v: &Value| v.as_u64();
+    let defaults = SurfaceConfig::default();
+    Some(SurfaceConfig {
+        voxel: s["voxel"].as_f64()?,
+        truncation_voxels: s["truncation_voxels"].as_f64()? as f32,
+        min_weight: int(&s["min_weight"])?.try_into().ok()?,
+        coarse_fallback: match &s["coarse_fallback"] {
+            Value::Null => true,
+            v => v.as_bool()?,
+        },
+        max_fill_gap: match &s["max_fill_gap"] {
+            Value::Null => defaults.max_fill_gap,
+            v => v.as_f64()?,
+        },
+        min_component_faces: int(&s["min_component_faces"])?.try_into().ok()?,
+        max_hole_perimeter: s["max_hole_perimeter"].as_f64()?,
+        simplify_error: s["simplify_error"].as_f64()?,
+        max_edge: s["max_edge"].as_f64()?,
+        min_texel: s["min_texel"].as_f64()?,
+        page_size: int(&s["page_size"])?.try_into().ok()?,
+        views_per_face: int(&s["views_per_face"])?.try_into().ok()?,
+        smooth_weight: s["smooth_weight"].as_f64()? as f32,
+        jpeg_quality: int(&s["jpeg_quality"])?.try_into().ok()?,
+        color: driftless_map::ColorConfig {
+            downscale: int(&c["downscale"])?.try_into().ok()?,
+            highlights: c["highlights"].as_bool()?,
+            max_dist: c["max_dist"].as_f64()?,
+            depth_tolerance: c["depth_tolerance"].as_f64()?,
+            min_sharpness: c["min_sharpness"].as_f64()?,
+            view_gap: c["view_gap"].as_f64()?,
+            ..defaults.color
+        },
+        noise: noise_config(s)?,
     })
 }
 
@@ -250,6 +353,7 @@ fn accuracy_split_json(a: &AccuracySplit) -> Value {
         "all": accuracy_json(&a.all),
         "walls": accuracy_json(&a.walls),
         "edges": accuracy_json(&a.edges),
+        "walls_plane": accuracy_json(&a.walls_plane),
     })
 }
 
@@ -303,6 +407,8 @@ fn stats_json(s: &SurfaceStats) -> Value {
             "islands_absorbed": s.texture.islands_absorbed,
             "gray_filled": s.texture.gray_filled,
             "untextured_area_share": s.texture.untextured_area_share,
+            "noise_before": s.texture.noise_before,
+            "noise_after": s.texture.noise_after,
         },
         "seams": {
             "seam_jump_before": s.seams.seam_jump_before,
@@ -320,6 +426,16 @@ fn stats_json(s: &SurfaceStats) -> Value {
         "accuracy_p95_mm": s.accuracy.all.p95_mm,
         "accuracy": accuracy_split_json(&s.accuracy),
         "accuracy_dense": s.accuracy_dense.as_ref().map(accuracy_split_json),
+        "roughness": accuracy_json(&s.roughness),
+        "snap": {
+            "vertices": s.snap.vertices,
+            "moved": s.snap.moved,
+            "no_plane": s.snap.no_plane,
+            "too_far": s.snap.too_far,
+            "reverted": s.snap.reverted,
+            "mean_shift_mm": s.snap.mean_shift_mm,
+        },
+        "occluders": s.occluders,
         "seconds": s.seconds,
         "gpu_batches": s.gpu_batches,
     })
@@ -415,10 +531,17 @@ fn make_surface(
         dense_xyz: points.dense.as_deref(),
     };
     let (mesh, mut stats) = build_mesh(&input, target.config, progress)?;
+    // Without images nothing would read them: no „Bilder neu“ on a gray surface.
+    let occluders = if sources.is_empty() {
+        Occluders::default()
+    } else {
+        surface_occluders(&mesh, input.xyz, target.config, progress, &mut stats)
+    };
     // The points are not needed for the texture: free them before the pages are made.
     drop(points);
-    let tex = texture_mesh(
+    let tex = texture_mesh_with(
         &mesh,
+        &occluders,
         &sources,
         target.config,
         progress,
@@ -460,6 +583,11 @@ fn make_surface(
         files.extend((0..pages).map(|p| format!("{STEM}_seite_{p:02}.jpg")));
     }
     drop(surface);
+    // For „Bilder neu“; `surface_occluders` gives none with the switch off.
+    if !occluders.is_empty() {
+        occluders.write(&out.join(OCCLUDERS_FILE))?;
+        files.push(OCCLUDERS_FILE.to_string());
+    }
     files.push(SURFACE_REPORT.to_string());
     let stale = stale_files(out, &files);
     if !stale.is_empty() {
@@ -570,11 +698,7 @@ pub fn run_surface(req: &SurfaceRequest, progress: &Progress) -> Result<Value, S
     // The rest of the cloud is not needed.
     drop(cloud);
     let sources: Vec<TextureSource> = color
-        .map(|c| TextureSource {
-            images: c.images,
-            poses,
-            cams: c.cams,
-        })
+        .map(|c| texture_source(c, poses))
         .into_iter()
         .collect();
     let target = Target {
@@ -620,12 +744,37 @@ struct PlannedMember {
     lidar_to_imu: Isometry3<f64>,
     /// Its camera images, if the texture is on and it has any.
     color: Option<ColorInput>,
+    /// Why it has none, with the texture on (German, naming the file).
+    no_color: Option<String>,
 }
 
 /// The input id (full text) of a model surface and the members in the model.
 struct ModelPlan {
     id: String,
     members: Vec<PlannedMember>,
+}
+
+/// Why the surface of a model cannot be planned ([`model_plan`]).
+enum Unplanned {
+    /// The model is stale: merged by another version of the merge, or the map of a scan in it
+    /// computed anew since the merge.
+    Stale(StepError),
+    /// Anything else.
+    Failed(StepError),
+}
+
+impl From<StepError> for Unplanned {
+    fn from(e: StepError) -> Self {
+        Unplanned::Failed(e)
+    }
+}
+
+impl From<Unplanned> for StepError {
+    fn from(e: Unplanned) -> Self {
+        match e {
+            Unplanned::Stale(e) | Unplanned::Failed(e) => e,
+        }
+    }
 }
 
 fn member_name(m: &ModelMember) -> String {
@@ -655,13 +804,16 @@ fn other_merge_version(dir: &Path, version: u32) -> StepError {
     .into()
 }
 
-fn model_plan(req: &ModelSurfaceRequest, progress: &Progress) -> Result<ModelPlan, StepError> {
+fn model_plan(req: &ModelSurfaceRequest, progress: &Progress) -> Result<ModelPlan, Unplanned> {
     let model = match &req.model {
         Some(m) => m.clone(),
         None => read_model(&req.model_dir)?,
     };
     if !version_fits(&model) {
-        return Err(other_merge_version(&req.model_dir, model.version));
+        return Err(Unplanned::Stale(other_merge_version(
+            &req.model_dir,
+            model.version,
+        )));
     }
     let mut id = format!("model {}\nsurface v{SURFACE_VERSION}\n", model.input_id);
     let mut members = Vec::new();
@@ -672,23 +824,24 @@ fn model_plan(req: &ModelSurfaceRequest, progress: &Progress) -> Result<ModelPla
         let clean_id = clean_stage_id(&input)?;
         // The map was computed anew after the merge: `T_i` may not fit it any more.
         if m.clean_id.as_ref().is_some_and(|c| *c != hex(&clean_id)) {
-            return Err(stale_member(&name));
+            return Err(Unplanned::Stale(stale_member(&name)));
         }
         let lidar_to_imu = m.slam.config()?.odom.lidar_to_imu;
-        let (images, color) = if !req.texture {
-            ("texture off\n".to_string(), None)
+        let (color, no_color) = if !req.texture {
+            (None, None)
         } else {
             match images_of(&m.scan, &lidar_to_imu, progress)? {
-                Ok(c) => (c.id.clone(), Some(c)),
+                Ok(c) => (Some(c), None),
                 Err(why) => {
                     progress.warn(format!(
                         "{name}: {why} – trägt nichts zur Textur bei, die anderen Scans färben \
                          das Modell"
                     ));
-                    ("no images\n".to_string(), None)
+                    (None, Some(why))
                 }
             }
         };
+        let images = images_text(req.texture, color.as_ref());
         id += &format!("member {k}\n{clean_id}{images}");
         members.push(PlannedMember {
             name,
@@ -698,13 +851,22 @@ fn model_plan(req: &ModelSurfaceRequest, progress: &Progress) -> Result<ModelPla
             transform: member_transform(m),
             lidar_to_imu,
             color,
+            no_color,
         });
     }
     if members.is_empty() {
-        return Err(format!("Modell {} enthält keinen Scan", req.model_dir.display()).into());
+        let e = format!("Modell {} enthält keinen Scan", req.model_dir.display());
+        return Err(Unplanned::Failed(e.into()));
     }
     id += &format!("{:?}\n", req.config);
     Ok(ModelPlan { id, members })
+}
+
+/// Whether the `clean.bin` of every scan of `plan` still fits its map.
+fn member_maps_fit(plan: &ModelPlan) -> bool {
+    plan.members
+        .iter()
+        .all(|m| stage_fits(&m.map_dir.join(CLEAN_BIN), &m.clean_id))
 }
 
 /// Whether `out_dir` holds the surface of this model request: its report has the current
@@ -717,14 +879,7 @@ pub fn model_surface_fits(req: &ModelSurfaceRequest) -> bool {
         let report: Value = serde_json::from_str(&text).ok()?;
         // Warnings are of no interest here.
         let plan = model_plan(req, &Progress::new()).ok()?;
-        Some(
-            report["input_id"].as_str() == Some(hex(&plan.id).as_str())
-                && files_intact(&req.out_dir, &report)
-                && plan
-                    .members
-                    .iter()
-                    .all(|m| stage_fits(&m.map_dir.join(CLEAN_BIN), &m.clean_id)),
-        )
+        Some(report_fits(&req.out_dir, &report, &plan.id) && member_maps_fit(&plan))
     };
     fits().unwrap_or(false)
 }
@@ -735,6 +890,16 @@ fn moved_pose(t: &Isometry3<f64>, pose: &Pose) -> Pose {
         t: pose.t,
         p: t.rotation * pose.p + t.translation.vector,
         q: t.rotation * pose.q,
+    }
+}
+
+/// The texture source of a scan: its camera images and mounts (`color`) with the poses of its
+/// trajectory in the frame of the surface (`poses`; a member's moved into the model).
+fn texture_source(color: ColorInput, poses: Vec<Pose>) -> TextureSource {
+    TextureSource {
+        images: color.images,
+        poses,
+        cams: color.cams,
     }
 }
 
@@ -785,11 +950,7 @@ fn model_points(
         let poses: Vec<Pose> = poses.iter().map(|p| moved_pose(t, p)).collect();
         sensors.extend(sensors_for_frames(&poses, &m.lidar_to_imu));
         if let Some(c) = m.color {
-            sources.push(TextureSource {
-                images: c.images,
-                poses,
-                cams: c.cams,
-            });
+            sources.push(texture_source(c, poses));
         }
         progress.advance(1);
     }
@@ -855,6 +1016,392 @@ pub fn run_model_surface(
     make_surface(points, sources, gpu, target, start, progress)
 }
 
+/// The file of a run of a project: its scan (`scan`, beside it `scan_rel`, both relative to
+/// the project folder as the program writes them) and its settings (`[slam]`); a run the
+/// command line made has none.
+const RUN_FILE: &str = "lauf.toml";
+/// The file of a project listing its scans (`[[scan]]` with `id`, `path` and `path_rel`).
+const PROJECT_FILE: &str = "project.toml";
+/// The folder of a project holding the runs of its scans: `<projekt>/scans/<id>/slam-NNN`.
+const SCANS_DIR: &str = "scans";
+
+/// What [`texture_sources`] reads of a run's [`RUN_FILE`].
+#[derive(Deserialize)]
+struct RunFile {
+    scan: String,
+    #[serde(default)]
+    scan_rel: Option<String>,
+    #[serde(default)]
+    slam: SlamSettings,
+}
+
+/// What [`texture_sources`] reads of a project's [`PROJECT_FILE`].
+#[derive(Deserialize)]
+struct ProjectFile {
+    #[serde(default, rename = "scan")]
+    scans: Vec<ProjectScan>,
+}
+
+#[derive(Deserialize)]
+struct ProjectScan {
+    id: String,
+    path: String,
+    #[serde(default)]
+    path_rel: Option<String>,
+}
+
+/// The camera images of a surface for touching it up, as [`texture_sources`] finds them.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TextureSources {
+    /// The raw data are there and still those the surface was made from: the texture sources
+    /// the surface step took, one per scan with camera images. None for a surface computed
+    /// without images (`--no-texture`) or from scans without any: there is nothing to bake
+    /// from.
+    Found(Vec<TextureSource>),
+    /// No images can be baked onto the surface now, for this reason. What the touch-up baked
+    /// before stays as it is.
+    Unavailable(NoSources),
+}
+
+impl TextureSources {
+    /// The sources, if found.
+    pub fn found(&self) -> Option<&[TextureSource]> {
+        match self {
+            TextureSources::Found(s) => Some(s),
+            TextureSources::Unavailable(_) => None,
+        }
+    }
+
+    /// The sources, if found.
+    pub fn into_found(self) -> Option<Vec<TextureSource>> {
+        match self {
+            TextureSources::Found(s) => Some(s),
+            TextureSources::Unavailable(_) => None,
+        }
+    }
+
+    /// Why there are none, if so.
+    pub fn unavailable(&self) -> Option<&NoSources> {
+        match self {
+            TextureSources::Found(_) => None,
+            TextureSources::Unavailable(why) => Some(why),
+        }
+    }
+}
+
+/// The text of [`NoSources::SurfaceStale`], also the hint of a touch-up step that it kept from
+/// baking images.
+pub const STALE_SURFACE: &str =
+    "Oberfläche veraltet – Bilder nur auf einer aktuellen Oberfläche neu einspielbar";
+
+/// Why no camera images can be baked onto a surface now ([`TextureSources::Unavailable`]):
+/// the raw data are not at hand, or are no longer those the surface was made from. The
+/// folders it names are as the project names them, for the program to point at.
+///
+/// [`fmt::Display`] gives it as the program says it: German and plain, saying what is missing
+/// („Rohdaten fehlen – Scan-Ordner … nicht gefunden“) or that the surface is stale
+/// ([`STALE_SURFACE`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NoSources {
+    /// The folder of the scan (of the run, of a scan of the model) is not where the project
+    /// names it – a drive unplugged, the folder moved, renamed or deleted – or holds no scan:
+    /// the folder, and what is wrong with it (German, naming the folder).
+    ScanFolder { folder: PathBuf, why: String },
+    /// The run folder of a scan of the model is gone (a model with folders relative to it).
+    RunFolder(PathBuf),
+    /// The run was made by the command line: it lies outside the project's `scans/<id>/` (a run
+    /// added to the project by hand), or has neither `lauf.toml` nor an entry in
+    /// `project.toml` that names its scan. The run folder.
+    CommandLineRun(PathBuf),
+    /// An old model, merged before `modell.json` kept the folders of its scans relative to it,
+    /// in a project moved or copied since: the run folders it names are at the old place of
+    /// the project. The model folder.
+    OldModel(PathBuf),
+    /// The scan folder is there, but not its camera images or their calibration, or they cannot
+    /// be read (a copy without them): the scan folder and why (German, as the surface step
+    /// says it, naming the file).
+    Images { scan: PathBuf, why: String },
+    /// Looking for the raw data failed – [`texture_sources`] gave an error (a trajectory or
+    /// `modell.json` unreadable, the settings of a run invalid) –: its message (German).
+    /// [`texture_sources`] itself never gives it; it is for the program, which then runs the
+    /// touch-up without the camera images, as with the raw data missing.
+    Unreadable(String),
+    /// The raw data are there, but no longer what the surface was made from: the trajectory of
+    /// its run (of a scan of its model) computed anew in its folder („Schleife eintragen →
+    /// Jetzt neu rechnen“, „Diesen Stand wiederherstellen“), the map of a scan of its model
+    /// computed anew, other camera images or calibration, a surface of another program
+    /// version, or a file of the surface changed. Photos baked now would not sit where the
+    /// surface is: images are baked anew only onto a current surface.
+    SurfaceStale,
+}
+
+impl NoSources {
+    /// Whether the raw data are missing (or unreadable): once they are back, the touch-up bakes
+    /// the images it could not. False for a stale surface.
+    pub fn raw_data_missing(&self) -> bool {
+        !matches!(self, NoSources::SurfaceStale)
+    }
+}
+
+impl fmt::Display for NoSources {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NoSources::ScanFolder { why, .. } | NoSources::Images { why, .. } => {
+                write!(f, "Rohdaten fehlen – {why}")
+            }
+            NoSources::RunFolder(dir) => write!(
+                f,
+                "Rohdaten fehlen – Lauf-Ordner {} nicht gefunden",
+                dir.display()
+            ),
+            NoSources::CommandLineRun(dir) => write!(
+                f,
+                "Rohdaten nicht gefunden – Lauf der Kommandozeile: zum Lauf {} ist kein \
+                 Scan-Ordner bekannt",
+                dir.display()
+            ),
+            NoSources::OldModel(dir) => write!(
+                f,
+                "Rohdaten nicht gefunden – altes Modell: {} kennt die Ordner seiner Scans nur \
+                 am früheren Ort des Projekts",
+                dir.display()
+            ),
+            NoSources::Unreadable(why) => write!(f, "Rohdaten nicht lesbar – {why}"),
+            NoSources::SurfaceStale => f.write_str(STALE_SURFACE),
+        }
+    }
+}
+
+/// The camera images of the surface in `surface_dir`, for touching it up („Bilder neu
+/// einspielen“): the texture sources the surface step takes for it, found from the folder
+/// alone. For a map's surface (the folder in the map folder `karte-NNN` of a run, or in a run
+/// folder holding its map) one source: the images and calibration of the scan with the run's
+/// settings (its `lauf.toml`) and trajectory, as [`run_surface`] takes them. For a model's
+/// surface (its report names the model, or the folder lies in it) one per scan in the model
+/// with images, its poses moved by `T_i`, as [`run_model_surface`] takes them. None for a
+/// surface computed without images (`--no-texture`), none from a scan without images or
+/// calibration (where the surface was made so).
+///
+/// The scan folder of a run is found as the program finds it: as `lauf.toml` names it, the
+/// relative path first where that folder exists, else the absolute one; failing both, as the
+/// project's `project.toml` names the scan (a scan given its folder anew). So a project moved
+/// or copied with its raw data finds them in the new place.
+///
+/// The sources are checked against the surface as [`surface_fits`] and [`model_surface_fits`]
+/// check it: its input id (the trajectories, the LiDAR and image bags, the calibration, the
+/// settings), its files and the `clean.bin` of its maps. [`TextureSources::Unavailable`] says
+/// why there are none to bake from ([`NoSources`]): a scan or run folder not found, a run of
+/// the command line, an old model of a moved project – each before anything else –; a surface
+/// that does not fit, with a scan lacking its camera images or calibration now (while its map
+/// still fits): those are missing; any other surface that does not fit: stale. Never a part of
+/// the sources: a model with one scan short of its images has none.
+///
+/// Fails if the folder holds no surface report or its settings cannot be read, a trajectory or
+/// `modell.json` cannot be read, or the settings of a run are invalid.
+pub fn texture_sources(surface_dir: &Path) -> Result<TextureSources, StepError> {
+    let path = surface_dir.join(SURFACE_REPORT);
+    let report: Value = fs::read_to_string(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
+        .map_err(|e| format!("{} nicht lesbar: {e}", path.display()))?;
+    if report["settings"]["texture"].as_bool() == Some(false) {
+        return Ok(TextureSources::Found(Vec::new()));
+    }
+    let dir = paths::canonical(surface_dir).unwrap_or_else(|_| surface_dir.to_path_buf());
+    match model_of(&dir, &report) {
+        Some(model) => model_sources(&dir, &model, &report),
+        None => map_sources(&dir, &report),
+    }
+}
+
+/// The model folder of the surface in `dir` with the report `report`: the one the report names
+/// where that folder exists (relative to the surface folder first, else absolute), else the
+/// folder above it if that holds a model, else the one the report names (it is gone); `None`
+/// for a map's surface.
+fn model_of(dir: &Path, report: &Value) -> Option<PathBuf> {
+    let named = &report["model"];
+    let rel = named["dir_rel"]
+        .as_str()
+        .map(|r| paths::stored_path(dir, r));
+    let abs = named["dir"].as_str().map(PathBuf::from);
+    let mut candidates = rel.iter().chain(abs.iter());
+    if let Some(found) = candidates.find(|p| p.is_dir()) {
+        return Some(found.clone());
+    }
+    dir.parent()
+        .filter(|p| p.join(MODEL_REPORT).is_file())
+        .map(Path::to_path_buf)
+        .or(abs)
+}
+
+/// The settings of the surface in `dir` from its report `report` ([`surface_config`]).
+fn settings_of(dir: &Path, report: &Value) -> Result<SurfaceConfig, StepError> {
+    surface_config(report).ok_or_else(|| {
+        let path = dir.join(SURFACE_REPORT);
+        format!("{}: Einstellungen nicht lesbar", path.display()).into()
+    })
+}
+
+/// Why there are no camera images: the scan folder `folder` is no scan (`e`).
+fn scan_missing(folder: &Path, e: &ProjectError) -> TextureSources {
+    let why = match e {
+        ProjectError::NotFound(_) => format!("Scan-Ordner {} nicht gefunden", folder.display()),
+        e => e.to_string(),
+    };
+    TextureSources::Unavailable(NoSources::ScanFolder {
+        folder: folder.to_path_buf(),
+        why,
+    })
+}
+
+/// The source of the map surface in `dir` with the report `report` (see [`texture_sources`]).
+fn map_sources(dir: &Path, report: &Value) -> Result<TextureSources, StepError> {
+    let map_dir = dir.parent().unwrap_or(dir);
+    let in_run = ["slam.json", "traj.tum", RUN_FILE]
+        .iter()
+        .any(|f| map_dir.join(f).is_file());
+    let run_dir = if in_run {
+        map_dir
+    } else {
+        map_dir.parent().unwrap_or(map_dir)
+    };
+    let (scan, slam) = match run_scan(run_dir) {
+        Ok(found) => found,
+        Err(why) => return Ok(TextureSources::Unavailable(why)),
+    };
+    let lidar_to_imu = slam.config()?.odom.lidar_to_imu;
+    let project = match discover_project(&scan) {
+        Ok(project) => project,
+        Err(e) => return Ok(scan_missing(&scan, &e)),
+    };
+    let color = color_input(&scan, &project, &lidar_to_imu, &Progress::new());
+    let (_, poses) = read_traj(run_dir)?;
+    // What the surface was made from, as `surface_fits` checks it.
+    let config = settings_of(dir, report)?;
+    let input = map_input_for(&scan, run_dir, map_dir, slam);
+    let images = images_text(true, color.as_ref().ok());
+    let plan = plan_text(clean_stage_id(&input)?, &images, &config);
+    let map_fits = stage_fits(&map_dir.join(CLEAN_BIN), &plan.clean_id);
+    if map_fits && report_fits(dir, report, &plan.id) {
+        let sources = color.ok().map(|c| texture_source(c, poses));
+        return Ok(TextureSources::Found(sources.into_iter().collect()));
+    }
+    Ok(TextureSources::Unavailable(match color {
+        // the map still fits its run: the images of the surface are what is gone
+        Err(why) if map_fits => NoSources::Images { scan, why },
+        _ => NoSources::SurfaceStale,
+    }))
+}
+
+/// The scan folder and the settings of the run `run_dir` of a project (see
+/// [`texture_sources`]): as its `lauf.toml` names the scan where that folder is there, else as
+/// `project.toml` names it, else as `lauf.toml` names it; the folder may be gone. A run outside
+/// a project's `scans/<id>/`, or whose scan no file names, is one of the command line.
+fn run_scan(run_dir: &Path) -> Result<(PathBuf, SlamSettings), NoSources> {
+    let cli = || NoSources::CommandLineRun(run_dir.to_path_buf());
+    let run: Option<RunFile> = fs::read_to_string(run_dir.join(RUN_FILE))
+        .ok()
+        .and_then(|t| toml::from_str(&t).ok());
+    let id_dir = run_dir.parent().ok_or_else(cli)?;
+    let scans = id_dir.parent().ok_or_else(cli)?;
+    let project = scans.parent().ok_or_else(cli)?;
+    if scans.file_name() != Some(SCANS_DIR.as_ref()) {
+        return Err(cli());
+    }
+    let slam = run.as_ref().map(|r| r.slam.clone()).unwrap_or_default();
+    // As the program reads a path of a project file: the relative one first where that folder
+    // exists, else the path as written; both relative to the project folder if relative.
+    let stored = |path: &str, rel: Option<&str>| {
+        rel.filter(|r| !r.is_empty())
+            .map(|r| paths::stored_path(project, r))
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| paths::stored_path(project, path))
+    };
+    let named = run.as_ref().map(|r| stored(&r.scan, r.scan_rel.as_deref()));
+    if let Some(scan) = named.as_ref().filter(|s| s.is_dir()) {
+        return Ok((scan.clone(), slam));
+    }
+    let listed = || -> Option<PathBuf> {
+        let id = id_dir.file_name()?.to_str()?;
+        let text = fs::read_to_string(project.join(PROJECT_FILE)).ok()?;
+        let file: ProjectFile = toml::from_str(&text).ok()?;
+        let entry = file.scans.iter().find(|s| s.id == id)?;
+        Some(stored(&entry.path, entry.path_rel.as_deref()))
+    };
+    match listed().or(named) {
+        Some(scan) => Ok((scan, slam)),
+        None => Err(cli()),
+    }
+}
+
+/// The sources of the surface in `dir` (report `report`) of the model in `model_dir` (see
+/// [`texture_sources`]).
+fn model_sources(
+    dir: &Path,
+    model_dir: &Path,
+    report: &Value,
+) -> Result<TextureSources, StepError> {
+    let model = read_model(model_dir)?;
+    let relative = model
+        .members
+        .iter()
+        .any(|m| m.scan_rel.is_some() || m.slam_dir_rel.is_some() || m.map_dir_rel.is_some());
+    for m in model.members.iter().filter(|m| m.included) {
+        if let Err(e) = discover_project(&m.scan) {
+            return Ok(scan_missing(&m.scan, &e));
+        }
+        if !m.slam_dir.is_dir() {
+            return Ok(TextureSources::Unavailable(if relative {
+                NoSources::RunFolder(m.slam_dir.clone())
+            } else {
+                NoSources::OldModel(model_dir.to_path_buf())
+            }));
+        }
+    }
+    // What the surface was made from, as `model_surface_fits` checks it.
+    let req = ModelSurfaceRequest {
+        model_dir: model_dir.to_path_buf(),
+        model: Some(model),
+        out_dir: dir.to_path_buf(),
+        config: settings_of(dir, report)?,
+        texture: true,
+        gpu: GpuPref::Off,
+        obj: false,
+    };
+    let plan = match model_plan(&req, &Progress::new()) {
+        Ok(plan) => plan,
+        Err(Unplanned::Stale(_)) => {
+            return Ok(TextureSources::Unavailable(NoSources::SurfaceStale))
+        }
+        Err(Unplanned::Failed(e)) => return Err(e),
+    };
+    let maps_fit = member_maps_fit(&plan);
+    if !(maps_fit && report_fits(dir, report, &plan.id)) {
+        // the maps still fit their runs: the images of a scan are what is gone
+        let short = plan.members.iter().find_map(|m| {
+            let why = m.no_color.clone()?;
+            Some(NoSources::Images {
+                scan: m.input.scan.clone(),
+                why,
+            })
+        });
+        let why = short
+            .filter(|_| maps_fit)
+            .unwrap_or(NoSources::SurfaceStale);
+        return Ok(TextureSources::Unavailable(why));
+    }
+    let mut sources = Vec::new();
+    for m in plan.members {
+        let Some(color) = m.color else {
+            continue;
+        };
+        let (_, poses) = read_traj(&m.input.slam_dir)?;
+        let poses = poses.iter().map(|p| moved_pose(&m.transform, p)).collect();
+        sources.push(texture_source(color, poses));
+    }
+    Ok(TextureSources::Found(sources))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,6 +1412,131 @@ mod tests {
             faces_unsupported,
             ..SurfaceStats::default()
         }
+    }
+
+    /// The settings of a report read back as they were given, through the text of the file;
+    /// what the report does not hold takes the defaults, and older reports still read.
+    #[test]
+    fn settings_read_back_from_the_report() {
+        let defaults = SurfaceConfig::default();
+        let given = SurfaceConfig {
+            voxel: 0.015,
+            truncation_voxels: 3.3,
+            min_weight: 3,
+            coarse_fallback: false,
+            max_fill_gap: 0.025,
+            min_component_faces: 77,
+            max_hole_perimeter: 1.25,
+            simplify_error: 0.0015,
+            max_edge: 0.21,
+            min_texel: 0.0031,
+            page_size: 2048,
+            views_per_face: 9,
+            smooth_weight: 0.35,
+            jpeg_quality: 83,
+            color: driftless_map::ColorConfig {
+                downscale: 4,
+                highlights: true,
+                max_dist: 9.5,
+                depth_tolerance: 0.07,
+                min_sharpness: 0.3,
+                view_gap: 0.6,
+                ..defaults.color
+            },
+            noise: NoiseConfig {
+                snap: false,
+                exposure: true,
+                denoise: false,
+                occlude: true,
+            },
+        };
+        let text = serde_json::to_string(&json!({"settings": settings_json(&given, true)}));
+        let report: Value = serde_json::from_str(&text.unwrap()).unwrap();
+        assert_eq!(
+            report["settings"]["noise"],
+            json!({"snap": false, "exposure": true, "denoise": false, "occlude": true})
+        );
+        assert_eq!(surface_config(&report), Some(given));
+        let mut old = report.clone();
+        let settings = old["settings"].as_object_mut().unwrap();
+        settings.remove("coarse_fallback");
+        settings.remove("max_fill_gap");
+        settings.remove("noise");
+        let old = surface_config(&old).unwrap();
+        assert!(old.coarse_fallback);
+        assert_eq!(old.max_fill_gap, defaults.max_fill_gap);
+        assert_eq!(old.noise, NoiseConfig::ON);
+        let mut broken = report.clone();
+        broken["settings"]["voxel"] = "fein".into();
+        assert_eq!(surface_config(&broken), None);
+        let mut broken = report;
+        broken["settings"]["noise"] = "aus".into();
+        assert_eq!(surface_config(&broken), None);
+        assert_eq!(surface_config(&json!({})), None);
+    }
+
+    #[test]
+    fn noise_config_reads_the_switches() {
+        let read = |noise: Value| noise_config(&json!({ "noise": noise }));
+        assert_eq!(
+            read(json!({"snap": false, "exposure": true, "denoise": true, "occlude": false})),
+            Some(NoiseConfig {
+                snap: false,
+                occlude: false,
+                ..NoiseConfig::ON
+            })
+        );
+        assert_eq!(
+            read(json!({"snap": true, "exposure": false, "denoise": false, "occlude": true})),
+            Some(NoiseConfig {
+                exposure: false,
+                denoise: false,
+                ..NoiseConfig::ON
+            })
+        );
+        let all_off = json!({"snap": false, "exposure": false, "denoise": false, "occlude": false});
+        assert_eq!(read(all_off), Some(NoiseConfig::OFF));
+        // No entry (a report from before the switches): the default.
+        assert_eq!(noise_config(&json!({})), Some(NoiseConfig::ON));
+        assert_eq!(read(Value::Null), Some(NoiseConfig::ON));
+        // A switch the entry does not hold takes its default as well.
+        assert_eq!(
+            read(json!({"snap": false})),
+            Some(NoiseConfig {
+                snap: false,
+                ..NoiseConfig::ON
+            })
+        );
+        // Wrong types, of the entry or of a switch.
+        assert_eq!(read(json!("aus")), None);
+        assert_eq!(read(json!(false)), None);
+        assert_eq!(read(json!(["snap"])), None);
+        assert_eq!(read(json!({"snap": "nein"})), None);
+        assert_eq!(read(json!({"occlude": 0})), None);
+    }
+
+    /// `--ohne` gives another input id: a surface computed with other switches counts as stale.
+    #[test]
+    fn switches_are_part_of_the_input_id() {
+        let id = |noise| {
+            let config = SurfaceConfig {
+                noise,
+                ..SurfaceConfig::default()
+            };
+            plan_text("clean\n".into(), "bilder\n", &config).id
+        };
+        assert_ne!(id(NoiseConfig::OFF), id(NoiseConfig::ON));
+        let without_snap = NoiseConfig {
+            snap: false,
+            ..NoiseConfig::ON
+        };
+        let without_occlude = NoiseConfig {
+            occlude: false,
+            ..NoiseConfig::ON
+        };
+        assert_ne!(id(without_snap), id(NoiseConfig::ON));
+        assert_ne!(id(without_snap), id(without_occlude));
+        assert_eq!(id(NoiseConfig::OFF), id(NoiseConfig::OFF));
     }
 
     /// The figures of the real scans at the default 2 cm: the office B (2.0 of 8.6 million

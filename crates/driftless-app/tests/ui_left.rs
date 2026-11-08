@@ -41,6 +41,7 @@ fn unselected() -> AppState {
         settings: None,
         clouds: vec![PathBuf::from("/p/scans/buero/slam-001/karte-001/color.las")],
         surfaces: Vec::new(),
+        plans: Vec::new(),
         incomplete: false,
     };
     let project = Project {

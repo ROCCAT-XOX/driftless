@@ -10,6 +10,10 @@
 //! Both sides of every face are drawn: the walls of a room show from outside too. What no
 //! triangle covers is [`BACKGROUND`].
 //!
+//! [`render_relief`] uses the same camera and raster but draws the form instead of the photo:
+//! every face one gray from its normal and a light coming in at a slant from the camera side.
+//! Only for test images: the app draws without light, so bumps only show this way.
+//!
 //! Deterministic: the image is split into bands of rows, each band draws every triangle in
 //! the same order.
 
@@ -23,11 +27,20 @@ pub const NEAR: f32 = 0.01;
 pub const BACKGROUND: [u8; 3] = [40, 40, 40];
 /// Rows per band of parallel work.
 const BAND_ROWS: usize = 16;
+/// Towards the light of [`render_relief`] in camera axes (right, up, forward), unit length:
+/// from the upper left and a little from the viewer, so a wall seen head-on is lit at a slant.
+const RELIEF_LIGHT: [f32; 3] = [-0.6, 0.6, -0.52915];
+/// Relief gray of a face turned away from the light (well above [`BACKGROUND`]).
+const RELIEF_AMBIENT: f32 = 70.0;
+/// Relief gray a face gains when it looks straight at the light.
+const RELIEF_DIFFUSE: f32 = 170.0;
 
 /// A clipped triangle on the screen: per corner `(x, y)` in pixels, `1/z`, `u/z`, `v/z`.
 #[derive(Clone, Copy)]
 struct ScreenTri {
     page: u32,
+    /// The flat gray of a relief, `None` for the photo of the page.
+    gray: Option<u8>,
     corners: [[f32; 5]; 3],
     /// Rows `[y0, y1)` it may cover.
     rows: [usize; 2],
@@ -40,6 +53,29 @@ pub fn render_preview(
     target: [f32; 3],
     fov_deg: f32,
     size: [u32; 2],
+) -> RgbImage {
+    render(tex, eye, target, fov_deg, size, false)
+}
+
+/// The camera of [`render_preview`], but gray with light from a slant by face normal and
+/// without the photos, so the form shows. Only for test images.
+pub fn render_relief(
+    tex: &TexturedMesh,
+    eye: [f32; 3],
+    target: [f32; 3],
+    fov_deg: f32,
+    size: [u32; 2],
+) -> RgbImage {
+    render(tex, eye, target, fov_deg, size, true)
+}
+
+fn render(
+    tex: &TexturedMesh,
+    eye: [f32; 3],
+    target: [f32; 3],
+    fov_deg: f32,
+    size: [u32; 2],
+    relief: bool,
 ) -> RgbImage {
     let (w, h) = (size[0] as usize, size[1] as usize);
     let mut data = BACKGROUND.repeat(w * h);
@@ -62,10 +98,11 @@ pub fn render_preview(
                     let c = cam.to_cam(page.positions[i]);
                     [c[0], c[1], c[2], page.uvs[i][0], page.uvs[i][1]]
                 });
+                let gray = relief.then(|| relief_gray(corners));
                 clip_near(corners)
                     .into_iter()
                     .flatten()
-                    .filter_map(move |t| cam.to_screen(p as u32, t, h))
+                    .filter_map(move |t| cam.to_screen(p as u32, gray, t, h))
             })
         })
         .collect();
@@ -139,10 +176,24 @@ fn raster(
                 continue;
             }
             depth[i] = inv_z;
-            let (u, v) = (at(3) / inv_z, at(4) / inv_z);
-            rgb[i * 3..i * 3 + 3].copy_from_slice(&bilinear(page, u, v));
+            let colour = t
+                .gray
+                .map_or_else(|| bilinear(page, at(3) / inv_z, at(4) / inv_z), |g| [g; 3]);
+            rgb[i * 3..i * 3 + 3].copy_from_slice(&colour);
         }
     }
+}
+
+/// The relief gray of a triangle in camera coordinates (camera at the origin): both sides of
+/// a face are drawn, so the side towards the camera is the one lit.
+fn relief_gray(t: [[f32; 5]; 3]) -> u8 {
+    let [a, b, c] = t.map(|p| [p[0], p[1], p[2]]);
+    let Some(n) = normalize(cross(sub(b, a), sub(c, a))) else {
+        return RELIEF_AMBIENT as u8;
+    };
+    let side = if dot(n, a) > 0.0 { -1.0 } else { 1.0 };
+    let light = (side * dot(n, RELIEF_LIGHT)).max(0.0);
+    (RELIEF_AMBIENT + RELIEF_DIFFUSE * light).round() as u8
 }
 
 /// The bilinear colour of `page` at `(u, v)` (0…1, `v` down), clamped at the edges.
@@ -226,7 +277,13 @@ impl Cam {
     }
 
     /// The triangle on the screen, `None` if it lies wholly beside the image.
-    fn to_screen(&self, page: u32, t: [[f32; 5]; 3], h: usize) -> Option<ScreenTri> {
+    fn to_screen(
+        &self,
+        page: u32,
+        gray: Option<u8>,
+        t: [[f32; 5]; 3],
+        h: usize,
+    ) -> Option<ScreenTri> {
         let corners = t.map(|c| {
             let iz = 1.0 / c[2];
             [
@@ -247,6 +304,7 @@ impl Cam {
         }
         Some(ScreenTri {
             page,
+            gray,
             corners,
             rows: [
                 ymin.floor().max(0.0) as usize,
@@ -300,6 +358,80 @@ mod tests {
             rgb,
             16,
         )
+    }
+
+    /// The gray of a relief pixel (all three channels are equal).
+    fn gray(img: &RgbImage, x: u32, y: u32) -> u8 {
+        let p = pixel(img, x, y);
+        assert!(p[0] == p[1] && p[1] == p[2], "not gray: {p:?}");
+        p[0]
+    }
+
+    #[test]
+    fn render_relief_shows_bumps() {
+        // From the origin towards +x (image right = −y): on the left a wall facing the camera,
+        // on the right a wall turned by about 34°. Both with two strong colours.
+        let flat = quad_page(
+            [
+                [3.0, 1.5, -1.0],
+                [3.0, 0.0, -1.0],
+                [3.0, 0.0, 1.0],
+                [3.0, 1.5, 1.0],
+            ],
+            [230, 10, 10],
+            [10, 230, 10],
+            16,
+        );
+        let turned = quad_page(
+            [
+                [3.0, 0.0, -1.0],
+                [2.0, -1.5, -1.0],
+                [2.0, -1.5, 1.0],
+                [3.0, 0.0, 1.0],
+            ],
+            [10, 10, 230],
+            [200, 200, 10],
+            16,
+        );
+        let tex = TexturedMesh {
+            pages: vec![flat, turned],
+            ..Default::default()
+        };
+        let (eye, target, size) = ([0.0; 3], [1.0, 0.0, 0.0], [64, 48]);
+        let img = render_relief(&tex, eye, target, 60.0, size);
+        assert_eq!((img.width, img.height), (64, 48));
+
+        let (left, right) = (gray(&img, 16, 12), gray(&img, 48, 12));
+        assert!(left.abs_diff(right) > 20, "{left} against {right}");
+        // Without the photo: one flat face keeps one gray over both colours of its page.
+        assert_eq!(gray(&img, 16, 12), gray(&img, 16, 36));
+
+        // The camera of the preview: the same pixels are covered.
+        let photo = render_preview(&tex, eye, target, 60.0, size);
+        let bg = |i: &RgbImage, k: usize| i.data[k * 3..k * 3 + 3] == BACKGROUND;
+        let n = (size[0] * size[1]) as usize;
+        assert!((0..n).any(|k| bg(&img, k)), "the walls leave a background");
+        for k in 0..n {
+            assert_eq!(bg(&img, k), bg(&photo, k), "pixel {k}");
+        }
+
+        // Nothing to draw: the background everywhere.
+        let empty = render_relief(&TexturedMesh::default(), eye, target, 60.0, size);
+        assert!((0..n).all(|k| bg(&empty, k)));
+    }
+
+    #[test]
+    fn render_relief_lights_both_sides() {
+        // The same wall from the front and from behind: the side towards the camera is lit.
+        let tex = TexturedMesh {
+            pages: vec![wall(3.0, 2.0, [230, 10, 10])],
+            ..Default::default()
+        };
+        let front = render_relief(&tex, [0.0; 3], [1.0, 0.0, 0.0], 60.0, [64, 48]);
+        let back = render_relief(&tex, [6.0, 0.0, 0.0], [5.0, 0.0, 0.0], 60.0, [64, 48]);
+        let (f, b) = (gray(&front, 32, 24), gray(&back, 32, 24));
+        assert!(f.abs_diff(b) <= 1, "{f} against {b}");
+        assert!(f > RELIEF_AMBIENT as u8 + 40, "lit, not only ambient: {f}");
     }
 
     #[test]

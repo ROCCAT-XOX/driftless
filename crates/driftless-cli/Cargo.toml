@@ -28,6 +28,7 @@ driftless-gpu = { path = "../driftless-gpu" }
 driftless-io = { path = "../driftless-io" }
 driftless-map = { path = "../driftless-map" }
 driftless-odom = { path = "../driftless-odom" }
+driftless-plan = { path = "../driftless-plan" }
 driftless-slam = { path = "../driftless-slam" }
 driftless-steps = { path = "../driftless-steps" }
 driftless-traj = { path = "../driftless-traj" }
@@ -49,5 +50,6 @@ debug-viewer = ["dep:rerun"]
 assert_cmd = "2"
 driftless-export = { path = "../driftless-export", features = ["test-util"] }
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
+driftless-plan = { path = "../driftless-plan", features = ["test-util"] }
 jpeg-encoder = "0.7.1"
 predicates = "3"

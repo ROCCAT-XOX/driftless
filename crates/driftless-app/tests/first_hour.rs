@@ -171,11 +171,6 @@ fn hints_fit_what_is_there() {
 #[test]
 fn texts_without_jargon_and_with_the_singular() {
     assert!(
-        !text::PLAN_COMING.contains("Baustein"),
-        "{}",
-        text::PLAN_COMING
-    );
-    assert!(
         !text::MEASUREMENTS_NOT_SAVED.contains("Baustein"),
         "{}",
         text::MEASUREMENTS_NOT_SAVED

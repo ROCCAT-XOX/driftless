@@ -4,6 +4,140 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
 [Keep a Changelog](https://keepachangelog.com/de/1.1.0/), die Nummern folgen
 [Semantic Versioning](https://semver.org/lang/de/).
 
+## [Unreleased]
+
+## [0.2.0] – 2026-11-08
+
+### Hinzugefügt
+
+#### Stellen nacharbeiten
+
+- Werkzeug „Pinsel“ in der 3D-Ansicht: Stellen auf die Oberfläche einer Karte oder eines Modells malen,
+  mit ⌥ (Windows: Alt) radieren, auch aus einer anderen als der gewählten Stelle. Die Größe geht von 5
+  bis 100 cm, Vorgabe 20 cm, und bleibt über einen Neustart. Drehen und Verschieben gehen mit der rechten
+  und der mittleren Taste weiter. Malen auf der Büro-Oberfläche läuft auf einem MacBook Pro mit M4 Pro mit
+  etwa 150 Bildern/s
+  ([Messung](https://github.com/ROCCAT-XOX/driftless/blob/main/docs/ergebnisse/2026-10-29-pinsel.md)),
+  auch auf einer nachgestellten Stelle von 30 m² flüssig.
+- „Markierte Stellen“ in „Bilder“: jede Stelle mit ihrer Lage („Stelle 1 · Wand“) und ihrem letzten
+  Schritt. Ein Klick zeigt sie, Rechtsklick → „Löschen“ nimmt sie samt Nacharbeit heraus. Farbig
+  markiert sind die Stellen nur, solange der Pinsel gewählt ist; nach einem Schritt zeigt eine Stelle
+  nur ihren Umriss, bis wieder in sie gemalt wird.
+- „Glätten“ in drei Stufen, „leicht“, „stark“ und „ganz eben“. „Ganz eben“ legt eine Stelle von Wand,
+  Boden oder Decke auf eine Ebene; ist sie nicht eben genug, ändert sich nichts und Driftless sagt warum.
+  Der Rand geht weich über. Danach werden die Bilder der Stelle von selbst neu eingespielt.
+- „Bilder neu einspielen“: schärfere, nähere und geradere Fotos für die Stelle, die Helligkeit an die
+  Umgebung angeglichen. Jeder weitere Druck probiert die nächstbeste Variante, zuerst je ein Foto einer
+  anderen Kamera, eines anderen Scans oder von einem anderen Standort, erst danach ähnliche. Meldung und
+  Liste sagen, welche: „Variante 2 von 5 · andere Kamera“. Zeigt das gewählte Foto vor der Wand etwas,
+  das die übrigen Fotos anderswo zeigen, etwa eine Stange, nimmt die Stelle dort meist ein anderes Foto:
+  wenn die Fotos es mindestens 5 cm versetzt zeigen und es sich mindestens um das Dreifache in der
+  Helligkeit abhebt (geprüft an einem nachgestellten Beispiel).
+- „Vorher“ und „Nachher“, dazu ↶ (⌘Z, Strg+Z) für jeden Pinselzug, jeden Schritt und jedes „Löschen“,
+  auch nach einem Neustart. ⌘Z und Strg+Z wirken mit jedem Werkzeug. „nicht aktuell“ neben „Nachher“
+  sagt, wenn es noch den Stand davor zeigt.
+- Die Nacharbeit rechnet im Hintergrund mit Fortschritt und „Abbrechen“; „Abbrechen“ hält „Alle rechnen“
+  und „Alle Oberflächen rechnen“ nicht an. Gespeichert wird sie im Projekt (`stellen.toml` bei der Karte
+  oder dem Modell, `nacharbeit/` bei der Oberfläche); sie übersteht Neustart, Verschieben, Kopieren und
+  „Aufräumen“. Eine neue Oberfläche derselben Karte oder desselben Modells übernimmt die Stellen.
+- Ohne die Rohdaten der Scans ist „Bilder neu einspielen“ aus (der Knopf nennt den ersten Scan, dessen
+  Ordner fehlt), Glätten geht weiter. Driftless sagt, was
+  fehlt (Scan-Ordner, Lauf-Ordner, Kamerabilder, Kalibrierung, Lauf der Kommandozeile, altes Modell), auch
+  wenn es die Nacharbeit beim Laden oder Exportieren wieder anwendet. Passt eine Oberfläche nicht mehr zu
+  ihren Rohdaten: „Oberfläche veraltet – Bilder nur auf einer aktuellen Oberfläche neu einspielbar“.
+  Schon eingespielte Fotos bleiben, auch wenn eine frühere Stelle ohne Rohdaten gelöscht und mit ↶
+  zurückgeholt wird (`nacharbeit/frueher/`); nach „Löschen“ sagt Driftless, wenn spätere Stellen dabei
+  ohne ihre Bilder neu gerechnet wurden. Liegen mehr als 64 Schritte vor, kommen die ersten 64 mit ihren
+  Fotos zurück, und nur die übrigen laufen ohne Rohdaten ohne Bilder.
+
+#### Melden
+
+- ⇧⇧ (zweimal kurz Shift) öffnet überall „Melden“: einen Fehler oder Wunsch, mit dem Bild des Fensters
+  und den markierten Stellen. Ansicht, Auswahl, Projekt, Version, System, Grafikkarte und die letzten
+  Zeilen des Protokolls kommen von selbst dazu. Gehaltenes Shift und Großbuchstaben lösen es nicht aus.
+- Jede Meldung ist ein Ordner auf dem Rechner (Mac: `~/Library/Application Support/Driftless/Meldungen/`,
+  Windows: `%LOCALAPPDATA%\Driftless\Meldungen\`); nichts wird hochgeladen.
+- ☰ → „Meldungen …“: alle Meldungen des Rechners mit Stand und Antwort. „Zur Ansicht“ öffnet das Projekt
+  einer Meldung und stellt Auswahl und Ansicht wieder her.
+
+#### Grundriss und DXF
+
+- Feld „Planung“: Aus einer Karte oder einem Modell rechnet Driftless einen Grundriss mit Wänden, Türen,
+  Fenstern, Räumen und Maßen. Was unklar bleibt, wird als unklar gezeichnet; mehrere Stockwerke werden
+  gemeldet und einzeln gerechnet.
+- Plan-Ansicht mit Layern, Draufsicht, Verschieben und Zoomen; „DXF …“ exportiert AutoCAD 2000 in
+  Millimetern, wahlweise an den Wänden oder wie die Punktwolke. Die Kommandozeile hat `driftless plan`.
+- Werkzeug „Objekt“ in der 3D-Ansicht: Steckdosen, Anschlüsse, Kabel und Rohre von Hand setzen. Enter oder
+  Doppelklick beendet einen Linienzug, Backspace nimmt den letzten Punkt zurück, Esc verwirft ihn. ↶ (⌘Z,
+  Strg+Z) nimmt jede Änderung zurück, auch nach einem Neustart. Die Liste „Objekte“ in „Planung“ markiert,
+  zeigt in 3D, benennt um, nimmt Notizen und löscht.
+- Türen und Fenster von Hand im Werkzeug „Objekt“: Der Laser sieht eine geschlossene Tür nur als Wand, ein
+  Fenster ohne Messung dahinter wird nicht erkannt. Zwei Klicks auf die beiden Kanten setzen sie, Höhe und
+  Brüstung sind freiwillig, unter 30 cm Breite lehnt die App ab. Nahe einer Wand (bis 30 cm) schneidet das
+  Objekt sie wie eine erkannte Öffnung, im Plan und im DXF, auf den Layern „Tür“ und „Fenster“, ohne dass der
+  Plan neu gerechnet wird; es gewinnt gegen eine erkannte Öffnung an derselben Stelle. Fern jeder Wand bleibt
+  es als Strich mit Beschriftung erhalten.
+- Objekte und Messungen gehören zur Karte oder zum Modell (`objekte.toml`) und überstehen einen neu
+  gerechneten Grundriss, Neustart und Verschieben des Projekts.
+
+### Geändert
+
+- Die Werkzeugleiste der Ansicht hat ein sechstes Werkzeug, „Pinsel“, und ein siebtes, „Objekt“.
+- Messungen werden gespeichert: bei der Karte oder dem Modell (auch im Plan und im DXF). Auf einer Datei
+  von anderswo bleiben sie wie bisher nur bis zum Schließen.
+- „Messungen löschen“ nimmt alle Messungen als einen Schritt heraus, ↶ bringt sie zurück.
+- „Exportieren …“ einer Oberfläche mit Nacharbeit exportiert sie mit der Nacharbeit („Oberfläche 001
+  mit Nacharbeit“, glb, OBJ und PLY-Netz). Die gerechnete Oberfläche selbst bleibt, wie sie ist; die
+  Kommandozeile exportiert weiter sie. Ein Ziel in `nacharbeit/` oder auf einer Datei der Oberfläche
+  selbst lehnt der Export ab.
+- „Aufräumen“ bietet auch halb geschriebene Ordner der Nacharbeit an (`nacharbeit.tmp-…`).
+- Die Anleitung hat die Abschnitte „Stellen nacharbeiten“, „Melden“ und „Grundriss und DXF“; die folgenden
+  Abschnitte rücken eine Nummer weiter.
+- Ruhigere Oberflächen, von selbst und ohne Einstellung: Wo die Messpunkte eben sind, liegt die Oberfläche
+  jetzt auf ihrer Ebene; die Rauheit der Wände sank im Prüflauf im Median um 83 bis 95 %. Fotos, auf denen
+  eine Stelle gut belichtet ist, gehen vor sehr dunklen oder überstrahlten. Zwei weitere Schritte sind
+  eingebaut, wirken bisher aber wenig: Das Dämpfen von Bildrauschen greift auf den Testscans fast nirgends.
+  Dünne Teile ohne eigene Fläche verdecken die Wand dahinter nur bei 2 cm; bei 1 cm fand der Prüflauf keine.
+  [Messung](https://github.com/ROCCAT-XOX/driftless/blob/main/docs/ergebnisse/2026-11-08-weniger-rauschen.md)
+- `driftless surface --ohne anlegen,belichtung,entrauschen,verdeckung` schaltet diese Schritte zum Vergleich
+  einzeln ab, `--ohne alles` alle vier. In der App gibt es dafür keinen Schalter.
+- Fremde Dateien werden strenger geprüft: Ein Chunk einer Bag-Datei, der nicht so groß ist wie sein Kopf
+  sagt oder entpackt mehr als 1 GiB hätte, ist ein klarer Fehler statt eines vollen Speichers; eine
+  `verdecker.bin` über der Höchstzahl an Punkten wird nicht gelesen. Graue Oberflächen (ohne Bilder) suchen
+  keine Verdecker mehr.
+- `oberflaeche.json` nennt neu die Rauheit der Wände, den Abstand der Wände zur Ebene der Punkte, das
+  Bildrauschen vor und nach dem Dämpfen, die angelegten Ecken und die Zahl der Verdecker.
+
+### Bekannte Grenzen
+
+- **Grundriss:** Rohre und Kabel werden von Hand gesetzt, die automatische Erkennung kommt später. Türen
+  stehen als Öffnung im Plan, ohne Türblatt und Aufschlag. Ein Plan zeigt immer ein Stockwerk. Ein Durchgang
+  bis zur Decke ist keine Tür und trennt keine Räume, das gilt auch für eine Tür mit Glasoberlicht. Ein Fenster
+  braucht Punkte dahinter, sonst bleibt die Wand stehen; ein schwarzer Fleck der Wand zählt nicht.
+- **Nacharbeit braucht Zeit:** Ein Schritt auf einer Stelle von 1 m² dauerte auf dem Testrechner
+  (6 Rechenkerne) 1,5 bis 2,8 s. Größere Stellen dauern länger: Eine Bodenstelle von 8,9 m² brauchte für „Bilder neu“ 12 bis 37 s. Der erste
+  Schritt nach dem Start legt ein Verzeichnis der Kamerabilder an; liest Driftless sie dafür vom
+  Laufwerk, kommen 0,4 bis 1,6 s dazu.
+- **Dünne Teile dicht an der Wand:** Ein Rohr oder Kabelkanal dicht vor der Stelle, den die Oberfläche nur
+  in Stücken hat, liegt in den Fotos je nach Standort ein paar Zentimeter anders, ebenso ein dunkler
+  Streifen daneben. „Bilder neu einspielen“ kann dann einen Streifen auf die Stelle legen, schärfer und
+  etwas versetzt. Dann die nächste Variante probieren oder ↶.
+- **Stellen in zwei Fenstern:** Stellen derselben Karte oder desselben Modells gleichzeitig in zwei
+  Fenstern nachzuarbeiten ist nicht erprobt. Dafür nur ein Fenster nutzen.
+- **Kleine Teile und Säume an Kanten:** Nur was mehr als 2 cm vor einer Fläche steht, Punkte hat und zusammen
+  mindestens 30 cm lang ist, verdeckt die Wand dahinter; Türgriffe und andere kleine Teile können weiter leicht
+  versetzt im Bild liegen. Wo keine ebene Umgebung zu finden ist, an Kanten und dünnen Teilen, bleibt ein
+  schmaler Saum der Oberfläche, wie er war.
+- **Speicher:** Eine Oberfläche mit 1 cm braucht im Büro jetzt 9,8 GB statt 8,3 GB und 23 statt 21 Minuten.
+
+### Hinweis
+
+- Laufbahnen und Karten von 0.1.0 bleiben aktuell. Oberflächen gelten als nicht mehr aktuell und werden beim
+  nächsten Rechnen neu erzeugt; die gespeicherte Nacharbeit einer Oberfläche wird dabei neu gerechnet, die
+  markierten Stellen bleiben. Mit `--ohne alles` entstehen dieselben Netze und Bilder wie vor diesen Schritten (an einem Scan gegen 0.1.0 Byte für Byte geprüft, auf der Grafikkarte und auf dem Prozessor).
+- Neu eingespielte Bilder der Nacharbeit sind auf demselben System Byte für Byte gleich. Zwischen
+  verschiedenen Systemen, etwa Mac und Windows, können einzelne Bildpunkte abweichen.
+
 ## [0.1.0] – 2026-10-28
 
 Die erste Version für echte Aufträge. Wie man sie installiert und benutzt, steht in der

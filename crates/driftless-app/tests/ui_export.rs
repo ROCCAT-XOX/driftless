@@ -97,6 +97,7 @@ fn tree_state() -> AppState {
                         settings: None,
                         hints: Vec::new(),
                     }],
+                    plans: Vec::new(),
                     incomplete: false,
                 }],
                 history: Vec::new(),
@@ -117,6 +118,7 @@ fn tree_state() -> AppState {
                 warnings: Vec::new(),
             },
             surfaces: Vec::new(),
+            plans: Vec::new(),
         }],
         selection: Selection::Scan("halle".into()),
         ..AppState::default()

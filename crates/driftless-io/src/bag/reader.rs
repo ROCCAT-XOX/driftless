@@ -26,14 +26,14 @@ pub struct RawMessage {
 }
 
 pub struct BagReader<R: Read + Seek> {
-    r: R,
+    pub(super) r: R,
     conns: Vec<Connection>,
-    by_id: HashMap<u32, usize>,
+    pub(super) by_id: HashMap<u32, usize>,
     /// First byte after the bag header record.
-    data_start: u64,
-    file_len: u64,
+    pub(super) data_start: u64,
+    pub(super) file_len: u64,
     /// Offset of the index section from the bag header (0 = unindexed).
-    index_pos: u64,
+    pub(super) index_pos: u64,
 }
 
 impl BagReader<BufReader<File>> {
@@ -57,19 +57,19 @@ fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<bool, BagError> {
 }
 
 /// A top-level record header; the data (`data_len` bytes) has not been consumed yet.
-struct Head {
-    fields: Fields,
-    data_len: u64,
-    data_pos: u64,
+pub(super) struct Head {
+    pub(super) fields: Fields,
+    pub(super) data_len: u64,
+    pub(super) data_pos: u64,
 }
 
-enum Next {
+pub(super) enum Next {
     Eof,
     Record(Head),
 }
 
 /// Reads the next record header at `pos`. A partial header is `Truncated { offset: pos }`.
-fn read_head<R: Read>(r: &mut R, pos: u64, file_len: u64) -> Result<Next, BagError> {
+pub(super) fn read_head<R: Read>(r: &mut R, pos: u64, file_len: u64) -> Result<Next, BagError> {
     let trunc = BagError::Truncated { offset: pos };
     if pos >= file_len {
         return Ok(Next::Eof);
@@ -98,28 +98,58 @@ fn read_head<R: Read>(r: &mut R, pos: u64, file_len: u64) -> Result<Next, BagErr
     }))
 }
 
-fn parse_connection(fields: &Fields, data: &[u8]) -> Result<Connection, BagError> {
+pub(super) fn parse_connection(fields: &Fields, data: &[u8]) -> Result<Connection, BagError> {
     let d = Fields::parse(data)?;
     Ok(Connection {
         id: fields.u32("conn")?,
         topic: fields
             .string("topic")
             .or_else(|| d.string("topic"))
-            .ok_or_else(|| BagError::Malformed("connection without topic".into()))?,
+            .ok_or_else(|| BagError::Malformed("Verbindung ohne Topic".into()))?,
         msg_type: d.string("type").unwrap_or_default(),
         md5sum: d.string("md5sum").unwrap_or_default(),
     })
 }
 
-fn decompress(compression: &str, data: Vec<u8>, size_hint: usize) -> Result<Vec<u8>, BagError> {
+/// The most bytes a chunk may hold decompressed, whatever its header says (files from outside
+/// are not trusted). A chunk is what a recorder gathers up to its chunk size (768 KiB unless
+/// set otherwise) plus one message.
+const CHUNK_MAX: u64 = 1 << 30;
+/// The most bytes a chunk may hold decompressed whose header names no size.
+const CHUNK_MAX_UNSAID: u64 = 1 << 28;
+
+/// The records of a chunk from its `data`, stored as `compression`. `size` is what its header
+/// gives as its size decompressed (0: nothing). An lz4 chunk must hold exactly that many bytes
+/// and never more than [`CHUNK_MAX`] (without a size in the header [`CHUNK_MAX_UNSAID`]);
+/// anything else is [`BagError::Malformed`], and the decoder stops at the limit: a few bytes in
+/// the file that stand for gigabytes cost no more memory than the limit.
+pub(super) fn decompress(
+    compression: &str,
+    data: Vec<u8>,
+    size: usize,
+) -> Result<Vec<u8>, BagError> {
     match compression {
         "none" => Ok(data),
         "lz4" => {
-            let mut out = Vec::with_capacity(size_hint.min(1 << 28));
+            let bad = |what: &str| BagError::Malformed(format!("ein Chunk {what}"));
+            let said = (size > 0).then_some(size as u64);
+            if said.is_some_and(|s| s > CHUNK_MAX) {
+                return Err(bad(&format!("ist zu groß ({size} Bytes laut Kopf)")));
+            }
+            let limit = said.unwrap_or(CHUNK_MAX_UNSAID);
+            let mut out = Vec::with_capacity(limit.min(1 << 28) as usize);
+            // German for the program; the decoder's own text is English.
             lz4_flex::frame::FrameDecoder::new(data.as_slice())
+                .take(limit + 1)
                 .read_to_end(&mut out)
-                .map_err(|e| BagError::Malformed(format!("lz4 chunk: {e}")))?;
-            Ok(out)
+                .map_err(|_| bad("lässt sich nicht entpacken (lz4)"))?;
+            let got = out.len() as u64;
+            match said {
+                Some(s) if got > s => Err(bad("ist größer als im Kopf angegeben")),
+                Some(s) if got < s => Err(bad("ist kleiner als im Kopf angegeben")),
+                None if got > limit => Err(bad("ohne Größe im Kopf ist zu groß")),
+                _ => Ok(out),
+            }
         }
         other => Err(BagError::UnsupportedCompression(other.to_string())),
     }
@@ -146,7 +176,7 @@ impl Chunk {
             if self.pos >= self.buf.len() {
                 return Ok(None);
             }
-            let bad = || BagError::Malformed("record exceeds chunk".into());
+            let bad = || BagError::Malformed("Eintrag reicht über den Chunk hinaus".into());
             let b = &self.buf;
             let hlen = read_u32(b, self.pos).ok_or_else(bad)? as usize;
             let hstart = self.pos + 4;
@@ -179,7 +209,24 @@ impl Chunk {
 }
 
 impl<R: Read + Seek> BagReader<R> {
-    pub fn new(mut r: R) -> Result<Self, BagError> {
+    pub fn new(r: R) -> Result<Self, BagError> {
+        let mut reader = BagReader::for_places(r)?;
+        let (index_pos, file_len) = (reader.index_pos, reader.file_len);
+        if index_pos > 0 && index_pos < file_len {
+            // Errors here (damaged index) fall through to the sequential scan below.
+            let _ = reader.read_index_connections(index_pos);
+        }
+        if reader.conns.is_empty() {
+            reader.scan_connections();
+        }
+        Ok(reader)
+    }
+
+    /// A reader for messages at their places ([`Self::read_message`], [`Self::read_chunk`]):
+    /// the bag header is read, the connections are not – not from the index, and for a bag
+    /// without one (cut off) the chunks are not walked whole for them, as [`Self::new`] does.
+    /// [`Self::connections`] is empty.
+    pub fn for_places(mut r: R) -> Result<Self, BagError> {
         let file_len = r.seek(SeekFrom::End(0))?;
         r.seek(SeekFrom::Start(0))?;
         let mut magic = [0u8; MAGIC.len()];
@@ -193,34 +240,31 @@ impl<R: Read + Seek> BagReader<R> {
         };
         if head.fields.op()? != OP_BAG_HEADER {
             return Err(BagError::Malformed(
-                "first record is not a bag header".into(),
+                "erster Eintrag ist kein Bag-Kopf".into(),
             ));
         }
         let index_pos = head.fields.u64("index_pos").unwrap_or(0);
         let data_start = head.data_pos + head.data_len;
-        let mut reader = BagReader {
+        Ok(BagReader {
             r,
             conns: Vec::new(),
             by_id: HashMap::new(),
             data_start,
             file_len,
             index_pos,
-        };
-        if index_pos > 0 && index_pos < file_len {
-            // Errors here (damaged index) fall through to the sequential scan below.
-            let _ = reader.read_index_connections(index_pos);
-        }
-        if reader.conns.is_empty() {
-            reader.scan_connections();
-        }
-        Ok(reader)
+        })
     }
 
     pub fn connections(&self) -> &[Connection] {
         &self.conns
     }
 
-    fn add_connection(&mut self, c: Connection) {
+    /// The topic of connection `id`, if the bag declares it (so far).
+    pub(super) fn topic_of(&self, id: u32) -> Option<&str> {
+        self.by_id.get(&id).map(|&i| self.conns[i].topic.as_str())
+    }
+
+    pub(super) fn add_connection(&mut self, c: Connection) {
         if !self.by_id.contains_key(&c.id) {
             self.by_id.insert(c.id, self.conns.len());
             self.conns.push(c);
@@ -261,7 +305,8 @@ impl<R: Read + Seek> BagReader<R> {
     }
 
     fn count_from_index(&mut self, ids: &[u32]) -> Result<u64, BagError> {
-        let damaged = || BagError::Malformed("chunk info exceeds record".into());
+        let damaged =
+            || BagError::Malformed("Chunk-Angaben reichen über den Eintrag hinaus".into());
         let mut pos = self.index_pos;
         let mut total = 0u64;
         self.r.seek(SeekFrom::Start(pos))?;
@@ -393,7 +438,9 @@ impl<'a, R: Read + Seek> Messages<'a, R> {
                     Some(ChunkItem::Connection(c)) => self.reader.add_connection(c),
                     Some(ChunkItem::Message { conn, time, data }) => {
                         let idx = self.reader.by_id.get(&conn).copied().ok_or_else(|| {
-                            BagError::Malformed(format!("message for unknown connection {conn}"))
+                            BagError::Malformed(format!(
+                                "Nachricht für unbekannte Verbindung {conn}"
+                            ))
                         })?;
                         let topic = &self.reader.conns[idx].topic;
                         if let Some(f) = &self.filter {

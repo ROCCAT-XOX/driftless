@@ -16,10 +16,15 @@ use driftless_steps::export::{
     ExportReport, ExportRequest, ExportSource, MESH_EXTENSIONS, POINT_EXTENSIONS,
 };
 use driftless_steps::merge::{member_transform, ModelMember, ModelReport, MODEL_LAS, MODEL_REPORT};
+use driftless_steps::objects::{ObjectInput, ObjectKind, Objects, OBJECTS_FILE};
+use driftless_steps::plan::{PlanReport, PlanSettings, TopViewInfo, PLAN_REPORT, PLAN_VERSION};
+use driftless_steps::plan_drawing::{PlanExport, PlanPlacement};
 use driftless_steps::slam::SlamSettings;
 use driftless_steps::StepError;
 use driftless_traj::nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 use driftless_traj::{write_tum, Pose};
+use dxf::entities::EntityType;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -398,7 +403,7 @@ fn detect_sources() {
         assert_eq!(
             ExportSource::detect(p).unwrap_err(),
             StepError::Failed(format!(
-                "{}: weder Karte, Modell, Oberfläche, Lauf noch Punktwolken- oder Netzdatei",
+                "{}: weder Karte, Modell, Oberfläche, Grundriss, Lauf noch Punktwolken- oder Netzdatei",
                 p.display()
             ))
         );
@@ -443,7 +448,7 @@ fn format_from_extension_and_override() {
     let names: Vec<&str> = ExportFormat::ALL.iter().map(|f| f.name()).collect();
     assert_eq!(
         names,
-        ["las", "laz", "e57", "ply", "pcd", "glb", "obj", "ply-netz", "tum", "csv"]
+        ["las", "laz", "e57", "ply", "pcd", "glb", "obj", "ply-netz", "tum", "csv", "dxf"]
     );
     let labels: Vec<&str> = ExportFormat::ALL.iter().map(|f| f.label()).collect();
     assert_eq!(
@@ -458,7 +463,8 @@ fn format_from_extension_and_override() {
             "OBJ mit Seitenbildern",
             "PLY-Netz (Farbe je Ecke)",
             "TUM",
-            "CSV"
+            "CSV",
+            "DXF (AutoCAD 2000)"
         ]
     );
     for f in ExportFormat::ALL {
@@ -482,8 +488,8 @@ fn format_from_extension_and_override() {
         None
     );
     let kinds: Vec<ExportKind> = ExportFormat::ALL.iter().map(|f| f.kind()).collect();
-    use ExportKind::{Mesh as M, Points as P, Trajectory as T};
-    assert_eq!(kinds, [P, P, P, P, P, M, M, M, T, T]);
+    use ExportKind::{Mesh as M, Plan as D, Points as P, Trajectory as T};
+    assert_eq!(kinds, [P, P, P, P, P, M, M, M, T, T, D]);
 
     // `format` decides, not the extension of the target.
     let dir = map_dir("export-override", true);
@@ -1025,4 +1031,271 @@ fn umlaut_paths_every_format() {
     let tum = dir.join("Prüfung ä.tum");
     assert_eq!(driftless_traj::read_tum(&tum).unwrap().len(), 5);
     assert!(leftovers(&dir).is_empty());
+}
+
+/// A folder `karte/grundriss` with a plan of two walls and a door, made by hand; returns the
+/// folder of the plan.
+fn plan_dir(root: &Path) -> PathBuf {
+    let map = root.join("karte");
+    let dir = map.join("grundriss");
+    fs::create_dir_all(&dir).unwrap();
+    let face = |a: [f64; 2], b: [f64; 2], inward: [f64; 2]| driftless_plan::WallFace {
+        a,
+        b,
+        inward,
+        seen_m: 4.0,
+    };
+    let report = PlanReport {
+        input_id: "abc".to_string(),
+        version: PLAN_VERSION,
+        settings: PlanSettings::default(),
+        plan: driftless_plan::FloorPlan {
+            storey: driftless_plan::Storey {
+                floor_z: -1.25,
+                ceiling_z: Some(1.35),
+                pose_share: 1.0,
+                floor_area: 20.0,
+            },
+            storeys: Vec::new(),
+            frame: driftless_plan::PlanFrame {
+                axis: [1.0, 0.0],
+                origin: [100.0, 200.0, -1.25],
+                leveling: driftless_plan::Leveling::NONE,
+            },
+            faces: vec![
+                face([0.0, 0.0], [4.0, 0.0], [0.0, 1.0]),
+                face([4.0, 0.0], [4.0, 4.0], [-1.0, 0.0]),
+            ],
+            pairs: Vec::new(),
+            openings: vec![driftless_plan::Opening {
+                kind: driftless_plan::OpeningKind::Door,
+                face: 0,
+                from: 1.0,
+                to: 1.9,
+                sill: 0.0,
+                head: 2.05,
+                crossed: false,
+                note: String::new(),
+            }],
+            rooms: Vec::new(),
+            dims: Vec::new(),
+            hints: Vec::new(),
+            cell: 0.02,
+        },
+        top_view: TopViewInfo {
+            width: 1,
+            height: 1,
+            origin: [0.0, 0.0],
+            cell: 0.02,
+        },
+        files: Vec::new(),
+        bytes: BTreeMap::new(),
+        points: 0,
+        seconds_total: 0.0,
+        peak_rss_bytes: None,
+    };
+    fs::write(
+        dir.join(PLAN_REPORT),
+        serde_json::to_string_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    dir
+}
+
+fn plan_source(dir: &Path) -> ExportSource {
+    ExportSource::Plan {
+        dir: dir.to_path_buf(),
+        export: PlanExport::default(),
+    }
+}
+
+/// Adds a socket to the map above the plan in `dir`.
+fn socket_above(dir: &Path, x: f64) {
+    let mut objects = Objects::load(dir.parent().unwrap()).unwrap();
+    objects
+        .add(ObjectInput {
+            kind: ObjectKind::Socket,
+            points: vec![[x, 200.5, -0.9]],
+            name: "Küche".to_string(),
+            note: String::new(),
+            connection: None,
+            diameter_mm: None,
+            height_m: None,
+            sill_m: None,
+            properties: BTreeMap::new(),
+        })
+        .unwrap();
+    objects.save(dir.parent().unwrap()).unwrap();
+}
+
+fn inserts(drawing: &dxf::Drawing) -> Vec<dxf::entities::Insert> {
+    drawing
+        .entities()
+        .filter_map(|e| match &e.specific {
+            EntityType::Insert(i) => Some(i.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn dxf_export_reads_back() {
+    let root = tmp("export-dxf");
+    let dir = plan_dir(&root);
+    socket_above(&dir, 101.0);
+    let out = root.join("plan ä.dxf");
+    let report = export(plan_source(&dir), &out, ExportFormat::Dxf);
+    assert_eq!(report.files, vec![out.clone()]);
+    assert_eq!(report.bytes, bytes_of(&report.files));
+    assert!(report.count > 0, "Elemente der Zeichnung");
+    assert!(leftovers(&root).is_empty());
+
+    let back = dxf::Drawing::load_file(&out).unwrap();
+    assert_eq!(back.header.version, dxf::enums::AcadVersion::R2000);
+    assert_eq!(
+        back.header.default_drawing_units,
+        dxf::enums::Units::Millimeters
+    );
+    for name in ["Wand", "Tür", "Öffnung-unklar", "Bemaßung", "Rohr"] {
+        assert!(back.layers().any(|l| l.name == name), "{name}");
+    }
+    for name in ["Steckdose", "Anschluss"] {
+        assert!(back.blocks().any(|b| b.name == name), "{name}");
+    }
+    let found = inserts(&back);
+    assert_eq!(found.len(), 1);
+    let at = &found[0].location;
+    assert!(
+        (at.x - 1000.0).abs() < 1.0 && (at.y - 500.0).abs() < 1.0,
+        "{at:?}"
+    );
+    let height = found[0]
+        .attributes()
+        .find(|a| a.attribute_tag == "HOEHE")
+        .unwrap();
+    assert_eq!(height.value, "350");
+
+    // „wie die Punktwolke“: the place of the cloud, at the height of the floor.
+    let cloud = root.join("wolke.dxf");
+    let source = ExportSource::Plan {
+        dir: dir.clone(),
+        export: PlanExport {
+            placement: PlanPlacement::AsCloud,
+            hidden: vec!["Wand".to_string()],
+        },
+    };
+    export(source, &cloud, ExportFormat::Dxf);
+    let back = dxf::Drawing::load_file(&cloud).unwrap();
+    let at = &inserts(&back)[0].location;
+    assert!(
+        (at.x - 101_000.0).abs() < 1.0 && (at.y - 200_500.0).abs() < 1.0,
+        "{at:?}"
+    );
+    assert!((at.z + 1250.0).abs() < 1.0, "{at:?}");
+    assert!(
+        !back
+            .layers()
+            .find(|l| l.name == "Wand")
+            .unwrap()
+            .is_layer_on
+    );
+}
+
+#[test]
+fn dxf_only_for_a_plan() {
+    let root = tmp("export-dxf-only");
+    let map = map_dir("export-dxf-only-map", true);
+    let out = root.join("x.dxf");
+    assert_eq!(
+        failed(
+            ExportSource::Map(map.to_path_buf()),
+            &out,
+            ExportFormat::Dxf,
+            false
+        ),
+        "DXF (AutoCAD 2000) passt nicht zu Karte: möglich sind LAS 1.4, LAZ, E57, PLY (binär), \
+         PCD (binär)"
+    );
+    assert!(!out.exists());
+
+    let dir = plan_dir(&root);
+    assert_eq!(
+        failed(
+            plan_source(&dir),
+            &root.join("x.las"),
+            ExportFormat::Las,
+            false
+        ),
+        "LAS 1.4 passt nicht zu Grundriss: möglich sind DXF (AutoCAD 2000)"
+    );
+}
+
+#[test]
+fn no_overwrite_without_asking() {
+    let root = tmp("export-dxf-overwrite");
+    let dir = plan_dir(&root);
+    let out = root.join("plan.dxf");
+    fs::write(&out, "alt").unwrap();
+    assert_eq!(
+        failed(plan_source(&dir), &out, ExportFormat::Dxf, false),
+        format!("gibt es schon: {}", out.display())
+    );
+    assert_eq!(fs::read_to_string(&out).unwrap(), "alt");
+    let req = request(plan_source(&dir), &out, ExportFormat::Dxf, true);
+    run_export(&req, &Progress::new()).unwrap();
+    assert!(fs::read(&out).unwrap().starts_with(b"999"), "ersetzt");
+
+    // The files of the plan are no target, neither is the file of the objects.
+    socket_above(&dir, 101.0);
+    for target in [dir.join(PLAN_REPORT), root.join("karte").join(OBJECTS_FILE)] {
+        let why = failed(plan_source(&dir), &target, ExportFormat::Dxf, true);
+        assert!(why.starts_with("Ziel ist die Quelle selbst"), "{why}");
+    }
+}
+
+#[test]
+fn objects_changed_after_plan_are_exported() {
+    let root = tmp("export-dxf-later");
+    let dir = plan_dir(&root);
+    let out = root.join("erst.dxf");
+    export(plan_source(&dir), &out, ExportFormat::Dxf);
+    assert!(inserts(&dxf::Drawing::load_file(&out).unwrap()).is_empty());
+
+    socket_above(&dir, 102.0);
+    let later = root.join("danach.dxf");
+    export(plan_source(&dir), &later, ExportFormat::Dxf);
+    let found = inserts(&dxf::Drawing::load_file(&later).unwrap());
+    assert_eq!(
+        found.len(),
+        1,
+        "die Objekte von jetzt, nicht die von damals"
+    );
+    assert!((found[0].location.x - 2000.0).abs() < 1.0);
+}
+
+#[test]
+fn a_plan_folder_knows_whether_a_map_is_above_it() {
+    let root = tmp("export-dxf-ohne-karte");
+    let dir = plan_dir(&root);
+    assert!(driftless_steps::export::plan_without_map(&dir));
+    fs::write(root.join("karte").join("map.json"), "{}").unwrap();
+    assert!(!driftless_steps::export::plan_without_map(&dir));
+}
+
+#[test]
+fn plan_of_a_folder_is_detected() {
+    let root = tmp("export-dxf-detect");
+    let dir = plan_dir(&root);
+    let source = ExportSource::detect(&dir).unwrap();
+    assert_eq!(source, plan_source(&dir));
+    assert_eq!(source.kind(), ExportKind::Plan);
+    assert_eq!(source.default_name(), "karte_grundriss");
+    assert_eq!(
+        ExportSource::detect_as(&dir, ExportKind::Plan).unwrap(),
+        plan_source(&dir)
+    );
+    assert_eq!(
+        ExportFormat::for_path(Path::new("x.DXF"), ExportKind::Plan),
+        Some(ExportFormat::Dxf)
+    );
 }

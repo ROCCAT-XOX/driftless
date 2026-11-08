@@ -9,6 +9,7 @@ mod inspect;
 mod map;
 mod merge;
 mod odom;
+mod plan;
 mod slam;
 mod surface;
 // The rerun viewer only with `--features debug-viewer`; else `view` says where to look.
@@ -88,6 +89,9 @@ enum Command {
     /// Führt mehrere Scans eines Orts zu einem Modell zusammen: modell.las und modell.json
     /// (Lage und Güte je Scan), mit --ply auch modell.ply
     Merge(merge::Args),
+    /// Grundriss einer Karte oder eines Modells: grundriss.json (Wände, Türen, Fenster, Räume,
+    /// Maße) und draufsicht.png; bei mehreren Stockwerken mit --stockwerk eines wählen
+    Plan(plan::Args),
     /// Exportiert Karte, Modell, Oberfläche, Laufbahn oder eine Punktwolken-Datei (LAS, LAZ,
     /// E57, PLY, PCD, glb, OBJ, TUM, CSV)
     Export(export::Args),
@@ -103,6 +107,7 @@ impl Command {
                 | Command::Map(_)
                 | Command::Surface(_)
                 | Command::Merge(_)
+                | Command::Plan(_)
                 | Command::Export(_)
         )
     }
@@ -194,6 +199,7 @@ fn main() -> ExitCode {
         Command::Map(args) => map::run(&args),
         Command::Surface(args) => surface::run(&args),
         Command::Merge(args) => merge::run(&args),
+        Command::Plan(args) => plan::run(&args),
         Command::Export(args) => export::run(&args),
     };
     let cancelled = CONSOLE.get().is_some_and(Progress::is_cancelled);

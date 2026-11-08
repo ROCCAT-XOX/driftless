@@ -30,6 +30,8 @@ driftless-io = { path = "../driftless-io" }
 driftless-gpu = { path = "../driftless-gpu" }
 # The settings of the surface (`SurfaceConfig`).
 driftless-map = { path = "../driftless-map" }
+# Storeys and the plan the field „Planung“ shows.
+driftless-plan = { path = "../driftless-plan" }
 driftless-slam = { path = "../driftless-slam" }
 driftless-steps = { path = "../driftless-steps" }
 driftless-traj = { path = "../driftless-traj" }
@@ -66,9 +68,12 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString", "NSURL", "NSValue"] }
 
 [dev-dependencies]
+driftless-export = { path = "../driftless-export", features = ["test-util"] }
 driftless-io = { path = "../driftless-io", features = ["test-util"] }
 # Scan folders of a walk that closes loops (`testutil::walk_bag`).
 driftless-odom = { path = "../driftless-odom", features = ["test-util"] }
+# Synthetic rooms for the field „Planung“.
+driftless-plan = { path = "../driftless-plan", features = ["test-util"] }
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
 # Foreign LAS files in the tests.
 las = "0.11"

@@ -43,15 +43,16 @@ impl Fields {
     pub fn parse(mut buf: &[u8]) -> Result<Fields, BagError> {
         let mut map = HashMap::new();
         while !buf.is_empty() {
-            let len =
-                read_u32(buf, 0).ok_or_else(|| malformed("header field length cut off"))? as usize;
+            let len = read_u32(buf, 0)
+                .ok_or_else(|| malformed("Länge eines Kopffelds abgeschnitten"))?
+                as usize;
             let body = buf
                 .get(4..4usize.saturating_add(len))
-                .ok_or_else(|| malformed("header field exceeds header"))?;
+                .ok_or_else(|| malformed("Kopffeld reicht über den Kopf hinaus"))?;
             let eq = body
                 .iter()
                 .position(|&b| b == b'=')
-                .ok_or_else(|| malformed("header field without `=`"))?;
+                .ok_or_else(|| malformed("Kopffeld ohne „=“"))?;
             let name = String::from_utf8_lossy(&body[..eq]).into_owned();
             map.insert(name, body[eq + 1..].to_vec());
             buf = &buf[4 + len..];
@@ -66,7 +67,7 @@ impl Fields {
     pub fn op(&self) -> Result<u8, BagError> {
         match self.get("op") {
             Some([b]) => Ok(*b),
-            _ => Err(malformed("record without valid `op` field")),
+            _ => Err(malformed("Eintrag ohne gültiges Feld „op“")),
         }
     }
 
@@ -74,14 +75,14 @@ impl Fields {
         self.get(name)
             .and_then(|v| <[u8; 4]>::try_from(v).ok())
             .map(u32::from_le_bytes)
-            .ok_or_else(|| BagError::Malformed(format!("missing or invalid field `{name}`")))
+            .ok_or_else(|| BagError::Malformed(format!("Feld „{name}“ fehlt oder ist ungültig")))
     }
 
     pub fn u64(&self, name: &str) -> Result<u64, BagError> {
         self.get(name)
             .and_then(|v| <[u8; 8]>::try_from(v).ok())
             .map(u64::from_le_bytes)
-            .ok_or_else(|| BagError::Malformed(format!("missing or invalid field `{name}`")))
+            .ok_or_else(|| BagError::Malformed(format!("Feld „{name}“ fehlt oder ist ungültig")))
     }
 
     pub fn string(&self, name: &str) -> Option<String> {
@@ -96,6 +97,6 @@ impl Fields {
                 sec: u32::from_le_bytes(v[..4].try_into().unwrap()),
                 nsec: u32::from_le_bytes(v[4..].try_into().unwrap()),
             })
-            .ok_or_else(|| BagError::Malformed(format!("missing or invalid field `{name}`")))
+            .ok_or_else(|| BagError::Malformed(format!("Feld „{name}“ fehlt oder ist ungültig")))
     }
 }

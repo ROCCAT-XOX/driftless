@@ -4,18 +4,24 @@
 //!   712.218 Dreiecke“), the numbers of the last frame, what a click does now and the clicked
 //!   point;
 //! - top right, while a surface is loaded, the switch Punkte · Fläche · beides (key `O`);
-//! - bottom centre the tools Drehen · Verschieben · Punkt wählen · Messen · Schnitt and the
-//!   button „Alles“ (key `F`); exactly one tool is active ([`Tool`]);
-//! - above them, with the tool „Schnitt“, the height cut: z min, z max, „Decke ausblenden“.
+//! - bottom centre the tools Drehen · Verschieben · Punkt wählen · Messen · Schnitt · Pinsel ·
+//!   Objekt and the button „Alles“ (key `F`); exactly one tool is active ([`Tool`]); „Pinsel“
+//!   only with a surface of the project shown, „Objekt“ only with something of a map or model
+//!   of the project shown, else off with the reason;
+//! - above them, with the tool „Schnitt“, the height cut: z min, z max, „Decke ausblenden“; with
+//!   the tool „Pinsel“ its bar ([`super::brush::bar`]); with the tool „Objekt“ its bar
+//!   ([`super::objects::bar`]).
 //!
 //! Measuring: the first click on a point sets its first end, the second the other and adds the
 //! [`Measurement`]; Esc or another tool drops a first end. The view draws the lines with their
-//! distance ([`paint_measurements`]), the field „Planung“ lists them.
+//! distance ([`paint_measurements`]), the field „Planung“ lists them; they are kept with the map
+//! or model shown ([`super::objects`]).
 //!
 //! Point pairs („Von Hand ausrichten“, [`PairSession`]): the view shows a model and beside it
 //! one of its scans; the tool „Punktpaare“ (in the bar only then) takes a place in the model
 //! and the same place in the scan by turns, each with a numbered marker ([`paint_pairs`]).
 
+use super::plan::PlanMode;
 use super::steps::{parse_decimal, point_lines};
 use super::theme::{self, icon, DARK};
 use super::view3d::{effective_show, target_size, PointInfo};
@@ -47,20 +53,30 @@ pub enum Tool {
     Measure,
     /// The height cut; its bar shows above the tools.
     Cut,
+    /// The left button paints Stellen on the surface ([`super::brush`]); its bar shows above
+    /// the tools, the right button turns the view.
+    Brush,
     /// Clicks set point pairs of a [`PairSession`]; only in the bar while one is open.
     Pairs,
+    /// Clicks set sockets, connections, cables and pipes ([`super::objects`]): on the points
+    /// like [`Tool::Measure`], while only the surface is shown on the surface. Its bar shows
+    /// above the tools.
+    Object,
 }
 
 impl Tool {
     /// Whether a click picks a point of the cloud (else it does nothing; dragging turns the
     /// view as with [`Tool::Orbit`], except with [`Tool::Pan`]).
     pub fn picks_points(self) -> bool {
-        matches!(self, Tool::Pick | Tool::Measure | Tool::Pairs)
+        matches!(
+            self,
+            Tool::Pick | Tool::Measure | Tool::Pairs | Tool::Object
+        )
     }
 }
 
 /// The tools of the bar: tool, symbol, name, tooltip.
-const TOOLS: [(Tool, &str, &str, &str); 5] = [
+const TOOLS: [(Tool, &str, &str, &str); 7] = [
     (
         Tool::Orbit,
         icon::ORBIT,
@@ -81,6 +97,18 @@ const TOOLS: [(Tool, &str, &str, &str); 5] = [
         text::TOOL_MEASURE_HINT,
     ),
     (Tool::Cut, icon::CUT, text::TOOL_CUT, text::CUT_HINT),
+    (
+        Tool::Brush,
+        icon::BRUSH,
+        text::TOOL_BRUSH,
+        text::TOOL_BRUSH_HINT,
+    ),
+    (
+        Tool::Object,
+        icon::OBJECT,
+        text::TOOL_OBJECT,
+        text::TOOL_OBJECT_HINT,
+    ),
 ];
 
 /// The distance between two points of the cloud (absolute coordinates).
@@ -112,6 +140,12 @@ pub struct ScreenLayout {
     pub show: Option<Rect>,
     pub tools: Option<Rect>,
     pub cut: Option<Rect>,
+    /// The switch „Plan · 3D“ ([`plan_bar`]).
+    pub plan: Option<Rect>,
+    /// The bar of the brush ([`super::brush::bar`]).
+    pub brush: Option<Rect>,
+    /// The bar of the tool „Objekt“ ([`super::objects::bar`]).
+    pub objects: Option<Rect>,
     /// The legend of the quality colours ([`quality_legend`]).
     pub legend: Option<Rect>,
 }
@@ -127,6 +161,9 @@ impl Default for ScreenLayout {
             show: None,
             tools: None,
             cut: None,
+            plan: None,
+            brush: None,
+            objects: None,
             legend: None,
         }
     }
@@ -143,6 +180,10 @@ const INFO_SHARE: f32 = 0.45;
 /// Height of a button of the bars (points).
 const BUTTON_HEIGHT: f32 = 28.0;
 const BUTTON_PAD: f32 = 9.0;
+/// In a view narrower than this the tools stand closer together, so that their names stay
+/// (points), with this padding.
+const COMPACT_VIEW: f32 = 760.0;
+const COMPACT_PAD: f32 = 5.0;
 /// A button with a symbol only (×) is smaller.
 const SMALL_BUTTON: f32 = 20.0;
 /// Least height of a row of text in the bars (points).
@@ -158,15 +199,16 @@ const SLIDER_WIDTH: f32 = 140.0;
 const END_RADIUS: f32 = 4.0;
 const LINE_WIDTH: f32 = 2.0;
 
-/// Makes `tool` the active one; a measurement being made is dropped, and „Punkt wählen“ or
-/// „Messen“ ends picking the places of a loop.
+/// Makes `tool` the active one; a measurement being made is dropped, and „Punkt wählen“,
+/// „Messen“ or „Pinsel“ ends picking the places of a loop.
 pub fn select(state: &mut AppState, tool: Tool) {
     if state.tool != tool {
         state.tool = tool;
         state.measure_a = None;
+        super::objects::cancel_line(state);
     }
-    // a click picks points now, not the places of a loop
-    if tool.picks_points() {
+    // a click picks points or paints now, not the places of a loop
+    if tool.picks_points() || tool == Tool::Brush {
         state.correct.picking = false;
     }
 }
@@ -198,7 +240,8 @@ pub fn point_clicked(state: &mut AppState, info: PointInfo) {
                 }
             }
         }
-        Tool::Orbit | Tool::Pan | Tool::Cut => {}
+        // the window hands the point to the tool „Objekt“ itself ([`super::objects`])
+        Tool::Orbit | Tool::Pan | Tool::Cut | Tool::Brush | Tool::Object => {}
     }
 }
 
@@ -405,11 +448,12 @@ pub fn remember_text_focus(ctx: &Context) {
 }
 
 /// Whether the keys of the view (Esc, `O`, `F`, flying) are free: no text field has the
-/// keyboard, now or at the end of the last pass. A button or slider with the keyboard (after
-/// Tab, say) does not hold them.
+/// keyboard, now or at the end of the last pass, and no modal dialog („Melden“) lies over the
+/// window. A button or slider with the keyboard (after Tab, say) does not hold them.
 pub fn keys_free(ctx: &Context) -> bool {
     let before = ctx.data(|d| d.get_temp::<bool>(text_focus_id()));
-    !before.unwrap_or(false) && !ctx.text_edit_focused()
+    let modal = ctx.memory(|m| m.top_modal_layer().is_some());
+    !before.unwrap_or(false) && !ctx.text_edit_focused() && !modal
 }
 
 /// The floating bars over the view `view`, while a cloud or a surface is loaded. Their
@@ -425,24 +469,73 @@ pub fn floats(
     layout.show = None;
     layout.tools = None;
     layout.cut = None;
-    if state.cloud.is_none() && state.surface.is_none() {
-        return None;
+    layout.brush = None;
+    layout.objects = None;
+    layout.plan = None;
+    // over the plan only its own switch: the bars below belong to the 3D view
+    if super::plan::on_screen(state) || (state.cloud.is_none() && state.surface.is_none()) {
+        return plan_bar(ctx, view, state, layout);
     }
     layout.info = Some(info(ctx, view, state));
     if state.surface.is_some() {
         layout.show = Some(show_switch(ctx, view, state));
     }
-    let (tools, action) = toolbar(ctx, view, state);
+    let plan_action = plan_bar(ctx, view, state, layout);
+    let (tools, mut action) = toolbar(ctx, view, state);
     layout.tools = Some(tools);
-    if state.tool == Tool::Cut {
-        layout.cut = cut_bar(ctx, view, tools.top() - GAP, state);
+    match state.tool {
+        Tool::Cut => layout.cut = cut_bar(ctx, view, tools.top() - GAP, state),
+        Tool::Brush => {
+            let (rect, asked) = super::brush::bar(ctx, view, tools.top() - GAP, state);
+            layout.brush = Some(rect);
+            action = action.or(asked);
+        }
+        Tool::Object => {
+            let (rect, asked) = super::objects::bar(ctx, view, tools.top() - GAP, state);
+            layout.objects = Some(rect);
+            action = action.or(asked);
+        }
+        _ => {}
     }
-    action
+    action.or(plan_action)
+}
+
+/// The switch „Plan · 3D“ at the top right, left of „Ansicht“ if that is there: in „Planung“,
+/// once there is a plan.
+fn plan_bar(
+    ctx: &Context,
+    view: Rect,
+    state: &AppState,
+    layout: &mut ScreenLayout,
+) -> Option<Action> {
+    if !super::plan::switch_shown(state) {
+        return None;
+    }
+    let right = layout
+        .show
+        .map_or(view.right() - MARGIN, |r| r.left() - GAP);
+    let pos = egui::pos2(right, view.top() + MARGIN);
+    let mode = state.plan.mode;
+    let mut chosen = None;
+    let rect = float(ctx, "plan_umschalter", view, pos, Align2::RIGHT_TOP, |ui| {
+        ui.horizontal(|ui| {
+            for (choice, label) in [
+                (PlanMode::Plan, text::PLAN_SWITCH_PLAN),
+                (PlanMode::View3d, text::PLAN_SWITCH_3D),
+            ] {
+                if bar_button(ui, None, Some(label), label, Some(mode == choice)).clicked() {
+                    chosen = Some(choice);
+                }
+            }
+        });
+    });
+    layout.plan = Some(rect);
+    chosen.map(Action::SetPlanMode)
 }
 
 /// A floating bar: an area at `pos` of the view (`pivot` its corner there), in
 /// [`theme::float_frame`]. Returns its rectangle.
-fn float(
+pub(super) fn float(
     ctx: &Context,
     id: &str,
     view: Rect,
@@ -482,9 +575,10 @@ fn info(ctx: &Context, view: Rect, state: &mut AppState) -> Rect {
             (Some(c), None) => text::info_cloud(c.points),
             (None, None) => return,
         };
-        let help = match s.view.camera_mode {
-            CameraMode::Orbit => text::VIEW_HELP_ORBIT,
-            CameraMode::Fly => text::VIEW_HELP_FLY,
+        let help = match (s.tool, s.view.camera_mode) {
+            (Tool::Brush, mode) => text::view_help_brush(mode == CameraMode::Fly),
+            (_, CameraMode::Orbit) => text::VIEW_HELP_ORBIT.into(),
+            (_, CameraMode::Fly) => text::VIEW_HELP_FLY.into(),
         };
         ui.label(RichText::new(head).color(DARK.text).strong())
             .on_hover_text(help);
@@ -508,8 +602,9 @@ fn info(ctx: &Context, view: Rect, state: &mut AppState) -> Rect {
             if let (Some(why), Tool::Pairs) = (why, s.tool) {
                 ui.add(egui::Label::new(RichText::new(why).color(DARK.warn)).wrap());
             }
-            // the clicks hit the points, also while only the surface is seen
-            if s.tool.picks_points() && s.cloud.is_some() && shown == ShowMode::Surface {
+            // the clicks hit the points, also while only the surface is seen (not of „Objekt“)
+            let on_points = s.tool.picks_points() && s.tool != Tool::Object;
+            if on_points && s.cloud.is_some() && shown == ShowMode::Surface {
                 ui.add(
                     egui::Label::new(RichText::new(text::PICKS_ON_CLOUD).color(DARK.text_dim))
                         .wrap(),
@@ -533,6 +628,12 @@ pub fn click_hint(s: &AppState) -> Option<String> {
     if s.correct.picking {
         return Some(text::VIEW_HELP_PICK.into());
     }
+    if s.tool == Tool::Object {
+        return Some(text::object_hint(
+            s.object_tool.kind,
+            s.object_tool.line.len(),
+        ));
+    }
     if s.tool.picks_points() && s.cloud.is_none() {
         return Some(text::TOOL_NEEDS_CLOUD.into());
     }
@@ -544,6 +645,7 @@ pub fn click_hint(s: &AppState) -> Option<String> {
             None => text::PAIRS_LOADING.into(),
             Some(_) => p.prompt(),
         }),
+        Tool::Brush => Some(text::brush_hint(s.brush.active)),
         _ => None,
     }
 }
@@ -611,6 +713,11 @@ fn toolbar(ctx: &Context, view: Rect, state: &mut AppState) -> (Rect, Option<Act
     let mut chosen = None;
     let mut action = None;
     let active = state.tool;
+    let pad = if view.width() < COMPACT_VIEW {
+        COMPACT_PAD
+    } else {
+        BUTTON_PAD
+    };
     let pos = view.center_bottom() - egui::vec2(0.0, BOTTOM_MARGIN);
     let rect = float(ctx, "werkzeuge", view, pos, Align2::CENTER_BOTTOM, |ui| {
         ui.horizontal(|ui| {
@@ -621,19 +728,43 @@ fn toolbar(ctx: &Context, view: Rect, state: &mut AppState) -> (Rect, Option<Act
                 text::TOOL_PAIRS_HINT,
             );
             let extra = state.pairs.is_some().then_some(pairs);
+            // the brush needs a surface of the project to paint on, „Objekt“ a map or model
+            let brush_off = super::brush::blocked(state);
+            let object_off = super::objects::blocked(state);
             for (tool, symbol, name, hint) in TOOLS.into_iter().chain(extra) {
-                let r = bar_button(ui, Some(symbol), Some(name), name, Some(tool == active));
-                if r.on_hover_text(hint).clicked() {
+                let off = match tool {
+                    Tool::Brush => brush_off.as_ref(),
+                    Tool::Object => object_off.as_ref(),
+                    _ => None,
+                };
+                let r = ui
+                    .add_enabled_ui(off.is_none(), |ui| {
+                        padded_button(
+                            ui,
+                            Some(symbol),
+                            Some(name),
+                            name,
+                            Some(tool == active),
+                            pad,
+                        )
+                    })
+                    .inner;
+                let r = match off {
+                    Some(why) => r.on_disabled_hover_text(why.as_str()),
+                    None => r.on_hover_text(hint),
+                };
+                if r.clicked() {
                     chosen = Some(tool);
                 }
             }
             ui.separator();
-            let r = bar_button(
+            let r = padded_button(
                 ui,
                 Some(icon::FIT),
                 Some(text::FIT_ALL),
                 text::FIT_ALL,
                 None,
+                pad,
             );
             if r.on_hover_text(text::FRAME_ALL_HINT).clicked() {
                 action = Some(Action::FrameAll);
@@ -649,12 +780,24 @@ fn toolbar(ctx: &Context, view: Rect, state: &mut AppState) -> (Rect, Option<Act
 /// A button of the floating bars: symbol and label, filled with the accent colour while `on`.
 /// `name` is what screen readers (and tests) see; `on` = `None` is a plain button, else a
 /// toggle.
-fn bar_button(
+pub(super) fn bar_button(
     ui: &mut Ui,
     symbol: Option<&str>,
     label: Option<&str>,
     name: &str,
     on: Option<bool>,
+) -> egui::Response {
+    padded_button(ui, symbol, label, name, on, BUTTON_PAD)
+}
+
+/// [`bar_button`] with `pad` left and right of a button with a label.
+fn padded_button(
+    ui: &mut Ui,
+    symbol: Option<&str>,
+    label: Option<&str>,
+    name: &str,
+    on: Option<bool>,
+    pad: f32,
 ) -> egui::Response {
     let selected = on.unwrap_or(false);
     let fg = if !ui.is_enabled() {
@@ -679,7 +822,7 @@ fn bar_button(
     let size = if label.is_none() {
         egui::vec2(SMALL_BUTTON.max(content + 6.0), SMALL_BUTTON)
     } else {
-        egui::vec2(content + 2.0 * BUTTON_PAD, BUTTON_HEIGHT)
+        egui::vec2(content + 2.0 * pad, BUTTON_HEIGHT)
     };
     let pad = (size.x - content) / 2.0;
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
@@ -846,7 +989,7 @@ pub fn quality_legend(ctx: &Context, view: Rect, show: bool, layout: &mut Screen
     }
     use driftless_steps::overlay::{quality_color, QUALITY_GREEN, QUALITY_RED, QUALITY_YELLOW};
     // above the bars at the bottom, if any
-    let above = [layout.tools, layout.cut]
+    let above = [layout.tools, layout.cut, layout.brush, layout.objects]
         .into_iter()
         .flatten()
         .map(|r| r.top() - GAP)

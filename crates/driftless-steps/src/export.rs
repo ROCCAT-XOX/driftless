@@ -1,12 +1,15 @@
-//! Export: a map, a model, a surface, a run or a single point cloud or mesh file into one
-//! of the open formats of [`driftless_export`]. The command line (`driftless export`) and
-//! the desktop program both call [`run_export`].
+//! Export: a map, a model, a surface (as computed, or touched up), a floor plan, a run or a
+//! single point cloud or mesh file into one of the open formats of [`driftless_export`]; a
+//! floor plan as DXF with the objects of its map or model as they are now. The command line
+//! (`driftless export`) and the desktop program both call [`run_export`]; only the program
+//! exports a touched-up surface ([`ExportSource::EditedSurface`]).
 //!
 //! Before anything is read, in this order: the format must fit the source
 //! ([`ExportFormat::kind`]), the target must not be a file of the source (compared as the
-//! file system resolves them), and without [`ExportRequest::overwrite`] none of the targets
-//! ([`export_targets`]: for OBJ also the `.mtl` and every page `<stem>_seite_NN.jpg|png`
-//! there) may exist.
+//! file system resolves them; of a surface every file its report lists), it must not lie in
+//! the folder of a touch-up (`nacharbeit/` of a surface: its next run replaces that folder),
+//! and without [`ExportRequest::overwrite`] none of the targets ([`export_targets`]: for OBJ
+//! also the `.mtl` and every page `<stem>_seite_NN.jpg|png` there) may exist.
 //! Every file is written through `<name>.tmp` and renamed at the end; a cancel or an error
 //! leaves the old files as they were, and the `.tmp` files a killed export to the same
 //! target left are removed first. An OBJ written over an older one removes the older one's
@@ -14,12 +17,19 @@
 
 use crate::error::{check_cancel, failed, StepError};
 use crate::leftovers::remove_stale_tmp;
+use crate::marks::MARKS_FILE;
 use crate::merge::{member_transform, read_model, MODEL_LAS, MODEL_REPORT};
+use crate::objects::{Objects, OBJECTS_FILE};
+use crate::plan::{read_plan, PLAN_REPORT, TOP_VIEW_FILE};
+use crate::plan_drawing::{elevation_mm, plan_drawing, PlanExport};
+use crate::touchup::{self, Edited, TOUCHUP_DIR, TOUCHUP_REPORT};
+use driftless_export::dxf::{write_dxf, Drawing};
 use driftless_export::mesh::{self, obj_files, Mesh};
 use driftless_export::traj::{write_traj, TrajFormat};
 use driftless_export::{read_points, write_points, PointFormat, Points, ScanInfo, PHASE_WRITE};
 use driftless_io::paths;
 use driftless_io::progress::Progress;
+use driftless_map::surface::edit::PATCHES_FILE;
 use serde::Serialize;
 use std::ffi::OsString;
 use std::fs;
@@ -31,17 +41,18 @@ const MAP_REPORT: &str = "map.json";
 const MAP_COLOR: &str = "color.las";
 const MAP_CLEAN: &str = "clean.las";
 /// Surface folder: its report and the mesh an export takes.
-const SURFACE_GLB: &str = "oberflaeche.glb";
+pub(crate) const SURFACE_GLB: &str = "oberflaeche.glb";
 const SURFACE_REPORT: &str = "oberflaeche.json";
 /// Run folder: the trajectory.
 const RUN_TRAJ: &str = "traj.tum";
 
-/// What is exported: points, a mesh or a trajectory.
+/// What is exported: points, a mesh, a trajectory or a floor plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportKind {
     Points,
     Mesh,
     Trajectory,
+    Plan,
 }
 
 /// A format to export to.
@@ -57,10 +68,11 @@ pub enum ExportFormat {
     PlyMesh,
     Tum,
     Csv,
+    Dxf,
 }
 
 impl ExportFormat {
-    pub const ALL: [ExportFormat; 10] = [
+    pub const ALL: [ExportFormat; 11] = [
         ExportFormat::Las,
         ExportFormat::Laz,
         ExportFormat::E57,
@@ -71,6 +83,7 @@ impl ExportFormat {
         ExportFormat::PlyMesh,
         ExportFormat::Tum,
         ExportFormat::Csv,
+        ExportFormat::Dxf,
     ];
 
     pub fn kind(self) -> ExportKind {
@@ -82,6 +95,7 @@ impl ExportFormat {
             | ExportFormat::Pcd => ExportKind::Points,
             ExportFormat::Glb | ExportFormat::Obj | ExportFormat::PlyMesh => ExportKind::Mesh,
             ExportFormat::Tum | ExportFormat::Csv => ExportKind::Trajectory,
+            ExportFormat::Dxf => ExportKind::Plan,
         }
     }
 
@@ -98,6 +112,7 @@ impl ExportFormat {
             ExportFormat::PlyMesh => "ply-netz",
             ExportFormat::Tum => "tum",
             ExportFormat::Csv => "csv",
+            ExportFormat::Dxf => "dxf",
         }
     }
 
@@ -114,6 +129,7 @@ impl ExportFormat {
             ExportFormat::PlyMesh => "PLY-Netz (Farbe je Ecke)",
             ExportFormat::Tum => "TUM",
             ExportFormat::Csv => "CSV",
+            ExportFormat::Dxf => "DXF (AutoCAD 2000)",
         }
     }
 
@@ -167,6 +183,15 @@ pub enum ExportSource {
     Model(PathBuf),
     /// A surface folder: `oberflaeche.glb`.
     Surface(PathBuf),
+    /// A surface folder with its touch-up („Nacharbeit“): `oberflaeche.glb` with the patches of
+    /// its `nacharbeit/` applied ([`touchup::edited_mesh`]); the surface as computed while no
+    /// Stelle of its map or model has a step. Refused while the touch-up does not fit the
+    /// Stellen ([`touchup::touchup_fits`]). [`Self::detect`] never gives it: the command line
+    /// exports the computed surface.
+    EditedSurface(PathBuf),
+    /// A folder of a floor plan (`grundriss.json`) as a drawing; the objects come from
+    /// `objekte.toml` of the folder above it, as it is at the export.
+    Plan { dir: PathBuf, export: PlanExport },
     /// A run folder: `traj.tum`.
     Run(PathBuf),
     /// A point cloud file ([`POINT_EXTENSIONS`]).
@@ -206,7 +231,8 @@ fn folder_name(dir: &Path) -> String {
 impl ExportSource {
     /// The source at `path`:
     /// - a folder with `modell.json` is a model, with `map.json` a map, with
-    ///   `oberflaeche.glb` a surface, with `traj.tum` a run (the first that fits);
+    ///   `oberflaeche.glb` a surface, with `grundriss.json` a floor plan, with `traj.tum` a run
+    ///   (the first that fits);
     /// - `modell.las` next to a `modell.json` is that model;
     /// - a file with an extension of [`POINT_EXTENSIONS`] or [`MESH_EXTENSIONS`] is a point
     ///   or mesh file; `traj.tum` is its run folder.
@@ -220,6 +246,12 @@ impl ExportSource {
             }
             if path.join(SURFACE_GLB).is_file() {
                 return Ok(ExportSource::Surface(path.to_path_buf()));
+            }
+            if path.join(PLAN_REPORT).is_file() {
+                return Ok(ExportSource::Plan {
+                    dir: path.to_path_buf(),
+                    export: PlanExport::default(),
+                });
             }
             if path.join(RUN_TRAJ).is_file() {
                 return Ok(ExportSource::Run(path.to_path_buf()));
@@ -240,7 +272,7 @@ impl ExportSource {
             }
         }
         Err(format!(
-            "{}: weder Karte, Modell, Oberfläche, Lauf noch Punktwolken- oder Netzdatei",
+            "{}: weder Karte, Modell, Oberfläche, Grundriss, Lauf noch Punktwolken- oder Netzdatei",
             path.display()
         )
         .into())
@@ -259,6 +291,10 @@ impl ExportSource {
             ExportKind::Trajectory if path.join(RUN_TRAJ).is_file() => ExportSource::Run(dir),
             ExportKind::Mesh if path.join(SURFACE_GLB).is_file() => ExportSource::Surface(dir),
             ExportKind::Points if path.join(MAP_REPORT).is_file() => ExportSource::Map(dir),
+            ExportKind::Plan if path.join(PLAN_REPORT).is_file() => ExportSource::Plan {
+                dir,
+                export: PlanExport::default(),
+            },
             _ => found,
         })
     }
@@ -268,8 +304,11 @@ impl ExportSource {
             ExportSource::Map(_) | ExportSource::Model(_) | ExportSource::PointFile(_) => {
                 ExportKind::Points
             }
-            ExportSource::Surface(_) | ExportSource::MeshFile(_) => ExportKind::Mesh,
+            ExportSource::Surface(_)
+            | ExportSource::EditedSurface(_)
+            | ExportSource::MeshFile(_) => ExportKind::Mesh,
             ExportSource::Run(_) => ExportKind::Trajectory,
+            ExportSource::Plan { .. } => ExportKind::Plan,
         }
     }
 
@@ -279,7 +318,13 @@ impl ExportSource {
     pub fn default_name(&self) -> String {
         match self {
             ExportSource::Map(d) | ExportSource::Model(d) => folder_name(d),
-            ExportSource::Surface(d) => format!("{}_oberflaeche", folder_name(d)),
+            ExportSource::Surface(d) | ExportSource::EditedSurface(d) => {
+                format!("{}_oberflaeche", folder_name(d))
+            }
+            ExportSource::Plan { dir, .. } => plan_owner(dir).as_deref().map_or_else(
+                || "grundriss".to_string(),
+                |owner| format!("{}_grundriss", folder_name(owner)),
+            ),
             ExportSource::Run(d) => format!("{}_laufbahn", folder_name(d)),
             ExportSource::PointFile(f) | ExportSource::MeshFile(f) => f
                 .file_stem()
@@ -292,7 +337,8 @@ impl ExportSource {
         match self {
             ExportSource::Map(_) => "Karte",
             ExportSource::Model(_) => "Modell",
-            ExportSource::Surface(_) => "Oberfläche",
+            ExportSource::Surface(_) | ExportSource::EditedSurface(_) => "Oberfläche",
+            ExportSource::Plan { .. } => "Grundriss",
             ExportSource::Run(_) => "Lauf",
             ExportSource::PointFile(_) => "Punktwolke",
             ExportSource::MeshFile(_) => "Netz",
@@ -300,17 +346,70 @@ impl ExportSource {
     }
 
     /// The files of the source a target must never be: what is read and the report of the
-    /// folder; for an OBJ also its `.mtl`.
+    /// folder; for an OBJ also its `.mtl`; for a surface also every file its report lists (the
+    /// OBJ of `--obj` with its `.mtl` and pages: the computed folder stays as it is), for a
+    /// touched-up one also its touch-up and the Stellen of its map or model.
     fn files(&self) -> Vec<PathBuf> {
         match self {
             ExportSource::Map(d) => vec![d.join(MAP_COLOR), d.join(MAP_CLEAN), d.join(MAP_REPORT)],
             ExportSource::Model(d) => vec![d.join(MODEL_LAS), d.join(MODEL_REPORT)],
-            ExportSource::Surface(d) => vec![d.join(SURFACE_GLB), d.join(SURFACE_REPORT)],
+            ExportSource::Surface(d) => {
+                let mut files = vec![d.join(SURFACE_GLB), d.join(SURFACE_REPORT)];
+                files.extend(listed_files(d));
+                files
+            }
+            ExportSource::EditedSurface(d) => {
+                let cache = d.join(TOUCHUP_DIR);
+                let mut files = vec![
+                    d.join(SURFACE_GLB),
+                    d.join(SURFACE_REPORT),
+                    cache.join(PATCHES_FILE),
+                    cache.join(TOUCHUP_REPORT),
+                ];
+                files.extend(listed_files(d));
+                files.extend(d.parent().map(|owner| owner.join(MARKS_FILE)));
+                files
+            }
+            ExportSource::Plan { dir, .. } => {
+                let mut files = vec![dir.join(PLAN_REPORT), dir.join(TOP_VIEW_FILE)];
+                files.extend(plan_owner(dir).map(|owner| owner.join(OBJECTS_FILE)));
+                files
+            }
             ExportSource::Run(d) => vec![d.join(RUN_TRAJ)],
             ExportSource::PointFile(f) => vec![f.clone()],
             ExportSource::MeshFile(f) => vec![f.clone(), f.with_extension("mtl")],
         }
     }
+}
+
+/// The folder of the map or model a floor plan in `dir` belongs to: the one above it, also for
+/// a `dir` given as `.`.
+fn plan_owner(dir: &Path) -> Option<PathBuf> {
+    paths::canonical(dir)
+        .ok()
+        .and_then(|d| d.parent().map(Path::to_path_buf))
+}
+
+/// Whether a floor plan in `dir` lies outside any map or model folder, so that an export has no
+/// objects to take along.
+pub fn plan_without_map(dir: &Path) -> bool {
+    !plan_owner(dir)
+        .is_some_and(|owner| owner.join(MAP_REPORT).is_file() || owner.join(MODEL_REPORT).is_file())
+}
+
+/// The files the report of the surface folder `dir` lists (`files`); none if it does not read.
+fn listed_files(dir: &Path) -> Vec<PathBuf> {
+    let report: Option<serde_json::Value> = fs::read_to_string(dir.join(SURFACE_REPORT))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok());
+    let Some(report) = report else {
+        return Vec::new();
+    };
+    let names = report["files"].as_array().into_iter().flatten();
+    names
+        .filter_map(serde_json::Value::as_str)
+        .map(|f| dir.join(f))
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -328,7 +427,7 @@ pub struct ExportRequest {
 pub struct ExportReport {
     /// Every file written, the main one first.
     pub files: Vec<PathBuf>,
-    /// Points, triangles or poses.
+    /// Points, triangles, poses or entities of a drawing.
     pub count: u64,
     /// Sum of the sizes of [`Self::files`].
     pub bytes: u64,
@@ -420,7 +519,8 @@ pub fn existing_targets(req: &ExportRequest) -> Vec<PathBuf> {
 }
 
 /// The checks before anything is read: the format fits the source, the folder of the target
-/// is there and no target is a file of the source. The existing targets are not checked here
+/// is there, no target is a file of the source, and none lies in the folder of a touch-up (of
+/// any surface: its next run would replace it). The existing targets are not checked here
 /// ([`existing_targets`]).
 pub fn check_export(req: &ExportRequest) -> Result<(), StepError> {
     let kind = req.source.kind();
@@ -461,6 +561,18 @@ pub fn check_export(req: &ExportRequest) -> Result<(), StepError> {
             }
         }
     }
+    // All targets lie in the folder of the target.
+    let in_cache = paths::canonical(dir)
+        .ok()
+        .and_then(|d| touchup::cache_folder_of(&d));
+    if let Some(cache) = in_cache {
+        return Err(format!(
+            "Ziel liegt im Ordner der Nacharbeit {}: Driftless ersetzt ihn bei jedem Schritt, \
+             die Datei ginge verloren – einen anderen Ordner wählen",
+            cache.display()
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -469,9 +581,25 @@ enum Data {
     Points(Points),
     Mesh(Mesh),
     Poses(Vec<driftless_traj::Pose>),
+    /// A drawing and the height it stands at (mm).
+    Drawing(Drawing, f64),
 }
 
-fn read_source(source: &ExportSource, progress: &Progress) -> Result<Data, StepError> {
+/// The drawing of the floor plan in `dir`, with the objects of `owner` as they are now.
+fn read_plan_drawing(dir: &Path, owner: &Path, export: &PlanExport) -> Result<Data, StepError> {
+    let report = read_plan(dir)?;
+    let objects = Objects::load(owner)?;
+    Ok(Data::Drawing(
+        plan_drawing(&report, &objects, export),
+        elevation_mm(&report, export),
+    ))
+}
+
+fn read_source(
+    source: &ExportSource,
+    owner: Option<&Path>,
+    progress: &Progress,
+) -> Result<Data, StepError> {
     Ok(match source {
         ExportSource::Map(d) => {
             let file = [MAP_COLOR, MAP_CLEAN]
@@ -509,7 +637,19 @@ fn read_source(source: &ExportSource, progress: &Progress) -> Result<Data, StepE
         }
         ExportSource::PointFile(f) => Data::Points(read_points(f, progress)?),
         ExportSource::Surface(d) => Data::Mesh(mesh::read_mesh(&d.join(SURFACE_GLB), progress)?),
+        ExportSource::EditedSurface(d) => Data::Mesh(match touchup::edited(d, progress)? {
+            Edited::Touched(m) => m,
+            Edited::Unchanged => mesh::read_mesh(&d.join(SURFACE_GLB), progress)?,
+            Edited::Stale => return Err(touchup::stale(d)),
+        }),
         ExportSource::MeshFile(f) => Data::Mesh(mesh::read_mesh(f, progress)?),
+        ExportSource::Plan { dir, export } => {
+            let above = plan_owner(dir);
+            let owner = owner
+                .or(above.as_deref())
+                .ok_or_else(|| format!("Grundriss {}: kein Ordner darüber", dir.display()))?;
+            read_plan_drawing(dir, owner, export)?
+        }
         ExportSource::Run(d) => {
             let path = d.join(RUN_TRAJ);
             Data::Poses(driftless_traj::read_tum(&path).map_err(failed)?)
@@ -532,9 +672,33 @@ fn point_format(f: ExportFormat) -> PointFormat {
 /// the source, an existing target without [`ExportRequest::overwrite`] and a source that
 /// cannot be read.
 pub fn run_export(req: &ExportRequest, progress: &Progress) -> Result<ExportReport, StepError> {
+    export(req, None, progress)
+}
+
+/// [`run_export`] of a floor plan that need not lie in the folder of its map or model
+/// (`driftless plan -o`): the objects come from `owner`. Their file is no target either.
+pub fn run_plan_export(
+    req: &ExportRequest,
+    owner: &Path,
+    progress: &Progress,
+) -> Result<ExportReport, StepError> {
+    export(req, Some(owner), progress)
+}
+
+fn export(
+    req: &ExportRequest,
+    owner: Option<&Path>,
+    progress: &Progress,
+) -> Result<ExportReport, StepError> {
     let start = Instant::now();
     check_cancel(progress)?;
     check_export(req)?;
+    if let Some(owner) = owner {
+        let objects = paths::canonical(&owner.join(OBJECTS_FILE)).ok();
+        if objects.is_some() && objects == paths::canonical(&req.out).ok() {
+            return Err(format!("Ziel ist die Quelle selbst: {}", req.out.display()).into());
+        }
+    }
     if !req.overwrite {
         let existing = existing_targets(req);
         if !existing.is_empty() {
@@ -544,7 +708,7 @@ pub fn run_export(req: &ExportRequest, progress: &Progress) -> Result<ExportRepo
     }
 
     remove_stale_tmp(target_dir(&req.out), |name| owns(req, name), progress);
-    let data = read_source(&req.source, progress)?;
+    let data = read_source(&req.source, owner, progress)?;
     // Last chance to stop before a file is touched.
     progress.phase(PHASE_WRITE, None);
     check_cancel(progress)?;
@@ -580,6 +744,10 @@ pub fn run_export(req: &ExportRequest, progress: &Progress) -> Result<ExportRepo
             };
             write_traj(out, poses, format)?;
             (vec![out.clone()], poses.len() as u64)
+        }
+        (Data::Drawing(drawing, elevation), _) => {
+            write_dxf(out, drawing, *elevation, progress)?;
+            (vec![out.clone()], drawing.entities.len() as u64)
         }
     };
     let bytes = files

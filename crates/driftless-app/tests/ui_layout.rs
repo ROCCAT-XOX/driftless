@@ -98,6 +98,7 @@ fn with_map() -> AppState {
             settings: None,
             clouds: Vec::new(),
             surfaces: Vec::new(),
+            plans: Vec::new(),
             incomplete: false,
         }],
         history: Vec::new(),
@@ -394,10 +395,13 @@ fn empty_states_explain_next_step() {
     h.run();
     assert_eq!(h.state().1, Some(Action::SetStep(Step::Daten)));
 
-    // Planung says what comes
+    // Planung without a map sends to Daten
     state.step = Step::Planung;
-    let h = panel(state, steps::show);
-    h.get_by_label(text::PLAN_COMING);
+    let mut h = panel(state, steps::show);
+    h.get_by_label(text::EMPTY_NO_MAPS);
+    h.get_by_label(text::GO_TO_DATA).click();
+    h.run();
+    assert_eq!(h.state().1, Some(Action::SetStep(Step::Daten)));
 }
 
 /// eframe's storage in memory.
@@ -508,6 +512,42 @@ fn stored_view_without_spot_fields_loads() {
     let mut back = self::app();
     back.restore_ui(&egui::Context::default(), Some(&storage));
     assert_eq!(back.state().view.point_m, Some(text::POINT_M_RANGE[1]));
+}
+
+/// The size of the brush survives saving and loading; stored without it (before it was kept)
+/// it is the default, a size out of range is clamped.
+#[test]
+fn stored_brush_size() {
+    use driftless_app::ui::brush::{DEFAULT_RADIUS, MAX_RADIUS, MIN_RADIUS};
+    let mut app = app();
+    app.state_mut().brush.radius = 0.35;
+    let mut storage = Storage::default();
+    eframe::App::save(&mut app, &mut storage);
+    let mut back = self::app();
+    back.restore_ui(&egui::Context::default(), Some(&storage));
+    assert_eq!(back.state().brush.radius, 0.35);
+    // stored before the size was kept: the default, the rest as stored
+    let mut app = self::app();
+    app.state_mut().brush.radius = 0.6;
+    app.state_mut().view.point_px = 3.5;
+    let mut ui: serde_json::Value = serde_json::from_str(&app.ui_to_store()).unwrap();
+    let fields = ui.as_object_mut().unwrap();
+    assert!(fields.remove("brush_radius").is_some(), "{fields:?}");
+    let storage = Storage([(UI_KEY.to_string(), ui.to_string())].into());
+    let mut back = self::app();
+    back.restore_ui(&egui::Context::default(), Some(&storage));
+    assert_eq!(back.state().brush.radius, DEFAULT_RADIUS);
+    assert_eq!(back.state().view.point_px, 3.5);
+    // a size set by hand out of range comes back within it
+    for (stored, want) in [(5.0, MAX_RADIUS), (0.001, MIN_RADIUS)] {
+        let mut app = self::app();
+        app.state_mut().brush.radius = stored;
+        let mut storage = Storage::default();
+        eframe::App::save(&mut app, &mut storage);
+        let mut back = self::app();
+        back.restore_ui(&egui::Context::default(), Some(&storage));
+        assert_eq!(back.state().brush.radius, want, "{stored}");
+    }
 }
 
 #[test]

@@ -7,6 +7,7 @@ members = [
     "crates/driftless-odom",
     "crates/driftless-slam",
     "crates/driftless-map",
+    "crates/driftless-plan",
     "crates/driftless-graph",
     "crates/driftless-steps",
     "crates/driftless-gpu",
@@ -15,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.99"
 license = "Apache-2.0 OR MIT"
@@ -48,6 +49,9 @@ opt-level = 2
 [profile.dev.package.jpeg-encoder]
 opt-level = 2
 [profile.dev.package.zune-jpeg]
+opt-level = 2
+# The floor plan tests run whole synthetic rooms of millions of points.
+[profile.dev.package.driftless-plan]
 opt-level = 2
 # The GPU tests compare against the CPU camera model over many points.
 [profile.dev.package.driftless-gpu]

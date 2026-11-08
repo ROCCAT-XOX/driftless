@@ -46,8 +46,6 @@ pub fn drop_unsupported(name: &str) -> String {
     format!("{DROP_UNSUPPORTED}: {name} (LAS, LAZ, E57, PLY, PCD, GLB oder OBJ)")
 }
 
-pub const PLAN_COMING: &str =
-    "Hier entstehen später Grundriss, Maße und der DWG-Export; heute geht das Messen in der Ansicht.";
 pub const ADD_RUN_NEEDS_SCAN: &str = "Zuerst im Feld „Daten“ einen Scan wählen";
 pub const ADD_SCAN_NEEDS_PROJECT: &str = "Zuerst ein Projekt öffnen";
 
@@ -301,7 +299,7 @@ pub const SURFACE_RECOMPUTE_HINT: &str = "Karte wählen und „Oberfläche rechn
 pub const SURFACE_FINENESS: &str = "Feinheit";
 /// Under the switch at 1 cm.
 pub const SURFACE_FINE_HINT: &str =
-    "braucht bei großen Aufnahmen bis 9 GB Arbeitsspeicher und rund 20 Minuten";
+    "braucht bei großen Aufnahmen bis 10 GB Arbeitsspeicher und rund 25 Minuten";
 /// The status of a map whose own map no longer fits its run: its surface waits for „Daten“.
 pub const STATUS_MAP_STALE: &str = "Karte veraltet";
 pub const STATUS_MAP_STALE_HINT: &str =
@@ -338,6 +336,7 @@ pub const STEP_SLAM: &str = "SLAM rechnen";
 pub const STEP_REUSE: &str = "Neu rechnen (aus Teilkarten)";
 pub const STEP_MAP: &str = "Karte rechnen";
 pub const STEP_SURFACE: &str = "Oberfläche rechnen";
+pub const STEP_FLOOR_PLAN: &str = "Grundriss rechnen";
 pub const NOT_COMPUTED: &str = "nicht gerechnet";
 pub const STALE: &str = "veraltet – Laufbahn neu gerechnet";
 pub const NO_CACHE: &str = "Kein Zwischenspeicher submaps.bin – zuerst SLAM rechnen";
@@ -395,7 +394,7 @@ pub const SURFACE_VOXEL_CHOICES: [(f64, &str); 3] =
     [(0.01, "1 cm"), (0.015, "1,5 cm"), (0.02, "2 cm")];
 pub const SURFACE_VOXEL_HINT: &str =
     "Kleiner ist feiner, braucht mehr Speicher und Zeit; 1 cm braucht bei großen Aufnahmen bis \
-     9 GB Arbeitsspeicher und rund 20 Minuten";
+     10 GB Arbeitsspeicher und rund 25 Minuten";
 pub const SURFACE_NO_PHOTOS: &str = "ohne Fotos (graue Fläche)";
 
 // The 3D view and its settings (window ⚙)
@@ -457,6 +456,14 @@ pub const EXPORT: &str = "Exportieren …";
 pub const EXPORT_TITLE: &str = "Exportieren";
 pub const EXPORT_WHAT: &str = "Was";
 pub const EXPORT_FORMAT: &str = "Format";
+/// Where a floor plan is drawn in its DXF.
+pub const EXPORT_PLACEMENT: &str = "Lage";
+pub const EXPORT_PLACEMENT_WALLS: &str = "An den Wänden";
+pub const EXPORT_PLACEMENT_CLOUD: &str = "Wie die Punktwolke";
+pub const EXPORT_PLACEMENT_WALLS_HINT: &str =
+    "Hauptrichtung der Wände = x-Achse, linke untere Ecke = Nullpunkt, Boden = 0";
+pub const EXPORT_PLACEMENT_CLOUD_HINT: &str =
+    "An der Stelle der Punktwolke, gleiche Drehung, in der Höhe des Bodens";
 pub const EXPORT_PICK: &str = "Ziel wählen …";
 pub const EXPORT_REPLACE: &str = "Ersetzen";
 /// Why „Exportieren …“ in ☰ is locked.
@@ -528,6 +535,7 @@ pub fn exported(
         ExportKind::Points => "Punkte",
         ExportKind::Mesh => "Dreiecke",
         ExportKind::Trajectory => "Lagen",
+        ExportKind::Plan => "Elemente",
     };
     let file = report
         .files
@@ -551,6 +559,9 @@ fn file_name(path: &std::path::Path) -> String {
 
 /// The switch at the top right of the view.
 pub const SHOW_MODE: &str = "Ansicht";
+/// The switch of the field „Planung“ over the view.
+pub const PLAN_SWITCH_PLAN: &str = "Plan";
+pub const PLAN_SWITCH_3D: &str = "3D";
 pub const SHOW_SURFACE: &str = "Fläche";
 pub const SHOW_CLOUD: &str = "Punkte";
 pub const SHOW_BOTH: &str = "beides";
@@ -612,12 +623,429 @@ pub const PICKS_ON_CLOUD: &str = "misst an der Punktwolke, nicht an der Fläche"
 /// Measuring and picking look at points only.
 pub const TOOL_NEEDS_CLOUD: &str = "Messen und Punkt wählen brauchen eine Punktwolke";
 
+// The tool „Pinsel“: Stellen painted on the surface, their bar over the tools, their list in
+// „Bilder“.
+pub const TOOL_OBJECT: &str = "Objekt";
+pub const TOOL_OBJECT_HINT: &str =
+    "Setzt Steckdosen, Anschlüsse, Kabel, Rohre, Türen und Fenster in die Ansicht; sie gehören zur Karte oder zum Modell";
+pub const TOOL_BRUSH: &str = "Pinsel";
+pub const TOOL_BRUSH_HINT: &str =
+    "Stellen auf die Oberfläche malen, um sie nachzuarbeiten (glätten, Bilder neu einspielen)";
+/// Why „Pinsel“ is off: no surface is loaded.
+pub const BRUSH_NEEDS_SURFACE: &str = "Pinsel braucht eine Oberfläche";
+/// Why „Pinsel“ is off: the surface is loaded, but only the points are shown.
+pub const BRUSH_NEEDS_SHOWN: &str =
+    "Pinsel malt auf die gezeigte Fläche: oben rechts „Fläche“ oder „beides“ wählen";
+/// Why „Pinsel“ is off: the surface shown is a file opened, no surface of the project.
+pub const BRUSH_NOT_IN_PROJECT: &str =
+    "Pinsel malt nur auf Oberflächen der Karten und Modelle des Projekts";
+/// The size of the brush in its bar, and its tooltip.
+pub const BRUSH_SIZE: &str = "Größe";
+pub const BRUSH_SIZE_HINT: &str = "Radius des Pinsels";
+/// ↶ in the bar of the brush.
+pub const BRUSH_UNDO: &str = "Zurücknehmen";
+/// Above the list of the Stellen of a map or model in „Bilder“.
+pub const MARKS_LIST: &str = "Markierte Stellen";
+pub const MARK_HINT: &str =
+    "Klick zeigt die Stelle in der Ansicht, der Pinsel malt dann in sie · Rechtsklick: Löschen";
+/// The context menu of a Stelle: takes it out with all its touch-up (no question first).
+pub const MARK_DELETE: &str = "Löschen";
+/// The label of the background work that writes `stellen.toml`.
+pub const MARKS_JOB: &str = "Stellen speichern";
+
+/// The key that erases with the brush: ⌥ (option) on a Mac – drawn by the icon font, the
+/// plain fonts lack it –, else Alt.
+pub fn erase_key() -> &'static str {
+    if cfg!(target_os = "macos") {
+        egui_phosphor::regular::OPTION
+    } else {
+        "Alt"
+    }
+}
+
+/// The keys that take back the last stroke or step: ⌘Z on a Mac, else Strg+Z.
+pub fn undo_keys() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌘Z"
+    } else {
+        "Strg+Z"
+    }
+}
+
+/// What a click with the brush does: „Pinsel: Stelle anmalen · mit ⌥ radieren“, painting
+/// into the chosen Stelle `active` „Pinsel: in Stelle 2 malen · mit ⌥ radieren · Esc: neue
+/// Stelle“.
+pub fn brush_hint(active: Option<u32>) -> String {
+    let erase = erase_key();
+    match active {
+        None => format!("Pinsel: Stelle anmalen · mit {erase} radieren"),
+        Some(nr) => {
+            format!("Pinsel: in Stelle {nr} malen · mit {erase} radieren · Esc: neue Stelle")
+        }
+    }
+}
+
+/// The tooltip of ↶.
+pub fn brush_undo_hint() -> String {
+    format!(
+        "Letzten Pinselzug oder Schritt zurücknehmen ({})",
+        undo_keys()
+    )
+}
+
+/// The mouse and keys of the view while the brush is chosen (the tooltip of the info); `fly`:
+/// in fly mode, where the right button looks around.
+pub fn view_help_brush(fly: bool) -> String {
+    let right = if fly { "umsehen" } else { "drehen" };
+    format!(
+        "Linke Taste: malen, mit {} radieren · rechte Taste: {right} · mittlere Taste oder \
+         Shift: verschieben · Rad: Zoom · {}: zurücknehmen · Esc: neue Stelle · F: alles zeigen",
+        erase_key(),
+        undo_keys()
+    )
+}
+
+/// A size of the brush (m) in whole centimetres: „20 cm“.
+pub fn centimetres(m: f32) -> String {
+    format!("{:.0} cm", f64::from(m) * 100.0)
+}
+
+/// [`mark_step`], with the variant of the images the touch-up of the surface shown baked for
+/// it, if known: „Bilder neu eingespielt (Variante 2 von 5 · andere Kamera)“.
+pub fn mark_step_baked(
+    step: &driftless_steps::marks::EditStep,
+    baked: Option<super::brush::Variant>,
+) -> String {
+    match (step, baked) {
+        (driftless_steps::marks::EditStep::Retexture { .. }, Some(v)) => {
+            format!("Bilder neu eingespielt ({})", variant(v))
+        }
+        _ => mark_step(step),
+    }
+}
+
+/// The last step of a Stelle, under its name in the list: „geglättet „stark““, „ganz eben“,
+/// „Bilder neu eingespielt“.
+pub fn mark_step(step: &driftless_steps::marks::EditStep) -> String {
+    use driftless_steps::marks::{EditStep, SmoothLevel};
+    match step {
+        EditStep::Smooth {
+            level: SmoothLevel::Light,
+            ..
+        } => "geglättet „leicht“".into(),
+        EditStep::Smooth {
+            level: SmoothLevel::Strong,
+            ..
+        } => "geglättet „stark“".into(),
+        EditStep::Smooth {
+            level: SmoothLevel::Flat,
+            ..
+        } => "geglättet „ganz eben“".into(),
+        EditStep::Retexture { variant: 0, .. } => "Bilder neu eingespielt".into(),
+        EditStep::Retexture { variant, .. } => {
+            format!("Bilder neu eingespielt (Variante {})", variant + 1)
+        }
+    }
+}
+
+/// A change of the Stellen that could not be saved: they are read again from the file.
+pub fn marks_not_saved(why: &str) -> String {
+    format!("Stellen nicht gespeichert: {why}")
+}
+
+// The touch-up of the Stellen („Nacharbeit“): the steps in the bar of the brush, the step that
+// computes them, what it says.
+/// The touch-up as a step (status bar, Protokoll).
+pub const STEP_TOUCHUP: &str = "Nacharbeit";
+/// Before the three levels of smoothing in the bar.
+pub const SMOOTH_LEVELS: &str = "Glätten:";
+/// The levels: their label, their name (for screen readers and tests) and their tooltip.
+pub const SMOOTH_LIGHT: &str = "leicht";
+pub const SMOOTH_LIGHT_NAME: &str = "Glätten: leicht";
+pub const SMOOTH_LIGHT_HINT: &str = "Die Stelle leicht glätten: feines Rauschen weg";
+pub const SMOOTH_STRONG: &str = "stark";
+pub const SMOOTH_STRONG_NAME: &str = "Glätten: stark";
+pub const SMOOTH_STRONG_HINT: &str = "Die Stelle stark glätten: auch gröbere Unebenheiten weg";
+pub const SMOOTH_FLAT: &str = "ganz eben";
+pub const SMOOTH_FLAT_NAME: &str = "Glätten: ganz eben";
+pub const SMOOTH_FLAT_HINT: &str =
+    "Die Stelle auf eine Ebene legen – für Wände, Boden und Decke. Der Rand geht weich über.";
+/// „Bilder neu einspielen“ and its tooltip.
+pub const RETEXTURE: &str = "Bilder neu einspielen";
+pub const RETEXTURE_HINT: &str = "Die Bilder der Stelle neu einspielen: schärfere, nähere und \
+     geradere Fotos. Jeder weitere Druck probiert die nächstbeste Variante.";
+/// Why „Bilder neu einspielen“ is off (and refused): the scan folders cannot be found.
+pub const RETEXTURE_NO_RAW_DATA: &str =
+    "Rohdaten fehlen – Bilder können nicht neu eingespielt werden";
+/// „Bilder neu einspielen“ off because the folder of `scan` is not there; a model has several.
+pub fn retexture_no_raw_data(scan: &str) -> String {
+    format!("Rohdaten von „{scan}“ fehlen – Bilder können nicht neu eingespielt werden")
+}
+/// Why „Bilder neu einspielen“ is off: the surface was computed without photos (gray).
+pub const RETEXTURE_NO_PHOTOS: &str = "Diese Oberfläche ist ohne Fotos gerechnet";
+/// „Melden …“ in the bar of the brush.
+pub const FEEDBACK_BUTTON: &str = "Melden …";
+
+/// ⇧⇧, the keys that open „Melden“ anywhere: the Shift symbol of the icon font twice (the plain
+/// fonts lack it).
+pub fn double_shift() -> String {
+    egui_phosphor::regular::ARROW_FAT_UP.repeat(2)
+}
+
+/// The tooltip of „Melden …“ in the bar of the brush: about the Stelle chosen (`mark`), else
+/// about none.
+pub fn feedback_button_hint(mark: Option<u32>) -> String {
+    match mark {
+        Some(nr) => format!(
+            "Einen Fehler oder Wunsch zu Stelle {nr} melden ({})",
+            double_shift()
+        ),
+        None => format!("Einen Fehler oder Wunsch melden ({})", double_shift()),
+    }
+}
+
+// „Melden“ (⇧⇧, `crate::feedback`) and ☰ → „Meldungen …“
+/// The dialog.
+pub const FEEDBACK_TITLE: &str = "Melden";
+/// What is reported: the two choices, also the words of the list.
+pub const FEEDBACK_BUG: &str = "Fehler";
+pub const FEEDBACK_WISH: &str = "Wunsch";
+/// The text field while it is empty.
+pub const FEEDBACK_HINT: &str = "Was ist passiert, oder was wünschst du dir?";
+pub const FEEDBACK_ATTACH_IMAGE: &str = "Bild des Fensters anhängen";
+/// Why the picture cannot be attached.
+pub const FEEDBACK_NO_IMAGE: &str = "Kein Bild des Fensters (ohne Grafikkarte)";
+/// Why the Stellen cannot be attached.
+pub const FEEDBACK_NO_MARKS: &str = "Auf der gezeigten Oberfläche ist keine Stelle markiert";
+/// Under the choices: what comes along without the user.
+pub const FEEDBACK_CONTEXT: &str =
+    "Ansicht, Auswahl, Version und die letzten Meldungen der App kommen von selbst dazu";
+/// Saves the report.
+pub const FEEDBACK_SEND: &str = "Melden";
+/// Why „Melden“ waits.
+pub const FEEDBACK_NEEDS_TEXT: &str = "Erst ein paar Worte schreiben";
+/// After a report was saved.
+pub const FEEDBACK_SAVED: &str = "Meldung gespeichert";
+/// „Melden“ when the system names no folder for the reports.
+pub const FEEDBACK_NO_FOLDER: &str = "Kein Ordner für Meldungen: HOME bzw. LOCALAPPDATA fehlt";
+/// The work of the helper that writes a report, and the one that reads the list.
+pub const FEEDBACK_JOB: &str = "Meldung speichern";
+pub const REPORTS_JOB: &str = "Meldungen lesen";
+/// What could not be written of a report.
+pub const FEEDBACK_FOLDER_FAILED: &str = "Ordner der Meldung nicht anlegbar";
+pub const FEEDBACK_FILE_FAILED: &str = "Datei der Meldung nicht schreibbar";
+
+/// „Markierte Stellen anhängen (2)“: the Stellen of the surface shown.
+pub fn feedback_attach_marks(n: usize) -> String {
+    format!("Markierte Stellen anhängen ({n})")
+}
+
+/// The Stelle a report is about: „Zu Stelle 1 · Wand“.
+pub fn feedback_about_mark(label: &str) -> String {
+    format!("Zu {label}")
+}
+
+/// A report that could not be saved (the dialog opens again with it).
+pub fn feedback_not_saved(why: &str) -> String {
+    format!("Meldung nicht gespeichert: {why}")
+}
+
+/// The picture of the window that could not be packed.
+pub fn feedback_picture_failed(e: &dyn std::fmt::Display) -> String {
+    format!("Bild des Fensters nicht speicherbar: {e}")
+}
+
+/// `meldung.toml` that could not be made.
+pub fn feedback_unwritable(e: &dyn std::fmt::Display) -> String {
+    format!("meldung.toml nicht schreibbar: {e}")
+}
+
+/// ☰: the window with the reports of this computer.
+pub const REPORTS: &str = "Meldungen …";
+pub const REPORTS_TITLE: &str = "Meldungen auf diesem Rechner";
+pub const REPORTS_READING: &str = "Meldungen werden gelesen …";
+pub const REPORTS_FOOTER: &str = "Gespeichert im Ordner der App auf diesem Rechner, nichts wird \
+     hochgeladen. Claude liest die offenen Meldungen in der nächsten Sitzung und trägt hier ein, \
+     was daraus wurde.";
+/// Of a report in the list: its folder in the file manager, and back to its view.
+pub const REPORT_OPEN_FOLDER: &str = "Ordner öffnen";
+pub const REPORT_TO_VIEW: &str = "Zur Ansicht";
+pub const REPORT_TO_VIEW_HINT: &str =
+    "Öffnet das Projekt und stellt Auswahl und Ansicht wieder her, wie sie beim Melden waren";
+/// Why „Zur Ansicht“ is off.
+pub const REPORT_NO_VIEW: &str = "Die Meldung nennt kein Projekt und keine Ansicht";
+/// „Zur Ansicht“ of a report whose selection is no longer in the project.
+pub const REPORT_SELECTION_GONE: &str = "Die Auswahl der Meldung gibt es im Projekt nicht mehr";
+/// „Zur Ansicht“ of a report the list no longer holds.
+pub const REPORT_GONE: &str = "Die Meldung gibt es nicht mehr";
+
+/// The tooltip of „Meldungen …“ in ☰.
+pub fn reports_hint() -> String {
+    format!(
+        "Die Fehler und Wünsche, die auf diesem Rechner gemeldet wurden; {} öffnet „Melden“ \
+         überall in der App",
+        double_shift()
+    )
+}
+
+/// The list without a report.
+pub fn reports_none() -> String {
+    format!(
+        "Noch keine Meldungen. {} (zweimal kurz Shift) öffnet „Melden“ überall in der App.",
+        double_shift()
+    )
+}
+
+/// Between the facts of a report in the list (kind, time, project, Stelle).
+pub const REPORT_DOT: &str = "·";
+
+/// The parts of a name as the window joins them: „Oberfläche 001 · Karte 001 · Halle“.
+pub fn joined_name(parts: &[&str]) -> String {
+    parts.join(" · ")
+}
+
+/// The project of a report in the list: „Projekt „Abnahme““.
+pub fn report_project(name: &str) -> String {
+    format!("Projekt „{name}“")
+}
+
+/// The Stelle of a report in the list: „Stelle 1“.
+pub fn report_mark(nr: u32) -> String {
+    format!("Stelle {nr}")
+}
+
+/// When a report was made, in local time: „29.10. 10:14“, of another year „29.10.2025 10:14“;
+/// what cannot be read as it is.
+pub fn report_time(created: &str) -> String {
+    use chrono::Datelike;
+    match chrono::DateTime::parse_from_rfc3339(created) {
+        Ok(t) => {
+            let t = t.with_timezone(&chrono::Local);
+            if t.year() == chrono::Local::now().year() {
+                t.format("%d.%m. %H:%M").to_string()
+            } else {
+                t.format("%d.%m.%Y %H:%M").to_string()
+            }
+        }
+        Err(_) => created.to_string(),
+    }
+}
+
+/// „Vorher“ / „Nachher“ in the bar of the brush: the surface as computed or touched up.
+pub const EDIT_BEFORE: &str = "Vorher";
+pub const EDIT_BEFORE_HINT: &str = "Die Oberfläche, wie sie gerechnet wurde";
+pub const EDIT_AFTER: &str = "Nachher";
+pub const EDIT_AFTER_HINT: &str = "Die Oberfläche mit der Nacharbeit";
+/// Why „Vorher“ / „Nachher“ is off.
+pub const EDIT_NONE: &str = "Diese Oberfläche hat noch keine Nacharbeit";
+/// Beside „Vorher“ / „Nachher“ while „Nachher“ is behind the Stellen (why on hover).
+pub const AFTER_BEHIND: &str = "nicht aktuell";
+/// A touch-up that was to bring „Nachher“ up to date was cancelled (or failed).
+pub const TOUCHUP_OUTDATED: &str = "„Nachher“ ist nicht aktuell – es zeigt den Stand davor, \
+     bis eine Stelle geändert oder die Oberfläche neu geladen wird";
+
+/// ↶ or „Löschen“ while the step `job` runs: the touch-up waits for it.
+pub fn touchup_after_job(job: &str) -> String {
+    format!("„Nachher“ zeigt den neuen Stand erst nach „{job}“")
+}
+
+/// Why the steps are off: no Stelle chosen, a stroke being painted, the touch-up running.
+pub const STEPS_NEED_MARK: &str = "Erst eine Stelle anmalen oder in der Liste wählen";
+pub const STEPS_WAIT_PAINTING: &str = "Erst den Pinselzug beenden";
+pub const TOUCHUP_RUNS: &str = "Die Nacharbeit läuft";
+
+/// The Stelle `nr` asked for is gone (another window, ↶).
+pub fn mark_gone(nr: u32) -> String {
+    format!("Stelle {nr} gibt es nicht mehr")
+}
+
+/// The name of a level of smoothing in a message: „stark“.
+pub fn smooth_level(level: driftless_steps::marks::SmoothLevel) -> &'static str {
+    use driftless_steps::marks::SmoothLevel;
+    match level {
+        SmoothLevel::Light => SMOOTH_LIGHT,
+        SmoothLevel::Strong => SMOOTH_STRONG,
+        SmoothLevel::Flat => SMOOTH_FLAT,
+    }
+}
+
+/// „Variante 2 von 5 · andere Kamera“: the images a step baked, of how many there are, and how
+/// its image stands to those of the variants before, if known.
+pub fn variant(v: super::brush::Variant) -> String {
+    let (variant, of) = v.of;
+    match v.from {
+        Some(from) => format!("Variante {variant} von {of} · {}", variant_from(from)),
+        None => format!("Variante {variant} von {of}"),
+    }
+}
+
+/// How the image of a variant stands to those of the variants before: „bestes Bild“,
+/// „anderer Scan“, „andere Kamera“, „anderer Standort“, „fast wie Variante 1“.
+pub fn variant_from(from: driftless_map::surface::edit::VariantFrom) -> String {
+    use driftless_map::surface::edit::VariantFrom;
+    match from {
+        VariantFrom::Best => "bestes Bild".into(),
+        VariantFrom::OtherScan => "anderer Scan".into(),
+        VariantFrom::OtherCamera => "andere Kamera".into(),
+        VariantFrom::OtherPlace => "anderer Standort".into(),
+        VariantFrom::Like(n) => format!("fast wie Variante {n}"),
+    }
+}
+
+/// A smoothing done: „Stelle 1 geglättet („stark“)“.
+pub fn touchup_smoothed(nr: u32, level: driftless_steps::marks::SmoothLevel) -> String {
+    format!("Stelle {nr} geglättet („{}“)", smooth_level(level))
+}
+
+/// Images baked anew: „Stelle 1: Bilder neu eingespielt (Variante 2 von 5 · andere Kamera)“.
+pub fn touchup_retextured(nr: u32, baked: Option<super::brush::Variant>) -> String {
+    match baked {
+        Some(v) => format!("Stelle {nr}: Bilder neu eingespielt ({})", variant(v)),
+        None => format!("Stelle {nr}: Bilder neu eingespielt"),
+    }
+}
+
+/// No images baked anew, because of `why`: „Bilder nicht neu eingespielt: Rohdaten fehlen –
+/// Scan-Ordner … nicht gefunden“; a stale surface says so as it is („Oberfläche veraltet – …“).
+pub fn no_images_baked(why: &driftless_steps::surface::NoSources) -> String {
+    match why {
+        driftless_steps::surface::NoSources::SurfaceStale => why.to_string(),
+        _ => format!("Bilder nicht neu eingespielt: {why}"),
+    }
+}
+
+/// A step that changed nothing, with why: it is taken back out of the Stellen.
+pub fn touchup_refused(nr: u32, why: &str) -> String {
+    format!("Stelle {nr}: {why}")
+}
+
+/// A step whose computation was cancelled or failed: taken back out of the Stellen.
+pub fn touchup_taken_back(nr: u32) -> String {
+    format!("Stelle {nr}: Schritt nicht ausgeführt und wieder herausgenommen")
+}
+
+/// The touch-up of the Stellen applied to another surface of the map or model (`label`).
+pub fn touchup_applied(label: &str) -> String {
+    format!("Nacharbeit übernommen: {label}")
+}
+
+/// The name of a surface with its touch-up in the window „Exportieren“.
+pub fn export_touched_up(label: &str) -> String {
+    format!("{label} mit Nacharbeit")
+}
+
+/// The camera images of a surface could not be found for its touch-up: it runs without them.
+pub fn raw_data_unreadable(why: &str) -> String {
+    format!("Kamerabilder der Oberfläche nicht lesbar, Nacharbeit ohne sie: {why}")
+}
+
 // Measurements (field „Planung“)
 pub const MEASUREMENTS: &str = "Messungen";
 pub const NO_MEASUREMENTS: &str =
     "Noch keine Messungen. Unten in der Ansicht „Messen“ wählen und zwei Punkte anklicken.";
 pub const MEASUREMENTS_NOT_SAVED: &str =
     "Messungen werden noch nicht gespeichert: sie gehen beim Schließen verloren.";
+pub const MEASUREMENTS_SAVED: &str = "Gespeichert bei dieser Karte bzw. diesem Modell.";
 pub const CLEAR_MEASUREMENTS: &str = "Messungen löschen";
 /// The legend of the quality colours in the view.
 pub const QUALITY_LEGEND: &str = "Güte";
@@ -1389,6 +1817,160 @@ pub fn surface_label(digits: &str) -> String {
 /// A stale surface in the tree: „Oberfläche 001 · veraltet – Karte oder Lauf neu gerechnet“.
 pub fn surface_stale(label: &str) -> String {
     format!("{label} · {SURFACE_STALE}")
+}
+
+/// „Grundriss 001“ for the folder `grundriss-001`.
+pub fn plan_label(digits: &str) -> String {
+    format!("Grundriss {digits}")
+}
+
+/// A floor plan that no longer fits its map or model.
+pub const PLAN_STALE: &str = "veraltet – Karte oder Laufbahn neu gerechnet";
+
+/// The entry of a stale floor plan.
+pub fn plan_stale(label: &str) -> String {
+    format!("{label} · {PLAN_STALE}")
+}
+
+/// „Grundriss 001“, with the storey it was computed for.
+pub fn plan_entry(label: &str, storey: Option<usize>) -> String {
+    match storey {
+        Some(storey) => format!("{label} · Stockwerk {storey}"),
+        None => label.to_string(),
+    }
+}
+
+/// The step found a floor plan that fits: nothing to compute.
+pub fn plan_fits(dir: &std::path::Path) -> String {
+    let name = dir.file_name().map_or_else(
+        || dir.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    format!("Grundriss passt schon: {name}")
+}
+
+/// A map with several storeys asks which one.
+pub const PLAN_SEVERAL_STOREYS: &str = "Mehrere Stockwerke gefunden";
+/// The button of a storey: „Boden 0,00 m · Decke 2,60 m · 80 % der Laufbahn“.
+pub fn storey_line(storey: &driftless_plan::Storey) -> String {
+    let ceiling = storey.ceiling_z.map_or_else(
+        || "keine Decke".to_string(),
+        |c| format!("Decke {}", driftless_plan::metres(c)),
+    );
+    format!(
+        "Boden {} · {ceiling} · {:.0} % der Laufbahn",
+        driftless_plan::metres(storey.floor_z),
+        100.0 * storey.pose_share
+    )
+}
+
+pub const PLAN_COMPUTE_HINT: &str =
+    "Rechnet aus der Karte oder dem Modell einen Grundriss; die Rohdaten braucht er nicht";
+pub const PLAN_PICK_OWNER: &str = "Zuerst eine Karte oder ein Modell wählen";
+pub const PLAN_MAP_INCOMPLETE: &str =
+    "Die Karte ist nicht fertig gerechnet – zuerst in „Daten“ neu rechnen";
+pub const PLAN_LOAD_JOB: &str = "Grundriss lesen";
+// The tool „Objekt“ and its list in the field „Planung“
+pub const OBJECTS_NEED_OWNER: &str = "Objekte brauchen eine Karte oder ein Modell des Projekts";
+pub const OBJECTS_JOB: &str = "Objekte speichern";
+pub const OBJECTS: &str = "Objekte";
+pub const NO_OBJECTS: &str =
+    "Noch keine Objekte. Unten in der Ansicht „Objekt“ wählen und Stellen anklicken.";
+pub const OBJECT_CONNECTION: &str = "Sorte";
+pub const OBJECT_DIAMETER: &str = "Durchmesser";
+pub const OBJECT_HEIGHT: &str = "Höhe";
+pub const OBJECT_SILL: &str = "Brüstung";
+/// A height or sill not known, in the bar.
+pub const OBJECT_LENGTH_UNKNOWN: &str = "–";
+pub const OBJECT_LENGTH_HINT: &str = "– oder 0 heißt: nicht bekannt, dann steht es nicht im Plan";
+pub const OBJECT_UNDO_HINT: &str = "Nimmt die letzte Änderung an den Objekten zurück (⌘Z, Strg+Z)";
+pub const OBJECT_PIPE_NEEDS_DIAMETER: &str = "Ein Rohr braucht einen Durchmesser über 0 mm.";
+pub const OBJECT_SHOW_3D: &str = "In 3D zeigen";
+pub const OBJECT_RENAME: &str = "Umbenennen …";
+pub const OBJECT_NOTE: &str = "Notiz …";
+pub const OBJECT_DELETE: &str = "Löschen";
+pub const OBJECT_RENAME_TITLE: &str = "Objekt umbenennen";
+pub const OBJECT_NOTE_TITLE: &str = "Notiz zum Objekt";
+pub const OBJECT_NAME: &str = "Name";
+pub const OBJECT_NOTE_FIELD: &str = "Notiz";
+pub const OBJECT_NOTE_CONFIRM: &str = "Speichern";
+/// A line with fewer than two points cannot be ended.
+pub fn object_line_short(kind: driftless_steps::objects::ObjectKind) -> &'static str {
+    match kind {
+        driftless_steps::objects::ObjectKind::Pipe => "Ein Rohr braucht mindestens zwei Punkte.",
+        _ => "Ein Kabel braucht mindestens zwei Punkte.",
+    }
+}
+/// What a click into the view does next with the tool „Objekt“.
+pub fn object_hint(kind: driftless_steps::objects::ObjectKind, points: usize) -> String {
+    use driftless_steps::objects::ObjectKind::{Cable, Door, Pipe, Window};
+    let name = kind.label();
+    match (kind, points) {
+        (Cable | Pipe, 0) => format!("{name}: ersten Punkt anklicken"),
+        (Cable | Pipe, _) => format!(
+            "{name}: weiteren Punkt anklicken · Enter oder Doppelklick beendet · \
+             Backspace nimmt zurück · Esc verwirft"
+        ),
+        (Door | Window, 0) => format!("{name}: eine Kante anklicken"),
+        (Door | Window, _) => {
+            format!("{name}: andere Kante anklicken · Backspace nimmt zurück · Esc verwirft")
+        }
+        _ => format!("{name}: Stelle anklicken"),
+    }
+}
+/// What an entry of the list of objects says on hover.
+pub fn object_details(object: &driftless_steps::objects::Object) -> String {
+    let mut lines = vec![object.label()];
+    if let Some(connection) = object.connection {
+        lines.push(connection.label().to_string());
+    }
+    if let Some(mm) = object.diameter_mm {
+        lines.push(format!(
+            "Durchmesser {} mm",
+            format!("{mm}").replace('.', ",")
+        ));
+    }
+    if let Some(width) =
+        driftless_steps::objects::opening_width(&object.points).filter(|_| object.kind.is_opening())
+    {
+        lines.push(format!("Breite {}", meters(width)));
+    }
+    if let Some(height) = object.height_m {
+        lines.push(format!("Höhe {}", meters(height)));
+    }
+    if let Some(sill) = object.sill_m {
+        lines.push(format!("Brüstung {}", meters(sill)));
+    }
+    if !object.note.is_empty() {
+        lines.push(object.note.clone());
+    }
+    lines.join("\n")
+}
+/// A change of the objects could not be saved.
+pub fn objects_not_saved(why: &str) -> String {
+    format!("Objekte nicht gespeichert: {why}")
+}
+pub const PLAN_LAYERS: &str = "Layer";
+/// A layer with what it holds: „Raum (2)“.
+pub fn plan_layer(name: &str, count: usize) -> String {
+    format!("{name} ({count})")
+}
+pub const PLAN_PIPE_HINT: &str = "von Hand · automatisch später";
+pub const PLAN_TOP_VIEW: &str = "Draufsicht";
+/// What screen readers call the picture under the plan.
+pub const PLAN_TOP_VIEW_PICTURE: &str = "Bild der Draufsicht";
+pub const PLAN_TOP_VIEW_MISSING: &str = "Das Bild der Draufsicht fehlt";
+pub const PLAN_HINTS: &str = "Hinweise";
+pub const PLAN_DXF: &str = "DXF …";
+pub const PLAN_DXF_HINT: &str = "Exportiert den Grundriss mit seinen Objekten als DXF";
+
+/// Under the heading „Planung“: how many floor plans the project has.
+pub fn plans_line(plans: usize) -> String {
+    match plans {
+        0 => "Noch kein Grundriss".to_string(),
+        1 => "1 Grundriss".to_string(),
+        n => format!("{n} Grundrisse"),
+    }
 }
 
 /// The step found a surface that fits: nothing to compute.
