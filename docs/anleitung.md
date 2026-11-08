@@ -15,11 +15,12 @@ Wörter in „…“ stehen genau so im Programm.
 7. [Projekte verwalten](#7-projekte-verwalten)
 8. [Korrigieren](#8-korrigieren)
 9. [Stellen nacharbeiten](#9-stellen-nacharbeiten)
-10. [Ergebnis weitergeben](#10-ergebnis-weitergeben)
-11. [Bekannte Grenzen](#11-bekannte-grenzen)
-12. [Melden](#12-melden)
+10. [Grundriss und DXF](#10-grundriss-und-dxf)
+11. [Ergebnis weitergeben](#11-ergebnis-weitergeben)
+12. [Bekannte Grenzen](#12-bekannte-grenzen)
+13. [Melden](#13-melden)
 
-Abschnitt 9 und „Melden“ mit ⇧⇧ in Abschnitt 12 sind neu nach Version 0.1.0.
+Die Abschnitte 9 und 10 und „Melden“ mit ⇧⇧ in Abschnitt 13 sind neu nach Version 0.1.0.
 
 **Wörter, die im Programm vorkommen**
 
@@ -173,13 +174,15 @@ unten die Statusleiste mit „Protokoll“ und „Abbrechen“.
    offen, steht unter ihr klein ein „Hinweis“ („Stellenweise offen“); angeklickt erklärt „Diese
    Oberfläche“ den Grund.
 6. **Messen, wenn nötig.** Unten in der Ansicht „Messen“ wählen und zwei Punkte anklicken: Driftless
-   zeigt den Abstand in Metern. Die Messungen stehen in „Planung“; sie werden noch nicht gespeichert.
-   Gegen ein Maßband oder einen Laser-Entfernungsmesser ist Driftless noch nicht geprüft (Abschnitt 11).
+   zeigt den Abstand in Metern. Die Messungen stehen in „Planung“ und bleiben bei der Karte oder dem
+   Modell gespeichert; auf einer Datei von anderswo bleiben sie nur bis zum Schließen.
+   Gegen ein Maßband oder einen Laser-Entfernungsmesser ist Driftless noch nicht geprüft (Abschnitt 12).
 7. **Exportieren.** Rechtsklick auf eine Karte, eine Oberfläche oder ein Modell → „Exportieren …“. Im
-   Fenster das „Format“ wählen, dann „Ziel wählen …“. Welches Format wofür: Abschnitt 10.
+   Fenster das „Format“ wählen, dann „Ziel wählen …“. Welches Format wofür: Abschnitt 11.
 
 Unten in der Ansicht liegen die Werkzeuge „Drehen“, „Verschieben“, „Punkt wählen“, „Messen“,
-„Schnitt“ (blendet zum Beispiel die Decke aus) und „Pinsel“ (Abschnitt 9); „Alles“ zeigt wieder alles.
+„Schnitt“ (blendet zum Beispiel die Decke aus), „Pinsel“ (Abschnitt 9) und „Objekt“ (Abschnitt 10);
+„Alles“ zeigt wieder alles.
 In ⚙ „Einstellungen“ stehen „Farbart“ („Farbe“, „Intensität“, „Güte“, „je Scan“), „Grafikkarte nutzen“
 („Auto“, „An“, „Aus“) und die Ebenen, zum Beispiel „Laufbahn“ und „Schleifen“.
 
@@ -369,7 +372,7 @@ wieder. Die Ebene „Schleifen“ in ⚙ „Einstellungen“ zeigt die Schleifen
 jeden Stand eines Laufs; ein gewählter Stand lässt sich mit „Diesen Stand wiederherstellen“
 zurückholen. Dabei entsteht ein neuer Stand, die alten bleiben.
 
-Ein schlechtes Stück der Laufbahn wegschneiden geht noch nicht (Abschnitt 11).
+Ein schlechtes Stück der Laufbahn wegschneiden geht noch nicht (Abschnitt 12).
 
 ## 9. Stellen nacharbeiten
 
@@ -458,7 +461,7 @@ Werkzeug, solange die gezeigte Oberfläche Stellen hat und kein Textfeld die Tas
 Statusleiste. „Abbrechen“ hält an; der Schritt ist dann nicht ausgeführt und steht nicht in der Liste.
 Warten noch Scans aus „Alle rechnen“ oder Karten aus „Alle Oberflächen rechnen“, geht es mit ihnen
 danach weiter. Ein Schritt auf einer Stelle von 1 m² dauert wenige Sekunden, der erste nach dem Start
-etwas länger; mehr unter [Bekannte Grenzen](#11-bekannte-grenzen).
+etwas länger; mehr unter [Bekannte Grenzen](#12-bekannte-grenzen).
 
 **Gespeichert.** Die Stellen stehen in `stellen.toml` im Ordner der Karte oder des Modells, die
 Nacharbeit in `nacharbeit/` im Ordner der Oberfläche. Beides übersteht einen Neustart, das Verschieben
@@ -500,9 +503,49 @@ Nacharbeit nicht. Die Kommandozeile exportiert die Oberfläche, wie sie gerechne
 Ordner `nacharbeit/` oder auf einer Datei der Oberfläche selbst lehnt Driftless ab.
 
 **Melden.** „Melden …“ in der Leiste des Pinsels meldet einen Fehler oder Wunsch zu der gewählten
-Stelle (Abschnitt 12).
+Stelle (Abschnitt 13).
 
-## 10. Ergebnis weitergeben
+## 10. Grundriss und DXF
+
+Aus einer Karte oder einem Modell rechnet Driftless einen Grundriss: Wände, Türen, Fenster, Räume und
+Maße. Dazu kommen Steckdosen, Anschlüsse, Kabel und Rohre, die du von Hand setzt. Das Ergebnis geht als
+DXF ins CAD-Programm. Die Rohdaten braucht der Grundriss nicht.
+
+**Rechnen.** Links „Planung“ wählen. Jede Karte und jedes Modell hat eine Kachel mit Stand („nicht
+gerechnet“, „fertig“, „veraltet“). Kachel anklicken, unten „Grundriss rechnen“ drücken. Findet Driftless
+mehrere Stockwerke, zeigt es „Mehrere Stockwerke gefunden“ mit einem Knopf je Stockwerk; ein Plan gilt
+immer für ein Stockwerk.
+
+**Ansehen.** Rechts steht der Plan. Mit gedrückter Taste verschieben, das Rad zoomt zum Zeiger, `F` zeigt
+alles. Oben rechts wechselt „Plan · 3D“ zur 3D-Ansicht und zurück. Unter „Layer“ schaltest du Wände,
+Türen und die übrigen Layer ein und aus; „Draufsicht“ zeigt das Bild von oben unter dem Plan. Was unklar
+geblieben ist, zeichnet der Plan gestrichelt als „Öffnung-unklar“ und nennt es unter „Hinweise“. Räume ohne
+ganz geschlossenen Umriss heißen „offen“.
+
+**Objekte setzen.** „3D“ wählen, unten das Werkzeug „Objekt“. Die Leiste darüber wählt die Art: „Steckdose“,
+„Anschluss“ (mit der Sorte „Strom“, „Wasser“, „Abwasser“, „Heizung“, „Gas“, „Netzwerk“ oder „Sonstiges“),
+„Kabel“ oder „Rohr“ (mit dem „Durchmesser“ in mm). Ein Klick setzt Steckdose oder Anschluss. Bei Kabel und
+Rohr setzt jeder Klick einen Punkt: Enter oder Doppelklick beendet den Linienzug, Backspace nimmt den
+letzten Punkt zurück, Esc verwirft ihn. Getroffen wird die Punktwolke, wie beim „Messen“; ist nur die
+Oberfläche zu sehen, die Oberfläche. ↶ (⌘Z, Strg+Z) nimmt die letzte Änderung zurück, auch nach einem
+Neustart. „Objekt“ geht nur auf einer Karte oder einem Modell des Projekts.
+
+**Liste.** Unter „Objekte“ stehen alle Objekte der Karte oder des Modells. Ein Klick markiert eines im
+Plan, „In 3D zeigen“ führt in der Ansicht hin. Rechtsklick: „Umbenennen …“, „Notiz …“, „Löschen“.
+
+Objekte und Messungen gehören zur Karte oder zum Modell, nicht zum einzelnen Grundriss: Ein neu
+gerechneter Grundriss behält sie. Sie stehen in `objekte.toml` im Ordner der Karte oder des Modells.
+
+**DXF.** „DXF …“ öffnet das Fenster „Exportieren“. Bei „Lage“ steht „An den Wänden“ (die Hauptrichtung ist
+die x-Achse, linke untere Ecke bei null, Boden bei null) oder „Wie die Punktwolke“ (dieselbe Lage wie die
+LAS-Datei). Das DXF ist im Format AutoCAD 2000, in Millimetern. Jede Bauteil-Art liegt auf einem eigenen
+Layer; was in der App aus ist, ist auch im DXF aus. Steckdosen und Anschlüsse sind Blöcke mit den Angaben
+Nummer, Name, Art, Höhe und Notiz.
+
+Über die Kommandozeile geht es auch: `driftless plan <karte>` rechnet den Grundriss, `--dxf <datei>`
+schreibt zugleich das DXF.
+
+## 11. Ergebnis weitergeben
 
 Rechtsklick auf das Ergebnis → „Exportieren …“, „Format“ wählen, „Ziel wählen …“. Eine vorhandene Datei
 wird nur nach „Ersetzen“ überschrieben.
@@ -542,7 +585,7 @@ Dateigrößen, gemessen in [Baustein 3](ergebnisse/2026-10-27-baustein-3.md):
 | OBJ mit Seitenbildern | 267 MB |
 | PLY-Netz | 60 MB |
 
-## 11. Bekannte Grenzen
+## 12. Bekannte Grenzen
 
 Dieselbe Liste steht im [CHANGELOG](../CHANGELOG.md).
 
@@ -559,10 +602,13 @@ Dieselbe Liste steht im [CHANGELOG](../CHANGELOG.md).
 | 1 cm braucht viel Speicher | Eine Oberfläche mit 1 cm braucht bei großen Aufnahmen bis 9 GB Arbeitsspeicher (Büro: 7,7 GB, 20 Minuten). |
 | Verfehlte Qualitätsziele | Bei 1 cm bleiben in großen und in dunklen Räumen Stellen der Oberfläche offen: von oben gesehen im Büro 31 % (Ziel höchstens 30 %), in einem dunklen Raum 9,7 % (Ziel höchstens 6 %). 2 cm schließt mehr. Die Übergänge zwischen zwei Fotos (Nähte) sind deutlicher zu sehen als geplant. Die Oberflächen-Datei eines Raums ist bei 1 cm rund 100 MB groß statt höchstens 60 MB. Dieselbe Wand, mehrmals abgelaufen, liegt vor dem Glätten einige Millimeter auseinander (Ziel höchstens 5 mm); die Ursache ist offen, das Glätten legt sie wieder auf eine Fläche. |
 | Nacharbeit braucht Zeit | Ein Schritt auf einer Stelle von 1 m² dauerte auf dem Testrechner (6 Rechenkerne) 1,5 bis 2,8 s ([Messung](ergebnisse/2026-10-29-pinsel.md)). Größere Stellen dauern länger; gemessen ist bisher nur 1 m². Der erste Schritt nach dem Start legt ein Verzeichnis der Kamerabilder an: Liest Driftless sie dafür vom Laufwerk, etwa gleich nach dem Anstecken, kommen 0,4 bis 1,6 s dazu. Liegen die Scans auf einem langsamen Laufwerk, dauert es länger. Malen und ↶ gehen sofort. |
+| Rohre von Hand | Rohre und Kabel erkennt Driftless nicht selbst, sie werden von Hand gesetzt. |
+| Türen ohne Aufschlag | Eine Tür steht als Öffnung im Plan: Laibung und Schwelle, ohne Türblatt und Aufschlagrichtung. |
+| Ein Stockwerk je Plan | Ein Grundriss zeigt ein Stockwerk. Hat eine Karte mehrere, wird jedes für sich gerechnet. |
 | Dünne Teile dicht an der Wand | Steht dicht vor der Stelle etwas Dünnes, das die Oberfläche nur in Stücken hat, etwa ein Rohr oder ein Kabelkanal, liegt es in den Fotos je nach Standort ein paar Zentimeter anders, ebenso ein dunkler Streifen daneben. „Bilder neu einspielen“ kann dann einen Streifen auf die Stelle legen, schärfer und etwas versetzt. Dann die nächste Variante probieren oder mit ↶ zurücknehmen. Was weiter vor der Wand steht, etwa eine Stange, legt es meist nicht auf die Wand: wenn die Fotos es mindestens 5 cm gegeneinander versetzt zeigen und es sich in der Helligkeit mindestens um das Dreifache von der Wand abhebt. Geprüft ist das nur an einem nachgestellten Beispiel; auf den echten Testscans kam so etwas nicht vor. |
 | Stellen in zwei Fenstern | Stellen derselben Karte oder desselben Modells gleichzeitig in zwei Fenstern nachzuarbeiten ist nicht erprobt. Dafür nur ein Fenster nutzen. |
 
-## 12. Melden
+## 13. Melden
 
 ### In der App: ⇧⇧
 

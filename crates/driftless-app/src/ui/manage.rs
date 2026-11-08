@@ -22,6 +22,8 @@ pub fn show(ctx: &Context, state: &mut AppState) -> Option<Action> {
         Ask::RenameScan { .. } => text::RENAME_TITLE,
         Ask::RemoveScan { .. } => text::REMOVE_TITLE,
         Ask::Delete(_) => text::DELETE_TITLE,
+        Ask::RenameObject { .. } => text::OBJECT_RENAME_TITLE,
+        Ask::ObjectNote { .. } => text::OBJECT_NOTE_TITLE,
     };
     egui::Window::new(title)
         .collapsible(false)
@@ -33,6 +35,38 @@ pub fn show(ctx: &Context, state: &mut AppState) -> Option<Action> {
                 Ask::RenameScan { id, name } => rename(ui, state, id, name),
                 Ask::RemoveScan { id } => remove(ui, state, id),
                 Ask::Delete(question) => delete(ui, state, question),
+                Ask::RenameObject { owner, nr, name } => object_text(
+                    ui,
+                    state,
+                    (text::OBJECT_NAME, text::RENAME_CONFIRM),
+                    name,
+                    |name| Ask::RenameObject {
+                        owner: owner.clone(),
+                        nr: *nr,
+                        name,
+                    },
+                    |name| Action::RenameObject {
+                        owner: owner.clone(),
+                        nr: *nr,
+                        name,
+                    },
+                ),
+                Ask::ObjectNote { owner, nr, note } => object_text(
+                    ui,
+                    state,
+                    (text::OBJECT_NOTE_FIELD, text::OBJECT_NOTE_CONFIRM),
+                    note,
+                    |note| Ask::ObjectNote {
+                        owner: owner.clone(),
+                        nr: *nr,
+                        note,
+                    },
+                    |note| Action::SetObjectNote {
+                        owner: owner.clone(),
+                        nr: *nr,
+                        note,
+                    },
+                ),
             };
         });
     action
@@ -92,6 +126,36 @@ fn rename(ui: &mut Ui, state: &mut AppState, id: &str, name: &str) -> Option<Act
             id: id.to_string(),
             name: typed,
         }),
+        (Some(false), _) => Some(Action::CloseAsk),
+        _ => None,
+    }
+}
+
+/// A text of an object being typed: `(what it is called, the button)`, `value` as typed so far;
+/// `ask` keeps what is typed, `answer` is what the button asks for.
+fn object_text(
+    ui: &mut Ui,
+    state: &mut AppState,
+    (name, confirm): (&str, &str),
+    value: &str,
+    ask: impl FnOnce(String) -> Ask,
+    answer: impl FnOnce(String) -> Action,
+) -> Option<Action> {
+    let mut typed = value.to_string();
+    let enter = ui
+        .horizontal(|ui| {
+            let label = ui.label(name);
+            let edit = ui
+                .add(egui::TextEdit::singleline(&mut typed).desired_width(WIDTH - 80.0))
+                .labelled_by(label.id);
+            edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+        })
+        .inner;
+    if typed != value {
+        state.ask = Some(ask(typed.clone()));
+    }
+    match (buttons(ui, confirm, None), enter) {
+        (Some(true), _) | (_, true) => Some(answer(typed)),
         (Some(false), _) => Some(Action::CloseAsk),
         _ => None,
     }

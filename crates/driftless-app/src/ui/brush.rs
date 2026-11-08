@@ -411,6 +411,12 @@ pub fn keys(ctx: &Context, state: &mut AppState) -> Option<Action> {
     if state.brush.painting || !tools::keys_free(ctx) {
         return None;
     }
+    // ⌘Z with the tool „Objekt“ is for the objects, and only those
+    if state.tool == Tool::Object {
+        let undo = super::objects::can_undo(state)
+            && ctx.input_mut(|i| !i.modifiers.shift && i.consume_shortcut(&UNDO));
+        return undo.then_some(Action::UndoObject);
+    }
     let other = state.ask.is_some() || egui::Popup::is_any_open(ctx);
     let deselect = state.tool == Tool::Brush && state.brush.active.is_some() && !other;
     if deselect && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
@@ -936,6 +942,14 @@ struct Ring {
     erase: bool,
 }
 
+/// The height cut of the view, absolute (`view_origin`: the origin of the view).
+fn view_cut(state: &AppState, view_origin: [f64; 3]) -> Option<[f64; 2]> {
+    state.view.cut.map(|[lo, hi]| {
+        let z = view_origin[2];
+        [z + f64::from(lo), z + f64::from(hi)]
+    })
+}
+
 /// How a frame sees the surface: through the camera, in the frame of the view.
 struct Sight<'a> {
     pick: &'a SurfacePick,
@@ -1234,6 +1248,30 @@ impl Brush {
         Some(tris)
     }
 
+    /// Where the ray through the pixel `px` (physical, from the top left of the view,
+    /// `viewport` large) first meets the surface shown, through the height cut: what the tool
+    /// „Objekt“ hits while only the surface is shown. `None` without a surface to hit or if the
+    /// ray meets none.
+    pub fn surface_hit(
+        &self,
+        state: &AppState,
+        px: [f32; 2],
+        viewport: [f32; 2],
+        camera: &Camera,
+        view_origin: [f64; 3],
+    ) -> Option<[f64; 3]> {
+        let shown = state.surface.as_ref().map(|s| &s.path);
+        let hits = self.hits.as_ref().filter(|h| Some(&h.glb) == shown)?;
+        let sight = Sight {
+            pick: &hits.pick,
+            camera,
+            viewport,
+            origin: view_origin,
+            cut: view_cut(state, view_origin),
+        };
+        sight.hit(px).map(|hit| hit.pos)
+    }
+
     /// One frame of the pointer, after the view took it (`input`, seen by `camera` in the frame
     /// at `view_origin`): the ring under it, and the stroke – begun, followed, ended. Returns
     /// the stroke as [`Action::Paint`] once it ended: let go, or where the brush cannot follow
@@ -1259,16 +1297,12 @@ impl Brush {
             // the brush cannot follow the stroke any more: it ends where it got to
             return self.finish();
         };
-        let cut = state.view.cut.map(|[lo, hi]| {
-            let z = view_origin[2];
-            [z + f64::from(lo), z + f64::from(hi)]
-        });
         let sight = Sight {
             pick: &pick,
             camera,
             viewport: input.viewport,
             origin: view_origin,
-            cut,
+            cut: view_cut(state, view_origin),
         };
         let radius = state.brush.radius.clamp(MIN_RADIUS, MAX_RADIUS);
         if let Some(hit) = input.hover.and_then(|px| sight.hit(px)) {
@@ -1609,6 +1643,7 @@ mod tests {
                 settings: Some(SurfaceSettings::default()),
                 hints: Vec::new(),
             }],
+            plans: Vec::new(),
             incomplete: false,
         };
         let run = RunInfo {

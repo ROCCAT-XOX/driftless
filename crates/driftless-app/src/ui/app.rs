@@ -6,6 +6,9 @@ use super::compare::{compare_maps, compare_refs, default_refs, TrajRef};
 use super::correct::{Corrected, RunLoaded};
 use super::export::{self, ExportDialog};
 use super::feedback::{FeedbackDialog, ReportList};
+use super::objects::{self, ObjectChange};
+use super::plan::{self, PlanMode};
+use super::plan_view;
 use super::tools::{self, PairSession, ScreenLayout, Tool};
 use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
@@ -20,7 +23,9 @@ use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
 use crate::logfile::{self, Level, LogFile};
 use crate::overlay::RunOverlay;
 use crate::pick::relative_to;
-use crate::project::{canonical, change_project, set_point_pair_enabled, Choices, Project};
+use crate::project::{
+    canonical, change_project, set_point_pair_enabled, Choices, PlanJobDone, Project,
+};
 use crate::render::ShowMode;
 use crate::surface::{load_mesh, surface_glb, SurfaceEdit, TouchupOutput, ViewEdit, SURFACE_GLB};
 use crate::synthetic::synthetic_cloud;
@@ -348,6 +353,14 @@ enum HelperTask {
     Feedback(Box<FeedbackJob>),
     /// The reports in the folder, for the list (☰ → „Meldungen …“).
     ReadReports(PathBuf),
+    /// A floor plan from its folder.
+    LoadPlan(PathBuf),
+    /// A change of the objects of the map or model in the folder, in its `objekte.toml`
+    /// ([`Objects::change`]); made on [`AppState::objects`] already.
+    Objects {
+        owner: PathBuf,
+        change: ObjectChange,
+    },
 }
 
 /// A report of „Melden“ to write ([`HelperTask::Feedback`]).
@@ -567,6 +580,12 @@ pub struct DriftlessApp {
     /// before it, so they are not taken from it.
     marks_saved: u64,
     tree_marks_at: u64,
+    /// The same for the objects.
+    objects_saved: u64,
+    tree_objects_at: u64,
+    /// An object to show in the view ([`Action::FrameObject`]) of the map or model in the
+    /// folder, once its cloud is there.
+    object_to_frame: Option<(PathBuf, u32)>,
     /// ⇧⇧ anywhere in the window opens „Melden“.
     double_shift: DoubleShift,
     /// „Melden“ asked for while the picture of the window is awaited.
@@ -644,6 +663,9 @@ impl DriftlessApp {
             image_indices: Arc::default(),
             marks_saved: 0,
             tree_marks_at: 0,
+            objects_saved: 0,
+            tree_objects_at: 0,
+            object_to_frame: None,
             double_shift: DoubleShift::default(),
             feedback_ask: None,
             feedback_dir: None,
@@ -1429,6 +1451,7 @@ impl DriftlessApp {
             }
             Selection::Surface(dir) => self.load_surface(&dir),
             Selection::Model(dir) => self.load_model_cloud(dir.join(MODEL_LAS)),
+            Selection::Plan(dir) => self.helper_queue.push_back(HelperTask::LoadPlan(dir)),
             _ => {}
         }
     }
@@ -1515,6 +1538,7 @@ impl DriftlessApp {
                 self.tree_task = Some(task);
                 self.tree_discard = false;
                 self.tree_marks_at = self.marks_saved;
+                self.tree_objects_at = self.objects_saved;
             }
             Err(e) => self.error(e.to_string()),
         }
@@ -1580,9 +1604,16 @@ impl DriftlessApp {
                         let changed =
                             self.marks_pending() || self.marks_saved != self.tree_marks_at;
                         let marks = changed.then(|| std::mem::take(&mut self.state.marks));
+                        // and so are the objects
+                        let changed =
+                            self.objects_pending() || self.objects_saved != self.tree_objects_at;
+                        let objects = changed.then(|| std::mem::take(&mut self.state.objects));
                         self.state.set_tree(tree);
                         if let Some(marks) = marks {
                             self.state.marks = marks;
+                        }
+                        if let Some(objects) = objects {
+                            self.state.objects = objects;
                         }
                         self.tell_cloud(&dir, cloud);
                     }
@@ -1609,9 +1640,12 @@ impl DriftlessApp {
     fn opened(&mut self, read: ProjectRead) {
         self.stop_queue();
         self.state.touchup.waiting.clear();
-        // the measurements belong to the project shown (they are not saved yet)
+        // those in memory belong to the project shown; a map's come back with it
         self.state.measurements.clear();
+        self.state.measure_view = objects::MeasureView::default();
         self.state.measure_a = None;
+        self.state.object_tool.line.clear();
+        self.object_to_frame = None;
         self.drop_surface();
         let ProjectRead {
             project,
@@ -1794,9 +1828,13 @@ impl DriftlessApp {
     /// the step is cancelled and [`DriftlessApp::take_close`] says when to close, so the
     /// window never waits for it inside the event loop.
     pub fn close_requested(&mut self) -> bool {
-        // a stroke or ↶ not yet in `stellen.toml`, a report not yet in its folder, are saved
-        // first
-        if !self.jobs.is_busy() && !self.marks_pending() && !self.feedback_pending() {
+        // a stroke or ↶ not yet in `stellen.toml`, a change of the objects not yet in
+        // `objekte.toml`, a report not yet in its folder, are saved first
+        if !self.jobs.is_busy()
+            && !self.marks_pending()
+            && !self.objects_pending()
+            && !self.feedback_pending()
+        {
             return true;
         }
         if !self.closing {
@@ -1814,7 +1852,7 @@ impl DriftlessApp {
     /// True once, after a put-off close, when the step has ended and the Stellen and the reports
     /// are saved.
     pub fn take_close(&mut self) -> bool {
-        let saving = self.marks_pending() || self.feedback_pending();
+        let saving = self.marks_pending() || self.objects_pending() || self.feedback_pending();
         if self.closing && !self.jobs.is_busy() && !saving {
             self.closing = false;
             return true;
@@ -1944,6 +1982,19 @@ impl DriftlessApp {
                 }
                 (Some(HelperTask::Feedback(_)), result) => self.feedback_written(result),
                 (Some(HelperTask::ReadReports(_)), result) => self.reports_read(result),
+                (Some(HelperTask::LoadPlan(_)), Ok(JobOutput::PlanLoaded(plan))) => {
+                    // the objects as the plan just read them, unless a change is under way
+                    if let (Some(owner), false) = (plan.dir.parent(), self.objects_pending()) {
+                        self.state
+                            .objects
+                            .insert(owner.to_path_buf(), Ok(plan.objects.clone()));
+                    }
+                    plan::set_shown(&mut self.state.plan, *plan);
+                }
+                (Some(HelperTask::LoadPlan(_)), Err(e)) => self.error(text::step_error(&e)),
+                (Some(HelperTask::Objects { owner, .. }), result) => {
+                    self.objects_written(owner, result)
+                }
                 _ => {}
             }
         }
@@ -2089,6 +2140,14 @@ impl DriftlessApp {
                     Ok(JobOutput::Marks(Box::new(marks)))
                 })
             }
+            HelperTask::Objects { owner, change } => {
+                let (owner, change) = (owner.clone(), change.clone());
+                self.helper.start(text::OBJECTS_JOB, move |_| {
+                    let (objects, _) =
+                        driftless_steps::objects::Objects::change(&owner, |o| change.apply(o))?;
+                    Ok(JobOutput::Objects(Box::new(objects)))
+                })
+            }
             HelperTask::Feedback(job) => {
                 let job = (**job).clone();
                 self.helper.start(text::FEEDBACK_JOB, move |_| {
@@ -2110,6 +2169,12 @@ impl DriftlessApp {
                 let dir = dir.clone();
                 self.helper.start(text::REPORTS_JOB, move |_| {
                     Ok(JobOutput::Reports(crate::feedback::read_all(&dir)))
+                })
+            }
+            HelperTask::LoadPlan(dir) => {
+                let dir = dir.clone();
+                self.helper.start(text::PLAN_LOAD_JOB, move |_| {
+                    Ok(JobOutput::PlanLoaded(Box::new(plan::load(&dir)?)))
                 })
             }
         };
@@ -2148,6 +2213,10 @@ impl DriftlessApp {
                 HelperTask::Marks { owner, .. } => {
                     let owner = owner.clone();
                     self.marks_written(owner, Err(StepError::Failed(e.to_string())))
+                }
+                HelperTask::Objects { owner, .. } => {
+                    let owner = owner.clone();
+                    self.objects_written(owner, Err(StepError::Failed(e.to_string())))
                 }
                 HelperTask::Feedback(_) => {
                     self.feedback_written(Err(StepError::Failed(e.to_string())))
@@ -2460,6 +2529,109 @@ impl DriftlessApp {
                 self.refresh_tree();
             }
         }
+    }
+
+    /// Changes the objects of the map or model in `owner`: at once on those shown
+    /// ([`AppState::objects`]), then in its `objekte.toml` in the background, in order. A change
+    /// that changes nothing writes nothing; an unreadable file is changed not at all.
+    fn change_objects(&mut self, owner: PathBuf, change: ObjectChange) {
+        let read = self
+            .state
+            .objects
+            .entry(owner.clone())
+            .or_insert_with(|| Ok(driftless_steps::objects::Objects::default()));
+        let objects = match read {
+            Ok(objects) => objects,
+            Err(e) => {
+                let e = text::objects_not_saved(e);
+                self.error(e);
+                return;
+            }
+        };
+        let before = objects.clone();
+        if let Err(e) = change.apply(objects) {
+            self.error(text::objects_not_saved(&e.to_string()));
+            return;
+        }
+        if *objects != before {
+            self.helper_queue
+                .push_back(HelperTask::Objects { owner, change });
+        }
+    }
+
+    /// A change of the objects of `owner` was written (or refused): the file as it is now is
+    /// shown, unless a later change of it is still to be written (it brings its own); a refusal
+    /// is said, and the tree is read again.
+    fn objects_written(&mut self, owner: PathBuf, result: Result<JobOutput, StepError>) {
+        self.objects_saved += 1;
+        let later = self
+            .helper_queue
+            .iter()
+            .any(|t| matches!(t, HelperTask::Objects { owner: o, .. } if *o == owner));
+        match result {
+            Ok(JobOutput::Objects(objects)) if !later => {
+                self.state.objects.insert(owner, Ok(*objects));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.error(text::objects_not_saved(&text::step_error(&e)));
+                self.refresh_tree();
+            }
+        }
+    }
+
+    /// Whether a change of the objects is still to be written.
+    fn objects_pending(&self) -> bool {
+        let objects = |t: &HelperTask| matches!(t, HelperTask::Objects { .. });
+        self.helper_running.as_ref().is_some_and(objects) || self.helper_queue.iter().any(objects)
+    }
+
+    /// Marks object `nr` of those listed and goes to it in the 3D view: the plan on the screen
+    /// gives way to it and the cloud of the map or model comes if another one is shown.
+    fn frame_object(&mut self, nr: u32) {
+        let Some(owner) = objects::listed_owner(&self.state) else {
+            return;
+        };
+        self.state.plan.selected_object = Some(nr);
+        self.state.plan.mode = PlanMode::View3d;
+        if objects::view_owner(&self.state).as_ref() != Some(&owner) && !self.is_loading() {
+            self.load_cloud_of(&owner);
+        }
+        self.object_to_frame = Some((owner, nr));
+    }
+
+    /// Goes to the object of [`Action::FrameObject`], once its map or model is shown and the
+    /// cloud is on the GPU.
+    fn advance_frame_object(&mut self) {
+        let Some((owner, nr)) = self.object_to_frame.clone() else {
+            return;
+        };
+        if self.render_state.is_none() {
+            self.object_to_frame = None;
+            return;
+        }
+        let shown = objects::view_owner(&self.state).as_ref() == Some(&owner);
+        if self.is_loading() || (shown && self.view.is_uploading()) {
+            return;
+        }
+        self.object_to_frame = None;
+        let view = self.layout.view;
+        let place = objects::of(&self.state, &owner)
+            .and_then(|o| o.get(nr))
+            .and_then(|o| objects::frame_of(&o.points));
+        let (Some(origin), Some((centre, radius)), true) = (self.view_origin(), place, shown)
+        else {
+            return;
+        };
+        let aspect = if view.height() > 0.0 {
+            view.width() / view.height()
+        } else {
+            1.0
+        };
+        let centre = relative_to(origin, centre);
+        self.view
+            .camera_mut()
+            .frame_facing(centre, [0.0; 3], radius as f32, aspect);
     }
 
     /// Whether a change of the Stellen is still to be written.
@@ -2855,6 +3027,7 @@ impl DriftlessApp {
         }
         // last: what the selection of a report loads starts here, its run is read next tick
         self.advance_report_view();
+        self.advance_frame_object();
     }
 
     fn finished(&mut self, f: JobFinished) {
@@ -2988,6 +3161,17 @@ impl DriftlessApp {
                     self.want_touchup(done.dir.clone(), None, true);
                 }
             }
+            (Some(JobOutput::PlanStep(done)), Some(Action::RunPlan { owner, .. })) => match *done {
+                PlanJobDone::Done { dir, reused } => {
+                    if reused {
+                        self.info(text::plan_fits(&dir));
+                    }
+                    self.show_plan(dir);
+                }
+                PlanJobDone::SeveralStoreys(storeys) => {
+                    self.state.plan.storeys = Some((owner, storeys));
+                }
+            },
             (Some(JobOutput::Touchup(out)), Some(Action::Touchup { step, tell, .. })) => {
                 self.touchup_done(*out, step, tell)
             }
@@ -3417,7 +3601,8 @@ impl DriftlessApp {
             | Action::RunSurface(_)
             | Action::RunMerge { .. }
             | Action::ApplyPairs { .. }
-            | Action::RunModelSurface { .. }) => {
+            | Action::RunModelSurface { .. }
+            | Action::RunPlan { .. }) => {
                 match actions::start_step(&mut self.state, &mut self.jobs, &step) {
                     Ok(()) => {
                         // the merge runs: its field closes, the model shows when it is done
@@ -3463,6 +3648,47 @@ impl DriftlessApp {
                     dialog.replace = None;
                 }
                 self.apply(Action::RunExport(request));
+            }
+            Action::ShowPlan(dir) => self.show_plan(dir),
+            Action::SetPlanMode(mode) => self.set_plan_mode(mode),
+            Action::SetPlanLayer { layer, on } => plan::set_layer(&mut self.state.plan, &layer, on),
+            Action::SetTopView(on) => self.state.plan.top_view = on,
+            Action::AddObject { owner, input } => {
+                self.change_objects(owner, ObjectChange::Add(input));
+            }
+            Action::RemoveObject { owner, nr } => {
+                self.change_objects(owner, ObjectChange::Remove(nr));
+            }
+            Action::RenameObject { owner, nr, name } => {
+                self.state.ask = None;
+                self.change_objects(owner, ObjectChange::Rename(nr, name));
+            }
+            Action::SetObjectNote { owner, nr, note } => {
+                self.state.ask = None;
+                self.change_objects(owner, ObjectChange::Note(nr, note));
+            }
+            Action::UndoObject => {
+                if let Some(owner) = objects::listed_owner(&self.state) {
+                    self.change_objects(owner, ObjectChange::Undo);
+                }
+            }
+            Action::FrameObject(nr) => self.frame_object(nr),
+            Action::ClearMeasurements => {
+                self.state.measure_a = None;
+                if objects::measurements_saved(&self.state) {
+                    if let Some(owner) = objects::measure_owner(&self.state) {
+                        self.change_objects(owner, ObjectChange::ClearMeasurements);
+                    }
+                } else {
+                    self.state.measurements.clear();
+                }
+            }
+            Action::OpenPlanExport => {
+                if let Some(dir) = self.state.plan.shown.as_ref().map(|s| s.dir.clone()) {
+                    let source = plan::export_source(&self.state.plan, &dir);
+                    let name = export::source_name(&self.state, &source);
+                    self.state.export = ExportDialog::new(vec![(source, name)]);
+                }
             }
             Action::OpenMerge => self.state.open_merge(),
             Action::StartPairs { model, member } => self.start_pairs(&model, member),
@@ -3580,6 +3806,34 @@ impl DriftlessApp {
         };
     }
 
+    /// Shows the floor plan in `dir` (read in the background) and selects it.
+    fn show_plan(&mut self, dir: PathBuf) {
+        self.state.selection = Selection::Plan(dir.clone());
+        self.state.plan.mode = PlanMode::Plan;
+        self.helper_queue.push_back(HelperTask::LoadPlan(dir));
+    }
+
+    /// „Plan · 3D“; 3D brings the cloud of the map or model of the plan if none is shown yet.
+    fn set_plan_mode(&mut self, mode: PlanMode) {
+        self.state.plan.mode = mode;
+        if mode != PlanMode::View3d || self.cloud.is_some() || self.is_loading() {
+            return;
+        }
+        let Some(owner) = self.state.plan.owner.clone() else {
+            return;
+        };
+        self.load_cloud_of(&owner);
+    }
+
+    /// Loads the cloud of the map or model in the folder `owner`.
+    fn load_cloud_of(&mut self, owner: &Path) {
+        if self.state.model(owner).is_some() {
+            self.load_model_cloud(owner.join(MODEL_LAS));
+        } else {
+            self.load_best_of_map(owner);
+        }
+    }
+
     /// „Aus der Ansicht nehmen“: what the view shows from the folder `dir` or from a model that
     /// uses it goes (the cloud, the surface, „Von Hand ausrichten“), and the selection if it
     /// lies there; the run drawn follows ([`Self::sync_run`]).
@@ -3606,6 +3860,9 @@ impl DriftlessApp {
         if self.state.pairs.as_ref().is_some_and(|p| hit(&p.model)) {
             tools::end_pairs(&mut self.state);
         }
+        for dir in &touched {
+            plan::unshow(&mut self.state, dir);
+        }
         self.sync_run();
     }
 
@@ -3617,6 +3874,7 @@ impl DriftlessApp {
             | Selection::Cloud(p)
             | Selection::Surface(p)
             | Selection::Model(p)
+            | Selection::Plan(p)
             | Selection::History { run: p, .. } => p.starts_with(dir),
             Selection::None | Selection::Scan(_) => false,
         }
@@ -3863,6 +4121,8 @@ impl DriftlessApp {
             show_mode_key(&ctx, &mut self.state);
             tools::keys(&ctx, &mut self.state);
         }
+        // the tool keeps up with what is shown: the measurements listed, the plan
+        objects::sync(&mut self.state);
         // ⇧⇧ anywhere: „Melden“
         if ctx.input(|i| self.double_shift.feed(&i.events, i.time)) {
             self.ask_feedback(None);
@@ -3871,10 +4131,15 @@ impl DriftlessApp {
 
         let mut actions: Vec<Action> = Vec::new();
         if !reporting {
+            actions.extend(objects::keys(&ctx, &mut self.state));
             actions.extend(brush::keys(&ctx, &mut self.state));
         }
         // without a surface of the project to paint on the brush goes back to „Drehen“
         if self.state.tool == Tool::Brush && brush::blocked(&self.state).is_some() {
+            tools::select(&mut self.state, Tool::Orbit);
+        }
+        // without a map or model of the project shown „Objekt“ goes back to „Drehen“
+        if self.state.tool == Tool::Object && objects::blocked(&self.state).is_some() {
             tools::select(&mut self.state, Tool::Orbit);
         }
         // the marks lie on the state drawn: „Nachher“ where the touch-up moved them
@@ -3928,8 +4193,13 @@ impl DriftlessApp {
             pick_places: self.state.correct.picking,
         });
         let shown = self.cloud.is_some() || overlay.is_some() || self.view.has_surface();
-        let central =
-            egui::CentralPanel::no_frame().show(ui, |ui| match (&self.render_state, shown) {
+        let plan_shown = plan::on_screen(&self.state);
+        let central = egui::CentralPanel::no_frame().show(ui, |ui| {
+            if plan_shown {
+                actions.extend(plan_view::show(ui, &mut self.state));
+                return;
+            }
+            match (&self.render_state, shown) {
                 (Some(rs), true) => {
                     let rect = ui.max_rect();
                     event = self
@@ -3953,6 +4223,7 @@ impl DriftlessApp {
                         let camera = self.view.camera();
                         tools::paint_measurements(ui, rect, camera, origin, &self.state);
                         tools::paint_pairs(ui, rect, camera, origin, &self.state);
+                        objects::paint(ui, rect, camera, origin, &self.state);
                         if self.state.tool == Tool::Brush {
                             let radius = self.state.brush.radius;
                             self.brush.paint_ring(ui, rect, camera, origin, radius);
@@ -3969,7 +4240,8 @@ impl DriftlessApp {
                     };
                     ui.centered_and_justified(|ui| ui.weak(hint));
                 }
-            });
+            }
+        });
         self.state.brush.painting = self.brush.painting();
         self.no_surface_hint(&ctx, central.response.rect);
         self.drop_hint(&ctx);
@@ -3980,9 +4252,24 @@ impl DriftlessApp {
         }
         let view = central.response.rect;
         actions.extend(tools::floats(&ctx, view, &mut self.state, &mut self.layout));
-        let legend = self.quality_drawn();
+        let legend = self.quality_drawn() && !plan_shown;
         tools::quality_legend(&ctx, view, legend, &mut self.layout);
         match event {
+            Some(ViewEvent::SurfaceClick { px, viewport }) => {
+                if let Some(origin) = origin {
+                    let camera = self.view.camera();
+                    let hit = self
+                        .brush
+                        .surface_hit(&self.state, px, viewport, camera, origin);
+                    if let Some(position) = hit {
+                        actions.extend(objects::point_clicked(&mut self.state, position));
+                    }
+                }
+            }
+            Some(ViewEvent::EndLine) => {
+                actions.extend(objects::finish_line(&mut self.state));
+                ctx.request_repaint();
+            }
             Some(ViewEvent::PickedPose(i)) => self.pose_picked(i),
             Some(ViewEvent::TrajectoryHidden) => {
                 let m = UiMessage::Info(text::PICK_NEEDS_TRAJECTORY.into());
@@ -4018,7 +4305,18 @@ impl DriftlessApp {
             ctx.request_repaint();
         }
         if let (Some(cloud), Some(ViewEvent::PickedPoint(i))) = (&self.cloud, event) {
-            tools::point_clicked(&mut self.state, point_info(cloud, i));
+            let point = point_info(cloud, i);
+            let measured = self.state.measurements.len();
+            match self.state.tool {
+                Tool::Object => {
+                    actions.extend(objects::point_clicked(&mut self.state, point.position));
+                }
+                _ => tools::point_clicked(&mut self.state, point),
+            }
+            // a new measurement is kept with its map or model
+            if self.state.measurements.len() > measured {
+                actions.extend(objects::measured(&mut self.state));
+            }
             // the marker and the measurement show from the next frame on
             ctx.request_repaint();
         }

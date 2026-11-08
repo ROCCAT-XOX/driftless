@@ -5,7 +5,7 @@
 //! Layout: the rail at the left edge ([`rail`]: ☰, the three [`Step`]s, ⚙), next to it the
 //! field of the active step ([`steps`]), the 3D view ([`view3d`]) in the rest with its floating
 //! bars ([`tools`]: info, the switch Punkte · Fläche · beides, the tools, the cut and the bar of
-//! the brush, [`brush`]), the status bar ([`status`]) at the bottom, the settings window ⚙
+//! the brush, [`brush`], and of the tool „Objekt“, [`objects`]), the status bar ([`status`]) at the bottom, the settings window ⚙
 //! ([`settings`]), the window „Exportieren“ ([`export`]), the window „Über Driftless“
 //! ([`about`]), and „Melden“ (⇧⇧) with the list of the reports ([`feedback`]).
 
@@ -18,6 +18,9 @@ pub mod correct;
 pub mod export;
 pub mod feedback;
 pub mod manage;
+pub mod objects;
+pub mod plan;
+pub mod plan_view;
 pub mod rail;
 pub mod settings;
 pub mod status;
@@ -35,8 +38,9 @@ pub use app::{
 use crate::camera::CameraMode;
 use crate::jobs::JobStatus;
 use crate::project::{
-    map_status, model_status, model_surface_status, point_pairs, state_gap, surface_status,
-    MapStatus, MergePick, ModelInfo, Project, ProjectError, RunInfo, ScanState, SurfaceSettings,
+    map_status, model_plan_status, model_status, model_surface_status, plan_status, point_pairs,
+    state_gap, surface_status, MapStatus, MergePick, ModelInfo, Project, ProjectError, RunInfo,
+    ScanState, SurfaceSettings,
 };
 use crate::render::{ColorMode, PointSize, ShowMode};
 use driftless_gpu::GpuPref;
@@ -59,7 +63,7 @@ pub enum Step {
     Daten,
     /// Surfaces of the maps: the view shows the surface.
     Bilder,
-    /// Floor plan and measures (comes with Baustein 5).
+    /// Floor plans of the maps and models, and the measurements.
     Planung,
 }
 
@@ -88,6 +92,8 @@ pub enum Selection {
     History { run: PathBuf, nr: u32 },
     /// A model folder (`modelle/modell-NNN`).
     Model(PathBuf),
+    /// A floor plan folder (`grundriss-NNN`) of a map or model.
+    Plan(PathBuf),
 }
 
 /// What a panel asks for. `Pick…` open a dialog first.
@@ -138,6 +144,53 @@ pub enum Action {
     RunModelSurface {
         model: PathBuf,
     },
+    /// A floor plan of the map or model in folder `owner`, as a step; `storey` (from 1) once
+    /// the map turned out to have several.
+    RunPlan {
+        owner: PathBuf,
+        storey: Option<usize>,
+    },
+    /// Show the floor plan in the folder.
+    ShowPlan(PathBuf),
+    /// „Plan · 3D“ of the field „Planung“.
+    SetPlanMode(plan::PlanMode),
+    /// Switches a layer of the plan shown on or off.
+    SetPlanLayer {
+        layer: String,
+        on: bool,
+    },
+    /// Draws the picture from above under the plan, or not.
+    SetTopView(bool),
+    /// „DXF …“: the window „Exportieren“ for the plan shown, with its layers as they are shown.
+    OpenPlanExport,
+    /// Adds an object to the map or model in `owner`: shown at once, saved in its
+    /// `objekte.toml` in the background ([`objects::ObjectChange`]).
+    AddObject {
+        owner: PathBuf,
+        input: driftless_steps::objects::ObjectInput,
+    },
+    /// Takes object `nr` out of the list of the map or model; ↶ brings it back.
+    RemoveObject {
+        owner: PathBuf,
+        nr: u32,
+    },
+    RenameObject {
+        owner: PathBuf,
+        nr: u32,
+        name: String,
+    },
+    SetObjectNote {
+        owner: PathBuf,
+        nr: u32,
+        note: String,
+    },
+    /// ↶, ⌘Z with the tool „Objekt“: takes back the youngest change of the objects listed.
+    UndoObject,
+    /// Marks object `nr` of the objects listed and goes to it in the 3D view.
+    FrameObject(u32),
+    /// „Messungen löschen“: of the map or model as one step back for ↶; on a cloud from
+    /// elsewhere those in memory.
+    ClearMeasurements,
     /// „Von Hand ausrichten“ of scan `member` (from 0) of the model (folder): shows the
     /// model and that scan side by side and opens the tool „Punktpaare“.
     StartPairs {
@@ -330,6 +383,18 @@ pub enum Ask {
     RemoveScan { id: String },
     /// „Löschen …“ of a folder of the tree.
     Delete(DeleteQuestion),
+    /// „Umbenennen …“ of object `nr` of the map or model in `owner`: the name being typed.
+    RenameObject {
+        owner: PathBuf,
+        nr: u32,
+        name: String,
+    },
+    /// „Notiz …“ of object `nr`: the note being typed.
+    ObjectNote {
+        owner: PathBuf,
+        nr: u32,
+        note: String,
+    },
 }
 
 /// What „Löschen …“ asks: the folder, its name and size, what lies in it, and the models
@@ -515,6 +580,8 @@ pub struct Tree {
     pub busy: Vec<(PathBuf, String)>,
     /// The Stellen of the maps and models, by folder ([`brush::read_marks`]).
     pub marks: BTreeMap<PathBuf, brush::MarksRead>,
+    /// The objects of the maps and models, by folder ([`objects::read_objects`]).
+    pub objects: BTreeMap<PathBuf, objects::ObjectsRead>,
 }
 
 /// Reads the tree of `project` from disk: every scan folder, run, map, surface and model, the
@@ -557,13 +624,15 @@ pub fn read_tree(project: &Project) -> Tree {
         Err(e) => (Vec::new(), Some(e)),
     };
     let models = project.models();
-    let owners = scans
+    let owners: Vec<PathBuf> = scans
         .iter()
         .flat_map(|s: &ScanNode| &s.runs)
         .flat_map(|r| &r.maps)
         .map(|m| m.dir.clone())
-        .chain(models.iter().map(|m| m.dir.clone()));
-    let marks = brush::read_marks(owners);
+        .chain(models.iter().map(|m| m.dir.clone()))
+        .collect();
+    let marks = brush::read_marks(owners.iter().cloned());
+    let objects = objects::read_objects(owners);
     Tree {
         scans,
         models,
@@ -572,6 +641,7 @@ pub fn read_tree(project: &Project) -> Tree {
         leftovers: crate::leftovers::find(&project.dir, &ids),
         busy: crate::leftovers::busy_folders(&project.dir),
         marks,
+        objects,
     }
 }
 
@@ -691,8 +761,11 @@ pub struct AppState {
     pub picked: Option<view3d::PointInfo>,
     /// The tool of the view; always exactly one.
     pub tool: tools::Tool,
-    /// The measurements of the tool „Messen“, oldest first (not saved yet: Baustein 5).
+    /// The measurements of the tool „Messen“ of the map or model shown, oldest first; on a
+    /// cloud from elsewhere those made in memory ([`objects::MeasureView`]).
     pub measurements: Vec<tools::Measurement>,
+    /// Which measurements [`AppState::measurements`] holds.
+    pub measure_view: objects::MeasureView,
     /// The first end of a measurement being made (absolute); Esc or another tool drops it.
     pub measure_a: Option<[f64; 3]>,
     /// The manual corrections of the run the view draws.
@@ -722,6 +795,11 @@ pub struct AppState {
     /// since by this window (a stroke shows here at once and is saved in the background):
     /// those of the surface shown are listed in „Bilder“ and marked in the view.
     pub marks: BTreeMap<PathBuf, brush::MarksRead>,
+    /// The objects of the maps and models, by folder, as last read with the tree and changed
+    /// since by this window: listed in „Planung“, drawn in the view and the plan.
+    pub objects: BTreeMap<PathBuf, objects::ObjectsRead>,
+    /// The tool „Objekt“: what it sets next, a line under way.
+    pub object_tool: objects::ObjectTool,
     /// The brush: its size and the Stelle it paints into.
     pub brush: brush::BrushState,
     /// The touch-up of the Stellen: „Vorher“ / „Nachher“, what the view holds, what waits.
@@ -730,6 +808,8 @@ pub struct AppState {
     pub feedback_dialog: Option<feedback::FeedbackDialog>,
     /// The window „Meldungen auf diesem Rechner“, while it is open.
     pub feedback_list: Option<feedback::ReportList>,
+    /// The field „Planung“ and the plan shown.
+    pub plan: plan::PlanState,
 }
 
 impl AppState {
@@ -751,6 +831,7 @@ impl AppState {
         self.inspect = None;
         self.merge = steps::merge::MergeState::default();
         tools::end_pairs(self);
+        self.plan = plan::PlanState::default();
         self.set_tree(tree);
     }
 
@@ -796,6 +877,7 @@ impl AppState {
         self.leftovers = tree.leftovers;
         self.busy = tree.busy;
         self.marks = tree.marks;
+        self.objects = tree.objects;
         // „Von Hand ausrichten“ of a model that is gone ends
         let gone = self
             .pairs
@@ -816,10 +898,12 @@ impl AppState {
         let dirs: std::collections::BTreeSet<PathBuf> = maps
             .chain(models)
             .flat_map(|(dir, surfaces)| std::iter::once(dir).chain(surfaces.iter().map(|s| &s.dir)))
+            .chain(self.all_plans().map(|(_, p)| &p.dir))
             .cloned()
             .collect();
         self.map_status.retain(|dir, _| dirs.contains(dir));
         self.mark_stale_surfaces();
+        plan::sync_with_tree(self);
         self.tree_version += 1;
     }
 
@@ -829,19 +913,47 @@ impl AppState {
         self.mark_stale_surfaces();
     }
 
-    /// [`crate::project::SurfaceInfo::stale`] of the tree from [`AppState::map_status`].
+    /// [`crate::project::SurfaceInfo::stale`] and [`crate::project::PlanInfo::stale`] of the
+    /// tree from [`AppState::map_status`]; a plan is stale too while its map or model is.
     fn mark_stale_surfaces(&mut self) {
         let status = &self.map_status;
+        let stale = |dir: &Path| status.get(dir).is_some_and(|s| s.stale);
         let maps = self
             .scans
             .iter_mut()
             .flat_map(|s| &mut s.runs)
-            .flat_map(|r| &mut r.maps)
-            .flat_map(|m| &mut m.surfaces);
-        let models = self.models.iter_mut().flat_map(|m| &mut m.surfaces);
-        for surface in maps.chain(models) {
-            surface.stale = status.get(&surface.dir).is_some_and(|s| s.stale);
+            .flat_map(|r| &mut r.maps);
+        for map in maps {
+            for surface in &mut map.surfaces {
+                surface.stale = stale(&surface.dir);
+            }
+            for plan in &mut map.plans {
+                plan.stale = stale(&plan.dir) || stale(&map.dir);
+            }
         }
+        for model in &mut self.models {
+            for surface in &mut model.surfaces {
+                surface.stale = stale(&surface.dir);
+            }
+            for plan in &mut model.plans {
+                plan.stale = stale(&plan.dir) || stale(&model.dir);
+            }
+        }
+    }
+
+    /// Every floor plan of the project with the folder of its map or model.
+    pub fn all_plans(&self) -> impl Iterator<Item = (&Path, &crate::project::PlanInfo)> {
+        let maps = self
+            .scans
+            .iter()
+            .flat_map(|s| &s.runs)
+            .flat_map(|r| &r.maps)
+            .flat_map(|m| m.plans.iter().map(|p| (m.dir.as_path(), p)));
+        let models = self
+            .models
+            .iter()
+            .flat_map(|m| m.plans.iter().map(|p| (m.dir.as_path(), p)));
+        maps.chain(models)
     }
 
     /// The work of computing [`AppState::map_status`] for the current tree, to run off the
@@ -869,12 +981,18 @@ impl AppState {
                 for surface in &model.surfaces {
                     out.insert(surface.dir.clone(), model_surface_status(&model, surface));
                 }
+                for plan in &model.plans {
+                    out.insert(plan.dir.clone(), model_plan_status(&model, plan));
+                }
                 out.insert(model.dir.clone(), model_status(&model));
             }
             for (scan, run, map) in maps {
                 for surface in &map.surfaces {
                     let status = surface_status(&scan, &run, &map, surface);
                     out.insert(surface.dir.clone(), status);
+                }
+                for plan in &map.plans {
+                    out.insert(plan.dir.clone(), plan_status(&map.dir, plan));
                 }
                 out.insert(map.dir.clone(), map_status(&scan, &run, &map));
             }
@@ -948,8 +1066,8 @@ impl AppState {
         })
     }
 
-    /// The name of a folder of the tree: a run, a map, a surface or a model; `None` for
-    /// another folder.
+    /// The name of a folder of the tree: a run, a map, a surface, a floor plan or a model;
+    /// `None` for another folder.
     fn tree_label(&self, dir: &Path) -> Option<String> {
         let maps = self.all_maps();
         self.scans
@@ -968,6 +1086,11 @@ impl AppState {
                     .chain(self.models.iter().flat_map(|m| &m.surfaces))
                     .find(|s| s.dir == dir)
                     .map(|s| s.label.clone())
+            })
+            .or_else(|| {
+                self.all_plans()
+                    .find(|(_, p)| p.dir == dir)
+                    .map(|(_, p)| p.label.clone())
             })
     }
 
@@ -1002,8 +1125,8 @@ impl AppState {
     }
 
     /// The question before „Löschen …“ of the folder `dir` of the tree: its name and size,
-    /// what lies in it (the maps of a run, the surfaces of a map or model) and the models that
-    /// use it; `None` for a folder that is not in the tree.
+    /// what lies in it (the maps of a run, the surfaces and floor plans of a map or model) and
+    /// the models that use it; `None` for a folder that is not in the tree.
     pub fn delete_question(&self, dir: &Path) -> Option<DeleteQuestion> {
         let label = self.tree_label(dir)?;
         let mut contains: Vec<String> = Vec::new();
@@ -1029,6 +1152,9 @@ impl AppState {
             );
         for surface in surfaces {
             contains.extend(self.sized_label(&surface.dir));
+        }
+        for (_, plan) in self.all_plans().filter(|(owner, _)| owner.starts_with(dir)) {
+            contains.extend(self.sized_label(&plan.dir));
         }
         Some(DeleteQuestion {
             dir: dir.to_path_buf(),
@@ -1063,6 +1189,7 @@ impl AppState {
             self.surface.as_ref().map(|s| s.path.as_path()),
             self.correct.run.as_deref(),
             self.pairs.as_ref().map(|p| p.model.as_path()),
+            self.plan.shown.as_ref().map(|p| p.dir.as_path()),
         ];
         let p = shown
             .into_iter()
@@ -1124,6 +1251,11 @@ impl AppState {
                 vec![run.clone()]
             }
             Action::RunSurface(map) => vec![map.clone()],
+            // it reads the map or model and writes a folder of it
+            Action::RunPlan { owner, .. } => match self.model(owner) {
+                Some(_) => model_maps(owner),
+                None => vec![owner.clone()],
+            },
             // it reads the Stellen of the map or model the surface folder lies in
             Action::Touchup { surface, .. } => vec![surface.clone()],
             Action::RunMerge { picks, .. } => picks.iter().map(|p| p.map.clone()).collect(),
@@ -1138,7 +1270,8 @@ impl AppState {
                 | S::EditedSurface(p)
                 | S::Run(p)
                 | S::PointFile(p)
-                | S::MeshFile(p)) = &req.source;
+                | S::MeshFile(p)
+                | S::Plan { dir: p, .. }) = &req.source;
                 vec![p.clone()]
             }
             _ => Vec::new(),
@@ -1177,6 +1310,9 @@ impl AppState {
             Selection::Surface(d) => maps
                 .into_iter()
                 .find(|m| m.surfaces.iter().any(|s| s.dir == *d)),
+            Selection::Plan(d) => maps
+                .into_iter()
+                .find(|m| m.plans.iter().any(|p| p.dir == *d)),
             _ => None,
         }
     }
@@ -1189,6 +1325,10 @@ impl AppState {
                 .models
                 .iter()
                 .find(|m| m.surfaces.iter().any(|s| s.dir == *d)),
+            Selection::Plan(d) => self
+                .models
+                .iter()
+                .find(|m| m.plans.iter().any(|p| p.dir == *d)),
             _ => None,
         }
     }
@@ -1350,6 +1490,7 @@ impl AppState {
                 self.run(dir).map(|(s, _)| s)
             }
             Action::RunSurface(dir) => self.map(dir).map(|(s, _, _)| s),
+            Action::RunPlan { owner, .. } => self.map(owner).map(|(s, _, _)| s),
             _ => None,
         }
     }
@@ -1380,7 +1521,9 @@ impl AppState {
                 .iter()
                 .any(|m| m.surfaces.iter().any(|s| s.dir == *d)),
             Selection::History { run, .. } => r.dir == *run,
-            Selection::None | Selection::Scan(_) | Selection::Model(_) => false,
+            Selection::None | Selection::Scan(_) | Selection::Model(_) | Selection::Plan(_) => {
+                false
+            }
         };
         self.scans
             .iter()

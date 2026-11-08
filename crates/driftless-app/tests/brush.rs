@@ -726,6 +726,7 @@ fn state_with_map() -> AppState {
         settings: Some(MapSwitches::default()),
         clouds: Vec::new(),
         surfaces: vec![surface],
+        plans: Vec::new(),
         incomplete: false,
     };
     let run = RunInfo {

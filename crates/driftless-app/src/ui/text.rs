@@ -46,8 +46,6 @@ pub fn drop_unsupported(name: &str) -> String {
     format!("{DROP_UNSUPPORTED}: {name} (LAS, LAZ, E57, PLY, PCD, GLB oder OBJ)")
 }
 
-pub const PLAN_COMING: &str =
-    "Hier entstehen später Grundriss, Maße und der DWG-Export; heute geht das Messen in der Ansicht.";
 pub const ADD_RUN_NEEDS_SCAN: &str = "Zuerst im Feld „Daten“ einen Scan wählen";
 pub const ADD_SCAN_NEEDS_PROJECT: &str = "Zuerst ein Projekt öffnen";
 
@@ -338,6 +336,7 @@ pub const STEP_SLAM: &str = "SLAM rechnen";
 pub const STEP_REUSE: &str = "Neu rechnen (aus Teilkarten)";
 pub const STEP_MAP: &str = "Karte rechnen";
 pub const STEP_SURFACE: &str = "Oberfläche rechnen";
+pub const STEP_FLOOR_PLAN: &str = "Grundriss rechnen";
 pub const NOT_COMPUTED: &str = "nicht gerechnet";
 pub const STALE: &str = "veraltet – Laufbahn neu gerechnet";
 pub const NO_CACHE: &str = "Kein Zwischenspeicher submaps.bin – zuerst SLAM rechnen";
@@ -457,6 +456,14 @@ pub const EXPORT: &str = "Exportieren …";
 pub const EXPORT_TITLE: &str = "Exportieren";
 pub const EXPORT_WHAT: &str = "Was";
 pub const EXPORT_FORMAT: &str = "Format";
+/// Where a floor plan is drawn in its DXF.
+pub const EXPORT_PLACEMENT: &str = "Lage";
+pub const EXPORT_PLACEMENT_WALLS: &str = "An den Wänden";
+pub const EXPORT_PLACEMENT_CLOUD: &str = "Wie die Punktwolke";
+pub const EXPORT_PLACEMENT_WALLS_HINT: &str =
+    "Hauptrichtung der Wände = x-Achse, linke untere Ecke = Nullpunkt, Boden = 0";
+pub const EXPORT_PLACEMENT_CLOUD_HINT: &str =
+    "An der Stelle der Punktwolke, gleiche Drehung, in der Höhe des Bodens";
 pub const EXPORT_PICK: &str = "Ziel wählen …";
 pub const EXPORT_REPLACE: &str = "Ersetzen";
 /// Why „Exportieren …“ in ☰ is locked.
@@ -528,6 +535,7 @@ pub fn exported(
         ExportKind::Points => "Punkte",
         ExportKind::Mesh => "Dreiecke",
         ExportKind::Trajectory => "Lagen",
+        ExportKind::Plan => "Elemente",
     };
     let file = report
         .files
@@ -551,6 +559,9 @@ fn file_name(path: &std::path::Path) -> String {
 
 /// The switch at the top right of the view.
 pub const SHOW_MODE: &str = "Ansicht";
+/// The switch of the field „Planung“ over the view.
+pub const PLAN_SWITCH_PLAN: &str = "Plan";
+pub const PLAN_SWITCH_3D: &str = "3D";
 pub const SHOW_SURFACE: &str = "Fläche";
 pub const SHOW_CLOUD: &str = "Punkte";
 pub const SHOW_BOTH: &str = "beides";
@@ -614,6 +625,9 @@ pub const TOOL_NEEDS_CLOUD: &str = "Messen und Punkt wählen brauchen eine Punkt
 
 // The tool „Pinsel“: Stellen painted on the surface, their bar over the tools, their list in
 // „Bilder“.
+pub const TOOL_OBJECT: &str = "Objekt";
+pub const TOOL_OBJECT_HINT: &str =
+    "Setzt Steckdosen, Anschlüsse, Kabel und Rohre in die Ansicht; sie gehören zur Karte oder zum Modell";
 pub const TOOL_BRUSH: &str = "Pinsel";
 pub const TOOL_BRUSH_HINT: &str =
     "Stellen auf die Oberfläche malen, um sie nachzuarbeiten (glätten, Bilder neu einspielen)";
@@ -1027,6 +1041,7 @@ pub const NO_MEASUREMENTS: &str =
     "Noch keine Messungen. Unten in der Ansicht „Messen“ wählen und zwei Punkte anklicken.";
 pub const MEASUREMENTS_NOT_SAVED: &str =
     "Messungen werden noch nicht gespeichert: sie gehen beim Schließen verloren.";
+pub const MEASUREMENTS_SAVED: &str = "Gespeichert bei dieser Karte bzw. diesem Modell.";
 pub const CLEAR_MEASUREMENTS: &str = "Messungen löschen";
 /// The legend of the quality colours in the view.
 pub const QUALITY_LEGEND: &str = "Güte";
@@ -1798,6 +1813,140 @@ pub fn surface_label(digits: &str) -> String {
 /// A stale surface in the tree: „Oberfläche 001 · veraltet – Karte oder Lauf neu gerechnet“.
 pub fn surface_stale(label: &str) -> String {
     format!("{label} · {SURFACE_STALE}")
+}
+
+/// „Grundriss 001“ for the folder `grundriss-001`.
+pub fn plan_label(digits: &str) -> String {
+    format!("Grundriss {digits}")
+}
+
+/// A floor plan that no longer fits its map or model.
+pub const PLAN_STALE: &str = "veraltet – Karte oder Laufbahn neu gerechnet";
+
+/// The entry of a stale floor plan.
+pub fn plan_stale(label: &str) -> String {
+    format!("{label} · {PLAN_STALE}")
+}
+
+/// „Grundriss 001“, with the storey it was computed for.
+pub fn plan_entry(label: &str, storey: Option<usize>) -> String {
+    match storey {
+        Some(storey) => format!("{label} · Stockwerk {storey}"),
+        None => label.to_string(),
+    }
+}
+
+/// The step found a floor plan that fits: nothing to compute.
+pub fn plan_fits(dir: &std::path::Path) -> String {
+    let name = dir.file_name().map_or_else(
+        || dir.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    format!("Grundriss passt schon: {name}")
+}
+
+/// A map with several storeys asks which one.
+pub const PLAN_SEVERAL_STOREYS: &str = "Mehrere Stockwerke gefunden";
+/// The button of a storey: „Boden 0,00 m · Decke 2,60 m · 80 % der Laufbahn“.
+pub fn storey_line(storey: &driftless_plan::Storey) -> String {
+    let ceiling = storey.ceiling_z.map_or_else(
+        || "keine Decke".to_string(),
+        |c| format!("Decke {}", driftless_plan::metres(c)),
+    );
+    format!(
+        "Boden {} · {ceiling} · {:.0} % der Laufbahn",
+        driftless_plan::metres(storey.floor_z),
+        100.0 * storey.pose_share
+    )
+}
+
+pub const PLAN_COMPUTE_HINT: &str =
+    "Rechnet aus der Karte oder dem Modell einen Grundriss; die Rohdaten braucht er nicht";
+pub const PLAN_PICK_OWNER: &str = "Zuerst eine Karte oder ein Modell wählen";
+pub const PLAN_MAP_INCOMPLETE: &str =
+    "Die Karte ist nicht fertig gerechnet – zuerst in „Daten“ neu rechnen";
+pub const PLAN_LOAD_JOB: &str = "Grundriss lesen";
+// The tool „Objekt“ and its list in the field „Planung“
+pub const OBJECTS_NEED_OWNER: &str = "Objekte brauchen eine Karte oder ein Modell des Projekts";
+pub const OBJECTS_JOB: &str = "Objekte speichern";
+pub const OBJECTS: &str = "Objekte";
+pub const NO_OBJECTS: &str =
+    "Noch keine Objekte. Unten in der Ansicht „Objekt“ wählen und Stellen anklicken.";
+pub const OBJECT_CONNECTION: &str = "Sorte";
+pub const OBJECT_DIAMETER: &str = "Durchmesser";
+pub const OBJECT_UNDO_HINT: &str = "Nimmt die letzte Änderung an den Objekten zurück (⌘Z, Strg+Z)";
+pub const OBJECT_PIPE_NEEDS_DIAMETER: &str = "Ein Rohr braucht einen Durchmesser über 0 mm.";
+pub const OBJECT_SHOW_3D: &str = "In 3D zeigen";
+pub const OBJECT_RENAME: &str = "Umbenennen …";
+pub const OBJECT_NOTE: &str = "Notiz …";
+pub const OBJECT_DELETE: &str = "Löschen";
+pub const OBJECT_RENAME_TITLE: &str = "Objekt umbenennen";
+pub const OBJECT_NOTE_TITLE: &str = "Notiz zum Objekt";
+pub const OBJECT_NAME: &str = "Name";
+pub const OBJECT_NOTE_FIELD: &str = "Notiz";
+pub const OBJECT_NOTE_CONFIRM: &str = "Speichern";
+/// A line with fewer than two points cannot be ended.
+pub fn object_line_short(kind: driftless_steps::objects::ObjectKind) -> &'static str {
+    match kind {
+        driftless_steps::objects::ObjectKind::Pipe => "Ein Rohr braucht mindestens zwei Punkte.",
+        _ => "Ein Kabel braucht mindestens zwei Punkte.",
+    }
+}
+/// What a click into the view does next with the tool „Objekt“.
+pub fn object_hint(kind: driftless_steps::objects::ObjectKind, points: usize) -> String {
+    use driftless_steps::objects::ObjectKind::{Cable, Pipe};
+    let name = kind.label();
+    match (kind, points) {
+        (Cable | Pipe, 0) => format!("{name}: ersten Punkt anklicken"),
+        (Cable | Pipe, _) => format!(
+            "{name}: weiteren Punkt anklicken · Enter oder Doppelklick beendet · \
+             Backspace nimmt zurück · Esc verwirft"
+        ),
+        _ => format!("{name}: Stelle anklicken"),
+    }
+}
+/// What an entry of the list of objects says on hover.
+pub fn object_details(object: &driftless_steps::objects::Object) -> String {
+    let mut lines = vec![object.label()];
+    if let Some(connection) = object.connection {
+        lines.push(connection.label().to_string());
+    }
+    if let Some(mm) = object.diameter_mm {
+        lines.push(format!(
+            "Durchmesser {} mm",
+            format!("{mm}").replace('.', ",")
+        ));
+    }
+    if !object.note.is_empty() {
+        lines.push(object.note.clone());
+    }
+    lines.join("\n")
+}
+/// A change of the objects could not be saved.
+pub fn objects_not_saved(why: &str) -> String {
+    format!("Objekte nicht gespeichert: {why}")
+}
+pub const PLAN_LAYERS: &str = "Layer";
+/// A layer with what it holds: „Raum (2)“.
+pub fn plan_layer(name: &str, count: usize) -> String {
+    format!("{name} ({count})")
+}
+pub const PLAN_PIPE_HINT: &str = "von Hand · automatisch später";
+pub const PLAN_TOP_VIEW: &str = "Draufsicht";
+/// What screen readers call the picture under the plan.
+pub const PLAN_TOP_VIEW_PICTURE: &str = "Bild der Draufsicht";
+pub const PLAN_TOP_VIEW_MISSING: &str = "Das Bild der Draufsicht fehlt";
+pub const PLAN_HINTS: &str = "Hinweise";
+pub const PLAN_DXF: &str = "DXF …";
+pub const PLAN_DXF_HINT: &str = "Exportiert den Grundriss mit seinen Objekten als DXF";
+
+/// Under the heading „Planung“: how many floor plans the project has.
+pub fn plans_line(plans: usize) -> String {
+    match plans {
+        0 => "Noch kein Grundriss".to_string(),
+        1 => "1 Grundriss".to_string(),
+        n => format!("{n} Grundrisse"),
+    }
 }
 
 /// The step found a surface that fits: nothing to compute.

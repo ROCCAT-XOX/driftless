@@ -13,6 +13,7 @@ use driftless_steps::export::{
     check_export, existing_targets, ExportFormat, ExportKind, ExportRequest, ExportSource,
 };
 use driftless_steps::merge::MODEL_LAS;
+use driftless_steps::plan_drawing::{PlanExport, PlanPlacement};
 use eframe::egui::{self, Context, Ui};
 use std::path::{Path, PathBuf};
 
@@ -53,6 +54,7 @@ pub fn default_format(kind: ExportKind) -> ExportFormat {
         ExportKind::Points => ExportFormat::Laz,
         ExportKind::Mesh => ExportFormat::Glb,
         ExportKind::Trajectory => ExportFormat::Csv,
+        ExportKind::Plan => ExportFormat::Dxf,
     }
 }
 
@@ -80,6 +82,15 @@ impl ExportDialog {
             .into_iter()
             .filter(|f| f.kind() == kind)
             .collect()
+    }
+
+    /// How the chosen floor plan is exported; `None` for any other source.
+    fn plan_export(&mut self) -> Option<&mut PlanExport> {
+        let last = self.choices.len() - 1;
+        match &mut self.choices[self.chosen.min(last)].0 {
+            ExportSource::Plan { export, .. } => Some(export),
+            _ => None,
+        }
     }
 
     /// Chooses source `k`; a source of another kind starts with its first format.
@@ -142,6 +153,7 @@ pub fn source_name(state: &AppState, source: &ExportSource) -> String {
             }
         }
         ExportSource::MeshFile(f) => folder(f),
+        ExportSource::Plan { dir, .. } => state.tree_label(dir).unwrap_or_else(|| folder(dir)),
     }
 }
 
@@ -303,6 +315,11 @@ pub fn show(ctx: &Context, state: &mut AppState) -> Option<Action> {
                         let label = ui.label(text::EXPORT_FORMAT);
                         format_choice(ui, dialog, label.id);
                         ui.end_row();
+                        if let Some(export) = dialog.plan_export() {
+                            ui.label(text::EXPORT_PLACEMENT);
+                            placement_choice(ui, export);
+                            ui.end_row();
+                        }
                     });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -323,6 +340,17 @@ pub fn show(ctx: &Context, state: &mut AppState) -> Option<Action> {
         state.export = None;
     }
     action
+}
+
+/// Lage of a floor plan: „An den Wänden“ (the default) or „Wie die Punktwolke“.
+fn placement_choice(ui: &mut Ui, export: &mut PlanExport) {
+    ui.vertical(|ui| {
+        let place = &mut export.placement;
+        ui.radio_value(place, PlanPlacement::Walls, text::EXPORT_PLACEMENT_WALLS)
+            .on_hover_text(text::EXPORT_PLACEMENT_WALLS_HINT);
+        ui.radio_value(place, PlanPlacement::AsCloud, text::EXPORT_PLACEMENT_CLOUD)
+            .on_hover_text(text::EXPORT_PLACEMENT_CLOUD_HINT);
+    });
 }
 
 /// Was: the name of the one source, or a choice of several.

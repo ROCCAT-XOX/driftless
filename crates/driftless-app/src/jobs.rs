@@ -30,10 +30,11 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::cloud::{LoadedCloud, PairCloud};
-use crate::project::{MapDone, MapStatus, SlamDone, SurfaceDone};
+use crate::project::{MapDone, MapStatus, PlanJobDone, SlamDone, SurfaceDone};
 use crate::surface::LoadedSurface;
 use crate::ui::compare::{Comparison, MapComparison};
 use crate::ui::correct::{Corrected, RunLoaded};
+use crate::ui::plan::ShownPlan;
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
 use driftless_steps::export::ExportReport;
 use driftless_steps::inspect;
@@ -51,6 +52,12 @@ pub enum JobOutput {
     Model(PathBuf),
     /// The step „Oberfläche rechnen“, with the surface folder.
     SurfaceStep(Box<SurfaceDone>),
+    /// The step „Grundriss rechnen“.
+    PlanStep(Box<PlanJobDone>),
+    /// A plan read from its folder (helper runner).
+    PlanLoaded(Box<ShownPlan>),
+    /// `objekte.toml` of a map or model after a change of its objects (helper runner).
+    Objects(Box<driftless_steps::objects::Objects>),
     /// A cloud with its levels of detail (loader runner).
     Cloud(Box<LoadedCloud>),
     /// A model with one of its scans beside it, for point pairs (loader runner).

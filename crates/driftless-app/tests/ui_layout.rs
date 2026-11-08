@@ -98,6 +98,7 @@ fn with_map() -> AppState {
             settings: None,
             clouds: Vec::new(),
             surfaces: Vec::new(),
+            plans: Vec::new(),
             incomplete: false,
         }],
         history: Vec::new(),
@@ -394,10 +395,13 @@ fn empty_states_explain_next_step() {
     h.run();
     assert_eq!(h.state().1, Some(Action::SetStep(Step::Daten)));
 
-    // Planung says what comes
+    // Planung without a map sends to Daten
     state.step = Step::Planung;
-    let h = panel(state, steps::show);
-    h.get_by_label(text::PLAN_COMING);
+    let mut h = panel(state, steps::show);
+    h.get_by_label(text::EMPTY_NO_MAPS);
+    h.get_by_label(text::GO_TO_DATA).click();
+    h.run();
+    assert_eq!(h.state().1, Some(Action::SetStep(Step::Daten)));
 }
 
 /// eframe's storage in memory.

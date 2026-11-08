@@ -74,6 +74,7 @@ fn map(dir: &str) -> MapInfo {
         settings: Some(MapSwitches::default()),
         clouds: Vec::new(),
         surfaces: Vec::new(),
+        plans: Vec::new(),
         incomplete: false,
     }
 }
@@ -896,6 +897,7 @@ fn with_model() -> AppState {
             settings: None,
             hints: Vec::new(),
         }],
+        plans: Vec::new(),
     }];
     state
 }

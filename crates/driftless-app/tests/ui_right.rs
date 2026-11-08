@@ -42,6 +42,7 @@ fn map(switches: Option<MapSwitches>) -> MapInfo {
         settings: switches,
         clouds: Vec::new(),
         surfaces: Vec::new(),
+        plans: Vec::new(),
         incomplete: false,
     }
 }

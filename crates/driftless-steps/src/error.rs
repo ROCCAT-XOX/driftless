@@ -3,6 +3,7 @@
 use driftless_export::ExportError;
 use driftless_map::surface::edit::EditError;
 use driftless_map::MapError;
+use driftless_plan::PlanError;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +54,15 @@ impl From<ExportError> for StepError {
     fn from(e: ExportError) -> Self {
         match e {
             ExportError::Cancelled => StepError::Cancelled,
+            e => StepError::Failed(e.to_string()),
+        }
+    }
+}
+
+impl From<PlanError> for StepError {
+    fn from(e: PlanError) -> Self {
+        match e {
+            PlanError::Cancelled => StepError::Cancelled,
             e => StepError::Failed(e.to_string()),
         }
     }
@@ -136,6 +146,13 @@ mod tests {
         assert_eq!(
             StepError::from(EditError::NoImages),
             StepError::Failed("Kein Bild zeigt diese Stelle; sie bleibt, wie sie ist.".into())
+        );
+        assert_eq!(StepError::from(PlanError::Cancelled), StepError::Cancelled);
+        assert_eq!(
+            StepError::from(PlanError::NoWalls),
+            StepError::Failed(
+                "Keine Wände gefunden: Aus diesen Punkten entsteht kein Grundriss.".into()
+            )
         );
         let boxed: Box<dyn std::error::Error> = "nicht lesbar".into();
         assert_eq!(

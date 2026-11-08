@@ -7,8 +7,10 @@
 //!                          slam-001/verlauf/   states of the run (driftless_steps::history)
 //!                          slam-001/karte-001/ a map of the run, one folder per set of switches
 //!                karte-001/oberflaeche-001/    a surface of the map (`driftless surface -o`)
+//!                karte-001/grundriss-001/      a floor plan of the map (`driftless plan -o`)
 //! <projekt>/modelle/modell-001/                 scans merged into one model (`driftless merge -o`)
 //!                  modell-001/oberflaeche-001/  a surface of the model (`driftless surface --model`)
+//!                  modell-001/grundriss-001/    a floor plan of the model
 //! ```
 //!
 //! `project.toml`:
@@ -77,6 +79,7 @@ use driftless_io::paths::{relative_text, relative_to};
 use driftless_io::progress::Progress;
 use driftless_io::project::discover_project;
 use driftless_map::surface::SurfaceConfig;
+use driftless_plan::Storey;
 use driftless_slam::align::AlignConfig;
 use driftless_steps::correct::utc_now;
 use driftless_steps::history::{self, HistoryEntry};
@@ -90,6 +93,9 @@ use driftless_steps::merge::{
 };
 use driftless_steps::pairs::{
     stored_path as from_stored, stored_text, PointPairEntry, PointPairs, POINT_PAIRS_FILE,
+};
+use driftless_steps::plan::{
+    plan_fits, read_plan, run_plan, PlanOutcome, PlanRequest, PlanSettings, PlanSource, PLAN_REPORT,
 };
 use driftless_steps::slam::{
     cache_fits, run_fits_scan, run_slam, scan_times, SlamOutcome, SlamRequest, SlamSettings,
@@ -114,6 +120,9 @@ pub const SCANS_DIR: &str = "scans";
 /// The models of the project: `modelle/modell-NNN`.
 pub const MODELS_DIR: &str = "modelle";
 pub const MODEL_PREFIX: &str = "modell-";
+/// The floor plan folders of a map or model: `grundriss-NNN` (a report `grundriss.json` makes
+/// one finished).
+pub const PLAN_NUMBERED: &str = "grundriss-";
 /// One point per cell of this size (m) in a model, as `driftless merge` does by default.
 pub const MODEL_VOXEL: f64 = 0.01;
 const FORMAT: i64 = 1;
@@ -217,6 +226,8 @@ pub struct MapInfo {
     /// The surfaces of the map: its subfolders `oberflaeche…` with an `oberflaeche.json` (the
     /// step writes it last; one without it is cut off, see [`crate::leftovers`]).
     pub surfaces: Vec<SurfaceInfo>,
+    /// Its floor plans: subfolders `grundriss-NNN` with a `grundriss.json`.
+    pub plans: Vec<PlanInfo>,
     /// Its report `map.json` is missing (computed in its folder by an older program or the
     /// command line, and cut off): the tree keeps such a map only while it holds finished
     /// surfaces, as „unvollständig – neu rechnen“ ([`crate::leftovers::holds_results`]).
@@ -240,6 +251,23 @@ pub struct SurfaceInfo {
     pub hints: Vec<String>,
 }
 
+/// A floor plan folder of a map or model (`grundriss-NNN` with its `grundriss.json`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanInfo {
+    pub dir: PathBuf,
+    /// „Grundriss 001“.
+    pub label: String,
+    /// It no longer fits its map or model: the map, its trajectory or the plan step changed
+    /// since, or the map or model is stale itself. False until the background check said so
+    /// ([`plan_status`], `AppState::map_status`).
+    pub stale: bool,
+    /// The storey it was computed for, counted from 1; `None` for a map of one storey or a
+    /// report that cannot be read.
+    pub storey: Option<usize>,
+    /// The hints of its report for the reader (German).
+    pub hints: Vec<String>,
+}
+
 /// A model of the project: scans merged into one (`modelle/modell-NNN` with `modell.json`).
 #[derive(Clone, Debug)]
 pub struct ModelInfo {
@@ -250,6 +278,8 @@ pub struct ModelInfo {
     pub report: ModelReport,
     /// Its surfaces: subfolders `oberflaeche…` with an `oberflaeche.json`, as for a map.
     pub surfaces: Vec<SurfaceInfo>,
+    /// Its floor plans: subfolders `grundriss-NNN` with a `grundriss.json`, as for a map.
+    pub plans: Vec<PlanInfo>,
 }
 
 impl ModelInfo {
@@ -873,6 +903,26 @@ fn surface_hints(report: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// The floor plans in the map or model folder `dir`, by number; only those with their report
+/// (written last: a folder without one was cut off, see [`crate::leftovers`]). A report that
+/// cannot be read still lists the plan, which then counts as stale.
+fn plans_of(dir: &Path) -> Vec<PlanInfo> {
+    numbered(dir, PLAN_NUMBERED)
+        .into_iter()
+        .filter(|(_, _, p)| p.join(PLAN_REPORT).is_file())
+        .map(|(_, digits, dir)| {
+            let report = read_plan(&dir).ok();
+            PlanInfo {
+                label: text::plan_label(&digits),
+                stale: false,
+                storey: report.as_ref().and_then(|r| r.settings.storey),
+                hints: report.map(|r| r.plan.hints).unwrap_or_default(),
+                dir,
+            }
+        })
+        .collect()
+}
+
 fn map_info(dir: &Path, label: String) -> MapInfo {
     let settings = fs::read_to_string(dir.join(REPORT))
         .ok()
@@ -888,6 +938,7 @@ fn map_info(dir: &Path, label: String) -> MapInfo {
             .filter(|p| p.is_file())
             .collect(),
         surfaces: surfaces_of(dir),
+        plans: plans_of(dir),
         incomplete: !dir.join(REPORT).is_file(),
     }
 }
@@ -1418,6 +1469,7 @@ impl Project {
                 Some(ModelInfo {
                     label: text::model_label(&digits),
                     surfaces: surfaces_of(&dir),
+                    plans: plans_of(&dir),
                     report,
                     dir,
                 })
@@ -2203,6 +2255,96 @@ pub fn run_model_surface_job(
         report,
         reused: false,
     })
+}
+
+/// The status of the floor plan `plan` of the map or model in `owner`: its runtime, and stale
+/// if it no longer fits ([`plan_fits`], which reads only the report and the trajectories, so a
+/// plan stays current in a project moved without its scans). That the map or model itself is
+/// stale counts as well, but is told by the owner's own status (`AppState::map_status`). Call
+/// it off the UI thread.
+pub fn plan_status(owner: &Path, plan: &PlanInfo) -> MapStatus {
+    status_of_plan(owner, None, plan)
+}
+
+/// [`plan_status`] of a plan of `model`, with the model as the project sees it.
+pub fn model_plan_status(model: &ModelInfo, plan: &PlanInfo) -> MapStatus {
+    status_of_plan(&model.dir, Some(&model.report), plan)
+}
+
+fn status_of_plan(owner: &Path, model: Option<&ModelReport>, plan: &PlanInfo) -> MapStatus {
+    let seconds = read_plan(&plan.dir).ok().map(|r| r.seconds_total);
+    let Ok(source) = PlanSource::detect(owner) else {
+        return MapStatus {
+            seconds,
+            stale: true,
+        };
+    };
+    let req = PlanRequest {
+        source,
+        model: model.cloned(),
+        out_dir: plan.dir.clone(),
+        settings: PlanSettings {
+            storey: plan.storey,
+        },
+    };
+    MapStatus {
+        seconds,
+        stale: !plan_fits(&req),
+    }
+}
+
+/// What came of a floor plan job.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlanJobDone {
+    /// A plan folder: computed, or `reused` because one already fitted.
+    Done { dir: PathBuf, reused: bool },
+    /// Nothing was written: one of these storeys has to be chosen.
+    SeveralStoreys(Vec<Storey>),
+}
+
+/// Makes the floor plan of the map or model in `owner`, as `driftless plan` does: if a
+/// `grundriss-NNN` already fits (the same input, the same `storey`), that one is kept and
+/// nothing is computed; else into a new `grundriss-NNN`, which is removed again if the step
+/// is cancelled or fails, or if the map has several storeys and none was chosen. `model`: the
+/// model as the project sees it (its report with the folders of now). Needs the map or model
+/// only, no raw data.
+pub fn run_plan_job(
+    owner: &Path,
+    model: Option<&ModelInfo>,
+    storey: Option<usize>,
+    progress: &Progress,
+) -> Result<PlanJobDone, StepError> {
+    let source = match model {
+        Some(model) => PlanSource::Model(model.dir.clone()),
+        None => PlanSource::detect(owner)?,
+    };
+    let request = |dir: &Path| PlanRequest {
+        source: source.clone(),
+        model: model.map(|m| m.report.clone()),
+        out_dir: dir.to_path_buf(),
+        settings: PlanSettings { storey },
+    };
+    for (_, _, dir) in numbered(owner, PLAN_NUMBERED).iter().rev() {
+        if plan_fits(&request(dir)) {
+            progress.info(text::plan_fits(dir));
+            return Ok(PlanJobDone::Done {
+                dir: dir.clone(),
+                reused: true,
+            });
+        }
+        if progress.is_cancelled() {
+            return Err(StepError::Cancelled);
+        }
+    }
+    let dir = create_numbered(owner, PLAN_NUMBERED)?;
+    match run_plan(&request(dir.path()), progress)? {
+        PlanOutcome::Done(_) => Ok(PlanJobDone::Done {
+            dir: dir.keep(),
+            reused: false,
+        }),
+        // the folder goes again with the guard
+        PlanOutcome::SeveralStoreys(storeys) => Ok(PlanJobDone::SeveralStoreys(storeys)),
+    }
 }
 
 // Unix paths: `/p` is not absolute on Windows.

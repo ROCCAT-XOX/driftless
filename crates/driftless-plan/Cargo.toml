@@ -1,0 +1,22 @@
+[package]
+name = "driftless-plan"
+description = "Driftless: Grundriss aus der Punktwolke (Stockwerke, Wände, Öffnungen, Räume)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Exposes `testutil` (synthetic rooms) to other crates' tests.
+test-util = []
+
+[dependencies]
+driftless-io = { path = "../driftless-io" }
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+rayon = "1.12.0"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"

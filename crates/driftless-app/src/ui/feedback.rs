@@ -44,6 +44,7 @@ const CLOUD: &str = "punktwolke";
 const SURFACE: &str = "oberflaeche";
 const STATE: &str = "stand";
 const MODEL: &str = "modell";
+const PLAN: &str = "grundriss";
 
 /// The small picture of the window on the GPU (egui's handle has no `Debug`).
 #[derive(Clone)]
@@ -426,6 +427,10 @@ pub fn selection_record(state: &AppState) -> Option<FeedbackSelection> {
                 .map_or_else(|| named(dir), |m| m.label.clone());
             FeedbackSelection::new(MODEL, &name, Some(dir.clone()))
         }
+        Selection::Plan(dir) => {
+            let name = state.tree_label(dir).unwrap_or_else(|| named(dir));
+            FeedbackSelection::new(PLAN, &name, Some(dir.clone()))
+        }
     };
     record.text = record.text.trim().to_string();
     Some(record)
@@ -494,6 +499,7 @@ pub fn selection_of(record: &FeedbackSelection) -> Option<Selection> {
             nr: record.nr?,
         },
         MODEL => Selection::Model(path()?),
+        PLAN => Selection::Plan(path()?),
         _ => return None,
     })
 }
@@ -521,6 +527,7 @@ pub fn selection_known(state: &AppState, selection: &Selection) -> bool {
             .run(run)
             .is_some_and(|(_, r)| r.history.iter().any(|h| h.nr == *nr)),
         Selection::Model(dir) => state.model(dir).is_some(),
+        Selection::Plan(dir) => state.all_plans().any(|(_, p)| p.dir == *dir),
     }
 }
 

@@ -494,6 +494,7 @@ fn model_of(dir: PathBuf, run: &Path, map: &Path) -> ModelInfo {
         label: "Modell 001".into(),
         report: serde_json::from_value(report).unwrap(),
         surfaces: Vec::new(),
+        plans: Vec::new(),
     }
 }
 

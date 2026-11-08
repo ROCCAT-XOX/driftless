@@ -1,6 +1,6 @@
 //! The steps of Driftless – inspect a scan, SLAM, manual corrections, map, surface, merge,
-//! compare, the touch-up of a surface – as functions that the command line and the desktop
-//! program both call. Every step reports to a [`driftless_io::progress::Progress`] (phases,
+//! compare, the touch-up of a surface, the floor plan and its drawing – as functions that the command line and
+//! the desktop program both call. Every step reports to a [`driftless_io::progress::Progress`] (phases,
 //! counts, the lines the CLI prints) and stops at its next check once that is cancelled.
 
 pub mod compare;
@@ -13,8 +13,11 @@ mod leftovers;
 pub mod map;
 pub mod marks;
 pub mod merge;
+pub mod objects;
 pub mod overlay;
 pub mod pairs;
+pub mod plan;
+pub mod plan_drawing;
 pub mod scan;
 pub mod slam;
 pub mod surface;
@@ -25,8 +28,8 @@ pub use error::StepError;
 use serde::Serialize;
 
 /// The program that made a result: version and commit (`packaging/build_commit.rs`). Every
-/// step report (`slam.json`, `map.json`, `oberflaeche.json`, `modell.json`) names it under
-/// [`PROGRAM_KEY`]. Informational only: part of no input id, so a result of another build
+/// step report (`slam.json`, `map.json`, `oberflaeche.json`, `modell.json`, `grundriss.json`)
+/// names it under [`PROGRAM_KEY`]. Informational only: part of no input id, so a result of another build
 /// that fits still counts as current, and a report written before the field still reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Program {
