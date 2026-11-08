@@ -4,13 +4,16 @@
 //! Everything here is deterministic on one system: no random numbers, sorts with a tie rule,
 //! no order taken from a hash map.
 
+mod grid;
 pub mod levels;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testutil;
+pub mod walls;
 
 pub use levels::{
     find_storeys, level_for, storey_points, Leveling, Storey, StoreyPoints, StoreySearch,
 };
+pub use walls::{find_walls, WallFace, WallPair, Walls};
 
 /// The cloud and the trajectory a plan is computed from (metres, Z up).
 #[derive(Debug, Clone, Copy)]

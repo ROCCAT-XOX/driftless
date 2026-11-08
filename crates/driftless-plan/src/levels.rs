@@ -168,7 +168,7 @@ struct WalkGroup {
     count: usize,
 }
 
-fn check(progress: &Progress) -> Result<(), PlanError> {
+pub(crate) fn check(progress: &Progress) -> Result<(), PlanError> {
     if progress.is_cancelled() {
         Err(PlanError::Cancelled)
     } else {
