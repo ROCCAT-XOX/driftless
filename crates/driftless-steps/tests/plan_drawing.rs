@@ -291,7 +291,7 @@ fn door_and_window_have_symbols_and_text() {
 }
 
 #[test]
-fn unclear_shows_its_reason() {
+fn unclear_says_unclear_and_keeps_its_reason_in_the_data() {
     let mut plan = plan_of(vec![long_wall()]);
     let mut unclear = opening(OpeningKind::Unclear, 0, 3.0, 4.0, 0.0, 2.0);
     unclear.note = "Tür oder bodentiefes Fenster?".to_string();
@@ -300,10 +300,43 @@ fn unclear_shows_its_reason() {
     let gap = lines(&d, "Öffnung-unklar");
     assert_eq!(gap.len(), 1);
     assert!(gap[0].2, "gestrichelt");
-    assert_eq!(
-        texts(&d, "Öffnung-unklar"),
-        ["Tür oder bodentiefes Fenster?"]
-    );
+    assert_eq!(texts(&d, "Öffnung-unklar"), ["unklar"]);
+    let dashed = entities(&d, "Öffnung-unklar")
+        .into_iter()
+        .find(|e| !e.xdata.is_empty())
+        .expect("Grund in den Daten");
+    assert_eq!(dashed.xdata, ["GRUND=Tür oder bodentiefes Fenster?"]);
+}
+
+#[test]
+fn texts_of_neighbouring_openings_do_not_lie_on_each_other() {
+    let mut plan = plan_of(vec![long_wall()]);
+    plan.openings = vec![
+        opening(OpeningKind::Window, 0, 2.0, 2.4, 1.0, 2.0),
+        opening(OpeningKind::Window, 0, 2.5, 2.9, 1.0, 2.0),
+        opening(OpeningKind::Door, 0, 3.0, 3.9, 0.0, 2.05),
+    ];
+    let d = draw(plan);
+    let boxes: Vec<(String, [f64; 4])> = d
+        .entities
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntityKind::Shape(Shape::Text {
+                at, height, value, ..
+            }) => {
+                let width = value.chars().count() as f64 * 0.6 * height;
+                Some((value.clone(), [at[0], at[1], at[0] + width, at[1] + height]))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(boxes.len(), 3, "{boxes:?}");
+    for (i, (a, ba)) in boxes.iter().enumerate() {
+        for (b, bb) in &boxes[i + 1..] {
+            let apart = ba[0] >= bb[2] || bb[0] >= ba[2] || ba[1] >= bb[3] || bb[1] >= ba[3];
+            assert!(apart, "{a} {ba:?} / {b} {bb:?}");
+        }
+    }
 }
 
 #[test]

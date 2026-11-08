@@ -9,13 +9,14 @@
 //!
 //! An opening in a wall with two faces stands twice in the plan: both faces are cut, its symbol
 //! and text are drawn once ([`FloorPlan::distinct_openings`]). Every layer is there even when
-//! nothing is on it, one hidden in the program is written but off.
+//! nothing is on it, one hidden in the program is written but off. Texts never lie on top of
+//! each other: one that finds no free place near its line is left out.
 
 use crate::objects::{Object, ObjectKind, Objects};
 use crate::plan::PlanReport;
 use crate::PROGRAM;
 use driftless_export::dxf::{Block, Drawing, Entity, EntityKind, Layer, Shape};
-use driftless_plan::{metres, FloorPlan, Opening, OpeningKind, PlanFrame, WallFace};
+use driftless_plan::{metres, FloorPlan, Opening, OpeningKind, PlanFrame, Room, WallFace};
 use std::collections::{BTreeMap, BTreeSet};
 
 const WALL: &str = "Wand";
@@ -77,6 +78,12 @@ const MAX_NAME_IN_TEXT: usize = 40;
 const DEFAULT_THICKNESS: f64 = 0.12;
 /// Distance of the two lines of a window (metres).
 const WINDOW_LINES: f64 = 0.06;
+/// What an unclear opening says in the plan; the reason is in its extended data.
+const UNCLEAR_TEXT: &str = "unklar";
+/// Space kept around a text (mm).
+const TEXT_MARGIN: f64 = 30.0;
+/// Rows on each side of a line in which a text looks for a free place.
+const TEXT_TRIES: usize = 4;
 /// A piece of wall shorter than this is not drawn (metres).
 const MIN_PIECE: f64 = 0.001;
 /// Half a tick at the end of a dimension, per axis (mm): at 45° to the line, 100 mm long in all.
@@ -118,8 +125,11 @@ pub fn plan_drawing(report: &PlanReport, objects: &Objects, export: &PlanExport)
         frame: &plan.frame,
         as_cloud: export.placement == PlanPlacement::AsCloud,
         entities: Vec::new(),
+        taken: Vec::new(),
     };
     sheet.walls(plan);
+    // The names of the rooms stand where they stand; the other texts make way for them.
+    sheet.reserve_room_labels(plan);
     sheet.openings(plan);
     sheet.rooms(plan);
     sheet.dimensions(plan);
@@ -189,6 +199,22 @@ fn reading(d: [f64; 2]) -> [f64; 2] {
     } else {
         d
     }
+}
+
+/// The lines of the label of a room.
+fn room_text(room: &Room) -> Vec<String> {
+    let mut text = vec![
+        if room.open {
+            format!("Raum {} (offen)", room.nr)
+        } else {
+            format!("Raum {}", room.nr)
+        },
+        format!("{} m²", number(room.area)),
+    ];
+    if let Some(height) = room.height {
+        text.push(format!("Höhe {}", metres(height)));
+    }
+    text
 }
 
 /// A text centred on `centre`, running along `along`.
@@ -310,6 +336,29 @@ struct Sheet<'a> {
     frame: &'a PlanFrame,
     as_cloud: bool,
     entities: Vec<Entity>,
+    /// Rectangles (min x, min y, max x, max y) of the texts placed so far, in the drawing (mm).
+    taken: Vec<[f64; 4]>,
+}
+
+/// The rectangle a text covers, in the drawing (mm), with a small margin.
+fn text_box(centre: [f64; 2], along: [f64; 2], value: &str) -> [f64; 4] {
+    let half = CHAR_WIDTH * TEXT_HEIGHT * value.chars().count() as f64 / 2.0 + TEXT_MARGIN;
+    let up = left_of(along);
+    let high = TEXT_HEIGHT / 2.0 + TEXT_MARGIN;
+    let reach = [
+        along[0].abs() * half + up[0].abs() * high,
+        along[1].abs() * half + up[1].abs() * high,
+    ];
+    [
+        centre[0] - reach[0],
+        centre[1] - reach[1],
+        centre[0] + reach[0],
+        centre[1] + reach[1],
+    ]
+}
+
+fn boxes_meet(a: &[f64; 4], b: &[f64; 4]) -> bool {
+    a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]
 }
 
 impl Sheet<'_> {
@@ -330,6 +379,62 @@ impl Sheet<'_> {
         } else {
             let q = self.frame.to_plan(p);
             [q[0] * 1000.0, q[1] * 1000.0]
+        }
+    }
+
+    /// Takes the place of a text, if it is free.
+    fn claim(&mut self, centre: [f64; 2], along: [f64; 2], value: &str) -> bool {
+        let wanted = text_box(centre, along, value);
+        if self.taken.iter().any(|t| boxes_meet(t, &wanted)) {
+            return false;
+        }
+        self.taken.push(wanted);
+        true
+    }
+
+    /// A text beside the middle of a line, on the side `side` or the other one and further off
+    /// until it meets no other text. `None` if there is no free place: no text is better than
+    /// two on top of each other.
+    fn free_beside(
+        &mut self,
+        mid: [f64; 2],
+        along: [f64; 2],
+        side: [f64; 2],
+        value: String,
+    ) -> Option<Shape> {
+        let read = reading(along);
+        let up = left_of(read);
+        let first = if up[0] * side[0] + up[1] * side[1] >= 0.0 {
+            1.0
+        } else {
+            -1.0
+        };
+        for row in 0..TEXT_TRIES {
+            for sign in [first, -first] {
+                let off = sign * (TEXT_GAP + TEXT_HEIGHT / 2.0 + row as f64 * TEXT_LINE);
+                let centre = [mid[0] + up[0] * off, mid[1] + up[1] * off];
+                if self.claim(centre, read, &value) {
+                    return Some(centred(centre, read, value));
+                }
+            }
+        }
+        None
+    }
+
+    /// Reserves the places of the names of the rooms.
+    fn reserve_room_labels(&mut self, plan: &FloorPlan) {
+        let along =
+            reading(unit(self.plan([0.0, 0.0]), self.plan([1.0, 0.0])).unwrap_or([1.0, 0.0]));
+        let up = left_of(along);
+        for room in &plan.rooms {
+            let text = room_text(room);
+            let centre = self.plan(room.label_at);
+            let top = (text.len() - 1) as f64 / 2.0;
+            for (row, value) in text.iter().enumerate() {
+                let off = (top - row as f64) * TEXT_LINE;
+                let at = [centre[0] + up[0] * off, centre[1] + up[1] * off];
+                self.taken.push(text_box(at, along, value));
+            }
         }
     }
 
@@ -424,8 +529,13 @@ impl Sheet<'_> {
                     (WINDOW, format!("Fenster {}, BRH {brh}", size(to - from, o)))
                 }
                 OpeningKind::Unclear => {
-                    self.line(UNCLEAR, a, b, true);
-                    (UNCLEAR, o.note.clone())
+                    // The reason stands in the extended data, the plan only says „unklar“.
+                    self.entities.push(Entity {
+                        layer: UNCLEAR.to_string(),
+                        kind: EntityKind::Shape(Shape::Line { a, b, dashed: true }),
+                        xdata: vec![format!("GRUND={}", o.note)],
+                    });
+                    (UNCLEAR, UNCLEAR_TEXT.to_string())
                 }
             };
             let Some(along) = unit(a, b) else {
@@ -433,7 +543,9 @@ impl Sheet<'_> {
             };
             let (centre, room) = (self.plan(wall.at(mid, 0.0)), self.plan(wall.at(mid, -1.0)));
             let side = unit(centre, room).unwrap_or(left_of(along));
-            self.add(layer, beside(middle(a, b), along, side, text));
+            if let Some(label) = self.free_beside(middle(a, b), along, side, text) {
+                self.add(layer, label);
+            }
         }
     }
 
@@ -454,17 +566,7 @@ impl Sheet<'_> {
                     },
                 );
             }
-            let mut text = vec![
-                if room.open {
-                    format!("Raum {} (offen)", room.nr)
-                } else {
-                    format!("Raum {}", room.nr)
-                },
-                format!("{} m²", number(room.area)),
-            ];
-            if let Some(height) = room.height {
-                text.push(format!("Höhe {}", metres(height)));
-            }
+            let text = room_text(room);
             let centre = self.plan(room.label_at);
             let top = (text.len() - 1) as f64 / 2.0;
             for (row, value) in text.into_iter().enumerate() {
@@ -491,15 +593,10 @@ impl Sheet<'_> {
                 );
                 self.line(DIMENSION, from, to, false);
             }
-            self.add(
-                DIMENSION,
-                beside(
-                    middle(a, b),
-                    along,
-                    left_of(reading(along)),
-                    dim.text.clone(),
-                ),
-            );
+            let side = left_of(reading(along));
+            if let Some(label) = self.free_beside(middle(a, b), along, side, dim.text.clone()) {
+                self.add(DIMENSION, label);
+            }
         }
     }
 
