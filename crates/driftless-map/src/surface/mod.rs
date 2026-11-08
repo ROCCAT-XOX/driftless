@@ -1,19 +1,23 @@
 //! Photo-like surface (baustein 2): a TSDF from the cleaned points, then mesh, texture, glb/obj.
 //!
 //! [`build_surface`] runs the chain ([`build_mesh`] and [`texture_mesh`] are its two halves): [`FusedSdf`] (the cleaned points and the positions they were
-//! measured from fused into a truncated signed distance field, fine and coarse) → [`extract`] → [`cleanup`] →
-//! [`simplify`] → camera views per face → one image per face → texture pages → seam
-//! levelling. [`write_glb`] and [`write_obj`] write the result, [`render_preview`] draws it.
+//! measured from fused into a truncated signed distance field, fine and coarse) → [`extract`] → the
+//! vertices onto the planes of the points ([`NoiseConfig::snap`]) → [`cleanup`] →
+//! [`simplify`] → camera views per face → one image per face → texture pages → image noise
+//! damped per chart ([`NoiseConfig::denoise`]) → seam levelling. [`write_glb`] and [`write_obj`] write the result, [`render_preview`] draws it ([`render_relief`]: the form in gray, for test images).
 //! [`edit`] touches up a computed surface where the user painted Stellen on it.
 
 mod atlas;
 mod cleanup;
+mod denoise;
 pub mod edit;
 mod extract;
 mod level;
 mod mc_tables;
+mod occlude;
 mod preview;
 mod simplify;
+mod snap;
 mod tsdf;
 mod views;
 mod views_gpu;
@@ -26,8 +30,13 @@ pub use atlas::{TexturePage, TextureStats, TexturedMesh};
 pub use cleanup::{cleanup, CleanupStats};
 pub use extract::{extract, Mesh};
 pub use level::SeamStats;
-pub use preview::render_preview;
+pub use occlude::{
+    find_occluders, Occluders, OCCLUDED_SCORE, OCCLUDERS_FILE, OCCLUDER_GAP, OCCLUDER_MAX,
+    OCCLUDER_MIN_EXTENT,
+};
+pub use preview::{render_preview, render_relief};
 pub use simplify::simplify;
+pub use snap::SnapStats;
 pub use tsdf::{FusedSdf, Tsdf};
 pub use views::TextureSource;
 pub use write::{encode_pages, write_glb, write_obj, PageJpegs};
@@ -36,7 +45,9 @@ use crate::{ColorConfig, MapError};
 use driftless_gpu::GpuContext;
 use driftless_io::progress::Progress;
 use driftless_traj::Pose;
+use kiddo::{ImmutableKdTree, SquaredEuclidean};
 use nalgebra::Isometry3;
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 
 /// Points with the positions they were measured from.
@@ -68,6 +79,44 @@ pub fn sensors_for_frames(poses: &[Pose], lidar_to_imu: &Isometry3<f64>) -> Vec<
 
 /// Smallest texture page: the gray block of unseen faces and a chart with its border fit.
 pub const MIN_PAGE_SIZE: u32 = 16;
+
+/// The measures against noise on the finished surface, each of which can be switched off to
+/// compare a run without it (`driftless surface --ohne`). With [`NoiseConfig::OFF`] the surface
+/// comes out as it did before these measures, byte for byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoiseConfig {
+    /// Vertices of the raw mesh move onto the plane of the points around them (`anlegen`).
+    pub snap: bool,
+    /// The image of a face is chosen with how well the face was exposed in it (`belichtung`).
+    pub exposure: bool,
+    /// An edge-preserving filter damps the image noise of every chart (`entrauschen`).
+    pub denoise: bool,
+    /// Points far from the mesh hide what lies behind them from the images (`verdeckung`).
+    pub occlude: bool,
+}
+
+impl NoiseConfig {
+    /// All measures on: the default.
+    pub const ON: NoiseConfig = NoiseConfig {
+        snap: true,
+        exposure: true,
+        denoise: true,
+        occlude: true,
+    };
+    /// All measures off.
+    pub const OFF: NoiseConfig = NoiseConfig {
+        snap: false,
+        exposure: false,
+        denoise: false,
+        occlude: false,
+    };
+}
+
+impl Default for NoiseConfig {
+    fn default() -> Self {
+        NoiseConfig::ON
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceConfig {
@@ -109,6 +158,8 @@ pub struct SurfaceConfig {
     pub jpeg_quality: u8,
     /// Camera selection and exposure for the texture; images are used at full size.
     pub color: ColorConfig,
+    /// Which measures against noise run.
+    pub noise: NoiseConfig,
 }
 
 impl Default for SurfaceConfig {
@@ -132,6 +183,7 @@ impl Default for SurfaceConfig {
                 downscale: 1,
                 ..ColorConfig::default()
             },
+            noise: NoiseConfig::default(),
         }
     }
 }
@@ -212,6 +264,14 @@ pub struct SurfaceStats {
     pub accuracy: AccuracySplit,
     /// The same against [`SurfaceInput::dense_xyz`]; `None` without it.
     pub accuracy_dense: Option<AccuracySplit>,
+    /// What moving the raw vertices onto the points did; zero with [`NoiseConfig::snap`] off.
+    pub snap: SnapStats,
+    /// How rough the walls of the final mesh are: per wall vertex (see [`FLAT_VERTEX_ANGLE`])
+    /// how far it lies from the mean of its neighbours along its normal (mm). Measured with
+    /// [`NoiseConfig::snap`] off as well.
+    pub roughness: Accuracy,
+    /// Occluders the views heeded (see [`find_occluders`]); 0 with [`NoiseConfig::occlude`] off.
+    pub occluders: usize,
     /// Wall-clock seconds per phase (not deterministic; never written into the mesh files).
     pub seconds: BTreeMap<&'static str, f64>,
     /// Of `seconds["views"]`: the quality pass, the pass over the images and, on the GPU,
@@ -250,8 +310,28 @@ pub fn build_surface(
     progress: &Progress,
 ) -> Result<(TexturedMesh, SurfaceStats), MapError> {
     let (mesh, mut stats) = build_mesh(input, cfg, progress)?;
-    let tex = texture_mesh(&mesh, sources, cfg, progress, &mut stats, None)?;
+    let occluders = surface_occluders(&mesh, input.xyz, cfg, progress, &mut stats);
+    let tex = texture_mesh_with(&mesh, &occluders, sources, cfg, progress, &mut stats, None)?;
     Ok((tex, stats))
+}
+
+/// [`find_occluders`] as the chain runs it, between [`build_mesh`] and [`texture_mesh_with`],
+/// while the points are at hand; none with [`NoiseConfig::occlude`] off.
+pub fn surface_occluders(
+    mesh: &Mesh,
+    xyz: &[[f32; 3]],
+    cfg: &SurfaceConfig,
+    progress: &Progress,
+    stats: &mut SurfaceStats,
+) -> Occluders {
+    if !cfg.noise.occlude {
+        return Occluders::default();
+    }
+    let mut clock = Clock::new();
+    progress.phase("Oberfläche: Verdecker suchen", None);
+    let occluders = find_occluders(mesh, xyz, cfg);
+    clock.lap(stats, "occluders");
+    occluders
 }
 
 fn check_cancel(progress: &Progress) -> Result<(), MapError> {
@@ -262,9 +342,11 @@ fn check_cancel(progress: &Progress) -> Result<(), MapError> {
     }
 }
 
-/// The untextured surface of `input`: [`FusedSdf::integrate`] → [`extract`] → [`cleanup`] →
-/// [`simplify`], and its accuracy against the points. After this the points are no longer
-/// needed: a caller that owns them can free them before [`texture_mesh`].
+/// The untextured surface of `input`: [`FusedSdf::integrate`] → [`extract`] → the vertices onto
+/// the planes of the points ([`NoiseConfig::snap`]) → [`cleanup`] → [`simplify`], and its
+/// accuracy against the points. One k-d tree of the points serves all of it, built once the
+/// TSDF is freed. After this the points are no longer needed: a caller that owns them can free
+/// them before [`texture_mesh`].
 pub fn build_mesh(
     input: &SurfaceInput,
     cfg: &SurfaceConfig,
@@ -284,11 +366,25 @@ pub fn build_mesh(
     progress.phase("Oberfläche: Netz", None);
     let (mut raw, face_coarse, cells_from_coarse) = extract(&sdf);
     drop(sdf);
+    let tree = point_tree(input.xyz);
     stats.faces_raw = raw.indices.len();
     stats.cells_from_coarse = cells_from_coarse;
-    stats.faces_unsupported = drop_unsupported(&mut raw, &face_coarse, input.xyz, cfg.max_fill_gap);
+    stats.faces_unsupported = drop_unsupported(
+        &mut raw,
+        &face_coarse,
+        tree.as_ref(),
+        input.xyz,
+        cfg.max_fill_gap,
+    );
     clock.lap(&mut stats, "extract");
     check_cancel(progress)?;
+
+    if let (true, Some(tree)) = (cfg.noise.snap, &tree) {
+        progress.phase("Oberfläche: Flächen an die Punkte legen", None);
+        stats.snap = snap::snap_to_points(&mut raw, tree, input.xyz, cfg);
+        clock.lap(&mut stats, "snap");
+        check_cancel(progress)?;
+    }
 
     stats.cleanup = cleanup(&mut raw, cfg);
     clock.lap(&mut stats, "cleanup");
@@ -302,15 +398,17 @@ pub fn build_mesh(
     check_cancel(progress)?;
 
     progress.phase("Oberfläche: Genauigkeit", None);
-    stats.accuracy = accuracy(&mesh, input.xyz);
+    stats.accuracy = accuracy_with(&mesh, tree.as_ref(), input.xyz);
+    drop(tree);
     stats.accuracy_dense = input.dense_xyz.map(|dense| accuracy(&mesh, dense));
+    stats.roughness = roughness(&mesh);
     clock.lap(&mut stats, "accuracy");
     check_cancel(progress)?;
     Ok((mesh, stats))
 }
 
 /// `mesh` (from [`build_mesh`]) textured from `sources` (all in the mesh's frame, see
-/// [`TextureSource`]): views, labels, baking and seam levelling, the images of the sources
+/// [`TextureSource`]): views, labels, baking, denoising and seam levelling, the images of the sources
 /// one after the other in every pass; gray without sources. Adds its figures and phases to
 /// `stats`. With `gpu` the
 /// views per face are found on the GPU (the same views up to rounding; see
@@ -323,13 +421,35 @@ pub fn texture_mesh(
     stats: &mut SurfaceStats,
     gpu: Option<&GpuContext>,
 ) -> Result<TexturedMesh, MapError> {
+    let none = Occluders::default();
+    texture_mesh_with(mesh, &none, sources, cfg, progress, stats, gpu)
+}
+
+/// [`texture_mesh`] with `occluders`: what has no face in `mesh` but hides the faces behind it
+/// from the images ([`find_occluders`]).
+pub fn texture_mesh_with(
+    mesh: &Mesh,
+    occluders: &Occluders,
+    sources: &[TextureSource],
+    cfg: &SurfaceConfig,
+    progress: &Progress,
+    stats: &mut SurfaceStats,
+    gpu: Option<&GpuContext>,
+) -> Result<TexturedMesh, MapError> {
     cfg.check()?;
     let mut clock = Clock::new();
     check_cancel(progress)?;
+    stats.occluders = occluders.points.len();
     let tex = match sources {
         [_, ..] => {
-            let (mut views, info) =
-                views::collect_views_on(mesh, sources, cfg, progress, gpu.map(|g| (g, None)))?;
+            let (mut views, info) = views::collect_views_on(
+                mesh,
+                occluders,
+                sources,
+                cfg,
+                progress,
+                gpu.map(|g| (g, None)),
+            )?;
             stats.views_seconds = ViewsSeconds {
                 quality: info.quality_seconds,
                 pass: info.views_seconds,
@@ -355,6 +475,23 @@ pub fn texture_mesh(
             stats.texture.islands_absorbed = absorbed.islands;
             stats.texture.gray_filled = absorbed.gray_filled;
             clock.lap(stats, "bake");
+            check_cancel(progress)?;
+            if cfg.noise.denoise {
+                progress.phase("Oberfläche: Bildrauschen", None);
+                let image: Vec<u32> = tex
+                    .charts
+                    .iter()
+                    .map(|c| labels[c.faces[0] as usize].expect("a chart's faces have an image"))
+                    .collect();
+                let noise = denoise::denoise_charts(mesh, &mut tex, |c| image[c]);
+                stats.texture.noise_before = noise.noise_before;
+                stats.texture.noise_after = noise.noise_after;
+            } else {
+                let noise = denoise::noise_of(&tex);
+                stats.texture.noise_before = noise;
+                stats.texture.noise_after = noise;
+            }
+            clock.lap(stats, "denoise");
             check_cancel(progress)?;
             progress.phase("Oberfläche: Nähte", None);
             stats.seams = level::level_seams(mesh, &labels, &mut tex);
@@ -397,7 +534,8 @@ fn gray_only(
 /// (rad, 15°) of their area-weighted mean; otherwise as edge (corners, edges, small details).
 pub const FLAT_VERTEX_ANGLE: f64 = 0.262;
 
-/// Distance of vertices to their nearest input point (mm).
+/// How far vertices lie from something (mm), see where it is used: by default their nearest
+/// input point.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Accuracy {
     pub vertices: usize,
@@ -408,7 +546,6 @@ pub struct Accuracy {
 
 impl Accuracy {
     fn of(mut mm: Vec<f64>) -> Accuracy {
-        use rayon::prelude::*;
         if mm.is_empty() {
             return Accuracy::default();
         }
@@ -430,11 +567,24 @@ pub struct AccuracySplit {
     pub all: Accuracy,
     pub walls: Accuracy,
     pub edges: Accuracy,
+    /// Distance of the wall vertices to the plane of the points within [`WALL_PLANE_RADIUS`]
+    /// (at least 10 points, on a plane; other vertices are left out). Unlike the distance to
+    /// the nearest point it does not grow with the spacing of the points.
+    pub walls_plane: Accuracy,
 }
+
+/// The plane of a wall vertex in [`AccuracySplit::walls_plane`] is fitted to the points within
+/// this distance (m).
+pub const WALL_PLANE_RADIUS: f64 = 0.03;
 
 /// Whether each vertex of `mesh` is a wall vertex (see [`FLAT_VERTEX_ANGLE`]); vertices
 /// without a face are not.
 fn flat_vertices(mesh: &Mesh) -> Vec<bool> {
+    wall_normals(mesh).iter().map(Option::is_some).collect()
+}
+
+/// The area-weighted mean normal of every wall vertex of `mesh`, `None` for the others.
+fn wall_normals(mesh: &Mesh) -> Vec<Option<[f64; 3]>> {
     let n = mesh.positions.len();
     let mut sum = vec![[0.0f64; 3]; n];
     let normals: Vec<([f64; 3], f64)> = (0..mesh.indices.len())
@@ -469,14 +619,67 @@ fn flat_vertices(mesh: &Mesh) -> Vec<bool> {
             }
         }
     }
-    flat
+    mean.into_iter()
+        .zip(flat)
+        .map(|(m, f)| m.filter(|_| f))
+        .collect()
 }
 
-/// Distance (mm) of every vertex of `mesh` to its nearest point of `xyz` (k-d tree), for all
-/// vertices and split into walls and edges; zero without vertices or points.
+/// [`SurfaceStats::roughness`] of `mesh`. The neighbours of a vertex are the vertices on its
+/// edges, each counted once however many faces share the edge.
+fn roughness(mesh: &Mesh) -> Accuracy {
+    let normals = wall_normals(mesh);
+    let mut edges: Vec<[u32; 2]> = mesh
+        .indices
+        .iter()
+        .flat_map(|&[a, b, c]| [[a, b], [b, c], [c, a]])
+        .map(|[a, b]| [a.min(b), a.max(b)])
+        .collect();
+    edges.par_sort_unstable();
+    edges.dedup();
+    let n = mesh.positions.len();
+    // Sum over the neighbours of (neighbour − vertex), and how many there are.
+    let mut sum = vec![[0.0f64; 3]; n];
+    let mut count = vec![0u32; n];
+    let at = |v: u32| mesh.positions[v as usize].map(f64::from);
+    for &[a, b] in &edges {
+        let (pa, pb) = (at(a), at(b));
+        let d = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+        for (v, sign) in [(a, 1.0), (b, -1.0)] {
+            let s = &mut sum[v as usize];
+            *s = [0, 1, 2].map(|k| s[k] + sign * d[k]);
+            count[v as usize] += 1;
+        }
+    }
+    let mm: Vec<f64> = normals
+        .iter()
+        .zip(sum.iter().zip(&count))
+        .filter_map(|(n, (s, &c))| {
+            let n = (*n)?;
+            (c > 0).then(|| (s[0] * n[0] + s[1] * n[1] + s[2] * n[2]).abs() / f64::from(c) * 1000.0)
+        })
+        .collect();
+    Accuracy::of(mm)
+}
+
+/// The k-d tree of `xyz`; `None` for fewer than two points, which the tree does not take.
+fn point_tree(xyz: &[[f32; 3]]) -> Option<ImmutableKdTree<f32, 3>> {
+    (xyz.len() >= 2).then(|| ImmutableKdTree::new_from_slice(xyz).expect("fewer than 2^32 points"))
+}
+
+/// [`accuracy_with`] that builds its own tree of `xyz`.
 fn accuracy(mesh: &Mesh, xyz: &[[f32; 3]]) -> AccuracySplit {
-    use kiddo::{ImmutableKdTree, SquaredEuclidean};
-    use rayon::prelude::*;
+    accuracy_with(mesh, point_tree(xyz).as_ref(), xyz)
+}
+
+/// Distance (mm) of every vertex of `mesh` to its nearest point of `xyz`, for all vertices and
+/// split into walls and edges, and of the wall vertices to the plane of the points around them;
+/// zero without vertices or points. `tree` is [`point_tree`] of `xyz`.
+fn accuracy_with(
+    mesh: &Mesh,
+    tree: Option<&ImmutableKdTree<f32, 3>>,
+    xyz: &[[f32; 3]],
+) -> AccuracySplit {
     let vertices = &mesh.positions;
     if vertices.is_empty() || xyz.is_empty() {
         return AccuracySplit::default();
@@ -487,12 +690,9 @@ fn accuracy(mesh: &Mesh, xyz: &[[f32; 3]]) -> AccuracySplit {
             .sum::<f64>()
             .sqrt()
     };
-    let mm: Vec<f64> = if xyz.len() < 2 {
-        vertices.iter().map(|v| dist(v, &xyz[0]) * 1000.0).collect()
-    } else {
-        let tree: ImmutableKdTree<f32, 3> =
-            ImmutableKdTree::new_from_slice(xyz).expect("fewer than 2^32 points");
-        vertices
+    let mm: Vec<f64> = match tree {
+        None => vertices.iter().map(|v| dist(v, &xyz[0]) * 1000.0).collect(),
+        Some(tree) => vertices
             .par_iter()
             .map(|v| {
                 let nn = tree
@@ -502,9 +702,20 @@ fn accuracy(mesh: &Mesh, xyz: &[[f32; 3]]) -> AccuracySplit {
                 // Distance from the f32 coordinates again in f64: no squared f32 rounding.
                 dist(v, &xyz[nn.item as usize]) * 1000.0
             })
-            .collect()
+            .collect(),
     };
     let flat = flat_vertices(mesh);
+    let plane_mm: Vec<f64> = match tree {
+        None => Vec::new(),
+        Some(tree) => vertices
+            .par_iter()
+            .zip(&flat)
+            .filter(|&(_, &f)| f)
+            .filter_map(|(v, _)| {
+                Some(snap::distance_to_plane(tree, xyz, v, WALL_PLANE_RADIUS)? * 1000.0)
+            })
+            .collect(),
+    };
     let pick = |want: bool| -> Vec<f64> {
         mm.iter()
             .zip(&flat)
@@ -516,19 +727,23 @@ fn accuracy(mesh: &Mesh, xyz: &[[f32; 3]]) -> AccuracySplit {
         walls: Accuracy::of(pick(true)),
         edges: Accuracy::of(pick(false)),
         all: Accuracy::of(mm),
+        walls_plane: Accuracy::of(plane_mm),
     }
 }
 
 /// Removes the faces flagged in `coarse` whose centre has no point of `xyz` within
-/// `max_gap` (m); returns how many. Unused vertices stay for [`cleanup`] to drop.
-fn drop_unsupported(mesh: &mut Mesh, coarse: &[bool], xyz: &[[f32; 3]], max_gap: f64) -> usize {
-    use kiddo::{ImmutableKdTree, SquaredEuclidean};
-    use rayon::prelude::*;
+/// `max_gap` (m); returns how many. Unused vertices stay for [`cleanup`] to drop. `tree` is
+/// [`point_tree`] of `xyz`.
+fn drop_unsupported(
+    mesh: &mut Mesh,
+    coarse: &[bool],
+    tree: Option<&ImmutableKdTree<f32, 3>>,
+    xyz: &[[f32; 3]],
+    max_gap: f64,
+) -> usize {
     if !coarse.contains(&true) {
         return 0;
     }
-    let tree = (xyz.len() >= 2)
-        .then(|| ImmutableKdTree::<f32, 3>::new_from_slice(xyz).expect("fewer than 2^32 points"));
     let gap2 = (max_gap * max_gap) as f32;
     let keep: Vec<bool> = mesh
         .indices
@@ -540,7 +755,7 @@ fn drop_unsupported(mesh: &mut Mesh, coarse: &[bool], xyz: &[[f32; 3]], max_gap:
             }
             let p = f.map(|v| mesh.positions[v as usize]);
             let cen = [0, 1, 2].map(|a| (p[0][a] + p[1][a] + p[2][a]) / 3.0);
-            let d2 = match (&tree, xyz.first()) {
+            let d2 = match (tree, xyz.first()) {
                 (Some(t), _) => {
                     t.query(&cen)
                         .nearest_one::<SquaredEuclidean<f32>>()
@@ -756,7 +971,8 @@ mod tests {
     /// platform's `exp`/`atan2` may differ in the last bit, so only determinism is checked
     /// there). Recorded before several sources were supported, and again for surface v13: the
     /// small gray patches are filled and 16 views are kept per face, and each of the two alone
-    /// changes these pages.
+    /// changes these pages. The hash guards the path without the measures against noise
+    /// ([`NoiseConfig::OFF`]).
     #[test]
     fn one_source_pages_unchanged() {
         let (painted, images, poses, cams) = scene::walk_data();
@@ -769,6 +985,7 @@ mod tests {
         let cfg = SurfaceConfig {
             min_texel: 0.01,
             page_size: 1024,
+            noise: NoiseConfig::OFF,
             ..SurfaceConfig::default()
         };
         let run = || {
@@ -800,6 +1017,7 @@ mod tests {
     /// from two sources of different exposure, recorded (Apple silicon, see
     /// [`one_source_pages_unchanged`]) before the baking and the seam levelling were split into
     /// parts that „Bilder neu einspielen“ shares: the surface step's pages stay byte for byte.
+    /// The hashes guard the path without the measures against noise ([`NoiseConfig::OFF`]).
     #[test]
     fn full_surface_unchanged() {
         let (painted, images, poses, cams) = scene::walk_data();
@@ -813,6 +1031,7 @@ mod tests {
             let cfg = SurfaceConfig {
                 min_texel,
                 page_size,
+                noise: NoiseConfig::OFF,
                 ..SurfaceConfig::default()
             };
             let mut stats = SurfaceStats::default();
@@ -859,7 +1078,7 @@ mod tests {
     }
 
     /// The texel at the centre of face `f` in its page.
-    fn face_colour(tex: &TexturedMesh, f: usize) -> [u8; 3] {
+    pub(super) fn face_colour(tex: &TexturedMesh, f: usize) -> [u8; 3] {
         let (page, tri) = tex.face_ref[f];
         let page = &tex.pages[page as usize];
         let uv = page.indices[tri as usize].map(|v| page.uvs[v as usize]);
@@ -1028,6 +1247,61 @@ mod tests {
         assert_eq!(gray.texture.faces_textured, 0);
     }
 
+    /// With noisy photos the filter lowers the noise of the charts, and the steps at the seams
+    /// do not get larger for it.
+    #[test]
+    fn texture_mesh_seams_no_worse() {
+        let mesh = painted_mesh(&scene::walk_scene(), 0.1);
+        let src = walk_source_with("denoise-noisy", &[0, 1], 1..=11, |rgb| with_noise(rgb, 6.0));
+        let run = |denoise: bool| {
+            let cfg = SurfaceConfig {
+                min_texel: 0.01,
+                page_size: 1024,
+                noise: NoiseConfig {
+                    denoise,
+                    ..NoiseConfig::OFF
+                },
+                ..SurfaceConfig::default()
+            };
+            let mut stats = SurfaceStats::default();
+            texture_mesh(
+                &mesh,
+                std::slice::from_ref(&src),
+                &cfg,
+                &Progress::new(),
+                &mut stats,
+                None,
+            )
+            .unwrap();
+            stats
+        };
+        let (off, on) = (run(false), run(true));
+        println!(
+            "seam step off {:.3}, on {:.3}; noise off {:.3}/{:.3}, on {:.3}/{:.3}",
+            off.seams.seam_step_after,
+            on.seams.seam_step_after,
+            off.texture.noise_before,
+            off.texture.noise_after,
+            on.texture.noise_before,
+            on.texture.noise_after,
+        );
+        assert!(
+            on.seams.seam_step_after <= off.seams.seam_step_after,
+            "{} > {}",
+            on.seams.seam_step_after,
+            off.seams.seam_step_after
+        );
+        assert!(on.texture.noise_before > 1.0, "{:?}", on.texture);
+        assert!(
+            on.texture.noise_after < on.texture.noise_before,
+            "{:?}",
+            on.texture
+        );
+        // Without the filter the noise is still reported, and nothing changes it.
+        assert!(off.texture.noise_before > 1.0, "{:?}", off.texture);
+        assert_eq!(off.texture.noise_after, off.texture.noise_before);
+    }
+
     #[test]
     fn accuracy_split_walls_and_edges() {
         // A closed slab of 1 cm squares: vertices inside a side are wall, those on the
@@ -1156,10 +1430,17 @@ mod tests {
         };
         let xyz = [[0.0f32, 0.0, 0.0], [0.0, 0.01, 0.01]];
         let coarse = [false, true, false, true];
-        assert_eq!(drop_unsupported(&mut mesh, &coarse, &xyz, 0.015), 1);
+        let tree = point_tree(&xyz);
+        assert_eq!(
+            drop_unsupported(&mut mesh, &coarse, tree.as_ref(), &xyz, 0.015),
+            1
+        );
         assert_eq!(mesh.indices, vec![[0, 1, 2], [0, 1, 2], [3, 4, 5]]);
         // Nothing from the coarse grid: nothing to do, even without points.
-        assert_eq!(drop_unsupported(&mut mesh, &[false; 3], &[], 0.015), 0);
+        assert_eq!(
+            drop_unsupported(&mut mesh, &[false; 3], None, &[], 0.015),
+            0
+        );
     }
 
     #[test]
@@ -1175,6 +1456,180 @@ mod tests {
         assert_eq!(on, off);
         assert_eq!(stats.cells_from_coarse, 0);
         assert_eq!(stats.tsdf_bytes, off_stats.tsdf_bytes);
+    }
+
+    /// The raw mesh of `input`, as [`build_mesh`] has it before the vertices move.
+    fn raw_mesh(input: &SurfaceInput, cfg: &SurfaceConfig) -> Mesh {
+        let sdf = FusedSdf::integrate(input, cfg, &Progress::new()).unwrap();
+        let (mut raw, coarse, _) = extract(&sdf);
+        drop_unsupported(
+            &mut raw,
+            &coarse,
+            point_tree(input.xyz).as_ref(),
+            input.xyz,
+            cfg.max_fill_gap,
+        );
+        raw
+    }
+
+    fn with_snap(snap: bool, cfg: SurfaceConfig) -> SurfaceConfig {
+        SurfaceConfig {
+            noise: NoiseConfig {
+                snap,
+                ..NoiseConfig::OFF
+            },
+            ..cfg
+        }
+    }
+
+    #[test]
+    fn noisy_wall_gets_flat() {
+        // 3 mm of noise along the normal; about two points per 1 cm voxel column, so the TSDF
+        // keeps most of it.
+        let mut scan = wall_x(2.003, 1.0, 0.007, |_, _| false);
+        for (i, p) in scan.xyz.iter_mut().enumerate() {
+            p[0] += (0.003 * noise(i as u64)) as f32;
+        }
+        let run = |snap| {
+            let cfg = with_snap(snap, one_cm(true));
+            build_mesh(&scan.input(), &cfg, &Progress::new()).unwrap().1
+        };
+        let (on, off) = (run(true), run(false));
+        println!("roughness {:?} -> {:?}", off.roughness, on.roughness);
+        println!(
+            "walls_plane {:?} -> {:?}",
+            off.accuracy.walls_plane, on.accuracy.walls_plane
+        );
+        println!("{:?}", on.snap);
+        println!("faces {} -> {}", off.faces_final, on.faces_final);
+        assert!(on.snap.moved * 2 > on.snap.vertices, "{:?}", on.snap);
+        assert_eq!(off.snap, SnapStats::default());
+        assert!(off.roughness.vertices > 0);
+        assert!(off.accuracy.walls_plane.vertices > 0);
+        assert!(
+            on.roughness.median_mm * 2.0 <= off.roughness.median_mm,
+            "{:?} {:?}",
+            on.roughness,
+            off.roughness
+        );
+        assert!(
+            on.accuracy.walls_plane.p95_mm < off.accuracy.walls_plane.p95_mm,
+            "{:?} {:?}",
+            on.accuracy.walls_plane,
+            off.accuracy.walls_plane
+        );
+    }
+
+    #[test]
+    fn room_corner_stays() {
+        let scan = box_room([0.0; 3], [1.0, 0.8, 0.6], 0.004);
+        let half = [1.0f32, 0.8, 0.6];
+        let input = scan.input();
+        let cfg = with_snap(true, small());
+        let voxel = cfg.voxel as f32;
+        let d = |a: &[f32; 3], b: &[f32; 3]| (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f32>();
+
+        // Raw mesh: a vertex near two walls moves by at most a voxel.
+        let raw = raw_mesh(&input, &cfg);
+        let mut snapped = raw.clone();
+        let tree = point_tree(input.xyz).unwrap();
+        let s = snap::snap_to_points(&mut snapped, &tree, input.xyz, &cfg);
+        assert!(s.moved > 0, "{s:?}");
+        let mut at_edges = 0;
+        for (a, b) in raw.positions.iter().zip(&snapped.positions) {
+            let near = (0..3)
+                .filter(|&k| (a[k].abs() - half[k]).abs() < 2.0 * voxel)
+                .count();
+            if near >= 2 {
+                at_edges += 1;
+                assert!(d(a, b).sqrt() <= voxel, "{a:?} -> {b:?}");
+            }
+        }
+        assert!(at_edges > 0);
+
+        // Final mesh: the corners of the room are where they are without the move.
+        let run = |snap| {
+            build_mesh(&input, &with_snap(snap, small()), &Progress::new())
+                .unwrap()
+                .0
+        };
+        let (on, off) = (run(true), run(false));
+        let nearest = |m: &Mesh, c: &[f32; 3]| {
+            *m.positions
+                .iter()
+                .min_by(|a, b| d(a, c).total_cmp(&d(b, c)))
+                .unwrap()
+        };
+        for mask in 0..8 {
+            let c = [0, 1, 2].map(|k| {
+                if mask >> k & 1 == 1 {
+                    half[k]
+                } else {
+                    -half[k]
+                }
+            });
+            let (a, b) = (nearest(&on, &c), nearest(&off, &c));
+            println!("corner {c:?}: {a:?} / {b:?}");
+            assert!(d(&a, &b).sqrt() <= voxel, "{c:?}: {a:?} / {b:?}");
+        }
+    }
+
+    #[test]
+    fn snap_off_keeps_mesh() {
+        let scan = box_room([0.0; 3], [1.0, 0.8, 0.6], 0.01);
+        let input = scan.input();
+        let cfg = with_snap(false, small());
+        let (mesh, stats) = build_mesh(&input, &cfg, &Progress::new()).unwrap();
+        let mut raw = raw_mesh(&input, &cfg);
+        cleanup(&mut raw, &cfg);
+        let expected = simplify(&raw, &cfg);
+        assert_eq!(mesh.positions, expected.positions);
+        assert_eq!(mesh.indices, expected.indices);
+        assert_eq!(stats.snap, SnapStats::default());
+        assert!(!stats.seconds.contains_key("snap"));
+        // Measured either way.
+        assert!(stats.roughness.vertices > 0, "{stats:?}");
+        assert!(stats.accuracy.walls_plane.vertices > 0, "{stats:?}");
+    }
+
+    #[test]
+    fn roughness_of_a_plane_is_zero_and_of_a_bump_not() {
+        let mut mesh = testutil::open_wall(10, 0.01);
+        let flat = roughness(&mesh);
+        assert_eq!(flat.vertices, mesh.positions.len());
+        assert!(flat.p95_mm < 1e-3, "{flat:?}");
+        // The middle vertex 1 mm out: it lies 1 mm from the mean of its neighbours.
+        let mid = 11 * 5 + 5;
+        mesh.positions[mid][0] = 0.001;
+        let bump = roughness(&mesh);
+        assert!(bump.vertices > 0, "{bump:?}");
+        assert!(bump.mean_mm > flat.mean_mm, "{bump:?}");
+    }
+
+    #[test]
+    fn walls_plane_measures_the_plane_not_the_nearest_point() {
+        // Points every 2 cm on x = 0, the mesh 1 mm in front: the nearest point is up to 14 mm
+        // away, the plane 1 mm.
+        let mesh = {
+            let mut m = testutil::open_wall(20, 0.01);
+            for p in &mut m.positions {
+                p[0] = 0.001;
+            }
+            m
+        };
+        let mut xyz = Vec::new();
+        for iy in -5..=15 {
+            for iz in -5..=15 {
+                xyz.push([0.0f32, iy as f32 * 0.01, iz as f32 * 0.01]);
+            }
+        }
+        let a = accuracy(&mesh, &xyz);
+        assert!(a.walls_plane.vertices > 0, "{a:?}");
+        assert!((a.walls_plane.median_mm - 1.0).abs() < 0.01, "{a:?}");
+        assert!((a.walls_plane.p95_mm - 1.0).abs() < 0.01, "{a:?}");
+        // Too few points for a plane: left out.
+        let few = accuracy(&mesh, &xyz[..3]);
+        assert_eq!(few.walls_plane, Accuracy::default());
     }
 
     #[test]

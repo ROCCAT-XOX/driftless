@@ -49,7 +49,9 @@ use std::path::PathBuf;
 /// computed anew. 2: „Bilder neu einspielen“ leaves out views that show something in front of
 /// the Stelle (photo consistency), compares each face with at most 64 around it, and takes the
 /// variants in another order (the best image of another scan, camera, or time and place first).
-pub const EDIT_VERSION: u32 = 2;
+/// 3: it damps the image noise and heeds the occluders as the surface step does
+/// ([`super::NoiseConfig`]), so a Stelle baked anew fits what is around it.
+pub const EDIT_VERSION: u32 = 3;
 
 /// Why a touch-up step left the surface as it was. The texts are for the app: German, plain.
 #[derive(Debug, thiserror::Error)]

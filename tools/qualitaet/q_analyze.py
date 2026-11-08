@@ -2,6 +2,7 @@
 """Quality metrics for a Driftless run of the template scans (see README.md).
 
   q_analyze.py variant <run_dir>                 -> <run_dir>/metrics.json
+  q_analyze.py surface <run_dir> [base.json]     -> <run_dir>/metrics.json of a surface variant, cloud figures from base.json
   q_analyze.py cross <label_dir> <ref> <s2> <s3> -> <label_dir>/cross.json, canon.json (alignment, dims, coverage)
 
 <run_dir> = <label_dir>/<scan>: the output folder of one scan (slam, map and surface results
@@ -282,6 +283,47 @@ def time_rss(log):
     return out
 
 
+def surface_figures(d):
+    """The surface block of metrics.json for the run folder d, None without a surface."""
+    sp = os.path.join(d, "oberflaeche", "oberflaeche.json")
+    if not os.path.exists(sp):
+        return None
+    sj2 = json.load(open(sp))
+    s = sj2["stats"]
+    tx = s.get("texture", {})
+    tot = tx.get("faces_textured", 0) + tx.get("faces_untextured", 0)
+    seams = s.get("seams", {})
+    return dict(voxel=sj2["settings"]["voxel"], accuracy=s.get("accuracy"), accuracy_dense=s.get("accuracy_dense"),
+                untextured_pct=100 * tx.get("faces_untextured", 0) / tot if tot else None,
+                untextured_area_share=tx.get("untextured_area_share"),
+                charts=tx.get("charts"), pages=tx.get("pages"), fill_ratio=tx.get("fill_ratio"),
+                texel_median_mm=tx.get("texel_median_mm"),
+                seam_step_after=seams.get("seam_step_after"),
+                seam_step_median_after=seams.get("seam_step_median_after"),
+                seam_step_per_m=seams.get("seam_step_per_m"),
+                roughness=s.get("roughness"), snap=s.get("snap"), occluders=s.get("occluders"),
+                noise_before=tx.get("noise_before"), noise_after=tx.get("noise_after"),
+                faces_final=s.get("faces_final"), cleanup=s.get("cleanup"),
+                glb_mb=os.path.getsize(os.path.join(d, "oberflaeche", "oberflaeche.glb")) / 1e6,
+                seconds_total=sj2.get("seconds_total"), peak_rss_gb=sj2.get("peak_rss_bytes", 0) / 1e9,
+                gpu=s.get("gpu") or sj2.get("gpu"))
+
+
+def surface_variant(d, base=None):
+    """metrics.json of a surface variant in d: the surface figures are its own, the trajectory and
+    cloud figures come from the metrics.json of its map (base; they do not change between variants)."""
+    d = os.path.abspath(d)
+    out = json.load(open(base)) if base and os.path.exists(base) else {}
+    out["scan"] = os.path.basename(d)
+    out["steps"] = dict(out.get("steps", {}))
+    out["steps"].pop("surface", None)
+    tr = time_rss(os.path.join(d, "surface.log"))
+    if tr:
+        out["steps"]["surface"] = tr
+    out["surface"] = surface_figures(d)
+    json.dump(out, open(os.path.join(d, "metrics.json"), "w"), indent=1)
+
+
 def variant(d):
     d = os.path.abspath(d)
     out = dict(scan=os.path.basename(d), steps={})
@@ -318,22 +360,9 @@ def variant(d):
                              ("points_colored", "colored_share", "images_used", "images_blurry", "seam_jump_after")},
                       gpu=st.get("color", {}).get("gpu"),
                       seconds={k: st[k].get("seconds") for k in st})
-    sp = os.path.join(d, "oberflaeche", "oberflaeche.json")
-    if os.path.exists(sp):
-        sj2 = json.load(open(sp))
-        s = sj2["stats"]
-        tx = s.get("texture", {})
-        tot = tx.get("faces_textured", 0) + tx.get("faces_untextured", 0)
-        out["surface"] = dict(voxel=sj2["settings"]["voxel"], accuracy=s.get("accuracy"), accuracy_dense=s.get("accuracy_dense"),
-                              untextured_pct=100 * tx.get("faces_untextured", 0) / tot if tot else None,
-                              charts=tx.get("charts"), pages=tx.get("pages"), fill_ratio=tx.get("fill_ratio"),
-                              texel_median_mm=tx.get("texel_median_mm"),
-                              seam_step_after=s.get("seams", {}).get("seam_step_after"),
-                              seam_step_median_after=s.get("seams", {}).get("seam_step_median_after"),
-                              faces_final=s.get("faces_final"), cleanup=s.get("cleanup"),
-                              glb_mb=os.path.getsize(os.path.join(d, "oberflaeche", "oberflaeche.glb")) / 1e6,
-                              seconds_total=sj2.get("seconds_total"), peak_rss_gb=sj2.get("peak_rss_bytes", 0) / 1e9,
-                              gpu=s.get("gpu") or sj2.get("gpu"))
+    surface = surface_figures(d)
+    if surface:
+        out["surface"] = surface
     for cloud in ("clean", "dense"):
         P = load(os.path.join(d, cloud + ".las"))
         d1, d2, cands, _ = detect(P)
@@ -497,5 +526,7 @@ def cross(base, scans):
 if __name__ == "__main__":
     if sys.argv[1] == "variant":
         variant(sys.argv[2])
+    elif sys.argv[1] == "surface":
+        surface_variant(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
     else:
         cross(os.path.abspath(sys.argv[2]), sys.argv[3:])

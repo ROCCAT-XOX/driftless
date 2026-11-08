@@ -113,19 +113,27 @@ pub fn simplify(mesh: &Mesh, cfg: &SurfaceConfig) -> Mesh {
 /// 4 cm (5-mm cells, dozens per face, each list its own allocation): on the merged black room
 /// at 1 cm (2.9 M faces) the process grew to 6.7 GB in this function, now to 1.9 GB.
 pub(crate) fn far_vertices(from: &Mesh, to: &Mesh, max: f64) -> Vec<u32> {
+    let mut used = vec![false; from.positions.len()];
+    for &v in from.indices.iter().flatten() {
+        used[v as usize] = true;
+    }
+    far_points(&from.positions, |v| used[v], to, max)
+}
+
+/// Those of `points` that `wanted` picks and that lie further than `max` (m) from every face of
+/// `to`, in ascending order; the search of [`far_vertices`]. Without faces in `to`, every point
+/// picked.
+pub(crate) fn far_points(
+    points: &[[f32; 3]],
+    wanted: impl Fn(usize) -> bool + Sync,
+    to: &Mesh,
+    max: f64,
+) -> Vec<u32> {
     let up = |p: [f32; 3]| p.map(f64::from);
     let tri = |f: usize| to.indices[f].map(|i| up(to.positions[i as usize]));
-    let used = || {
-        let mut used = vec![false; from.positions.len()];
-        for &v in from.indices.iter().flatten() {
-            used[v as usize] = true;
-        }
-        used
-    };
     if to.indices.is_empty() {
-        let used = used();
-        return (0..from.positions.len() as u32)
-            .filter(|&v| used[v as usize])
+        return (0..points.len() as u32)
+            .filter(|&v| wanted(v as usize))
             .collect();
     }
     let length: f64 = (0..to.indices.len())
@@ -180,15 +188,14 @@ pub(crate) fn far_vertices(from: &Mesh, to: &Mesh, max: f64) -> Vec<u32> {
         })
         .collect();
     grid.par_sort_unstable();
-    let used = used();
     let max_sq = max * max;
-    (0..from.positions.len() as u32)
+    (0..points.len() as u32)
         .into_par_iter()
         .filter(|&v| {
-            if !used[v as usize] {
+            if !wanted(v as usize) {
                 return false;
             }
-            let p = up(from.positions[v as usize]);
+            let p = up(points[v as usize]);
             let Some(k) = key([0, 1, 2].map(|i| coord(p[i], i))) else {
                 return true;
             };

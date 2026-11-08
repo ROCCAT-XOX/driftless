@@ -49,6 +49,12 @@
 //! slots by untagged ones, each of those scores above that share: the same decision.) Walls,
 //! desk edges and steps' risers near the path are not tagged.
 //!
+//! **Occluders** ([`super::occlude`]): what was measured but has no face
+//! hides the faces behind it from an image, though the depth buffer of the faces cannot know.
+//! Such a view counts [`OCCLUDED_SCORE`] of its score and is tagged like a carrier view; the
+//! rules for those then do the rest: it goes when another image shows the face, stays if none
+//! does, and is no part of the exposure fit.
+//!
 //! **Occlusion mask** ([`mask_views`], after the exposure fit): what moves with the device –
 //! the carrier's legs, a strap – sits in the same part of a camera's image in every frame, also
 //! farther than the carrier rule reaches. Every view of a face with at least
@@ -120,6 +126,7 @@
 //! per camera and [`ColorConfig::view_gap`]), the fit sees the
 //! [`SurfaceConfig::views_per_face`] best views by half octave of score.
 
+use super::occlude::{face_occluded, occluder_buffer, side_samples, Occluders, OCCLUDED_SCORE};
 use super::{Mesh, SurfaceConfig};
 use crate::color::{
     frame_camera, image_count, keep_best, linear_table, quality_pass, sample_linear, srgb_value,
@@ -474,7 +481,8 @@ pub(crate) struct Shot<'a> {
 /// `view` are tested in (and these faces themselves). The pass over a whole mesh gives the faces
 /// whose centroid lies within [`ColorConfig::max_dist`] plus [`Faces::reach`] of the camera
 /// (sorted) as both; a Stelle ([`super::edit`]) gives its faces as `view` and the faces in front
-/// of and around them as `splat`.
+/// of and around them as `splat`. `occluders` is the depth buffer of what has no face
+/// ([`occluder_buffer`]), if there is any.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn image_views(
     mesh: &Mesh,
@@ -482,6 +490,7 @@ pub(crate) fn image_views(
     splat: &[u32],
     view: &[u32],
     shot: &Shot,
+    occluders: Option<&DepthBuffer>,
     cfg: &ColorConfig,
     sampled: impl Fn(usize) -> bool + Sync,
     lin: &[f32; 256],
@@ -577,6 +586,15 @@ pub(crate) fn image_views(
                 && below > CARRIER_BELOW
                 && across < CARRIER_RADIUS
                 && across < below;
+            let occluded = occluders.is_some_and(|buffer| {
+                let corners = mesh.indices[f].map(|i| mesh.positions[i as usize]);
+                face_occluded(buffer, corners, &proj, cam, &world_to_cam)
+            });
+            let (score, carrier) = if occluded {
+                (score * OCCLUDED_SCORE, true)
+            } else {
+                (score, carrier)
+            };
             let (colour, sample) = match shot.rgb {
                 Some(image) => {
                     let to_px =
@@ -650,8 +668,12 @@ struct Pending {
 /// buffer holds only those cells – the cells of the centroid and the corners of every face that
 /// passes the other tests, and their neighbours – else the whole image; either way the result is
 /// what [`image_views`] gives on a mesh of both sets of faces, bit for bit: the same tests with
-/// the same numbers, the depth tests after the others. Returns the views and the number of
-/// cells of the buffer.
+/// the same numbers, the depth tests after the others. `occluders` are what has no face and the
+/// grid of their points, if there are any: as [`image_views`] with their depth buffer
+/// ([`occluder_buffer`], with `cutout` only over the cells of the 7 samples of the faces seen),
+/// a view they hide counts [`OCCLUDED_SCORE`] of its score and carries the mark. Returns the
+/// views, each with whether the occluders hide it, and the number of cells of the depth buffer
+/// of the faces.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn windowed_views(
     mesh: &Mesh,
@@ -659,10 +681,11 @@ pub(crate) fn windowed_views(
     view: &[u32],
     surface: CornerFaces,
     splat: &[u32],
+    occluders: Option<(&Occluders, &PointGrid)>,
     shot: &Shot,
     cfg: &ColorConfig,
     cutout: bool,
-) -> (Vec<(u32, FaceView)>, usize) {
+) -> (Vec<(u32, FaceView, bool)>, usize) {
     let world_to_cam = shot.world_from_cam.inverse();
     let cam_pos = shot.world_from_cam.translation.vector;
     let cam = shot.geometry;
@@ -779,14 +802,52 @@ pub(crate) fn windowed_views(
         }
     });
     let tol = cfg.depth_tolerance;
-    let seen = pending
+    let seen: Vec<Pending> = pending
         .into_par_iter()
         .filter(|p| {
             buffer.is_visible(&p.centre, tol) && p.corners.iter().all(|c| buffer.is_visible(c, tol))
         })
-        .map(|p| (p.face, p.view))
         .collect();
-    (seen, buffer.cells())
+    let corners_of =
+        |p: &Pending| mesh.indices[p.face as usize].map(|i| mesh.positions[i as usize]);
+    let cover = match occluders {
+        Some((occluders, grid)) if !seen.is_empty() => {
+            // The cells `face_occluded` reads: those of the samples of the faces seen.
+            let window = cutout.then(|| {
+                let (mut lo, mut hi) = ([i32::MAX; 2], [i32::MIN; 2]);
+                let mut grow = |q: &Projection| {
+                    let (x, y) = DepthBuffer::cell_of(cam, cfg.zbuffer_scale, q.uv);
+                    lo = [lo[0].min(x), lo[1].min(y)];
+                    hi = [hi[0].max(x), hi[1].max(y)];
+                };
+                for p in &seen {
+                    grow(&p.centre);
+                    for s in side_samples(corners_of(p)) {
+                        if let Some(q) = project_point(&s, cam, &world_to_cam, f64::INFINITY) {
+                            grow(&q);
+                        }
+                    }
+                }
+                (lo, hi)
+            });
+            occluder_buffer(occluders, grid, shot, cfg, window)
+        }
+        _ => None,
+    };
+    let found = seen
+        .into_par_iter()
+        .map(|mut p| {
+            let hidden = cover
+                .as_ref()
+                .is_some_and(|b| face_occluded(b, corners_of(&p), &p.centre, cam, &world_to_cam));
+            if hidden {
+                p.view.score *= OCCLUDED_SCORE;
+                p.view.tag |= TAG_CARRIER;
+            }
+            (p.face, p.view, hidden)
+        })
+        .collect();
+    (found, buffer.cells())
 }
 
 /// Exposure-corrected colour of view `v` (sRGB levels).
@@ -1204,7 +1265,15 @@ pub(crate) fn collect_views_with(
     progress: &Progress,
     gpu: Option<&GpuContext>,
 ) -> Result<ViewTable, MapError> {
-    collect_views_on(mesh, sources, cfg, progress, gpu.map(|g| (g, None))).map(|(t, _)| t)
+    collect_views_on(
+        mesh,
+        &Occluders::default(),
+        sources,
+        cfg,
+        progress,
+        gpu.map(|g| (g, None)),
+    )
+    .map(|(t, _)| t)
 }
 
 /// What [`collect_views_on`] reports besides the views.
@@ -1224,9 +1293,11 @@ pub(crate) struct ViewsInfo {
 }
 
 /// [`collect_views_with`] with the GPU's batch size (faces per batch; `None`: as large as the
-/// device allows), and what the run reports.
+/// device allows), what hides faces from the images (see the module docs), and what the run
+/// reports.
 pub(crate) fn collect_views_on(
     mesh: &Mesh,
+    occluders: &Occluders,
     sources: &[TextureSource],
     cfg: &SurfaceConfig,
     progress: &Progress,
@@ -1322,6 +1393,7 @@ pub(crate) fn collect_views_on(
         let pass = Pass {
             mesh,
             faces: &faces,
+            occluders,
             sources,
             cams: &cams,
             cfg,
@@ -1468,6 +1540,8 @@ impl Stream {
 pub(crate) struct Pass<'a> {
     pub mesh: &'a Mesh,
     pub faces: &'a Faces,
+    /// What hides faces from the images (see the module docs).
+    pub occluders: &'a Occluders,
     pub sources: &'a [TextureSource],
     /// [`all_cameras`] of `sources`.
     pub cams: &'a [ColorCamera],
@@ -1487,6 +1561,7 @@ fn cpu_views(pass: &Pass, progress: &Progress) -> Result<(Vec<FaceView>, Vec<Vie
     let Pass {
         mesh,
         faces,
+        occluders,
         sources,
         cams,
         cfg,
@@ -1503,6 +1578,7 @@ fn cpu_views(pass: &Pass, progress: &Progress) -> Result<(Vec<FaceView>, Vec<Vie
     let mut samples = vec![empty; sample_faces * k];
     {
         let grid = PointGrid::new(&faces.centroid);
+        let occluder_grid = PointGrid::new(&occluders.points);
         let lin = linear_table();
         let geometry: Vec<Camera> = cams
             .iter()
@@ -1549,7 +1625,18 @@ fn cpu_views(pass: &Pass, progress: &Progress) -> Result<(Vec<FaceView>, Vec<Vie
                 let cam_pos = shot.world_from_cam.translation.vector;
                 let mut near = grid.near(&cam_pos, ccfg.max_dist + faces.reach);
                 near.par_sort_unstable();
-                let found = image_views(mesh, faces, &near, &near, &shot, ccfg, sampled, &lin);
+                let cover = occluder_buffer(occluders, &occluder_grid, &shot, ccfg, None);
+                let found = image_views(
+                    mesh,
+                    faces,
+                    &near,
+                    &near,
+                    &shot,
+                    cover.as_ref(),
+                    ccfg,
+                    sampled,
+                    &lin,
+                );
                 for (f, view, colour) in found {
                     let f = f as usize;
                     keep_best_view(&mut per_face[f * k..(f + 1) * k], view);
@@ -1593,7 +1680,9 @@ mod tests {
         aabb, cameras, near_boundary, poses, render, shot, surface_cloud, walk, walk_data,
         walk_scene, write_bag, Painted, Shot, Trajectory, T0,
     };
-    use super::super::testutil::{blur, centroid, face_near, painted_mesh, walk_source, Steps};
+    use super::super::testutil::{
+        blur, centroid, face_near, painted_mesh, test_gpu, walk_source, Steps,
+    };
     use super::*;
     use crate::{colorize, ColorConfig, ExposureConfig};
     use driftless_gpu::GpuContext;
@@ -2772,8 +2861,15 @@ mod tests {
         let cfg = SurfaceConfig::default();
         let k = cfg.views_per_face;
         let cpu = collect_views(&mesh, &sources, &cfg, &Progress::new()).unwrap();
-        let (gpu, info) =
-            collect_views_on(&mesh, &sources, &cfg, &Progress::new(), Some((&ctx, None))).unwrap();
+        let (gpu, info) = collect_views_on(
+            &mesh,
+            &Occluders::default(),
+            &sources,
+            &cfg,
+            &Progress::new(),
+            Some((&ctx, None)),
+        )
+        .unwrap();
         assert_eq!(info.gpu_fallback, None);
         assert!(cpu.images.iter().any(|i| i.source == 1));
         let (seen, same, off, worst, tint) = agreement(&cpu, &gpu, k);
@@ -2798,12 +2894,6 @@ mod tests {
                 .iter()
                 .any(|v| v.score > 0.0 && gpu.images[v.image as usize].source == s));
         }
-    }
-
-    /// A GPU for the tests that fails instead of falling back to the CPU (else a broken
-    /// kernel would pass unnoticed).
-    fn test_gpu() -> Option<GpuContext> {
-        GpuContext::new_for_tests().map(|c| c.with_fallback(false))
     }
 
     /// `mesh` with every vertex moved by up to ±1 cm (normals off by up to about 20°, as on
@@ -2863,6 +2953,7 @@ mod tests {
                 collect_views(&mesh, std::slice::from_ref(&src), &cfg, &Progress::new()).unwrap();
             let (gpu, info) = collect_views_on(
                 &mesh,
+                &Occluders::default(),
                 std::slice::from_ref(&src),
                 &cfg,
                 &Progress::new(),
@@ -2922,6 +3013,7 @@ mod tests {
         let run = |batch: Option<usize>| {
             collect_views_on(
                 &mesh,
+                &Occluders::default(),
                 std::slice::from_ref(&src),
                 &cfg,
                 &Progress::new(),
@@ -2951,6 +3043,7 @@ mod tests {
         let run = |cfg: &SurfaceConfig, ctx: &GpuContext, batch: Option<usize>| {
             collect_views_on(
                 &mesh,
+                &Occluders::default(),
                 std::slice::from_ref(&src),
                 cfg,
                 &Progress::new(),
@@ -2969,7 +3062,7 @@ mod tests {
         );
         // Room for the slots of a quarter of the faces (and no exposure samples): at least
         // four passes.
-        let budget = driftless_gpu::faces_pass_bytes(count, count / 4, k, 0, image, depth);
+        let budget = driftless_gpu::faces_pass_bytes(count, count / 4, k, 0, image, depth, 0);
         let small = ctx.with_budget(budget);
         let notes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = notes.clone();
@@ -2980,6 +3073,7 @@ mod tests {
         });
         let (many, info) = collect_views_on(
             &mesh,
+            &Occluders::default(),
             std::slice::from_ref(&src),
             &cfg,
             &p,
@@ -3057,6 +3151,7 @@ mod tests {
         });
         let (table, info) = collect_views_on(
             &mesh,
+            &Occluders::default(),
             std::slice::from_ref(&src),
             &cfg,
             &p,

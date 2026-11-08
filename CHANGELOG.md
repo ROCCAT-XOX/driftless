@@ -82,6 +82,16 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
 - „Aufräumen“ bietet auch halb geschriebene Ordner der Nacharbeit an (`nacharbeit.tmp-…`).
 - Die Anleitung hat die Abschnitte „Stellen nacharbeiten“, „Melden“ und „Grundriss und DXF“; die folgenden
   Abschnitte rücken eine Nummer weiter.
+- Weniger Rauschen auf der Oberfläche, von selbst und ohne Einstellung: Wo die Messpunkte eben sind, liegt
+  die Oberfläche jetzt auf ihrer Ebene, Wände, Böden und Decken werden ruhiger. Fotos, auf denen eine Stelle
+  gut belichtet ist, gehen vor sehr dunklen oder überstrahlten. Körnung und farbige Sprenkel im Bild werden
+  je Bildstück gedämpft, Schrift und Kanten bleiben scharf. Gemessene Teile ohne eigene Fläche, etwa ein
+  dünnes Rohr oder eine Leiter, malen sich nicht mehr auf die Wand dahinter. „Bilder neu einspielen“ dämpft
+  und verdeckt genauso.
+- `driftless surface --ohne anlegen,belichtung,entrauschen,verdeckung` schaltet diese Schritte zum Vergleich
+  einzeln ab, `--ohne alles` alle vier. In der App gibt es dafür keinen Schalter.
+- `oberflaeche.json` nennt neu die Rauheit der Wände, den Abstand der Wände zur Ebene der Punkte, das
+  Bildrauschen vor und nach dem Dämpfen, die angelegten Ecken und die Zahl der Verdecker.
 
 ### Bekannte Grenzen
 
@@ -97,12 +107,16 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
   etwas versetzt. Dann die nächste Variante probieren oder ↶.
 - **Stellen in zwei Fenstern:** Stellen derselben Karte oder desselben Modells gleichzeitig in zwei
   Fenstern nachzuarbeiten ist nicht erprobt. Dafür nur ein Fenster nutzen.
+- **Kleine Teile und Säume an Kanten:** Nur was mehr als 2 cm vor einer Fläche steht, Punkte hat und zusammen
+  mindestens 30 cm lang ist, verdeckt die Wand dahinter; Türgriffe und andere kleine Teile können weiter leicht
+  versetzt im Bild liegen. Wo keine ebene Umgebung zu finden ist, an Kanten und dünnen Teilen, bleibt ein
+  schmaler Saum der Oberfläche, wie er war.
 
 ### Hinweis
 
-- Laufbahnen, Karten und Oberflächen von 0.1.0 bleiben aktuell: Dieser Stand rechnet sie Byte für Byte
-  gleich (geprüft an einem Scan, die Oberfläche auf der Grafikkarte und auf dem Prozessor, auf einem
-  Zwischenstand dieses Zweigs; für den letzten Stand steht die Prüfung auf echten Daten noch aus).
+- Laufbahnen und Karten von 0.1.0 bleiben aktuell. Oberflächen gelten als nicht mehr aktuell und werden beim
+  nächsten Rechnen neu erzeugt; die gespeicherte Nacharbeit einer Oberfläche wird dabei neu gerechnet, die
+  markierten Stellen bleiben. Mit `--ohne alles` entstehen dieselben Netze und Bilder wie vor diesen Schritten.
 - Neu eingespielte Bilder der Nacharbeit sind auf demselben System Byte für Byte gleich. Zwischen
   verschiedenen Systemen, etwa Mac und Windows, können einzelne Bildpunkte abweichen.
 

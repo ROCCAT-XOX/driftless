@@ -220,6 +220,30 @@ Die Laufbahn vor der Karte braucht nur Sekunden: 9 s im kleinen Raum, 34 s im B�
 62 s). Den freien Platz für
 die Ergebnisse nennt [Voraussetzungen](#voraussetzungen).
 
+**Weniger Rauschen, von selbst.** Neu nach Version 0.1.0. Jede Oberfläche bekommt diese vier Schritte, einstellen
+muss man dafür nichts:
+
+| Schritt | Was er tut |
+|---|---|
+| anlegen | Wo die Messpunkte eine ebene Fläche zeigen, legt Driftless die Oberfläche auf diese Ebene. Wände, Böden und Decken werden ruhiger, Kanten bleiben, wie sie sind. |
+| belichtung | Für jede Fläche nimmt Driftless lieber ein Foto, auf dem die Stelle gut belichtet ist, als eines, auf dem sie sehr dunkel oder überstrahlt ist. |
+| entrauschen | Körnung und farbige Sprenkel im Bild werden gedämpft, je Bildstück so stark, wie es rauscht. Schrift und Kanten bleiben scharf, saubere Fotos bleiben, wie sie sind. |
+| verdeckung | Was gemessen wurde, aber keine eigene Fläche hat, etwa ein dünnes Rohr oder eine Leiter, verdeckt beim Zuordnen der Fotos die Wand dahinter und malt sich nicht mehr auf sie. |
+
+„Bilder neu einspielen“ dämpft das Rauschen und beachtet die Verdeckung genauso, damit eine neue Stelle zu
+ihrer Umgebung passt. Die Grenzen stehen unter [Bekannte Grenzen](#11-bekannte-grenzen).
+
+Zum Vergleich lässt sich in der Kommandozeile jeder Schritt einzeln abschalten; in der App gibt es dafür keinen
+Schalter:
+
+```
+driftless surface <scan> --slam <lauf> --ohne entrauschen,verdeckung
+driftless surface <scan> --slam <lauf> --ohne alles
+```
+
+`--ohne` geht auch mit `--model`. Mit `--ohne alles` entsteht die Oberfläche wie vor diesen Schritten. Eine
+Oberfläche aus einer älteren Version gilt nicht mehr als aktuell und wird beim nächsten Rechnen neu erzeugt.
+
 ## 6. Mehrere Scans zusammenführen
 
 Mehrere Scans desselben Orts werden zu einem Modell, zum Beispiel ein großer Raum in Teilen. Jeder Scan
@@ -605,6 +629,7 @@ Dieselbe Liste steht im [CHANGELOG](../CHANGELOG.md).
 | Rohre von Hand | Rohre und Kabel erkennt Driftless nicht selbst, sie werden von Hand gesetzt. |
 | Türen ohne Aufschlag | Eine Tür steht als Öffnung im Plan: Laibung und Schwelle, ohne Türblatt und Aufschlagrichtung. |
 | Ein Stockwerk je Plan | Ein Grundriss zeigt ein Stockwerk. Hat eine Karte mehrere, wird jedes für sich gerechnet. |
+| Kleine Teile und Säume an Kanten | Nur was mehr als 2 cm vor einer Fläche steht, Punkte hat und zusammen mindestens 30 cm lang ist, verdeckt die Wand dahinter. Türgriffe und andere kleine Teile können deshalb weiter leicht versetzt im Bild liegen. Wo keine ebene Umgebung zu finden ist, also an Kanten und dünnen Teilen, bleibt ein schmaler Saum der Oberfläche, wie er war. |
 | Dünne Teile dicht an der Wand | Steht dicht vor der Stelle etwas Dünnes, das die Oberfläche nur in Stücken hat, etwa ein Rohr oder ein Kabelkanal, liegt es in den Fotos je nach Standort ein paar Zentimeter anders, ebenso ein dunkler Streifen daneben. „Bilder neu einspielen“ kann dann einen Streifen auf die Stelle legen, schärfer und etwas versetzt. Dann die nächste Variante probieren oder mit ↶ zurücknehmen. Was weiter vor der Wand steht, etwa eine Stange, legt es meist nicht auf die Wand: wenn die Fotos es mindestens 5 cm gegeneinander versetzt zeigen und es sich in der Helligkeit mindestens um das Dreifache von der Wand abhebt. Geprüft ist das nur an einem nachgestellten Beispiel; auf den echten Testscans kam so etwas nicht vor. |
 | Stellen in zwei Fenstern | Stellen derselben Karte oder desselben Modells gleichzeitig in zwei Fenstern nachzuarbeiten ist nicht erprobt. Dafür nur ein Fenster nutzen. |
 

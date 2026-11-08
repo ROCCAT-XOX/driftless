@@ -2,13 +2,14 @@
 //! the results of a `driftless map` / `surface` run, see tools/qualitaet/README.md).
 //! Env: QA_A_SURF (folder with oberflaeche.glb), QA_A_CLOUD (color.las), QA_TRAJ (traj.tum),
 //! QA_OUT (folder for the images), optional QA_B_SURF + QA_B_CLOUD (a second run, shown next to
-//! the first), QA_PREFIX, QA_VIEWS ("name:ex,ey,ez:tx,ty,tz:fov;...").
+//! the first), QA_PREFIX, QA_VIEWS ("name:ex,ey,ez:tx,ty,tz:fov;..."), QA_RELIEF (if set, also
+//! `<view>_relief.png`: the form of the surfaces in gray with light from a slant, no photos).
 //! Prints one line per view and run: `LOECHER <view> <percent>` (run A) and `LOECHER_B <view>
 //! <percent>` (run B): the share of pixels with cloud points that show no surface.
 //! cargo test --release -p driftless-steps --test quality_real -- --ignored --nocapture
 
 use driftless_io::images::{decode_jpeg, RgbImage};
-use driftless_map::surface::{render_preview, TexturePage, TexturedMesh};
+use driftless_map::surface::{render_preview, render_relief, TexturePage, TexturedMesh};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -131,21 +132,17 @@ fn save_view(
         .iter()
         .map(|r| render_points(&r.cloud, eye, target, fov, size))
         .collect();
-    let gap = 8u32;
     let cols = runs.len() as u32;
-    let w = size[0] * cols + gap * (cols - 1);
-    let h = size[1] * 2 + gap;
-    let mut data = vec![255u8; (w * h * 3) as usize];
-    for (k, img) in surfaces.iter().chain(&points).enumerate() {
-        let ox = (k as u32 % cols) * (size[0] + gap);
-        let oy = (k as u32 / cols) * (size[1] + gap);
-        let row = size[0] as usize * 3;
-        for y in 0..size[1] as usize {
-            let dst = ((oy as usize + y) * w as usize + ox as usize) * 3;
-            data[dst..dst + row].copy_from_slice(&img.data[y * row..(y + 1) * row]);
-        }
+    let grid: Vec<&RgbImage> = surfaces.iter().chain(&points).collect();
+    write_grid(&out.join(format!("{file}.png")), size, cols, &grid);
+    if std::env::var("QA_RELIEF").is_ok() {
+        let reliefs: Vec<RgbImage> = runs
+            .iter()
+            .map(|r| render_relief(&r.mesh, eye, target, fov, size))
+            .collect();
+        let grid: Vec<&RgbImage> = reliefs.iter().collect();
+        write_grid(&out.join(format!("{file}_relief.png")), size, cols, &grid);
     }
-    write_png(&out.join(format!("{file}.png")), w, h, &data);
     let bg = |img: &RgbImage, i: usize| img.data[i * 3..i * 3 + 3] == BACKGROUND;
     let n = (size[0] * size[1]) as usize;
     for (k, (s, c)) in surfaces.iter().zip(&points).enumerate() {
@@ -157,6 +154,25 @@ fn save_view(
             100.0 * holes as f64 / covered.max(1) as f64
         );
     }
+}
+
+/// Images of one size as a white-gapped grid of `cols` columns.
+fn write_grid(path: &Path, size: [u32; 2], cols: u32, images: &[&RgbImage]) {
+    let gap = 8u32;
+    let rows = images.len() as u32 / cols;
+    let w = size[0] * cols + gap * (cols - 1);
+    let h = size[1] * rows + gap * (rows - 1);
+    let mut data = vec![255u8; (w * h * 3) as usize];
+    for (k, img) in images.iter().enumerate() {
+        let ox = (k as u32 % cols) * (size[0] + gap);
+        let oy = (k as u32 / cols) * (size[1] + gap);
+        let row = size[0] as usize * 3;
+        for y in 0..size[1] as usize {
+            let dst = ((oy as usize + y) * w as usize + ox as usize) * 3;
+            data[dst..dst + row].copy_from_slice(&img.data[y * row..(y + 1) * row]);
+        }
+    }
+    write_png(path, w, h, &data);
 }
 
 fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) {

@@ -10,7 +10,7 @@ use driftless_io::testdir::{SharedDir, TestDir};
 use driftless_io::testscan::{
     furnished_room_bag, furnished_scan_with_images, room_bag, scan_with_images, shared, tmp, IMAGES,
 };
-use driftless_map::surface::{SurfaceConfig, TextureSource};
+use driftless_map::surface::{Occluders, SurfaceConfig, TextureSource, OCCLUDERS_FILE};
 use driftless_map::{ColorCamera, ImageSource};
 use driftless_slam::align::AlignConfig;
 use driftless_steps::map::{map_input_for, run_map, MapInput, MapRequest, MapSettings, MapStep};
@@ -191,18 +191,22 @@ fn program() -> Value {
     })
 }
 
-/// Without `obj` a surface is its glb and its report; an OBJ of an earlier run is listed as
-/// stale, not deleted. The OBJ is part of no id.
+/// Without `obj` a surface is its glb and its report, and what hides it from the images if
+/// there is any; an OBJ of an earlier run is listed as stale, not deleted. The OBJ is part of
+/// no id.
 #[test]
 fn surface_writes_only_the_glb_by_default() {
     let (dir, out) = prepared("steps-surface-glb", true);
     let dest = out.join("oberflaeche");
     let req = request(&dir, &out, &dest);
     let report = run_surface(&req, &Progress::new()).unwrap();
-    assert_eq!(names(&dest), ["oberflaeche.glb", SURFACE_REPORT]);
+    assert_eq!(
+        names(&dest),
+        ["oberflaeche.glb", SURFACE_REPORT, OCCLUDERS_FILE]
+    );
     assert_eq!(
         report["files"],
-        serde_json::json!(["oberflaeche.glb", SURFACE_REPORT])
+        serde_json::json!(["oberflaeche.glb", OCCLUDERS_FILE, SURFACE_REPORT])
     );
     let with_obj = SurfaceRequest {
         obj: true,
@@ -269,6 +273,28 @@ fn surface_without_dense_bin_still_succeeds() {
         with["stats"]["accuracy_dense"]["walls"]["median_mm"].is_number(),
         "{with}"
     );
+    // The measures of `anlegen`, against the dense cloud as well.
+    let stats = &with["stats"];
+    assert!(
+        stats["accuracy"]["walls_plane"]["p95_mm"].is_number(),
+        "{with}"
+    );
+    assert!(
+        stats["accuracy_dense"]["walls_plane"]["p95_mm"].is_number(),
+        "{with}"
+    );
+    assert!(stats["roughness"]["median_mm"].is_number(), "{with}");
+    for key in [
+        "vertices",
+        "moved",
+        "no_plane",
+        "too_far",
+        "reverted",
+        "mean_shift_mm",
+    ] {
+        assert!(stats["snap"][key].is_number(), "{key}: {with}");
+    }
+    assert!(stats["occluders"].is_u64(), "{with}");
     fs::remove_file(out.join("dense.bin")).unwrap();
     let p = Progress::new();
     let without = run_surface(&request(&dir, &out, &out.join("without")), &p).unwrap();
@@ -286,6 +312,67 @@ fn surface_without_dense_bin_still_succeeds() {
         1,
         "{infos:?}"
     );
+}
+
+/// Whether `report` lists the file of the occluders.
+fn lists_occluders(report: &Value) -> bool {
+    report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f.as_str() == Some(OCCLUDERS_FILE))
+}
+
+/// The file of the occluders in `dest` is what the `report` of a run says about it.
+fn check_occluders_file(dest: &Path, report: &Value) {
+    assert!(lists_occluders(report), "{report}");
+    let found = report["stats"]["occluders"].as_u64().unwrap();
+    assert!(
+        found > 0,
+        "the synthetic scan has points without a face: {report}"
+    );
+    let file = dest.join(OCCLUDERS_FILE);
+    let size = fs::metadata(&file).unwrap().len();
+    assert_eq!(report["bytes"][OCCLUDERS_FILE], size, "{report}");
+    assert_eq!(Occluders::read(&file).unwrap().points.len() as u64, found);
+}
+
+#[test]
+fn occluders_file_belongs_to_the_surface() {
+    let (dir, out) = prepared("steps-surface-occluders", false);
+    let dest = out.join("oberflaeche");
+    let req = request(&dir, &out, &dest);
+    let report = run_surface(&req, &Progress::new()).unwrap();
+    check_occluders_file(&dest, &report);
+    assert!(surface_fits(&req));
+    let file = dest.join(OCCLUDERS_FILE);
+    let bytes = fs::read(&file).unwrap();
+    fs::write(&file, &bytes[..bytes.len() - 12]).unwrap();
+    assert!(!surface_fits(&req), "another size");
+    fs::remove_file(&file).unwrap();
+    assert!(!surface_fits(&req), "gone");
+    fs::write(&file, &bytes).unwrap();
+    assert!(surface_fits(&req));
+    // A later run with the switch off lists none, and the file of the first run stays what it
+    // is: not part of this surface.
+    let mut off = request(&dir, &out, &dest);
+    off.config.noise.occlude = false;
+    let report = run_surface(&off, &Progress::new()).unwrap();
+    assert!(!lists_occluders(&report), "{report}");
+    assert_eq!(report["stats"]["occluders"], 0);
+    assert!(surface_fits(&off));
+}
+
+#[test]
+fn no_occluders_file_with_the_switch_off() {
+    let (dir, out) = prepared("steps-surface-occluders-off", false);
+    let dest = out.join("oberflaeche");
+    let mut req = request(&dir, &out, &dest);
+    req.config.noise.occlude = false;
+    let report = run_surface(&req, &Progress::new()).unwrap();
+    assert!(!dest.join(OCCLUDERS_FILE).exists(), "{report}");
+    assert!(!lists_occluders(&report), "{report}");
+    assert!(surface_fits(&req));
 }
 
 #[test]
@@ -693,6 +780,21 @@ fn model_surface_with_one_imageless_member() {
     let t = &report["stats"]["texture"];
     assert!(t["faces_textured"].as_u64().unwrap() > 0, "{report}");
     assert!(dest.join("oberflaeche.glb").is_file());
+}
+
+#[test]
+fn model_surface_writes_the_occluders_too() {
+    let s = model_scene();
+    let dest = model_out("verdecker");
+    let mut req = model_request(&s.both, &dest);
+    // More measurements a voxel than the two scans give everywhere: parts of them have no
+    // face, and their points are what is looked for.
+    req.config.min_weight = 50;
+    let report = run_model_surface(&req, &Progress::new()).unwrap();
+    check_occluders_file(&dest, &report);
+    assert!(model_surface_fits(&req));
+    fs::remove_file(dest.join(OCCLUDERS_FILE)).unwrap();
+    assert!(!model_surface_fits(&req), "gone");
 }
 
 #[test]
