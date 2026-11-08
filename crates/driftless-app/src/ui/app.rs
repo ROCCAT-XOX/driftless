@@ -6,6 +6,8 @@ use super::compare::{compare_maps, compare_refs, default_refs, TrajRef};
 use super::correct::{Corrected, RunLoaded};
 use super::export::{self, ExportDialog};
 use super::feedback::{FeedbackDialog, ReportList};
+use super::plan::{self, PlanMode};
+use super::plan_view;
 use super::tools::{self, PairSession, ScreenLayout, Tool};
 use super::view3d::{effective_show, point_info, View3d, ViewEvent, ViewOverlay};
 use super::{
@@ -20,7 +22,9 @@ use crate::jobs::{JobFinished, JobOutput, JobRunner, StartError};
 use crate::logfile::{self, Level, LogFile};
 use crate::overlay::RunOverlay;
 use crate::pick::relative_to;
-use crate::project::{canonical, change_project, set_point_pair_enabled, Choices, Project};
+use crate::project::{
+    canonical, change_project, set_point_pair_enabled, Choices, PlanJobDone, Project,
+};
 use crate::render::ShowMode;
 use crate::surface::{load_mesh, surface_glb, SurfaceEdit, TouchupOutput, ViewEdit, SURFACE_GLB};
 use crate::synthetic::synthetic_cloud;
@@ -348,6 +352,8 @@ enum HelperTask {
     Feedback(Box<FeedbackJob>),
     /// The reports in the folder, for the list (☰ → „Meldungen …“).
     ReadReports(PathBuf),
+    /// A floor plan from its folder.
+    LoadPlan(PathBuf),
 }
 
 /// A report of „Melden“ to write ([`HelperTask::Feedback`]).
@@ -1429,6 +1435,7 @@ impl DriftlessApp {
             }
             Selection::Surface(dir) => self.load_surface(&dir),
             Selection::Model(dir) => self.load_model_cloud(dir.join(MODEL_LAS)),
+            Selection::Plan(dir) => self.helper_queue.push_back(HelperTask::LoadPlan(dir)),
             _ => {}
         }
     }
@@ -1944,6 +1951,10 @@ impl DriftlessApp {
                 }
                 (Some(HelperTask::Feedback(_)), result) => self.feedback_written(result),
                 (Some(HelperTask::ReadReports(_)), result) => self.reports_read(result),
+                (Some(HelperTask::LoadPlan(_)), Ok(JobOutput::PlanLoaded(plan))) => {
+                    plan::set_shown(&mut self.state.plan, *plan);
+                }
+                (Some(HelperTask::LoadPlan(_)), Err(e)) => self.error(text::step_error(&e)),
                 _ => {}
             }
         }
@@ -2110,6 +2121,12 @@ impl DriftlessApp {
                 let dir = dir.clone();
                 self.helper.start(text::REPORTS_JOB, move |_| {
                     Ok(JobOutput::Reports(crate::feedback::read_all(&dir)))
+                })
+            }
+            HelperTask::LoadPlan(dir) => {
+                let dir = dir.clone();
+                self.helper.start(text::PLAN_LOAD_JOB, move |_| {
+                    Ok(JobOutput::PlanLoaded(Box::new(plan::load(&dir)?)))
                 })
             }
         };
@@ -2988,6 +3005,17 @@ impl DriftlessApp {
                     self.want_touchup(done.dir.clone(), None, true);
                 }
             }
+            (Some(JobOutput::PlanStep(done)), Some(Action::RunPlan { owner, .. })) => match *done {
+                PlanJobDone::Done { dir, reused } => {
+                    if reused {
+                        self.info(text::plan_fits(&dir));
+                    }
+                    self.show_plan(dir);
+                }
+                PlanJobDone::SeveralStoreys(storeys) => {
+                    self.state.plan.storeys = Some((owner, storeys));
+                }
+            },
             (Some(JobOutput::Touchup(out)), Some(Action::Touchup { step, tell, .. })) => {
                 self.touchup_done(*out, step, tell)
             }
@@ -3417,7 +3445,8 @@ impl DriftlessApp {
             | Action::RunSurface(_)
             | Action::RunMerge { .. }
             | Action::ApplyPairs { .. }
-            | Action::RunModelSurface { .. }) => {
+            | Action::RunModelSurface { .. }
+            | Action::RunPlan { .. }) => {
                 match actions::start_step(&mut self.state, &mut self.jobs, &step) {
                     Ok(()) => {
                         // the merge runs: its field closes, the model shows when it is done
@@ -3463,6 +3492,17 @@ impl DriftlessApp {
                     dialog.replace = None;
                 }
                 self.apply(Action::RunExport(request));
+            }
+            Action::ShowPlan(dir) => self.show_plan(dir),
+            Action::SetPlanMode(mode) => self.set_plan_mode(mode),
+            Action::SetPlanLayer { layer, on } => plan::set_layer(&mut self.state.plan, &layer, on),
+            Action::SetTopView(on) => self.state.plan.top_view = on,
+            Action::OpenPlanExport => {
+                if let Some(dir) = self.state.plan.shown.as_ref().map(|s| s.dir.clone()) {
+                    let source = plan::export_source(&self.state.plan, &dir);
+                    let name = export::source_name(&self.state, &source);
+                    self.state.export = ExportDialog::new(vec![(source, name)]);
+                }
             }
             Action::OpenMerge => self.state.open_merge(),
             Action::StartPairs { model, member } => self.start_pairs(&model, member),
@@ -3580,6 +3620,29 @@ impl DriftlessApp {
         };
     }
 
+    /// Shows the floor plan in `dir` (read in the background) and selects it.
+    fn show_plan(&mut self, dir: PathBuf) {
+        self.state.selection = Selection::Plan(dir.clone());
+        self.state.plan.mode = PlanMode::Plan;
+        self.helper_queue.push_back(HelperTask::LoadPlan(dir));
+    }
+
+    /// „Plan · 3D“; 3D brings the cloud of the map or model of the plan if none is shown yet.
+    fn set_plan_mode(&mut self, mode: PlanMode) {
+        self.state.plan.mode = mode;
+        if mode != PlanMode::View3d || self.cloud.is_some() || self.is_loading() {
+            return;
+        }
+        let Some(owner) = self.state.plan.owner.clone() else {
+            return;
+        };
+        if self.state.model(&owner).is_some() {
+            self.load_model_cloud(owner.join(MODEL_LAS));
+        } else {
+            self.load_best_of_map(&owner);
+        }
+    }
+
     /// „Aus der Ansicht nehmen“: what the view shows from the folder `dir` or from a model that
     /// uses it goes (the cloud, the surface, „Von Hand ausrichten“), and the selection if it
     /// lies there; the run drawn follows ([`Self::sync_run`]).
@@ -3606,6 +3669,9 @@ impl DriftlessApp {
         if self.state.pairs.as_ref().is_some_and(|p| hit(&p.model)) {
             tools::end_pairs(&mut self.state);
         }
+        for dir in &touched {
+            plan::unshow(&mut self.state, dir);
+        }
         self.sync_run();
     }
 
@@ -3617,6 +3683,7 @@ impl DriftlessApp {
             | Selection::Cloud(p)
             | Selection::Surface(p)
             | Selection::Model(p)
+            | Selection::Plan(p)
             | Selection::History { run: p, .. } => p.starts_with(dir),
             Selection::None | Selection::Scan(_) => false,
         }
@@ -3928,8 +3995,13 @@ impl DriftlessApp {
             pick_places: self.state.correct.picking,
         });
         let shown = self.cloud.is_some() || overlay.is_some() || self.view.has_surface();
-        let central =
-            egui::CentralPanel::no_frame().show(ui, |ui| match (&self.render_state, shown) {
+        let plan_shown = plan::on_screen(&self.state);
+        let central = egui::CentralPanel::no_frame().show(ui, |ui| {
+            if plan_shown {
+                actions.extend(plan_view::show(ui, &mut self.state));
+                return;
+            }
+            match (&self.render_state, shown) {
                 (Some(rs), true) => {
                     let rect = ui.max_rect();
                     event = self
@@ -3969,7 +4041,8 @@ impl DriftlessApp {
                     };
                     ui.centered_and_justified(|ui| ui.weak(hint));
                 }
-            });
+            }
+        });
         self.state.brush.painting = self.brush.painting();
         self.no_surface_hint(&ctx, central.response.rect);
         self.drop_hint(&ctx);
@@ -3980,7 +4053,7 @@ impl DriftlessApp {
         }
         let view = central.response.rect;
         actions.extend(tools::floats(&ctx, view, &mut self.state, &mut self.layout));
-        let legend = self.quality_drawn();
+        let legend = self.quality_drawn() && !plan_shown;
         tools::quality_legend(&ctx, view, legend, &mut self.layout);
         match event {
             Some(ViewEvent::PickedPose(i)) => self.pose_picked(i),

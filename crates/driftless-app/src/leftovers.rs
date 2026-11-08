@@ -1,6 +1,6 @@
-//! What a job cut off left behind (a crash, a force quit, a power cut): a run, map, surface or
-//! model folder without its final report (`slam.json`, `map.json`, `oberflaeche.json`,
-//! `modell.json`; each step writes it last), a stale `<name>.tmp` beside a file being
+//! What a job cut off left behind (a crash, a force quit, a power cut): a run, map, surface,
+//! floor plan or model folder without its final report (`slam.json`, `map.json`,
+//! `oberflaeche.json`, `grundriss.json`, `modell.json`; each step writes it last), a stale `<name>.tmp` beside a file being
 //! written, or a folder `nacharbeit.tmp-…` a touch-up left in a surface folder. A surface
 //! folder with its glb but without its report was cut off between the two: it is a leftover
 //! too, never a finished surface. A cancelled or failed job removes its new
@@ -23,11 +23,12 @@
 
 use crate::disk::folder_size;
 use crate::project::{numbered, MAP_PREFIX, MODELS_DIR, MODEL_PREFIX, RUN_PREFIX, SCANS_DIR};
-use crate::project::{SURFACE_NUMBERED, SURFACE_PREFIX};
+use crate::project::{PLAN_NUMBERED, SURFACE_NUMBERED, SURFACE_PREFIX};
 use crate::ui::text;
 use driftless_steps::history::HISTORY_DIR;
 use driftless_steps::map::REPORT as MAP_REPORT;
 use driftless_steps::merge::MODEL_REPORT;
+use driftless_steps::plan::PLAN_REPORT;
 use driftless_steps::slam::reuse_cut_off;
 use driftless_steps::surface::SURFACE_REPORT;
 use driftless_steps::touchup::{touchup_cut_off, touchup_leftovers};
@@ -54,6 +55,8 @@ pub enum LeftoverKind {
     Map,
     Surface,
     Model,
+    /// A floor plan folder `grundriss-NNN` without its report.
+    Plan,
     /// A `<name>.tmp` in a folder that is complete otherwise, or a folder `nacharbeit.tmp-…` a
     /// touch-up left in a surface folder.
     Temp,
@@ -112,6 +115,7 @@ pub fn find(dir: &Path, scan_ids: &[String]) -> Vec<Leftover> {
                 }
                 temps(&map, Some(&map_label), &mut out);
                 surfaces(&map, &map_label, &mut out);
+                plans(&map, &map_label, &mut out);
             }
         }
     }
@@ -127,6 +131,7 @@ pub fn find(dir: &Path, scan_ids: &[String]) -> Vec<Leftover> {
         }
         temps(&model, Some(&label), &mut out);
         surfaces(&model, &label, &mut out);
+        plans(&model, &label, &mut out);
     }
     temps(&models, None, &mut out);
     temps(dir, None, &mut out);
@@ -148,6 +153,23 @@ fn surfaces(dir: &Path, parent: &str, out: &mut Vec<Leftover>) {
         } else {
             let label = format!("{label} ({parent})");
             out.push(folder(LeftoverKind::Surface, &surface, label));
+        }
+    }
+}
+
+/// The floor plans `grundriss-NNN` of the map or model folder `dir` (named `parent`): one
+/// without its report (`grundriss.json`, written last) whole, else its stale `.tmp` files.
+fn plans(dir: &Path, parent: &str, out: &mut Vec<Leftover>) {
+    for (_, digits, plan) in numbered(dir, PLAN_NUMBERED) {
+        let label = text::plan_label(&digits);
+        if busy(&plan) {
+            continue;
+        }
+        if plan.join(PLAN_REPORT).is_file() {
+            temps(&plan, Some(&label), out);
+        } else {
+            let label = format!("{label} ({parent})");
+            out.push(folder(LeftoverKind::Plan, &plan, label));
         }
     }
 }
@@ -217,8 +239,8 @@ fn newest(dir: &Path) -> SystemTime {
 /// Whether the run or map folder `dir` holds finished results: the history of a run
 /// (`verlauf/`), the old result of a run whose reuse was cut off ([`reuse_cut_off`]), a map
 /// with its `map.json` (a `karte-NNN`, or one the command line wrote into the run folder), a
-/// surface (`oberflaeche…`) with its `oberflaeche.json`; also further down (a surface in a map
-/// folder without its report). Such a folder without its own report is no leftover. Reads
+/// surface (`oberflaeche…`) with its `oberflaeche.json`, a floor plan (`grundriss-NNN`) with its
+/// `grundriss.json`; also further down (a surface in a map folder without its report). Such a folder without its own report is no leftover. Reads
 /// folders: call it off the UI thread.
 pub fn holds_results(dir: &Path) -> bool {
     if dir.join(HISTORY_DIR).is_dir() || reuse_cut_off(dir) || dir.join(MAP_REPORT).is_file() {
@@ -229,6 +251,10 @@ pub fn holds_results(dir: &Path) -> bool {
         .iter()
         .any(|(_, _, map)| map.join(MAP_REPORT).is_file() || holds_results(map))
     {
+        return true;
+    }
+    let plans = numbered(dir, PLAN_NUMBERED);
+    if plans.iter().any(|(_, _, p)| p.join(PLAN_REPORT).is_file()) {
         return true;
     }
     let Ok(entries) = fs::read_dir(dir) else {
@@ -250,7 +276,13 @@ pub fn holds_results(dir: &Path) -> bool {
 /// touch-up cut off while putting its new cache in place left ([`touchup_cut_off`]: the next
 /// touch-up puts the old one back) – each may have come after the leftovers were listed.
 pub fn may_clean_up(path: &Path) -> bool {
-    let reports = [SLAM_REPORT, MAP_REPORT, SURFACE_REPORT, MODEL_REPORT];
+    let reports = [
+        SLAM_REPORT,
+        MAP_REPORT,
+        SURFACE_REPORT,
+        PLAN_REPORT,
+        MODEL_REPORT,
+    ];
     if !path.is_dir() {
         return !path.parent().is_some_and(reuse_cut_off);
     }

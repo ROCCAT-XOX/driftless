@@ -1609,6 +1609,7 @@ mod tests {
                 settings: Some(SurfaceSettings::default()),
                 hints: Vec::new(),
             }],
+            plans: Vec::new(),
             incomplete: false,
         };
         let run = RunInfo {

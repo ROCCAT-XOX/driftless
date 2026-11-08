@@ -16,7 +16,7 @@
 //! surfaces of the map or model whose surface is shown its Stellen ([`mark_list`]).
 
 use super::{badge, model_stale_hint};
-use crate::project::{MapInfo, ModelInfo, RunInfo, SurfaceInfo};
+use crate::project::{MapInfo, ModelInfo, PlanInfo, RunInfo, SurfaceInfo};
 use crate::render::mesh::mark_color;
 use crate::render::SCAN_COLORS;
 use crate::ui::theme::{icon, DARK};
@@ -473,6 +473,53 @@ pub(super) fn surface_leaf(
     );
     if r.clicked() {
         *action = Some(Action::Select(Selection::Surface(surface.dir.clone())));
+    }
+}
+
+/// A floor plan below its map or model in „Planung“: a click shows it, its hints on hover; the
+/// context menu as for a surface.
+pub(super) fn plan_leaf(
+    ui: &mut Ui,
+    state: &AppState,
+    plan: &PlanInfo,
+    action: &mut Option<Action>,
+) {
+    let selected = state.selection == Selection::Plan(plan.dir.clone());
+    let label = sized(
+        state,
+        &text::plan_entry(&plan.label, plan.storey),
+        &plan.dir,
+    );
+    let hover = |name: &str| {
+        let mut hover = format!("{name}\n{}", plan.dir.display());
+        for hint in &plan.hints {
+            hover += &format!("\n\n{hint}");
+        }
+        hover
+    };
+    let r = leaf(ui, |ui| {
+        if plan.stale {
+            let name = text::plan_stale(&label);
+            let warn = ui.visuals().warn_fg_color;
+            entry(
+                ui,
+                selected,
+                RichText::new(&name).color(warn),
+                &hover(&name),
+            )
+        } else {
+            entry(ui, selected, label.clone(), &hover(&label))
+        }
+    });
+    entry_menu(
+        &r,
+        state,
+        || super::super::plan::export_source(&state.plan, &plan.dir),
+        Manage::Delete(plan.dir.clone()),
+        action,
+    );
+    if r.clicked() {
+        *action = Some(Action::ShowPlan(plan.dir.clone()));
     }
 }
 

@@ -68,6 +68,7 @@ fn map(dir: &str, surfaces: Vec<SurfaceInfo>) -> MapInfo {
         settings: Some(MapSwitches::default()),
         clouds: Vec::new(),
         surfaces,
+        plans: Vec::new(),
         incomplete: false,
     }
 }
@@ -503,15 +504,16 @@ fn fineness_switch_sets_only_the_voxel() {
 }
 
 #[test]
-fn planning_shows_placeholder() {
+fn planning_lists_the_maps() {
     let mut state = four_maps();
     state.step = Step::Planung;
     let h = panel(state);
     h.get_by_label(text::STEP_PLAN);
-    h.get_by_label(text::PLAN_COMING);
-    assert!(text::PLAN_COMING.contains("Grundriss"));
-    assert!(text::PLAN_COMING.contains("Maße"));
-    assert!(text::PLAN_COMING.contains("DWG"));
+    h.get_by_label(text::STEP_FLOOR_PLAN);
+    h.get_by_label(&text::map_of("Scan a", "SLAM 001", "Karte 001"));
+    // no plan yet: no list of layers
+    assert!(h.query_by_label(text::PLAN_LAYERS).is_none());
+    assert!(h.query_by_label(text::PLAN_DXF).is_none());
 }
 
 /// Writes a one-triangle glb to `path`.
@@ -859,6 +861,7 @@ fn with_model(surfaces: Vec<SurfaceInfo>) -> AppState {
         label: "Modell 001".into(),
         report,
         surfaces,
+        plans: Vec::new(),
     }];
     state
 }

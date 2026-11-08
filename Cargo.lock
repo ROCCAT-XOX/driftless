@@ -1658,6 +1658,7 @@ dependencies = [
  "driftless-io",
  "driftless-map",
  "driftless-odom",
+ "driftless-plan",
  "driftless-slam",
  "driftless-steps",
  "driftless-traj",

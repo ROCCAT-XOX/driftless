@@ -413,6 +413,7 @@ fn small_window_no_overlap() {
                 settings: None,
                 hints: Vec::new(),
             }],
+            plans: Vec::new(),
             incomplete: false,
         }],
         history: Vec::new(),
@@ -783,6 +784,7 @@ fn pair_model(dir: &Path, root: &Path) -> ModelInfo {
             warnings: Vec::new(),
         },
         surfaces: Vec::new(),
+        plans: Vec::new(),
     }
 }
 

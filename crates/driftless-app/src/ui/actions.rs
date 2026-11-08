@@ -9,7 +9,7 @@ use super::{text, Action, AppState};
 use crate::jobs::{JobOutput, JobRunner};
 use crate::project::{
     restore_job, run_map_job, run_merge_job, run_model_surface_job, run_pairs_merge_job,
-    run_slam_job, run_surface_job, ScanState, SlamJob,
+    run_plan_job, run_slam_job, run_surface_job, ScanState, SlamJob,
 };
 use crate::surface::{run_touchup_job, TouchupJob, TouchupView, SURFACE_GLB};
 use driftless_steps::export::run_export;
@@ -18,12 +18,12 @@ use driftless_steps::map::MapStep;
 use driftless_steps::touchup::TouchupPrepared;
 
 /// Starts the job of a step action (`Inspect`, `RunSlam`, `Reuse`, `RestoreHistory`,
-/// `RunMap`, `RunSurface`, `RunMerge`, `ApplyPairs`, `RunModelSurface`, `RunExport`,
+/// `RunMap`, `RunSurface`, `RunPlan`, `RunMerge`, `ApplyPairs`, `RunModelSurface`, `RunExport`,
 /// `Touchup`) and records it in [`AppState::running`]. Only the export runs without a project;
 /// its checks are the step's own ([`run_export`]). Refused with a German message while a job
 /// runs, for a scan that cannot be read, a run without `submaps.bin` (reuse, restore), while a
 /// change of the corrections is being written (reuse, restore), for invalid map or surface
-/// settings, a map without `map.json` (surface), fewer than two scans to merge, a model not in
+/// settings, a map without `map.json` (surface, floor plan), fewer than two scans to merge, a model not in
 /// the project, a surface folder not in the tree (touch-up), or any other action.
 pub fn start_step(
     state: &mut AppState,
@@ -139,6 +139,25 @@ pub fn start_step(
                 let done = run_surface_job(&run, &scan, &map, &settings, gpu, p)?;
                 Ok(JobOutput::SurfaceStep(Box::new(done)))
             })
+        }
+        Action::RunPlan { owner, storey } => {
+            let model = state.model(owner).cloned();
+            if model.is_none() {
+                let map = state.map(owner).ok_or_else(|| text::unknown_map(owner))?;
+                if map.2.incomplete {
+                    return Err(text::PLAN_MAP_INCOMPLETE.into());
+                }
+            }
+            let (dir, storey) = (owner.clone(), *storey);
+            let started = runner.start(text::STEP_FLOOR_PLAN, move |p| {
+                let done = run_plan_job(&dir, model.as_ref(), storey, p)?;
+                Ok(JobOutput::PlanStep(Box::new(done)))
+            });
+            if started.is_ok() {
+                state.plan.storeys = None;
+                state.plan.owner = Some(owner.clone());
+            }
+            started
         }
         Action::RunMerge {
             picks,

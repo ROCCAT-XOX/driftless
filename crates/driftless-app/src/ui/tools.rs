@@ -18,6 +18,7 @@
 //! one of its scans; the tool „Punktpaare“ (in the bar only then) takes a place in the model
 //! and the same place in the scan by turns, each with a numbered marker ([`paint_pairs`]).
 
+use super::plan::PlanMode;
 use super::steps::{parse_decimal, point_lines};
 use super::theme::{self, icon, DARK};
 use super::view3d::{effective_show, target_size, PointInfo};
@@ -123,6 +124,8 @@ pub struct ScreenLayout {
     pub show: Option<Rect>,
     pub tools: Option<Rect>,
     pub cut: Option<Rect>,
+    /// The switch „Plan · 3D“ ([`plan_bar`]).
+    pub plan: Option<Rect>,
     /// The bar of the brush ([`super::brush::bar`]).
     pub brush: Option<Rect>,
     /// The legend of the quality colours ([`quality_legend`]).
@@ -140,6 +143,7 @@ impl Default for ScreenLayout {
             show: None,
             tools: None,
             cut: None,
+            plan: None,
             brush: None,
             legend: None,
         }
@@ -441,13 +445,16 @@ pub fn floats(
     layout.tools = None;
     layout.cut = None;
     layout.brush = None;
-    if state.cloud.is_none() && state.surface.is_none() {
-        return None;
+    layout.plan = None;
+    // over the plan only its own switch: the bars below belong to the 3D view
+    if super::plan::on_screen(state) || (state.cloud.is_none() && state.surface.is_none()) {
+        return plan_bar(ctx, view, state, layout);
     }
     layout.info = Some(info(ctx, view, state));
     if state.surface.is_some() {
         layout.show = Some(show_switch(ctx, view, state));
     }
+    let plan_action = plan_bar(ctx, view, state, layout);
     let (tools, mut action) = toolbar(ctx, view, state);
     layout.tools = Some(tools);
     match state.tool {
@@ -459,7 +466,40 @@ pub fn floats(
         }
         _ => {}
     }
-    action
+    action.or(plan_action)
+}
+
+/// The switch „Plan · 3D“ at the top right, left of „Ansicht“ if that is there: in „Planung“,
+/// once there is a plan.
+fn plan_bar(
+    ctx: &Context,
+    view: Rect,
+    state: &AppState,
+    layout: &mut ScreenLayout,
+) -> Option<Action> {
+    if !super::plan::switch_shown(state) {
+        return None;
+    }
+    let right = layout
+        .show
+        .map_or(view.right() - MARGIN, |r| r.left() - GAP);
+    let pos = egui::pos2(right, view.top() + MARGIN);
+    let mode = state.plan.mode;
+    let mut chosen = None;
+    let rect = float(ctx, "plan_umschalter", view, pos, Align2::RIGHT_TOP, |ui| {
+        ui.horizontal(|ui| {
+            for (choice, label) in [
+                (PlanMode::Plan, text::PLAN_SWITCH_PLAN),
+                (PlanMode::View3d, text::PLAN_SWITCH_3D),
+            ] {
+                if bar_button(ui, None, Some(label), label, Some(mode == choice)).clicked() {
+                    chosen = Some(choice);
+                }
+            }
+        });
+    });
+    layout.plan = Some(rect);
+    chosen.map(Action::SetPlanMode)
 }
 
 /// A floating bar: an area at `pos` of the view (`pivot` its corner there), in
