@@ -83,7 +83,7 @@ Beides ist nach jeder neuen Version noch einmal nötig.
 | Einstellung | Arbeitsspeicher bei großen Aufnahmen |
 |---|---|
 | Karte mit „Maximal“ | etwa 4 GB |
-| Oberfläche mit „1 cm“ | bis 9 GB |
+| Oberfläche mit „1 cm“ | bis 10 GB |
 
 ### Kommandozeile
 
@@ -195,7 +195,7 @@ Zwei Schalter entscheiden über Zeit, Arbeitsspeicher und Platz:
 Die Vorgaben „Genau“ und „2 cm“ passen für die meisten Räume.
 
 Die Zahlen sind auf einem Testrechner gemessen: Linux mit der Grafikkarte NVIDIA RTX 5080, Version 0.1.0
-([Ergebnisse](ergebnisse/2026-10-28-version-0-1.md)). Auf einem Büro-PC oder Laptop dauert es länger.
+([Ergebnisse](ergebnisse/2026-10-28-version-0-1.md)). Seit 0.2.0 braucht die Oberfläche etwas mehr, im Büro mit „1 cm“ 22,8 min und 9,8 GB ([Messung](ergebnisse/2026-11-08-weniger-rauschen.md)). Auf einem Büro-PC oder Laptop dauert es länger.
 Auf einem MacBook Pro mit M4 Pro sind die Oberflächen gleich schnell. Die Karte eines kleinen Raums
 dauert dort bis 2,5-mal so lange (2,3 statt 1,4 min), die des Büros nicht. Alle vier Scans samt Modell
 dauerten auf dem Mac 28 statt 24 Minuten.
@@ -227,11 +227,11 @@ muss man dafür nichts:
 |---|---|
 | anlegen | Wo die Messpunkte eine ebene Fläche zeigen, legt Driftless die Oberfläche auf diese Ebene. Wände, Böden und Decken werden ruhiger, Kanten bleiben, wie sie sind. |
 | belichtung | Für jede Fläche nimmt Driftless lieber ein Foto, auf dem die Stelle gut belichtet ist, als eines, auf dem sie sehr dunkel oder überstrahlt ist. |
-| entrauschen | Körnung und farbige Sprenkel im Bild werden gedämpft, je Bildstück so stark, wie es rauscht. Schrift und Kanten bleiben scharf, saubere Fotos bleiben, wie sie sind. |
-| verdeckung | Was gemessen wurde, aber keine eigene Fläche hat, etwa ein dünnes Rohr oder eine Leiter, verdeckt beim Zuordnen der Fotos die Wand dahinter und malt sich nicht mehr auf sie. |
+| entrauschen | Soll Körnung und farbige Sprenkel im Bild dämpfen, je Bildstück so stark, wie es rauscht. Auf den Testscans greift das bisher fast nirgends, das Bild bleibt also meist, wie es ist. |
+| verdeckung | Was gemessen wurde, aber keine eigene Fläche hat, etwa ein dünnes Rohr oder eine Leiter, verdeckt beim Zuordnen der Fotos die Wand dahinter. Das wirkt bisher nur mit „2 cm“; mit „1 cm“ fand der Prüflauf keine solchen Teile. |
 
 „Bilder neu einspielen“ dämpft das Rauschen und beachtet die Verdeckung genauso, damit eine neue Stelle zu
-ihrer Umgebung passt. Die Grenzen stehen unter [Bekannte Grenzen](#11-bekannte-grenzen).
+ihrer Umgebung passt. Die Grenzen stehen unter [Bekannte Grenzen](#12-bekannte-grenzen).
 
 Zum Vergleich lässt sich in der Kommandozeile jeder Schritt einzeln abschalten; in der App gibt es dafür keinen
 Schalter:
@@ -637,15 +637,16 @@ Dieselbe Liste steht im [CHANGELOG](../CHANGELOG.md).
 | Nicht signiert | Die Programme sind nicht signiert und nicht bei Apple beglaubigt. Der erste Start braucht deshalb einen Schritt mehr (siehe Installieren). |
 | Windows nur automatisch geprüft | Bauen, Tests und Installieren laufen unter Windows in der CI. Von Hand auf einem echten Windows-PC ist Driftless noch nicht geprüft. |
 | SharePoint-Bibliotheken | Mit OneDrive abgeglichene SharePoint-Bibliotheken (unter `%USERPROFILE%\<Firmenname>`) erkennt Driftless nicht als Cloud-Ordner und warnt dort nicht; das tut es nur bei OneDrive selbst. Projekte nicht dort ablegen. |
-| 1 cm braucht viel Speicher | Eine Oberfläche mit 1 cm braucht bei großen Aufnahmen bis 9 GB Arbeitsspeicher (Büro: 7,7 GB, 20 Minuten). |
+| 1 cm braucht viel Speicher | Eine Oberfläche mit 1 cm braucht bei großen Aufnahmen bis 10 GB Arbeitsspeicher (Büro: 9,8 GB, 23 Minuten). |
 | Verfehlte Qualitätsziele | Bei 1 cm bleiben in großen und in dunklen Räumen Stellen der Oberfläche offen: von oben gesehen im Büro 31 % (Ziel höchstens 30 %), in einem dunklen Raum 9,7 % (Ziel höchstens 6 %). 2 cm schließt mehr. Die Übergänge zwischen zwei Fotos (Nähte) sind deutlicher zu sehen als geplant. Die Oberflächen-Datei eines Raums ist bei 1 cm rund 100 MB groß statt höchstens 60 MB. Dieselbe Wand, mehrmals abgelaufen, liegt vor dem Glätten einige Millimeter auseinander (Ziel höchstens 5 mm); die Ursache ist offen, das Glätten legt sie wieder auf eine Fläche. |
-| Nacharbeit braucht Zeit | Ein Schritt auf einer Stelle von 1 m² dauerte auf dem Testrechner (6 Rechenkerne) 1,5 bis 2,8 s ([Messung](ergebnisse/2026-10-29-pinsel.md)). Größere Stellen dauern länger; gemessen ist bisher nur 1 m². Der erste Schritt nach dem Start legt ein Verzeichnis der Kamerabilder an: Liest Driftless sie dafür vom Laufwerk, etwa gleich nach dem Anstecken, kommen 0,4 bis 1,6 s dazu. Liegen die Scans auf einem langsamen Laufwerk, dauert es länger. Malen und ↶ gehen sofort. |
+| Nacharbeit braucht Zeit | Ein Schritt auf einer Stelle von 1 m² dauerte auf dem Testrechner (6 Rechenkerne) 1,5 bis 2,8 s ([Messung](ergebnisse/2026-10-29-pinsel.md)). Größere Stellen dauern länger: Eine Bodenstelle von 8,9 m² brauchte für „Bilder neu“ 12 bis 37 s. Der erste Schritt nach dem Start legt ein Verzeichnis der Kamerabilder an: Liest Driftless sie dafür vom Laufwerk, etwa gleich nach dem Anstecken, kommen 0,4 bis 1,6 s dazu. Liegen die Scans auf einem langsamen Laufwerk, dauert es länger. Malen und ↶ gehen sofort. |
 | Rohre von Hand | Rohre und Kabel erkennt Driftless nicht selbst, sie werden von Hand gesetzt. |
 | Türen ohne Aufschlag | Eine Tür steht als Öffnung im Plan: Laibung und Schwelle, ohne Türblatt und Aufschlagrichtung. |
 | Fenster nur mit Beleg | Ein Loch im Wandbild wird nur Fenster oder Tür, wenn die Laufbahn hindurchging, die andere Seite der Wand dort auch offen ist oder dahinter (in einem nicht begangenen Bereich) gemessen wurde. Schwarze Wände, die der Laser schlecht trifft, bleiben Wand; ebenso Fenster, hinter denen nichts gemessen wurde. |
 | Nur Wände an Räumen | Im Plan stehen die Wände, die einen begangenen Raum begrenzen. Hohe Möbel im Raum und Fassaden, die durch ein Fenster gemessen wurden, stehen nicht darin. |
 | Durchgänge bis zur Decke | Eine Öffnung bis zur Decke, also ohne Wand darüber, ist keine Tür. Sie trennt keine Räume: Ein offener Flur zwischen fluchtenden Wänden bleibt ein Raum. Auch eine Tür, die bis zur Decke reicht (etwa mit Glasoberlicht), wird so behandelt: Die Räume davor und dahinter werden dann ein Raum. |
 | Ein Stockwerk je Plan | Ein Grundriss zeigt ein Stockwerk. Hat eine Karte mehrere, wird jedes für sich gerechnet. |
+| Bildrauschen und dünne Teile | Das Dämpfen von Bildrauschen greift auf den Testscans fast nirgends. Dünne Teile ohne eigene Fläche verdecken die Wand dahinter bisher nur mit „2 cm“, mit „1 cm“ nicht ([Messung](ergebnisse/2026-11-08-weniger-rauschen.md)). |
 | Kleine Teile und Säume an Kanten | Nur was mehr als 2 cm vor einer Fläche steht, Punkte hat und zusammen mindestens 30 cm lang ist, verdeckt die Wand dahinter. Türgriffe und andere kleine Teile können deshalb weiter leicht versetzt im Bild liegen. Wo keine ebene Umgebung zu finden ist, also an Kanten und dünnen Teilen, bleibt ein schmaler Saum der Oberfläche, wie er war. |
 | Dünne Teile dicht an der Wand | Steht dicht vor der Stelle etwas Dünnes, das die Oberfläche nur in Stücken hat, etwa ein Rohr oder ein Kabelkanal, liegt es in den Fotos je nach Standort ein paar Zentimeter anders, ebenso ein dunkler Streifen daneben. „Bilder neu einspielen“ kann dann einen Streifen auf die Stelle legen, schärfer und etwas versetzt. Dann die nächste Variante probieren oder mit ↶ zurücknehmen. Was weiter vor der Wand steht, etwa eine Stange, legt es meist nicht auf die Wand: wenn die Fotos es mindestens 5 cm gegeneinander versetzt zeigen und es sich in der Helligkeit mindestens um das Dreifache von der Wand abhebt. Geprüft ist das nur an einem nachgestellten Beispiel; auf den echten Testscans kam so etwas nicht vor. |
 | Stellen in zwei Fenstern | Stellen derselben Karte oder desselben Modells gleichzeitig in zwei Fenstern nachzuarbeiten ist nicht erprobt. Dafür nur ein Fenster nutzen. |

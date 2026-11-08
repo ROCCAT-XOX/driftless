@@ -93,12 +93,12 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
 - „Aufräumen“ bietet auch halb geschriebene Ordner der Nacharbeit an (`nacharbeit.tmp-…`).
 - Die Anleitung hat die Abschnitte „Stellen nacharbeiten“, „Melden“ und „Grundriss und DXF“; die folgenden
   Abschnitte rücken eine Nummer weiter.
-- Weniger Rauschen auf der Oberfläche, von selbst und ohne Einstellung: Wo die Messpunkte eben sind, liegt
-  die Oberfläche jetzt auf ihrer Ebene, Wände, Böden und Decken werden ruhiger. Fotos, auf denen eine Stelle
-  gut belichtet ist, gehen vor sehr dunklen oder überstrahlten. Körnung und farbige Sprenkel im Bild werden
-  je Bildstück gedämpft, Schrift und Kanten bleiben scharf. Gemessene Teile ohne eigene Fläche, etwa ein
-  dünnes Rohr oder eine Leiter, malen sich nicht mehr auf die Wand dahinter. „Bilder neu einspielen“ dämpft
-  und verdeckt genauso.
+- Ruhigere Oberflächen, von selbst und ohne Einstellung: Wo die Messpunkte eben sind, liegt die Oberfläche
+  jetzt auf ihrer Ebene; die Rauheit der Wände sank im Prüflauf im Median um 83 bis 95 %. Fotos, auf denen
+  eine Stelle gut belichtet ist, gehen vor sehr dunklen oder überstrahlten. Zwei weitere Schritte sind
+  eingebaut, wirken bisher aber wenig: Das Dämpfen von Bildrauschen greift auf den Testscans fast nirgends.
+  Dünne Teile ohne eigene Fläche verdecken die Wand dahinter nur bei 2 cm; bei 1 cm fand der Prüflauf keine.
+  [Messung](https://github.com/ROCCAT-XOX/driftless/blob/main/docs/ergebnisse/2026-11-08-weniger-rauschen.md)
 - `driftless surface --ohne anlegen,belichtung,entrauschen,verdeckung` schaltet diese Schritte zum Vergleich
   einzeln ab, `--ohne alles` alle vier. In der App gibt es dafür keinen Schalter.
 - Fremde Dateien werden strenger geprüft: Ein Chunk einer Bag-Datei, der nicht so groß ist wie sein Kopf
@@ -115,7 +115,7 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
   bis zur Decke ist keine Tür und trennt keine Räume, das gilt auch für eine Tür mit Glasoberlicht. Ein Fenster
   braucht Punkte dahinter, sonst bleibt die Wand stehen; ein schwarzer Fleck der Wand zählt nicht.
 - **Nacharbeit braucht Zeit:** Ein Schritt auf einer Stelle von 1 m² dauerte auf dem Testrechner
-  (6 Rechenkerne) 1,5 bis 2,8 s. Größere Stellen dauern länger; gemessen ist bisher nur 1 m². Der erste
+  (6 Rechenkerne) 1,5 bis 2,8 s. Größere Stellen dauern länger: Eine Bodenstelle von 8,9 m² brauchte für „Bilder neu“ 12 bis 37 s. Der erste
   Schritt nach dem Start legt ein Verzeichnis der Kamerabilder an; liest Driftless sie dafür vom
   Laufwerk, kommen 0,4 bis 1,6 s dazu.
 - **Dünne Teile dicht an der Wand:** Ein Rohr oder Kabelkanal dicht vor der Stelle, den die Oberfläche nur
@@ -128,12 +128,13 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
   mindestens 30 cm lang ist, verdeckt die Wand dahinter; Türgriffe und andere kleine Teile können weiter leicht
   versetzt im Bild liegen. Wo keine ebene Umgebung zu finden ist, an Kanten und dünnen Teilen, bleibt ein
   schmaler Saum der Oberfläche, wie er war.
+- **Speicher:** Eine Oberfläche mit 1 cm braucht im Büro jetzt 9,8 GB statt 8,3 GB und 23 statt 21 Minuten.
 
 ### Hinweis
 
 - Laufbahnen und Karten von 0.1.0 bleiben aktuell. Oberflächen gelten als nicht mehr aktuell und werden beim
   nächsten Rechnen neu erzeugt; die gespeicherte Nacharbeit einer Oberfläche wird dabei neu gerechnet, die
-  markierten Stellen bleiben. Mit `--ohne alles` entstehen dieselben Netze und Bilder wie vor diesen Schritten.
+  markierten Stellen bleiben. Mit `--ohne alles` entstehen dieselben Netze und Bilder wie vor diesen Schritten (an einem Scan gegen 0.1.0 Byte für Byte geprüft, auf der Grafikkarte und auf dem Prozessor).
 - Neu eingespielte Bilder der Nacharbeit sind auf demselben System Byte für Byte gleich. Zwischen
   verschiedenen Systemen, etwa Mac und Windows, können einzelne Bildpunkte abweichen.
 
