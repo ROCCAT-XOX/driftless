@@ -1840,6 +1840,7 @@ dependencies = [
  "driftless-plan",
  "driftless-slam",
  "driftless-traj",
+ "dxf",
  "image",
  "las",
  "libc",

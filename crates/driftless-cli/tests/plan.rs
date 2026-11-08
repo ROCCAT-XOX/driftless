@@ -6,8 +6,10 @@ use assert_cmd::Command;
 use common::tmp;
 use driftless_export::testutil::write_map_folder;
 use driftless_plan::testutil::{Scene, TestData};
+use driftless_steps::objects::{ObjectInput, ObjectKind, Objects};
 use driftless_steps::plan::{read_plan, PLAN_REPORT, TOP_VIEW_FILE};
 use predicates::prelude::*;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -133,4 +135,148 @@ fn bad_source_says_why() {
         .failure()
         .stderr(predicate::str::contains("weder eine Karte"));
     assert!(!dir.join("grundriss").exists());
+}
+
+/// A socket at (2, 2) in the map folder `dir`, 30 cm above the floor.
+fn put_socket(dir: &Path) {
+    let mut objects = Objects::default();
+    objects
+        .add(ObjectInput {
+            kind: ObjectKind::Socket,
+            points: vec![[2.0, 2.0, FLOOR + 0.3]],
+            name: "Bad".to_string(),
+            note: String::new(),
+            connection: None,
+            diameter_mm: None,
+            properties: BTreeMap::new(),
+        })
+        .unwrap();
+    objects.save(dir).unwrap();
+}
+
+/// Group code and value of every pair of a DXF file, values as Latin-1.
+fn pairs(path: &Path) -> Vec<(i32, String)> {
+    let bytes = fs::read(path).unwrap();
+    let text: String = bytes.iter().map(|&b| b as char).collect();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len() % 2, 0, "je Gruppe zwei Zeilen");
+    lines
+        .chunks(2)
+        .map(|p| (p[0].trim().parse().unwrap(), p[1].to_string()))
+        .collect()
+}
+
+#[test]
+fn plan_dxf_writes_the_file() {
+    let dir = tmp("plan-cli-dxf");
+    let data = one_room();
+    write_map_folder(&dir, &data.xyz, &data.poses);
+    put_socket(&dir);
+    let out = dir.join("grundriss.dxf");
+    plan(&["--dxf", out.to_str().unwrap()], &dir)
+        .success()
+        .stdout(predicate::str::contains("Elemente → "));
+    let all = pairs(&out);
+    assert!(all.contains(&(1, "AC1015".to_string())));
+    assert!(all.iter().any(|p| p.0 == 9 && p.1 == "$INSUNITS"));
+    assert!(all.iter().any(|p| p.0 == 2 && p.1 == "Steckdose"));
+    assert!(
+        all.iter().any(|p| p.0 == 0 && p.1 == "INSERT"),
+        "die Steckdose"
+    );
+    assert!(all.iter().any(|p| p.0 == 8 && p.1 == "Wand"));
+    assert!(dir.join("grundriss").join(PLAN_REPORT).is_file());
+
+    // A plan that fits is not computed again, the DXF is written anyway.
+    let again = dir.join("zweite.dxf");
+    plan(&["--dxf", again.to_str().unwrap()], &dir)
+        .success()
+        .stdout(predicate::str::contains("passt schon"));
+    assert!(again.is_file());
+
+    // The plan elsewhere: the objects still come from the map.
+    let other = tmp("plan-cli-dxf-woanders");
+    let out = other.join("woanders.dxf");
+    plan(
+        &[
+            "-o",
+            other.join("plan").to_str().unwrap(),
+            "--dxf",
+            out.to_str().unwrap(),
+        ],
+        &dir,
+    )
+    .success();
+    assert!(pairs(&out).iter().any(|p| p.0 == 0 && p.1 == "INSERT"));
+}
+
+#[test]
+fn lage_punktwolke() {
+    let dir = tmp("plan-cli-lage");
+    let data = one_room();
+    write_map_folder(&dir, &data.xyz, &data.poses);
+    let walls = dir.join("waende.dxf");
+    let cloud = dir.join("wolke.dxf");
+    plan(&["--dxf", walls.to_str().unwrap()], &dir).success();
+    plan(
+        &["--dxf", cloud.to_str().unwrap(), "--lage", "punktwolke"],
+        &dir,
+    )
+    .success();
+    let height = |path: &Path| -> f64 {
+        let all = pairs(path);
+        let start = all.iter().position(|p| p.1 == "ENTITIES").unwrap();
+        let value = &all[start..]
+            .iter()
+            .find(|p| p.0 == 38)
+            .expect("LWPOLYLINE")
+            .1;
+        value.parse().unwrap()
+    };
+    assert!(height(&walls).abs() < 1e-9);
+    assert!((height(&cloud) + 1300.0).abs() < 20.0, "{}", height(&cloud));
+
+    plan(&["--lage", "irgendwo", "--dxf", "x.dxf"], &dir).failure();
+    plan(&["--lage", "punktwolke"], &dir)
+        .failure()
+        .stderr(predicate::str::contains("--dxf"));
+}
+
+#[test]
+fn dxf_exists_needs_ueberschreiben() {
+    let dir = tmp("plan-cli-dxf-da");
+    let data = one_room();
+    write_map_folder(&dir, &data.xyz, &data.poses);
+    let out = dir.join("plan.dxf");
+    fs::write(&out, "alt").unwrap();
+    let args = ["--dxf", out.to_str().unwrap()];
+    plan(&args, &dir)
+        .failure()
+        .stderr(predicate::str::contains("gibt es schon"))
+        .stderr(predicate::str::contains("--ueberschreiben"));
+    assert_eq!(fs::read_to_string(&out).unwrap(), "alt");
+    assert!(!dir.join("grundriss").exists(), "vor dem Rechnen geprüft");
+
+    plan(&["--dxf", out.to_str().unwrap(), "--ueberschreiben"], &dir).success();
+    assert!(fs::read(&out).unwrap().starts_with(b"999"));
+}
+
+#[test]
+fn export_of_plan_folder() {
+    let dir = tmp("plan-cli-export");
+    let data = one_room();
+    write_map_folder(&dir, &data.xyz, &data.poses);
+    plan(&[], &dir).success();
+    put_socket(&dir);
+    let out = dir.join("x.dxf");
+    Command::cargo_bin("driftless")
+        .unwrap()
+        .arg("export")
+        .arg(dir.join("grundriss"))
+        .arg("-o")
+        .arg(&out)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Elemente → "));
+    assert!(pairs(&out).iter().any(|p| p.0 == 0 && p.1 == "INSERT"));
 }

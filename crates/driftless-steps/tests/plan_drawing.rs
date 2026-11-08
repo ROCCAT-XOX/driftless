@@ -1,0 +1,809 @@
+//! The floor plan as a drawing: walls cut at the openings, symbols and texts, where things lie
+//! in the two placements, blocks and attributes of the objects. All plans are made by hand.
+
+use driftless_export::dxf::{dxf_bytes, write_dxf, Drawing, Entity, EntityKind, Shape};
+use driftless_io::progress::Progress;
+use driftless_io::testscan::tmp;
+use driftless_plan::{
+    Dim, FloorPlan, Leveling, Opening, OpeningKind, PlanFrame, Room, Storey, WallFace, WallPair,
+};
+use driftless_steps::objects::{ConnectionKind, ObjectInput, ObjectKind, Objects};
+use driftless_steps::plan::{PlanReport, PlanSettings, TopViewInfo, PLAN_VERSION};
+use driftless_steps::plan_drawing::{
+    elevation_mm, plan_drawing, PlanExport, PlanPlacement, LAYERS,
+};
+use dxf::entities::EntityType;
+use dxf::XDataItem;
+use std::collections::BTreeMap;
+
+const LEVEL_FRAME: PlanFrame = PlanFrame {
+    axis: [1.0, 0.0],
+    origin: [0.0, 0.0, 0.0],
+    leveling: Leveling::NONE,
+};
+
+fn face(a: [f64; 2], b: [f64; 2], inward: [f64; 2]) -> WallFace {
+    WallFace {
+        a,
+        b,
+        inward,
+        seen_m: (b[0] - a[0]).hypot(b[1] - a[1]),
+    }
+}
+
+/// A wall of 10 m along x, the room above it.
+fn long_wall() -> WallFace {
+    face([0.0, 0.0], [10.0, 0.0], [0.0, 1.0])
+}
+
+fn opening(kind: OpeningKind, face: usize, from: f64, to: f64, sill: f64, head: f64) -> Opening {
+    Opening {
+        kind,
+        face,
+        from,
+        to,
+        sill,
+        head,
+        crossed: false,
+        note: String::new(),
+    }
+}
+
+fn plan_of(faces: Vec<WallFace>) -> FloorPlan {
+    FloorPlan {
+        storey: Storey {
+            floor_z: 0.0,
+            ceiling_z: Some(2.6),
+            pose_share: 1.0,
+            floor_area: 20.0,
+        },
+        storeys: Vec::new(),
+        frame: LEVEL_FRAME,
+        faces,
+        pairs: Vec::new(),
+        openings: Vec::new(),
+        rooms: Vec::new(),
+        dims: Vec::new(),
+        hints: Vec::new(),
+        cell: 0.02,
+    }
+}
+
+fn report(plan: FloorPlan) -> PlanReport {
+    PlanReport {
+        input_id: "abc".to_string(),
+        version: PLAN_VERSION,
+        settings: PlanSettings::default(),
+        plan,
+        top_view: TopViewInfo {
+            width: 1,
+            height: 1,
+            origin: [0.0, 0.0],
+            cell: 0.02,
+        },
+        files: Vec::new(),
+        bytes: BTreeMap::new(),
+        points: 0,
+        seconds_total: 0.0,
+        peak_rss_bytes: None,
+    }
+}
+
+fn draw(plan: FloorPlan) -> Drawing {
+    plan_drawing(&report(plan), &Objects::default(), &PlanExport::default())
+}
+
+fn input(kind: ObjectKind, points: Vec<[f64; 3]>) -> ObjectInput {
+    ObjectInput {
+        kind,
+        points,
+        name: String::new(),
+        note: String::new(),
+        connection: None,
+        diameter_mm: None,
+        properties: BTreeMap::new(),
+    }
+}
+
+fn add(objects: &mut Objects, input: ObjectInput) {
+    objects.add(input).unwrap();
+}
+
+fn entities<'a>(d: &'a Drawing, layer: &str) -> Vec<&'a Entity> {
+    d.entities.iter().filter(|e| e.layer == layer).collect()
+}
+
+fn shapes<'a>(d: &'a Drawing, layer: &str) -> Vec<&'a Shape> {
+    entities(d, layer)
+        .into_iter()
+        .filter_map(|e| match &e.kind {
+            EntityKind::Shape(s) => Some(s),
+            EntityKind::Insert { .. } => None,
+        })
+        .collect()
+}
+
+fn texts<'a>(d: &'a Drawing, layer: &str) -> Vec<&'a str> {
+    shapes(d, layer)
+        .into_iter()
+        .filter_map(|s| match s {
+            Shape::Text { value, .. } => Some(value.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `a`, `b` and whether dashed, of every `Line`.
+fn lines(d: &Drawing, layer: &str) -> Vec<([f64; 2], [f64; 2], bool)> {
+    shapes(d, layer)
+        .into_iter()
+        .filter_map(|s| match s {
+            Shape::Line { a, b, dashed } => Some((*a, *b, *dashed)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn polylines<'a>(d: &'a Drawing, layer: &str) -> Vec<&'a Vec<[f64; 2]>> {
+    shapes(d, layer)
+        .into_iter()
+        .filter_map(|s| match s {
+            Shape::Polyline { points, .. } => Some(points),
+            _ => None,
+        })
+        .collect()
+}
+
+fn length(a: [f64; 2], b: [f64; 2]) -> f64 {
+    (b[0] - a[0]).hypot(b[1] - a[1])
+}
+
+/// Within a millimetre.
+fn near(a: [f64; 2], b: [f64; 2]) -> bool {
+    length(a, b) < 1.0
+}
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-6
+}
+
+/// The attributes of the only `INSERT` on `layer`.
+fn attributes<'a>(d: &'a Drawing, layer: &str) -> &'a [(String, String)] {
+    let found: Vec<_> = entities(d, layer)
+        .into_iter()
+        .filter_map(|e| match &e.kind {
+            EntityKind::Insert { attributes, .. } => Some(attributes.as_slice()),
+            EntityKind::Shape(_) => None,
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "{layer}");
+    found[0]
+}
+
+fn value<'a>(attributes: &'a [(String, String)], tag: &str) -> &'a str {
+    attributes
+        .iter()
+        .find(|(t, _)| t == tag)
+        .unwrap_or_else(|| panic!("{tag} fehlt"))
+        .1
+        .as_str()
+}
+
+fn insert_at(d: &Drawing, layer: &str) -> [f64; 2] {
+    entities(d, layer)
+        .into_iter()
+        .find_map(|e| match &e.kind {
+            EntityKind::Insert { at, .. } => Some(*at),
+            EntityKind::Shape(_) => None,
+        })
+        .expect("INSERT")
+}
+
+#[test]
+fn walls_cut_at_openings() {
+    let mut plan = plan_of(vec![
+        long_wall(),
+        face([0.0, 5.0], [6.0, 5.0], [0.0, -1.0]),
+        face([0.0, 5.2], [6.0, 5.2], [0.0, 1.0]),
+    ]);
+    plan.pairs = vec![WallPair {
+        front: 1,
+        back: 2,
+        thickness: 0.2,
+    }];
+    plan.openings = vec![
+        opening(OpeningKind::Door, 0, 2.0, 3.0, 0.0, 2.05),
+        // up to the end of the face: no piece behind it
+        opening(OpeningKind::Window, 0, 8.0, 10.0, 0.9, 2.2),
+        // the same door, seen from the two faces of a wall
+        opening(OpeningKind::Door, 1, 1.0, 2.0, 0.0, 2.05),
+        opening(OpeningKind::Door, 2, 1.0, 2.0, 0.0, 2.05),
+    ];
+    let d = draw(plan);
+
+    let pieces = polylines(&d, "Wand");
+    let on_y = |y: f64| -> Vec<(f64, f64)> {
+        pieces
+            .iter()
+            .filter(|p| close(p[0][1], y))
+            .map(|p| (p[0][0], p[1][0]))
+            .collect()
+    };
+    assert_eq!(
+        on_y(0.0),
+        [(0.0, 2000.0), (3000.0, 8000.0)],
+        "a piece before and after the door, none behind the window"
+    );
+    assert_eq!(on_y(5000.0), [(0.0, 1000.0), (2000.0, 6000.0)]);
+    assert_eq!(
+        on_y(5200.0),
+        [(0.0, 1000.0), (2000.0, 6000.0)],
+        "beide Flächen"
+    );
+    assert_eq!(pieces.len(), 6);
+
+    let caps = lines(&d, "Wand");
+    let of = |y: f64, x: f64| {
+        caps.iter()
+            .find(|(a, _, _)| close(a[1], y) && close(a[0], x))
+    };
+    let (a, b, dashed) = of(0.0, 2000.0).expect("Endkappe");
+    assert!(!dashed);
+    assert!(close(length(*a, *b), 120.0), "ohne Paar 120 mm");
+    assert!(b[1] < a[1], "in die Wand, von der Raumseite weg");
+    assert!(of(0.0, 3000.0).is_some());
+    let (a, b, _) = of(5000.0, 1000.0).expect("Endkappe der gepaarten Wand");
+    assert!(close(length(*a, *b), 200.0), "Dicke aus dem Paar");
+    assert!(close(b[1], 5200.0), "reicht bis zur anderen Fläche");
+    assert_eq!(caps.len(), 6, "je Öffnung zwei, die doppelte nur einmal");
+    assert_eq!(texts(&d, "Tür").len(), 2, "die doppelte Tür nur einmal");
+}
+
+#[test]
+fn door_and_window_have_symbols_and_text() {
+    let mut plan = plan_of(vec![long_wall()]);
+    plan.openings = vec![
+        opening(OpeningKind::Door, 0, 1.0, 1.9, 0.0, 2.05),
+        opening(OpeningKind::Window, 0, 4.0, 5.2, 0.9, 2.2),
+    ];
+    let d = draw(plan);
+
+    let door = lines(&d, "Tür");
+    assert_eq!(door.len(), 3, "zwei Laibungen, eine Schwelle");
+    let dashed: Vec<_> = door.iter().filter(|l| l.2).collect();
+    assert_eq!(dashed.len(), 1, "die Schwelle ist gestrichelt");
+    assert!(near(dashed[0].0, [1000.0, 0.0]) && near(dashed[0].1, [1900.0, 0.0]));
+    let reveals: Vec<_> = door.iter().filter(|l| !l.2).collect();
+    assert!(close(reveals[0].0[0], 1000.0) && close(reveals[1].0[0], 1900.0));
+    assert_eq!(texts(&d, "Tür"), ["Tür 0,90 × 2,05 m"]);
+
+    let window = lines(&d, "Fenster");
+    assert_eq!(window.len(), 2);
+    assert!(window.iter().all(|l| !l.2), "durchgezogen");
+    assert!(close(window[0].0[0], 4000.0) && close(window[0].1[0], 5200.0));
+    assert!(
+        close((window[0].0[1] - window[1].0[1]).abs(), 60.0),
+        "Doppellinie 60 mm"
+    );
+    let text = texts(&d, "Fenster");
+    assert_eq!(text, ["Fenster 1,20 × 1,30 m, BRH 0,90 m"]);
+    assert!(text[0].contains("BRH"));
+}
+
+#[test]
+fn unclear_shows_its_reason() {
+    let mut plan = plan_of(vec![long_wall()]);
+    let mut unclear = opening(OpeningKind::Unclear, 0, 3.0, 4.0, 0.0, 2.0);
+    unclear.note = "Tür oder bodentiefes Fenster?".to_string();
+    plan.openings = vec![unclear];
+    let d = draw(plan);
+    let gap = lines(&d, "Öffnung-unklar");
+    assert_eq!(gap.len(), 1);
+    assert!(gap[0].2, "gestrichelt");
+    assert_eq!(
+        texts(&d, "Öffnung-unklar"),
+        ["Tür oder bodentiefes Fenster?"]
+    );
+}
+
+#[test]
+fn room_label_and_dimensions() {
+    let mut plan = plan_of(vec![long_wall()]);
+    plan.rooms = vec![
+        Room {
+            nr: 1,
+            outline: vec![[0.0, 0.0], [8.3, 0.0], [8.3, 7.9], [0.0, 7.9]],
+            area: 65.57,
+            height: Some(2.6),
+            open: false,
+            label_at: [4.0, 4.0],
+        },
+        Room {
+            nr: 2,
+            outline: vec![[9.0, 0.0], [12.0, 0.0], [12.0, 3.0]],
+            area: 4.5,
+            height: None,
+            open: true,
+            label_at: [11.0, 1.0],
+        },
+    ];
+    plan.dims = vec![Dim {
+        a: [0.0, 0.0],
+        b: [8.3, 0.0],
+        line_a: [0.0, 0.3],
+        line_b: [8.3, 0.3],
+        text: "8,30 m".to_string(),
+    }];
+    let d = draw(plan);
+
+    let outlines: Vec<_> = shapes(&d, "Raum")
+        .into_iter()
+        .filter(|s| matches!(s, Shape::Polyline { .. }))
+        .collect();
+    assert_eq!(outlines.len(), 2);
+    let Shape::Polyline { points, closed, .. } = outlines[0] else {
+        panic!()
+    };
+    assert!(*closed, "geschlossen");
+    assert_eq!(points.len(), 4);
+    assert!(near(points[2], [8300.0, 7900.0]));
+    let text = texts(&d, "Raum");
+    for line in ["Raum 1", "65,57 m²", "Höhe 2,60 m"] {
+        assert!(text.contains(&line), "{line} in {text:?}");
+    }
+    assert!(text.contains(&"Raum 2 (offen)"), "{text:?}");
+    assert_eq!(text.len(), 5, "ohne Decke keine Höhe");
+
+    let dim = lines(&d, "Bemaßung");
+    assert_eq!(dim.len(), 3, "Linie und zwei Häkchen");
+    assert!(near(dim[0].0, [0.0, 300.0]) && near(dim[0].1, [8300.0, 300.0]));
+    for (end, tick) in [(dim[0].0, dim[1]), (dim[0].1, dim[2])] {
+        let centre = [(tick.0[0] + tick.1[0]) / 2.0, (tick.0[1] + tick.1[1]) / 2.0];
+        assert!(near(centre, end), "Häkchen auf dem Ende: {tick:?}");
+        assert!(length(tick.0, tick.1) > 40.0, "{tick:?}");
+    }
+    assert_eq!(texts(&d, "Bemaßung"), ["8,30 m"]);
+}
+
+#[test]
+fn all_layers_exist_even_when_empty() {
+    let d = draw(plan_of(Vec::new()));
+    let got: Vec<(&str, u8)> = d
+        .layers
+        .iter()
+        .map(|l| (l.name.as_str(), l.color))
+        .collect();
+    assert_eq!(got, LAYERS);
+    assert_eq!(
+        LAYERS.map(|l| l.0),
+        [
+            "Wand",
+            "Tür",
+            "Fenster",
+            "Öffnung-unklar",
+            "Raum",
+            "Bemaßung",
+            "Messung",
+            "Steckdose",
+            "Anschluss",
+            "Kabel",
+            "Rohr"
+        ]
+    );
+    assert!(d.layers.iter().all(|l| l.on));
+    assert!(d.entities.is_empty());
+
+    let names: Vec<&str> = d.blocks.iter().map(|b| b.name.as_str()).collect();
+    assert_eq!(names, ["Steckdose", "Anschluss"]);
+    for block in &d.blocks {
+        assert_eq!(block.attributes, ["NR", "NAME", "ART", "HOEHE", "NOTIZ"]);
+        assert!(!block.shapes.is_empty());
+    }
+
+    let comments = d.comments.join("\n");
+    assert!(comments.contains("Driftless"), "{comments}");
+    assert!(
+        comments.contains(driftless_steps::PROGRAM.version),
+        "{comments}"
+    );
+    assert!(comments.contains("Lage"), "{comments}");
+    assert!(comments.contains("Drehung") && comments.contains("Verschiebung"));
+    assert!(comments.contains("Rohre: von Hand gesetzt, automatische Erkennung folgt"));
+    dxf_bytes(&d, 0.0).expect("eine leere Zeichnung lässt sich schreiben");
+}
+
+#[test]
+fn hidden_layer_is_off() {
+    let mut plan = plan_of(vec![long_wall()]);
+    plan.dims = vec![Dim {
+        a: [0.0, 0.0],
+        b: [1.0, 0.0],
+        line_a: [0.0, 0.3],
+        line_b: [1.0, 0.3],
+        text: "1,00 m".to_string(),
+    }];
+    let export = PlanExport {
+        hidden: vec!["Bemaßung".to_string()],
+        ..PlanExport::default()
+    };
+    let d = plan_drawing(&report(plan), &Objects::default(), &export);
+    let off: Vec<&str> = d
+        .layers
+        .iter()
+        .filter(|l| !l.on)
+        .map(|l| l.name.as_str())
+        .collect();
+    assert_eq!(off, ["Bemaßung"]);
+    assert_eq!(texts(&d, "Bemaßung"), ["1,00 m"], "mitgeschrieben, nur aus");
+}
+
+#[test]
+fn as_cloud_moves_it_and_walls_is_default() {
+    let (sin, cos) = 23f64.to_radians().sin_cos();
+    let origin = [12.5, -3.0, -1.3];
+    let to_map = |u: f64, v: f64| {
+        [
+            (origin[0] + cos * u - sin * v) * 1000.0,
+            (origin[1] + sin * u + cos * v) * 1000.0,
+        ]
+    };
+    let mut plan = plan_of(vec![face([1.0, 2.0], [5.0, 2.0], [0.0, 1.0])]);
+    plan.frame.axis = [cos, sin];
+    plan.frame.origin = origin;
+    plan.openings = vec![opening(OpeningKind::Door, 0, 1.0, 2.0, 0.0, 2.05)];
+    let frame = plan.frame;
+    let report = report(plan);
+
+    let mut objects = Objects::default();
+    let socket = frame.to_map([3.0, 1.0, 0.4]);
+    add(&mut objects, input(ObjectKind::Socket, vec![socket]));
+
+    assert_eq!(PlanExport::default().placement, PlanPlacement::Walls);
+    assert_eq!(PlanExport::default().hidden, Vec::<String>::new());
+
+    let walls = plan_drawing(&report, &objects, &PlanExport::default());
+    let first = polylines(&walls, "Wand")[0];
+    assert!(near(first[0], [1000.0, 2000.0]), "{first:?}");
+    assert!(near(insert_at(&walls, "Steckdose"), [3000.0, 1000.0]));
+    assert!(close(elevation_mm(&report, &PlanExport::default()), 0.0));
+
+    let cloud = PlanExport {
+        placement: PlanPlacement::AsCloud,
+        hidden: Vec::new(),
+    };
+    let d = plan_drawing(&report, &objects, &cloud);
+    let first = polylines(&d, "Wand")[0];
+    assert!(near(first[0], to_map(1.0, 2.0)), "{first:?}");
+    assert!(near(first[1], to_map(2.0, 2.0)), "{first:?}");
+    let at = insert_at(&d, "Steckdose");
+    assert!(near(at, [socket[0] * 1000.0, socket[1] * 1000.0]), "{at:?}");
+    let Some(Shape::Text { rotation_deg, .. }) = shapes(&d, "Tür")
+        .into_iter()
+        .find(|s| matches!(s, Shape::Text { .. }))
+    else {
+        panic!("Text fehlt");
+    };
+    assert!((rotation_deg - 23.0).abs() < 0.01, "{rotation_deg}");
+    assert!((elevation_mm(&report, &cloud) + 1300.0).abs() < 1e-6);
+    assert_eq!(
+        value(attributes(&d, "Steckdose"), "HOEHE"),
+        "400",
+        "die Höhe bleibt die über dem Boden"
+    );
+}
+
+#[test]
+fn socket_has_attributes() {
+    let mut objects = Objects::default();
+    let mut socket = input(ObjectKind::Socket, vec![[2.0, 3.0, 0.31]]);
+    socket.name = "Küche".to_string();
+    socket.note = "hinter dem Schrank".to_string();
+    add(&mut objects, socket);
+    let mut water = input(ObjectKind::Connection, vec![[1.0, 1.0, 1.2345]]);
+    water.connection = Some(ConnectionKind::Water);
+    add(&mut objects, water);
+    let d = plan_drawing(
+        &report(plan_of(Vec::new())),
+        &objects,
+        &PlanExport::default(),
+    );
+
+    let list = attributes(&d, "Steckdose");
+    assert_eq!(value(list, "NR"), "1");
+    assert_eq!(value(list, "NAME"), "Küche");
+    assert_eq!(value(list, "ART"), "Steckdose");
+    assert_eq!(value(list, "NOTIZ"), "hinter dem Schrank");
+    let height: i64 = value(list, "HOEHE").parse().expect("ganzzahlig");
+    assert!((height - 310).abs() <= 1, "{height}");
+    assert!(near(insert_at(&d, "Steckdose"), [2000.0, 3000.0]));
+
+    let list = attributes(&d, "Anschluss");
+    assert_eq!(value(list, "ART"), "Wasser");
+    assert_eq!(value(list, "HOEHE"), "1235");
+    assert!(near(insert_at(&d, "Anschluss"), [1000.0, 1000.0]));
+    let block = d.blocks.iter().find(|b| b.name == "Anschluss").unwrap();
+    assert_eq!(block.attributes[0], "NR", "die Nummer steht sichtbar");
+    assert_eq!(
+        d.blocks.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+        ["Steckdose", "Anschluss"]
+    );
+}
+
+#[test]
+fn free_properties_become_attributes() {
+    let long_key = "Lange Bezeichnung ".repeat(30);
+    let mut objects = Objects::default();
+    let mut socket = input(ObjectKind::Socket, vec![[0.0, 0.0, 0.3]]);
+    socket.properties = BTreeMap::from([
+        ("Größe".to_string(), "16 A".to_string()),
+        ("hersteller".to_string(), "Gira".to_string()),
+        // takes a name the block already has: it must not overwrite it
+        ("Name".to_string(), "frei".to_string()),
+        // the same tag as `a_b`
+        ("a b".to_string(), "1".to_string()),
+        ("a_b".to_string(), "2".to_string()),
+        // nothing of it is left
+        ("😀".to_string(), "lacht".to_string()),
+        (long_key.clone(), "lang".to_string()),
+    ]);
+    socket.name = "Küche".to_string();
+    add(&mut objects, socket);
+    let mut second = input(ObjectKind::Socket, vec![[1.0, 0.0, 0.3]]);
+    second.properties = BTreeMap::from([("nur hier".to_string(), "x".to_string())]);
+    add(&mut objects, second);
+    let d = plan_drawing(
+        &report(plan_of(Vec::new())),
+        &objects,
+        &PlanExport::default(),
+    );
+
+    let block = d.blocks.iter().find(|b| b.name == "Steckdose").unwrap();
+    for tag in [
+        "GROESSE",
+        "HERSTELLER",
+        "NAME_2",
+        "A_B",
+        "A_B_2",
+        "EIGENSCHAFT",
+        "NUR_HIER",
+    ] {
+        assert!(
+            block.attributes.contains(&tag.to_string()),
+            "{tag}: {:?}",
+            block.attributes
+        );
+    }
+    for tag in &block.attributes {
+        assert!(tag
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'));
+        assert!(tag.len() <= 70, "{tag}");
+    }
+    assert!(
+        !d.blocks[1].attributes.contains(&"GROESSE".to_string()),
+        "nur beim eigenen Block"
+    );
+
+    let first = entities(&d, "Steckdose")[0];
+    let EntityKind::Insert { attributes, .. } = &first.kind else {
+        panic!()
+    };
+    assert_eq!(value(attributes, "GROESSE"), "16 A");
+    assert_eq!(value(attributes, "HERSTELLER"), "Gira");
+    assert_eq!(value(attributes, "NAME"), "Küche");
+    assert_eq!(value(attributes, "NAME_2"), "frei");
+    assert_eq!(value(attributes, "A_B"), "1");
+    assert_eq!(value(attributes, "A_B_2"), "2");
+    assert_eq!(value(attributes, "EIGENSCHAFT"), "lacht");
+
+    // Every tag an INSERT uses is one of its block: the writer checks that.
+    let bytes = dxf_bytes(&d, 0.0).expect("die Zeichnung lässt sich schreiben");
+    assert!(!bytes.is_empty());
+}
+
+#[test]
+fn cable_and_pipe_have_text_and_xdata() {
+    let mut objects = Objects::default();
+    let mut cable = input(ObjectKind::Cable, vec![[0.0, 0.0, 2.0], [2.0, 0.0, 2.0]]);
+    cable.note = "NYM".to_string();
+    add(&mut objects, cable);
+    add(
+        &mut objects,
+        input(ObjectKind::Measure, vec![[0.0; 3], [1.0, 0.0, 0.0]]),
+    );
+    let mut pipe = input(
+        ObjectKind::Pipe,
+        vec![[0.0, 1.0, 2.4], [3.0, 1.0, 2.4], [3.0, 5.0, 2.4]],
+    );
+    pipe.name = "Heizung".to_string();
+    pipe.diameter_mm = Some(50.0);
+    pipe.properties = BTreeMap::from([("Größe".to_string(), "DN 50".to_string())]);
+    add(&mut objects, pipe);
+    let mut thin = input(ObjectKind::Pipe, vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]);
+    thin.diameter_mm = Some(12.5);
+    add(&mut objects, thin);
+    let d = plan_drawing(
+        &report(plan_of(Vec::new())),
+        &objects,
+        &PlanExport::default(),
+    );
+
+    assert_eq!(texts(&d, "Kabel"), ["Kabel 1"]);
+    let cable = entities(&d, "Kabel")[0];
+    assert!(matches!(
+        &cable.kind,
+        EntityKind::Shape(Shape::Polyline { points, closed: false, .. }) if points.len() == 2
+    ));
+    assert_eq!(cable.xdata, ["NR=1", "NAME=", "NOTIZ=NYM", "QUELLE=hand"]);
+
+    assert_eq!(
+        texts(&d, "Rohr"),
+        ["Rohr 3 · Heizung · Ø 50 mm", "Rohr 4 · Ø 12,5 mm"]
+    );
+    let pipes = polylines(&d, "Rohr");
+    assert_eq!(pipes[0].len(), 3);
+    assert!(near(pipes[0][2], [3000.0, 5000.0]));
+    let lines_with_data: Vec<_> = entities(&d, "Rohr")
+        .into_iter()
+        .filter(|e| !e.xdata.is_empty())
+        .collect();
+    assert_eq!(lines_with_data.len(), 2, "die Texte tragen keine Daten");
+    assert_eq!(
+        lines_with_data[0].xdata,
+        [
+            "NR=3",
+            "NAME=Heizung",
+            "NOTIZ=",
+            "QUELLE=hand",
+            "GROESSE=DN 50",
+            "DURCHMESSER_MM=50"
+        ]
+    );
+    assert!(lines_with_data[1]
+        .xdata
+        .iter()
+        .all(|x| !x.starts_with("GROESSE")));
+    assert!(lines_with_data[1]
+        .xdata
+        .contains(&"DURCHMESSER_MM=12.5".to_string()));
+
+    // The text lies at the longest stretch and runs along it.
+    let Some(Shape::Text {
+        at, rotation_deg, ..
+    }) = shapes(&d, "Rohr")
+        .into_iter()
+        .find(|s| matches!(s, Shape::Text { .. }))
+    else {
+        panic!("Text fehlt");
+    };
+    assert!((rotation_deg - 90.0).abs() < 1e-6, "{rotation_deg}");
+    assert!((at[1] - 3000.0).abs() < 2000.0, "{at:?}");
+    assert!((at[0] - 3000.0).abs() < 400.0, "{at:?}");
+}
+
+#[test]
+fn measurement_on_its_layer() {
+    let mut objects = Objects::default();
+    add(
+        &mut objects,
+        input(ObjectKind::Measure, vec![[0.0, 0.0, 0.0], [3.0, 4.0, 0.0]]),
+    );
+    let mut named = input(ObjectKind::Measure, vec![[0.0, 0.0, 0.0], [0.0, 0.0, 2.5]]);
+    named.name = "Decke".to_string();
+    add(&mut objects, named);
+    let d = plan_drawing(
+        &report(plan_of(Vec::new())),
+        &objects,
+        &PlanExport::default(),
+    );
+    let list = lines(&d, "Messung");
+    assert_eq!(list.len(), 2);
+    assert!(near(list[0].0, [0.0, 0.0]) && near(list[0].1, [3000.0, 4000.0]));
+    assert!(!list[0].2);
+    assert_eq!(
+        texts(&d, "Messung"),
+        ["5,00 m", "Decke · 2,50 m"],
+        "die Länge im Raum"
+    );
+    assert!(
+        texts(&d, "Bemaßung").is_empty(),
+        "nicht auf dem Layer der Maße"
+    );
+}
+
+#[test]
+fn object_far_outside_stays_where_it_is() {
+    let mut objects = Objects::default();
+    add(
+        &mut objects,
+        input(ObjectKind::Socket, vec![[500.0, -300.0, 1.0]]),
+    );
+    let mut plan = plan_of(vec![long_wall()]);
+    plan.openings = vec![opening(OpeningKind::Door, 0, 1.0, 2.0, 0.0, 2.05)];
+    let d = plan_drawing(&report(plan), &objects, &PlanExport::default());
+    assert!(near(insert_at(&d, "Steckdose"), [500_000.0, -300_000.0]));
+    assert_eq!(value(attributes(&d, "Steckdose"), "HOEHE"), "1000");
+    assert_eq!(
+        polylines(&d, "Wand").len(),
+        2,
+        "der Plan bleibt, wie er ist"
+    );
+    dxf_bytes(&d, 0.0).expect("weit draußen lässt sich schreiben");
+}
+
+#[test]
+fn odd_characters_in_names_read_back() {
+    let odd = format!("ä\nb;😀{}", "x".repeat(5000));
+    let mut objects = Objects::default();
+    let mut socket = input(ObjectKind::Socket, vec![[1.0, 2.0, 0.3]]);
+    socket.name = odd.clone();
+    socket.note = odd.clone();
+    socket.properties = BTreeMap::from([("ä\nb".to_string(), odd.clone())]);
+    add(&mut objects, socket);
+    let mut pipe = input(ObjectKind::Pipe, vec![[0.0, 0.0, 2.0], [3.0, 0.0, 2.0]]);
+    pipe.name = odd.clone();
+    pipe.note = odd.clone();
+    pipe.diameter_mm = Some(50.0);
+    add(&mut objects, pipe);
+
+    let drawing = plan_drawing(
+        &report(plan_of(Vec::new())),
+        &objects,
+        &PlanExport::default(),
+    );
+    let dir = tmp("plan-drawing-odd");
+    let path = dir.join("plan.dxf");
+    write_dxf(&path, &drawing, 0.0, &Progress::new()).unwrap();
+    let back = dxf::Drawing::load_file(&path).expect("der Leser verschluckt sich nicht");
+
+    let found: Vec<_> = back.entities().collect();
+    let insert = found
+        .iter()
+        .find_map(|e| match &e.specific {
+            EntityType::Insert(i) => Some(i),
+            _ => None,
+        })
+        .expect("INSERT");
+    let name = insert
+        .attributes()
+        .find(|a| a.attribute_tag == "NAME")
+        .unwrap();
+    assert!(name.value.starts_with("ä b;?xxx"), "{}", &name.value[..20]);
+    assert!(name.value.len() <= 2100);
+    assert!(
+        insert
+            .attributes()
+            .any(|a| a.attribute_tag == "AE_B" && a.value.starts_with("ä b;")),
+        "die freie Eigenschaft ist da"
+    );
+
+    let (text, line) = (
+        found.iter().find_map(|e| match &e.specific {
+            EntityType::Text(t) if e.common.layer == "Rohr" => Some(t),
+            _ => None,
+        }),
+        found
+            .iter()
+            .find(|e| matches!(e.specific, EntityType::LwPolyline(_)))
+            .unwrap(),
+    );
+    let text = text.expect("Text");
+    assert!(
+        text.value.starts_with("Rohr 2 · ä b;?"),
+        "{}",
+        &text.value[..20]
+    );
+    assert!(
+        text.value.ends_with("Ø 50 mm"),
+        "der Durchmesser bleibt: {}",
+        text.value
+    );
+    assert!(text.value.chars().count() < 80, "ein Plan-Text bleibt kurz");
+
+    let items = &line.common.x_data[0].items;
+    let XDataItem::Str(name) = &items[1] else {
+        panic!("{:?}", items[1]);
+    };
+    assert!(name.starts_with("NAME=ä b;?"), "{name}");
+    assert!(name.len() <= 300, "{}", name.len());
+}

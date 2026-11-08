@@ -1,5 +1,5 @@
 //! The steps of Driftless – inspect a scan, SLAM, manual corrections, map, surface, merge,
-//! compare, the touch-up of a surface, the floor plan – as functions that the command line and
+//! compare, the touch-up of a surface, the floor plan and its drawing – as functions that the command line and
 //! the desktop program both call. Every step reports to a [`driftless_io::progress::Progress`] (phases,
 //! counts, the lines the CLI prints) and stops at its next check once that is cancelled.
 
@@ -17,6 +17,7 @@ pub mod objects;
 pub mod overlay;
 pub mod pairs;
 pub mod plan;
+pub mod plan_drawing;
 pub mod scan;
 pub mod slam;
 pub mod surface;

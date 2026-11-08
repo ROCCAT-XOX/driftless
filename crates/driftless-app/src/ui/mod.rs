@@ -1138,7 +1138,8 @@ impl AppState {
                 | S::EditedSurface(p)
                 | S::Run(p)
                 | S::PointFile(p)
-                | S::MeshFile(p)) = &req.source;
+                | S::MeshFile(p)
+                | S::Plan { dir: p, .. }) = &req.source;
                 vec![p.clone()]
             }
             _ => Vec::new(),

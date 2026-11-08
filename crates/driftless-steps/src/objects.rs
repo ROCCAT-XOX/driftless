@@ -130,6 +130,21 @@ pub enum ConnectionKind {
     Other,
 }
 
+impl ConnectionKind {
+    /// The name in the program and in the DXF.
+    pub fn label(self) -> &'static str {
+        match self {
+            ConnectionKind::Power => "Strom",
+            ConnectionKind::Water => "Wasser",
+            ConnectionKind::Drain => "Abwasser",
+            ConnectionKind::Heating => "Heizung",
+            ConnectionKind::Gas => "Gas",
+            ConnectionKind::Network => "Netzwerk",
+            ConnectionKind::Other => "Sonstiges",
+        }
+    }
+}
+
 /// An [`Object`] before it is added: [`Objects::add`] gives it its number and `seq`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ObjectInput {

@@ -40,5 +40,7 @@ driftless-io = { path = "../driftless-io", features = ["test-util"] }
 driftless-odom = { path = "../driftless-odom", features = ["test-util"] }
 # Synthetic rooms of the floor plan tests.
 driftless-plan = { path = "../driftless-plan", features = ["test-util"] }
+# Independent reader of the floor plan as DXF.
+dxf = "0.6.2"
 # Tiny JPEG pages of the export tests.
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }

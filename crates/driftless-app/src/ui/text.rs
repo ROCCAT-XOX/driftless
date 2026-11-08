@@ -528,6 +528,7 @@ pub fn exported(
         ExportKind::Points => "Punkte",
         ExportKind::Mesh => "Dreiecke",
         ExportKind::Trajectory => "Lagen",
+        ExportKind::Plan => "Elemente",
     };
     let file = report
         .files

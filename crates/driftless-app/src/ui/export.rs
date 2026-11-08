@@ -53,6 +53,7 @@ pub fn default_format(kind: ExportKind) -> ExportFormat {
         ExportKind::Points => ExportFormat::Laz,
         ExportKind::Mesh => ExportFormat::Glb,
         ExportKind::Trajectory => ExportFormat::Csv,
+        ExportKind::Plan => ExportFormat::Dxf,
     }
 }
 
@@ -142,6 +143,7 @@ pub fn source_name(state: &AppState, source: &ExportSource) -> String {
             }
         }
         ExportSource::MeshFile(f) => folder(f),
+        ExportSource::Plan { dir, .. } => folder(dir),
     }
 }
 

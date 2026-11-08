@@ -1,5 +1,5 @@
 //! `driftless export <quelle> -o <datei> [--format <name>] [--ueberschreiben]`: a map, a
-//! model, a surface, a run or a point cloud or mesh file in an open format. The run itself is
+//! model, a surface, a floor plan, a run or a point cloud or mesh file in an open format. The run itself is
 //! [`driftless_steps::export::run_export`].
 
 use driftless_steps::export::{
@@ -10,14 +10,14 @@ use std::path::PathBuf;
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Karten-, Modell-, Oberflächen- oder Lauf-Ordner, oder eine Datei (.las, .laz, .e57,
-    /// .ply, .pcd, .glb, .obj)
+    /// Karten-, Modell-, Oberflächen-, Grundriss- oder Lauf-Ordner, oder eine Datei (.las, .laz,
+    /// .e57, .ply, .pcd, .glb, .obj)
     #[arg(value_name = "QUELLE")]
     source: PathBuf,
     /// Zieldatei; das Format folgt der Endung, wenn --format fehlt
     #[arg(short = 'o', long = "out", value_name = "DATEI")]
     out: PathBuf,
-    /// Format: las, laz, e57, ply, pcd, glb, obj, ply-netz, tum, csv
+    /// Format: las, laz, e57, ply, pcd, glb, obj, ply-netz, tum, csv, dxf
     #[arg(long, value_name = "NAME")]
     format: Option<String>,
     /// Vorhandene Zieldateien ersetzen (bei OBJ auch .mtl und Seitenbilder)
@@ -63,12 +63,13 @@ fn request(args: &Args) -> Result<ExportRequest, Box<dyn std::error::Error>> {
     })
 }
 
-/// `<count> Punkte|Dreiecke|Lagen → <datei> (<MB> MB, <s> s)`.
-fn summary(req: &ExportRequest, report: &ExportReport) -> String {
+/// `<count> Punkte|Dreiecke|Lagen|Elemente → <datei> (<MB> MB, <s> s)`.
+pub(crate) fn summary(req: &ExportRequest, report: &ExportReport) -> String {
     let what = match req.format.kind() {
         ExportKind::Points => "Punkte",
         ExportKind::Mesh => "Dreiecke",
         ExportKind::Trajectory => "Lagen",
+        ExportKind::Plan => "Elemente",
     };
     format!(
         "{} {what} → {} ({:.1} MB, {:.1} s)",
