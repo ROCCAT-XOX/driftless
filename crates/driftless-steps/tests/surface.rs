@@ -4,6 +4,7 @@
 use driftless_io::calib::load_calibration;
 use driftless_io::camera::Camera;
 use driftless_io::images::{for_each_image_where, Wanted};
+use driftless_io::paths::canonical;
 use driftless_io::progress::{LogLine, Progress, ProgressSnapshot};
 use driftless_io::testdir::{SharedDir, TestDir};
 use driftless_io::testscan::{
@@ -831,7 +832,7 @@ fn image_list(src: &TextureSource) -> Vec<(String, f64)> {
 
 /// `path` resolved, for comparing paths given another way.
 fn resolved(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap()
+    canonical(path).unwrap()
 }
 
 /// The sources of the surface in `surface`; panics without.
@@ -1087,7 +1088,7 @@ fn shift_traj(traj: &Path, dx: f64) -> String {
 #[test]
 fn texture_sources_say_what_is_missing() {
     let (dir, project, surface) = project_with_surface("steps-quellen-fehlen");
-    let scan = fs::canonicalize(project.join("rohdaten").join("raum")).unwrap();
+    let scan = canonical(&project.join("rohdaten").join("raum")).unwrap();
     let missing = |surface: &Path, what: &str| match texture_sources(surface).unwrap() {
         TextureSources::Unavailable(why) => {
             assert!(why.raw_data_missing(), "{what}: {why:?}");
@@ -1162,7 +1163,7 @@ fn texture_sources_say_what_is_missing() {
     fs::rename(&run, &cli).unwrap();
     fs::remove_file(cli.join("lauf.toml")).unwrap();
     let surface = cli.join("karte-001").join("oberflaeche-001");
-    let cli = fs::canonicalize(&cli).unwrap();
+    let cli = canonical(&cli).unwrap();
     let why = missing(&surface, "run of the command line");
     assert_eq!(why, NoSources::CommandLineRun(cli.clone()));
     assert_eq!(
@@ -1183,7 +1184,7 @@ fn texture_sources_of_a_model_say_what_is_missing() {
     let s = model_scene();
     // a copy of A, B and their model for this test alone, the model's absolute folders
     // pointing nowhere: only its relative ones lead to the copy
-    let root = fs::canonicalize(s.a.parent().unwrap()).unwrap();
+    let root = canonical(s.a.parent().unwrap()).unwrap();
     let dir = tmp("steps-quellen-modell-fehlt");
     for name in ["raum-a", "raum-b"] {
         copy_dir(&root.join(name), &dir.join(name));
@@ -1210,8 +1211,8 @@ fn texture_sources_of_a_model_say_what_is_missing() {
     run_model_surface(&model_request(&model, &surface), &Progress::new()).unwrap();
     assert_eq!(sources_of(&surface).len(), 2);
     let (a, b) = (
-        fs::canonicalize(dir.join("raum-a")).unwrap(),
-        fs::canonicalize(dir.join("raum-b")).unwrap(),
+        canonical(&dir.join("raum-a")).unwrap(),
+        canonical(&dir.join("raum-b")).unwrap(),
     );
 
     // B without its images: none at all, B named
@@ -1275,7 +1276,7 @@ fn texture_sources_of_a_model_say_what_is_missing() {
     }
     fs::write(model.join(MODEL_REPORT), report.to_string()).unwrap();
     let why = texture_sources(&surface).unwrap();
-    let model = fs::canonicalize(&model).unwrap();
+    let model = canonical(&model).unwrap();
     assert_eq!(
         why,
         TextureSources::Unavailable(NoSources::OldModel(model.clone()))

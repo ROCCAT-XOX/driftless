@@ -5,6 +5,7 @@
 use driftless_export::mesh::{read_mesh, Mesh};
 use driftless_gpu::GpuPref;
 use driftless_io::images::ImageIndices;
+use driftless_io::paths::canonical;
 use driftless_io::progress::{Progress, ProgressSnapshot};
 use driftless_io::testdir::{SharedDir, TestDir};
 use driftless_io::testscan::{scan_with_images, shared, tmp};
@@ -1147,7 +1148,7 @@ fn stale_surface_bakes_no_images() {
 #[test]
 fn missing_images_are_missing_raw_data() {
     let scene = Scene::new("nacharbeit-ohne-bilder");
-    let scan = fs::canonicalize(scene.project.join("rohdaten").join("raum")).unwrap();
+    let scan = canonical(&scene.project.join("rohdaten").join("raum")).unwrap();
     fs::rename(scan.join("IMAGE_0.bag"), scan.join("IMAGE_0.weg")).unwrap();
     let sources = texture_sources(&scene.surface).unwrap();
     let why = sources.unavailable().expect("no images").clone();
@@ -1461,7 +1462,7 @@ fn export_keeps_off_the_surface_and_the_touchup() {
             assert!(
                 m.starts_with(&format!(
                     "Ziel liegt im Ordner der Nacharbeit {}",
-                    fs::canonicalize(&cache).unwrap().display()
+                    canonical(&cache).unwrap().display()
                 )),
                 "{m}"
             );
