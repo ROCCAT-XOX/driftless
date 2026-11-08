@@ -48,7 +48,15 @@ pub const LAYERS: [(&str, u8); 11] = [
 /// Attributes of the blocks; the first one stands visibly next to the symbol.
 const BLOCK_TAGS: [&str; 5] = ["NR", "NAME", "ART", "HOEHE", "NOTIZ"];
 /// What the extended data of a cable or pipe always holds, which a free property cannot be.
-const LINE_TAGS: [&str; 5] = ["NR", "NAME", "NOTIZ", "QUELLE", "DURCHMESSER_MM"];
+const LINE_TAGS: [&str; 7] = [
+    "NR",
+    "NAME",
+    "ART",
+    "HOEHE",
+    "NOTIZ",
+    "QUELLE",
+    "DURCHMESSER_MM",
+];
 /// Longest tag made from the key of a free property, before a number that makes it unique.
 const MAX_TAG: usize = 64;
 /// A key of which nothing is left for a tag.
@@ -261,6 +269,37 @@ fn thickness(plan: &FloorPlan, index: usize, wall: &Wall, along: f64) -> f64 {
         .unwrap_or(DEFAULT_THICKNESS)
 }
 
+/// The doors and windows of the faces paired with `index`, on this face: where a partner has
+/// one that this face does not know of. Unclear openings stay on their own face.
+fn partner_gaps(plan: &FloorPlan, index: usize, wall: &Wall) -> Vec<(f64, f64)> {
+    let mut gaps = Vec::new();
+    for pair in &plan.pairs {
+        let partner = match (pair.front == index, pair.back == index) {
+            (true, _) => pair.back,
+            (_, true) => pair.front,
+            _ => continue,
+        };
+        let Some(other) = plan.faces.get(partner).and_then(Wall::of) else {
+            continue;
+        };
+        for o in plan
+            .openings
+            .iter()
+            .filter(|o| o.face == partner && o.kind != OpeningKind::Unclear)
+        {
+            let (t0, t1) = (
+                wall.along(other.at(o.from, 0.0)),
+                wall.along(other.at(o.to, 0.0)),
+            );
+            let (from, to) = (t0.min(t1).max(0.0), t0.max(t1).min(wall.len));
+            if to > from {
+                gaps.push((from, to));
+            }
+        }
+    }
+    gaps
+}
+
 /// The size of an opening: „0,90 × 2,05 m“.
 fn size(width: f64, o: &Opening) -> String {
     format!("{} × {}", number(width), metres(o.head - o.sill))
@@ -307,7 +346,7 @@ impl Sheet<'_> {
     }
 
     /// The faces without their openings. Both entries of an opening in a wall with two faces
-    /// cut their face.
+    /// cut their face; a door or window found from one side only cuts the other face as well.
     fn walls(&mut self, plan: &FloorPlan) {
         for (index, face) in plan.faces.iter().enumerate() {
             let Some(wall) = Wall::of(face) else {
@@ -320,6 +359,7 @@ impl Sheet<'_> {
                 .map(|o| (o.from.max(0.0), o.to.min(wall.len)))
                 .filter(|(from, to)| to > from)
                 .collect();
+            gaps.extend(partner_gaps(plan, index, &wall));
             gaps.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
             let mut start = 0.0_f64;
             for (from, to) in gaps {
@@ -518,9 +558,26 @@ impl Sheet<'_> {
 
     fn line_object(&mut self, o: &Object, layer: &str, tags: &BTreeMap<String, String>) {
         let points: Vec<[f64; 2]> = o.points.iter().map(|p| self.map(*p)).collect();
+        // Height above the floor (mm), as a span where the line rises or falls.
+        let heights: Vec<i64> = o
+            .points
+            .iter()
+            .map(|p| (self.frame.to_plan(*p)[2] * 1000.0).round() as i64)
+            .collect();
+        let (low, high) = (
+            heights.iter().min().copied().unwrap_or(0),
+            heights.iter().max().copied().unwrap_or(0),
+        );
+        let height = if low == high {
+            low.to_string()
+        } else {
+            format!("{low}..{high}")
+        };
         let mut xdata = vec![
             format!("NR={}", o.nr),
             format!("NAME={}", o.name),
+            format!("ART={}", o.kind.label()),
+            format!("HOEHE={height}"),
             format!("NOTIZ={}", o.note),
             format!("QUELLE={}", o.source),
         ];

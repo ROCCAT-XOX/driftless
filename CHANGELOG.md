@@ -96,7 +96,8 @@ Was sich in jeder Version von Driftless geändert hat. Die Form folgt
 ### Bekannte Grenzen
 
 - **Grundriss:** Rohre und Kabel werden von Hand gesetzt, die automatische Erkennung kommt später. Türen
-  stehen als Öffnung im Plan, ohne Türblatt und Aufschlag. Ein Plan zeigt immer ein Stockwerk.
+  stehen als Öffnung im Plan, ohne Türblatt und Aufschlag. Ein Plan zeigt immer ein Stockwerk. Ein Durchgang
+  bis zur Decke ist keine Tür und trennt keine Räume, das gilt auch für eine Tür mit Glasoberlicht.
 - **Nacharbeit braucht Zeit:** Ein Schritt auf einer Stelle von 1 m² dauerte auf dem Testrechner
   (6 Rechenkerne) 1,5 bis 2,8 s. Größere Stellen dauern länger; gemessen ist bisher nur 1 m². Der erste
   Schritt nach dem Start legt ein Verzeichnis der Kamerabilder an; liest Driftless sie dafür vom

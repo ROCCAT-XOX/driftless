@@ -1272,6 +1272,15 @@ fn objects_changed_after_plan_are_exported() {
 }
 
 #[test]
+fn a_plan_folder_knows_whether_a_map_is_above_it() {
+    let root = tmp("export-dxf-ohne-karte");
+    let dir = plan_dir(&root);
+    assert!(driftless_steps::export::plan_without_map(&dir));
+    fs::write(root.join("karte").join("map.json"), "{}").unwrap();
+    assert!(!driftless_steps::export::plan_without_map(&dir));
+}
+
+#[test]
 fn plan_of_a_folder_is_detected() {
     let root = tmp("export-dxf-detect");
     let dir = plan_dir(&root);

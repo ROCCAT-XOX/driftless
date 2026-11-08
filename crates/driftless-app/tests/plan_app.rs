@@ -3,6 +3,7 @@
 
 use driftless_app::leftovers::LeftoverKind;
 use driftless_app::project::{canonical, PlanInfo, PLAN_NUMBERED};
+use driftless_app::ui::objects;
 use driftless_app::ui::plan::{refresh_drawing, PlanMode};
 use driftless_app::ui::plan_view::{bounds, PlanCamera};
 use driftless_app::ui::{text, Action, Ask, DriftlessApp, Selection, Step, UiMessage};
@@ -443,6 +444,44 @@ fn switch_to_3d_and_back() {
     h.state_mut().apply(Action::SetStep(Step::Daten));
     settle(&mut h);
     assert!(h.query_by_label("Raum 1").is_none());
+}
+
+#[test]
+fn switching_to_3d_brings_the_cloud_of_the_plan_s_map() {
+    let dir = tmp("plan-zwei-karten");
+    let project = dir.join("projekt");
+    let first = write_project(&project, one_room());
+    let other_map = first.parent().unwrap().join("karte-002");
+    write_map_folder(&other_map, &one_room().xyz, &one_room().poses);
+    let mut h = open(&project);
+    let known = |p: &Path| {
+        canonical(&project)
+            .unwrap()
+            .join(p.strip_prefix(&project).unwrap())
+    };
+    let (first, other_map) = (known(&first), known(&other_map));
+    let plan = compute(&mut h, &first);
+
+    // the view still shows the other map, the plan of the first one is on the screen
+    run(
+        &mut h,
+        Action::LoadCloud {
+            path: other_map.join("color.las"),
+            run: None,
+        },
+    );
+    assert_eq!(objects::view_owner(h.state().state()), Some(other_map));
+    run(&mut h, Action::ShowPlan(plan));
+    h.get_by_label(text::PLAN_SWITCH_3D).click();
+    settle(&mut h);
+    assert_eq!(h.state().state().plan.mode, PlanMode::View3d);
+    assert_eq!(objects::view_owner(h.state().state()), Some(first.clone()));
+    // the plan shown again keeps its map
+    h.get_by_label(text::PLAN_SWITCH_PLAN).click();
+    h.run();
+    h.get_by_label(text::PLAN_SWITCH_3D).click();
+    settle(&mut h);
+    assert_eq!(objects::view_owner(h.state().state()), Some(first));
 }
 
 #[test]

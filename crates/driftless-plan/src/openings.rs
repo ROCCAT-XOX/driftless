@@ -782,14 +782,16 @@ impl<'a> FaceWork<'a> {
                 continue;
             }
             let rectangular = part.fill() >= MIN_FILL;
-            let reached = self.crossed(at) || self.has_points_behind(at);
+            let passage = rectangular && self.is_passage(at);
+            let reached = (passage || (rectangular && at.door_sized()))
+                && (self.crossed(at) || self.has_points_behind(at));
             // Open up to the ceiling and one can get through: the wall stops here.
-            if rectangular && reached && self.is_passage(at) {
+            if passage && reached {
                 found.passages.push((at.from, at.to));
                 continue;
             }
             let below = self.below(&part, hole, &free, solid);
-            let (kind, note) = if rectangular && at.door_sized() && reached {
+            let (kind, note) = if reached {
                 (OpeningKind::Door, "")
             } else if rectangular && at.sill >= WINDOW_SILL && below == Below::Wall {
                 (OpeningKind::Window, "")

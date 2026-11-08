@@ -19,7 +19,6 @@ use eframe::egui::{
 };
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
 
 /// Room around the plan when it is fitted (points).
 const FIT_MARGIN: f32 = 40.0;
@@ -38,6 +37,8 @@ const DASH: f32 = 6.0;
 const GAP: f32 = 4.0;
 /// A text smaller than this cannot be read and is left out (points).
 const MIN_TEXT: f32 = 4.0;
+/// Texts are not drawn larger than this (points), however far the view zooms in.
+const MAX_TEXT: f32 = 200.0;
 /// Number next to the symbol of a block, as the DXF has it (mm): its height, and where it stands
 /// from the insertion point.
 const NUMBER_HEIGHT: f64 = 100.0;
@@ -163,9 +164,9 @@ pub(super) fn layer_colour(index: u8) -> Color32 {
 
 /// The picture from above, uploaded once per plan (kept in the memory of egui: the plan state
 /// holds the image itself, the texture belongs to the window).
-fn top_view_texture(ui: &Ui, key: usize, name: &Path, image: &egui::ColorImage) -> TextureHandle {
+fn top_view_texture(ui: &Ui, key: &str, name: &Path, image: &egui::ColorImage) -> TextureHandle {
     let id = Id::new("grundriss_draufsicht");
-    if let Some((held, texture)) = ui.data(|d| d.get_temp::<(usize, TextureHandle)>(id)) {
+    if let Some((held, texture)) = ui.data(|d| d.get_temp::<(String, TextureHandle)>(id)) {
         if held == key {
             return texture;
         }
@@ -175,7 +176,7 @@ fn top_view_texture(ui: &Ui, key: usize, name: &Path, image: &egui::ColorImage) 
         image.clone(),
         TextureOptions::LINEAR,
     );
-    ui.data_mut(|d| d.insert_temp(id, (key, texture.clone())));
+    ui.data_mut(|d| d.insert_temp(id, (key.to_string(), texture.clone())));
     texture
 }
 
@@ -211,13 +212,18 @@ impl Surface {
         if size < MIN_TEXT {
             return;
         }
-        // whole sizes only: every size is one more set of glyphs in the font atlas
-        let font = FontId::proportional(size.round());
-        let galley = self.painter.layout_no_wrap(value.to_string(), font, colour);
         // the top left corner of the text, about which it is turned
         let turn = rotation_deg.to_radians();
         let up = [-turn.sin(), turn.cos()];
         let corner = self.at([at[0] + up[0] * height, at[1] + up[1] * height]);
+        // a text that cannot reach the picture is left out; its glyphs would fill the atlas
+        let reach = size * (value.chars().count() + 1) as f32;
+        if !self.rect.expand(reach).contains(corner) {
+            return;
+        }
+        // whole sizes only: every size is one more set of glyphs in the font atlas
+        let font = FontId::proportional(size.min(MAX_TEXT).round());
+        let galley = self.painter.layout_no_wrap(value.to_string(), font, colour);
         let rect = Rect::from_min_size(corner, galley.size());
         self.painter
             .add(TextShape::new(corner, galley, colour).with_angle(-turn as f32));
@@ -353,8 +359,9 @@ pub fn show(ui: &mut Ui, state: &mut AppState) -> Option<Action> {
         texts: Vec::new(),
     };
     if let (true, Some(image)) = (show_picture, &shown.top_view) {
-        let key = Arc::as_ptr(&shown) as usize;
-        let texture = top_view_texture(ui, key, &shown.dir, image);
+        // the folder and the id of its input, not the address: a later plan can reuse that
+        let key = format!("{}\n{}", shown.dir.display(), shown.report.input_id);
+        let texture = top_view_texture(ui, &key, &shown.dir, image);
         draw_top_view(ui, &surface, &texture, &shown.report.top_view);
     }
     let layers: BTreeMap<&str, (bool, u8)> = shown

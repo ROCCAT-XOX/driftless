@@ -390,6 +390,13 @@ fn plan_owner(dir: &Path) -> Option<PathBuf> {
         .and_then(|d| d.parent().map(Path::to_path_buf))
 }
 
+/// Whether a floor plan in `dir` lies outside any map or model folder, so that an export has no
+/// objects to take along.
+pub fn plan_without_map(dir: &Path) -> bool {
+    !plan_owner(dir)
+        .is_some_and(|owner| owner.join(MAP_REPORT).is_file() || owner.join(MODEL_REPORT).is_file())
+}
+
 /// The files the report of the surface folder `dir` lists (`files`); none if it does not read.
 fn listed_files(dir: &Path) -> Vec<PathBuf> {
     let report: Option<serde_json::Value> = fs::read_to_string(dir.join(SURFACE_REPORT))

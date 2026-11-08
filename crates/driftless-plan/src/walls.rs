@@ -1126,7 +1126,7 @@ impl CutFaces {
 /// The new end of a face where it was cut: runs onto the face behind it, if one is that close.
 fn close_cut_end(faces: &mut [WallFace], i: usize, at_b: bool) {
     let face = faces[i];
-    let Some((d, len)) = direction(face.a, face.b) else {
+    let Some((d, _)) = direction(face.a, face.b) else {
         return;
     };
     let end = if at_b { face.b } else { face.a };
@@ -1155,7 +1155,7 @@ fn close_cut_end(faces: &mut [WallFace], i: usize, at_b: bool) {
         return;
     };
     let kept = if at_b { face.a } else { face.b };
-    if distance(kept, at) < MIN_CLOSED || distance(kept, at) > len + CORNER {
+    if distance(kept, at) < MIN_CLOSED {
         return;
     }
     if at_b {
