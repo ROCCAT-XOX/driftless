@@ -28,6 +28,7 @@ use crate::ui::text;
 use driftless_steps::history::HISTORY_DIR;
 use driftless_steps::map::REPORT as MAP_REPORT;
 use driftless_steps::merge::MODEL_REPORT;
+use driftless_steps::objects::OBJECTS_FILE;
 use driftless_steps::plan::PLAN_REPORT;
 use driftless_steps::slam::reuse_cut_off;
 use driftless_steps::surface::SURFACE_REPORT;
@@ -125,7 +126,7 @@ pub fn find(dir: &Path, scan_ids: &[String]) -> Vec<Leftover> {
         if busy(&model) {
             continue;
         }
-        if !model.join(MODEL_REPORT).is_file() {
+        if !model.join(MODEL_REPORT).is_file() && !model.join(OBJECTS_FILE).is_file() {
             out.push(folder(LeftoverKind::Model, &model, label));
             continue;
         }
@@ -240,10 +241,14 @@ fn newest(dir: &Path) -> SystemTime {
 /// (`verlauf/`), the old result of a run whose reuse was cut off ([`reuse_cut_off`]), a map
 /// with its `map.json` (a `karte-NNN`, or one the command line wrote into the run folder), a
 /// surface (`oberflaeche…`) with its `oberflaeche.json`, a floor plan (`grundriss-NNN`) with its
-/// `grundriss.json`; also further down (a surface in a map folder without its report). Such a folder without its own report is no leftover. Reads
+/// `grundriss.json`, objects set by hand (`objekte.toml`); also further down (a surface in a map
+/// folder without its report). Such a folder without its own report is no leftover. Reads
 /// folders: call it off the UI thread.
 pub fn holds_results(dir: &Path) -> bool {
     if dir.join(HISTORY_DIR).is_dir() || reuse_cut_off(dir) || dir.join(MAP_REPORT).is_file() {
+        return true;
+    }
+    if dir.join(OBJECTS_FILE).is_file() {
         return true;
     }
     let maps = numbered(dir, MAP_PREFIX);

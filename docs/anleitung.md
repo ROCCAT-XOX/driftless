@@ -546,7 +546,8 @@ immer für ein Stockwerk.
 **Ansehen.** Rechts steht der Plan. Mit gedrückter Taste verschieben, das Rad zoomt zum Zeiger, `F` zeigt
 alles. Oben rechts wechselt „Plan · 3D“ zur 3D-Ansicht und zurück. Unter „Layer“ schaltest du Wände,
 Türen und die übrigen Layer ein und aus; „Draufsicht“ zeigt das Bild von oben unter dem Plan. Was unklar
-geblieben ist, zeichnet der Plan gestrichelt als „Öffnung-unklar“ und nennt es unter „Hinweise“. Räume ohne
+geblieben ist, zeichnet der Plan gestrichelt mit dem Text „unklar“ auf dem Layer „Öffnung-unklar“; der
+Grund steht als Angabe an der Linie im DXF und in `grundriss.json`, „Hinweise“ nennt die Anzahl. Räume ohne
 ganz geschlossenen Umriss heißen „offen“.
 
 **Objekte setzen.** „3D“ wählen, unten das Werkzeug „Objekt“. Die Leiste darüber wählt die Art: „Steckdose“,
@@ -631,6 +632,9 @@ Dieselbe Liste steht im [CHANGELOG](../CHANGELOG.md).
 | Nacharbeit braucht Zeit | Ein Schritt auf einer Stelle von 1 m² dauerte auf dem Testrechner (6 Rechenkerne) 1,5 bis 2,8 s ([Messung](ergebnisse/2026-10-29-pinsel.md)). Größere Stellen dauern länger; gemessen ist bisher nur 1 m². Der erste Schritt nach dem Start legt ein Verzeichnis der Kamerabilder an: Liest Driftless sie dafür vom Laufwerk, etwa gleich nach dem Anstecken, kommen 0,4 bis 1,6 s dazu. Liegen die Scans auf einem langsamen Laufwerk, dauert es länger. Malen und ↶ gehen sofort. |
 | Rohre von Hand | Rohre und Kabel erkennt Driftless nicht selbst, sie werden von Hand gesetzt. |
 | Türen ohne Aufschlag | Eine Tür steht als Öffnung im Plan: Laibung und Schwelle, ohne Türblatt und Aufschlagrichtung. |
+| Fenster nur mit Beleg | Ein Loch im Wandbild wird nur Fenster oder Tür, wenn die Laufbahn hindurchging, die andere Seite der Wand dort auch offen ist oder dahinter (in einem nicht begangenen Bereich) gemessen wurde. Schwarze Wände, die der Laser schlecht trifft, bleiben Wand; ebenso Fenster, hinter denen nichts gemessen wurde. |
+| Nur Wände an Räumen | Im Plan stehen die Wände, die einen begangenen Raum begrenzen. Hohe Möbel im Raum und Fassaden, die durch ein Fenster gemessen wurden, stehen nicht darin. |
+| Durchgänge bis zur Decke | Eine Öffnung bis zur Decke, also ohne Wand darüber, ist keine Tür. Sie trennt keine Räume: Ein offener Flur zwischen fluchtenden Wänden bleibt ein Raum. Auch eine Tür, die bis zur Decke reicht (etwa mit Glasoberlicht), wird so behandelt: Die Räume davor und dahinter werden dann ein Raum. |
 | Ein Stockwerk je Plan | Ein Grundriss zeigt ein Stockwerk. Hat eine Karte mehrere, wird jedes für sich gerechnet. |
 | Kleine Teile und Säume an Kanten | Nur was mehr als 2 cm vor einer Fläche steht, Punkte hat und zusammen mindestens 30 cm lang ist, verdeckt die Wand dahinter. Türgriffe und andere kleine Teile können deshalb weiter leicht versetzt im Bild liegen. Wo keine ebene Umgebung zu finden ist, also an Kanten und dünnen Teilen, bleibt ein schmaler Saum der Oberfläche, wie er war. |
 | Dünne Teile dicht an der Wand | Steht dicht vor der Stelle etwas Dünnes, das die Oberfläche nur in Stücken hat, etwa ein Rohr oder ein Kabelkanal, liegt es in den Fotos je nach Standort ein paar Zentimeter anders, ebenso ein dunkler Streifen daneben. „Bilder neu einspielen“ kann dann einen Streifen auf die Stelle legen, schärfer und etwas versetzt. Dann die nächste Variante probieren oder mit ↶ zurücknehmen. Was weiter vor der Wand steht, etwa eine Stange, legt es meist nicht auf die Wand: wenn die Fotos es mindestens 5 cm gegeneinander versetzt zeigen und es sich in der Helligkeit mindestens um das Dreifache von der Wand abhebt. Geprüft ist das nur an einem nachgestellten Beispiel; auf den echten Testscans kam so etwas nicht vor. |

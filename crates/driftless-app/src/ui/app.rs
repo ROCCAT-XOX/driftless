@@ -3819,16 +3819,19 @@ impl DriftlessApp {
         self.helper_queue.push_back(HelperTask::LoadPlan(dir));
     }
 
-    /// „Plan · 3D“; 3D brings the cloud of the map or model of the plan if none is shown yet.
+    /// „Plan · 3D“; 3D brings the cloud of the map or model of the plan unless that is shown
+    /// already: an object set in 3D belongs to what is shown, so it has to be the plan's map.
     fn set_plan_mode(&mut self, mode: PlanMode) {
         self.state.plan.mode = mode;
-        if mode != PlanMode::View3d || self.cloud.is_some() || self.is_loading() {
+        if mode != PlanMode::View3d || self.is_loading() {
             return;
         }
         let Some(owner) = self.state.plan.owner.clone() else {
             return;
         };
-        self.load_cloud_of(&owner);
+        if objects::view_owner(&self.state).as_ref() != Some(&owner) {
+            self.load_cloud_of(&owner);
+        }
     }
 
     /// Loads the cloud of the map or model in the folder `owner`.

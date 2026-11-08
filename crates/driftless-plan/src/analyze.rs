@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dims::dimensions;
 use crate::levels::{check, comma};
-use crate::rooms::find_rooms;
+use crate::rooms::{find_rooms, spans_of_room_walls};
 use crate::top_view::top_view;
 use crate::{
     find_openings, find_storeys, find_walls, level_for, storey_points, Dim, Leveling, Opening,
@@ -21,6 +21,10 @@ use crate::{
 /// Two openings on the two faces of a wall are one if they overlap on this share of the
 /// narrower one.
 const SAME_OPENING: f64 = 0.5;
+/// A wall face goes this far beyond the stretch that borders a room (metres).
+const TRIM_MARGIN: f64 = 0.15;
+/// An opening cut by the end of its face stays down to this width (metres).
+const MIN_CUT_OPENING: f64 = 0.25;
 
 /// How the plan lies in the map.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -150,12 +154,12 @@ pub fn analyze(
     check(progress)?;
     let mut points = storey_points(input, &storey, &leveling);
 
-    let walls = find_walls(&points, cfg, progress)?;
+    let mut walls = find_walls(&points, cfg, progress)?;
     // One wall, even measured from both sides, is no plan.
     if walls.faces.len() < 2 || (walls.faces.len() == 2 && walls.pairs.len() == 1) {
         return Err(PlanError::NoWalls);
     }
-    let openings = find_openings(&points, &walls, progress)?;
+    let openings = find_openings(&points, &mut walls, progress)?;
 
     progress.phase("Räume", Some(3));
     let (frame, shift) = plan_frame(&points, &walls, leveling);
@@ -163,8 +167,10 @@ pub fn analyze(
     progress.advance(1);
     check(progress)?;
 
-    let rooms = find_rooms(&points, &faces, &walls.pairs, progress)?;
-    let dims = dimensions(&rooms, &faces, &walls.pairs);
+    let mut rooms = find_rooms(&points, &faces, &walls.pairs, progress)?;
+    let (faces, pairs, openings) = only_faces_of_rooms(faces, walls.pairs, openings, &rooms);
+    let (faces, frame) = move_corner_to_origin(faces, frame, &mut points, &mut rooms);
+    let dims = dimensions(&rooms, &faces, &pairs);
     progress.advance(1);
     check(progress)?;
     let view = top_view(&points, &faces, cfg.cell);
@@ -175,7 +181,7 @@ pub fn analyze(
         storeys: search.storeys,
         frame,
         faces,
-        pairs: walls.pairs,
+        pairs,
         openings,
         rooms,
         dims,
@@ -241,6 +247,114 @@ fn turn_into_plan(
         .collect()
 }
 
+/// Only the faces that border a room, cut to the stretch that does (a little more for the
+/// corners), and with the openings and pairs of what stays. If no room was found there is
+/// nothing to tell walls from furniture by: all faces stay.
+fn only_faces_of_rooms(
+    faces: Vec<WallFace>,
+    pairs: Vec<WallPair>,
+    openings: Vec<Opening>,
+    rooms: &[Room],
+) -> (Vec<WallFace>, Vec<WallPair>, Vec<Opening>) {
+    if rooms.is_empty() {
+        return (faces, pairs, openings);
+    }
+    let spans = spans_of_room_walls(rooms, &faces, &pairs);
+    let mut new_index = vec![usize::MAX; faces.len()];
+    let mut moved_by = vec![0.0; faces.len()];
+    let mut kept = Vec::with_capacity(faces.len());
+    for (i, face) in faces.iter().enumerate() {
+        let Some((low, high)) = spans[i] else {
+            continue;
+        };
+        let Some((d, len)) = unit(face.a, face.b) else {
+            continue;
+        };
+        let (from, to) = ((low - TRIM_MARGIN).max(0.0), (high + TRIM_MARGIN).min(len));
+        if to <= from {
+            continue;
+        }
+        let at = |t: f64| [face.a[0] + d[0] * t, face.a[1] + d[1] * t];
+        new_index[i] = kept.len();
+        moved_by[i] = from;
+        kept.push(WallFace {
+            a: at(from),
+            b: at(to),
+            inward: face.inward,
+            seen_m: face.seen_m.min(to - from),
+        });
+    }
+    let pairs = pairs
+        .into_iter()
+        .filter(|p| new_index[p.front] != usize::MAX && new_index[p.back] != usize::MAX)
+        .map(|p| WallPair {
+            front: new_index[p.front],
+            back: new_index[p.back],
+            thickness: p.thickness,
+        })
+        .collect();
+    let openings = openings
+        .into_iter()
+        .filter(|o| new_index[o.face] != usize::MAX)
+        .filter_map(|mut o| {
+            let face = new_index[o.face];
+            o.from -= moved_by[o.face];
+            o.to -= moved_by[o.face];
+            o.face = face;
+            let (from, to) = (o.from.max(0.0), o.to);
+            let len = (kept[face].b[0] - kept[face].a[0]).hypot(kept[face].b[1] - kept[face].a[1]);
+            // What now lies outside the face, or is cut down to a sliver, is no opening of a
+            // wall of this plan.
+            let to = to.min(len);
+            (to - from >= MIN_CUT_OPENING).then(|| {
+                o.from = from;
+                o.to = to;
+                o
+            })
+        })
+        .collect();
+    (kept, pairs, openings)
+}
+
+/// Moves the lower left corner of `faces` back to (0, 0), once the frame has lost some of them.
+fn move_corner_to_origin(
+    mut faces: Vec<WallFace>,
+    mut frame: PlanFrame,
+    points: &mut StoreyPoints,
+    rooms: &mut [Room],
+) -> (Vec<WallFace>, PlanFrame) {
+    let mut low = [f64::MAX; 2];
+    for p in faces.iter().flat_map(|f| [f.a, f.b]) {
+        low = [low[0].min(p[0]), low[1].min(p[1])];
+    }
+    if low[0] == f64::MAX || low == [0.0, 0.0] {
+        return (faces, frame);
+    }
+    let [ax, ay] = frame.axis;
+    frame.origin[0] += ax * low[0] - ay * low[1];
+    frame.origin[1] += ay * low[0] + ax * low[1];
+    let moved = |p: &mut [f64; 2]| {
+        p[0] -= low[0];
+        p[1] -= low[1];
+    };
+    for face in &mut faces {
+        moved(&mut face.a);
+        moved(&mut face.b);
+    }
+    for room in rooms.iter_mut() {
+        room.outline.iter_mut().for_each(moved);
+        moved(&mut room.label_at);
+    }
+    let shift = [low[0] as f32, low[1] as f32];
+    let shift_point = |p: &mut [f32; 3]| {
+        p[0] -= shift[0];
+        p[1] -= shift[1];
+    };
+    points.xyz.par_iter_mut().for_each(shift_point);
+    points.poses.iter_mut().for_each(shift_point);
+    (faces, frame)
+}
+
 /// The hints of the storey search that concern storey `nr`.
 fn storey_hints(all: &[String], nr: usize) -> Vec<String> {
     let own = format!("Stockwerk {nr}: ");
@@ -283,9 +397,9 @@ fn add_hints(plan: &mut FloorPlan, cfg: &PlanConfig) {
         0 => {}
         1 => plan
             .hints
-            .push("Eine Öffnung ist unklar, sie steht mit dem Grund im Plan.".to_string()),
+            .push("Eine Öffnung ist unklar, sie steht als „unklar“ im Plan.".to_string()),
         n => plan.hints.push(format!(
-            "{n} Öffnungen sind unklar, sie stehen mit dem Grund im Plan."
+            "{n} Öffnungen sind unklar, sie stehen als „unklar“ im Plan."
         )),
     }
     let open: Vec<u32> = plan.rooms.iter().filter(|r| r.open).map(|r| r.nr).collect();
@@ -424,6 +538,208 @@ mod tests {
             .collect();
         assert_eq!(doors.len(), 1, "{:?}", plan.openings);
         assert_eq!(plan.openings.len(), 2, "{:?}", plan.openings);
+    }
+
+    /// A corridor with two rooms on either side; the walls between the rooms are in line.
+    fn corridor_scene(width: f64) -> Scene {
+        let south = 4.12;
+        let north = south + width;
+        let upper = north + 0.12;
+        let mid = south + width / 2.0;
+        Scene::new()
+            .spacing(0.02)
+            .room([0.0, south], [12.12, north], FLOOR, 2.6)
+            .door(0, 2.0, 0.9, 2.05)
+            .door(0, 8.5, 0.9, 2.05)
+            .door(2, 8.5, 0.9, 2.05)
+            .door(2, 2.0, 0.9, 2.05)
+            .room([0.0, 0.0], [6.0, 4.0], FLOOR, 2.6)
+            .door(2, 3.1, 0.9, 2.05)
+            .room([6.12, 0.0], [12.12, 4.0], FLOOR, 2.6)
+            .door(2, 2.72, 0.9, 2.05)
+            .room([0.0, upper], [6.0, upper + 4.0], FLOOR, 2.6)
+            .door(0, 2.72, 0.9, 2.05)
+            .room([6.12, upper], [12.12, upper + 4.0], FLOOR, 2.6)
+            .door(0, 3.1, 0.9, 2.05)
+            .walk(&[
+                [1.0, mid, 0.0],
+                [2.45, mid, 0.0],
+                [2.45, 2.0, 0.0],
+                [1.5, 2.0, 0.0],
+                [2.45, 2.0, 0.0],
+                [2.45, mid, 0.0],
+                [3.17, mid, 0.0],
+                [3.17, upper + 2.0, 0.0],
+                [1.5, upper + 2.0, 0.0],
+                [3.17, upper + 2.0, 0.0],
+                [3.17, mid, 0.0],
+                [8.95, mid, 0.0],
+                [8.95, 2.0, 0.0],
+                [11.0, 2.0, 0.0],
+                [8.95, 2.0, 0.0],
+                [8.95, mid, 0.0],
+                [9.67, mid, 0.0],
+                [9.67, upper + 2.0, 0.0],
+                [11.0, upper + 2.0, 0.0],
+            ])
+    }
+
+    fn corridor_stays_one_room(width: f64) {
+        let (plan, _) = plan_of(corridor_scene(width));
+        let corridor = 12.12 * width;
+        let corridors: Vec<&Room> = plan
+            .rooms
+            .iter()
+            .filter(|r| (4.12..4.12 + width).contains(&r.label_at[1]))
+            .collect();
+        assert_eq!(corridors.len(), 1, "{:?}", plan.rooms);
+        near("Flur", corridors[0].area, corridor, 0.4);
+        assert!(!corridors[0].open, "{:?}", corridors[0]);
+        assert_eq!(plan.rooms.len(), 5, "{:?}", plan.rooms);
+        // Nothing stands across the corridor: all openings belong to the doors of its rooms.
+        let doors = plan
+            .distinct_openings()
+            .into_iter()
+            .filter(|&i| plan.openings[i].kind == OpeningKind::Door)
+            .count();
+        assert_eq!(doors, 4, "{:?}", plan.openings);
+        assert!(
+            plan.openings.iter().all(|o| o.head < 2.2),
+            "{:?}",
+            plan.openings
+        );
+    }
+
+    #[test]
+    fn a_corridor_between_aligned_walls_stays_one_room() {
+        corridor_stays_one_room(2.0);
+    }
+
+    #[test]
+    fn a_wider_corridor_between_aligned_walls_stays_one_room() {
+        corridor_stays_one_room(2.62);
+    }
+
+    #[test]
+    fn a_full_height_passage_is_no_door_and_rooms_join() {
+        // Both rooms meet in a gap up to the ceiling: no lintel, so no door.
+        let scene = Scene::new()
+            .spacing(0.02)
+            .room([0.0, 0.0], [4.0, 4.0], FLOOR, 2.6)
+            .door(1, 1.5, 1.0, 2.6)
+            .room([4.2, 0.0], [8.2, 4.0], FLOOR, 2.6)
+            .door(3, 1.5, 1.0, 2.6)
+            .walk(&[
+                [1.0, 1.0, 0.0],
+                [3.0, 1.0, 0.0],
+                [3.0, 2.0, 0.0],
+                [5.2, 2.0, 0.0],
+                [7.0, 2.0, 0.0],
+                [7.0, 3.0, 0.0],
+            ]);
+        let (plan, _) = plan_of(scene);
+        assert!(
+            plan.openings
+                .iter()
+                .all(|o| o.kind == OpeningKind::Unclear || o.head < 2.2),
+            "{:?}",
+            plan.openings
+        );
+        assert!(
+            !plan.openings.iter().any(|o| o.kind == OpeningKind::Door),
+            "{:?}",
+            plan.openings
+        );
+        assert_eq!(plan.rooms.len(), 1, "{:?}", plan.rooms);
+    }
+
+    #[test]
+    fn a_door_below_a_lintel_stays_a_door_in_a_room_without_ceiling() {
+        // The image ends at 2.2 m without a ceiling, the wall goes on to 2.6 m above the door.
+        let scene = Scene::new()
+            .spacing(0.02)
+            .room([0.0, 0.0], [8.3, 7.9], FLOOR, 2.6)
+            .open_top()
+            .door(0, 3.0, 0.9, 2.15)
+            .behind([1.0, -2.5, FLOOR], [7.0, -2.5, FLOOR + 2.6])
+            .walk(&walk())
+            .walk(&[[3.45, 1.0, 0.0], [3.45, -1.5, 0.0], [3.45, 1.0, 0.0]]);
+        let (plan, _) = plan_of(scene);
+        let doors: Vec<&Opening> = plan
+            .openings
+            .iter()
+            .filter(|o| o.kind == OpeningKind::Door)
+            .collect();
+        assert_eq!(doors.len(), 1, "{:?}", plan.openings);
+    }
+
+    /// A long corridor wall with two rooms behind it, at different wall thicknesses.
+    fn offset_faces_scene() -> Scene {
+        Scene::new()
+            .spacing(0.02)
+            .room([0.0, 0.0], [14.0, 2.0], FLOOR, 2.6)
+            .door(2, 10.1, 0.9, 2.05)
+            .door(2, 3.1, 0.9, 2.05)
+            .room([0.0, 2.12], [7.0, 6.0], FLOOR, 2.6)
+            .door(0, 3.0, 0.9, 2.05)
+            .room([7.12, 2.22], [14.0, 6.0], FLOOR, 2.6)
+            .door(0, 2.88, 0.9, 2.05)
+            .walk(&[
+                [1.0, 1.0, 0.0],
+                [3.45, 1.0, 0.0],
+                [3.45, 4.0, 0.0],
+                [1.0, 4.0, 0.0],
+                [3.45, 4.0, 0.0],
+                [3.45, 1.0, 0.0],
+                [10.45, 1.0, 0.0],
+                [10.45, 4.0, 0.0],
+                [12.0, 4.0, 0.0],
+            ])
+    }
+
+    #[test]
+    fn a_wall_facing_two_faces_counts_each_door_once() {
+        let (plan, _) = plan_of(offset_faces_scene());
+        let doors = plan
+            .distinct_openings()
+            .into_iter()
+            .filter(|&i| plan.openings[i].kind == OpeningKind::Door)
+            .count();
+        assert_eq!(doors, 2, "{:?}", plan.openings);
+        // The long wall has a partner on both stretches.
+        let long = plan
+            .faces
+            .iter()
+            .position(|f| (f.b[0] - f.a[0]).abs() > 13.0 && f.inward[1] < 0.0)
+            .expect("lange Wand");
+        let partners = plan
+            .pairs
+            .iter()
+            .filter(|p| p.front == long || p.back == long)
+            .count();
+        assert_eq!(partners, 2, "{:?} {:?}", plan.faces, plan.pairs);
+        // No room in the strip inside the wall.
+        assert_eq!(plan.rooms.len(), 3, "{:?}", plan.rooms);
+        assert!(plan.rooms.iter().all(|r| r.area > 3.0), "{:?}", plan.rooms);
+    }
+
+    #[test]
+    fn tall_furniture_inside_a_room_is_no_wall_of_the_plan() {
+        // A cupboard nearly up to the ceiling, standing free in the room, and a facade seen
+        // through a window: neither borders the room.
+        let (plan, _) = plan_of(
+            room()
+                .block([3.0, 3.0, FLOOR], [4.5, 3.6, FLOOR + 2.4])
+                .window(0, 3.0, 1.2, 0.9, 1.3)
+                .behind([-5.0, -6.0, FLOOR], [13.0, -6.0, FLOOR + 2.6]),
+        );
+        assert_eq!(plan.faces.len(), 4, "{:?}", plan.faces);
+        assert_eq!(plan.rooms.len(), 1, "{:?}", plan.rooms);
+        assert_box(&plan.rooms[0], [WIDE, DEEP], 0.02);
+        for face in &plan.faces {
+            let len = (face.b[0] - face.a[0]).hypot(face.b[1] - face.a[1]);
+            assert!(len < WIDE + 0.2, "{face:?}");
+        }
     }
 
     #[test]

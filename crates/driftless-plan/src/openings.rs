@@ -5,6 +5,10 @@
 //! front of it. That is decided by the line of sight from the trajectory ([`SightGrid`]): where
 //! the view is free and still no point lies, the wall really is open. Where the view is blocked
 //! the wall simply runs on. What the program cannot be sure about is reported as unclear.
+//!
+//! An opening has wall above it. A gap that is open up to the ceiling, between two walls that
+//! only happen to lie in line, is no opening at all: the face is cut there, and what is on both
+//! sides of it stays one room.
 
 use driftless_io::progress::Progress;
 use rayon::prelude::*;
@@ -12,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::levels::check;
 use crate::sight::SightGrid;
+use crate::walls::cut_faces;
 use crate::{PlanError, StoreyPoints, WallFace, Walls};
 
 /// Edge of a cell of the wall image (metres).
@@ -54,12 +59,22 @@ const DOOR_HEIGHT: f64 = 1.7;
 const DOOR_WIDTH: (f64, f64) = (0.55, 2.6);
 /// Points count from this far to this far behind a door (metres).
 const BEHIND: (f64, f64) = (0.10, 3.0);
-/// Lines through the opening that have to meet a point behind it.
+/// Lines through the opening that have to meet a point behind it, at least this many and this
+/// share: stray points behind a badly hit wall reach neither.
 const MIN_BEHIND_LINES: u32 = 16;
+const MIN_BEHIND_SHARE: f64 = 0.20;
 /// Lattice of those lines and step along them; distance to the sides of the opening (metres).
 const BEHIND_STEP: f64 = 0.05;
 const BEHIND_DEPTH_STEP: f64 = 0.025;
 const BEHIND_SIDE: f64 = 0.08;
+/// Points this close to the floor or the ceiling are those of the floor and ceiling (metres).
+const BEHIND_EDGE: f64 = 0.15;
+/// Sideways, poses this close beside an opening count as being behind it (metres).
+const WALKED_SIDE: f64 = 3.0;
+/// Step of the look at the other side of a wall (metres); from this share of measured cells it
+/// has a wall there.
+const PARTNER_STEP: f64 = 0.08;
+const PARTNER_SOLID: f64 = 0.3;
 
 /// A window or an unclear opening is at least this big each way (metres).
 const MIN_SIZE: f64 = 0.25;
@@ -70,6 +85,10 @@ const WALL_BELOW: f64 = 0.5;
 const MIN_FILL: f64 = 0.6;
 /// A hole at the ceiling over this share of the face is the end of the wall.
 const WALL_END_SHARE: f64 = 0.9;
+/// Wall over an opening of a storey without a ceiling: on this share of its width.
+const LINTEL_SHARE: f64 = 0.5;
+/// Openings of a face overlapping on this share of the narrower one are stacked.
+const STACKED_OVERLAP: f64 = 0.5;
 
 /// A closed door: depth behind the face, height and width (metres), filled share of the
 /// rectangle; a cell is behind the face when at most this share of its points is on it.
@@ -90,6 +109,7 @@ const BIN: f64 = 0.5;
 const OPEN_TO_FLOOR: &str = "Bis zum Boden offen, nichts dahinter: Tür oder bodentiefes Fenster?";
 const CLOSED_DOOR: &str = "Tür geschlossen?";
 const NEITHER: &str = "Öffnung in Größe oder Form weder Tür noch Fenster";
+const HIDDEN_BELOW: &str = "Unten verdeckt: Fenster oder Tür?";
 
 /// What an opening is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,10 +137,12 @@ pub struct Opening {
     pub note: String,
 }
 
-/// Finds the openings of all wall faces, sorted by face and position along it.
+/// Finds the openings of all wall faces, sorted by face and position along it. A face that is
+/// open up to the ceiling in a stretch is cut there (in `walls`): it runs on neither as a door
+/// nor as a border of the rooms.
 pub fn find_openings(
     points: &StoreyPoints,
-    walls: &Walls,
+    walls: &mut Walls,
     progress: &Progress,
 ) -> Result<Vec<Opening>, PlanError> {
     progress.phase("Öffnungen", Some(walls.faces.len() as u64 + 2));
@@ -134,15 +156,24 @@ pub fn find_openings(
     progress.advance(1);
     check(progress)?;
 
+    let mut partners = vec![Vec::new(); planes.len()];
+    for pair in &walls.pairs {
+        partners[pair.front].push(pair.back);
+        partners[pair.back].push(pair.front);
+    }
     let ctx = Context {
         poses: thinned_poses(&points.poses),
         walk: &points.poses,
         grid: sight_grid(points, walls),
+        above_image: points.height.is_none().then_some(NO_CEILING_POINTS),
+        planes: &planes,
+        images: &images,
+        partners,
     };
     progress.advance(1);
     check(progress)?;
 
-    let per_face: Vec<Vec<Opening>> = planes
+    let per_face: Vec<FaceResult> = planes
         .par_iter()
         .zip(images.par_iter())
         .enumerate()
@@ -150,14 +181,17 @@ pub fn find_openings(
             check(progress)?;
             let found = match plane {
                 Some(plane) => FaceWork::new(index, *plane, image, &ctx).openings(),
-                None => Vec::new(),
+                None => FaceResult::default(),
             };
             progress.advance(1);
             Ok(found)
         })
         .collect::<Result<_, PlanError>>()?;
 
-    let mut found: Vec<Opening> = per_face.into_iter().flatten().collect();
+    let passages: Vec<Vec<(f64, f64)>> = per_face.iter().map(|f| f.passages.clone()).collect();
+    let mut found: Vec<Opening> = per_face.into_iter().flat_map(|f| f.openings).collect();
+    let cut = cut_faces(walls, &passages);
+    found.retain_mut(|o| cut.place(o));
     found.sort_by(|a, b| {
         a.face
             .cmp(&b.face)
@@ -454,6 +488,20 @@ struct Context<'a> {
     poses: Vec<[f64; 3]>,
     walk: &'a [[f32; 3]],
     grid: SightGrid,
+    /// Without a ceiling the image ends low: how far above it to look for wall (metres).
+    above_image: Option<f64>,
+    planes: &'a [Option<Plane>],
+    images: &'a [WallImage],
+    /// For every face the faces paired with it.
+    partners: Vec<Vec<usize>>,
+}
+
+/// What one face yields.
+#[derive(Debug, Default)]
+struct FaceResult {
+    openings: Vec<Opening>,
+    /// Stretches that are open up to the ceiling (metres along the face), to cut the face at.
+    passages: Vec<(f64, f64)>,
 }
 
 /// A connected group of cells of a wall image.
@@ -579,6 +627,17 @@ impl Extent {
     }
 }
 
+/// What was measured below an opening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Below {
+    /// Wall, on half of its width at least.
+    Wall,
+    /// No wall, but something stands in front of it.
+    Hidden,
+    /// Neither.
+    Open,
+}
+
 /// The work on one face.
 struct FaceWork<'a> {
     index: usize,
@@ -618,10 +677,10 @@ impl<'a> FaceWork<'a> {
             .any(|&u| u >= at.from - CROSSING_MARGIN && u <= at.to + CROSSING_MARGIN)
     }
 
-    fn openings(&self) -> Vec<Opening> {
+    fn openings(&self) -> FaceResult {
         let image = self.image;
         let Some(threshold) = image.threshold() else {
-            return Vec::new();
+            return FaceResult::default();
         };
         let (cols, rows) = (image.cols, image.rows);
         let measured = image.measured();
@@ -636,7 +695,7 @@ impl<'a> FaceWork<'a> {
             .collect();
         solid = close(&solid, cols, rows, true);
 
-        let mut found = Vec::new();
+        let mut found = FaceResult::default();
         for door in self.closed_doors(threshold) {
             for r in door.rows.0..=door.rows.1 {
                 for c in door.cols.0..=door.cols.1 {
@@ -654,7 +713,7 @@ impl<'a> FaceWork<'a> {
             } else {
                 CLOSED_DOOR
             };
-            found.push(self.opening(kind, at, note));
+            found.openings.push(self.opening(kind, at, note));
         }
 
         let empty: Vec<bool> = solid.iter().map(|s| !s).collect();
@@ -663,6 +722,7 @@ impl<'a> FaceWork<'a> {
                 self.classify(&hole, &solid, &mut found);
             }
         }
+        found.openings = merge_stacked(found.openings);
         found
     }
 
@@ -694,14 +754,50 @@ impl<'a> FaceWork<'a> {
             .collect()
     }
 
+    /// Whether no wall was measured over `at`, up to the ceiling.
+    fn open_to_top(&self, at: Extent) -> bool {
+        at.head >= self.image.top && !self.wall_above_image(at)
+    }
+
+    /// Whether wall was measured above the top of the image: that is a storey without a ceiling,
+    /// where the image ends low and a door can reach its top.
+    fn wall_above_image(&self, at: Extent) -> bool {
+        let Some(end) = self.ctx.above_image else {
+            return false;
+        };
+        let columns = ((at.to - at.from) / BEHIND_STEP).floor() as u32;
+        let levels = ((end - self.image.top) / BEHIND_STEP).ceil() as u32;
+        let walled = (0..columns)
+            .filter(|&i| {
+                let u = at.from + (i as f64 + 0.5) * BEHIND_STEP;
+                (0..levels).any(|k| {
+                    let z = self.image.top + (k as f64 + 0.5) * BEHIND_STEP;
+                    [-0.02, 0.0, 0.02]
+                        .iter()
+                        .any(|&s| self.ctx.grid.occupied(self.plane.point(u, s, z)))
+                })
+            })
+            .count();
+        columns > 0 && walled as f64 >= LINTEL_SHARE * columns as f64
+    }
+
+    /// A gap one can walk through, without wall above it: the space between two walls.
+    fn is_passage(&self, at: Extent) -> bool {
+        at.sill <= DOOR_SILL && at.width() >= DOOR_WIDTH.0 && self.open_to_top(at)
+    }
+
     /// Decides what a hole in the image is.
-    fn classify(&self, hole: &Region, solid: &[bool], found: &mut Vec<Opening>) {
+    fn classify(&self, hole: &Region, solid: &[bool], found: &mut FaceResult) {
         let whole = self.measure(&hole.cells);
         if whole.head >= self.image.top && whole.width() >= WALL_END_SHARE * self.plane.len {
             return;
         }
-        if whole.door_sized() && self.crossed(whole) {
-            found.push(self.opening(OpeningKind::Door, whole, ""));
+        // The walk went through it and there is wall above it: a door, however much of it is
+        // hidden. With no wall above it, it may be the space between two walls: see below.
+        if whole.door_sized() && self.crossed(whole) && !self.open_to_top(whole) {
+            found
+                .openings
+                .push(self.opening(OpeningKind::Door, whole, ""));
             return;
         }
         let free = self.free_cells(hole);
@@ -711,22 +807,37 @@ impl<'a> FaceWork<'a> {
                 continue;
             }
             let rectangular = part.fill() >= MIN_FILL;
-            let (kind, note) = if rectangular
-                && at.door_sized()
-                && (self.crossed(at) || self.has_points_behind(at))
-            {
+            let reached = self.crossed(at) || self.seen_through(at);
+            // Open up to the ceiling and one can get through: the wall stops here.
+            if rectangular && reached && self.is_passage(at) {
+                found.passages.push((at.from, at.to));
+                continue;
+            }
+            if !reached {
+                // Nothing went through it and nothing lies behind it: a hole in the picture of
+                // a black or badly hit wall says nothing. Only the shape of a door is worth a
+                // question.
+                if rectangular && at.door_sized() && !self.open_to_top(at) {
+                    found
+                        .openings
+                        .push(self.opening(OpeningKind::Unclear, at, OPEN_TO_FLOOR));
+                }
+                continue;
+            }
+            let below = self.below(&part, hole, &free, solid);
+            let (kind, note) = if rectangular && at.door_sized() {
                 (OpeningKind::Door, "")
-            } else if rectangular
-                && at.sill >= WINDOW_SILL
-                && self.wall_below(&part, hole, &free, solid)
-            {
+            } else if rectangular && at.sill >= WINDOW_SILL && below == Below::Wall {
                 (OpeningKind::Window, "")
-            } else if rectangular && at.door_sized() {
-                (OpeningKind::Unclear, OPEN_TO_FLOOR)
-            } else {
+            } else if rectangular && at.sill >= WINDOW_SILL && below == Below::Hidden {
+                // Something stands in front of its lower part: a parapet may be there or not.
+                (OpeningKind::Unclear, HIDDEN_BELOW)
+            } else if at.width() >= DOOR_WIDTH.0 && at.height() >= DOOR_HEIGHT {
                 (OpeningKind::Unclear, NEITHER)
+            } else {
+                continue;
             };
-            found.push(self.opening(kind, at, note));
+            found.openings.push(self.opening(kind, at, note));
         }
     }
 
@@ -791,25 +902,85 @@ impl<'a> FaceWork<'a> {
         })
     }
 
-    /// Whether points lie behind the opening.
+    /// Whether something else than a hole in the measurement is shown by what lies behind the
+    /// opening: the other side of the wall is open there too, or the space behind was not walked
+    /// and something was measured there through the hole. A space that was walked holds its own
+    /// points, so they prove nothing, and a wall measured from the other side is no opening.
+    fn seen_through(&self, at: Extent) -> bool {
+        match self.partner_open(at) {
+            Some(open) => open,
+            None => !self.walked_behind(at) && self.has_points_behind(at),
+        }
+    }
+
+    /// Whether the faces paired with this one are open at `at`; `None` without such a face there.
+    fn partner_open(&self, at: Extent) -> Option<bool> {
+        let (mut samples, mut measured) = (0u32, 0u32);
+        for &partner in &self.ctx.partners[self.index] {
+            let (Some(plane), image) = (self.ctx.planes[partner], &self.ctx.images[partner]) else {
+                continue;
+            };
+            let mut u = at.from + BEHIND_SIDE;
+            while u < at.to - BEHIND_SIDE {
+                let p = self.plane.point(u, 0.0, 0.0);
+                let on_partner = plane.u([p[0], p[1]]);
+                let mut z = at.sill.max(BEHIND_EDGE);
+                while z < at.head.min(image.top - BEHIND_EDGE) {
+                    let (col, row) = ((on_partner / CELL) as usize, (z / CELL) as usize);
+                    if on_partner >= 0.0 && col < image.cols && row < image.rows {
+                        samples += 1;
+                        measured += u32::from(image.at(col, row).on > 0);
+                    }
+                    z += PARTNER_STEP;
+                }
+                u += PARTNER_STEP;
+            }
+        }
+        (samples > 0).then_some((measured as f64) < PARTNER_SOLID * samples as f64)
+    }
+
+    /// Whether the trajectory ran behind the face near this opening.
+    fn walked_behind(&self, at: Extent) -> bool {
+        self.ctx.poses.iter().any(|p| {
+            let xy = [p[0], p[1]];
+            let (u, s) = (self.plane.u(xy), self.plane.s(xy));
+            s < -WALL_CLEARANCE
+                && s > -MAX_SIGHT
+                && u > at.from - WALKED_SIDE
+                && u < at.to + WALKED_SIDE
+        })
+    }
+
+    /// Whether points lie behind the opening, apart from floor and ceiling.
     fn has_points_behind(&self, at: Extent) -> bool {
         let from = at.from + BEHIND_SIDE;
         let to = at.to - BEHIND_SIDE;
         let along = ((to - from) / BEHIND_STEP).floor().max(0.0) as u32;
         let up = (at.height() / BEHIND_STEP).floor() as u32;
         let depths = ((BEHIND.1 - BEHIND.0) / BEHIND_DEPTH_STEP).floor() as u32;
+        let rows = (0..up)
+            .filter(|&j| {
+                let z = at.sill + (j as f64 + 0.5) * BEHIND_STEP;
+                (BEHIND_EDGE..=self.image.top - BEHIND_EDGE).contains(&z)
+            })
+            .count();
+        let lines = (along + 1) as f64 * rows as f64;
+        let needed = MIN_BEHIND_LINES.max((lines * MIN_BEHIND_SHARE).ceil() as u32);
         let mut hits = 0;
         for i in 0..=along {
             let u = from + i as f64 * BEHIND_STEP;
             for j in 0..up {
                 let z = at.sill + (j as f64 + 0.5) * BEHIND_STEP;
+                if z < BEHIND_EDGE || z > self.image.top - BEHIND_EDGE {
+                    continue;
+                }
                 let hit = (0..=depths).any(|k| {
                     let depth = BEHIND.0 + k as f64 * BEHIND_DEPTH_STEP;
                     self.ctx.grid.occupied(self.plane.point(u, -depth, z))
                 });
                 if hit {
                     hits += 1;
-                    if hits >= MIN_BEHIND_LINES {
+                    if hits >= needed {
                         return true;
                     }
                 }
@@ -818,21 +989,32 @@ impl<'a> FaceWork<'a> {
         false
     }
 
-    /// Whether the wall below the part is measured, or hidden and running on, on half its width.
-    fn wall_below(&self, part: &Region, hole: &Region, free: &[bool], solid: &[bool]) -> bool {
+    /// What is measured below the part of the hole, on half of its width at least.
+    fn below(&self, part: &Region, hole: &Region, free: &[bool], solid: &[bool]) -> Below {
         let image = self.image;
         let lowest = EDGE_ROWS as u32;
-        let mut seen = vec![false; part.col_count() as usize];
+        let width = part.col_count() as usize;
+        let mut wall = vec![false; width];
         for c in part.cols.0..=part.cols.1 {
-            seen[(c - part.cols.0) as usize] =
+            wall[(c - part.cols.0) as usize] =
                 (lowest..part.rows.0).any(|r| solid[r as usize * image.cols + c as usize]);
         }
+        let mut hidden = wall.clone();
         for (&(c, r), &open) in hole.cells.iter().zip(free) {
             if !open && r < part.rows.0 && (part.cols.0..=part.cols.1).contains(&c) {
-                seen[(c - part.cols.0) as usize] = true;
+                hidden[(c - part.cols.0) as usize] = true;
             }
         }
-        seen.iter().filter(|&&s| s).count() as f64 >= WALL_BELOW * seen.len() as f64
+        let enough = |marks: &[bool]| {
+            marks.iter().filter(|&&s| s).count() as f64 >= WALL_BELOW * width as f64
+        };
+        if enough(&wall) {
+            Below::Wall
+        } else if enough(&hidden) {
+            Below::Hidden
+        } else {
+            Below::Open
+        }
     }
 
     /// The extent of a group of cells, taken from the points around it.
@@ -910,6 +1092,43 @@ impl<'a> FaceWork<'a> {
             head,
         }
     }
+}
+
+/// A plan shows one opening per place: openings of a face lying over each other (the same
+/// stretch at different heights) become one, the surest of them, with the extent of those of
+/// its kind. A door goes before a window, a window before an unclear one.
+fn merge_stacked(mut found: Vec<Opening>) -> Vec<Opening> {
+    let rank = |o: &Opening| match o.kind {
+        OpeningKind::Door => 0,
+        OpeningKind::Window => 1,
+        OpeningKind::Unclear => 2,
+    };
+    found.sort_by(|a, b| {
+        rank(a)
+            .cmp(&rank(b))
+            .then((b.to - b.from).total_cmp(&(a.to - a.from)))
+            .then(a.from.total_cmp(&b.from))
+            .then(a.sill.total_cmp(&b.sill))
+    });
+    let mut kept: Vec<Opening> = Vec::with_capacity(found.len());
+    for o in found {
+        let over = kept.iter_mut().find(|k| {
+            let common = k.to.min(o.to) - k.from.max(o.from);
+            common >= STACKED_OVERLAP * (k.to - k.from).min(o.to - o.from)
+        });
+        match over {
+            Some(k) if k.kind == o.kind => {
+                k.from = k.from.min(o.from);
+                k.to = k.to.max(o.to);
+                k.sill = k.sill.min(o.sill);
+                k.head = k.head.max(o.head);
+                k.crossed |= o.crossed;
+            }
+            Some(_) => {}
+            None => kept.push(o),
+        }
+    }
+    kept
 }
 
 /// The parts of a hole that are open: columns with a free view, cut to the rows with one.
@@ -1027,8 +1246,8 @@ mod tests {
 
     fn openings_of(scene: Scene) -> Vec<Opening> {
         let points = storey_of(scene);
-        let walls = find_walls(&points, &PlanConfig::default(), &Progress::new()).unwrap();
-        find_openings(&points, &walls, &Progress::new()).unwrap()
+        let mut walls = find_walls(&points, &PlanConfig::default(), &Progress::new()).unwrap();
+        find_openings(&points, &mut walls, &Progress::new()).unwrap()
     }
 
     fn of_kind(openings: &[Opening], kind: OpeningKind) -> Vec<&Opening> {
@@ -1074,7 +1293,7 @@ mod tests {
 
     #[test]
     fn window_found() {
-        let found = openings_of(room().window(0, 3.0, 1.20, 0.90, 1.30));
+        let found = openings_of(back_wall(room().window(0, 3.0, 1.20, 0.90, 1.30)));
         assert_eq!(found.len(), 1, "{found:?}");
         let window = &found[0];
         assert_eq!(window.kind, OpeningKind::Window, "{window:?}");
@@ -1086,8 +1305,8 @@ mod tests {
     #[test]
     fn cabinet_is_no_door() {
         let points = storey_of(room().block([3.0, 0.0, FLOOR], [4.0, 0.6, FLOOR + 2.1]));
-        let walls = find_walls(&points, &PlanConfig::default(), &Progress::new()).unwrap();
-        let found = find_openings(&points, &walls, &Progress::new()).unwrap();
+        let mut walls = find_walls(&points, &PlanConfig::default(), &Progress::new()).unwrap();
+        let found = find_openings(&points, &mut walls, &Progress::new()).unwrap();
         assert!(found.is_empty(), "{found:?}");
         // Wall 0 still runs through behind the cabinet.
         let y = -points.origin[1];
@@ -1117,11 +1336,73 @@ mod tests {
 
     #[test]
     fn very_wide_gap_is_unclear() {
-        let found = openings_of(room().door(0, 2.5, 3.0, 2.2));
+        let found = openings_of(back_wall(room().door(0, 2.5, 3.0, 2.2)));
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].kind, OpeningKind::Unclear);
         assert_eq!(found[0].note, WRONG_SHAPE);
         assert_near("Breite", width(&found[0]), 3.0, 0.05);
+    }
+
+    #[test]
+    fn a_hole_with_nothing_behind_it_is_no_window_and_no_question() {
+        // A hole that no line of sight passes: a black patch of the wall looks the same.
+        let found = openings_of(room().window(0, 3.0, 1.20, 0.90, 1.30));
+        assert!(found.is_empty(), "{found:?}");
+        // Wide and from the floor up (a badly hit wall behind a ladder): nothing either.
+        let found = openings_of(room().door(0, 2.5, 3.5, 2.3));
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn holes_stacked_over_each_other_are_one_entry() {
+        let found = openings_of(back_wall(
+            room()
+                .window(0, 3.0, 1.2, 0.9, 0.5)
+                .window(0, 3.0, 1.2, 1.6, 0.5),
+        ));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].kind, OpeningKind::Window, "{found:?}");
+        assert_near("Brüstung", found[0].sill, 0.9, 0.05);
+        assert_near("Sturz", found[0].head, 2.1, 0.05);
+    }
+
+    #[test]
+    fn a_hole_with_the_wall_measured_from_the_other_side_is_none() {
+        // A strip of the wall is not measured from the left, but from the right it is whole.
+        let scene = Scene::new()
+            .room([0.0, 0.0], [4.0, 4.0], FLOOR, 2.6)
+            .window(1, 1.5, 1.2, 0.9, 1.3)
+            .room([4.2, 0.0], [8.2, 4.0], FLOOR, 2.6)
+            .walk(&[
+                [1.0, 1.0, 0.0],
+                [3.0, 1.0, 0.0],
+                [3.0, 3.0, 0.0],
+                [1.0, 3.0, 0.0],
+            ])
+            .walk(&[
+                [5.5, 1.0, 0.0],
+                [7.0, 1.0, 0.0],
+                [7.0, 3.0, 0.0],
+                [5.5, 3.0, 0.0],
+            ]);
+        let found = openings_of(scene);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn what_lies_in_a_walked_room_behind_a_hole_proves_nothing() {
+        // The wall behind the hole belongs to a second room, too far off to be its other side.
+        let scene = Scene::new()
+            .room([0.0, 0.0], [8.0, 5.0], FLOOR, 2.6)
+            .window(0, 3.0, 1.2, 0.9, 1.3)
+            .room([0.0, -6.0], [8.0, -1.0], FLOOR, 2.6)
+            .walk(&[[1.0, 1.0, 0.0], [7.0, 1.0, 0.0], [7.0, 4.0, 0.0]])
+            .walk(&[[1.0, -4.0, 0.0], [7.0, -4.0, 0.0], [7.0, -2.0, 0.0]]);
+        let found = openings_of(scene);
+        assert!(
+            !found.iter().any(|o| o.kind == OpeningKind::Window),
+            "{found:?}"
+        );
     }
 
     #[test]
@@ -1144,7 +1425,7 @@ mod tests {
 
     #[test]
     fn noise_keeps_the_window() {
-        let found = openings_of(room().window(0, 3.0, 1.20, 0.90, 1.30).noise(0.005));
+        let found = openings_of(back_wall(room().window(0, 3.0, 1.20, 0.90, 1.30)).noise(0.005));
         let windows = of_kind(&found, OpeningKind::Window);
         assert_eq!(windows.len(), 1, "{found:?}");
         assert_near("Breite", width(windows[0]), 1.20, 0.05);
@@ -1200,15 +1481,37 @@ mod tests {
 
     #[test]
     fn window_above_a_sideboard_is_a_window() {
-        let found = openings_of(
+        let found = openings_of(back_wall(
             room()
                 .window(0, 3.0, 1.2, 0.9, 1.3)
                 .block([2.8, 0.0, FLOOR], [4.4, 0.4, FLOOR + 0.85]),
-        );
+        ));
         let windows = of_kind(&found, OpeningKind::Window);
         assert_eq!(windows.len(), 1, "{found:?}");
         assert_near("Breite", width(windows[0]), 1.2, 0.05);
         assert_near("Brüstung", windows[0].sill, 0.9, 0.08);
+    }
+
+    #[test]
+    fn a_door_behind_a_low_sideboard_is_unclear_not_a_window() {
+        // An unwalked door, a sideboard 12 cm in front of it, no parapet measured.
+        let scene = Scene::new()
+            .spacing(0.02)
+            .room([0.0, 0.0], [8.0, 6.0], FLOOR, 2.6)
+            .door(0, 3.0, 0.9, 2.05)
+            .block([2.7, 0.12, FLOOR], [4.2, 0.6, FLOOR + 0.9])
+            .behind([1.0, -2.5, FLOOR], [7.0, -2.5, FLOOR + 2.6])
+            .walk(&[
+                [1.0, 2.0, 0.0],
+                [7.0, 2.0, 0.0],
+                [7.0, 5.0, 0.0],
+                [1.0, 5.0, 0.0],
+                [1.0, 2.0, 0.0],
+            ]);
+        let found = openings_of(scene);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].kind, OpeningKind::Unclear, "{found:?}");
+        assert_eq!(found[0].note, HIDDEN_BELOW, "{found:?}");
     }
 
     #[test]
@@ -1288,10 +1591,10 @@ mod tests {
     #[test]
     fn no_poses_no_openings() {
         let mut points = storey_of(room().spacing(0.05));
-        let walls = find_walls(&points, &PlanConfig::default(), &Progress::new()).unwrap();
+        let mut walls = find_walls(&points, &PlanConfig::default(), &Progress::new()).unwrap();
         points.poses.clear();
         assert_eq!(
-            find_openings(&points, &walls, &Progress::new()),
+            find_openings(&points, &mut walls, &Progress::new()),
             Err(PlanError::NoPoses)
         );
     }
@@ -1299,11 +1602,11 @@ mod tests {
     #[test]
     fn cancel_stops() {
         let points = storey_of(room().spacing(0.05));
-        let walls = find_walls(&points, &PlanConfig::default(), &Progress::new()).unwrap();
+        let mut walls = find_walls(&points, &PlanConfig::default(), &Progress::new()).unwrap();
         let progress = Progress::new();
         progress.cancel();
         assert_eq!(
-            find_openings(&points, &walls, &progress),
+            find_openings(&points, &mut walls, &progress),
             Err(PlanError::Cancelled)
         );
     }

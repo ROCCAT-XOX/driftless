@@ -169,6 +169,30 @@ fn finds_what_a_cut_off_job_left() {
     assert_eq!(leftovers::find(&project, &ids).len(), 6);
 }
 
+/// A map cut off before its report that has objects in it (`driftless map -o` into a folder a
+/// map already was in) and a model cut off with objects: the objects keep them from the trash.
+#[test]
+fn folders_with_objects_are_no_leftovers() {
+    let dir = tmp("reste-objekte");
+    let (project, run) = project(&dir);
+    let ids = ["halle".to_string()];
+    file(&run.join("karte-002"), "dense.bin.tmp", 2000);
+    file(&project.join("modelle/modell-001"), "modell.las.tmp", 500);
+    let (map, model) = (run.join("karte-002"), project.join("modelle/modell-001"));
+    assert_eq!(leftovers::find(&project, &ids).len(), 2);
+
+    file(&map, "objekte.toml", 10);
+    file(&model, "objekte.toml", 10);
+    // what is still offered is only the stale temporary files, not the folders with the objects
+    let found = leftovers::find(&project, &ids);
+    assert!(
+        found.iter().all(|l| l.kind == LeftoverKind::Temp),
+        "{found:?}"
+    );
+    assert!(leftovers::holds_results(&map));
+    assert!(!leftovers::may_clean_up(&map));
+}
+
 /// What a recompute cut off in a run's or a map's own folder leaves (by a crash, or by an
 /// older program): the run without its report, but with its history and its finished map; a
 /// second map without its report, but with a finished surface – and in it a surface cut off; a

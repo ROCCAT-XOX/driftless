@@ -3,8 +3,8 @@
 //! [`driftless_steps::export::run_export`].
 
 use driftless_steps::export::{
-    check_export, existing_targets, run_export, ExportFormat, ExportKind, ExportReport,
-    ExportRequest, ExportSource,
+    check_export, existing_targets, plan_without_map, run_export, ExportFormat, ExportKind,
+    ExportReport, ExportRequest, ExportSource,
 };
 use std::path::PathBuf;
 
@@ -94,5 +94,13 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     let report = run_export(&req, &crate::console())?;
     println!("{}", summary(&req, &report));
+    if let ExportSource::Plan { dir, .. } = &req.source {
+        if plan_without_map(dir) {
+            eprintln!(
+                "Hinweis: Dieser Grundriss-Ordner liegt nicht in einer Karte oder einem Modell, \
+                 im DXF stehen darum keine Objekte."
+            );
+        }
+    }
     Ok(())
 }

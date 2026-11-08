@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::grid::{Band, CellClass, HeightGrid};
 use crate::levels::check;
-use crate::{PlanConfig, PlanError, StoreyPoints};
+use crate::{Opening, PlanConfig, PlanError, StoreyPoints};
 
 /// The wall band starts this far above the floor ...
 const FLOOR_MARGIN: f64 = 0.15;
@@ -79,6 +79,8 @@ const RAY_LENGTH: f64 = 30.0;
 const PAIR_THICKNESS: (f64, f64) = (0.05, 0.60);
 /// The two faces overlap on this share of the shorter one.
 const PAIR_OVERLAP: f64 = 0.5;
+/// A face may have several partners; another partner may overlap this share of a new stretch.
+const PAIR_SHARED: f64 = 0.5;
 
 /// A measured wall surface in the frame of [`StoreyPoints`], seen from above.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1083,8 +1085,175 @@ fn first_wall(ctx: &Search, pose: [f64; 2], ray: [f64; 2]) -> Option<u32> {
     None
 }
 
-/// Pairs of faces that are the two sides of one wall. The longest common stretch goes first,
-/// then the thinnest: a door leaf set back in one of the faces must not take the wall's partner.
+/// What became of the faces cut by [`cut_faces`].
+#[derive(Debug)]
+pub(crate) struct CutFaces {
+    /// For every old face its pieces, in order.
+    pieces: Vec<Vec<CutPiece>>,
+}
+
+/// A piece of an old face.
+#[derive(Debug, Clone, Copy)]
+struct CutPiece {
+    /// Index of the new face.
+    face: usize,
+    /// The start of the new face on the old one (metres).
+    a_on_old: f64,
+    /// The stretch of the old face it was cut from (metres).
+    from: f64,
+    to: f64,
+}
+
+impl CutFaces {
+    /// Moves an opening onto the piece that holds it; `false` if there is none any more.
+    pub(crate) fn place(&self, opening: &mut Opening) -> bool {
+        let middle = (opening.from + opening.to) / 2.0;
+        let piece = self.pieces[opening.face]
+            .iter()
+            .find(|p| middle >= p.from && middle <= p.to);
+        match piece {
+            Some(p) => {
+                opening.face = p.face;
+                opening.from = (opening.from - p.a_on_old).max(0.0);
+                opening.to -= p.a_on_old;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The new end of a face where it was cut: runs onto the face behind it, if one is that close.
+fn close_cut_end(faces: &mut [WallFace], i: usize, at_b: bool) {
+    let face = faces[i];
+    let Some((d, _)) = direction(face.a, face.b) else {
+        return;
+    };
+    let end = if at_b { face.b } else { face.a };
+    let outward = if at_b { d } else { [-d[0], -d[1]] };
+    let mut nearest: Option<(f64, usize, [f64; 2])> = None;
+    for (j, other) in faces.iter().enumerate() {
+        let Some((e, other_len)) = direction(other.a, other.b) else {
+            continue;
+        };
+        if i == j || cross(d, e).abs() < CROSSING_SIN || dot(other.inward, outward) >= 0.0 {
+            continue;
+        }
+        let t = cross([other.a[0] - end[0], other.a[1] - end[1]], e) / cross(d, e);
+        let at = [end[0] + d[0] * t, end[1] + d[1] * t];
+        let u = dot(e, [at[0] - other.a[0], at[1] - other.a[1]]);
+        let gap = t.abs();
+        if gap <= CORNER
+            && u >= -REACH_MARGIN
+            && u <= other_len + REACH_MARGIN
+            && nearest.is_none_or(|n| (gap, j) < (n.0, n.1))
+        {
+            nearest = Some((gap, j, at));
+        }
+    }
+    let Some((_, _, at)) = nearest else {
+        return;
+    };
+    let kept = if at_b { face.a } else { face.b };
+    if distance(kept, at) < MIN_CLOSED {
+        return;
+    }
+    if at_b {
+        faces[i].b = at;
+    } else {
+        faces[i].a = at;
+    }
+}
+
+/// Cuts every face at its stretches in `cuts` (metres from `a`), closes the new ends onto what
+/// runs behind them and pairs the faces anew. The faces keep their order, the pieces of one in
+/// a row; pieces shorter than `MIN_FACE` go.
+pub(crate) fn cut_faces(walls: &mut Walls, cuts: &[Vec<(f64, f64)>]) -> CutFaces {
+    let old_faces = std::mem::take(&mut walls.faces);
+    let mut new_faces: Vec<WallFace> = Vec::with_capacity(old_faces.len());
+    // New face -> (old face, from, to, cut at a, cut at b).
+    let mut origins: Vec<(usize, f64, f64, bool, bool)> = Vec::with_capacity(old_faces.len());
+    for (index, (face, stretches)) in old_faces.iter().zip(cuts).enumerate() {
+        let Some((d, len)) = direction(face.a, face.b).filter(|_| !stretches.is_empty()) else {
+            new_faces.push(*face);
+            origins.push((index, 0.0, distance(face.a, face.b), false, false));
+            continue;
+        };
+        let mut sorted = stretches.clone();
+        sorted.sort_by(|p, q| p.0.total_cmp(&q.0).then(p.1.total_cmp(&q.1)));
+        let mut pieces: Vec<(f64, f64, bool, bool)> = Vec::new();
+        let (mut start, mut cut_at_start) = (0.0_f64, false);
+        for (from, to) in sorted {
+            if from > start {
+                pieces.push((start, from.min(len), cut_at_start, true));
+            }
+            start = start.max(to);
+            cut_at_start = true;
+        }
+        if start < len {
+            pieces.push((start, len, cut_at_start, false));
+        }
+        let kept: f64 = pieces.iter().map(|p| p.1 - p.0).sum();
+        for (from, to, cut_a, cut_b) in pieces {
+            let at = |t: f64| [face.a[0] + d[0] * t, face.a[1] + d[1] * t];
+            let piece_len = to - from;
+            new_faces.push(WallFace {
+                a: at(from),
+                b: at(to),
+                inward: face.inward,
+                seen_m: if kept > 0.0 {
+                    (face.seen_m * piece_len / kept).min(piece_len)
+                } else {
+                    0.0
+                },
+            });
+            origins.push((index, from, to, cut_a, cut_b));
+        }
+    }
+
+    let ends: Vec<(usize, bool)> = origins
+        .iter()
+        .enumerate()
+        .flat_map(|(i, o)| [(o.3, (i, false)), (o.4, (i, true))])
+        .filter(|(cut, _)| *cut)
+        .map(|(_, end)| end)
+        .collect();
+    for (i, at_b) in ends {
+        close_cut_end(&mut new_faces, i, at_b);
+    }
+
+    let mut pieces: Vec<Vec<CutPiece>> = vec![Vec::new(); old_faces.len()];
+    let mut faces: Vec<WallFace> = Vec::with_capacity(new_faces.len());
+    for (face, (old, from, to, cut_a, cut_b)) in new_faces.into_iter().zip(origins) {
+        if (cut_a || cut_b) && distance(face.a, face.b) < MIN_FACE {
+            continue;
+        }
+        let original = &old_faces[old];
+        let a_on_old = direction(original.a, original.b).map_or(0.0, |(d, _)| {
+            dot(d, [face.a[0] - original.a[0], face.a[1] - original.a[1]])
+        });
+        pieces[old].push(CutPiece {
+            face: faces.len(),
+            a_on_old,
+            from,
+            to,
+        });
+        faces.push(face);
+    }
+    walls.pairs = find_pairs(&faces);
+    walls.faces = faces;
+    CutFaces { pieces }
+}
+
+fn direction(a: [f64; 2], b: [f64; 2]) -> Option<([f64; 2], f64)> {
+    let len = distance(a, b);
+    (len > 0.0).then(|| ([(b[0] - a[0]) / len, (b[1] - a[1]) / len], len))
+}
+
+/// Pairs of faces that are the two sides of one wall. A long face can have several partners, one
+/// per stretch, when the other side consists of faces lying at different depths. The longest
+/// common stretch goes first, then the thinnest: a door leaf set back in one of the faces must
+/// not take the stretch of the wall's real partner.
 fn find_pairs(faces: &[WallFace]) -> Vec<WallPair> {
     let unit = |f: &WallFace| {
         let len = distance(f.a, f.b);
@@ -1110,11 +1279,17 @@ fn find_pairs(faces: &[WallFace]) -> Vec<WallPair> {
             if !(PAIR_THICKNESS.0..=PAIR_THICKNESS.1).contains(&thickness) {
                 continue;
             }
+            // The stretch where they overlap, on each of them.
             let (from, to) = (along(fj.a, fi, di), along(fj.b, fi, di));
-            let overlap = to.max(from).min(len_i) - to.min(from).max(0.0);
+            let stretch_i = (to.min(from).max(0.0), to.max(from).min(len_i));
+            let overlap = stretch_i.1 - stretch_i.0;
             if overlap >= PAIR_OVERLAP * len_i.min(len_j) {
+                let (from, to) = (along(fi.a, fj, dj), along(fi.b, fj, dj));
+                let stretch_j = (to.min(from).max(0.0), to.max(from).min(len_j));
                 found.push((
                     overlap,
+                    stretch_i,
+                    stretch_j,
                     WallPair {
                         front: i,
                         back: j,
@@ -1126,20 +1301,27 @@ fn find_pairs(faces: &[WallFace]) -> Vec<WallPair> {
     }
     found.sort_by(|a, b| {
         b.0.total_cmp(&a.0)
-            .then(a.1.thickness.total_cmp(&b.1.thickness))
-            .then((a.1.front, a.1.back).cmp(&(b.1.front, b.1.back)))
+            .then(a.3.thickness.total_cmp(&b.3.thickness))
+            .then((a.3.front, a.3.back).cmp(&(b.3.front, b.3.back)))
     });
-    let mut used = vec![false; faces.len()];
+    let mut taken: Vec<Vec<(f64, f64)>> = vec![Vec::new(); faces.len()];
     found
         .into_iter()
-        .map(|(_, pair)| pair)
-        .filter(|pair| {
-            let free = !used[pair.front] && !used[pair.back];
-            if free {
-                used[pair.front] = true;
-                used[pair.back] = true;
+        .filter_map(|(_, stretch_i, stretch_j, pair)| {
+            let free = |taken: &[(f64, f64)], stretch: (f64, f64)| {
+                let used: f64 = taken
+                    .iter()
+                    .map(|t| (t.1.min(stretch.1) - t.0.max(stretch.0)).max(0.0))
+                    .sum();
+                used <= PAIR_SHARED * (stretch.1 - stretch.0)
+            };
+            if free(&taken[pair.front], stretch_i) && free(&taken[pair.back], stretch_j) {
+                taken[pair.front].push(stretch_i);
+                taken[pair.back].push(stretch_j);
+                Some(pair)
+            } else {
+                None
             }
-            free
         })
         .collect()
 }

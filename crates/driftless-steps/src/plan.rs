@@ -47,7 +47,7 @@ pub const TOP_VIEW_FILE: &str = "draufsicht.png";
 /// Part of the input id: raised whenever the plan gives another result for the same input,
 /// so an older folder counts as stale. Only then: the program version is no part of the id
 /// (see the rule at the step versions in [`crate::map`]).
-pub const PLAN_VERSION: u32 = 1;
+pub const PLAN_VERSION: u32 = 2;
 
 /// The clouds of a map, the first that exists is read.
 const MAP_CLOUDS: [&str; 2] = ["color.las", "clean.las"];

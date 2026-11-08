@@ -611,6 +611,87 @@ fn walls_along(p: [f64; 2], q: [f64; 2], faces: &[WallFace], paired: &[bool]) ->
     near
 }
 
+/// How much of every face borders a room (metres from `a`), `None` for a face that borders none
+/// and is paired with none that does: what stands inside a room or outside all of them (tall
+/// furniture, a facade seen through a window) is no wall of the plan. A face paired with one
+/// that borders a room gets that stretch, the wall has two sides.
+pub(crate) fn spans_of_room_walls(
+    rooms: &[Room],
+    faces: &[WallFace],
+    pairs: &[WallPair],
+) -> Vec<Option<(f64, f64)>> {
+    let mut paired = vec![false; faces.len()];
+    for pair in pairs {
+        paired[pair.front] = true;
+        paired[pair.back] = true;
+    }
+    let along_face = |index: usize, p: [f64; 2]| -> f64 {
+        let face = &faces[index];
+        direction(face.a, face.b).map_or(0.0, |(d, _)| dot(d, sub(p, face.a)))
+    };
+    let mut spans: Vec<Option<(f64, f64)>> = vec![None; faces.len()];
+    let extend = |spans: &mut Vec<Option<(f64, f64)>>, index: usize, a: f64, b: f64| {
+        let (low, high) = (a.min(b), a.max(b));
+        spans[index] = Some(match spans[index] {
+            Some((l, h)) => (l.min(low), h.max(high)),
+            None => (low, high),
+        });
+    };
+    for room in rooms {
+        let n = room.outline.len();
+        for i in 0..n {
+            let (p, q) = (room.outline[i], room.outline[(i + 1) % n]);
+            let needed = MIN_OVERLAP.min(distance(p, q) / 2.0);
+            let Some((d, _)) = direction(p, q) else {
+                continue;
+            };
+            // Nearest first: a second line beside the same stretch (a curtain, a radiator, a
+            // shelf at the wall) adds nothing, it is no wall of its own.
+            let mut near: Vec<WallNear> = walls_along(p, q, faces, &paired)
+                .into_iter()
+                .filter(|w| w.to - w.from >= needed)
+                .collect();
+            near.sort_by(|a, b| {
+                (a.wrong_side as u8)
+                    .cmp(&(b.wrong_side as u8))
+                    .then(a.distance.total_cmp(&b.distance))
+                    .then(a.face.cmp(&b.face))
+            });
+            let mut covered: Vec<(f64, f64)> = Vec::new();
+            for wall in near {
+                let taken: f64 = covered
+                    .iter()
+                    .map(|c| (c.1.min(wall.to) - c.0.max(wall.from)).max(0.0))
+                    .sum();
+                if wall.to - wall.from - taken < needed {
+                    continue;
+                }
+                covered.push((wall.from, wall.to));
+                let (a, b) = (
+                    along_face(wall.face, along(p, d, wall.from)),
+                    along_face(wall.face, along(p, d, wall.to)),
+                );
+                extend(&mut spans, wall.face, a, b);
+            }
+        }
+    }
+    let bordering = spans.clone();
+    for pair in pairs {
+        for (from, to) in [(pair.front, pair.back), (pair.back, pair.front)] {
+            let Some((low, high)) = bordering[from] else {
+                continue;
+            };
+            let Some((d, _)) = direction(faces[from].a, faces[from].b) else {
+                continue;
+            };
+            let a = along_face(to, along(faces[from].a, d, low));
+            let b = along_face(to, along(faces[from].a, d, high));
+            extend(&mut spans, to, a, b);
+        }
+    }
+    spans
+}
+
 /// The edge from `p` to `q`, on its wall if there is one.
 fn edge_on_wall(p: [f64; 2], q: [f64; 2], faces: &[WallFace], paired: &[bool]) -> Option<Edge> {
     let (d, len) = direction(p, q)?;

@@ -291,7 +291,7 @@ fn door_and_window_have_symbols_and_text() {
 }
 
 #[test]
-fn unclear_shows_its_reason() {
+fn unclear_says_unclear_and_keeps_its_reason_in_the_data() {
     let mut plan = plan_of(vec![long_wall()]);
     let mut unclear = opening(OpeningKind::Unclear, 0, 3.0, 4.0, 0.0, 2.0);
     unclear.note = "Tür oder bodentiefes Fenster?".to_string();
@@ -300,10 +300,43 @@ fn unclear_shows_its_reason() {
     let gap = lines(&d, "Öffnung-unklar");
     assert_eq!(gap.len(), 1);
     assert!(gap[0].2, "gestrichelt");
-    assert_eq!(
-        texts(&d, "Öffnung-unklar"),
-        ["Tür oder bodentiefes Fenster?"]
-    );
+    assert_eq!(texts(&d, "Öffnung-unklar"), ["unklar"]);
+    let dashed = entities(&d, "Öffnung-unklar")
+        .into_iter()
+        .find(|e| !e.xdata.is_empty())
+        .expect("Grund in den Daten");
+    assert_eq!(dashed.xdata, ["GRUND=Tür oder bodentiefes Fenster?"]);
+}
+
+#[test]
+fn texts_of_neighbouring_openings_do_not_lie_on_each_other() {
+    let mut plan = plan_of(vec![long_wall()]);
+    plan.openings = vec![
+        opening(OpeningKind::Window, 0, 2.0, 2.4, 1.0, 2.0),
+        opening(OpeningKind::Window, 0, 2.5, 2.9, 1.0, 2.0),
+        opening(OpeningKind::Door, 0, 3.0, 3.9, 0.0, 2.05),
+    ];
+    let d = draw(plan);
+    let boxes: Vec<(String, [f64; 4])> = d
+        .entities
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntityKind::Shape(Shape::Text {
+                at, height, value, ..
+            }) => {
+                let width = value.chars().count() as f64 * 0.6 * height;
+                Some((value.clone(), [at[0], at[1], at[0] + width, at[1] + height]))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(boxes.len(), 3, "{boxes:?}");
+    for (i, (a, ba)) in boxes.iter().enumerate() {
+        for (b, bb) in &boxes[i + 1..] {
+            let apart = ba[0] >= bb[2] || bb[0] >= ba[2] || ba[1] >= bb[3] || bb[1] >= ba[3];
+            assert!(apart, "{a} {ba:?} / {b} {bb:?}");
+        }
+    }
 }
 
 #[test]
@@ -602,6 +635,50 @@ fn free_properties_become_attributes() {
 }
 
 #[test]
+fn rising_cable_says_its_span_of_heights() {
+    let mut objects = Objects::default();
+    add(
+        &mut objects,
+        input(ObjectKind::Cable, vec![[0.0, 0.0, 2.0], [2.0, 0.0, 0.5]]),
+    );
+    let d = plan_drawing(
+        &report(plan_of(Vec::new())),
+        &objects,
+        &PlanExport::default(),
+    );
+    let cable = entities(&d, "Kabel")[0];
+    assert!(cable.xdata.contains(&"HOEHE=500..2000".to_string()));
+}
+
+#[test]
+fn a_door_seen_from_one_side_cuts_both_faces() {
+    let mut plan = plan_of(vec![
+        face([0.0, 5.0], [6.0, 5.0], [0.0, -1.0]),
+        face([6.0, 5.2], [0.0, 5.2], [0.0, 1.0]),
+    ]);
+    plan.pairs = vec![WallPair {
+        front: 0,
+        back: 1,
+        thickness: 0.2,
+    }];
+    // only the first face sees the door; on the other a cupboard hides it.
+    plan.openings = vec![opening(OpeningKind::Door, 0, 1.0, 2.0, 0.0, 2.05)];
+    let d = draw(plan);
+    let pieces = polylines(&d, "Wand");
+    let on_y = |y: f64| -> Vec<(f64, f64)> {
+        pieces
+            .iter()
+            .filter(|p| close(p[0][1], y))
+            .map(|p| (p[0][0].min(p[1][0]), p[0][0].max(p[1][0])))
+            .collect()
+    };
+    assert_eq!(on_y(5000.0), [(0.0, 1000.0), (2000.0, 6000.0)]);
+    let mut other = on_y(5200.0);
+    other.sort_by(|a, b| a.0.total_cmp(&b.0));
+    assert_eq!(other, [(0.0, 1000.0), (2000.0, 6000.0)]);
+}
+
+#[test]
 fn cable_and_pipe_have_text_and_xdata() {
     let mut objects = Objects::default();
     let mut cable = input(ObjectKind::Cable, vec![[0.0, 0.0, 2.0], [2.0, 0.0, 2.0]]);
@@ -634,7 +711,17 @@ fn cable_and_pipe_have_text_and_xdata() {
         &cable.kind,
         EntityKind::Shape(Shape::Polyline { points, closed: false, .. }) if points.len() == 2
     ));
-    assert_eq!(cable.xdata, ["NR=1", "NAME=", "NOTIZ=NYM", "QUELLE=hand"]);
+    assert_eq!(
+        cable.xdata,
+        [
+            "NR=1",
+            "NAME=",
+            "ART=Kabel",
+            "HOEHE=2000",
+            "NOTIZ=NYM",
+            "QUELLE=hand"
+        ]
+    );
 
     assert_eq!(
         texts(&d, "Rohr"),
@@ -653,6 +740,8 @@ fn cable_and_pipe_have_text_and_xdata() {
         [
             "NR=3",
             "NAME=Heizung",
+            "ART=Rohr",
+            "HOEHE=2400",
             "NOTIZ=",
             "QUELLE=hand",
             "GROESSE=DN 50",
