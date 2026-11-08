@@ -745,7 +745,8 @@ fn stale_surface_does_not_widen_the_field() {
     let mut h = Harness::builder()
         .with_size([1400.0, 900.0])
         .build_ui_state(|ui, app: &mut DriftlessApp| app.show(ui), app);
-    h.run();
+    // the run of the selection and the statuses are read in the background first
+    settle(&mut h);
     h.get_by_label(text::THIS_SURFACE);
     let width = h.state().layout().step.width();
     assert!(width <= 251.0, "the field grew to {width}");
