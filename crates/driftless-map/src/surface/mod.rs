@@ -31,7 +31,8 @@ pub use cleanup::{cleanup, CleanupStats};
 pub use extract::{extract, Mesh};
 pub use level::SeamStats;
 pub use occlude::{
-    find_occluders, Occluders, OCCLUDED_SCORE, OCCLUDER_GAP, OCCLUDER_MAX, OCCLUDER_MIN_EXTENT,
+    find_occluders, Occluders, OCCLUDED_SCORE, OCCLUDERS_FILE, OCCLUDER_GAP, OCCLUDER_MAX,
+    OCCLUDER_MIN_EXTENT,
 };
 pub use preview::render_preview;
 pub use simplify::simplify;

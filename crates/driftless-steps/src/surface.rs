@@ -50,6 +50,7 @@ use driftless_io::{atomic_write, paths};
 use driftless_map::surface::{
     build_mesh, encode_pages, sensors_for_frames, surface_occluders, texture_mesh_with, Accuracy,
     AccuracySplit, NoiseConfig, SurfaceConfig, SurfaceInput, SurfaceStats, TextureSource,
+    OCCLUDERS_FILE,
 };
 use driftless_map::{load_stage, stage_fits};
 use driftless_traj::nalgebra::{Isometry3, Point3};
@@ -206,12 +207,13 @@ fn files_intact(dir: &Path, report: &Value) -> bool {
 }
 
 /// Whether a surface writes the file `name`: the glb, the OBJ with its `.mtl` and pages, the
-/// report.
+/// occluders, the report.
 fn owns(name: &str) -> bool {
     let fixed = [
         format!("{STEM}.glb"),
         format!("{STEM}.obj"),
         format!("{STEM}.mtl"),
+        OCCLUDERS_FILE.to_string(),
         SURFACE_REPORT.to_string(),
     ];
     fixed.iter().any(|f| f == name) || is_page_of(name.as_ref(), STEM.as_ref())
@@ -576,6 +578,11 @@ fn make_surface(
         files.extend((0..pages).map(|p| format!("{STEM}_seite_{p:02}.jpg")));
     }
     drop(surface);
+    // For „Bilder neu“; `surface_occluders` gives none with the switch off.
+    if !occluders.is_empty() {
+        occluders.write(&out.join(OCCLUDERS_FILE))?;
+        files.push(OCCLUDERS_FILE.to_string());
+    }
     files.push(SURFACE_REPORT.to_string());
     let stale = stale_files(out, &files);
     if !stale.is_empty() {

@@ -126,7 +126,7 @@
 //! per camera and [`ColorConfig::view_gap`]), the fit sees the
 //! [`SurfaceConfig::views_per_face`] best views by half octave of score.
 
-use super::occlude::{face_occluded, occluder_buffer, Occluders, OCCLUDED_SCORE};
+use super::occlude::{face_occluded, occluder_buffer, side_samples, Occluders, OCCLUDED_SCORE};
 use super::{Mesh, SurfaceConfig};
 use crate::color::{
     frame_camera, image_count, keep_best, linear_table, quality_pass, sample_linear, srgb_value,
@@ -668,8 +668,12 @@ struct Pending {
 /// buffer holds only those cells – the cells of the centroid and the corners of every face that
 /// passes the other tests, and their neighbours – else the whole image; either way the result is
 /// what [`image_views`] gives on a mesh of both sets of faces, bit for bit: the same tests with
-/// the same numbers, the depth tests after the others. Returns the views and the number of
-/// cells of the buffer.
+/// the same numbers, the depth tests after the others. `occluders` are what has no face and the
+/// grid of their points, if there are any: as [`image_views`] with their depth buffer
+/// ([`occluder_buffer`], with `cutout` only over the cells of the 7 samples of the faces seen),
+/// a view they hide counts [`OCCLUDED_SCORE`] of its score and carries the mark. Returns the
+/// views, each with whether the occluders hide it, and the number of cells of the depth buffer
+/// of the faces.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn windowed_views(
     mesh: &Mesh,
@@ -677,10 +681,11 @@ pub(crate) fn windowed_views(
     view: &[u32],
     surface: CornerFaces,
     splat: &[u32],
+    occluders: Option<(&Occluders, &PointGrid)>,
     shot: &Shot,
     cfg: &ColorConfig,
     cutout: bool,
-) -> (Vec<(u32, FaceView)>, usize) {
+) -> (Vec<(u32, FaceView, bool)>, usize) {
     let world_to_cam = shot.world_from_cam.inverse();
     let cam_pos = shot.world_from_cam.translation.vector;
     let cam = shot.geometry;
@@ -797,14 +802,52 @@ pub(crate) fn windowed_views(
         }
     });
     let tol = cfg.depth_tolerance;
-    let seen = pending
+    let seen: Vec<Pending> = pending
         .into_par_iter()
         .filter(|p| {
             buffer.is_visible(&p.centre, tol) && p.corners.iter().all(|c| buffer.is_visible(c, tol))
         })
-        .map(|p| (p.face, p.view))
         .collect();
-    (seen, buffer.cells())
+    let corners_of =
+        |p: &Pending| mesh.indices[p.face as usize].map(|i| mesh.positions[i as usize]);
+    let cover = match occluders {
+        Some((occluders, grid)) if !seen.is_empty() => {
+            // The cells `face_occluded` reads: those of the samples of the faces seen.
+            let window = cutout.then(|| {
+                let (mut lo, mut hi) = ([i32::MAX; 2], [i32::MIN; 2]);
+                let mut grow = |q: &Projection| {
+                    let (x, y) = DepthBuffer::cell_of(cam, cfg.zbuffer_scale, q.uv);
+                    lo = [lo[0].min(x), lo[1].min(y)];
+                    hi = [hi[0].max(x), hi[1].max(y)];
+                };
+                for p in &seen {
+                    grow(&p.centre);
+                    for s in side_samples(corners_of(p)) {
+                        if let Some(q) = project_point(&s, cam, &world_to_cam, f64::INFINITY) {
+                            grow(&q);
+                        }
+                    }
+                }
+                (lo, hi)
+            });
+            occluder_buffer(occluders, grid, shot, cfg, window)
+        }
+        _ => None,
+    };
+    let found = seen
+        .into_par_iter()
+        .map(|mut p| {
+            let hidden = cover
+                .as_ref()
+                .is_some_and(|b| face_occluded(b, corners_of(&p), &p.centre, cam, &world_to_cam));
+            if hidden {
+                p.view.score *= OCCLUDED_SCORE;
+                p.view.tag |= TAG_CARRIER;
+            }
+            (p.face, p.view, hidden)
+        })
+        .collect();
+    (found, buffer.cells())
 }
 
 /// Exposure-corrected colour of view `v` (sRGB levels).
@@ -1582,7 +1625,7 @@ fn cpu_views(pass: &Pass, progress: &Progress) -> Result<(Vec<FaceView>, Vec<Vie
                 let cam_pos = shot.world_from_cam.translation.vector;
                 let mut near = grid.near(&cam_pos, ccfg.max_dist + faces.reach);
                 near.par_sort_unstable();
-                let cover = occluder_buffer(occluders, &occluder_grid, &shot, ccfg);
+                let cover = occluder_buffer(occluders, &occluder_grid, &shot, ccfg, None);
                 let found = image_views(
                     mesh,
                     faces,

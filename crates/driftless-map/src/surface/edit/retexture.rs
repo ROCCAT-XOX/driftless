@@ -30,8 +30,12 @@
 //!    [`SurfaceConfig::min_texel`], times the cosine to the normal smoothed over two rings)
 //!    with `sharpness_norm` 1; a view that may show the carrier counts at
 //!    [`CARRIER_ALTERNATIVE`](super::super::views::CARRIER_ALTERNATIVE) of it, as in the slot
-//!    order there. So the scores of one face compare across images and scans. The faces of a
-//!    ring around the Stelle are looked at the same way (the cone around both), for step 5.
+//!    order there. So the scores of one face compare across images and scans. What was measured
+//!    but has no face hides the faces behind it as in the surface step ([`Occluders`], next to
+//!    the surface as [`crate::surface::OCCLUDERS_FILE`]): a view it hides counts
+//!    [`OCCLUDED_SCORE`](crate::surface::OCCLUDED_SCORE) of its score and carries the same mark
+//!    ([`windowed_views`]). The faces of a ring around the Stelle are looked at the same way
+//!    (the cone around both), for step 5.
 //! 3. **Ranking**: an image covering at least [`FULL_COVERAGE`] of the Stelle's area can
 //!    texture it alone; those come first, then the others, each by their quality (the area-
 //!    weighted mean over the Stelle of `√(score / best score of the face)`, 0 where unseen),
@@ -40,8 +44,9 @@
 //!
 //! **Only the best get a depth buffer.** Without a depth buffer every candidate already has, for
 //! every face of the Stelle, the score it would give it if nothing were in the way: the same
-//! numbers as with the buffer, which can only take a face away. These bounds rank the
-//! candidates; the first [`PRERANK_BATCH`] get a depth buffer, then, in rounds of twice as
+//! numbers as with the buffer, which can only take a face away or, where an occluder hides it,
+//! lower its score. These bounds rank the candidates; the first [`PRERANK_BATCH`] get a depth
+//! buffer, then, in rounds of twice as
 //! many, every candidate that could still change the best [`DECODED_VIEWS`] views: one that
 //! could raise the best score of a face one of them sees (and so their qualities), or whose
 //! bounds would put it before the last of them (its coverage could reach [`FULL_COVERAGE`]
@@ -76,11 +81,15 @@
 //!    the group of the first better image it is so alike to, else into a group of its own, and
 //!    the variants take first the best image of every group, by rank, then in turn the next
 //!    image of every group ([`variant_order`]): one after the other they show the Stelle from
-//!    another scan, camera, or time and place, as long as there is one ([`VariantFrom`]).
+//!    another scan, camera, or time and place, as long as there is one ([`VariantFrom`]). A
+//!    view that an occluder hides goes where another decoded image shows the face instead
+//!    ([`drop_occluded`], the rule of the surface step); it stays where none does, so that no
+//!    face goes gray.
 //!    Variant `k` takes the `k`-th of them (`k mod n`) for
 //!    every face it sees, but where the photo consistency (below) leaves its views out in a
-//!    group of at least [`ISLAND_FACES`] faces, and along the edge of such a group
-//!    ([`Prepared::taken_from`]). The other faces take the next best by [`ICM_ROUNDS`] rounds
+//!    group of at least [`ISLAND_FACES`] faces, and along the edge of such a group, or where
+//!    its view went for an occluder ([`Prepared::taken_from`]). The other faces take the next
+//!    best by [`ICM_ROUNDS`] rounds
 //!    of ICM over the views kept in the other images, the faces of the chosen one and the
 //!    outside held (the outside never has the same image), as the surface step labels; then
 //!    islands and small gray patches take the image around them where its camera sees them
@@ -169,8 +178,8 @@ use crate::surface::views::{
     all_cameras, consistent, stretch_of, vote_median, voters, windowed_views, CornerFaces, Faces,
     Shot, TextureSource, UsedImage, ViewTable, MAX_VIEWS_PER_FACE, SMOOTH_COS_MIN, VOTE_GAP,
 };
-use crate::surface::{encode_pages, Mesh, PageJpegs, SurfaceConfig, TexturedMesh};
-use crate::visibility::MAX_SPLAT;
+use crate::surface::{encode_pages, Mesh, Occluders, PageJpegs, SurfaceConfig, TexturedMesh};
+use crate::visibility::{PointGrid, MAX_SPLAT};
 use crate::MapError;
 use driftless_export::mesh::{ImageKind, Mesh as PageMesh};
 use driftless_io::camera::Camera;
@@ -296,6 +305,9 @@ pub(crate) struct RegionView {
     /// The faces of the ring around the Stelle it sees (of `around`, see [`region_views`]),
     /// sorted.
     pub ring: Vec<u32>,
+    /// The faces of [`RegionView::faces`] that something without a face hides in this image
+    /// (see the module docs, step 2), sorted.
+    pub occluded: Vec<u32>,
 }
 
 /// How [`region_views`] finds the images that see a Stelle (see the module docs, step 2).
@@ -343,8 +355,9 @@ pub(crate) struct SightStats {
 /// The images of `sources` that see faces of the Stelle `faces` (welded ids, any order) on the
 /// surface `s` (its faces in the tree `bvh`), best first (see the module docs): those covering
 /// [`FULL_COVERAGE`] of it, then the others, each by [`RegionView::quality`], then by source and
-/// frame. Of them the best `sight.keep` ([`Sight::BEST`]: [`DECODED_VIEWS`]; `usize::MAX`:
-/// all), exactly as a depth buffer for every candidate gives them; and what it took. Each view
+/// frame. `occluders` is what has no face but hides the surface (none: as if nothing did). Of
+/// them the best `sight.keep` ([`Sight::BEST`]: [`DECODED_VIEWS`]; `usize::MAX`: all), exactly
+/// as a depth buffer for every candidate gives them; and what it took. Each view
 /// also lists the faces of `around` it sees ([`RegionView::ring`]; `around`: sorted, none of
 /// the Stelle, typically a ring around it), as the surface step would see them; the images and
 /// their views of the Stelle are the same with any `around`. The images are listed from
@@ -364,6 +377,7 @@ pub(crate) fn region_views(
     bvh: &FaceBvh,
     faces: &[u32],
     around: &[u32],
+    occluders: &Occluders,
     sources: &[TextureSource],
     indices: &[Arc<ImageIndex>],
     cfg: &SurfaceConfig,
@@ -471,6 +485,8 @@ pub(crate) fn region_views(
 
     // Depth buffers in rounds, until the best `keep` cannot change any more (see the module
     // docs): what each candidate sees of the Stelle (with its scores) and of the ring.
+    let grid = (!occluders.is_empty()).then(|| PointGrid::new(&occluders.points));
+    let hiding = grid.as_ref().map(|g| (occluders, g));
     let mut seen: Vec<Option<SeenFaces>> = vec![None; candidates.len()];
     let mut best = vec![0.0f32; region.len()];
     let mut round: Vec<usize> = order.iter().copied().take(sight.batch).collect();
@@ -497,23 +513,36 @@ pub(crate) fn region_views(
                     &view,
                     corners,
                     &splat,
+                    hiding,
                     &shot(c),
                     ccfg,
                     sight.cutout,
                 );
-                // The bound of a face it sees is its score (`OpenFaces::scores`).
+                // The bound of a face it sees is its score (`OpenFaces::scores`); only what has
+                // no face can lower that.
                 #[cfg(debug_assertions)]
-                for (f, v) in &views {
+                for (f, v, hidden) in &views {
                     if let Ok(i) = region.binary_search(&near[*f as usize]) {
-                        assert_eq!(v.score.to_bits(), bounds[c][i].to_bits(), "face {f}");
+                        if *hidden {
+                            assert!(v.score < bounds[c][i], "face {f}");
+                        } else {
+                            assert_eq!(v.score.to_bits(), bounds[c][i].to_bits(), "face {f}");
+                        }
                     }
                 }
+                let occluded: Vec<u32> = views
+                    .iter()
+                    .filter(|v| v.2)
+                    .map(|v| near[v.0 as usize])
+                    .filter(|f| region.binary_search(f).is_ok())
+                    .collect();
                 let (stelle, ring): Scored2 = views
                     .into_iter()
-                    .map(|(f, v)| (near[f as usize], v.rank_score()))
+                    .map(|(f, v, _)| (near[f as usize], v.rank_score()))
                     .partition(|(f, _)| region.binary_search(f).is_ok());
                 progress.advance(1);
-                Some(((stelle, ring.into_iter().map(|(f, _)| f).collect()), cells))
+                let ring = ring.into_iter().map(|(f, _)| f).collect();
+                Some(((stelle, ring, occluded), cells))
             })
             .collect();
         if progress.is_cancelled() {
@@ -577,7 +606,7 @@ fn ranked_views(
         .iter()
         .zip(seen)
         .filter_map(|(c, seen)| {
-            let (faces, ring) = seen.as_ref()?;
+            let (faces, ring, occluded) = seen.as_ref()?;
             if faces.is_empty() {
                 return None;
             }
@@ -597,6 +626,7 @@ fn ranked_views(
                 quality: (quality / total) as f32,
                 faces: faces.clone(),
                 ring: ring.clone(),
+                occluded: occluded.clone(),
             })
         })
         .collect();
@@ -904,8 +934,9 @@ pub(crate) fn decode_views(
 type Scored = Vec<(u32, f32)>;
 /// Faces with their scores, two lists.
 type Scored2 = (Scored, Scored);
-/// What one image sees: the faces of the Stelle with their scores, the faces of the ring.
-type SeenFaces = (Scored, Vec<u32>);
+/// What one image sees: the faces of the Stelle with their scores, the faces of the ring, the
+/// faces of the Stelle that something without a face hides.
+type SeenFaces = (Scored, Vec<u32>, Vec<u32>);
 
 /// The faces of a Stelle as the search for its images needs them.
 struct Shape {
@@ -1196,8 +1227,10 @@ pub enum VariantFrom {
 /// further variant tries the next one. `s` is the welded surface as the earlier steps left it (their
 /// moves applied, [`WeldedSurface::apply_moves`]) and `bvh` the tree of its faces,
 /// `current` the surface with their patches applied ([`super::apply_patches`]): its texture
-/// around the Stelle is what the new images are matched to. `indices` hold, per source, where
-/// its images lie ([`index_images`]). `cfg` is the surface's (as its report has it). Progress:
+/// around the Stelle is what the new images are matched to. `occluders` is what was measured but
+/// has no face, as the surface step left it ([`Occluders::read`]; none: nothing hides the
+/// surface but itself). `indices` hold, per source, where its images lie ([`index_images`]).
+/// `cfg` is the surface's (as its report has it). Progress:
 /// the phases „Bilder der Stelle suchen“, „Bilder der Stelle lesen“ and „Stelle neu backen“; a
 /// cancel returns [`EditError::Cancelled`]. Same input, the same patch, byte for byte.
 ///
@@ -1217,6 +1250,7 @@ pub fn retexture_region(
     bvh: &FaceBvh,
     current: &PageMesh,
     faces: &[u32],
+    occluders: &Occluders,
     sources: &[TextureSource],
     indices: &[Arc<ImageIndex>],
     variant: u32,
@@ -1228,6 +1262,7 @@ pub fn retexture_region(
         bvh,
         current,
         faces,
+        occluders,
         sources,
         indices,
         variant,
@@ -1267,6 +1302,7 @@ fn retexture(
     bvh: &FaceBvh,
     current: &PageMesh,
     faces: &[u32],
+    occluders: &Occluders,
     sources: &[TextureSource],
     indices: &[Arc<ImageIndex>],
     variant: u32,
@@ -1277,7 +1313,7 @@ fn retexture(
     judging: Judging,
 ) -> Result<RetextureDone, EditError> {
     let prep = prepare(
-        s, bvh, current, faces, sources, indices, cfg, sight, judging, progress,
+        s, bvh, current, faces, occluders, sources, indices, cfg, sight, judging, progress,
     )?;
     let n = prep.variants.len();
     let k = variant as usize % n;
@@ -1431,6 +1467,7 @@ fn variants(
     bvh: &FaceBvh,
     current: &PageMesh,
     faces: &[u32],
+    occluders: &Occluders,
     sources: &[TextureSource],
     indices: &[Arc<ImageIndex>],
     cfg: &SurfaceConfig,
@@ -1441,6 +1478,7 @@ fn variants(
         bvh,
         current,
         faces,
+        occluders,
         sources,
         indices,
         cfg,
@@ -1548,10 +1586,54 @@ struct Prepared<'a> {
     variants: Vec<Variant>,
     /// The photo consistency of the views ([`judge_views`]).
     judged: Judged,
+    /// Per face of the Stelle the images (indices, sorted) whose view went because something
+    /// without a face hides the face there ([`drop_occluded`]).
+    occluded_out: Vec<Vec<u32>>,
     /// Where the faces of the Stelle and of the ring sit in the current surface.
     old: Located<'a>,
     /// The old texture of the ring's faces.
     ring_old: Vec<Option<OldFace>>,
+}
+
+/// Takes from the decoded `images` the views of the faces of the Stelle `region` (sorted) that
+/// something without a face hides ([`RegionView::occluded`]) where another image can show the
+/// face instead. It is the rule of the surface step's filter
+/// ([`filter_views`](super::super::views::filter_views)), in the scores of the slot order that
+/// [`RegionView::faces`] holds: the best other view of the face scores at least as much as the
+/// best hidden one. Where none does, the hidden views stay: no new gray faces. Returns per face
+/// of the Stelle the images (indices, ascending) whose view went. Without hidden views nothing
+/// changes.
+fn drop_occluded(images: &mut [Decoded], region: &[u32]) -> Vec<Vec<u32>> {
+    let mut gone = vec![Vec::new(); region.len()];
+    if images.iter().all(|c| c.view.occluded.is_empty()) {
+        return gone;
+    }
+    // Per face the best score of the views that are hidden, and of the others.
+    let mut best = vec![(0.0f32, 0.0f32); region.len()];
+    for image in images.iter() {
+        for &(f, score) in &image.view.faces {
+            let i = region.binary_search(&f).expect("a face of the Stelle");
+            if image.view.occluded.binary_search(&f).is_ok() {
+                best[i].0 = best[i].0.max(score);
+            } else {
+                best[i].1 = best[i].1.max(score);
+            }
+        }
+    }
+    for (c, image) in images.iter_mut().enumerate() {
+        let RegionView {
+            faces, occluded, ..
+        } = &mut image.view;
+        faces.retain(|(f, _)| {
+            let i = region.binary_search(f).expect("a face of the Stelle");
+            let goes = occluded.binary_search(f).is_ok() && best[i].1 >= best[i].0;
+            if goes {
+                gone[i].push(c as u32);
+            }
+            !goes
+        });
+    }
+    gone
 }
 
 /// Steps 1 to 6 of the module docs: the images of the Stelle `faces`, decoded, their gains,
@@ -1562,6 +1644,7 @@ fn prepare<'a>(
     bvh: &FaceBvh,
     current: &'a PageMesh,
     faces: &[u32],
+    occluders: &Occluders,
     sources: &[TextureSource],
     indices: &[Arc<ImageIndex>],
     cfg: &SurfaceConfig,
@@ -1592,7 +1675,7 @@ fn prepare<'a>(
         ..sight
     };
     let (views, looked) = region_views(
-        s, bvh, &region, &ring, sources, indices, cfg, sight, progress,
+        s, bvh, &region, &ring, occluders, sources, indices, cfg, sight, progress,
     )?;
     if looked.candidates > 0 {
         progress.info(format!(
@@ -1607,7 +1690,7 @@ fn prepare<'a>(
     if decoded.is_empty() {
         return Err(EditError::NoImages);
     }
-    let images: Vec<Decoded> = decoded
+    let mut images: Vec<Decoded> = decoded
         .into_iter()
         .map(|(i, rgb)| Decoded {
             view: views[i].clone(),
@@ -1640,6 +1723,7 @@ fn prepare<'a>(
     let mesh = local_mesh(s, &region);
     let ranked = rank(s, &region, &mesh, &images, &gains, sources, cfg);
     let variants = variant_order(&images, &ranked, Shape::new(s, &region).centre);
+    let occluded_out = drop_occluded(&mut images, &region);
     let judged = match judging {
         Judging::Consistent => judge_views(s, bvh, &region, &images, &gains, sources, &lin),
         #[cfg(test)]
@@ -1658,6 +1742,7 @@ fn prepare<'a>(
         own_gain: own.iter().map(Option::is_some).collect(),
         variants,
         judged,
+        occluded_out,
         old,
         ring_old,
     })
@@ -1783,11 +1868,12 @@ impl Prepared<'_> {
             vignetting: Vignetting::flat(cams.len(), cfg.color.exposure.max_gain),
         };
         let kept = |f: usize, c: u32| {
-            if c == main {
-                !taken[f]
-            } else {
-                !self.judged.left_out(f, c)
-            }
+            self.occluded_out[f].binary_search(&c).is_err()
+                && if c == main {
+                    !taken[f]
+                } else {
+                    !self.judged.left_out(f, c)
+                }
         };
         absorb_islands_where(&self.mesh, &table, &cams, cfg, &mut labels, &kept);
         (labels, taken)
@@ -1796,9 +1882,10 @@ impl Prepared<'_> {
     /// The faces of the Stelle the chosen image `main` does not take although it sees them (see
     /// the module docs, step 6): those where the photo consistency leaves its view out, in groups
     /// over shared edges of at least [`ISLAND_FACES`] faces (a smaller group stays with it, as an
-    /// island would), and the faces sharing an edge with such a group that it sees and another
-    /// image sees and keeps: a thing in front covers the faces along its edge only in part, and
-    /// their mean colour differs less.
+    /// island would), those whose view of it went for an occluder ([`drop_occluded`]), and the
+    /// faces sharing an edge with such a group that it sees and another image sees and keeps: a
+    /// thing in front covers the faces along its edge only in part, and their mean colour differs
+    /// less.
     fn taken_from(&self, main: u32) -> Vec<bool> {
         let n = self.region.len();
         let mut sees = vec![false; n];
@@ -1855,6 +1942,10 @@ impl Prepared<'_> {
             for &i in &group {
                 taken[i] = true;
             }
+        }
+        // What hides the face is known, not judged: the size of the group does not matter.
+        for (i, out) in self.occluded_out.iter().enumerate() {
+            taken[i] |= out.binary_search(&main).is_ok();
         }
         let grown: Vec<usize> = (0..n)
             .filter(|&j| !taken[j] && sees[j] && others[j])
@@ -2908,6 +2999,7 @@ mod tests {
             &bvh,
             spot,
             around,
+            &Occluders::default(),
             sources,
             &indices,
             cfg,
@@ -3000,8 +3092,63 @@ mod tests {
         let bvh = FaceBvh::build(s);
         let indices = index_of(sources);
         retexture_region(
-            s, &bvh, current, faces, sources, &indices, variant, cfg, progress,
+            s,
+            &bvh,
+            current,
+            faces,
+            &Occluders::default(),
+            sources,
+            &indices,
+            variant,
+            cfg,
+            progress,
         )
+    }
+
+    #[test]
+    fn occluded_views_go_where_another_shows_the_face() {
+        let view = |faces: &[(u32, f32)], occluded: &[u32]| RegionView {
+            source: 0,
+            frame: 0,
+            stamp: 0,
+            camera: 0,
+            world_from_cam: Isometry3::identity(),
+            coverage: 1.0,
+            quality: 1.0,
+            faces: faces.to_vec(),
+            ring: Vec::new(),
+            occluded: occluded.to_vec(),
+        };
+        let decoded = |v: RegionView| Decoded {
+            view: v,
+            rgb: RgbImage {
+                width: 1,
+                height: 1,
+                data: vec![0; 3],
+            },
+        };
+        let region = [10, 11, 12, 13];
+        // Face 10: hidden in 0 and 1, plain in 2: both go. 11: hidden in 0 only, the only view:
+        // stays. 12: hidden in 0 (0.5), plain in 1 worse than that: stays. 13: hidden in 1
+        // (0.25), plain in 2 as good: goes.
+        let mut images = [
+            decoded(view(&[(10, 8.0), (11, 1.0), (12, 0.5)], &[10, 11, 12])),
+            decoded(view(&[(10, 4.0), (12, 0.2), (13, 0.25)], &[10, 13])),
+            decoded(view(&[(10, 9.0), (13, 0.25)], &[])),
+        ];
+        let out = drop_occluded(&mut images, &region);
+        assert_eq!(out, [vec![0, 1], Vec::new(), Vec::new(), vec![1]]);
+        let left = |c: usize| images[c].view.faces.clone();
+        assert_eq!(left(0), [(11, 1.0), (12, 0.5)]);
+        assert_eq!(left(1), [(12, 0.2)]);
+        assert_eq!(left(2), [(10, 9.0), (13, 0.25)]);
+        // Without occluded views nothing changes.
+        let mut images = [decoded(view(&[(10, 8.0)], &[]))];
+        assert_eq!(
+            drop_occluded(&mut images, &region),
+            vec![Vec::<u32>::new(); 4]
+        );
+        assert_eq!(images[0].view.faces, [(10, 8.0)]);
     }
 
     #[test]
@@ -3437,6 +3584,7 @@ mod tests {
                 &bvh,
                 &spot,
                 &around,
+                &Occluders::default(),
                 sources,
                 &indices,
                 &cfg,
@@ -3711,6 +3859,7 @@ mod tests {
                     &FaceBvh::build(s),
                     &room.mesh,
                     &spot,
+                    &Occluders::default(),
                     src,
                     &index_of(src),
                     0,
@@ -3760,6 +3909,7 @@ mod tests {
             &FaceBvh::build(s),
             &room.mesh,
             &spot,
+            &Occluders::default(),
             &sources,
             &index_of(&sources),
             &cfg,
@@ -3864,6 +4014,7 @@ mod tests {
                 &bvh,
                 mesh,
                 &spot,
+                &Occluders::default(),
                 &sources,
                 &indices,
                 &cfg,
@@ -3947,6 +4098,7 @@ mod tests {
                     &bvh,
                     mesh,
                     &spot,
+                    &Occluders::default(),
                     &sources,
                     &indices,
                     k as u32,
@@ -4201,6 +4353,7 @@ mod tests {
             &FaceBvh::build(s),
             pages,
             &spot,
+            &Occluders::default(),
             sources,
             &index_of(sources),
             &cfg,
@@ -4232,6 +4385,7 @@ mod tests {
             &FaceBvh::build(s),
             pages,
             &spot,
+            &Occluders::default(),
             sources,
             &index_of(sources),
             0,
@@ -4635,6 +4789,7 @@ mod tests {
                 &self.bvh,
                 &self.spot,
                 &self.around,
+                &Occluders::default(),
                 &self.sources,
                 &self.indices,
                 &self.cfg,
@@ -4937,6 +5092,7 @@ mod tests {
                         &bvh,
                         mesh,
                         &spot,
+                        &Occluders::default(),
                         &sources,
                         &indices,
                         variant,
@@ -5094,6 +5250,7 @@ mod tests {
                 &bvh,
                 &spot,
                 &[],
+                &Occluders::default(),
                 sources,
                 &indices,
                 &walk_config(),
@@ -5138,6 +5295,7 @@ mod tests {
                 &bvh,
                 &spot,
                 &[],
+                &Occluders::default(),
                 sources,
                 &indices,
                 &cfg,

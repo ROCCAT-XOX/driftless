@@ -21,6 +21,9 @@
 //!   the mark of a view that may show the carrier, so that it goes as soon as another image
 //!   shows the face and stays if none does (no new gray faces, no new rule in the filter). It
 //!   does not count for the exposure either.
+//! - **„Bilder neu“** ([`super::edit`]): the surface step leaves them next to the surface
+//!   ([`OCCLUDERS_FILE`], [`Occluders::write`]) and [`super::views::windowed_views`] heeds them
+//!   the same way, the depth buffer again only where it is read.
 //!
 //! Sorted cells and an integer grid make the result independent of the order of the points.
 
@@ -29,9 +32,11 @@ use super::views::Shot;
 use super::{Mesh, SurfaceConfig};
 use crate::color::ColorConfig;
 use crate::visibility::{project_point, DepthBuffer, PointGrid, Projection};
+use crate::MapError;
 use driftless_io::camera::Camera;
 use nalgebra::Isometry3;
 use rayon::prelude::*;
+use std::path::Path;
 
 /// A face hides behind an occluder that is more than this nearer (m).
 pub const OCCLUDER_GAP: f64 = 0.02;
@@ -47,6 +52,10 @@ pub const OCCLUDER_FAR_VOXELS: f64 = 1.5;
 pub const OCCLUDER_FAR_MIN: f64 = 0.02;
 /// Points a cell needs to be an occluder.
 pub const OCCLUDER_MIN_POINTS: usize = 3;
+/// The occluders next to a surface, for „Bilder neu“ ([`Occluders::write`]).
+pub const OCCLUDERS_FILE: &str = "verdecker.bin";
+/// The first bytes of [`OCCLUDERS_FILE`].
+const FILE_ID: &[u8; 8] = b"DLVERDK1";
 
 /// The 13 neighbouring cells after a cell in key order: the other 13 see it from their side.
 const FORWARD: [[i32; 3]; 13] = [
@@ -77,6 +86,50 @@ pub struct Occluders {
 impl Occluders {
     pub fn is_empty(&self) -> bool {
         self.points.is_empty()
+    }
+
+    /// Writes them to `path`, atomically (a run killed meanwhile leaves the file as it was): the
+    /// bytes of [`FILE_ID`], [`Occluders::spacing`] (`f32`), their number (`u64`), the points
+    /// (three `f32` each), all little-endian.
+    pub fn write(&self, path: &Path) -> Result<(), MapError> {
+        let mut bytes = Vec::with_capacity(FILE_ID.len() + 12 + 12 * self.points.len());
+        bytes.extend_from_slice(FILE_ID);
+        bytes.extend_from_slice(&self.spacing.to_le_bytes());
+        bytes.extend_from_slice(&(self.points.len() as u64).to_le_bytes());
+        for v in self.points.iter().flatten() {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        driftless_io::atomic_write(path, &bytes).map_err(|source| MapError::Io {
+            path: path.display().to_string(),
+            source,
+        })
+    }
+
+    /// The occluders [`Occluders::write`] wrote to `path`; `None` if there is no such file or it
+    /// is not one of them: another start, another size than the number of points says, a number
+    /// that is not finite, points without a spacing above 0.
+    pub fn read(path: &Path) -> Option<Occluders> {
+        let bytes = std::fs::read(path).ok()?;
+        let rest = bytes.strip_prefix(FILE_ID.as_slice())?;
+        let (spacing, rest) = rest.split_first_chunk::<4>()?;
+        let (count, rest) = rest.split_first_chunk::<8>()?;
+        let spacing = f32::from_le_bytes(*spacing);
+        let count = u64::from_le_bytes(*count);
+        let ok_spacing = spacing.is_finite() && (spacing > 0.0 || (count == 0 && spacing == 0.0));
+        if !ok_spacing || count.checked_mul(12)? != rest.len() as u64 {
+            return None;
+        }
+        let points: Vec<[f32; 3]> = rest
+            .as_chunks::<12>()
+            .0
+            .iter()
+            .map(|p| [0, 4, 8].map(|k| f32::from_le_bytes([p[k], p[k + 1], p[k + 2], p[k + 3]])))
+            .collect();
+        points
+            .iter()
+            .flatten()
+            .all(|v| v.is_finite())
+            .then_some(Occluders { points, spacing })
     }
 }
 
@@ -180,19 +233,25 @@ fn thinned(cells: Vec<[i32; 3]>, max: usize) -> (Vec<[i32; 3]>, i32) {
 
 /// The depth buffer of the occluders near the camera of `shot`, with the cells of the faces'
 /// buffer in [`super::views::image_views`]; `None` if there are none (`grid` holds
-/// `occluders.points`).
+/// `occluders.points`). With `window` (the least and the greatest cell, as
+/// [`DepthBuffer::window`]) it holds only those cells; there it holds what the whole buffer
+/// holds.
 pub(crate) fn occluder_buffer(
     occluders: &Occluders,
     grid: &PointGrid,
     shot: &Shot,
     cfg: &ColorConfig,
+    window: Option<([i32; 2], [i32; 2])>,
 ) -> Option<DepthBuffer> {
     let near = grid.near(&shot.world_from_cam.translation.vector, cfg.max_dist);
     if near.is_empty() {
         return None;
     }
     let world_to_cam = shot.world_from_cam.inverse();
-    let buffer = DepthBuffer::new(shot.geometry, cfg.zbuffer_scale);
+    let buffer = match window {
+        Some((lo, hi)) => DepthBuffer::window(shot.geometry, cfg.zbuffer_scale, lo, hi),
+        None => DepthBuffer::new(shot.geometry, cfg.zbuffer_scale),
+    };
     near.par_iter().for_each(|&i| {
         let p = &occluders.points[i as usize];
         if let Some(proj) = project_point(p, shot.geometry, &world_to_cam, cfg.max_dist) {
@@ -200,6 +259,23 @@ pub(crate) fn occluder_buffer(
         }
     });
     Some(buffer)
+}
+
+/// The 6 samples of a face with these `corners` besides its centroid: the corners and the
+/// middles of the edges.
+pub(crate) fn side_samples(corners: [[f32; 3]; 3]) -> [[f32; 3]; 6] {
+    let middle = |k: usize| {
+        let (a, b) = (corners[k], corners[(k + 1) % 3]);
+        [0, 1, 2].map(|i| (a[i] + b[i]) * 0.5)
+    };
+    [
+        corners[0],
+        middle(0),
+        corners[1],
+        middle(1),
+        corners[2],
+        middle(2),
+    ]
 }
 
 /// Whether an occluder of `buffer` hides one of the 7 samples of a face with these `corners`:
@@ -215,25 +291,31 @@ pub(crate) fn face_occluded(
         project_point(p, cam, world_to_cam, f64::INFINITY)
             .is_some_and(|q| buffer.is_behind(&q, OCCLUDER_GAP))
     };
-    buffer.is_behind(centre, OCCLUDER_GAP)
-        || (0..3).any(|k| {
-            let (a, b) = (corners[k], corners[(k + 1) % 3]);
-            hidden(&a) || hidden(&[0, 1, 2].map(|i| (a[i] + b[i]) * 0.5))
-        })
+    buffer.is_behind(centre, OCCLUDER_GAP) || side_samples(corners).iter().any(hidden)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::edit::{retexture_region, FaceBvh, SurfacePatch, WeldedSurface};
     use super::super::tests::face_colour;
     use super::super::testutil::{centroid, face_near, grid, scene, test_gpu, Lcg, Steps};
     use super::super::views::{
-        all_cameras, collect_views, collect_views_on, TextureSource, ViewTable,
+        all_cameras, collect_views, collect_views_on, image_views, windowed_views, CornerFaces,
+        Faces, TextureSource, ViewTable,
     };
-    use super::super::{texture_mesh_with, NoiseConfig, SurfaceStats};
+    use super::super::{encode_pages, texture_mesh_with, NoiseConfig, SurfaceStats};
     use super::*;
+    use crate::color::{linear_table, sample_linear, srgb_value};
+    use driftless_export::mesh::Mesh as PageMesh;
     use driftless_gpu::GpuContext;
+    use driftless_io::images::{decode_jpeg, index_images};
     use driftless_io::progress::Progress;
+    use driftless_io::testdir::TestDir;
+    use driftless_traj::interpolate_pose;
     use nalgebra::Isometry3;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::sync::Arc;
 
     /// The rod of [`rod_source`]: its middle (x, m) and half its width. It stands 0.5 m in front
     /// of the +y wall (y 4.46 … 4.54), from z −1.1 to 1.7.
@@ -661,6 +743,301 @@ mod tests {
         .unwrap();
         for &f in &shadow {
             assert!(tex.textured[f], "face {f} went gray");
+        }
+    }
+
+    #[test]
+    fn file_gives_the_same_points() {
+        let dir = TestDir::new(format!("driftless-occluders-{}", std::process::id()));
+        let path = dir.join(OCCLUDERS_FILE);
+        let found = find_occluders(&wall(), &full_rod(), &config());
+        assert!(!found.is_empty());
+        found.write(&path).unwrap();
+        assert!(Occluders::read(&path).as_ref() == Some(&found));
+        // Writing again replaces it; none of them is one as well.
+        let few = Occluders {
+            points: vec![[1.0, -2.5, 0.125]],
+            spacing: 0.04,
+        };
+        few.write(&path).unwrap();
+        assert_eq!(Occluders::read(&path).as_ref(), Some(&few));
+        Occluders::default().write(&path).unwrap();
+        assert_eq!(Occluders::read(&path), Some(Occluders::default()));
+    }
+
+    #[test]
+    fn broken_file_is_none() {
+        let dir = TestDir::new(format!("driftless-occluders-broken-{}", std::process::id()));
+        let path = dir.join(OCCLUDERS_FILE);
+        assert_eq!(Occluders::read(&path), None, "no file");
+        let good = Occluders {
+            points: vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            spacing: 0.02,
+        };
+        good.write(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 20 + 2 * 12);
+        let read = |b: &[u8]| {
+            fs::write(&path, b).unwrap();
+            Occluders::read(&path)
+        };
+        assert_eq!(read(&bytes).as_ref(), Some(&good));
+        assert_eq!(read(&[]), None, "empty");
+        assert_eq!(read(&bytes[..10]), None, "shorter than its head");
+        assert_eq!(read(&bytes[..bytes.len() - 1]), None, "a byte short");
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_eq!(read(&longer), None, "a byte too many");
+        let mut other = bytes.clone();
+        other[0] ^= 0xff;
+        assert_eq!(read(&other), None, "not ours");
+        let mut count = bytes.clone();
+        count[12..20].copy_from_slice(&3u64.to_le_bytes());
+        assert_eq!(read(&count), None, "more than it holds");
+        count[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(read(&count), None, "absurdly many");
+        let mut point = bytes.clone();
+        point[24..28].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert_eq!(read(&point), None, "no number");
+        for spacing in [0.0f32, -1.0, f32::INFINITY] {
+            let mut bad = bytes.clone();
+            bad[8..12].copy_from_slice(&spacing.to_le_bytes());
+            assert_eq!(read(&bad), None, "spacing {spacing}");
+        }
+    }
+
+    #[test]
+    fn windowed_views_heed_occluders_like_image_views() {
+        let mesh = wall();
+        let cfg = config();
+        let ccfg = &cfg.color;
+        let src = rod_source("occlude-window", &[0.0]);
+        let occluders = find_occluders(&mesh, &full_rod(), &cfg);
+        let grid = PointGrid::new(&occluders.points);
+        let geometry = Faces::new(&mesh);
+        let all: Vec<u32> = (0..mesh.indices.len() as u32).collect();
+        // A Stelle across the rod's shadow; every face of the wall splats.
+        let view: Vec<u32> = all
+            .iter()
+            .copied()
+            .filter(|&f| {
+                let c = centroid(&mesh, f as usize);
+                (-0.7..0.7).contains(&c[0]) && (-0.4..0.4).contains(&c[2])
+            })
+            .collect();
+        let positions: Vec<[f64; 3]> = mesh.positions.iter().map(|p| p.map(f64::from)).collect();
+        let corners = CornerFaces {
+            positions: &positions,
+            faces: &mesh.indices,
+        };
+        let cam = &src.cams[0];
+        let body = interpolate_pose(&src.poses, scene::T0 + 1.0).unwrap();
+        let shot = Shot {
+            geometry: &cam.camera.downscaled(ccfg.downscale),
+            full: &cam.camera,
+            world_from_cam: body * cam.cam_in_body,
+            rank: 0,
+            sharpness_norm: 1.0,
+            rgb: None,
+            min_texel: cfg.min_texel,
+        };
+        let cover = occluder_buffer(&occluders, &grid, &shot, ccfg, None);
+        assert!(cover.is_some());
+        let lin = linear_table();
+        let whole = image_views(
+            &mesh,
+            &geometry,
+            &all,
+            &view,
+            &shot,
+            cover.as_ref(),
+            ccfg,
+            |_| false,
+            &lin,
+        );
+        assert!(whole.len() > 20, "{}", whole.len());
+        let found = Some((&occluders, &grid));
+        for cutout in [false, true] {
+            let (views, _) = windowed_views(
+                &mesh, &geometry, &view, corners, &all, found, &shot, ccfg, cutout,
+            );
+            assert_eq!(views.len(), whole.len(), "cut out: {cutout}");
+            let hidden = views.iter().filter(|v| v.2).count();
+            assert!(hidden > 10, "cut out: {cutout}, {hidden}");
+            assert!(hidden < views.len(), "cut out: {cutout}");
+            for ((f, v, h), (g, w, _)) in views.iter().zip(&whole) {
+                assert_eq!((f, v), (g, w), "cut out: {cutout}");
+                assert_eq!(*h, v.carrier(), "cut out: {cutout}, face {f}");
+            }
+        }
+        // Nothing to hide: as without.
+        let (none, _) = windowed_views(
+            &mesh, &geometry, &view, corners, &all, None, &shot, ccfg, true,
+        );
+        assert_eq!(none.len(), whole.len());
+        assert!(none.iter().all(|v| !v.2 && !v.1.carrier()));
+    }
+
+    /// The surface of `wall` as the surface step leaves it: textured from `src` with `occluders`,
+    /// as pages and welded.
+    fn textured_wall(
+        mesh: &Mesh,
+        occluders: &Occluders,
+        src: &TextureSource,
+        cfg: &SurfaceConfig,
+    ) -> (PageMesh, WeldedSurface) {
+        let mut stats = SurfaceStats::default();
+        let tex = texture_mesh_with(
+            mesh,
+            occluders,
+            std::slice::from_ref(src),
+            cfg,
+            &Progress::new(),
+            &mut stats,
+            None,
+        )
+        .unwrap();
+        let jpegs = encode_pages(&tex, cfg.jpeg_quality).unwrap();
+        let pages = tex.to_mesh(&jpegs).unwrap();
+        let welded = WeldedSurface::from_mesh(&pages);
+        (pages, welded)
+    }
+
+    /// The colour of every face on the new pages of `patch` (at the middle of its triangle in the
+    /// texture), by its number in the surface.
+    fn patch_colours(patch: &SurfacePatch) -> BTreeMap<u32, [u8; 3]> {
+        let lin = linear_table();
+        let mut colours = BTreeMap::new();
+        for page in &patch.pages {
+            let image = decode_jpeg(&page.jpeg, 1).unwrap();
+            for (tri, &f) in page.indices.iter().zip(&page.faces) {
+                let uv =
+                    [0, 1].map(|k| tri.iter().map(|&v| page.uvs[v as usize][k]).sum::<f32>() / 3.0);
+                let px = [
+                    uv[0] * image.width as f32 - 0.5,
+                    uv[1] * image.height as f32 - 0.5,
+                ];
+                let colour = sample_linear(&image, px, &lin).map(srgb_value);
+                colours.insert(f, colour.map(|v| v.round().clamp(0.0, 255.0) as u8));
+            }
+        }
+        colours
+    }
+
+    /// The faces of the Stelle `spot` of `s` the rod hides completely seen from the camera at
+    /// `place` (x, m), as [`in_the_rods_shadow`].
+    fn shadow_on(s: &WeldedSurface, spot: &[u32], place: f64) -> Vec<u32> {
+        let mid = place + (ROD_X - place) * (5.0 - 3.5) / (4.5 - 3.5);
+        spot.iter()
+            .copied()
+            .filter(|&f| {
+                let c = s.face_centroid(f);
+                (c[0] - mid).abs() < 0.02 && c[2].abs() < 0.5
+            })
+            .collect()
+    }
+
+    /// A Stelle on the wall that holds the rod's shadow from both of [`retexture_case`]'s
+    /// places: x from −0.7 to 0.3, z within ±0.55.
+    fn spot_around_the_shadows(s: &WeldedSurface) -> Vec<u32> {
+        (0..s.face_count() as u32)
+            .filter(|&f| {
+                let c = s.face_centroid(f);
+                (-0.7..0.3).contains(&c[0]) && c[2].abs() < 0.55
+            })
+            .collect()
+    }
+
+    #[test]
+    fn retexture_keeps_rod_off_the_wall() {
+        // Head-on the rod hides one stripe of the Stelle, from the side another; each image
+        // shows the wall where the other shows the rod.
+        let mesh = wall();
+        let cfg = config();
+        let src = rod_source("occlude-retexture", &[0.0, 1.0]);
+        let occluders = find_occluders(&mesh, &full_rod(), &cfg);
+        assert!(!occluders.is_empty());
+        let (pages, s) = textured_wall(&mesh, &occluders, &src, &cfg);
+        let bvh = FaceBvh::build(&s);
+        let spot = spot_around_the_shadows(&s);
+        let sources = std::slice::from_ref(&src);
+        let indices = vec![Arc::new(
+            index_images(&src.images.bags, &src.images.topics, &Progress::new()).unwrap(),
+        )];
+        let run = |occ: &Occluders, variant: u32| {
+            retexture_region(
+                &s,
+                &bvh,
+                &pages,
+                &spot,
+                occ,
+                sources,
+                &indices,
+                variant,
+                &cfg,
+                &Progress::new(),
+            )
+            .unwrap()
+        };
+        let mut shadow = shadow_on(&s, &spot, 0.0);
+        let first = shadow.len();
+        shadow.extend(shadow_on(&s, &spot, 1.0));
+        assert!(first > 10 && shadow.len() > first + 10, "{}", shadow.len());
+        // Without them every variant's image brings its stripe of the rod along.
+        let mut with_rod = 0;
+        for variant in 0..2 {
+            let colours = patch_colours(&run(&Occluders::default(), variant).patch);
+            with_rod += shadow
+                .iter()
+                .filter(|f| off_the_wall(colours[f]) > 100)
+                .count();
+        }
+        assert!(with_rod > 10, "{with_rod}");
+        // With them no image paints it, and every face of the shadows still has an image.
+        for variant in 0..2 {
+            let done = run(&occluders, variant);
+            let colours = patch_colours(&done.patch);
+            for f in &shadow {
+                let off = off_the_wall(colours[f]);
+                assert!(off <= 3 * scene::TOL, "variant {variant}, face {f}: {off}");
+            }
+            assert_eq!(done.patch.removed_faces.len(), spot.len(), "{variant}");
+        }
+    }
+
+    #[test]
+    fn retexture_keeps_the_only_view() {
+        // One image: the stripe behind the rod has no other, so it stays (no new gray faces),
+        // though the image shows the rod there.
+        let mesh = wall();
+        let cfg = config();
+        let src = rod_source("occlude-retexture-one", &[0.0]);
+        let occluders = find_occluders(&mesh, &full_rod(), &cfg);
+        let (pages, s) = textured_wall(&mesh, &occluders, &src, &cfg);
+        let bvh = FaceBvh::build(&s);
+        let spot = spot_around_the_shadows(&s);
+        let sources = std::slice::from_ref(&src);
+        let indices = vec![Arc::new(
+            index_images(&src.images.bags, &src.images.topics, &Progress::new()).unwrap(),
+        )];
+        let done = retexture_region(
+            &s,
+            &bvh,
+            &pages,
+            &spot,
+            &occluders,
+            sources,
+            &indices,
+            0,
+            &cfg,
+            &Progress::new(),
+        )
+        .unwrap();
+        let shadow = shadow_on(&s, &spot, 0.0);
+        assert!(shadow.len() > 10, "{}", shadow.len());
+        let colours = patch_colours(&done.patch);
+        for f in &shadow {
+            assert!(off_the_wall(colours[f]) > 100, "face {f}: {:?}", colours[f]);
         }
     }
 

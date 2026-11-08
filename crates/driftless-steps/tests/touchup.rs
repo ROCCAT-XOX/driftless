@@ -12,14 +12,14 @@ use driftless_map::surface::edit::{
     dab_normal, read_patches, write_patches, FaceBvh, SurfacePatch, VariantFrom, WeldedSurface,
     PATCHES_FILE,
 };
-use driftless_map::surface::SurfaceConfig;
+use driftless_map::surface::{Occluders, SurfaceConfig, OCCLUDERS_FILE};
 use driftless_steps::export::{run_export, ExportFormat, ExportKind, ExportRequest, ExportSource};
 use driftless_steps::map::{run_map, MapInput, MapRequest, MapSettings, MapStep};
 use driftless_steps::marks::{DabInput, Marks, SmoothLevel, StepInput};
 use driftless_steps::slam::{run_slam, SlamRequest, SlamSettings};
 use driftless_steps::surface::{
     run_surface, surface_fits, texture_sources, NoSources, SurfaceRequest, TextureSources,
-    STALE_SURFACE,
+    STALE_SURFACE, SURFACE_REPORT,
 };
 use driftless_steps::touchup::{
     edited_mesh, edited_pages, run_touchup, touchup_cut_off, touchup_fits, touchup_leftovers,
@@ -27,6 +27,7 @@ use driftless_steps::touchup::{
     TouchupRequest, FORMER_DIR, TOUCHUP_DIR, TOUCHUP_REPORT,
 };
 use driftless_steps::StepError;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1090,6 +1091,97 @@ fn shift_traj(traj: &Path, dx: f64) -> String {
 /// surface are stale, and no images are baked onto it with the new poses. A step that needs
 /// them says why and is kept as made without them; the images baked before stay as they were.
 /// With the trajectory as it was, the step gets its images.
+/// Changes the report of the surface in `surface`.
+fn change_report(surface: &Path, change: impl FnOnce(&mut Value)) {
+    let path = surface.join(SURFACE_REPORT);
+    let mut report: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    change(&mut report);
+    fs::write(&path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
+}
+
+/// Takes the occluders of its run out of the surface in `surface`, file and report.
+fn take_out_occluders(surface: &Path) {
+    let _ = fs::remove_file(surface.join(OCCLUDERS_FILE));
+    change_report(surface, |report| {
+        let files = report["files"].as_array_mut().unwrap();
+        files.retain(|f| f.as_str() != Some(OCCLUDERS_FILE));
+        report["bytes"]
+            .as_object_mut()
+            .unwrap()
+            .remove(OCCLUDERS_FILE);
+    });
+}
+
+/// Puts `occluders` next to the surface in `surface` as a run does: the file, and in the report.
+fn put_in_occluders(surface: &Path, occluders: &Occluders) {
+    let file = surface.join(OCCLUDERS_FILE);
+    occluders.write(&file).unwrap();
+    let size = fs::metadata(&file).unwrap().len();
+    change_report(surface, |report| {
+        report["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(OCCLUDERS_FILE));
+        report["bytes"][OCCLUDERS_FILE] = json!(size);
+    });
+}
+
+/// Two sheets 3 m in front of the device: one hides a band of the Stelle of [`front_wall`] from
+/// the device, the other a band of it from the device 1 m along +y ([`two_places`]). So from
+/// each place a part of the Stelle is hidden that the other place shows.
+fn sheets() -> Occluders {
+    let spacing = 0.02f32;
+    let sheet = |from: f32, n: i32| {
+        (0..n).flat_map(move |i| {
+            (-30..=30).map(move |k| [3.0, from + i as f32 * 0.02, k as f32 * 0.02])
+        })
+    };
+    Occluders {
+        points: sheet(0.3, 11).chain(sheet(1.0, 11)).collect(),
+        spacing,
+    }
+}
+
+/// The camera images of `scene` from where they were taken and from 1 m along +y: two scans of
+/// the same images that see the wall from two places.
+fn two_places(scene: &Scene) -> TextureSources {
+    let found = scene.sources().into_found().unwrap();
+    let mut other = found[0].clone();
+    for pose in &mut other.poses {
+        pose.p.y += 1.0;
+    }
+    TextureSources::Found(vec![found[0].clone(), other])
+}
+
+#[test]
+fn touch_up_heeds_the_occluders_of_the_surface() {
+    let patches = |name: &str, setup: &dyn Fn(&Path)| -> Vec<u8> {
+        let scene = Scene::new(name);
+        take_out_occluders(&scene.surface);
+        setup(&scene.surface);
+        scene.mark(
+            &front_wall(&scene.surface),
+            Some(StepInput::Retexture { variant: 0 }),
+        );
+        let done = run_touchup(&scene.request(two_places(&scene)), &Progress::new()).unwrap();
+        assert!(done.refused.is_empty(), "{done:?}");
+        fs::read(scene.cache().join(PATCHES_FILE)).unwrap()
+    };
+    let plain = patches("nacharbeit-verdecker-ohne", &|_| ());
+    // What the report does not list is not the surface's: a file left by an earlier run.
+    let stale = patches("nacharbeit-verdecker-alt", &|s| {
+        sheets().write(&s.join(OCCLUDERS_FILE)).unwrap();
+    });
+    assert!(
+        plain == stale,
+        "a file the report does not list is not read"
+    );
+    let listed = patches("nacharbeit-verdecker-da", &|s| {
+        put_in_occluders(s, &sheets())
+    });
+    assert!(plain != listed, "the occluders of the surface count");
+}
+
 #[test]
 fn stale_surface_bakes_no_images() {
     let scene = Scene::new("nacharbeit-veraltet");

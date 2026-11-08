@@ -77,7 +77,7 @@ use driftless_map::surface::edit::{
     smooth_region, write_patches, EditError, FaceBvh, PageEdit, RetextureDone, SelectDab,
     Smoothing, SurfacePatch, VariantFrom, VariantImage, WeldedSurface, EDIT_VERSION, PATCHES_FILE,
 };
-use driftless_map::surface::{SurfaceConfig, TextureSource};
+use driftless_map::surface::{Occluders, SurfaceConfig, TextureSource, OCCLUDERS_FILE};
 use driftless_map::MapError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -424,6 +424,19 @@ fn surface_report(dir: &Path) -> Result<Value, StepError> {
         .map_err(|e| format!("{} nicht lesbar: {e}", path.display()).into())
 }
 
+/// The occluders the surface in `dir` was made with, to hide what its images must not paint
+/// ([`retexture_region`]): the file of its report ([`OCCLUDERS_FILE`]). None if the report lists
+/// none (a file there is from an earlier run: a surface computed since without them must not
+/// heed it), the file is gone or damaged, or the surface is older than the file: then the images
+/// are baked as before.
+fn occluders_of(dir: &Path, report: &Value) -> Occluders {
+    let listed = report["files"]
+        .as_array()
+        .is_some_and(|f| f.iter().any(|n| n.as_str() == Some(OCCLUDERS_FILE)));
+    let read = || Occluders::read(&dir.join(OCCLUDERS_FILE));
+    listed.then(read).flatten().unwrap_or_default()
+}
+
 /// The report in the cache folder `cache`, if one is there and reads.
 fn read_report(cache: &Path) -> Option<Report> {
     let text = fs::read_to_string(cache.join(TOUCHUP_REPORT)).ok()?;
@@ -577,6 +590,8 @@ struct Replay<'a> {
     indices: Option<Vec<Arc<ImageIndex>>>,
     kept: Option<&'a ImageIndices>,
     cfg: &'a SurfaceConfig,
+    /// What hides the surface from the images ([`occluders_of`]).
+    occluders: Occluders,
 }
 
 /// What came of a step besides its patch ([`StepRecord`]).
@@ -701,7 +716,16 @@ impl Replay<'_> {
         let indices = self.indices(sources, progress)?;
         let current = apply_patches(self.mesh, &self.s, &self.patches);
         match retexture_region(
-            &self.s, &self.bvh, &current, faces, sources, &indices, variant, self.cfg, progress,
+            &self.s,
+            &self.bvh,
+            &current,
+            faces,
+            &self.occluders,
+            sources,
+            &indices,
+            variant,
+            self.cfg,
+            progress,
         ) {
             Ok(done) => Ok(Baked::Done(done)),
             Err(e) => refusal(e).map(Baked::Refused),
@@ -955,6 +979,7 @@ pub fn run_touchup(req: &TouchupRequest, progress: &Progress) -> Result<TouchupD
             indices: None,
             kept: req.prepared.indices.as_deref(),
             cfg: &cfg,
+            occluders: occluders_of(dir, &report),
         };
         let mut exact = steps.iter().all(|s| !s.without_raw_data);
         for (i, event) in events.iter().enumerate().skip(steps.len()) {
