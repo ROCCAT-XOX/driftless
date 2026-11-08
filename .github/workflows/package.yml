@@ -19,7 +19,7 @@ env:
 jobs:
   macos:
     name: macos
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       # The oldest macOS (also for the release, which calls this workflow): LSMinimumSystemVersion
       # of packaging/macos/Info.plist.in; build-dmg.sh refuses another one, check-dmg.sh checks
