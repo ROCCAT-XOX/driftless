@@ -91,7 +91,9 @@
 //! 7. **Bake** ([`bake_region`]): the charts as the surface step makes them, at its texel size
 //!    ([`SurfaceConfig::min_texel`]), on pages of their own: the smallest power of two from
 //!    [`REGION_PAGE_MIN`] to [`REGION_PAGE_MAX`] that holds them, several if one does not; the
-//!    colours divided by the gains. The old pages stay as they are: nothing is packed anew.
+//!    colours divided by the gains. The old pages stay as they are: nothing is packed anew. With
+//!    [`crate::surface::NoiseConfig::denoise`] the charts then go through the filter of the surface
+//!    step ([`denoise_charts`]), else the new page would be grainier than the surface around it.
 //! 8. **Level** ([`level_region`]): where a chart meets the old texture (an edge to a textured
 //!    face that keeps it, not across a crease of [`SEAM_MIN_COS`]) only the new page adapts, by
 //!    the whole difference; the seams between its own charts are levelled both ways, as the
@@ -158,6 +160,7 @@ use crate::surface::atlas::{
 };
 #[cfg(doc)]
 use crate::surface::atlas::{REGION_PAGE_MAX, REGION_PAGE_MIN};
+use crate::surface::denoise::denoise_charts;
 use crate::surface::level::{
     level_region, FrozenEdge, GAIN_FLOOR, MAX_SEAM_RATIO, MIN_SEAM_LUMINANCE, SEAM_MIN_COS,
     SEAM_SAMPLES,
@@ -1391,6 +1394,14 @@ fn retexture(
         .collect();
     let mesh = local_mesh(s, &new);
     let mut tex = bake_region(&mesh, &new_labels, &images, cfg);
+    if cfg.noise.denoise {
+        let image: Vec<u32> = tex
+            .charts
+            .iter()
+            .map(|c| new_labels[c.faces[0] as usize])
+            .collect();
+        denoise_charts(&mesh, &mut tex, |c| image[c]);
+    }
     if matching == Matching::Full {
         let labels: Vec<Option<u32>> = new_labels.iter().map(|&l| Some(l)).collect();
         level_region(&mesh, &labels, &mut tex, &frozen);
@@ -2786,7 +2797,7 @@ mod tests {
     use crate::surface::edit::{apply_patches, write_patches, PATCHES_FILE};
     use crate::surface::testutil::{
         paged, painted_mesh, scene, testscan_config, testscan_source, testscan_source_scaled,
-        testscan_surface, walk_source,
+        testscan_surface, walk_source, walk_source_with, with_noise,
     };
     use crate::surface::views::image_views;
     use driftless_export::mesh::Mesh as PageMesh;
@@ -2905,6 +2916,75 @@ mod tests {
         )
         .unwrap()
         .0
+    }
+
+    /// The grain of the pages of `patch`: the mean of `|N ∗ Y|` (Immerkær's operator on the
+    /// luminance, after JPEG) over all their pixels.
+    fn patch_grain(patch: &SurfacePatch) -> f64 {
+        let (mut sum, mut count) = (0.0f64, 0u64);
+        for page in &patch.pages {
+            let image = decode_jpeg(&page.jpeg, 1).unwrap();
+            let (w, h) = (image.width as usize, image.height as usize);
+            let y = |i: usize| {
+                f64::from(image.data[i * 3])
+                    + 2.0 * f64::from(image.data[i * 3 + 1])
+                    + f64::from(image.data[i * 3 + 2])
+            };
+            for j in 1..h - 1 {
+                for i in 1..w - 1 {
+                    let c = j * w + i;
+                    let n = y(c - w - 1) - 2.0 * y(c - w) + y(c - w + 1)
+                        - 2.0 * (y(c - 1) - 2.0 * y(c) + y(c + 1))
+                        + y(c + w - 1)
+                        - 2.0 * y(c + w)
+                        + y(c + w + 1);
+                    sum += n.abs();
+                    count += 1;
+                }
+            }
+        }
+        sum / count as f64
+    }
+
+    /// „Bilder neu“ on noisy photos: the new pages are filtered as the surface is, the other
+    /// pages keep their images.
+    #[test]
+    fn retexture_is_denoised() {
+        let (pages, s, _) = textured_walk();
+        let noisy = walk_source_with("retexture-noisy", &[0, 1], 1..=11, |rgb| {
+            with_noise(rgb, 6.0)
+        });
+        let spot = spot_at(s, [1.0, 5.0, 0.3], 0.565, [0.0, -1.0, 0.0]);
+        assert!(!spot.is_empty());
+        let run = |denoise: bool| {
+            let cfg = SurfaceConfig {
+                noise: crate::surface::NoiseConfig {
+                    denoise,
+                    ..crate::surface::NoiseConfig::OFF
+                },
+                ..walk_config()
+            };
+            retexture_here(
+                s,
+                pages,
+                &spot,
+                std::slice::from_ref(&noisy),
+                0,
+                &cfg,
+                &Progress::new(),
+            )
+            .unwrap()
+        };
+        let (off, on) = (run(false), run(true));
+        let (grain_off, grain_on) = (patch_grain(&off.patch), patch_grain(&on.patch));
+        println!("grain of the new page: without {grain_off:.3}, with {grain_on:.3}");
+        assert!(grain_on < 0.9 * grain_off, "{grain_off} -> {grain_on}");
+        // The same Stelle either way, and the pages around it keep their images.
+        assert_eq!(on.patch.removed_faces, off.patch.removed_faces);
+        let out = apply_patches(pages, s, std::slice::from_ref(&on.patch));
+        for (a, b) in pages.pages.iter().zip(&out.pages) {
+            assert_eq!(a.image, b.image);
+        }
     }
 
     /// [`retexture_region`] with the tree of `s` and the indices of `sources` made here.

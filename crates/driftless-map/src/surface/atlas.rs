@@ -197,6 +197,11 @@ pub struct TextureStats {
     pub gray_filled: usize,
     /// Area of the gray faces over the area of all faces (0 without faces).
     pub untextured_area_share: f64,
+    /// Image noise of the charts as baked (standard deviation, sRGB levels; the median over the
+    /// charts weighted by their texels; set by `texture_mesh`, 0 from `bake`).
+    pub noise_before: f64,
+    /// … and after the charts were denoised (the same as before with the filter off).
+    pub noise_after: f64,
 }
 
 /// Edge neighbours of every face (faces sharing an edge, either winding), in CSR form.
@@ -1288,6 +1293,8 @@ pub(crate) fn bake(
         } else {
             0.0
         },
+        noise_before: 0.0,
+        noise_after: 0.0,
     };
     Ok((
         TexturedMesh {

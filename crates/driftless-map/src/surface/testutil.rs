@@ -461,20 +461,31 @@ pub(crate) fn walk_source(
     steps: std::ops::RangeInclusive<u32>,
     gain: f64,
 ) -> super::TextureSource {
+    if gain == 1.0 {
+        walk_source_with(name, which, steps, |rgb| rgb)
+    } else {
+        walk_source_with(name, which, steps, move |rgb| brighter(rgb, gain))
+    }
+}
+
+/// [`walk_source`] with every image changed by `edit` before it is encoded.
+pub(crate) fn walk_source_with(
+    name: &str,
+    which: &[usize],
+    steps: std::ops::RangeInclusive<u32>,
+    edit: impl Fn(Vec<u8>) -> Vec<u8> + Clone + 'static,
+) -> super::TextureSource {
     let painted = scene::walk_scene();
     let all = scene::cameras();
     let cams: Vec<crate::ColorCamera> = which.iter().map(|&c| all[c].clone()).collect();
     let traj = scene::walk();
     let shots: Vec<scene::Shot> = steps
         .flat_map(|i| {
+            let edit = edit.clone();
             (0..cams.len()).map(move |c| scene::Shot {
                 camera: c,
                 stamp: scene::T0 + 0.5 * f64::from(i),
-                edit: if gain == 1.0 {
-                    Box::new(|rgb| rgb)
-                } else {
-                    Box::new(move |rgb: Vec<u8>| brighter(rgb, gain))
-                },
+                edit: Box::new(edit.clone()),
             })
         })
         .collect();
@@ -484,6 +495,23 @@ pub(crate) fn walk_source(
         poses: scene::poses(&traj, 6.0),
         cams,
     }
+}
+
+/// `rgb` (sRGB) plus the same Gaussian noise of standard deviation `sigma` on all three
+/// channels; the noise depends only on the image's bytes, so it differs between images.
+pub(crate) fn with_noise(rgb: Vec<u8>, sigma: f64) -> Vec<u8> {
+    let seed = rgb
+        .iter()
+        .fold(7u64, |s, &v| s.wrapping_mul(31).wrapping_add(u64::from(v)));
+    let mut rng = Lcg::new(seed);
+    rgb.as_chunks::<3>()
+        .0
+        .iter()
+        .flat_map(|p| {
+            let n = sigma * rng.normal();
+            p.map(|v| (f64::from(v) + n).round().clamp(0.0, 255.0) as u8)
+        })
+        .collect()
 }
 
 /// `rgb` (sRGB) with every linear value times `gain`, clipped at white.

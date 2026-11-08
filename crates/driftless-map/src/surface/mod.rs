@@ -3,12 +3,13 @@
 //! [`build_surface`] runs the chain ([`build_mesh`] and [`texture_mesh`] are its two halves): [`FusedSdf`] (the cleaned points and the positions they were
 //! measured from fused into a truncated signed distance field, fine and coarse) → [`extract`] → the
 //! vertices onto the planes of the points ([`NoiseConfig::snap`]) → [`cleanup`] →
-//! [`simplify`] → camera views per face → one image per face → texture pages → seam
-//! levelling. [`write_glb`] and [`write_obj`] write the result, [`render_preview`] draws it.
+//! [`simplify`] → camera views per face → one image per face → texture pages → image noise
+//! damped per chart ([`NoiseConfig::denoise`]) → seam levelling. [`write_glb`] and [`write_obj`] write the result, [`render_preview`] draws it.
 //! [`edit`] touches up a computed surface where the user painted Stellen on it.
 
 mod atlas;
 mod cleanup;
+mod denoise;
 pub mod edit;
 mod extract;
 mod level;
@@ -380,7 +381,7 @@ pub fn build_mesh(
 }
 
 /// `mesh` (from [`build_mesh`]) textured from `sources` (all in the mesh's frame, see
-/// [`TextureSource`]): views, labels, baking and seam levelling, the images of the sources
+/// [`TextureSource`]): views, labels, baking, denoising and seam levelling, the images of the sources
 /// one after the other in every pass; gray without sources. Adds its figures and phases to
 /// `stats`. With `gpu` the
 /// views per face are found on the GPU (the same views up to rounding; see
@@ -425,6 +426,23 @@ pub fn texture_mesh(
             stats.texture.islands_absorbed = absorbed.islands;
             stats.texture.gray_filled = absorbed.gray_filled;
             clock.lap(stats, "bake");
+            check_cancel(progress)?;
+            if cfg.noise.denoise {
+                progress.phase("Oberfläche: Bildrauschen", None);
+                let image: Vec<u32> = tex
+                    .charts
+                    .iter()
+                    .map(|c| labels[c.faces[0] as usize].expect("a chart's faces have an image"))
+                    .collect();
+                let noise = denoise::denoise_charts(mesh, &mut tex, |c| image[c]);
+                stats.texture.noise_before = noise.noise_before;
+                stats.texture.noise_after = noise.noise_after;
+            } else {
+                let noise = denoise::noise_of(&tex);
+                stats.texture.noise_before = noise;
+                stats.texture.noise_after = noise;
+            }
+            clock.lap(stats, "denoise");
             check_cancel(progress)?;
             progress.phase("Oberfläche: Nähte", None);
             stats.seams = level::level_seams(mesh, &labels, &mut tex);
@@ -1178,6 +1196,61 @@ mod tests {
         // Only sources without images: gray.
         let (_, gray) = textured(&mesh, &[none]).unwrap();
         assert_eq!(gray.texture.faces_textured, 0);
+    }
+
+    /// With noisy photos the filter lowers the noise of the charts, and the steps at the seams
+    /// do not get larger for it.
+    #[test]
+    fn texture_mesh_seams_no_worse() {
+        let mesh = painted_mesh(&scene::walk_scene(), 0.1);
+        let src = walk_source_with("denoise-noisy", &[0, 1], 1..=11, |rgb| with_noise(rgb, 6.0));
+        let run = |denoise: bool| {
+            let cfg = SurfaceConfig {
+                min_texel: 0.01,
+                page_size: 1024,
+                noise: NoiseConfig {
+                    denoise,
+                    ..NoiseConfig::OFF
+                },
+                ..SurfaceConfig::default()
+            };
+            let mut stats = SurfaceStats::default();
+            texture_mesh(
+                &mesh,
+                std::slice::from_ref(&src),
+                &cfg,
+                &Progress::new(),
+                &mut stats,
+                None,
+            )
+            .unwrap();
+            stats
+        };
+        let (off, on) = (run(false), run(true));
+        println!(
+            "seam step off {:.3}, on {:.3}; noise off {:.3}/{:.3}, on {:.3}/{:.3}",
+            off.seams.seam_step_after,
+            on.seams.seam_step_after,
+            off.texture.noise_before,
+            off.texture.noise_after,
+            on.texture.noise_before,
+            on.texture.noise_after,
+        );
+        assert!(
+            on.seams.seam_step_after <= off.seams.seam_step_after,
+            "{} > {}",
+            on.seams.seam_step_after,
+            off.seams.seam_step_after
+        );
+        assert!(on.texture.noise_before > 1.0, "{:?}", on.texture);
+        assert!(
+            on.texture.noise_after < on.texture.noise_before,
+            "{:?}",
+            on.texture
+        );
+        // Without the filter the noise is still reported, and nothing changes it.
+        assert!(off.texture.noise_before > 1.0, "{:?}", off.texture);
+        assert_eq!(off.texture.noise_after, off.texture.noise_before);
     }
 
     #[test]

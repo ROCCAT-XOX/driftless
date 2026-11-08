@@ -405,6 +405,8 @@ fn stats_json(s: &SurfaceStats) -> Value {
             "islands_absorbed": s.texture.islands_absorbed,
             "gray_filled": s.texture.gray_filled,
             "untextured_area_share": s.texture.untextured_area_share,
+            "noise_before": s.texture.noise_before,
+            "noise_after": s.texture.noise_after,
         },
         "seams": {
             "seam_jump_before": s.seams.seam_jump_before,
