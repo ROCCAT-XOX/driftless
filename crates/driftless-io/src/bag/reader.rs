@@ -105,28 +105,51 @@ pub(super) fn parse_connection(fields: &Fields, data: &[u8]) -> Result<Connectio
         topic: fields
             .string("topic")
             .or_else(|| d.string("topic"))
-            .ok_or_else(|| BagError::Malformed("connection without topic".into()))?,
+            .ok_or_else(|| BagError::Malformed("Verbindung ohne Topic".into()))?,
         msg_type: d.string("type").unwrap_or_default(),
         md5sum: d.string("md5sum").unwrap_or_default(),
     })
 }
 
+/// The most bytes a chunk may hold decompressed, whatever its header says (files from outside
+/// are not trusted). A chunk is what a recorder gathers up to its chunk size (768 KiB unless
+/// set otherwise) plus one message.
+const CHUNK_MAX: u64 = 1 << 30;
+/// The most bytes a chunk may hold decompressed whose header names no size.
+const CHUNK_MAX_UNSAID: u64 = 1 << 28;
+
+/// The records of a chunk from its `data`, stored as `compression`. `size` is what its header
+/// gives as its size decompressed (0: nothing). An lz4 chunk must hold exactly that many bytes
+/// and never more than [`CHUNK_MAX`] (without a size in the header [`CHUNK_MAX_UNSAID`]);
+/// anything else is [`BagError::Malformed`], and the decoder stops at the limit: a few bytes in
+/// the file that stand for gigabytes cost no more memory than the limit.
 pub(super) fn decompress(
     compression: &str,
     data: Vec<u8>,
-    size_hint: usize,
+    size: usize,
 ) -> Result<Vec<u8>, BagError> {
     match compression {
         "none" => Ok(data),
         "lz4" => {
-            let mut out = Vec::with_capacity(size_hint.min(1 << 28));
+            let bad = |what: &str| BagError::Malformed(format!("ein Chunk {what}"));
+            let said = (size > 0).then_some(size as u64);
+            if said.is_some_and(|s| s > CHUNK_MAX) {
+                return Err(bad(&format!("ist zu groß ({size} Bytes laut Kopf)")));
+            }
+            let limit = said.unwrap_or(CHUNK_MAX_UNSAID);
+            let mut out = Vec::with_capacity(limit.min(1 << 28) as usize);
             // German for the program; the decoder's own text is English.
             lz4_flex::frame::FrameDecoder::new(data.as_slice())
+                .take(limit + 1)
                 .read_to_end(&mut out)
-                .map_err(|_| {
-                    BagError::Malformed("ein Chunk lässt sich nicht entpacken (lz4)".into())
-                })?;
-            Ok(out)
+                .map_err(|_| bad("lässt sich nicht entpacken (lz4)"))?;
+            let got = out.len() as u64;
+            match said {
+                Some(s) if got > s => Err(bad("ist größer als im Kopf angegeben")),
+                Some(s) if got < s => Err(bad("ist kleiner als im Kopf angegeben")),
+                None if got > limit => Err(bad("ohne Größe im Kopf ist zu groß")),
+                _ => Ok(out),
+            }
         }
         other => Err(BagError::UnsupportedCompression(other.to_string())),
     }
@@ -153,7 +176,7 @@ impl Chunk {
             if self.pos >= self.buf.len() {
                 return Ok(None);
             }
-            let bad = || BagError::Malformed("record exceeds chunk".into());
+            let bad = || BagError::Malformed("Eintrag reicht über den Chunk hinaus".into());
             let b = &self.buf;
             let hlen = read_u32(b, self.pos).ok_or_else(bad)? as usize;
             let hstart = self.pos + 4;
@@ -217,7 +240,7 @@ impl<R: Read + Seek> BagReader<R> {
         };
         if head.fields.op()? != OP_BAG_HEADER {
             return Err(BagError::Malformed(
-                "first record is not a bag header".into(),
+                "erster Eintrag ist kein Bag-Kopf".into(),
             ));
         }
         let index_pos = head.fields.u64("index_pos").unwrap_or(0);
@@ -282,7 +305,8 @@ impl<R: Read + Seek> BagReader<R> {
     }
 
     fn count_from_index(&mut self, ids: &[u32]) -> Result<u64, BagError> {
-        let damaged = || BagError::Malformed("chunk info exceeds record".into());
+        let damaged =
+            || BagError::Malformed("Chunk-Angaben reichen über den Eintrag hinaus".into());
         let mut pos = self.index_pos;
         let mut total = 0u64;
         self.r.seek(SeekFrom::Start(pos))?;
@@ -414,7 +438,9 @@ impl<'a, R: Read + Seek> Messages<'a, R> {
                     Some(ChunkItem::Connection(c)) => self.reader.add_connection(c),
                     Some(ChunkItem::Message { conn, time, data }) => {
                         let idx = self.reader.by_id.get(&conn).copied().ok_or_else(|| {
-                            BagError::Malformed(format!("message for unknown connection {conn}"))
+                            BagError::Malformed(format!(
+                                "Nachricht für unbekannte Verbindung {conn}"
+                            ))
                         })?;
                         let topic = &self.reader.conns[idx].topic;
                         if let Some(f) = &self.filter {

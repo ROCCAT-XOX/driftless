@@ -149,6 +149,96 @@ fn damaged_lz4_chunk_says_so() {
     );
 }
 
+/// A bag of one lz4 chunk of one message of `n` bytes that compress to nearly nothing.
+fn one_chunk(n: usize) -> Vec<u8> {
+    let mut w = BagWriter::new(Compression::Lz4).messages_per_chunk(1);
+    let c = w.add_connection("/a", "pkg/A");
+    w.write_message(c, Time { sec: 1, nsec: 0 }, &vec![0u8; n]);
+    w.finish()
+}
+
+/// Where the value of the field `size` of the chunk's header lies, and that value.
+fn size_field(bytes: &[u8]) -> (usize, u32) {
+    let field = b"\x09\x00\x00\x00size=";
+    let at = bytes
+        .windows(field.len())
+        .position(|w| w == field)
+        .expect("a chunk header with a size")
+        + field.len();
+    let size = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    (at, size)
+}
+
+/// The last thing the sequential reader and the walk give for `bytes`: both end in this error.
+fn refused_by_both(bytes: Vec<u8>) -> String {
+    let sequential = read_all(bytes.clone(), &[]);
+    assert_eq!(sequential.len(), 1, "no message before the error");
+    let Some(Err(e)) = sequential.last() else {
+        panic!("{sequential:?}")
+    };
+    assert!(matches!(e, BagError::Malformed(_)), "{e:?}");
+    let text = e.to_string();
+    let mut reader = BagReader::new(Cursor::new(bytes)).unwrap();
+    let walked: Vec<_> = reader.message_places(&[], 12).collect();
+    let Some(Err(w)) = walked.last() else {
+        panic!("{walked:?}")
+    };
+    assert_eq!(w.to_string(), text);
+    text
+}
+
+/// A chunk that decompresses to more than its header says – a little in the file standing for
+/// megabytes – stops there and is an error: what a bag can cost is bounded by what it says.
+#[test]
+fn chunk_larger_than_it_says_is_refused() {
+    let mut bytes = one_chunk(64 << 20);
+    assert!(bytes.len() < 1 << 20, "{}", bytes.len());
+    let (at, size) = size_field(&bytes);
+    assert!(size > 64 << 20, "{size}");
+    bytes[at..at + 4].copy_from_slice(&16u32.to_le_bytes());
+    assert_eq!(
+        refused_by_both(bytes),
+        "Bag-Datei ist beschädigt: ein Chunk ist größer als im Kopf angegeben"
+    );
+}
+
+/// A chunk that holds less than its header says is an error as well.
+#[test]
+fn chunk_smaller_than_it_says_is_refused() {
+    let mut bytes = one_chunk(1000);
+    let (at, size) = size_field(&bytes);
+    bytes[at..at + 4].copy_from_slice(&(size + 1).to_le_bytes());
+    assert_eq!(
+        refused_by_both(bytes),
+        "Bag-Datei ist beschädigt: ein Chunk ist kleiner als im Kopf angegeben"
+    );
+}
+
+/// A header that names more than a chunk may hold is refused, before anything is decompressed.
+#[test]
+fn chunk_saying_too_much_is_refused() {
+    let mut bytes = one_chunk(1000);
+    let (at, _) = size_field(&bytes);
+    bytes[at..at + 4].copy_from_slice(&(1u32 << 31).to_le_bytes());
+    assert_eq!(
+        refused_by_both(bytes),
+        "Bag-Datei ist beschädigt: ein Chunk ist zu groß (2147483648 Bytes laut Kopf)"
+    );
+}
+
+/// A chunk whose header names no size is read as before (up to a limit of its own).
+#[test]
+fn chunk_without_a_size_is_read() {
+    let mut bytes = one_chunk(1000);
+    let (at, _) = size_field(&bytes);
+    // the field named „sizf“: not one the reader knows
+    bytes[at - 2] = b'f';
+    let got = read_all(bytes, &[]);
+    assert_eq!(got.len(), 1, "{got:?}");
+    let (_, _, data) = got.into_iter().next().unwrap().unwrap();
+    assert_eq!(data, vec![0u8; 1000]);
+}
+
 #[test]
 fn rejects_non_bag() {
     let err = BagReader::new(Cursor::new(b"this is definitely not a bag file".to_vec()))

@@ -880,10 +880,11 @@ fn places_read_little_of_the_chunks() {
 }
 
 /// Chunks whose blocks hold more than their header says (`size` a quarter of what they hold):
-/// the walk keeps no more of a chunk than its header says and reads such a chunk whole, as the
-/// sequential reader does; the index and the images are the same as the stream's.
+/// the walk keeps no more of a chunk than its header says, and such a chunk is refused – by the
+/// walk and by the sequential reader alike, however it is read. A bag that does not hold what
+/// it says is damaged; the honest one is read in pieces as before.
 #[test]
-fn chunks_larger_than_they_say_are_read_whole() {
+fn chunks_larger_than_they_say_are_refused() {
     let dir = TestDir::new(format!("driftless_images_size_{}", std::process::id()));
     let lz4 = Compression::Lz4Frame(Lz4Frame {
         block_kib: 64,
@@ -914,47 +915,49 @@ fn chunks_larger_than_they_say_are_read_whole() {
         "/camera_left/image_raw".to_string(),
         "/camera_right/image_raw".to_string(),
     ];
-    for bag in [&honest, &crafted] {
-        let bags = std::slice::from_ref(bag);
-        let mut listed = Vec::new();
-        for_each_image_where(
-            bags,
-            &topics,
-            1,
-            |h| {
-                listed.push(h.clone());
-                Wanted::No
-            },
-            |_| true,
-        )
-        .unwrap();
-        let index = index_images(bags, &topics, &Progress::new()).unwrap();
-        assert_eq!(index.headers().cloned().collect::<Vec<_>>(), listed);
-        let mut all = Vec::new();
-        for_each_image(bags, &topics, 1, |r| {
-            all.push(r.map_err(|e| e.to_string()));
-            true
-        })
-        .unwrap();
-        let wanted: Vec<usize> = listed.iter().map(|h| h.index).collect();
-        read_indexed(&index, &wanted, 1, |i, r| {
-            assert_eq!(r.map_err(|e| e.to_string()), all[i], "image {i}");
-            true
-        })
-        .unwrap();
-    }
-    // The honest bag is read in pieces, the crafted one whole.
+
+    // The honest bag: the index and the images are the same as the stream's.
+    let bags = std::slice::from_ref(&honest);
+    let mut listed = Vec::new();
+    for_each_image_where(
+        bags,
+        &topics,
+        1,
+        |h| {
+            listed.push(h.clone());
+            Wanted::No
+        },
+        |_| true,
+    )
+    .unwrap();
+    let index = index_images(bags, &topics, &Progress::new()).unwrap();
+    assert_eq!(index.headers().cloned().collect::<Vec<_>>(), listed);
+    let mut all = Vec::new();
+    for_each_image(bags, &topics, 1, |r| {
+        all.push(r.map_err(|e| e.to_string()));
+        true
+    })
+    .unwrap();
+    let wanted: Vec<usize> = listed.iter().map(|h| h.index).collect();
+    read_indexed(&index, &wanted, 1, |i, r| {
+        assert_eq!(r.map_err(|e| e.to_string()), all[i], "image {i}");
+        true
+    })
+    .unwrap();
     let size = |p: &PathBuf| std::fs::metadata(p).unwrap().len();
     let (read, n) = walk_read(&honest);
     assert_eq!(n, 14, "nine images, five IMU messages");
     assert!(read * 10 < size(&honest) * 6, "{read} of {}", size(&honest));
-    let (read, n) = walk_read(&crafted);
-    assert_eq!(n, 14);
-    assert!(
-        read * 10 > size(&crafted) * 9,
-        "{read} of {}",
-        size(&crafted)
-    );
+
+    // The crafted one: refused, the same error every way it is read.
+    let refused = "Bag-Datei ist beschädigt: ein Chunk ist größer als im Kopf angegeben";
+    let bags = std::slice::from_ref(&crafted);
+    let walked = index_images(bags, &topics, &Progress::new()).err();
+    assert_eq!(walked.map(|e| e.to_string()).as_deref(), Some(refused));
+    let streamed = for_each_image(bags, &topics, 1, |_| true).err();
+    assert_eq!(streamed.map(|e| e.to_string()).as_deref(), Some(refused));
+    let listing = for_each_image_where(bags, &topics, 1, |_| Wanted::No, |_| true).err();
+    assert_eq!(listing.map(|e| e.to_string()).as_deref(), Some(refused));
 }
 
 /// The index of real image bags (`$DRIFTLESS_BAGS`, paths separated by `:`; not in the

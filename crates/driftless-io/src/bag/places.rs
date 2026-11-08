@@ -14,9 +14,11 @@
 //! An lz4 frame of another kind (linked blocks, a dictionary, another version, anything after
 //! its end) and anything that does not fit is decompressed whole, as the sequential reader
 //! does it, so it gives the same records or the same error. So is a frame whose blocks hold
-//! more than the chunk's header gives as its size, more than [`LAZY_BYTES`] or more than
-//! [`LAZY_BLOCKS`] blocks: what the walk keeps of a chunk is never more than that, nor more
-//! than the sequential reader holds of it.
+//! more than the chunk's header gives as its size, fewer than it says at the end mark, more
+//! than [`LAZY_BYTES`] or more than [`LAZY_BLOCKS`] blocks: what the walk keeps of a chunk is
+//! never more than that, nor more than the sequential reader holds of it. A chunk that does not
+//! hold what its header says is an error then, as for the sequential reader
+//! ([`super::reader::decompress`]).
 
 use super::reader::{decompress, parse_connection, read_head, BagReader, Next};
 use super::record::*;
@@ -141,6 +143,8 @@ struct Frame {
     /// by its header, at most [`LAZY_BYTES`].
     total: u64,
     limit: u64,
+    /// The chunk's size by its header (0: none named).
+    said: u64,
     /// The end mark was read.
     ended: bool,
 }
@@ -222,6 +226,7 @@ impl Frame {
             blocks: Vec::new(),
             total: 0,
             limit: u64::from(size).min(LAZY_BYTES),
+            said: u64::from(size),
             ended: false,
         }))
     }
@@ -241,10 +246,11 @@ impl Frame {
         let head = peek.read(r, self.next, 4, file_len)?;
         let word = u32::from_le_bytes(head.try_into().expect("4 bytes"));
         if word == 0 {
-            // The end mark, then the checksum of the content; nothing may follow.
+            // The end mark, then the checksum of the content; nothing may follow. Short of
+            // the size the header gives: read whole, which says so.
             let after = self.next + 4 + if self.content_checksum { 4 } else { 0 };
             self.ended = true;
-            return Ok(after == self.end);
+            return Ok(after == self.end && (self.said == 0 || self.total == self.said));
         }
         let stored = word & BLOCK_STORED != 0;
         let size = u64::from(word & !BLOCK_STORED);
@@ -382,7 +388,7 @@ impl Chunk {
         peek: &mut Peeker,
         file_len: u64,
     ) -> Result<Option<Item>, BagError> {
-        let bad = || BagError::Malformed("record exceeds chunk".into());
+        let bad = || BagError::Malformed("Eintrag reicht über den Chunk hinaus".into());
         let u32_at =
             |c: &mut Chunk, r: &mut R, peek: &mut Peeker, at: u64| -> Result<u64, BagError> {
                 if !c.reaches(r, peek, at + 4, file_len)? {
@@ -501,7 +507,9 @@ impl<R: Read + Seek> Places<'_, R> {
                         len,
                     }) => {
                         let topic = self.reader.topic_of(conn).ok_or_else(|| {
-                            BagError::Malformed(format!("message for unknown connection {conn}"))
+                            BagError::Malformed(format!(
+                                "Nachricht für unbekannte Verbindung {conn}"
+                            ))
                         })?;
                         if let Some(f) = &self.filter {
                             if !f.iter().any(|t| t == topic) {
@@ -589,7 +597,7 @@ impl<R: Read + Seek> BagReader<R> {
     /// whole and checked as [`Self::messages`] does it. Fails if the place is not in the file or
     /// the chunk cannot be decompressed.
     pub fn read_message(&mut self, place: &MessagePlace) -> Result<Vec<u8>, BagError> {
-        let outside = || BagError::Malformed("message outside its chunk".into());
+        let outside = || BagError::Malformed("Nachricht außerhalb ihres Chunks".into());
         if place
             .chunk_pos
             .checked_add(place.chunk_len)
