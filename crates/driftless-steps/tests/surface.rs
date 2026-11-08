@@ -1249,7 +1249,10 @@ fn texture_sources_of_a_model_say_what_is_missing() {
         why,
         TextureSources::Unavailable(NoSources::ScanFolder {
             folder: PathBuf::from("/frueher/raum-b"),
-            why: "Scan-Ordner /frueher/raum-b nicht gefunden".into(),
+            why: format!(
+                "Scan-Ordner {} nicht gefunden",
+                Path::new("/frueher").join("raum-b").display()
+            ),
         })
     );
     fs::rename(b.with_file_name("raum-b-weg"), &b).unwrap();
