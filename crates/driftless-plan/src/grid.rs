@@ -31,7 +31,7 @@ pub(crate) struct Band {
 }
 
 impl Band {
-    fn contains(&self, z: f64) -> bool {
+    pub(crate) fn contains(&self, z: f64) -> bool {
         z >= self.low && z < self.high
     }
 
@@ -64,7 +64,7 @@ pub(crate) struct HeightGrid {
 /// The area holding the points of the band. Only cells of a coarse raster with enough points
 /// count, and a group of such cells, cut off from the rest, only with a real share of the
 /// points. So a stray point or a patch of reflections 80 m away does not make the grid grow.
-fn robust_extent(xyz: &[[f32; 3]], band: Band) -> Option<([f64; 2], [f64; 2])> {
+pub(crate) fn robust_extent(xyz: &[[f32; 3]], band: Band) -> Option<([f64; 2], [f64; 2])> {
     const OFFSET: i64 = 1 << 31;
     let mut keys: Vec<u64> = xyz
         .par_iter()

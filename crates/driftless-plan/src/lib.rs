@@ -4,18 +4,26 @@
 //! Everything here is deterministic on one system: no random numbers, sorts with a tie rule,
 //! no order taken from a hash map.
 
+pub mod analyze;
+pub mod dims;
 mod grid;
 pub mod levels;
 pub mod openings;
+pub mod rooms;
 mod sight;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testutil;
+pub mod top_view;
 pub mod walls;
 
+pub use analyze::{analyze, Analysis, FloorPlan, PlanFrame};
+pub use dims::{metres, Dim};
 pub use levels::{
     find_storeys, level_for, storey_points, Leveling, Storey, StoreyPoints, StoreySearch,
 };
 pub use openings::{find_openings, Opening, OpeningKind};
+pub use rooms::Room;
+pub use top_view::TopView;
 pub use walls::{find_walls, WallFace, WallPair, Walls};
 
 /// The cloud and the trajectory a plan is computed from (metres, Z up).

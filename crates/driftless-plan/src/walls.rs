@@ -40,8 +40,10 @@ const SUPPORT_PIECE: f64 = 0.10;
 /// Points this close to a line are on it (metres).
 const BAND: f64 = 0.04;
 const SETTLE_ROUNDS: usize = 4;
-/// Lines closer than this are the same line (metres).
-const SAME_LINE: f64 = 0.03;
+/// Lines closer than this are the same line (metres): nearer than the thinnest wall
+/// ([`PAIR_THICKNESS`]), so they cannot be two surfaces. A door leaf set back a little would
+/// otherwise see the wall's own cells and become a second line along the whole wall.
+const SAME_LINE: f64 = 0.05;
 /// sin 1°: lines closer in direction are parallel.
 const PARALLEL_SIN: f64 = 0.017_452_406_437_283_51;
 /// sin 2°: lines closer than this to a main direction are laid on it.
@@ -108,6 +110,11 @@ pub struct Walls {
     pub cell: f64,
 }
 
+/// Upper end of the wall band above the floor (metres).
+pub(crate) fn band_top(height: Option<f32>) -> f64 {
+    height.map_or(NO_CEILING_TOP, |h| h as f64 - CEILING_MARGIN)
+}
+
 /// Finds the wall faces of a storey.
 pub fn find_walls(
     points: &StoreyPoints,
@@ -121,9 +128,7 @@ pub fn find_walls(
     }
     let band = Band {
         low: FLOOR_MARGIN,
-        high: points
-            .height
-            .map_or(NO_CEILING_TOP, |h| h as f64 - CEILING_MARGIN),
+        high: band_top(points.height),
     };
     let grid = HeightGrid::build(&points.xyz, band, cfg.cell).ok_or(PlanError::NoWalls)?;
     progress.advance(1);
@@ -1078,7 +1083,8 @@ fn first_wall(ctx: &Search, pose: [f64; 2], ray: [f64; 2]) -> Option<u32> {
     None
 }
 
-/// Pairs of faces that are the two sides of one wall, the closest first.
+/// Pairs of faces that are the two sides of one wall. The longest common stretch goes first,
+/// then the thinnest: a door leaf set back in one of the faces must not take the wall's partner.
 fn find_pairs(faces: &[WallFace]) -> Vec<WallPair> {
     let unit = |f: &WallFace| {
         let len = distance(f.a, f.b);
@@ -1107,29 +1113,35 @@ fn find_pairs(faces: &[WallFace]) -> Vec<WallPair> {
             let (from, to) = (along(fj.a, fi, di), along(fj.b, fi, di));
             let overlap = to.max(from).min(len_i) - to.min(from).max(0.0);
             if overlap >= PAIR_OVERLAP * len_i.min(len_j) {
-                found.push(WallPair {
-                    front: i,
-                    back: j,
-                    thickness,
-                });
+                found.push((
+                    overlap,
+                    WallPair {
+                        front: i,
+                        back: j,
+                        thickness,
+                    },
+                ));
             }
         }
     }
     found.sort_by(|a, b| {
-        a.thickness
-            .total_cmp(&b.thickness)
-            .then((a.front, a.back).cmp(&(b.front, b.back)))
+        b.0.total_cmp(&a.0)
+            .then(a.1.thickness.total_cmp(&b.1.thickness))
+            .then((a.1.front, a.1.back).cmp(&(b.1.front, b.1.back)))
     });
     let mut used = vec![false; faces.len()];
-    found.retain(|pair| {
-        let free = !used[pair.front] && !used[pair.back];
-        if free {
-            used[pair.front] = true;
-            used[pair.back] = true;
-        }
-        free
-    });
     found
+        .into_iter()
+        .map(|(_, pair)| pair)
+        .filter(|pair| {
+            let free = !used[pair.front] && !used[pair.back];
+            if free {
+                used[pair.front] = true;
+                used[pair.back] = true;
+            }
+            free
+        })
+        .collect()
 }
 
 #[cfg(test)]

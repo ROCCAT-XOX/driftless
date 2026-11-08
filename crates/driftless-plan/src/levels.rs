@@ -531,7 +531,7 @@ fn below_hint(surfaces: &[Surface], lowest_floor: usize, hints: &mut Vec<String>
 }
 
 /// A number with a decimal comma.
-fn comma(value: f64, digits: usize) -> String {
+pub(crate) fn comma(value: f64, digits: usize) -> String {
     format!("{value:.digits$}").replace('.', ",")
 }
 
