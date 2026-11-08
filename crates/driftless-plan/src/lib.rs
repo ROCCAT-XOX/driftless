@@ -6,6 +6,8 @@
 
 mod grid;
 pub mod levels;
+pub mod openings;
+mod sight;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testutil;
 pub mod walls;
@@ -13,6 +15,7 @@ pub mod walls;
 pub use levels::{
     find_storeys, level_for, storey_points, Leveling, Storey, StoreyPoints, StoreySearch,
 };
+pub use openings::{find_openings, Opening, OpeningKind};
 pub use walls::{find_walls, WallFace, WallPair, Walls};
 
 /// The cloud and the trajectory a plan is computed from (metres, Z up).
